@@ -18,8 +18,9 @@ import pytest
 import torch
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
-    VllmDeepseekV4IndexerCache
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    VllmDeepseekV4IndexerCache,
+)
 
 
 @pytest.mark.parametrize("block_size, expected_ratio", [(1024, 4), (2, 2)])

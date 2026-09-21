@@ -59,17 +59,16 @@ def scatter_available() -> bool:
 if _jax_import_error is None:
 
     def _scatter_kernel_body(
-            num_chunks_ref,
-            src_offsets_ref,
-            dest_offsets_ref,
-            src_ref,  # HBM: (num_src_blocks, ...)
-            dst_ref_in,  # HBM: (num_dst_blocks, ...) aliased to out
-            dst_ref_out,  # HBM
+        num_chunks_ref,
+        src_offsets_ref,
+        dest_offsets_ref,
+        src_ref,  # HBM: (num_src_blocks, ...)
+        dst_ref_in,  # HBM: (num_dst_blocks, ...) aliased to out
+        dst_ref_out,  # HBM
     ):
         del dst_ref_in
 
         def body(sem):
-
             @pl.loop(0, num_chunks_ref[0])
             def _start(i):
                 pltpu.make_async_copy(
@@ -96,22 +95,25 @@ if _jax_import_error is None:
         transparently; varying ``num_layers`` rebuilds the Python
         wrapper (which is fine, vLLM keeps it constant per worker)."""
 
-        def _jax_multi_layer_scatter(num_chunks, src_offsets, dest_offsets,
-                                     *srcs_and_dsts):
+        def _jax_multi_layer_scatter(
+            num_chunks, src_offsets, dest_offsets, *srcs_and_dsts
+        ):
             if len(srcs_and_dsts) != 2 * num_layers:
                 raise ValueError(
-                    f"multi_layer_scatter: expected {2*num_layers} "
-                    f"src/dst tensors, got {len(srcs_and_dsts)}")
+                    f"multi_layer_scatter: expected {2 * num_layers} "
+                    f"src/dst tensors, got {len(srcs_and_dsts)}"
+                )
             srcs = srcs_and_dsts[:num_layers]
             dsts = srcs_and_dsts[num_layers:]
             new_dsts = []
             for i in range(num_layers):
                 new_dst = pl.pallas_call(
                     _scatter_kernel_body,
-                    out_shape=jax.ShapeDtypeStruct(shape=dsts[i].shape,
-                                                   dtype=dsts[i].dtype),
+                    out_shape=jax.ShapeDtypeStruct(
+                        shape=dsts[i].shape, dtype=dsts[i].dtype
+                    ),
                     grid_spec=pltpu.PrefetchScalarGridSpec(
-                        grid=(1, ),
+                        grid=(1,),
                         num_scalar_prefetch=3,
                         in_specs=[
                             pl.BlockSpec(memory_space=pl.ANY),
@@ -140,7 +142,7 @@ else:  # pragma: no cover
 
 
 def prepare_scatter_args(
-        local_blocks: torch.Tensor, device: torch.device
+    local_blocks: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the three scalar-prefetch tensors once per scatter call
     instead of once per layer. Pass the returned tuple as
@@ -157,8 +159,7 @@ def multi_layer_scatter_into(
     dsts: list[torch.Tensor],
     local_blocks: torch.Tensor,
     *,
-    prebuilt_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    | None = None,
+    prebuilt_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> list[torch.Tensor]:
     """Scatter ``srcs[l][i]`` into ``dsts[l][local_blocks[i]]`` for all
     layers ``l`` and blocks ``i``, in one kernel dispatch.
@@ -170,8 +171,9 @@ def multi_layer_scatter_into(
     if _jax_import_error is not None:
         raise RuntimeError(f"KV scatter unavailable: {_jax_import_error!r}")
     if len(srcs) != len(dsts):
-        raise ValueError(f"multi_layer_scatter_into: len(srcs)={len(srcs)} != "
-                         f"len(dsts)={len(dsts)}")
+        raise ValueError(
+            f"multi_layer_scatter_into: len(srcs)={len(srcs)} != len(dsts)={len(dsts)}"
+        )
     num_layers = len(srcs)
     if num_layers == 0:
         return []
@@ -182,7 +184,8 @@ def multi_layer_scatter_into(
         num_chunks, src_offsets, dest_offsets = prebuilt_args
     else:
         num_chunks, src_offsets, dest_offsets = prepare_scatter_args(
-            local_blocks, dsts[0].device)
+            local_blocks, dsts[0].device
+        )
     kernel = _make_multi_layer_scatter_kernel(num_layers)
     result = kernel(num_chunks, src_offsets, dest_offsets, *srcs, *dsts)
     # JAX returns a tuple matching the function's return shape.
@@ -192,11 +195,12 @@ def multi_layer_scatter_into(
 
 
 def smoke_test_multi_layer_scatter(
-        device: torch.device,
-        num_layers: int = 2,
-        num_blocks: int = 4,
-        trailing_shape: tuple[int, ...] = (16, 2, 128),
-        dtype: torch.dtype = torch.bfloat16) -> bool:
+    device: torch.device,
+    num_layers: int = 2,
+    num_blocks: int = 4,
+    trailing_shape: tuple[int, ...] = (16, 2, 128),
+    dtype: torch.dtype = torch.bfloat16,
+) -> bool:
     """Round-trip a small multi-layer scatter and check contents per
     layer. ``num_layers`` defaults to 2 so the smoke test is cheap;
     compile for the real worker's num_layers happens on first invocation
@@ -205,20 +209,19 @@ def smoke_test_multi_layer_scatter(
         logger.warning("KV scatter smoke test skipped: %s", _jax_import_error)
         return False
     try:
-        src_shape = (num_blocks, ) + trailing_shape
-        dst_shape = (num_blocks * 2, ) + trailing_shape
-        srcs_cpu = [
-            torch.randn(src_shape).to(dtype) for _ in range(num_layers)
-        ]
+        src_shape = (num_blocks,) + trailing_shape
+        dst_shape = (num_blocks * 2,) + trailing_shape
+        srcs_cpu = [torch.randn(src_shape).to(dtype) for _ in range(num_layers)]
         srcs = [s.to(device) for s in srcs_cpu]
         dsts = [
             torch.zeros(dst_shape, dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
-        local_blocks = torch.tensor(list(
-            range(num_blocks * 2 - 1, num_blocks - 1, -1)),
-                                    dtype=torch.int32,
-                                    device=device)
+        local_blocks = torch.tensor(
+            list(range(num_blocks * 2 - 1, num_blocks - 1, -1)),
+            dtype=torch.int32,
+            device=device,
+        )
         outs = multi_layer_scatter_into(srcs, dsts, local_blocks)
         for layer in range(num_layers):
             out_cpu = outs[layer].cpu()
@@ -226,8 +229,7 @@ def smoke_test_multi_layer_scatter(
             for i, idx in enumerate(local_blocks.tolist()):
                 expected[idx] = srcs_cpu[layer][i]
             if not torch.equal(out_cpu, expected):
-                logger.warning("KV scatter smoke test mismatch at layer %d",
-                               layer)
+                logger.warning("KV scatter smoke test mismatch at layer %d", layer)
                 return False
         return True
     except Exception as e:

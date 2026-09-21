@@ -18,24 +18,29 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear,
-                                               UnquantizedLinearMethod)
-from vllm.model_executor.model_loader.utils import \
-    process_weights_after_loading
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
-    OnlineFp8Policy, attach_online_fp8, validate_online_fp8)
+    OnlineFp8Policy,
+    attach_online_fp8,
+    validate_online_fp8,
+)
 
 
 @pytest.fixture(autouse=True)
 def tensor_parallel_group(monkeypatch):
     from vllm.distributed import parallel_state
+
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "_TP", group)
     return group
@@ -44,20 +49,24 @@ def tensor_parallel_group(monkeypatch):
 def make_config(kind="fp8", targets=None, exclude=None, **options):
     ignored = ["proj", "untouched", "merged", "gate", "row"]
     if kind == "fp8":
-        config = VllmFp8Config.from_config({
-            "quant_method": "fp8",
-            "activation_scheme": "dynamic",
-            "weight_block_size": [128, 128],
-            "modules_to_not_convert": ignored,
-        })
+        config = VllmFp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+                "modules_to_not_convert": ignored,
+            }
+        )
     else:
-        config = VllmNvfp4Config.from_config({
-            "quant_method": "modelopt",
-            "quant_algo": "NVFP4",
-            "group_size": 16,
-            "with_input_scale": True,
-            "ignore": ignored,
-        })
+        config = VllmNvfp4Config.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "with_input_scale": True,
+                "ignore": ignored,
+            }
+        )
     attach_online_fp8(
         config,
         SimpleNamespace(
@@ -66,20 +75,24 @@ def make_config(kind="fp8", targets=None, exclude=None, **options):
                     "enabled": True,
                     "targets": targets if targets is not None else ["proj"],
                     "exclude": exclude or [],
-                    **options
+                    **options,
                 }
-            }))
+            }
+        ),
+    )
     return config
 
 
 def linear(config, name="proj", dtype=torch.bfloat16):
-    return ReplicatedLinear(32,
-                            16,
-                            bias=False,
-                            params_dtype=dtype,
-                            quant_config=config,
-                            prefix=name,
-                            disable_tp=True)
+    return ReplicatedLinear(
+        32,
+        16,
+        bias=False,
+        params_dtype=dtype,
+        quant_config=config,
+        prefix=name,
+        disable_tp=True,
+    )
 
 
 @pytest.mark.parametrize("value", [None, {}, {"enabled": False}])
@@ -87,37 +100,19 @@ def test_disabled(value):
     assert OnlineFp8Policy.from_dict(value) is None
 
 
-@pytest.mark.parametrize("value", [
-    [],
-    {
-        "enabled": "true"
-    },
-    {
-        "enabled": True
-    },
-    {
-        "enabled": True,
-        "targets": "proj"
-    },
-    {
-        "enabled": True,
-        "targets": [""]
-    },
-    {
-        "enabled": True,
-        "targets": ["re:.*"]
-    },
-    {
-        "enabled": True,
-        "targets": ["proj"],
-        "weight_scheme": "per_block"
-    },
-    {
-        "enabled": True,
-        "targets": ["proj"],
-        "typo": True
-    },
-])
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        {"enabled": "true"},
+        {"enabled": True},
+        {"enabled": True, "targets": "proj"},
+        {"enabled": True, "targets": [""]},
+        {"enabled": True, "targets": ["re:.*"]},
+        {"enabled": True, "targets": ["proj"], "weight_scheme": "per_block"},
+        {"enabled": True, "targets": ["proj"], "typo": True},
+    ],
+)
 def test_invalid_config(value):
     with pytest.raises(ValueError):
         OnlineFp8Policy.from_dict(value)
@@ -151,10 +146,10 @@ def test_prequantized_conflict():
 def test_checkpoint_method_preserved(kind, monkeypatch):
     config = make_config(kind)
     original = object()
-    monkeypatch.setattr(config, "_get_checkpoint_quant_method",
-                        lambda layer, prefix: original)
-    assert config.get_quant_method(torch.nn.Module(),
-                                   "mlp.experts") is original
+    monkeypatch.setattr(
+        config, "_get_checkpoint_quant_method", lambda layer, prefix: original
+    )
+    assert config.get_quant_method(torch.nn.Module(), "mlp.experts") is original
 
 
 def test_fused_aliases_and_exclude():
@@ -175,9 +170,10 @@ def test_fused_aliases_and_exclude():
 def test_checkpoint_name_mapper(kind):
     config = make_config(kind, targets=["model.language_model.proj"])
     config.apply_vllm_mapper(
-        WeightsMapper(orig_to_new_prefix={
-            "model.language_model.": "language_model.model."
-        }))
+        WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "language_model.model."}
+        )
+    )
     assert config.online_fp8_policy.targets == ["language_model.model.proj"]
 
 
@@ -196,9 +192,11 @@ def test_real_bf16_checkpoint_loading(tmp_path, kind, keep_layout):
     for name, tensor in load_file(tmp_path / "model.safetensors").items():
         param = dict(model.named_parameters())[name]
         param.weight_loader(param, tensor)
-    model_config = SimpleNamespace(dtype=torch.bfloat16,
-                                   quantization=None,
-                                   word_embeddings_untied_by_checkpoint=False)
+    model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        quantization=None,
+        word_embeddings_untied_by_checkpoint=False,
+    )
     process_weights_after_loading(model, model_config, torch.device("cpu"))
     validate_online_fp8(model, config)
     weight = layer.weight.float() if keep_layout else layer.weight.float().t()
@@ -207,8 +205,7 @@ def test_real_bf16_checkpoint_loading(tmp_path, kind, keep_layout):
     torch.testing.assert_close(scales, expected_scales)
     dequantized = weight * scales[:, None]
     assert torch.isfinite(dequantized).all()
-    relative_error = (dequantized -
-                      source.float()).norm() / source.float().norm()
+    relative_error = (dequantized - source.float()).norm() / source.float().norm()
     assert relative_error < 0.04
     old_weight = layer.weight
     old_scale = layer.weight_scale
@@ -229,27 +226,29 @@ def test_online_ignores_checkpoint_requant_environment(monkeypatch):
     layer = linear(make_config())
     layer.weight.data.fill_(1)
     layer.quant_method.process_weights_after_loading(layer)
-    assert layer.weight_scale.shape == (16, )
+    assert layer.weight_scale.shape == (16,)
 
 
 def test_fused_weight_loader_scale_order():
     config = make_config(targets=["merged"])
-    layer = MergedColumnParallelLinear(32, [16, 32],
-                                       bias=False,
-                                       params_dtype=torch.bfloat16,
-                                       quant_config=config,
-                                       prefix="merged",
-                                       disable_tp=True)
-    layer.weight.weight_loader(layer.weight,
-                               torch.ones(16, 32, dtype=torch.bfloat16), 0)
-    layer.weight.weight_loader(layer.weight,
-                               torch.full((32, 32), 4., dtype=torch.bfloat16),
-                               1)
+    layer = MergedColumnParallelLinear(
+        32,
+        [16, 32],
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="merged",
+        disable_tp=True,
+    )
+    layer.weight.weight_loader(
+        layer.weight, torch.ones(16, 32, dtype=torch.bfloat16), 0
+    )
+    layer.weight.weight_loader(
+        layer.weight, torch.full((32, 32), 4.0, dtype=torch.bfloat16), 1
+    )
     layer.quant_method.process_weights_after_loading(layer)
-    torch.testing.assert_close(layer.weight_scale[:16],
-                               torch.full((16, ), 1 / 448))
-    torch.testing.assert_close(layer.weight_scale[16:],
-                               torch.full((32, ), 4 / 448))
+    torch.testing.assert_close(layer.weight_scale[:16], torch.full((16,), 1 / 448))
+    torch.testing.assert_close(layer.weight_scale[16:], torch.full((32,), 4 / 448))
 
 
 def test_audit_detects_bypassed_dispatch():
@@ -277,24 +276,24 @@ def test_row_parallel_shard_loading(tp_rank, tensor_parallel_group):
     tensor_parallel_group.rank_in_group = tp_rank
     tensor_parallel_group.world_size = 2
     config = make_config(targets=["row"])
-    layer = RowParallelLinear(32,
-                              16,
-                              bias=False,
-                              params_dtype=torch.bfloat16,
-                              quant_config=config,
-                              prefix="row")
+    layer = RowParallelLinear(
+        32,
+        16,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="row",
+    )
     source = torch.arange(512).reshape(16, 32).to(torch.bfloat16)
     layer.weight.weight_loader(layer.weight, source)
     layer.quant_method.process_weights_after_loading(layer)
-    expected = source[:, tp_rank * 16:(tp_rank + 1) *
-                      16].float().abs().amax(1) / 448
+    expected = source[:, tp_rank * 16 : (tp_rank + 1) * 16].float().abs().amax(1) / 448
     torch.testing.assert_close(layer.weight_scale, expected)
 
 
 @pytest.mark.parametrize("scheme", ["per_channel", "per_tensor"])
 @pytest.mark.parametrize("keep_layout", [False, True])
-def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch,
-                                                    scheme):
+def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch, scheme):
     import jax.numpy as jnp
     import numpy as np
 
@@ -306,9 +305,11 @@ def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch,
         result = linear_common._quantized_matmul_jax(
             jnp.asarray(x.float().numpy(), dtype=jnp.bfloat16),
             jnp.asarray(w.float().numpy(), dtype=jnp.float8_e4m3fn),
-            jnp.asarray(scale.numpy()))
-        return torch.from_numpy(np.asarray(result.astype(
-            jnp.float32)).copy()).to(x.dtype)
+            jnp.asarray(scale.numpy()),
+        )
+        return torch.from_numpy(np.asarray(result.astype(jnp.float32)).copy()).to(
+            x.dtype
+        )
 
     monkeypatch.setattr(fp8, "quantized_matmul", cpu_bridge)
     layer = linear(make_config(weight_scheme=scheme))
@@ -325,45 +326,33 @@ def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch,
 
 
 def test_pcp_parameter_contract():
-    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import \
-        VllmGatedDeltaNetAttention
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
     layer = linear(make_config())
     setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
     layer.weight.data.fill_(0.5)
     layer.quant_method.process_weights_after_loading(layer)
-    attention = SimpleNamespace(in_proj_qkvz=layer,
-                                gqa_interleaved_layout=False)
+    attention = SimpleNamespace(in_proj_qkvz=layer, gqa_interleaved_layout=False)
     weight, scale = VllmGatedDeltaNetAttention._require_pcp_projection_parameters(
-        attention)
+        attention
+    )
     assert weight.shape == (16, 32)
-    assert scale.shape == (16, )
+    assert scale.shape == (16,)
 
 
-@pytest.mark.parametrize("options", [
-    {
-        "weight_scheme": "unknown"
-    },
-    {
-        "weight_scheme": "per_tensor",
-        "weight_block_size": [128, 128]
-    },
-    {
-        "weight_scheme": "per_block",
-        "weight_block_size": [True, 128]
-    },
-    {
-        "weight_scheme": "per_block",
-        "weight_block_size": [0, 128]
-    },
-    {
-        "weight_scheme": "per_block",
-        "weight_block_size": [128, 16]
-    },
-    {
-        "weight_scheme": "per_block",
-        "weight_block_size": [128]
-    },
-])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"weight_scheme": "unknown"},
+        {"weight_scheme": "per_tensor", "weight_block_size": [128, 128]},
+        {"weight_scheme": "per_block", "weight_block_size": [True, 128]},
+        {"weight_scheme": "per_block", "weight_block_size": [0, 128]},
+        {"weight_scheme": "per_block", "weight_block_size": [128, 16]},
+        {"weight_scheme": "per_block", "weight_block_size": [128]},
+    ],
+)
 def test_granularity_config_rejected(options):
     with pytest.raises(ValueError):
         make_config(**options)
@@ -377,13 +366,15 @@ def test_granular_checkpoint_loading(tmp_path, kind, keep_layout, block):
     if block is not None:
         options["weight_block_size"] = block
     config = make_config(kind, **options)
-    layer = ReplicatedLinear(512,
-                             256,
-                             bias=False,
-                             params_dtype=torch.bfloat16,
-                             quant_config=config,
-                             prefix="proj",
-                             disable_tp=True)
+    layer = ReplicatedLinear(
+        512,
+        256,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="proj",
+        disable_tp=True,
+    )
     setattr(layer, KEEP_VLLM_LAYOUT_ATTR, keep_layout)
     model = torch.nn.Module()
     model.add_module("proj", layer)
@@ -393,8 +384,8 @@ def test_granular_checkpoint_loading(tmp_path, kind, keep_layout, block):
     source = source.to(torch.bfloat16)
     save_file({"weight": source}, tmp_path / "weights.safetensors")
     layer.weight.weight_loader(
-        layer.weight,
-        load_file(tmp_path / "weights.safetensors")["weight"])
+        layer.weight, load_file(tmp_path / "weights.safetensors")["weight"]
+    )
     layer.quant_method.process_weights_after_loading(layer)
     validate_online_fp8(model, config)
     weight = layer.weight.float() if keep_layout else layer.weight.float().t()
@@ -408,19 +399,23 @@ def test_granular_checkpoint_loading(tmp_path, kind, keep_layout, block):
         reconstructed = torch.empty_like(weight)
         for n in range(0, 256, bn):
             for k in range(0, 512, bk):
-                expected = source[n:n + bn, k:k + bk].float().abs().max() / 448
-                torch.testing.assert_close(scales[n:n + bn, k // bk],
-                                           expected.expand(bn))
-                reconstructed[n:n + bn,
-                              k:k + bk] = weight[n:n + bn, k:k + bk] * expected
+                expected = source[n : n + bn, k : k + bk].float().abs().max() / 448
+                torch.testing.assert_close(
+                    scales[n : n + bn, k // bk], expected.expand(bn)
+                )
+                reconstructed[n : n + bn, k : k + bk] = (
+                    weight[n : n + bn, k : k + bk] * expected
+                )
     assert torch.isfinite(reconstructed).all()
-    assert (reconstructed -
-            source.float()).norm() / source.float().norm() < 0.04
+    assert (reconstructed - source.float()).norm() / source.float().norm() < 0.04
     if keep_layout:
-        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import \
-            VllmGatedDeltaNetAttention
+        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+            VllmGatedDeltaNetAttention,
+        )
+
         VllmGatedDeltaNetAttention._require_pcp_projection_parameters(
-            SimpleNamespace(in_proj_qkvz=layer, gqa_interleaved_layout=False))
+            SimpleNamespace(in_proj_qkvz=layer, gqa_interleaved_layout=False)
+        )
     old_weight = layer.weight
     layer.quant_method.process_weights_after_loading(layer)
     assert layer.weight is old_weight
@@ -431,8 +426,7 @@ def test_granular_checkpoint_loading(tmp_path, kind, keep_layout, block):
 
 
 def test_block_must_divide_local_shard():
-    layer = linear(
-        make_config(weight_scheme="per_block", weight_block_size=[128, 128]))
+    layer = linear(make_config(weight_scheme="per_block", weight_block_size=[128, 128]))
     with pytest.raises(ValueError, match="after tensor-parallel sharding"):
         layer.quant_method.process_weights_after_loading(layer)
 
@@ -443,19 +437,20 @@ def test_online_block_matmul_tpu(block):
     import jax.numpy as jnp
     import numpy as np
 
-    from vllm_torchtpu.layers.adapter.linear_common import \
-        _quantized_matmul_jax
+    from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 
     if jax.default_backend() != "tpu":
         pytest.skip("Requires TPU for the production GMM kernel")
     config = make_config(weight_scheme="per_block", weight_block_size=block)
-    layer = ReplicatedLinear(512,
-                             256,
-                             bias=False,
-                             params_dtype=torch.bfloat16,
-                             quant_config=config,
-                             prefix="proj",
-                             disable_tp=True)
+    layer = ReplicatedLinear(
+        512,
+        256,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="proj",
+        disable_tp=True,
+    )
     generator = torch.Generator().manual_seed(42)
     source = torch.randn(256, 512, generator=generator).to(torch.bfloat16)
     x = torch.randn(128, 512, generator=generator).to(torch.bfloat16)
@@ -464,8 +459,8 @@ def test_online_block_matmul_tpu(block):
     result = _quantized_matmul_jax(
         jnp.asarray(x.float().numpy(), dtype=jnp.bfloat16),
         jnp.asarray(layer.weight.float().numpy(), dtype=jnp.float8_e4m3fn),
-        jnp.asarray(layer.weight_scale.numpy()))
+        jnp.asarray(layer.weight_scale.numpy()),
+    )
     result = np.asarray(result.astype(jnp.float32))
     reference = (x.float() @ source.float().t()).numpy()
-    assert np.linalg.norm(result -
-                          reference) / np.linalg.norm(reference) < 0.07
+    assert np.linalg.norm(result - reference) / np.linalg.norm(reference) < 0.07

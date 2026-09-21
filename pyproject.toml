@@ -93,7 +93,7 @@ test = [
 
 # Dev tools (linting, formatting)
 dev = [
-    "yapf>=0.43.0",
+    "ruff==0.14.0",
 ]
 
 # These are required for running any benchmarking
@@ -143,6 +143,10 @@ markers = [
 # makes `exclude` hold for both `ruff format .` and the hook.
 force-exclude = true
 
+# protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
+# would make every regeneration produce a spurious diff.
+exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
 # I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
@@ -178,13 +182,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# isort and yapf still own these paths. The same list appears in `exclude`
-# under [tool.ruff.format] and in the isort and yapf excludes in
-# .pre-commit-config.yaml; all three move together, otherwise two tools format the
-# same file.
-"src/**" = ["I"]
-"tests/**" = ["I"]
-
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
 # that built it. B023 warns that a closure outliving its loop sees the last
@@ -198,9 +195,6 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
-
-# Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]

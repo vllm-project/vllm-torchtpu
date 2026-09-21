@@ -34,9 +34,11 @@ from typing import Any
 import torch
 from vllm.distributed import parallel_state
 
-from vllm_torchtpu.distributed.mesh_utils import (_collect_rank_to_device_id,
-                                                  _get_current_global_rank,
-                                                  _get_tpu_global_device_id)
+from vllm_torchtpu.distributed.mesh_utils import (
+    _collect_rank_to_device_id,
+    _get_current_global_rank,
+    _get_tpu_global_device_id,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -52,9 +54,9 @@ _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 
 
-def ep_token_replica_groups(*,
-                            is_sequence_parallel: bool = False
-                            ) -> tuple[tuple[int, ...], ...]:
+def ep_token_replica_groups(
+    *, is_sequence_parallel: bool = False
+) -> tuple[tuple[int, ...], ...]:
     """Native token replica groups expressed in the EP mesh's coordinates.
 
     TP inputs are replicated unless MoE sequence parallelism partitions them.
@@ -64,12 +66,14 @@ def ep_token_replica_groups(*,
     """
     group = get_ep_group()
     if group is None:
-        raise RuntimeError(
-            "Token replica groups require an initialized EP group")
+        raise RuntimeError("Token replica groups require an initialized EP group")
     rank = _get_current_global_rank()
     ranks = tuple(int(r) for r in group.ranks)
-    replicas = ((rank, ) if is_sequence_parallel else tuple(
-        int(r) for r in parallel_state.get_tp_group().ranks))
+    replicas = (
+        (rank,)
+        if is_sequence_parallel
+        else tuple(int(r) for r in parallel_state.get_tp_group().ranks)
+    )
     device_ids = ep_device_ids()
     key = (ranks, device_ids, replicas)
     cached = _TOKEN_GROUP_CACHE.get(key)
@@ -77,37 +81,32 @@ def ep_token_replica_groups(*,
         return cached
 
     gathered = [None] * len(ranks)
-    torch.distributed.all_gather_object(gathered, (rank, replicas),
-                                        group=group.cpu_group)
+    torch.distributed.all_gather_object(
+        gathered, (rank, replicas), group=group.cpu_group
+    )
     if any(item is None for item in gathered):
         raise RuntimeError("EP token replica gather returned an empty entry")
-    reported = {
-        int(r): tuple(int(p) for p in members)
-        for r, members in gathered
-    }
+    reported = {int(r): tuple(int(p) for p in members) for r, members in gathered}
     if set(reported) != set(ranks):
-        raise RuntimeError(
-            "EP token replica gather does not cover the EP ranks")
+        raise RuntimeError("EP token replica gather does not cover the EP ranks")
     for r, members in reported.items():
-        if (r not in members or len(set(members)) != len(members)
-                or any(reported.get(peer) != members for peer in members)):
-            raise RuntimeError(
-                f"Inconsistent token replica group: {r}: {members}")
+        if (
+            r not in members
+            or len(set(members)) != len(members)
+            or any(reported.get(peer) != members for peer in members)
+        ):
+            raise RuntimeError(f"Inconsistent token replica group: {r}: {members}")
     if len({len(members) for members in reported.values()}) != 1:
         raise RuntimeError("EP token replica groups must have equal sizes")
     if len(set(device_ids)) != len(ranks):
         raise RuntimeError("EP token replica ranks must use distinct devices")
-    mesh_index = {
-        r: i
-        for i, (_, r) in enumerate(sorted(zip(device_ids, ranks)))
-    }
+    mesh_index = {r: i for i, (_, r) in enumerate(sorted(zip(device_ids, ranks)))}
     groups = tuple(
         sorted(
-            {
-                tuple(mesh_index[r] for r in members)
-                for members in reported.values()
-            },
-            key=min))
+            {tuple(mesh_index[r] for r in members) for members in reported.values()},
+            key=min,
+        )
+    )
     _TOKEN_GROUP_CACHE[key] = groups
     return groups
 
@@ -136,14 +135,15 @@ def ep_device_ids() -> tuple[int, ...] | None:
     if group is None:
         return None
     ranks = tuple(int(r) for r in group.ranks)
-    rank_to_device_id = _collect_rank_to_device_id(group,
-                                                   _get_current_global_rank(),
-                                                   _get_tpu_global_device_id())
+    rank_to_device_id = _collect_rank_to_device_id(
+        group, _get_current_global_rank(), _get_tpu_global_device_id()
+    )
     missing = [r for r in ranks if r not in rank_to_device_id]
     if missing:
         raise RuntimeError(
             "Could not map all EP ranks to TPU global device ids: "
-            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}")
+            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
+        )
     return tuple(rank_to_device_id[r] for r in ranks)
 
 
@@ -176,10 +176,10 @@ def ep_rank_order() -> tuple[int, ...] | None:
     if len(by_device) != len(ranks):
         raise RuntimeError(
             "Two EP ranks report the same TPU global device id: "
-            f"ranks={ranks}, device_ids={device_ids}")
+            f"ranks={ranks}, device_ids={device_ids}"
+        )
     ep_rank_of_group_rank = {r: i for i, r in enumerate(ranks)}
-    return tuple(ep_rank_of_group_rank[by_device[d]]
-                 for d in sorted(device_ids))
+    return tuple(ep_rank_of_group_rank[by_device[d]] for d in sorted(device_ids))
 
 
 def ep_mesh_index() -> int | None:
@@ -226,11 +226,15 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
             f"jax_visible_ids={sorted(visible)}. A multi-device op needs the "
             "whole slice visible in each process; check the chip binding "
             "(TPU_VISIBLE_CHIPS/TPU_VISIBLE_DEVICES) the worker was started "
-            "with.")
+            "with."
+        )
 
-    mesh = Mesh(np.asarray([visible[d] for d in device_ids]),
-                axis_names=(axis_name, ))
-    logger.info("Built EP mesh | axis=%s | size=%d | device_ids=%s", axis_name,
-                len(device_ids), list(device_ids))
+    mesh = Mesh(np.asarray([visible[d] for d in device_ids]), axis_names=(axis_name,))
+    logger.info(
+        "Built EP mesh | axis=%s | size=%d | device_ids=%s",
+        axis_name,
+        len(device_ids),
+        list(device_ids),
+    )
     _MESH_CACHE[cache_key] = mesh
     return mesh

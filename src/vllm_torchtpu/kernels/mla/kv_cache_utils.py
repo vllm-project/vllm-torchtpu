@@ -105,38 +105,45 @@ class SparseMLAKVCacheSpec:
     kv_packing: int
 
     @classmethod
-    def create(cls,
-               cache_type: KVCacheType,
-               layout: KVCacheLayout,
-               num_pages: int,
-               page_size: int,
-               head_dim: int,
-               kv_packing: int = 4) -> "SparseMLAKVCacheSpec":
+    def create(
+        cls,
+        cache_type: KVCacheType,
+        layout: KVCacheLayout,
+        num_pages: int,
+        page_size: int,
+        head_dim: int,
+        kv_packing: int = 4,
+    ) -> "SparseMLAKVCacheSpec":
         """Builds a spec with the kernel's page/head-dim padding applied."""
         num_pages, packed_page_size, kv_packing, head_dim = get_kv_cache_shape(
-            num_pages, page_size, head_dim, None, kv_packing)
+            num_pages, page_size, head_dim, None, kv_packing
+        )
         page_size = packed_page_size * kv_packing
 
         if layout is KVCacheLayout.SPARSECORE:
             assert head_dim % WORD_BYTES == 0, (
-                f"head_dim {head_dim} must be a multiple of {WORD_BYTES}")
+                f"head_dim {head_dim} must be a multiple of {WORD_BYTES}"
+            )
             if cache_type is KVCacheType.ROPE:
                 assert page_size % WORD_BYTES == 0, (
-                    f"page_size {page_size} must be a multiple of "
-                    f"{WORD_BYTES}")
+                    f"page_size {page_size} must be a multiple of {WORD_BYTES}"
+                )
         elif layout is KVCacheLayout.TENSORCORE:
             if cache_type is KVCacheType.NOPE:
                 assert head_dim == WORD_BYTES * TILE_LANE_BYTES, (
                     f"NOPE TC head_dim {head_dim} must equal"
                     f" {WORD_BYTES * TILE_LANE_BYTES}"
-                    f" ({WORD_BYTES * TILE_LANE_BYTES}B per token)")
+                    f" ({WORD_BYTES * TILE_LANE_BYTES}B per token)"
+                )
 
-        return cls(cache_type=cache_type,
-                   layout=layout,
-                   num_pages=num_pages,
-                   page_size=page_size,
-                   head_dim=head_dim,
-                   kv_packing=kv_packing)
+        return cls(
+            cache_type=cache_type,
+            layout=layout,
+            num_pages=num_pages,
+            page_size=page_size,
+            head_dim=head_dim,
+            kv_packing=kv_packing,
+        )
 
     @property
     def jax_dtype(self) -> jnp.dtype:
@@ -155,26 +162,31 @@ class SparseMLAKVCacheSpec:
     def shape(self) -> tuple[int, ...]:
         if self.cache_type is KVCacheType.NOPE:
             if self.layout is KVCacheLayout.TENSORCORE:
-                return (self.num_pages, self.page_size,
-                        self.head_dim // TILE_LANE_BYTES, TILE_LANE_BYTES)
-            return (self.num_pages, self.page_size,
-                    self.head_dim // WORD_BYTES)
+                return (
+                    self.num_pages,
+                    self.page_size,
+                    self.head_dim // TILE_LANE_BYTES,
+                    TILE_LANE_BYTES,
+                )
+            return (self.num_pages, self.page_size, self.head_dim // WORD_BYTES)
         if self.cache_type is KVCacheType.ROPE:
             if self.layout is KVCacheLayout.TENSORCORE:
-                return (self.num_pages, self.page_size // self.kv_packing,
-                        self.kv_packing, self.head_dim)
-            return (self.num_pages, self.page_size // WORD_BYTES,
-                    self.head_dim)
+                return (
+                    self.num_pages,
+                    self.page_size // self.kv_packing,
+                    self.kv_packing,
+                    self.head_dim,
+                )
+            return (self.num_pages, self.page_size // WORD_BYTES, self.head_dim)
         raise ValueError(f"unsupported cache type {self.cache_type}")
 
 
 def as_token_bytes(values: jax.Array, token_bytes: int) -> jax.Array:
     """`[num_tokens, n]` -> `[num_tokens, token_bytes]` uint8, zero-padded."""
-    u8 = jax.lax.bitcast_convert_type(values,
-                                      jnp.uint8).reshape(values.shape[0], -1)
+    u8 = jax.lax.bitcast_convert_type(values, jnp.uint8).reshape(values.shape[0], -1)
     assert u8.shape[-1] <= token_bytes, (
-        f"token is {u8.shape[-1]}B, more than the {token_bytes}B reserved "
-        "for it")
+        f"token is {u8.shape[-1]}B, more than the {token_bytes}B reserved for it"
+    )
     pad = token_bytes - u8.shape[-1]
     return jnp.pad(u8, ((0, 0), (0, pad))) if pad else u8
 
@@ -186,12 +198,13 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
     the same interleave `ref.bitcast(jnp.int32)` produces from uint8 rows.
     """
     assert token_bytes % WORD_BYTES == 0, (
-        f"token_bytes ({token_bytes}) must be a multiple of {WORD_BYTES}")
+        f"token_bytes ({token_bytes}) must be a multiple of {WORD_BYTES}"
+    )
     u8 = as_token_bytes(values, token_bytes)
-    bands = u8.reshape(u8.shape[0], WORD_BYTES,
-                       token_bytes // WORD_BYTES).astype(jnp.uint32)
-    return (bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16)
-            | (bands[:, 3] << 24))
+    bands = u8.reshape(u8.shape[0], WORD_BYTES, token_bytes // WORD_BYTES).astype(
+        jnp.uint32
+    )
+    return bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16) | (bands[:, 3] << 24)
 
 
 def _row_positions(
@@ -212,8 +225,7 @@ def _row_positions(
     """
     num_seqs = seq_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
-                              side="right").astype(jnp.int32)
+    seq_id = jnp.searchsorted(query_start_loc[1:], tok, side="right").astype(jnp.int32)
     valid = tok < query_start_loc[-1]
 
     seq_id = jnp.minimum(seq_id, num_seqs - 1)
@@ -230,14 +242,12 @@ def get_page_and_slot(
     page_size: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Computes target (page, slot) in the paged KV cache for each token."""
-    _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens,
-                                           query_start_loc)
+    _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens, query_start_loc)
 
     block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
     max_pages_per_seq = block_tables_2d.shape[1]
     safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
-    page = jnp.where(valid, block_tables_2d[seq_id, safe_page_idx],
-                     jnp.int32(OOB_PAGE))
+    page = jnp.where(valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE))
     slot = jnp.where(valid, pos % page_size, 0)
     return page, slot
 
@@ -250,8 +260,9 @@ def get_dst_rows(
     page_size: int,
 ) -> jax.Array:
     """Computes flattened row indices for SparseCore scatter kernels."""
-    page, slot = get_page_and_slot(num_tokens, seq_lens, block_tables,
-                                   query_start_loc, page_size)
+    page, slot = get_page_and_slot(
+        num_tokens, seq_lens, block_tables, query_start_loc, page_size
+    )
     return jnp.where(page < OOB_PAGE, page * page_size + slot, SKIP_ROW)
 
 
@@ -262,17 +273,19 @@ def get_dst_rows(
 # ---------------------------------------------------------------------------
 
 
-def _scatter_rows(cache: jax.Array, spec: SparseMLAKVCacheSpec,
-                  values: jax.Array, page: jax.Array,
-                  slot: jax.Array) -> jax.Array:
+def _scatter_rows(
+    cache: jax.Array,
+    spec: SparseMLAKVCacheSpec,
+    values: jax.Array,
+    page: jax.Array,
+    slot: jax.Array,
+) -> jax.Array:
     """Write each token's `values` into the (`page`, `slot`) it lands in."""
     if spec.layout is KVCacheLayout.TENSORCORE:
         src = as_token_bytes(values, spec.token_bytes)
         if spec.cache_type is KVCacheType.NOPE:
-            return cache.at[page, slot].set(
-                src.reshape(src.shape[0], *cache.shape[2:]))
-        return cache.at[page, slot // spec.kv_packing,
-                        slot % spec.kv_packing].set(src)
+            return cache.at[page, slot].set(src.reshape(src.shape[0], *cache.shape[2:]))
+        return cache.at[page, slot // spec.kv_packing, slot % spec.kv_packing].set(src)
     if spec.layout is KVCacheLayout.SPARSECORE:
         words = pack_tokens(values, spec.token_bytes)
         rows = cache.reshape(spec.num_pages, spec.page_size, -1)
@@ -281,36 +294,48 @@ def _scatter_rows(cache: jax.Array, spec: SparseMLAKVCacheSpec,
     raise ValueError(f"unsupported layout {spec.layout}")
 
 
-def _check_inputs(kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
-                  kv_c_normed: jax.Array, nope_spec: SparseMLAKVCacheSpec,
-                  rope_spec: SparseMLAKVCacheSpec) -> None:
+def _check_inputs(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> None:
     """Assert the caches were allocated from the specs they are written with."""
     assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
-        "sparse MLA kernel requires --kv-cache-dtype fp8 (got "
-        f"{kv_c_normed.dtype})")
+        f"sparse MLA kernel requires --kv-cache-dtype fp8 (got {kv_c_normed.dtype})"
+    )
     assert kv_cache_nope.dtype == nope_spec.jax_dtype, (
         f"nope cache {kv_cache_nope.dtype} does not match its spec "
-        f"{nope_spec.jax_dtype}")
+        f"{nope_spec.jax_dtype}"
+    )
     assert kv_cache_rope.dtype == rope_spec.jax_dtype, (
         f"rope cache {kv_cache_rope.dtype} does not match its spec "
-        f"{rope_spec.jax_dtype}")
+        f"{rope_spec.jax_dtype}"
+    )
     assert kv_cache_nope.shape == nope_spec.shape, (
-        f"nope cache {kv_cache_nope.shape} does not match its spec "
-        f"{nope_spec.shape}")
+        f"nope cache {kv_cache_nope.shape} does not match its spec {nope_spec.shape}"
+    )
     assert kv_cache_rope.shape == rope_spec.shape, (
-        f"rope cache {kv_cache_rope.shape} does not match its spec "
-        f"{rope_spec.shape}")
+        f"rope cache {kv_cache_rope.shape} does not match its spec {rope_spec.shape}"
+    )
     assert nope_spec.page_size == rope_spec.page_size, (
-        f"nope page size {nope_spec.page_size} != rope page size "
-        f"{rope_spec.page_size}")
+        f"nope page size {nope_spec.page_size} != rope page size {rope_spec.page_size}"
+    )
 
 
 def update_sparse_mla_kv_cache(
-        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
-        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
-        block_tables: jax.Array, query_start_loc: jax.Array, *,
-        nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec) -> tuple[jax.Array, jax.Array]:
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's new MLA latents into the split sparse-MLA cache.
 
     Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
@@ -331,58 +356,78 @@ def update_sparse_mla_kv_cache(
     Returns:
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
     """
-    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec,
-                  rope_spec)
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
     # Imported here, not at module scope: `scatter` imports this module back.
     from vllm_torchtpu.kernels.mla import scatter
 
-    addressing = (kv_c_normed.shape[0], seq_lens, block_tables,
-                  query_start_loc, nope_spec.page_size)
+    addressing = (
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        nope_spec.page_size,
+    )
     dst_rows = get_dst_rows(*addressing)
-    kv_cache_nope = scatter.scatter(kv_cache_nope,
-                                    kv_c_normed,
-                                    nope_spec,
-                                    dst_rows=dst_rows)
+    kv_cache_nope = scatter.scatter(
+        kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
+    )
     if rope_spec.layout is KVCacheLayout.SPARSECORE:
-        kv_cache_rope = scatter.scatter(kv_cache_rope,
-                                        k_pe,
-                                        rope_spec,
-                                        dst_rows=dst_rows)
+        kv_cache_rope = scatter.scatter(
+            kv_cache_rope, k_pe, rope_spec, dst_rows=dst_rows
+        )
     else:
         page, slot = get_page_and_slot(*addressing)
-        kv_cache_rope = _scatter_rows(kv_cache_rope, rope_spec, k_pe, page,
-                                      slot)
+        kv_cache_rope = _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot)
     return kv_cache_nope, kv_cache_rope
 
 
 def update_sparse_mla_kv_cache_jax(
-        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
-        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
-        block_tables: jax.Array, query_start_loc: jax.Array, *,
-        nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec) -> tuple[jax.Array, jax.Array]:
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> tuple[jax.Array, jax.Array]:
     """Pure-XLA `update_sparse_mla_kv_cache`, for every layout.
 
     Needs no TPU, so it runs on CPU: this is the golden the SparseCore writer is
     checked against, and what `update_sparse_mla_kv_cache` falls back to for the
     layouts that writer cannot express. Same arguments and returns as it.
     """
-    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec,
-                  rope_spec)
-    page, slot = get_page_and_slot(kv_c_normed.shape[0], seq_lens,
-                                   block_tables, query_start_loc,
-                                   nope_spec.page_size)
-    return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
-            _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    page, slot = get_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        nope_spec.page_size,
+    )
+    return (
+        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
+    )
 
 
 def update_sparse_mla_kv_cache_dcp(
-        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
-        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
-        block_tables: jax.Array, query_start_loc: jax.Array,
-        dcp_rank: jax.Array, *, nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec, dcp_size: int,
-        interleave_size: int) -> tuple[jax.Array, jax.Array]:
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
     The DCP twin of `update_sparse_mla_kv_cache`, and the reason DCP is cheap:
@@ -424,8 +469,7 @@ def update_sparse_mla_kv_cache_dcp(
     Returns:
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
     """
-    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec,
-                  rope_spec)
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
     # Asserted equal to the rope page size just above, so one (page, slot)
     # addresses both caches.
     page_size = nope_spec.page_size
@@ -433,17 +477,20 @@ def update_sparse_mla_kv_cache_dcp(
         raise ValueError(
             f"interleave_size={interleave_size} must be a multiple of "
             f"WORD_BYTES={WORD_BYTES}, or a rope tile -- which packs that many "
-            "consecutive tokens into one word -- would straddle two ranks.")
+            "consecutive tokens into one word -- would straddle two ranks."
+        )
     if page_size % interleave_size:
         raise ValueError(
             f"interleave_size={interleave_size} must divide "
             f"page_size={page_size}. Otherwise an interleave chunk straddles "
             "a page boundary and the local index a reader derives from the "
             "global position stops agreeing with the (page, slot) written "
-            "here.")
+            "here."
+        )
 
-    _, seq_id, pos, in_batch = _row_positions(kv_c_normed.shape[0], seq_lens,
-                                              query_start_loc)
+    _, seq_id, pos, in_batch = _row_positions(
+        kv_c_normed.shape[0], seq_lens, query_start_loc
+    )
 
     virtual_page_size = jnp.int32(page_size * dcp_size)
     cycle = jnp.int32(dcp_size * interleave_size)
@@ -454,15 +501,18 @@ def update_sparse_mla_kv_cache_dcp(
 
     # Virtual ordinal -> physical block in this rank's own shard, exactly as
     # the DCP readers resolve it.
-    local_block_tables = jnp.mod(block_tables,
-                                 jnp.int32(nope_spec.num_pages)).reshape(
-                                     seq_lens.shape[0], -1)
+    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages)).reshape(
+        seq_lens.shape[0], -1
+    )
     max_pages_per_seq = local_block_tables.shape[1]
     virtual_page = jnp.clip(pos // virtual_page_size, 0, max_pages_per_seq - 1)
 
     valid = jnp.logical_and(in_batch, owner == dcp_rank)
-    page = jnp.where(valid, local_block_tables[seq_id, virtual_page],
-                     jnp.int32(OOB_PAGE))
+    page = jnp.where(
+        valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
+    )
 
-    return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
-            _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
+    return (
+        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
+    )

@@ -13,10 +13,13 @@ from vllm_torchtpu.platforms import tpu_platform
 
 def _config(dp=1, cls=None, chunked=True):
     return SimpleNamespace(
-        parallel_config=SimpleNamespace(pipeline_parallel_size=8,
-                                        data_parallel_size=dp),
-        scheduler_config=SimpleNamespace(scheduler_cls=cls,
-                                         enable_chunked_prefill=chunked))
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=8, data_parallel_size=dp
+        ),
+        scheduler_config=SimpleNamespace(
+            scheduler_cls=cls, enable_chunked_prefill=chunked
+        ),
+    )
 
 
 def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1):
@@ -26,8 +29,9 @@ def _env(monkeypatch, dynamic=True, dp_sched=False, slack=0.1):
 
 
 def _configure(config):
-    with patch("vllm_torchtpu.core.pp_chunk_scheduler."
-               "patch_engine_core_for_pp_chunks") as hook:
+    with patch(
+        "vllm_torchtpu.core.pp_chunk_scheduler.patch_engine_core_for_pp_chunks"
+    ) as hook:
         tpu_platform._configure_pipeline_chunks(config)
     return hook
 
@@ -40,14 +44,18 @@ def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
     hook.assert_called_once_with(config)
 
 
-@pytest.mark.parametrize("dynamic,dp_sched,dp,cls,chunked", [
-    (False, False, 1, None, True),
-    (True, True, 2, None, True),
-    (True, False, 1, "x.Y", True),
-    (True, False, 1, None, False),
-])
-def test_chunk_scheduler_is_off_when_gated(monkeypatch, dynamic, dp_sched, dp,
-                                           cls, chunked):
+@pytest.mark.parametrize(
+    "dynamic,dp_sched,dp,cls,chunked",
+    [
+        (False, False, 1, None, True),
+        (True, True, 2, None, True),
+        (True, False, 1, "x.Y", True),
+        (True, False, 1, None, False),
+    ],
+)
+def test_chunk_scheduler_is_off_when_gated(
+    monkeypatch, dynamic, dp_sched, dp, cls, chunked
+):
     _env(monkeypatch, dynamic=dynamic, dp_sched=dp_sched)
     config = _config(dp=dp, cls=cls, chunked=chunked)
     hook = _configure(config)

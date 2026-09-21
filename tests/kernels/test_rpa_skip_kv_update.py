@@ -37,16 +37,12 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as KB
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel as K
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel_hd64 as K64
 
-_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(bq_sz=1,
-                                        bq_c_sz=1,
-                                        bkv_sz=256,
-                                        batch_size=8,
-                                        n_buffer=3)
-_BATCHED_PREFILL_BLOCKS = KBC.BlockSizes(bq_sz=1792,
-                                         bq_c_sz=28,
-                                         bkv_sz=256,
-                                         batch_size=2,
-                                         n_buffer=3)
+_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(
+    bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
+)
+_BATCHED_PREFILL_BLOCKS = KBC.BlockSizes(
+    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2, n_buffer=3
+)
 
 # One entry per kernel family. Each kernel family ships its own cache layout
 # (`get_kv_cache_shape`/`merge_kv`) and reference + Pallas implementations, but
@@ -79,18 +75,22 @@ def _require_tpu() -> None:
         pytest.skip(f"Requires TPU backend, found {backend!r}.")
 
 
-def _build_packed_cache(cfg, target_k, target_v, kv_len, total_pages,
-                        page_size, num_kv_heads, dtype):
+def _build_packed_cache(
+    cfg, target_k, target_v, kv_len, total_pages, page_size, num_kv_heads, dtype
+):
     """Pack `target_k/v` for positions [0, kv_len) into a paged kv cache.
 
     Page i holds positions [i*page_size, (i+1)*page_size), so the single
     sequence uses pages 0, 1, ... in order.
     """
-    cache_shape = cfg["get_shape"](total_pages, page_size, num_kv_heads,
-                                   cfg["head_dim"], dtype)
-    merged = np.asarray(cfg["merge_kv"](jnp.asarray(target_k, dtype),
-                                        jnp.asarray(target_v, dtype)).astype(
-                                            jnp.float32))
+    cache_shape = cfg["get_shape"](
+        total_pages, page_size, num_kv_heads, cfg["head_dim"], dtype
+    )
+    merged = np.asarray(
+        cfg["merge_kv"](
+            jnp.asarray(target_k, dtype), jnp.asarray(target_v, dtype)
+        ).astype(jnp.float32)
+    )
     cache = np.zeros(cache_shape, np.float32)
     flat = cache.reshape(total_pages * page_size, *cache_shape[2:])
     flat[:kv_len] = merged
@@ -106,8 +106,9 @@ def _build_packed_cache(cfg, target_k, target_v, kv_len, total_pages,
         (33, 1, (1, 1, 1)),  # decode: a single current token
     ],
 )
-def test_skip_kv_update_reuses_cache_without_writing(cfg, impl, kv_len, q_len,
-                                                     distribution):
+def test_skip_kv_update_reuses_cache_without_writing(
+    cfg, impl, kv_len, q_len, distribution
+):
     _require_tpu()
     rng = np.random.default_rng(0)
     dtype = jnp.bfloat16
@@ -122,19 +123,25 @@ def test_skip_kv_update_reuses_cache_without_writing(cfg, impl, kv_len, q_len,
         return (rng.standard_normal(shape) * 0.5).astype(np.float32)
 
     # The K/V the target layer placed into the shared cache for every position.
-    target_k, target_v = r(kv_len, num_kv_heads,
-                           head_dim), r(kv_len, num_kv_heads, head_dim)
+    target_k, target_v = (
+        r(kv_len, num_kv_heads, head_dim),
+        r(kv_len, num_kv_heads, head_dim),
+    )
     query = r(q_len, num_q_heads, head_dim)
     # The shared layer's own (un-normed / un-RoPE'd) K/V -- must be ignored.
-    garbage_k, garbage_v = r(q_len, num_kv_heads,
-                             head_dim), r(q_len, num_kv_heads, head_dim)
+    garbage_k, garbage_v = (
+        r(q_len, num_kv_heads, head_dim),
+        r(q_len, num_kv_heads, head_dim),
+    )
     # What the target wrote at the current positions == what is already cached.
-    cached_k, cached_v = target_k[kv_len -
-                                  q_len:kv_len], target_v[kv_len -
-                                                          q_len:kv_len]
+    cached_k, cached_v = (
+        target_k[kv_len - q_len : kv_len],
+        target_v[kv_len - q_len : kv_len],
+    )
 
-    cache_np = _build_packed_cache(cfg, target_k, target_v, kv_len,
-                                   total_pages, page_size, num_kv_heads, dtype)
+    cache_np = _build_packed_cache(
+        cfg, target_k, target_v, kv_len, total_pages, page_size, num_kv_heads, dtype
+    )
 
     kv_lens = jnp.array([kv_len], jnp.int32)
     page_indices = jnp.arange(pages_per_seq, dtype=jnp.int32)
@@ -155,8 +162,10 @@ def test_skip_kv_update_reuses_cache_without_writing(cfg, impl, kv_len, q_len,
             sm_scale=sm_scale,
             skip_kv_update=skip,
         )
-        return (np.asarray(out.astype(jnp.float32)),
-                np.asarray(cache.astype(jnp.float32)))
+        return (
+            np.asarray(out.astype(jnp.float32)),
+            np.asarray(cache.astype(jnp.float32)),
+        )
 
     # Oracle: write the already-cached values back (a no-op) and attend.
     oracle_out, _ = run(cached_k, cached_v, skip=False)
@@ -190,9 +199,19 @@ def test_batched_wrapper_accepts_skip_kv_update():
     assert params["skip_kv_update"].default is False
 
 
-def _build_batched_cache(target_k, target_v, kv_len, total_pages, page_size,
-                         num_q_heads, num_kv_heads, head_dim, dtype,
-                         page_indices, sm_scale):
+def _build_batched_cache(
+    target_k,
+    target_v,
+    kv_len,
+    total_pages,
+    page_size,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    page_indices,
+    sm_scale,
+):
     """Populate a batched-layout kv cache with target K/V for [0, kv_len).
 
     Rather than hand-replicate the batched kernel's packed cache layout
@@ -201,8 +220,9 @@ def _build_batched_cache(target_k, target_v, kv_len, total_pages, page_size,
     (`skip_kv_update=False`, q_len == kv_len) writes every position's K/V into
     an initially-zero cache. The attention output is discarded.
     """
-    cache_shape = KB.get_kv_cache_shape(total_pages, page_size, num_kv_heads,
-                                        head_dim, dtype)
+    cache_shape = KB.get_kv_cache_shape(
+        total_pages, page_size, num_kv_heads, head_dim, dtype
+    )
     _, cache = KB.ragged_paged_attention(
         jnp.zeros((kv_len, num_q_heads, head_dim), dtype),
         jnp.asarray(target_k, dtype),
@@ -252,20 +272,35 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
         return (rng.standard_normal(shape) * 0.5).astype(np.float32)
 
     # The K/V the target layer placed into the shared cache for every position.
-    target_k, target_v = r(kv_len, num_kv_heads,
-                           head_dim), r(kv_len, num_kv_heads, head_dim)
+    target_k, target_v = (
+        r(kv_len, num_kv_heads, head_dim),
+        r(kv_len, num_kv_heads, head_dim),
+    )
     query = r(q_len, num_q_heads, head_dim)
     # The shared layer's own (un-normed / un-RoPE'd) K/V -- must be ignored.
-    garbage_k, garbage_v = r(q_len, num_kv_heads,
-                             head_dim), r(q_len, num_kv_heads, head_dim)
+    garbage_k, garbage_v = (
+        r(q_len, num_kv_heads, head_dim),
+        r(q_len, num_kv_heads, head_dim),
+    )
     # What the target wrote at the current positions == what is already cached.
-    cached_k, cached_v = target_k[kv_len -
-                                  q_len:kv_len], target_v[kv_len -
-                                                          q_len:kv_len]
+    cached_k, cached_v = (
+        target_k[kv_len - q_len : kv_len],
+        target_v[kv_len - q_len : kv_len],
+    )
 
-    cache_np = _build_batched_cache(target_k, target_v, kv_len, total_pages,
-                                    page_size, num_q_heads, num_kv_heads,
-                                    head_dim, dtype, page_indices, sm_scale)
+    cache_np = _build_batched_cache(
+        target_k,
+        target_v,
+        kv_len,
+        total_pages,
+        page_size,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        page_indices,
+        sm_scale,
+    )
 
     kv_lens = jnp.array([kv_len], jnp.int32)
     cu_q_lens = jnp.array([0, q_len], jnp.int32)
@@ -287,8 +322,10 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
             prefill_block_sizes=_BATCHED_PREFILL_BLOCKS,
             skip_kv_update=skip,
         )
-        return (np.asarray(out.astype(jnp.float32)),
-                np.asarray(cache.astype(jnp.float32)))
+        return (
+            np.asarray(out.astype(jnp.float32)),
+            np.asarray(cache.astype(jnp.float32)),
+        )
 
     # Oracle: write the already-cached values back (a no-op) and attend.
     oracle_out, _ = run(cached_k, cached_v, skip=False)
@@ -308,8 +345,9 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
     # Cross-kernel parity: the trusted v3 skip path over the same logical K/V
     # must produce the same attention output (different reduction order -> a
     # looser bf16 tolerance than the self-consistency check above).
-    v3_cache = _build_packed_cache(V3, target_k, target_v, kv_len, total_pages,
-                                   page_size, num_kv_heads, dtype)
+    v3_cache = _build_packed_cache(
+        V3, target_k, target_v, kv_len, total_pages, page_size, num_kv_heads, dtype
+    )
     v3_out, _ = K.ragged_paged_attention(
         jnp.asarray(query, dtype),
         jnp.asarray(garbage_k, dtype),
@@ -322,10 +360,9 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
         sm_scale=sm_scale,
         skip_kv_update=True,
     )
-    np.testing.assert_allclose(skip_out,
-                               np.asarray(v3_out.astype(jnp.float32)),
-                               atol=2e-2,
-                               rtol=0)
+    np.testing.assert_allclose(
+        skip_out, np.asarray(v3_out.astype(jnp.float32)), atol=2e-2, rtol=0
+    )
 
 
 def test_batched_seq_along_lane_matches_head_along_sublane():
@@ -357,12 +394,9 @@ def test_batched_seq_along_lane_matches_head_along_sublane():
     query = r(q_len, num_q_heads, head_dim)
 
     def run(kv_layout):
-        cache_shape = KB.get_kv_cache_shape(total_pages,
-                                            page_size,
-                                            num_kv_heads,
-                                            head_dim,
-                                            dtype,
-                                            kv_layout=kv_layout)
+        cache_shape = KB.get_kv_cache_shape(
+            total_pages, page_size, num_kv_heads, head_dim, dtype, kv_layout=kv_layout
+        )
         out, _ = KB.ragged_paged_attention(
             jnp.asarray(query, dtype),
             jnp.asarray(key, dtype),
@@ -383,7 +417,6 @@ def test_batched_seq_along_lane_matches_head_along_sublane():
     seq_along_lane_out = run(KBC.KVLayout.SEQ_ALONG_LANE)
 
     tol = 2e-2  # bf16, cross-layout reduction order differs
-    np.testing.assert_allclose(seq_along_lane_out,
-                               head_along_sublane_out,
-                               atol=tol,
-                               rtol=0)
+    np.testing.assert_allclose(
+        seq_along_lane_out, head_along_sublane_out, atol=tol, rtol=0
+    )

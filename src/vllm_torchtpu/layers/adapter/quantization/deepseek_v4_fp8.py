@@ -15,23 +15,24 @@
 import torch
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization import \
-    register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import \
-    QuantizeMethodBase
-from vllm.model_executor.layers.quantization.utils.quant_utils import \
-    is_layer_skipped
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
 
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    VllmFp8LinearMethodTPU, VllmFp8MoEMethodTPU)
-from vllm_torchtpu.layers.adapter.quantization.mxfp4 import \
-    VllmDeepseekV4Mxfp4MoEMethod
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedFusedMoEMethod
-from vllm_torchtpu.layers.core.quant_methods import (DEEPSEEK_V4_FP8,
-                                                     get_tpu_quant_method)
+    VllmFp8LinearMethodTPU,
+    VllmFp8MoEMethodTPU,
+)
+from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedFusedMoEMethod,
+)
+from vllm_torchtpu.layers.core.quant_methods import (
+    DEEPSEEK_V4_FP8,
+    get_tpu_quant_method,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -53,10 +54,10 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
     def is_scale_e8m0(self) -> bool:
         try:
             from vllm.config import get_current_vllm_config
+
             hf_config = get_current_vllm_config().model_config.hf_config
             quant_cfg = getattr(hf_config, "quantization_config", None) or {}
-            if isinstance(quant_cfg,
-                          dict) and quant_cfg.get("scale_fmt") == "ue8m0":
+            if isinstance(quant_cfg, dict) and quant_cfg.get("scale_fmt") == "ue8m0":
                 return True
         except Exception:
             pass
@@ -74,19 +75,21 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
         if isinstance(layer, vllm_linear.LinearBase):
             linear_config = self.get_linear_config(layer)
             if is_layer_skipped(
-                    prefix=prefix,
-                    ignored_layers=self.ignored_layers,
-                    fused_mapping=self.packed_modules_mapping,
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
             ):
-                from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-                    VllmUnquantizedLinearMethod
+                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+                    VllmUnquantizedLinearMethod,
+                )
+
                 return VllmUnquantizedLinearMethod()
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(
-                    prefix=prefix,
-                    ignored_layers=self.ignored_layers,
-                    fused_mapping=self.packed_modules_mapping,
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
             ):
                 return VllmUnquantizedFusedMoEMethod(layer.moe_config)
 

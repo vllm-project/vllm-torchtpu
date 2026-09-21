@@ -16,18 +16,24 @@ import jax
 import jax.numpy as jnp
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.attention_layer_base import \
-    AttentionBackend  # isort: skip
+from vllm.model_executor.layers.attention_layer_base import (
+    AttentionBackend,  # isort: skip
+)
 from vllm.v1.attention.backends.mla.sparse_swa import (
-    DeepseekSparseSWABackend, DeepseekV4SWACache)
+    DeepseekSparseSWABackend,
+    DeepseekV4SWACache,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
-from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import \
-    mla_ragged_paged_attention
-from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import \
-    mla_sliding_window_ragged_paged_attention
-from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import \
-    sparse_ragged_paged_attention
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
+    mla_ragged_paged_attention,
+)
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
+    mla_sliding_window_ragged_paged_attention,
+)
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
+    sparse_ragged_paged_attention,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
 
@@ -59,9 +65,12 @@ def _run_swa(
     """
     if sw_cache.shape[0] == 0:
         # Profiling-shape trace: no cache to attend over.
-        return (jnp.zeros_like(q), sw_cache,
-                jnp.zeros((q.shape[0], q.shape[1]), dtype=jnp.float32),
-                jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32))
+        return (
+            jnp.zeros_like(q),
+            sw_cache,
+            jnp.zeros((q.shape[0], q.shape[1]), dtype=jnp.float32),
+            jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32),
+        )
     return mla_sliding_window_ragged_paged_attention(
         q=q,
         new_kv=new_kv,
@@ -255,21 +264,20 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         cache_config,
         backend_cls: type[AttentionBackend] | None = None,
     ) -> None:
-        super().__init__(head_dim,
-                         window_size,
-                         dtype,
-                         prefix,
-                         cache_config,
-                         backend_cls=backend_cls
-                         or VllmDeepseekSparseSWABackend)
+        super().__init__(
+            head_dim,
+            window_size,
+            dtype,
+            prefix,
+            cache_config,
+            backend_cls=backend_cls or VllmDeepseekSparseSWABackend,
+        )
         # Initialize with default block size at construction time;
         # get_kv_cache_spec recomputes self.block_size from finalized runtime config.
-        self.block_size = self._swa_block_size(cache_config.block_size,
-                                               window_size)
+        self.block_size = self._swa_block_size(cache_config.block_size, window_size)
 
     @staticmethod
-    def _swa_block_size(compressed_kv_cache_bz: int,
-                        window_size: int | None) -> int:
+    def _swa_block_size(compressed_kv_cache_bz: int, window_size: int | None) -> int:
         # We would like to overlay the SWA cache with CSA's main NOPE cache
         # on the same KV-Tensor, whose shape is [num_pages, page_size, 4, 128]
         # u8.
@@ -288,7 +296,8 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         # Update self.block_size so the returned spec and the Pallas kernel's
         # logical_page_size in attention.py agree on the final runtime block size.
         self.block_size = self._swa_block_size(
-            vllm_config.cache_config.block_size, self.window_size)
+            vllm_config.cache_config.block_size, self.window_size
+        )
         # `mla_swa` keeps the SWA entries as raw bf16, packed as uint8.
         return SlidingWindowMLASpec(
             block_size=self.block_size,

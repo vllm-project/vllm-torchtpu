@@ -68,10 +68,9 @@ def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
     def _boom(_shape):
         raise RuntimeError("topology_aware_mesh exploded")
 
-    monkeypatch.setattr(torch,
-                        "tpu",
-                        SimpleNamespace(topology_aware_mesh=_boom),
-                        raising=False)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(topology_aware_mesh=_boom), raising=False
+    )
     with pytest.raises(RuntimeError, match="exploded"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -85,7 +84,8 @@ def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
         torch,
         "tpu",
         SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False)
+        raising=False,
+    )
     with pytest.raises(RuntimeError, match="not a permutation"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -101,7 +101,8 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
         torch,
         "tpu",
         SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False)
+        raising=False,
+    )
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
     assert got == {
@@ -128,7 +129,8 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
         torch,
         "tpu",
         SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False)
+        raising=False,
+    )
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
@@ -152,9 +154,11 @@ def test_context_manager_only_touches_axes_it_was_given():
     try:
         with order_mod.pcp_topology_order({"pcp": [[0, 1, 2, 3, 6, 7, 4, 5]]}):
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp"
+            )
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="tp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="tp"
+            )
     finally:
         parallel_state.init_model_parallel_group = original
 
@@ -201,9 +205,14 @@ def test_new_group_preserves_rank_order_only_for_replaced_axes():
     try:
         with order_mod.pcp_topology_order(orders):
             patched = parallel_state.init_model_parallel_group
-            for axis, built in (("tp", singletons), ("dcp", singletons),
-                                ("pcp", [list(range(8))]), ("pp", singletons),
-                                ("dp", singletons), ("ep", [list(range(8))])):
+            for axis, built in (
+                ("tp", singletons),
+                ("dcp", singletons),
+                ("pcp", [list(range(8))]),
+                ("pp", singletons),
+                ("dp", singletons),
+                ("ep", [list(range(8))]),
+            ):
                 calls.clear()
                 patched(built, 0, "gloo", group_name=axis)
                 seen[axis] = sorted({c for c in calls}, key=str)
@@ -272,11 +281,11 @@ def test_context_manager_changes_no_group_without_orders():
     try:
         with order_mod.pcp_topology_order(None):
             parallel_state.init_model_parallel_group(
-                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp")
-            parallel_state.init_model_parallel_group([[0, 1], [2, 3]],
-                                                     0,
-                                                     "gloo",
-                                                     group_name="tp")
+                [[0, 1, 2, 3, 4, 5, 6, 7]], 0, "gloo", group_name="pcp"
+            )
+            parallel_state.init_model_parallel_group(
+                [[0, 1], [2, 3]], 0, "gloo", group_name="tp"
+            )
         # Restored even though nothing was replaced.
         assert parallel_state.init_model_parallel_group is _record
     finally:
@@ -305,13 +314,12 @@ def test_context_manager_replaces_both_axes():
     try:
         with order_mod.pcp_topology_order(orders):
             parallel_state.init_model_parallel_group(
-                [[0, 2, 4, 6], [1, 3, 5, 7]], 0, "gloo", group_name="pcp")
+                [[0, 2, 4, 6], [1, 3, 5, 7]], 0, "gloo", group_name="pcp"
+            )
             parallel_state.init_model_parallel_group(
-                [[0, 1], [2, 3], [4, 5], [6, 7]], 0, "gloo", group_name="tp")
-            parallel_state.init_model_parallel_group([[0]],
-                                                     0,
-                                                     "gloo",
-                                                     group_name="dp")
+                [[0, 1], [2, 3], [4, 5], [6, 7]], 0, "gloo", group_name="tp"
+            )
+            parallel_state.init_model_parallel_group([[0]], 0, "gloo", group_name="dp")
     finally:
         parallel_state.init_model_parallel_group = original
 
@@ -330,10 +338,12 @@ def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None):
 
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp)):
-        monkeypatch.setattr(parallel_state,
-                            name,
-                            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
-                            raising=False)
+        monkeypatch.setattr(
+            parallel_state,
+            name,
+            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
+            raising=False,
+        )
 
 
 def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
@@ -354,14 +364,15 @@ def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
 def test_verify_accepts_the_order_it_asked_for(monkeypatch):
     _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 6, 7, 4, 5, 2, 3], tp=[6])
 
-    order_mod.verify_pcp_topology_order({
-        "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
-        "tp": [[r] for r in range(8)],
-    })
+    order_mod.verify_pcp_topology_order(
+        {
+            "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
+            "tp": [[r] for r in range(8)],
+        }
+    )
 
 
-def test_verify_raises_when_the_members_match_but_the_order_does_not(
-        monkeypatch):
+def test_verify_raises_when_the_members_match_but_the_order_does_not(monkeypatch):
     """The failure this function exists for.
 
     A ring is its order, so a group holding the right ranks in the wrong
@@ -371,8 +382,7 @@ def test_verify_raises_when_the_members_match_but_the_order_does_not(
     _patch_groups(monkeypatch, rank=6, pcp=[0, 1, 2, 3, 4, 5, 6, 7])
 
     with pytest.raises(RuntimeError, match="did not adopt the requested"):
-        order_mod.verify_pcp_topology_order(
-            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+        order_mod.verify_pcp_topology_order({"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
 
 
 def test_verify_raises_when_the_rank_is_in_no_resolved_group(monkeypatch):
@@ -381,8 +391,7 @@ def test_verify_raises_when_the_rank_is_in_no_resolved_group(monkeypatch):
     _patch_groups(monkeypatch, rank=9, pcp=[0, 1, 6, 7, 4, 5, 2, 3])
 
     with pytest.raises(RuntimeError, match="does not appear in the pcp"):
-        order_mod.verify_pcp_topology_order(
-            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+        order_mod.verify_pcp_topology_order({"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
 
 
 def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
@@ -394,10 +403,16 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
         order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
 
 
-@pytest.mark.parametrize("field", [
-    "prefill_context_parallel_size", "nnodes", "data_parallel_size",
-    "tensor_parallel_size", "pipeline_parallel_size"
-])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "prefill_context_parallel_size",
+        "nnodes",
+        "data_parallel_size",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+    ],
+)
 def test_missing_parallel_field_cannot_select_a_default_topology(field):
     config = _config()
     delattr(config.parallel_config, field)

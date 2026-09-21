@@ -87,8 +87,9 @@ def main_kernel(
         core_id = pl.program_id(1)
         col_id = pl.program_id(2)
 
-        row_tile_start = (aligned_start + block_id * block_size +
-                          core_id * num_simd_lanes)
+        row_tile_start = (
+            aligned_start + block_id * block_size + core_id * num_simd_lanes
+        )
         col_tile_start = col_id * col_size
 
         @pl.when(col_id == 0)
@@ -122,10 +123,8 @@ def main_kernel(
                 # memory addresss does not yield desired values anymore. Therefore,
                 # we break up a dmas into multiple num_lanes sized requests.
                 pltpu.make_async_copy(
-                    in_32b_hbm_ref.at[row_hbm,
-                                      pl.ds(col_hbm_start, num_lanes)],
-                    out_vmem_ref.at[row_vmem,
-                                    pl.ds(col_vmem_start, num_lanes)],
+                    in_32b_hbm_ref.at[row_hbm, pl.ds(col_hbm_start, num_lanes)],
+                    out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
                     recv_sem,
                 ).start()
 
@@ -151,8 +150,9 @@ def main_kernel(
             # elements and reorder them.
             if packing > 1:
                 for col_compute_offset in range(0, num_lanes, num_simd_lanes):
-                    col_slice = pl.ds(col_vmem_start + col_compute_offset,
-                                      num_simd_lanes)
+                    col_slice = pl.ds(
+                        col_vmem_start + col_compute_offset, num_simd_lanes
+                    )
 
                     out = None
                     for row_src in range(num_simd_lanes):
@@ -192,10 +192,8 @@ def main_kernel(
             for row_vmem in range(num_simd_lanes // packing):
                 row_hbm = row_tile_start // packing + row_vmem
                 pltpu.make_async_copy(
-                    out_vmem_ref.at[row_vmem,
-                                    pl.ds(col_vmem_start, num_lanes)],
-                    out_32b_hbm_ref.at[row_hbm,
-                                       pl.ds(col_hbm_start, num_lanes)],
+                    out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
+                    out_32b_hbm_ref.at[row_hbm, pl.ds(col_hbm_start, num_lanes)],
                     send_sem,
                 ).start()
 
@@ -236,8 +234,9 @@ def calculate_col_size(hidden_size: int) -> int:
 
 
 @jax.jit
-def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array,
-                  end: jax.Array) -> jax.Array:
+def ragged_gather(
+    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+) -> jax.Array:
     """Perform gather on indices within dynamic array start and end."""
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
@@ -282,17 +281,18 @@ def ragged_gather(x: jax.Array, indices: jax.Array, start: jax.Array,
             subcore_axis_name=vector_mesh.subcore_axis_name,
         ),
         out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype),
+            (out_size + out_pad_size, aligned_hidden_size), dtype
+        ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             disable_bounds_checks=True,
         ),
         scratch_types=dict(
-            start_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
-            end_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
+            start_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            end_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-            indices_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
-            sem_ref=pltpu.SemaphoreType.DMA((2, )),
+            indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            sem_ref=pltpu.SemaphoreType.DMA((2,)),
         ),
         mesh=vector_mesh,
         name="sc_ragged_gather",

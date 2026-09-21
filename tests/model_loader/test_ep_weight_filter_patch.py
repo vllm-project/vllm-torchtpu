@@ -11,14 +11,17 @@ widens the suffix allowlist. No TPU, no network.
 import torch
 
 from vllm_torchtpu.model_loader_patches import (
-    _should_skip_weight_tpu, patch_default_loader_ep_weight_filter)
+    _should_skip_weight_tpu,
+    patch_default_loader_ep_weight_filter,
+)
 
 _LOCAL = {0, 1, 27}
 
 
 def _expert_name(expert_id: int, suffix: str) -> str:
-    return ("language_model.model.layers.3.block_sparse_moe"
-            f".experts.{expert_id}.w1{suffix}")
+    return (
+        f"language_model.model.layers.3.block_sparse_moe.experts.{expert_id}.w1{suffix}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -33,33 +36,29 @@ def test_remote_expert_packed_and_scale_skipped():
 
 
 def test_local_expert_packed_and_scale_kept():
-    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_packed"),
-                                       _LOCAL)
-    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale"),
-                                       _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_packed"), _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale"), _LOCAL)
 
 
 def test_remote_expert_input_scale_kept():
     # NVFP4 per-expert activation scales feed a global-max reduction in
     # FlashInfer backends; they must stay unfiltered on every rank.
-    assert not _should_skip_weight_tpu(_expert_name(500, ".input_scale"),
-                                       _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(500, ".input_scale"), _LOCAL)
 
 
 def test_no_local_ids_keeps_everything():
     # Filter off (EP weight filter disabled): the upstream contract is that
     # local_expert_ids=None keeps every tensor.
-    assert not _should_skip_weight_tpu(_expert_name(500, ".weight_packed"),
-                                       None)
+    assert not _should_skip_weight_tpu(_expert_name(500, ".weight_packed"), None)
 
 
 def test_dense_and_fused_names_kept():
     for name in (
-            "language_model.model.layers.3.self_attn.o_proj.weight",
-            "language_model.model.layers.3.block_sparse_moe.gate.weight",
-            "language_model.model.embed_tokens.weight",
-            # 3D fused-expert layout: no numeric id, full tensor must load.
-            "model.layers.3.mlp.experts.gate_proj.weight",
+        "language_model.model.layers.3.self_attn.o_proj.weight",
+        "language_model.model.layers.3.block_sparse_moe.gate.weight",
+        "language_model.model.embed_tokens.weight",
+        # 3D fused-expert layout: no numeric id, full tensor must load.
+        "model.layers.3.mlp.experts.gate_proj.weight",
     ):
         assert not _should_skip_weight_tpu(name, _LOCAL), name
 
@@ -73,17 +72,16 @@ def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
     from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
 
     # Register teardown restoration of the attributes the patch overwrites.
-    monkeypatch.setattr(weight_utils, "should_skip_weight",
-                        weight_utils.should_skip_weight)
-    monkeypatch.setattr(ep_weight_filter, "should_skip_weight",
-                        ep_weight_filter.should_skip_weight)
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
     # delattr(raising=False) records nothing when the flag is absent, so it
     # would not undo the stamp the patch sets. setattr registers a teardown
     # that deletes (or restores) it.
-    monkeypatch.setattr(weight_utils,
-                        "_tpu_ep_filter_patch",
-                        False,
-                        raising=False)
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
 
     patch_default_loader_ep_weight_filter()
     assert weight_utils.should_skip_weight is _should_skip_weight_tpu
@@ -123,7 +121,6 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
     real_safe_open = weight_utils.safe_open
 
     class _TrackingSafeOpen:
-
         def __init__(self, *args, **kwargs):
             self._inner = real_safe_open(*args, **kwargs)
 
@@ -141,14 +138,14 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
             read_names.append(name)
             return self._inner.get_tensor(name)
 
-    monkeypatch.setattr(weight_utils, "should_skip_weight",
-                        _should_skip_weight_tpu)
+    monkeypatch.setattr(weight_utils, "should_skip_weight", _should_skip_weight_tpu)
     monkeypatch.setattr(weight_utils, "safe_open", _TrackingSafeOpen)
 
     yielded = {
         name
         for name, _ in weight_utils.safetensors_weights_iterator(
-            [str(shard)], use_tqdm_on_load=False, local_expert_ids={0})
+            [str(shard)], use_tqdm_on_load=False, local_expert_ids={0}
+        )
     }
 
     assert f"{e}.0.w1.weight_packed" in yielded

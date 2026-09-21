@@ -16,8 +16,10 @@
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
@@ -39,8 +41,7 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
 
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor",
-                                             1.0)
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
@@ -119,16 +120,16 @@ class DeepseekV4MoE(nn.Module):
         # `FusedMoEFactory` above only reaches the router object, so mirror it
         # onto the experts layer.
         if self.gate.tid2eid is not None:
-            object.__setattr__(self.experts.routed_experts,
-                               "hash_indices_table", self.gate.tid2eid)
+            object.__setattr__(
+                self.experts.routed_experts, "hash_indices_table", self.gate.tid2eid
+            )
 
-    def forward(self,
-                hidden_states: torch.Tensor,
-                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
         if self.gate.tid2eid is not None and input_ids is None:
-            raise ValueError(
-                "DeepSeek V4 hash MoE routing requires input_ids.")
+            raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
         # FusedMoEFactory gives the runner our gate, so it computes the logits.

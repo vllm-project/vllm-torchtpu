@@ -54,8 +54,7 @@ FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def dtype_max(dtype: jnp.dtype) -> float:
-    info = (jnp.iinfo(dtype)
-            if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype))
+    info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
     return float(info.max)
 
 
@@ -81,7 +80,8 @@ def static_per_tensor_quantize_tensor(
     else:
         dtype_info = torch.iinfo(quant_dtype)
     quantized = torch.clamp(
-        tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max)
+        tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max
+    )
     return quantized.to(quant_dtype)
 
 
@@ -141,12 +141,28 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
         float32 tensor of shape [..., N] with unpacked FP4 values.
     """
     # FP4 e2m1 lookup table mapping 4-bit index to float value
-    FP4_LUT = torch.tensor([
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
-        -3.0, -4.0, -6.0
-    ],
-                           dtype=torch.float32,
-                           device=packed.device)
+    FP4_LUT = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=packed.device,
+    )
 
     # Extract low and high nibbles
     low_nibble = (packed & 0x0F).to(torch.int64)
@@ -198,8 +214,7 @@ def dequantize_tensor(
                 blocked_shape.append(dim)
 
         # Calculate the axis positions after reshaping
-        axis_normalized = sorted([(a + tensor_q.ndim) % tensor_q.ndim
-                                  for a in axis])
+        axis_normalized = sorted([(a + tensor_q.ndim) % tensor_q.ndim for a in axis])
         expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
 
         tensor_q = tensor_q.reshape(blocked_shape)
@@ -240,7 +255,8 @@ def quantize_tensor(
         raise ValueError(
             "Quantization expects the requested axis to be divisible by "
             f"block_size, got tensor.shape={tuple(tensor.shape)}, axis={axis}, "
-            f"block_size={block_size}.")
+            f"block_size={block_size}."
+        )
 
     if torch.empty((), dtype=quant_dtype).is_floating_point():
         dtype_info = torch.finfo(quant_dtype)
@@ -255,9 +271,9 @@ def quantize_tensor(
     abs_max = blocked.abs().amax(dim=-1, keepdim=True)
     # Use explicit fp32 reciprocal multiply for stable FP8 scale rounding.
     # Plain division can land one ULP lower and change tie-point buckets.
-    dtype_max_recip = torch.tensor(1.0 / float(dtype_info.max),
-                                   dtype=torch.float32,
-                                   device=tensor.device)
+    dtype_max_recip = torch.tensor(
+        1.0 / float(dtype_info.max), dtype=torch.float32, device=tensor.device
+    )
     scale = abs_max * dtype_max_recip
 
     scale_bits = None
@@ -274,8 +290,8 @@ def quantize_tensor(
         # is not < 0, so it falls through to the clamp, which pins it to the
         # smallest representable exponent.
         scale_exp = torch.where(
-            torch.exp2(scale_exp) < scale, scale_exp + 1,
-            scale_exp).clamp(E8M0_MIN_EXP, E8M0_MAX_EXP)
+            torch.exp2(scale_exp) < scale, scale_exp + 1, scale_exp
+        ).clamp(E8M0_MIN_EXP, E8M0_MAX_EXP)
         scale = torch.exp2(scale_exp)
         # Keep the biased exponent byte, not the power of two itself. This is
         # the exact inverse of `e8m0_to_fp32`, and the clamp above already
@@ -286,9 +302,9 @@ def quantize_tensor(
     # 0 * inf -> NaN during requantization.
     scale_inv = _safe_inverse_scale(scale)
 
-    blocked_q = torch.clamp(blocked * scale_inv,
-                            min=float(dtype_info.min),
-                            max=float(dtype_info.max))
+    blocked_q = torch.clamp(
+        blocked * scale_inv, min=float(dtype_info.min), max=float(dtype_info.max)
+    )
     if not is_floating_dtype(quant_dtype):
         # A float->int cast truncates toward zero, biasing every element by
         # half an LSB; float dtypes already round in the cast. Half-to-even,
@@ -350,12 +366,28 @@ def quantize_tensor_to_fp4(
         axis = [axis]
 
     # FP4 e2m1 representable values
-    FP4_VALUES = torch.tensor([
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
-        -3.0, -4.0, -6.0
-    ],
-                              dtype=torch.float32,
-                              device=tensor.device)
+    FP4_VALUES = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=tensor.device,
+    )
     FP4_MAX = 6.0  # Maximum representable magnitude
     FP4_MIN = -6.0
 
@@ -442,11 +474,27 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
     Returns:
         float32 tensor with FP4 values.
     """
-    FP4_VALUES = torch.tensor([
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
-        -3.0, -4.0, -6.0
-    ],
-                              dtype=torch.float32,
-                              device=indices.device)
+    FP4_VALUES = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=indices.device,
+    )
 
     return FP4_VALUES[indices.to(torch.int64)]

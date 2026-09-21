@@ -19,39 +19,43 @@ and calls ``core_map`` directly on the given mesh. Near drop-in for
 (list) becomes ``scratch_types`` (dict).
 """
 
-from jax._src import api
+from jax._src import api, lax, tree_util
 from jax._src import core as jax_core
-from jax._src import lax, tree_util
 from jax._src.pallas import core as pl_core
 
 
 def _empty_out_ref(out_type):
     # Mirrors internal `pl.kernel` logic; may need updating on JAX bumps.
     aval = pl_core._convert_out_shape_to_aval(out_type)
-    memory_space = (None if isinstance(aval.memory_space, jax_core.MemorySpace)
-                    else aval.memory_space)
+    memory_space = (
+        None
+        if isinstance(aval.memory_space, jax_core.MemorySpace)
+        else aval.memory_space
+    )
     value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
     return jax_core.new_ref(value, memory_space=memory_space)
 
 
-def kernel(body,
-           *,
-           out_type,
-           mesh,
-           scratch_types=(),
-           compiler_params=None,
-           interpret=False,
-           cost_estimate=None,
-           debug=False,
-           name=None,
-           metadata=None):
+def kernel(
+    body,
+    *,
+    out_type,
+    mesh,
+    scratch_types=(),
+    compiler_params=None,
+    interpret=False,
+    cost_estimate=None,
+    debug=False,
+    name=None,
+    metadata=None,
+):
     """Near drop-in for ``pl.kernel`` that lowers via ``core_map``.
 
     Differs in that ``out_shape`` is renamed to ``out_type`` and
     ``scratch_shapes`` (list) is renamed to ``scratch_types`` (dict).
     """
     single_output = not isinstance(out_type, (tuple, list))
-    out_types = (out_type, ) if single_output else out_type
+    out_types = (out_type,) if single_output else out_type
 
     @api.jit
     def run(*operands):

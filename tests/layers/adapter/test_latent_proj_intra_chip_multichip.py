@@ -60,8 +60,9 @@ def _worker_command(result_dir: Path) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-            prepare_tpu_environment
+        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
+            prepare_tpu_environment,
+        )
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
 
@@ -85,8 +86,7 @@ def _prepare_worker_env() -> dict[str, str]:
             else:
                 os.environ[key] = value
 
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                   "false")
+    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     # Drop env leaked by an in-process engine run earlier in the pytest
@@ -119,11 +119,13 @@ def _measure(rank: int) -> dict[str, object]:
     peers = sorted(group.ranks)
 
     # (1) The group must be this rank's chip, not an arbitrary pair.
-    expected = sorted(r for r in range(WORLD_SIZE)
-                      if topology.chip_of(r)[0] == chip_index)
+    expected = sorted(
+        r for r in range(WORLD_SIZE) if topology.chip_of(r)[0] == chip_index
+    )
     if peers != expected:
         raise AssertionError(
-            f"group {peers} is not chip {chip_index}'s cores {expected}")
+            f"group {peers} is not chip {chip_index}'s cores {expected}"
+        )
 
     shard = LATENT // group.world_size
     torch.manual_seed(1234)  # same weight on every rank
@@ -151,10 +153,10 @@ def _measure(rank: int) -> dict[str, object]:
     # (3) Compiled -- the case that actually matters, since these layers live
     # inside the compiled decode graph.
     from torch_tpu._internal import compile as tpu_compile
-    compiled_fn = torch.compile(sharded,
-                                fullgraph=True,
-                                dynamic=False,
-                                backend=tpu_compile.TpuBackend())
+
+    compiled_fn = torch.compile(
+        sharded, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend()
+    )
     compiled = compiled_fn(x_tpu).cpu().float()
 
     eager_max = float((eager - reference).abs().max().item())
@@ -175,7 +177,8 @@ def _measure(rank: int) -> dict[str, object]:
     if compiled_max != 0.0 or eager_max > 4e-3 * scale:
         raise AssertionError(
             f"rank={rank} eager_max={eager_max} compiled_max={compiled_max} "
-            f"scale={scale}")
+            f"scale={scale}"
+        )
 
     return {
         "rank": rank,
@@ -200,10 +203,9 @@ def _run_worker(result_dir: Path) -> None:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
         # Match vLLM startup: touch the device before querying JAX topology.
-        torch.empty((1, ), device="tpu").cpu()
+        torch.empty((1,), device="tpu").cpu()
 
-        from vllm.distributed.parallel_state import \
-            init_distributed_environment
+        from vllm.distributed.parallel_state import init_distributed_environment
 
         # Only the world group is set up, not the TP group: the intra-chip
         # group is derived from the chip topology and the world size, and
@@ -231,8 +233,7 @@ def _run_worker(result_dir: Path) -> None:
         raise SystemExit(1)
 
 
-def _run_worker_group_once(
-        result_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_worker_group_once(result_dir: Path) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         _worker_command(result_dir),
         cwd=Path(__file__).resolve().parents[3],
@@ -248,8 +249,7 @@ def _run_worker_group_once(
         os.killpg(process.pid, signal.SIGTERM)
         output = exc.output or ""
         process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode,
-                                       output, "")
+    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
 def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
@@ -263,8 +263,7 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
     """
     completed = _run_worker_group_once(result_dir)
     attempts = 1
-    while ("PjRtClient is not initialized" in (completed.stdout or "")
-           and attempts < 3):
+    while "PjRtClient is not initialized" in (completed.stdout or "") and attempts < 3:
         attempts += 1
         time.sleep(60)
         completed = _run_worker_group_once(result_dir)
@@ -280,21 +279,22 @@ def test_intra_chip_gather_matches_the_replicated_projection(tmp_path):
     for rank in range(WORLD_SIZE):
         path = result_dir / f"rank_{rank}.json"
         results.append(
-            json.loads(path.read_text(
-                encoding="utf-8")) if path.exists() else {
-                    "rank": rank,
-                    "error": "missing worker result"
-                })
+            json.loads(path.read_text(encoding="utf-8"))
+            if path.exists()
+            else {"rank": rank, "error": "missing worker result"}
+        )
     errors = [r for r in results if "error" in r]
     assert completed.returncode == 0 and not errors, (
         f"worker failure: returncode={completed.returncode}, errors={errors}\n"
-        f"output tail:\n{completed.stdout[-12000:]}")
+        f"output tail:\n{completed.stdout[-12000:]}"
+    )
 
     # The worker already enforces the per-rank bounds; restate the one that
     # carries the claim so a reader of this test sees it.
     assert all(r["compiled_max"] == 0.0 for r in results), (
         "the compiled sharded projection must be bit-exact vs the replicated "
-        f"one: {[(r['rank'], r['compiled_max']) for r in results]}")
+        f"one: {[(r['rank'], r['compiled_max']) for r in results]}"
+    )
     # Four chips, two cores each, and the two cores of a chip must have taken
     # different shards -- if both took shard 0 the gather would still return a
     # full-width tensor, holding the same half twice.

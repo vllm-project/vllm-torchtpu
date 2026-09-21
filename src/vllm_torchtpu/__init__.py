@@ -25,20 +25,22 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
 
     kv_transfer_config = scheduler.vllm_config.kv_transfer_config
     manager = scheduler.kv_cache_manager
-    if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
-            or not scheduler.has_mamba_layers
-            or not isinstance(manager.coordinator, HybridKVCacheCoordinator)):
+    if (
+        kv_transfer_config is None
+        or not kv_transfer_config.is_kv_producer
+        or not scheduler.has_mamba_layers
+        or not isinstance(manager.coordinator, HybridKVCacheCoordinator)
+    ):
         return
 
     def get_common_prefix_hit_for_connector(self, request):
-        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(
-            request)
+        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(request)
         return blocks, hit_length, shared_prefix_boundary, False
 
     manager.get_computed_blocks_for_connector = MethodType(
-        get_common_prefix_hit_for_connector, manager)
-    logger.info(
-        "Reconciled hybrid TPU producer prefix hits to a common boundary.")
+        get_common_prefix_hit_for_connector, manager
+    )
+    logger.info("Reconciled hybrid TPU producer prefix hits to a common boundary.")
 
 
 def _patch_vllm_hybrid_producer_prefix_hits() -> None:
@@ -75,8 +77,7 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
         return
 
-    original_update = getattr(Scheduler,
-                              "_update_requests_with_invalid_blocks", None)
+    original_update = getattr(Scheduler, "_update_requests_with_invalid_blocks", None)
     if original_update is None:
         return
 
@@ -104,10 +105,10 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
         null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             req_id = request.request_id
-            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(
-                req_id)
-            req_num_computed_tokens = (request.num_computed_tokens -
-                                       num_scheduled_tokens.get(req_id, 0))
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
+            req_num_computed_tokens = (
+                request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+            )
             request_invalid_block_ids = {
                 block_id
                 for req_block_ids in req_block_ids_per_group
@@ -120,14 +121,17 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
                 request.num_computed_tokens = 0
                 if evict_blocks:
                     for req_block_ids in req_block_ids_per_group:
-                        blocks_to_evict.update(block_id
-                                               for block_id in req_block_ids
-                                               if block_id != null_block_id)
+                        blocks_to_evict.update(
+                            block_id
+                            for block_id in req_block_ids
+                            if block_id != null_block_id
+                        )
                 affected_req_ids.add(req_id)
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
     Scheduler._update_requests_with_invalid_blocks = (
-        _hybrid_update_requests_with_invalid_blocks)
+        _hybrid_update_requests_with_invalid_blocks
+    )
     Scheduler._tpu_hybrid_kv_load_failure_patch = True
     logger.info(
         "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."
@@ -172,8 +176,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
-    logger.info(
-        "Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
+    logger.info("Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
 
 
 def _patch_vllm_aot_compile_cache_key() -> None:
@@ -187,8 +190,8 @@ def _patch_vllm_aot_compile_cache_key() -> None:
 
     def tpu_aot_compile_hash_factors(vllm_config):
         from vllm_torchtpu.compilation import shape_variants
-        from vllm_torchtpu.compilation.tpu_compiler import \
-            compute_tpu_compilation_hash
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
@@ -250,7 +253,8 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     logger.info(
         "Applied TPU patch: exclude diagnostics-only additional_config keys "
         "%s from the compile cache key.",
-        sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
+        sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS),
+    )
 
 
 def _patch_default_moe_runner_select_forward() -> None:
@@ -266,13 +270,15 @@ def _patch_default_moe_runner_select_forward() -> None:
         return
 
     def patched_select(self):
-        return (_dmr._moe_forward
-                if self.shared_experts is None else _dmr._moe_forward_shared)
+        return (
+            _dmr._moe_forward
+            if self.shared_experts is None
+            else _dmr._moe_forward_shared
+        )
 
     _dmr.MoERunner._select_forward = patched_select
     _dmr.MoERunner._tpu_select_forward_patch = True
-    logger.info(
-        "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
+    logger.info("Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
 def _patch_moe_runner_fused_output_is_reduced() -> None:
@@ -324,15 +330,15 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
-                fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
         except ImportError:
             return original.fget(self)
         # Asked of the layer's own quant method, because arming is per layer:
         # a model whose layers do not all qualify must not have one armed layer
         # answer for the rest.
-        return (fused_moe_ep_supported(getattr(self, "_quant_method", None))
-                or original.fget(self))
+        return fused_moe_ep_supported(
+            getattr(self, "_quant_method", None)
+        ) or original.fget(self)
 
     _mr.MoERunner._fused_output_is_reduced = patched
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
@@ -356,24 +362,29 @@ def _patch_moe_explicit_pcp_collectives() -> None:
     same model still gets the explicit fallback collectives.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
-    from vllm.model_executor.layers.fused_moe.runner import \
-        moe_runner as _moe_runner
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 
-    if not getattr(FusedMoEParallelConfig,
-                   "_tpu_explicit_pcp_collectives_patch", False):
+    if not getattr(
+        FusedMoEParallelConfig, "_tpu_explicit_pcp_collectives_patch", False
+    ):
         upstream_property = FusedMoEParallelConfig.use_all2all_kernels
         upstream_getter = upstream_property.fget
         assert upstream_getter is not None
 
         def use_all2all_kernels(self):
-            if (self.use_ep and self.pcp_size > 1 and self.dp_size == 1
-                    and not self.is_sequence_parallel
-                    and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0):
+            if (
+                self.use_ep
+                and self.pcp_size > 1
+                and self.dp_size == 1
+                and not self.is_sequence_parallel
+                and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0
+            ):
                 return False
             return upstream_getter(self)
 
         FusedMoEParallelConfig.use_all2all_kernels = property(
-            use_all2all_kernels, doc=upstream_property.__doc__)
+            use_all2all_kernels, doc=upstream_property.__doc__
+        )
         FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
 
     runner_cls = _moe_runner.MoERunner
@@ -384,8 +395,8 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
-                fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
             return fused_moe_ep_supported(getattr(self, "_quant_method", None))
 
         def maybe_dispatch(self, hidden_states, router_logits):
@@ -410,8 +421,10 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         runner_cls._maybe_combine = maybe_combine
         runner_cls._tpu_fused_ep_pcp_collectives_patch = True
 
-    logger.info("Applied TPU patch: use explicit PCP collectives unless MoE "
-                "chunk pipelining or an armed fused EP layer owns them.")
+    logger.info(
+        "Applied TPU patch: use explicit PCP collectives unless MoE "
+        "chunk pipelining or an armed fused EP layer owns them."
+    )
 
 
 def _patch_expert_map_host_lookup() -> None:
@@ -435,8 +448,10 @@ def _patch_expert_map_host_lookup() -> None:
         expert_map = self._expert_map
         if expert_map is None:
             return global_id
-        if (self._tpu_expert_map_source is not expert_map
-                or self._tpu_expert_map_version != expert_map._version):
+        if (
+            self._tpu_expert_map_source is not expert_map
+            or self._tpu_expert_map_version != expert_map._version
+        ):
             self._tpu_expert_map_source = expert_map
             self._tpu_expert_map_version = expert_map._version
             self._tpu_expert_map_host = expert_map.tolist()
@@ -473,8 +488,9 @@ def _patch_vllm_disable_compile_ranges() -> None:
         return []
 
     CompilationConfig.get_compile_ranges = get_compile_ranges
-    logger.info("Applied TPU patch: disable dynamic compile_ranges (static "
-                "compile_sizes only).")
+    logger.info(
+        "Applied TPU patch: disable dynamic compile_ranges (static compile_sizes only)."
+    )
 
 
 def _patch_vllm_compile_all_ranges() -> None:
@@ -486,16 +502,19 @@ def _patch_vllm_compile_all_ranges() -> None:
     import os
     from collections import deque
 
-    from vllm.compilation.piecewise_backend import (PiecewiseBackend,
-                                                    create_concrete_args,
-                                                    get_fake_args_from_graph)
+    from vllm.compilation.piecewise_backend import (
+        PiecewiseBackend,
+        create_concrete_args,
+        get_fake_args_from_graph,
+    )
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
         assert self.graph is not None, (
             "Cannot compile without a graph. "
             "When loading from cache/AOT artifacts, "
-            "compile_all_ranges should not be called.")
+            "compile_all_ranges should not be called."
+        )
 
         local_rank = int(os.environ["LOCAL_RANK"])
         range_entry_list = list(self.range_entries.values())
@@ -520,7 +539,8 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             if range_entry.compile_range.is_single_size():
                 args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start)
+                    self.graph, range_entry.compile_range.start
+                )
             else:
                 args_list = get_fake_args_from_graph(self.graph)
 
@@ -585,10 +605,18 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
             "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
-            "init_local_rank=%d)", binding.rank, binding.local_rank,
-            binding.world_size, binding.local_world_size, rank, local_rank,
-            binding.dp_rank, binding.dp_size, binding.local_rank_offset,
-            binding.init_local_rank)
+            "init_local_rank=%d)",
+            binding.rank,
+            binding.local_rank,
+            binding.world_size,
+            binding.local_world_size,
+            rank,
+            local_rank,
+            binding.dp_rank,
+            binding.dp_size,
+            binding.local_rank_offset,
+            binding.init_local_rank,
+        )
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
@@ -600,9 +628,9 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     from vllm_torchtpu import patch_registry
 
     patch_registry.apply("engine_core")
-    from vllm_torchtpu.core.pp_chunk_scheduler import \
-        patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
 
@@ -629,11 +657,11 @@ def _patch_vllm_offloading_config_build() -> None:
     import sys
     from dataclasses import replace
 
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
-        config as offloading_config_module
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        config as offloading_config_module,
+    )
 
-    if getattr(offloading_config_module, "_tpu_offloading_config_patch",
-               False):
+    if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
         return
 
     original_build = offloading_config_module.build_offloading_config
@@ -648,44 +676,49 @@ def _patch_vllm_offloading_config_build() -> None:
         # assert compares rank-local to rank-local), then scale each
         # group's tokens_per_block to the logical all-PCP-rank span.
         from vllm.v1.core import kv_cache_utils
+
         unpatched_resolve = getattr(
-            kv_cache_utils, "_tpu_original_resolve_kv_cache_block_sizes",
-            kv_cache_utils.resolve_kv_cache_block_sizes)
-        saved_resolve = (offloading_config_module.resolve_kv_cache_block_sizes)
-        offloading_config_module.resolve_kv_cache_block_sizes = (
-            unpatched_resolve)
+            kv_cache_utils,
+            "_tpu_original_resolve_kv_cache_block_sizes",
+            kv_cache_utils.resolve_kv_cache_block_sizes,
+        )
+        saved_resolve = offloading_config_module.resolve_kv_cache_block_sizes
+        offloading_config_module.resolve_kv_cache_block_sizes = unpatched_resolve
         try:
             config = original_build(vllm_config, kv_cache_config)
         finally:
-            offloading_config_module.resolve_kv_cache_block_sizes = (
-                saved_resolve)
+            offloading_config_module.resolve_kv_cache_block_sizes = saved_resolve
         # tokens_per_hash must match the granularity the scheduler
         # actually hashes Request.block_hashes at -- the runtime
         # (PCP-patched) resolve: logical under hybrid PCP, rank-local
         # otherwise.
         _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config)
+            kv_cache_config, vllm_config
+        )
         config = replace(
             config,
             groups=tuple(
                 replace(group, tokens_per_block=group.tokens_per_block * pcp)
-                for group in config.groups),
-            cache=replace(config.cache, tokens_per_hash=tokens_per_hash))
+                for group in config.groups
+            ),
+            cache=replace(config.cache, tokens_per_hash=tokens_per_hash),
+        )
         for group in config.groups:
             assert group.tokens_per_block % tokens_per_hash == 0, (
                 f"tokens_per_block={group.tokens_per_block} not "
                 f"divisible by tokens_per_hash={tokens_per_hash} after "
-                f"PCP scaling (pcp={pcp})")
+                f"PCP scaling (pcp={pcp})"
+            )
         return config
 
-    offloading_config_module.build_offloading_config = (
-        build_offloading_config_tpu)
+    offloading_config_module.build_offloading_config = build_offloading_config_tpu
     offloading_config_module._tpu_offloading_config_patch = True
 
     # OffloadingConnector imports the function directly; rebind if the
     # module is already loaded.
     connector_module = sys.modules.get(
-        "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector")
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector"
+    )
     if connector_module is not None:
         connector_module.build_offloading_config = build_offloading_config_tpu
 
@@ -703,30 +736,27 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
 
     original_get_num_layers = ModelConfig.get_num_layers_by_block_type
 
-    def patched_get_num_layers_by_block_type(self,
-                                             parallel_config,
-                                             block_type="attention") -> int:
+    def patched_get_num_layers_by_block_type(
+        self, parallel_config, block_type="attention"
+    ) -> int:
         try:
             return original_get_num_layers(self, parallel_config, block_type)
         except ValueError:
             pass
 
         start, end = self.get_layers_start_end_indices(parallel_config)
-        linear_attn_config = getattr(self.hf_text_config, "linear_attn_config",
-                                     None)
+        linear_attn_config = getattr(self.hf_text_config, "linear_attn_config", None)
         if linear_attn_config is not None and block_type == "attention":
             kda_layers = set(linear_attn_config.get("kda_layers", []))
-            return sum(
-                (idx + 1) not in kda_layers for idx in range(start, end))
+            return sum((idx + 1) not in kda_layers for idx in range(start, end))
 
         return original_get_num_layers(self, parallel_config, block_type)
 
-    ModelConfig.get_num_layers_by_block_type = (
-        patched_get_num_layers_by_block_type)
+    ModelConfig.get_num_layers_by_block_type = patched_get_num_layers_by_block_type
     ModelConfig._tpu_kimi_kda_layer_counts_patched = True
     logger.info(
-        "Applied TPU patch: accurate layer counts for Kimi-K3 / KDA hybrid"
-        " models.")
+        "Applied TPU patch: accurate layer counts for Kimi-K3 / KDA hybrid models."
+    )
 
 
 def _patch_vllm_hybrid_pcp_block_sizes() -> None:
@@ -745,11 +775,16 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     from dataclasses import replace
 
     from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
-    from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
-                                            MambaSpec, UniformTypeKVCacheSpecs)
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheSpec,
+        MambaSpec,
+        UniformTypeKVCacheSpecs,
+    )
 
-    already_patched = getattr(kv_cache_utils,
-                              "_tpu_hybrid_pcp_block_sizes_patch", False)
+    already_patched = getattr(
+        kv_cache_utils, "_tpu_hybrid_pcp_block_sizes_patch", False
+    )
     original_resolve = getattr(
         kv_cache_utils,
         "_tpu_original_resolve_kv_cache_block_sizes",
@@ -763,19 +798,18 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             yield spec
 
     def _has_spec_type(spec: KVCacheSpec, spec_type: type) -> bool:
-        return any(
-            isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
+        return any(isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
 
     def _is_attention_mamba_hybrid(groups) -> bool:
         return any(
-            _has_spec_type(group.kv_cache_spec, MambaSpec)
-            for group in groups) and any(
-                _has_spec_type(group.kv_cache_spec, AttentionSpec)
-                for group in groups)
+            _has_spec_type(group.kv_cache_spec, MambaSpec) for group in groups
+        ) and any(
+            _has_spec_type(group.kv_cache_spec, AttentionSpec) for group in groups
+        )
 
-    def _with_effective_block_size(spec: KVCacheSpec,
-                                   pcp: int,
-                                   dcp: int = 1) -> KVCacheSpec:
+    def _with_effective_block_size(
+        spec: KVCacheSpec, pcp: int, dcp: int = 1
+    ) -> KVCacheSpec:
         """Restate a rank-local spec in the logical (all-ranks) page size."""
         assert not (pcp > 1 and dcp > 1), (
             f"Concurrent PCP and DCP are not supported: got pcp={pcp}, dcp={dcp}."
@@ -786,10 +820,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 for name, leaf in spec.kv_cache_specs.items()
             }
             effective_block_size = math.lcm(
-                *(leaf.block_size for leaf in effective_specs.values()))
-            return replace(spec,
-                           block_size=effective_block_size,
-                           kv_cache_specs=effective_specs)
+                *(leaf.block_size for leaf in effective_specs.values())
+            )
+            return replace(
+                spec, block_size=effective_block_size, kv_cache_specs=effective_specs
+            )
         if isinstance(spec, AttentionSpec):
             # Attention KV cache is partitioned along the 1D Context Parallel (CP)
             # axis during prefill (PCP) or decode (DCP). Because PCP and DCP share
@@ -804,9 +839,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             return replace(spec, block_size=spec.block_size * pcp)
         return spec
 
-    def _effective_block_size(spec: KVCacheSpec,
-                              pcp: int,
-                              dcp: int = 1) -> int:
+    def _effective_block_size(spec: KVCacheSpec, pcp: int, dcp: int = 1) -> int:
         return _with_effective_block_size(spec, pcp, dcp).block_size
 
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
@@ -839,73 +872,87 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     f"Invalid prefix_match_unit={hash_block_size}; all logical "
                     "PCP KV cache group block sizes must be divisible by "
                     "prefix_match_unit. Got "
-                    f"block sizes={group_block_sizes}.")
+                    f"block sizes={group_block_sizes}."
+                )
 
         logger.info(
             "Applied TPU PCP hybrid KV cache block-size resolution: "
             "pcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
-            "hash_block_size=%d", pcp, group_block_sizes, scheduler_block_size,
-            hash_block_size)
+            "hash_block_size=%d",
+            pcp,
+            group_block_sizes,
+            scheduler_block_size,
+            hash_block_size,
+        )
         return scheduler_block_size, hash_block_size
 
-    patched_resolve = (kv_cache_utils.resolve_kv_cache_block_sizes
-                       if already_patched else resolve_kv_cache_block_sizes)
+    patched_resolve = (
+        kv_cache_utils.resolve_kv_cache_block_sizes
+        if already_patched
+        else resolve_kv_cache_block_sizes
+    )
     if not already_patched:
-        kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes = (
-            original_resolve)
+        kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes = original_resolve
         kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
 
     hybrid_coordinator = kv_cache_coordinator.HybridKVCacheCoordinator
-    if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch",
-                   False):
+    if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch", False):
         original_hybrid_init = hybrid_coordinator.__init__
 
-        def _hybrid_init_with_logical_pcp_blocks(self,
-                                                 kv_cache_config,
-                                                 max_model_len,
-                                                 max_in_flight_tokens,
-                                                 use_eagle,
-                                                 enable_caching,
-                                                 enable_kv_cache_events,
-                                                 dcp_world_size,
-                                                 pcp_world_size,
-                                                 scheduler_block_size,
-                                                 hash_block_size,
-                                                 metrics_collector=None,
-                                                 num_prefill_lookahead=0):
+        def _hybrid_init_with_logical_pcp_blocks(
+            self,
+            kv_cache_config,
+            max_model_len,
+            max_in_flight_tokens,
+            use_eagle,
+            enable_caching,
+            enable_kv_cache_events,
+            dcp_world_size,
+            pcp_world_size,
+            scheduler_block_size,
+            hash_block_size,
+            metrics_collector=None,
+            num_prefill_lookahead=0,
+        ):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
-            if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
+            if pcp_world_size == 1 and _is_attention_mamba_hybrid(groups):
                 # vLLM 0.26's Scheduler already folds PCP into
                 # scheduler_block_size, but hard-codes pcp_world_size=1 when
                 # constructing KVCacheManager. Recover the folded PCP factor
                 # from the logical scheduler block and the rank-local specs.
                 physical_scheduler_block_size = math.lcm(
-                    *(_effective_block_size(group.kv_cache_spec, 1,
-                                            dcp_world_size)
-                      for group in groups))
+                    *(
+                        _effective_block_size(group.kv_cache_spec, 1, dcp_world_size)
+                        for group in groups
+                    )
+                )
                 if scheduler_block_size % physical_scheduler_block_size != 0:
                     raise ValueError(
                         "Logical scheduler block size must be divisible by "
                         "the physical hybrid KV cache block size. Got "
                         f"scheduler_block_size={scheduler_block_size}, "
                         "physical_scheduler_block_size="
-                        f"{physical_scheduler_block_size}.")
-                logical_pcp_world_size = (scheduler_block_size //
-                                          physical_scheduler_block_size)
+                        f"{physical_scheduler_block_size}."
+                    )
+                logical_pcp_world_size = (
+                    scheduler_block_size // physical_scheduler_block_size
+                )
                 if logical_pcp_world_size > 1:
                     logger.info(
                         "Inferred PCP world size %d from logical scheduler "
                         "block size %d and physical block size %d.",
-                        logical_pcp_world_size, scheduler_block_size,
-                        physical_scheduler_block_size)
+                        logical_pcp_world_size,
+                        scheduler_block_size,
+                        physical_scheduler_block_size,
+                    )
 
-            if (logical_pcp_world_size > 1
-                    and _is_attention_mamba_hybrid(groups)):
+            if logical_pcp_world_size > 1 and _is_attention_mamba_hybrid(groups):
                 if dcp_world_size != 1:
-                    raise ValueError("TPU hybrid PCP cache coordination does "
-                                     "not support DCP.")
+                    raise ValueError(
+                        "TPU hybrid PCP cache coordination does not support DCP."
+                    )
                 # The generic coordinator only needs logical token
                 # granularity. Encoding PCP into each group spec and then
                 # passing pcp_world_size=1 avoids multiplying block sizes
@@ -914,12 +961,15 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 kv_cache_config = replace(
                     kv_cache_config,
                     kv_cache_groups=[
-                        replace(group,
-                                kv_cache_spec=_with_effective_block_size(
-                                    group.kv_cache_spec,
-                                    logical_pcp_world_size))
+                        replace(
+                            group,
+                            kv_cache_spec=_with_effective_block_size(
+                                group.kv_cache_spec, logical_pcp_world_size
+                            ),
+                        )
                         for group in kv_cache_config.kv_cache_groups
-                    ])
+                    ],
+                )
                 pcp_world_size = 1
 
             original_hybrid_init(
@@ -957,10 +1007,10 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     # per-group block sizing). We patch it to catch ValueError and return an
     # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
     # cache coordinator without crashing.
-    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs",
-                               None)
+    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs", None)
     if original_promote is not None and not getattr(
-            original_promote, "_tpu_hybrid_promote_patch", False):
+        original_promote, "_tpu_hybrid_promote_patch", False
+    ):
 
         def patched_promote(specs):
             try:
@@ -970,23 +1020,18 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
 
         patched_promote._tpu_hybrid_promote_patch = True
         kv_cache_utils._promote_local_kv_cache_specs = patched_promote
-        for module_name in ("vllm.v1.engine.core",
-                            "vllm.v1.core.kv_cache_utils"):
+        for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
             mod = sys.modules.get(module_name)
-            if mod is not None and hasattr(mod,
-                                           "_promote_local_kv_cache_specs"):
+            if mod is not None and hasattr(mod, "_promote_local_kv_cache_specs"):
                 mod._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
-        EngineCoreProc._tpu_original_run_engine_core = (
-            EngineCoreProc.run_engine_core)
-        EngineCoreProc.run_engine_core = staticmethod(
-            _run_engine_core_with_tpu_patches)
+        EngineCoreProc._tpu_original_run_engine_core = EngineCoreProc.run_engine_core
+        EngineCoreProc.run_engine_core = staticmethod(_run_engine_core_with_tpu_patches)
         EngineCoreProc._tpu_engine_core_patch_wrapper = True
 
     if not already_patched:
-        logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
-                    "block sizes.")
+        logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
 def _patch_vllm_merge_multimodal_embeddings() -> None:
@@ -1016,13 +1061,13 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
             if len(multimodal_embeddings) == 0:
                 return inputs_embeds
 
-            mm_embeds_flat = vllm_utils._flatten_embeddings(
-                multimodal_embeddings)
+            mm_embeds_flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
             if mm_embeds_flat.numel() == 0:
                 return inputs_embeds
 
-            mm_embeds_flat = mm_embeds_flat.to(dtype=inputs_embeds.dtype,
-                                               device=inputs_embeds.device)
+            mm_embeds_flat = mm_embeds_flat.to(
+                dtype=inputs_embeds.dtype, device=inputs_embeds.device
+            )
 
             idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
             idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
@@ -1040,7 +1085,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     patched_fn = vllm_utils._merge_multimodal_embeddings
     for mod_name, mod in list(sys.modules.items()):
         if mod_name.startswith("vllm.model_executor.models") and hasattr(
-                mod, "_merge_multimodal_embeddings"):
+            mod, "_merge_multimodal_embeddings"
+        ):
             if mod._merge_multimodal_embeddings is not patched_fn:
                 mod._merge_multimodal_embeddings = patched_fn
 
@@ -1106,45 +1152,47 @@ def _patch_vllm_piecewise_backend() -> None:
             range_entry = self._find_range_for_shape(runtime_shape)
             assert range_entry is not None, (
                 f"Shape: {runtime_shape} out of considered ranges: "
-                f"{self.compile_ranges}")
-        elif len(self.range_entries) > 1 or (self.compile_sizes
-                                             and len(self.compile_sizes) > 1):
+                f"{self.compile_ranges}"
+            )
+        elif len(self.range_entries) > 1 or (
+            self.compile_sizes and len(self.compile_sizes) > 1
+        ):
             # Dynamic token count from tensor dimension 0
-            first_tensor = next(
-                (x for x in args if isinstance(x, torch.Tensor)), None)
+            first_tensor = next((x for x in args if isinstance(x, torch.Tensor)), None)
             if first_tensor is not None:
                 runtime_shape = first_tensor.shape[0]
                 range_entry = self._find_range_for_shape(runtime_shape)
                 assert range_entry is not None, (
                     f"Shape: {runtime_shape} out of considered ranges: "
-                    f"{self.compile_ranges}")
+                    f"{self.compile_ranges}"
+                )
             else:
                 compiled_entries = [
                     re for re in self.range_entries.values() if re.compiled
                 ]
                 assert len(compiled_entries) == 1, (
                     f"Expected exactly one compiled range_entry for static shape "
-                    f"compilation, but found {len(compiled_entries)}")
+                    f"compilation, but found {len(compiled_entries)}"
+                )
                 range_entry = compiled_entries[0]
         else:
-            compiled_entries = [
-                re for re in self.range_entries.values() if re.compiled
-            ]
+            compiled_entries = [re for re in self.range_entries.values() if re.compiled]
             assert len(compiled_entries) == 1, (
                 f"Expected exactly one compiled range_entry for static shape "
-                f"compilation, but found {len(compiled_entries)}")
+                f"compilation, but found {len(compiled_entries)}"
+            )
             range_entry = compiled_entries[0]
 
         assert range_entry.compiled, (
             "All ranges should be compiled or loaded up front in "
             "PiecewiseBackend.__init__. "
-            f"range_entry={range_entry.compile_range}")
+            f"range_entry={range_entry.compile_range}"
+        )
         return range_entry.runnable(*args, **kwargs)
 
     patched_call._tpu_piecewise_backend_patch = True
     PiecewiseBackend.__call__ = patched_call
-    logger.info(
-        "Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+    logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
 
 
 def _patch_vllm_compile_prefix_isolation() -> None:
@@ -1165,9 +1213,7 @@ def _patch_vllm_compile_prefix_isolation() -> None:
 
     counter = itertools.count()
 
-    def patched_init(self,
-                     compile_prefix: str = "",
-                     is_encoder: bool = False) -> None:
+    def patched_init(self, compile_prefix: str = "", is_encoder: bool = False) -> None:
         if not compile_prefix and not is_encoder:
             prefix = getattr(self, "prefix", None)
             if prefix:
@@ -1180,16 +1226,17 @@ def _patch_vllm_compile_prefix_isolation() -> None:
                     "compile_prefix isolation: %s has no self.prefix; using "
                     "non-deterministic fallback %s (its on-disk compile "
                     "cache will not persist across restarts).",
-                    type(self).__name__, compile_prefix)
-        original_init(self,
-                      compile_prefix=compile_prefix,
-                      is_encoder=is_encoder)
+                    type(self).__name__,
+                    compile_prefix,
+                )
+        original_init(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
 
     patched_init._tpu_compile_prefix_isolation_patch = True
     TorchCompileWithNoGuardsWrapper.__init__ = patched_init
     logger.info(
         "Applied TPU patch: per-instance compile-artifact cache isolation "
-        "(compile_prefix keyed off self.prefix).")
+        "(compile_prefix keyed off self.prefix)."
+    )
 
 
 def _patch_dflash_bypass_v2_runner_check() -> None:
@@ -1219,11 +1266,13 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
         # instead of silently no-op'ing and letting the original V2 check
         # reject the drafter with an unrelated-looking error.
         from vllm.config import get_current_vllm_config
+
         cfg_cls = type(get_current_vllm_config())
         if not hasattr(cfg_cls, _FLAG):
             raise RuntimeError(
                 f"VllmConfig no longer defines {_FLAG!r}; the TPU DFlash "
-                "bypass needs updating for this vLLM version.")
+                "bypass needs updating for this vLLM version."
+            )
 
         # Restore exactly what was there: if the flag is inherited rather than
         # defined on this class, putting it back with setattr would leave a
@@ -1259,8 +1308,10 @@ def _patch_vllm_config_triton_tpu() -> None:
     original_validate = VllmConfig._validate_v2_model_runner
 
     def patched_validate(self):
-        if getattr(self, "device_config",
-                   None) and self.device_config.device_type == "tpu":
+        if (
+            getattr(self, "device_config", None)
+            and self.device_config.device_type == "tpu"
+        ):
             return
         return original_validate(self)
 
@@ -1290,11 +1341,13 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         logger.warning(
             "VllmConfig.use_v2_model_runner is no longer a property; skipping "
             "the TPU V1-runner patch. TPU execution may misbehave until this "
-            "is updated for the current vLLM version.")
+            "is updated for the current vLLM version."
+        )
         return
 
     def patched_use_v2(self):
         import vllm.envs as envs
+
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
             return original_prop.fget(self)
         device_config = getattr(self, "device_config", None)
@@ -1317,9 +1370,7 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
             "dspark speculative decoding",
             "mixed sliding/full dflash drafts",
         }
-        return [
-            feature for feature in unsupported if feature not in implemented
-        ]
+        return [feature for feature in unsupported if feature not in implemented]
 
     VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
@@ -1335,8 +1386,10 @@ if "proxy" in envs.JAX_PLATFORMS:
 
         import pathwaysutils
         import vllm
-        from vllm.platforms import (resolve_current_platform_cls_qualname,
-                                    resolve_obj_by_qualname)
+        from vllm.platforms import (
+            resolve_current_platform_cls_qualname,
+            resolve_obj_by_qualname,
+        )
 
         pathwaysutils.initialize()
         logger.info("Module pathwaysutils is imported.")
@@ -1347,8 +1400,7 @@ if "proxy" in envs.JAX_PLATFORMS:
         # resolution must happen before other components are loaded.
         logger.info("Eagerly resolving vLLM current_platform for Pathways.")
         platform_cls_qualname = resolve_current_platform_cls_qualname()
-        resolved_platform_instance = resolve_obj_by_qualname(
-            platform_cls_qualname)()
+        resolved_platform_instance = resolve_obj_by_qualname(platform_cls_qualname)()
         vllm.platforms._current_platform = resolved_platform_instance
         vllm.platforms._init_trace = "".join(traceback.format_stack())
         logger.info(
@@ -1394,8 +1446,7 @@ def _patch_vllm_block_pool_lifo_free() -> None:
 
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
-    logger.info(
-        "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+    logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:
@@ -1408,8 +1459,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     import torch
     import vllm.model_executor.layers.vocab_parallel_embedding as vpe
 
-    if getattr(vpe.VocabParallelEmbedding,
-               "_tpu_vocab_parallel_embedding_patch", False):
+    if getattr(
+        vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
+    ):
         return
 
     original_init = vpe.VocabParallelEmbedding.__init__
@@ -1419,32 +1471,35 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         if not hasattr(self, "org_vocab_start_index"):
             self.register_buffer(
                 "org_vocab_start_index",
-                torch.tensor(self.shard_indices.org_vocab_start_index,
-                             dtype=torch.int64),
+                torch.tensor(
+                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index,
-                             dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
                 persistent=False,
             )
             self.register_buffer(
                 "num_org_vocab_padding",
-                torch.tensor(self.shard_indices.num_org_vocab_padding,
-                             dtype=torch.int64),
+                torch.tensor(
+                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
+                ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_start_index",
-                torch.tensor(self.shard_indices.added_vocab_start_index,
-                             dtype=torch.int64),
+                torch.tensor(
+                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
+                ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_end_index",
-                torch.tensor(self.shard_indices.added_vocab_end_index,
-                             dtype=torch.int64),
+                torch.tensor(
+                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
+                ),
                 persistent=False,
             )
 
@@ -1452,24 +1507,37 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
-                getattr(self, "org_vocab_start_index",
-                        self.shard_indices.org_vocab_start_index),
-                getattr(self, "org_vocab_end_index",
-                        self.shard_indices.org_vocab_end_index),
-                getattr(self, "num_org_vocab_padding",
-                        self.shard_indices.num_org_vocab_padding),
-                getattr(self, "added_vocab_start_index",
-                        self.shard_indices.added_vocab_start_index),
-                getattr(self, "added_vocab_end_index",
-                        self.shard_indices.added_vocab_end_index),
+                getattr(
+                    self,
+                    "org_vocab_start_index",
+                    self.shard_indices.org_vocab_start_index,
+                ),
+                getattr(
+                    self, "org_vocab_end_index", self.shard_indices.org_vocab_end_index
+                ),
+                getattr(
+                    self,
+                    "num_org_vocab_padding",
+                    self.shard_indices.num_org_vocab_padding,
+                ),
+                getattr(
+                    self,
+                    "added_vocab_start_index",
+                    self.shard_indices.added_vocab_start_index,
+                ),
+                getattr(
+                    self,
+                    "added_vocab_end_index",
+                    self.shard_indices.added_vocab_end_index,
+                ),
             )
         else:
             masked_input = input_
-        output_parallel = self.quant_method.embedding(self,
-                                                      masked_input.long())
+        output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
+
             return tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
@@ -1497,9 +1565,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
 
         org_vocab_mask = (input_ >= start) & (input_ < end)
         added_vocab_mask = (input_ >= added_start) & (input_ < added_end)
-        added_offset = (added_start - (end - start) - num_padding)
-        valid_offset = (start * org_vocab_mask) + (added_offset *
-                                                   added_vocab_mask)
+        added_offset = added_start - (end - start) - num_padding
+        valid_offset = (start * org_vocab_mask) + (added_offset * added_vocab_mask)
         vocab_mask = org_vocab_mask | added_vocab_mask
         input_ = vocab_mask * (input_ - valid_offset)
         return input_, ~vocab_mask

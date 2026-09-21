@@ -2,22 +2,24 @@
 """
 Unit tests for the P/D KV endpoint advertise/resolve pair:
 """
+
 import os
 import unittest
 from unittest.mock import patch
 
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import LoadMeta
-from vllm_torchtpu.distributed.kv_transfer.tpu_connector import \
-    TPURaidenConnectorWorker
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnectorWorker
 
 
 def _load_meta(remote_host, remote_port) -> LoadMeta:
-    return LoadMeta(uuid=1,
-                    local_block_ids=[0],
-                    remote_block_ids=[0],
-                    remote_host=remote_host,
-                    remote_port=remote_port)
+    return LoadMeta(
+        uuid=1,
+        local_block_ids=[0],
+        remote_block_ids=[0],
+        remote_host=remote_host,
+        remote_port=remote_port,
+    )
 
 
 class _ResolverHarness:
@@ -60,10 +62,9 @@ class TestGetKvIpsPorts(unittest.TestCase):
     def test_mp_backend(self):
         # mp takes the scalar branch: host ip string and the env-configured
         # transfer port, registry ignored.
-        with patch.dict(os.environ, {
-                "TPU_MULTIHOST_BACKEND": "mp",
-                "TPU_KV_TRANSFER_PORT": "9345"
-        }):
+        with patch.dict(
+            os.environ, {"TPU_MULTIHOST_BACKEND": "mp", "TPU_KV_TRANSFER_PORT": "9345"}
+        ):
             self.assertIsInstance(dist_utils.get_kv_ips(), str)
             self.assertEqual(dist_utils.get_kv_ports(), "9345")
 
@@ -75,22 +76,19 @@ class TestResolveRemoteEndpoint(unittest.TestCase):
         # A single-node (ray executor-DP) producer advertises one endpoint.
         worker = _ResolverHarness(node_id=1, tp_rank=0, tp_size=1)
         meta = _load_meta(["10.0.0.2"], [9100])
-        self.assertEqual(worker._resolve_remote_endpoint(meta),
-                         "10.0.0.2:9100")
+        self.assertEqual(worker._resolve_remote_endpoint(meta), "10.0.0.2:9100")
 
     def test_multihost_producer_indexed_by_consumer_node(self):
         # Multihost-TP producer (2 nodes): consumer node i pulls from
         # producer node i.
         worker = _ResolverHarness(node_id=1, tp_rank=9, tp_size=16)
         meta = _load_meta(["10.0.0.1", "10.0.0.2"], [9100, 9200])
-        self.assertEqual(worker._resolve_remote_endpoint(meta),
-                         "10.0.0.2:9202")
+        self.assertEqual(worker._resolve_remote_endpoint(meta), "10.0.0.2:9202")
 
     def test_scalar_host_mp(self):
         worker = _ResolverHarness(node_id=1, tp_rank=2, tp_size=8)
         meta = _load_meta("10.0.0.9", 9100)
-        self.assertEqual(worker._resolve_remote_endpoint(meta),
-                         "10.0.0.9:9104")
+        self.assertEqual(worker._resolve_remote_endpoint(meta), "10.0.0.9:9104")
 
 
 if __name__ == "__main__":

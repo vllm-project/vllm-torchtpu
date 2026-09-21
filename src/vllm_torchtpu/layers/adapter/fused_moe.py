@@ -23,8 +23,12 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
-    resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
+    fused_moe_func,
+    quantize_to_native_fp4_kmajor,
+    requant_unpack_kmajor,
+    resolve_onehot_permute_threshold,
+    unpack_fp4_to_e2m1,
+)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
@@ -36,8 +40,7 @@ _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 def _resolve_activation_name(activation: Any) -> str:
     if isinstance(activation, enum.Enum):
         return activation.value
-    return activation.value if hasattr(activation,
-                                       "value") else str(activation)
+    return activation.value if hasattr(activation, "value") else str(activation)
 
 
 def get_fused_moe_activation(activation, moe_config) -> str:
@@ -91,13 +94,15 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     """
     global _load_kmajor_fp4_op
     if _load_kmajor_fp4_op is None:
-        _load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor",
-                                            unpack_fp4_to_e2m1)
+        _load_kmajor_fp4_op = pallas.jax_op(
+            "pallas::nvfp4_load_kmajor", unpack_fp4_to_e2m1
+        )
     return _load_kmajor_fp4_op(w_u8)
 
 
-def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
-                            block: int) -> tuple[torch.Tensor, torch.Tensor]:
+def requant_load_kmajor_fp4(
+    w_u8: torch.Tensor, scale_f: torch.Tensor, block: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """W4A8 requant + K-major load in one JAX op (matches tpu-inference). Takes
     the packed uint8 weight ``[..., N, K//2]`` + its fused fp32 block-16 scale
     ``[..., N, K//16]``; returns native-fp4 ``torch.float4_e2m1fn_x2`` ``[...,
@@ -109,15 +114,15 @@ def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
     if op is None:
         op = pallas.jax_op(
             f"pallas::nvfp4_requant_kmajor_b{block}",
-            functools.partial(requant_unpack_kmajor, block=block))
+            functools.partial(requant_unpack_kmajor, block=block),
+        )
         _requant_kmajor_fp4_ops[block] = op
     return op(w_u8, scale_f)
 
 
 def quantize_native_fp4_kmajor(
-        w: torch.Tensor,
-        block: int,
-        pack: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    w: torch.Tensor, block: int, pack: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize an already-dequantized, K-major float weight to native FP4.
 
     ``pack=False`` hands the weight back as ``torch.float4_e2m1fn_x2`` rather
@@ -132,9 +137,8 @@ def quantize_native_fp4_kmajor(
         op = pallas.jax_op(
             f"pallas::nvfp4_quantize_native_kmajor_b{block}"
             f"{'' if pack else '_unpacked'}",
-            functools.partial(quantize_to_native_fp4_kmajor,
-                              block=block,
-                              pack=pack))
+            functools.partial(quantize_to_native_fp4_kmajor, block=block, pack=pack),
+        )
         _quantize_native_fp4_kmajor_ops[key] = op
     return op(w)
 
@@ -175,7 +179,8 @@ def _build_fused_moe_custom_op(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens)
+        skip_padded_tokens=skip_padded_tokens,
+    )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -272,9 +277,7 @@ def fused_moe_gmm(
         # The compiled program for use_ep=False never reads this operand
         # (see the `if use_ep:` guard in fused_moe_func), but the custom op
         # still needs a concrete tensor to call with a fixed arity.
-        experts_start = torch.zeros((),
-                                    dtype=torch.int32,
-                                    device=hidden_states.device)
+        experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
     return fused_moe(
         hidden_states,
         w1,

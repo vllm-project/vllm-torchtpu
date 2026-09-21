@@ -44,8 +44,7 @@ import vllm.model_executor.parameter as parameter_mod
 from vllm.config import CacheConfig
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-from vllm.model_executor.models.deepseek_v2 import (DeepseekV32IndexerCache,
-                                                    Indexer)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
 
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
@@ -120,29 +119,24 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
         index_head_dim=HEAD_DIM,
         qk_rope_head_dim=ROPE_DIM,
     )
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(
-        max_model_len=MAX_MODEL_LEN))
-    topk_indices_buffer = torch.full((buffer_tokens, TOPK),
-                                     -1,
-                                     dtype=torch.int32)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN)
+    )
+    topk_indices_buffer = torch.full((buffer_tokens, TOPK), -1, dtype=torch.int32)
 
     # `VllmTPUIndexer` has no `__init__`: it is a retype of an in-tree `Indexer`
     # that `DeepseekV2MLAAttention` has already built. So build the in-tree
     # layer -- stubbing the collaborators where *it* looks them up -- and then
     # rebind, exactly as `VllmTPUMultiHeadLatentAttentionWrapper` does.
-    with patch.object(deepseek_v2, "DeepseekV32IndexerCache",
-                      _StubIndexerCache), \
-         patch.object(deepseek_v2, "SparseAttnIndexer",
-                      _RecordingIndexerOp), \
-         patch.object(linear_mod, "get_tensor_model_parallel_rank",
-                      lambda: 0), \
-         patch.object(linear_mod, "get_tensor_model_parallel_world_size",
-                      lambda: 1), \
-         patch.object(parameter_mod, "get_tensor_model_parallel_rank",
-                      lambda: 0), \
-         patch.object(parameter_mod, "get_tensor_model_parallel_world_size",
-                      lambda: 1), \
-         _default_dtype(dtype):
+    with (
+        patch.object(deepseek_v2, "DeepseekV32IndexerCache", _StubIndexerCache),
+        patch.object(deepseek_v2, "SparseAttnIndexer", _RecordingIndexerOp),
+        patch.object(linear_mod, "get_tensor_model_parallel_rank", lambda: 0),
+        patch.object(linear_mod, "get_tensor_model_parallel_world_size", lambda: 1),
+        patch.object(parameter_mod, "get_tensor_model_parallel_rank", lambda: 0),
+        patch.object(parameter_mod, "get_tensor_model_parallel_world_size", lambda: 1),
+        _default_dtype(dtype),
+    ):
         indexer = Indexer(
             vllm_config=vllm_config,
             config=config,
@@ -178,10 +172,12 @@ def _make_rope(dtype=torch.float32):
     current vLLM config for that; a bare CompilationConfig is enough and binds
     `forward_native` (the TPU dispatch target is `forward_native` too).
     """
-    compilation_config = CompilationConfig(mode=CompilationMode.NONE,
-                                           custom_ops=["none"])
-    with patch.object(custom_op_mod, "get_cached_compilation_config",
-                      lambda: compilation_config):
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE, custom_ops=["none"]
+    )
+    with patch.object(
+        custom_op_mod, "get_cached_compilation_config", lambda: compilation_config
+    ):
         return RotaryEmbedding(
             head_size=ROPE_DIM,
             rotary_dim=ROPE_DIM,
@@ -219,10 +215,10 @@ def _reference(layer, hidden_states, qr, positions, rope):
 
         q_pe, q_nope = q[..., :ROPE_DIM], q[..., ROPE_DIM:]
         k_pe, k_nope = k[..., :ROPE_DIM], k[..., ROPE_DIM:]
-        q_pe, k_pe = rope.forward_native(positions, q_pe.clone(),
-                                         k_pe.clone().unsqueeze(1))
-        q = torch.cat([q_pe.view(num_tokens, n_head, ROPE_DIM), q_nope],
-                      dim=-1)
+        q_pe, k_pe = rope.forward_native(
+            positions, q_pe.clone(), k_pe.clone().unsqueeze(1)
+        )
+        q = torch.cat([q_pe.view(num_tokens, n_head, ROPE_DIM), q_nope], dim=-1)
         k = torch.cat([k_pe.view(num_tokens, ROPE_DIM), k_nope], dim=-1)
     return q, k, weights
 
@@ -245,7 +241,8 @@ def _assert_relclose(actual, expected, tol, msg=""):
     deviation = (actual - expected).abs().max()
     scale = expected.abs().max()
     assert deviation <= tol * scale, (
-        f"{msg} max deviation {deviation:.3e} > {tol:g} * {scale:.3e}")
+        f"{msg} max deviation {deviation:.3e} > {tol:g} * {scale:.3e}"
+    )
 
 
 def _run(layer, rope, num_tokens=6, dtype=torch.float32, seed=1):
@@ -268,9 +265,16 @@ def test_construction_wires_kernel_contract():
     assert layer.scale_fmt == "ue8m0"
     assert layer.softmax_scale == pytest.approx(HEAD_DIM**-0.5)
 
-    (k_cache, quant_block_size, scale_fmt, topk_tokens, head_dim,
-     max_model_len, max_total_seq_len,
-     topk_indices_buffer) = layer.indexer_op.init_args
+    (
+        k_cache,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        max_total_seq_len,
+        topk_indices_buffer,
+    ) = layer.indexer_op.init_args
     assert k_cache is layer.k_cache
     assert quant_block_size == HEAD_DIM
     assert scale_fmt == "ue8m0"
@@ -285,8 +289,7 @@ def test_projection_shapes():
     """wq_b is replicated per-head; wk and weights_proj share one GEMM."""
     layer = _build_indexer()
     assert layer.wq_b.weight.shape == (N_HEAD * HEAD_DIM, Q_LORA_RANK)
-    assert layer.wk_weights_proj.weight.shape == (HEAD_DIM + N_HEAD,
-                                                  HIDDEN_SIZE)
+    assert layer.wk_weights_proj.weight.shape == (HEAD_DIM + N_HEAD, HIDDEN_SIZE)
     assert layer.wk_weights_proj.output_sizes == [HEAD_DIM, N_HEAD]
     # No TP shard: the indexer heads are replicated on every rank.
     assert layer.wk_weights_proj.tp_size == 1
@@ -309,10 +312,7 @@ def test_fused_gemm_shard_order_matches_forward_split():
     param.weight_loader(param, wk_ckpt, 0)
     param.weight_loader(param, w_proj_ckpt, 1)
     torch.testing.assert_close(param.data[:HEAD_DIM], wk_ckpt, rtol=0, atol=0)
-    torch.testing.assert_close(param.data[HEAD_DIM:],
-                               w_proj_ckpt,
-                               rtol=0,
-                               atol=0)
+    torch.testing.assert_close(param.data[HEAD_DIM:], w_proj_ckpt, rtol=0, atol=0)
 
     with torch.no_grad():  # not _randomize: it would clobber the loaded shards
         layer.wq_b.weight.normal_(0.0, 0.1)
@@ -324,10 +324,8 @@ def test_fused_gemm_shard_order_matches_forward_split():
 
     # k comes from the wk shard alone (through k_norm and RoPE)...
     k_ckpt = layer.k_norm(hidden_states @ wk_ckpt.T)
-    k_pe = rope.forward_native(positions, k_ckpt[..., :ROPE_DIM].clone(),
-                               None)[0]
-    _assert_relclose(k, torch.cat([k_pe, k_ckpt[..., ROPE_DIM:]], dim=-1),
-                     1e-5, "k")
+    k_pe = rope.forward_native(positions, k_ckpt[..., :ROPE_DIM].clone(), None)[0]
+    _assert_relclose(k, torch.cat([k_pe, k_ckpt[..., ROPE_DIM:]], dim=-1), 1e-5, "k")
 
     # ...and the head weights from the weights_proj shard alone, times the
     # per-(token, head) fold.
@@ -345,10 +343,9 @@ def test_forward_emits_expected_triple(dtype):
     rope = _make_rope(dtype)
     num_tokens = 6
 
-    out, (hidden_states, qr, positions) = _run(layer,
-                                               rope,
-                                               num_tokens=num_tokens,
-                                               dtype=dtype)
+    out, (hidden_states, qr, positions) = _run(
+        layer, rope, num_tokens=num_tokens, dtype=dtype
+    )
 
     assert out is _RecordingIndexerOp.SENTINEL
     captured_hidden, q_fp8, k, weights = layer.indexer_op.last_call
@@ -362,8 +359,7 @@ def test_forward_emits_expected_triple(dtype):
     # scale fold is computed in.
     assert weights.dtype == dtype
 
-    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions,
-                                           rope)
+    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions, rope)
     # In bf16 a 1-ULP reassociation is ~0.4%; fp8 e4m3 error would be ~10x
     # that, so these still separate "kept in the activation dtype" from
     # "silently quantized".
@@ -400,15 +396,15 @@ def test_scale_folding_is_algebraically_exact(dtype):
 
     _, (hidden_states, qr, positions) = _run(layer, rope, 6, dtype)
     _, q_fp8, k, weights = layer.indexer_op.last_call
-    q_ref, _, weights_ref = _reference(layer, hidden_states, qr, positions,
-                                       rope)
+    q_ref, _, weights_ref = _reference(layer, hidden_states, qr, positions, rope)
 
     q_scale = q_ref.float().abs().amax(dim=-1, keepdim=True) / FP8_MAX
     fold = layer.softmax_scale * N_HEAD**-0.5
 
     folded = _indexer_scores(q_fp8.float(), k, weights)
-    dequantized = _indexer_scores(q_fp8.float() * q_scale, k,
-                                  weights_ref.float() * fold)
+    dequantized = _indexer_scores(
+        q_fp8.float() * q_scale, k, weights_ref.float() * fold
+    )
 
     scale = dequantized.abs().max()
     # bf16 weights carry ~2^-8 relative rounding on the folded product.
@@ -430,8 +426,7 @@ def test_scores_track_unquantized_reference(dtype):
 
     _, (hidden_states, qr, positions) = _run(layer, rope, num_tokens, dtype)
     _, q_fp8, k, weights = layer.indexer_op.last_call
-    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions,
-                                           rope)
+    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions, rope)
 
     fold = layer.softmax_scale * N_HEAD**-0.5
     actual = _indexer_scores(q_fp8.float(), k, weights)
@@ -447,8 +442,7 @@ def test_scores_track_unquantized_reference(dtype):
     picked = actual.topk(TOPK, dim=-1).indices
     best_scores = ideal.topk(TOPK, dim=-1).values
     picked_scores = ideal.gather(1, picked)
-    regret = (best_scores.min(dim=-1, keepdim=True).values -
-              picked_scores).clamp(min=0)
+    regret = (best_scores.min(dim=-1, keepdim=True).values - picked_scores).clamp(min=0)
     assert regret.max() <= 0.05 * scale
     assert picked_scores.sum() >= 0.99 * best_scores.sum()
 
@@ -485,20 +479,17 @@ def test_rope_receives_pe_slices_and_tolerates_extra_leading_dims():
         k_pre = layer.k_norm(hidden_states @ fused[:HEAD_DIM].T)
 
     torch.testing.assert_close(seen["q_pe"], q_pre[..., :ROPE_DIM])
-    torch.testing.assert_close(seen["k_pe"],
-                               k_pre[..., :ROPE_DIM].unsqueeze(1))
+    torch.testing.assert_close(seen["k_pe"], k_pre[..., :ROPE_DIM].unsqueeze(1))
 
     # Rotated halves land first, unrotated halves pass through untouched.
     torch.testing.assert_close(k[:, :ROPE_DIM], k_pre[:, :ROPE_DIM] * 5.0)
     torch.testing.assert_close(k[:, ROPE_DIM:], k_pre[:, ROPE_DIM:])
 
-    q_expected = torch.cat(
-        [q_pre[..., :ROPE_DIM] * 3.0, q_pre[..., ROPE_DIM:]], dim=-1)
+    q_expected = torch.cat([q_pre[..., :ROPE_DIM] * 3.0, q_pre[..., ROPE_DIM:]], dim=-1)
     q_scale = q_expected.abs().amax(dim=-1, keepdim=True) / FP8_MAX
-    torch.testing.assert_close(q_fp8.float() * q_scale,
-                               q_expected,
-                               rtol=0.07,
-                               atol=1e-5 * q_scale.max().item())
+    torch.testing.assert_close(
+        q_fp8.float() * q_scale, q_expected, rtol=0.07, atol=1e-5 * q_scale.max().item()
+    )
     assert weights.shape == (num_tokens, N_HEAD)
 
 
@@ -514,13 +505,11 @@ def test_decode_single_token():
     assert k.shape == (1, HEAD_DIM)
     assert weights.shape == (1, N_HEAD)
 
-    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions,
-                                           rope)
+    q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions, rope)
     _assert_relclose(k, k_ref, 1e-5, "k")
     fold = layer.softmax_scale * N_HEAD**-0.5
     q_scale = q_ref.float().abs().amax(dim=-1) / FP8_MAX
-    _assert_relclose(weights,
-                     weights_ref.float() * q_scale * fold, 1e-5, "weights")
+    _assert_relclose(weights, weights_ref.float() * q_scale * fold, 1e-5, "weights")
 
 
 def test_no_nans_when_a_query_head_is_all_zero():

@@ -16,7 +16,10 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
-    get_kv_cache_shape, ragged_paged_attention, ragged_paged_attention_bundled)
+    get_kv_cache_shape,
+    ragged_paged_attention,
+    ragged_paged_attention_bundled,
+)
 
 
 def _require_tpu() -> None:
@@ -46,14 +49,18 @@ def _cfg():
 
 
 def _per_layer_shape(c):
-    return get_kv_cache_shape(c["num_blocks"], c["page_size"],
-                              c["num_kv_heads"], c["head_dim"], c["kv_dtype"])
+    return get_kv_cache_shape(
+        c["num_blocks"], c["page_size"], c["num_kv_heads"], c["head_dim"], c["kv_dtype"]
+    )
 
 
 def _workload(c, scenario, seed=0):
     page_size, num_blocks = c["page_size"], c["num_blocks"]
-    num_kv_heads, num_q_heads, head_dim = (c["num_kv_heads"], c["num_q_heads"],
-                                           c["head_dim"])
+    num_kv_heads, num_q_heads, head_dim = (
+        c["num_kv_heads"],
+        c["num_q_heads"],
+        c["head_dim"],
+    )
     if scenario == "decode":
         q_lens = [1, 1, 1, 1, 1, 1, 1, 1]
         kv_lens_l = [128] * 8
@@ -71,20 +78,16 @@ def _workload(c, scenario, seed=0):
     max_num_seqs = len(q_lens)
     cu = np.cumsum([0] + q_lens, dtype=np.int32)
     max_tokens = max(int(cu[-1]), 16)
-    cu = np.pad(cu, (0, max_num_seqs + 1 - len(cu)),
-                mode="edge").astype(np.int32)
+    cu = np.pad(cu, (0, max_num_seqs + 1 - len(cu)), mode="edge").astype(np.int32)
     pages_per_seq = max(int(np.ceil(max(kv_lens_l) / page_size)), 1)
     pool = np.arange(num_blocks, dtype=np.int32)
     np.random.default_rng(seed).shuffle(pool)
-    page_indices = pool[:max_num_seqs * pages_per_seq].astype(np.int32)
+    page_indices = pool[: max_num_seqs * pages_per_seq].astype(np.int32)
     rng = np.random.default_rng(seed)
     return dict(
-        q=rng.standard_normal((max_tokens, num_q_heads, head_dim),
-                              dtype=np.float32),
-        k=rng.standard_normal((max_tokens, num_kv_heads, head_dim),
-                              dtype=np.float32),
-        v=rng.standard_normal((max_tokens, num_kv_heads, head_dim),
-                              dtype=np.float32),
+        q=rng.standard_normal((max_tokens, num_q_heads, head_dim), dtype=np.float32),
+        k=rng.standard_normal((max_tokens, num_kv_heads, head_dim), dtype=np.float32),
+        v=rng.standard_normal((max_tokens, num_kv_heads, head_dim), dtype=np.float32),
         kv_lens=np.asarray(kv_lens_l, dtype=np.int32),
         page_indices=page_indices,
         cu_q_lens=cu,
@@ -93,13 +96,15 @@ def _workload(c, scenario, seed=0):
 
 
 def _to_jax_workload(wl_np, dtype):
-    return dict(q=jnp.asarray(wl_np["q"], dtype=dtype),
-                k=jnp.asarray(wl_np["k"], dtype=dtype),
-                v=jnp.asarray(wl_np["v"], dtype=dtype),
-                kv_lens=jnp.asarray(wl_np["kv_lens"]),
-                page_indices=jnp.asarray(wl_np["page_indices"]),
-                cu_q_lens=jnp.asarray(wl_np["cu_q_lens"]),
-                distribution=jnp.asarray(wl_np["distribution"]))
+    return dict(
+        q=jnp.asarray(wl_np["q"], dtype=dtype),
+        k=jnp.asarray(wl_np["k"], dtype=dtype),
+        v=jnp.asarray(wl_np["v"], dtype=dtype),
+        kv_lens=jnp.asarray(wl_np["kv_lens"]),
+        page_indices=jnp.asarray(wl_np["page_indices"]),
+        cu_q_lens=jnp.asarray(wl_np["cu_q_lens"]),
+        distribution=jnp.asarray(wl_np["distribution"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,30 +114,35 @@ def _to_jax_workload(wl_np, dtype):
 
 @jax.jit
 def _rpa_layer(kv, q, k, v, kv_lens, page_indices, cu_q_lens, distribution):
-    return ragged_paged_attention(q,
-                                  k,
-                                  v,
-                                  kv,
-                                  kv_lens,
-                                  page_indices,
-                                  cu_q_lens,
-                                  distribution,
-                                  sm_scale=1.0 / (q.shape[-1]**0.5))
+    return ragged_paged_attention(
+        q,
+        k,
+        v,
+        kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=1.0 / (q.shape[-1] ** 0.5),
+    )
 
 
 @jax.jit
-def _rpa_bundled(bundle, layer_idx, q, k, v, kv_lens, page_indices, cu_q_lens,
-                 distribution):
-    return ragged_paged_attention_bundled(q,
-                                          k,
-                                          v,
-                                          bundle,
-                                          layer_idx,
-                                          kv_lens,
-                                          page_indices,
-                                          cu_q_lens,
-                                          distribution,
-                                          sm_scale=1.0 / (q.shape[-1]**0.5))
+def _rpa_bundled(
+    bundle, layer_idx, q, k, v, kv_lens, page_indices, cu_q_lens, distribution
+):
+    return ragged_paged_attention_bundled(
+        q,
+        k,
+        v,
+        bundle,
+        layer_idx,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=1.0 / (q.shape[-1] ** 0.5),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,38 +156,54 @@ def test_bundled_matches_layer_major(scenario):
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
-    init_np = np.random.default_rng(0).standard_normal((c["num_layers"], ) +
-                                                       pls).astype(np.float32)
+    init_np = (
+        np.random.default_rng(0)
+        .standard_normal((c["num_layers"],) + pls)
+        .astype(np.float32)
+    )
     wl_np = _workload(c, scenario, seed=1)
 
     for layer in range(c["num_layers"]):
         # Layer-major reference: fresh per-layer tensor + fresh inputs.
         kv_ref = jnp.asarray(init_np[layer], dtype=c["kv_dtype"])
         w_ref = _to_jax_workload(wl_np, c["kv_dtype"])
-        out_ref, new_kv_ref = _rpa_layer(kv_ref, w_ref["q"], w_ref["k"],
-                                         w_ref["v"], w_ref["kv_lens"],
-                                         w_ref["page_indices"],
-                                         w_ref["cu_q_lens"],
-                                         w_ref["distribution"])
+        out_ref, new_kv_ref = _rpa_layer(
+            kv_ref,
+            w_ref["q"],
+            w_ref["k"],
+            w_ref["v"],
+            w_ref["kv_lens"],
+            w_ref["page_indices"],
+            w_ref["cu_q_lens"],
+            w_ref["distribution"],
+        )
 
         # Bundled: fresh bundle in block-major layout (num_blocks at
         # dim 0, num_layers at dim 1) + fresh inputs.
         bundle = jnp.asarray(init_np, dtype=c["kv_dtype"]).swapaxes(0, 1)
         w_b = _to_jax_workload(wl_np, c["kv_dtype"])
-        out_b, new_bundle = _rpa_bundled(bundle,
-                                         jnp.asarray(layer, dtype=jnp.int32),
-                                         w_b["q"], w_b["k"], w_b["v"],
-                                         w_b["kv_lens"], w_b["page_indices"],
-                                         w_b["cu_q_lens"], w_b["distribution"])
+        out_b, new_bundle = _rpa_bundled(
+            bundle,
+            jnp.asarray(layer, dtype=jnp.int32),
+            w_b["q"],
+            w_b["k"],
+            w_b["v"],
+            w_b["kv_lens"],
+            w_b["page_indices"],
+            w_b["cu_q_lens"],
+            w_b["distribution"],
+        )
 
         np.testing.assert_array_equal(
             np.asarray(out_ref),
             np.asarray(out_b),
-            err_msg=f"output differs at layer {layer} ({scenario})")
+            err_msg=f"output differs at layer {layer} ({scenario})",
+        )
         np.testing.assert_array_equal(
             np.asarray(new_kv_ref),
             np.asarray(new_bundle[:, layer, ...]),
-            err_msg=f"per-layer kv differs at layer {layer} ({scenario})")
+            err_msg=f"per-layer kv differs at layer {layer} ({scenario})",
+        )
 
 
 def test_bundled_donation_chain():
@@ -185,8 +211,11 @@ def test_bundled_donation_chain():
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
-    init_np = np.random.default_rng(7).standard_normal((c["num_layers"], ) +
-                                                       pls).astype(np.float32)
+    init_np = (
+        np.random.default_rng(7)
+        .standard_normal((c["num_layers"],) + pls)
+        .astype(np.float32)
+    )
     wl_np = _workload(c, "mixed", seed=2)
 
     bundle = jnp.asarray(init_np, dtype=c["kv_dtype"]).swapaxes(0, 1)
@@ -194,10 +223,17 @@ def test_bundled_donation_chain():
     # the new bundle. This is the production access pattern.
     for layer in range(c["num_layers"]):
         w = _to_jax_workload(wl_np, c["kv_dtype"])
-        _, bundle = _rpa_bundled(bundle, jnp.asarray(layer, dtype=jnp.int32),
-                                 w["q"], w["k"], w["v"], w["kv_lens"],
-                                 w["page_indices"], w["cu_q_lens"],
-                                 w["distribution"])
+        _, bundle = _rpa_bundled(
+            bundle,
+            jnp.asarray(layer, dtype=jnp.int32),
+            w["q"],
+            w["k"],
+            w["v"],
+            w["kv_lens"],
+            w["page_indices"],
+            w["cu_q_lens"],
+            w["distribution"],
+        )
     jax.tree_util.tree_map(lambda x: x.block_until_ready(), bundle)
 
     # Reference for each layer using a fresh per-layer call from the same
@@ -205,13 +241,21 @@ def test_bundled_donation_chain():
     for layer in range(c["num_layers"]):
         kv_ref = jnp.asarray(init_np[layer], dtype=c["kv_dtype"])
         w_ref = _to_jax_workload(wl_np, c["kv_dtype"])
-        _, new_kv_ref = _rpa_layer(kv_ref, w_ref["q"], w_ref["k"], w_ref["v"],
-                                   w_ref["kv_lens"], w_ref["page_indices"],
-                                   w_ref["cu_q_lens"], w_ref["distribution"])
+        _, new_kv_ref = _rpa_layer(
+            kv_ref,
+            w_ref["q"],
+            w_ref["k"],
+            w_ref["v"],
+            w_ref["kv_lens"],
+            w_ref["page_indices"],
+            w_ref["cu_q_lens"],
+            w_ref["distribution"],
+        )
         np.testing.assert_array_equal(
             np.asarray(new_kv_ref),
             np.asarray(bundle[:, layer, ...]),
-            err_msg=f"chained donation: layer {layer} bundle slot diverged")
+            err_msg=f"chained donation: layer {layer} bundle slot diverged",
+        )
 
 
 def test_bundled_does_not_touch_other_layers():
@@ -219,17 +263,27 @@ def test_bundled_does_not_touch_other_layers():
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
-    init_np = np.random.default_rng(11).standard_normal((c["num_layers"], ) +
-                                                        pls).astype(np.float32)
+    init_np = (
+        np.random.default_rng(11)
+        .standard_normal((c["num_layers"],) + pls)
+        .astype(np.float32)
+    )
     wl_np = _workload(c, "mixed", seed=3)
 
     target = 3
     bundle = jnp.asarray(init_np, dtype=c["kv_dtype"]).swapaxes(0, 1)
     w = _to_jax_workload(wl_np, c["kv_dtype"])
-    _, new_bundle = _rpa_bundled(bundle, jnp.asarray(target, dtype=jnp.int32),
-                                 w["q"], w["k"], w["v"], w["kv_lens"],
-                                 w["page_indices"], w["cu_q_lens"],
-                                 w["distribution"])
+    _, new_bundle = _rpa_bundled(
+        bundle,
+        jnp.asarray(target, dtype=jnp.int32),
+        w["q"],
+        w["k"],
+        w["v"],
+        w["kv_lens"],
+        w["page_indices"],
+        w["cu_q_lens"],
+        w["distribution"],
+    )
     for layer in range(c["num_layers"]):
         if layer == target:
             continue
@@ -237,7 +291,8 @@ def test_bundled_does_not_touch_other_layers():
         np.testing.assert_array_equal(
             np.asarray(new_bundle[:, layer, ...]),
             np.asarray(jnp.asarray(init_np[layer], dtype=c["kv_dtype"])),
-            err_msg=f"bundled call touched untargeted layer {layer}")
+            err_msg=f"bundled call touched untargeted layer {layer}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +308,20 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     """
     _require_tpu()
     from vllm_torchtpu.layers.core.attention_interface import (
-        AttentionMetadata, attention, attention_bundled)
+        AttentionMetadata,
+        attention,
+        attention_bundled,
+    )
 
     c = _cfg()
     pls = _per_layer_shape(c)
-    init_np = np.random.default_rng(5).standard_normal((c["num_layers"], ) +
-                                                       pls).astype(np.float32)
+    init_np = (
+        np.random.default_rng(5)
+        .standard_normal((c["num_layers"],) + pls)
+        .astype(np.float32)
+    )
     wl_np = _workload(c, "mixed", seed=6)
-    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("model", ))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("model",))
 
     def _metadata(w):
         return AttentionMetadata(
@@ -307,11 +368,13 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     np.testing.assert_array_equal(
         np.asarray(out_ref),
         np.asarray(out_b),
-        err_msg="non-default-param output differs from layer-major")
+        err_msg="non-default-param output differs from layer-major",
+    )
     np.testing.assert_array_equal(
         np.asarray(new_kv_ref),
         np.asarray(new_bundle[:, layer, ...]),
-        err_msg="non-default-param kv update differs from layer-major")
+        err_msg="non-default-param kv update differs from layer-major",
+    )
 
     # Parameter sensitivity check: verify that non-default attention parameters alter
     # the computed output rather than silently falling back to default values.
@@ -328,4 +391,5 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     )
     assert not np.array_equal(np.asarray(out_default), np.asarray(out_b)), (
         "non-default sm_scale/soft_cap produced the default-param output — "
-        "the bundled interface dropped attention parameters")
+        "the bundled interface dropped attention parameters"
+    )

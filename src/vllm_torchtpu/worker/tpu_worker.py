@@ -13,13 +13,17 @@ import torch.profiler
 import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
-                                          get_kv_transfer_group,
-                                          has_kv_transfer_group)
-from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
-                                             get_pp_group,
-                                             get_tensor_model_parallel_rank,
-                                             init_distributed_environment)
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.parallel_state import (
+    ensure_model_parallel_initialized,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    init_distributed_environment,
+)
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -28,7 +32,10 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import (
-    pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
+    pcp_topology_order,
+    resolve_pcp_topology_order,
+    verify_pcp_topology_order,
+)
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -40,13 +47,17 @@ logger = init_logger(__name__)
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
     transfer_rank = getattr(metadata, "transfer_rank", None)
-    rank = (int(transfer_rank) if transfer_rank is not None else int(
-        get_tensor_model_parallel_rank()))
+    rank = (
+        int(transfer_rank)
+        if transfer_rank is not None
+        else int(get_tensor_model_parallel_rank())
+    )
     return get_pp_group().rank_in_group, rank
 
 
-def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
-                               local_world_size: int) -> None:
+def _configure_tpu_process_env(
+    rank: int, local_rank: int, world_size: int, local_world_size: int
+) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
@@ -57,7 +68,6 @@ def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
 
 
 class TPUWorker(WorkerBase):
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -73,13 +83,16 @@ class TPUWorker(WorkerBase):
         patch_registry.apply("worker_init")
         # This process creates the worker's reply ring to the engine.
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
+
         widen_message_rings(vllm_config)
 
-        super().__init__(vllm_config=vllm_config,
-                         local_rank=local_rank,
-                         rank=rank,
-                         distributed_init_method=distributed_init_method,
-                         is_driver_worker=is_driver_worker)
+        super().__init__(
+            vllm_config=vllm_config,
+            local_rank=local_rank,
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            is_driver_worker=is_driver_worker,
+        )
 
         # Multi-host object-storage serve: ranks on hosts other than the API
         # server's receive a model_config.model rewritten to a local aux-file
@@ -104,12 +117,15 @@ class TPUWorker(WorkerBase):
 
         if self.cache_config.cache_dtype == "auto":
             model_dtype = self.model_config.dtype
-            self.kv_cache_dtype = (TPU_STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
-                                   if isinstance(model_dtype, str) else
-                                   model_dtype)
+            self.kv_cache_dtype = (
+                TPU_STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+                if isinstance(model_dtype, str)
+                else model_dtype
+            )
         else:
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
-                self.cache_config.cache_dtype]
+                self.cache_config.cache_dtype
+            ]
 
         # TPU profiler: every worker captures the chips it owns into its own
         # sandbox, and the captures are merged into one run directory on stop
@@ -130,8 +146,9 @@ class TPUWorker(WorkerBase):
         torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
         if torch_profiler_dir:
             self.profile_dir = torch_profiler_dir
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        self.profile_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s", self.profile_dir
+            )
 
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         # TPU resolves before model load because layout determines its page
@@ -145,8 +162,7 @@ class TPUWorker(WorkerBase):
             )
         super().set_kv_cache_layout(kv_cache_layout)
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
@@ -166,11 +182,13 @@ class TPUWorker(WorkerBase):
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
         pcp_size = pc.prefill_context_parallel_size
-        binding = get_tpu_worker_binding(pc,
-                                         self.rank,
-                                         self.local_rank,
-                                         env=os.environ,
-                                         use_spawned_pcp_local_rank=True)
+        binding = get_tpu_worker_binding(
+            pc,
+            self.rank,
+            self.local_rank,
+            env=os.environ,
+            use_spawned_pcp_local_rank=True,
+        )
         # Slice-global rank: unique per worker process across DP replicas and
         # TP/PP ranks, which is what trace filenames must be keyed on. Set
         # before TPUModelRunner is built below, since the phased profiler
@@ -199,8 +217,7 @@ class TPUWorker(WorkerBase):
                 pc.data_parallel_rank = 0
                 pc.data_parallel_rank_local = 0
 
-            master_addr = os.environ.get("TORCH_TPU_DP_MASTER_ADDR",
-                                         "localhost")
+            master_addr = os.environ.get("TORCH_TPU_DP_MASTER_ADDR", "localhost")
             master_port = os.environ["TORCH_TPU_DP_MASTER_PORT"]
             os.environ.update(binding.as_env())
             os.environ["MASTER_ADDR"] = str(master_addr)
@@ -253,34 +270,39 @@ class TPUWorker(WorkerBase):
                 # deterministically out of the same parent-established list
                 # every sibling worker also inherited.
                 full_sb_addresses = os.environ.get(
-                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", "")
-                sb_addresses = full_sb_addresses.split(
-                    ",") if full_sb_addresses else []
+                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", ""
+                )
+                sb_addresses = full_sb_addresses.split(",") if full_sb_addresses else []
                 start = dp_rank * per_engine_world
-                my_sb_addresses = sb_addresses[start:start + per_engine_world]
+                my_sb_addresses = sb_addresses[start : start + per_engine_world]
                 if len(my_sb_addresses) == per_engine_world:
                     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-                        my_sb_addresses)
+                        my_sb_addresses
+                    )
                 else:
                     logger.warning(
                         "Expected %d slicebuilder addresses for dp_rank=%d "
                         "at offset %d, found %d in inherited list %r; "
                         "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
-                        per_engine_world, dp_rank, start, len(my_sb_addresses),
-                        full_sb_addresses)
+                        per_engine_world,
+                        dp_rank,
+                        start,
+                        len(my_sb_addresses),
+                        full_sb_addresses,
+                    )
                 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-                os.environ["TORCH_TPU_TOPOLOGY"] = \
-                    TpuPlatform._get_tpu_topology(per_engine_world)
+
+                os.environ["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(
+                    per_engine_world
+                )
                 # Request this worker's own physical chip explicitly,
                 # instead of relying on the flattened-rank chip binding EP
                 # uses, so independent replicas don't contend for the same
                 # chips. Both TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES must
                 # be set -- TorchTPU only honors the chip pin under the
                 # RANK/WORLD_SIZE distributed bootstrap when both agree.
-                os.environ["TPU_VISIBLE_CHIPS"] = str(
-                    binding.native_local_rank)
-                os.environ["TPU_VISIBLE_DEVICES"] = str(
-                    binding.native_local_rank)
+                os.environ["TPU_VISIBLE_CHIPS"] = str(binding.native_local_rank)
+                os.environ["TPU_VISIBLE_DEVICES"] = str(binding.native_local_rank)
                 os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
@@ -320,7 +342,8 @@ class TPUWorker(WorkerBase):
             else:
                 raise ValueError(
                     "Expected tcp://<host>:<port> or file://<path> "
-                    f"distributed_init_method, got: {dist_init_method!r}")
+                    f"distributed_init_method, got: {dist_init_method!r}"
+                )
             if pcp_size > 1:
                 logger.info(
                     "PCP native-rank TPU binding | rank=%d "
@@ -340,28 +363,31 @@ class TPUWorker(WorkerBase):
                 dist_world_size = binding.world_size
                 os.environ.update(binding.as_env())
             else:
-                local_world = os.environ.get(
-                    "LOCAL_WORLD_SIZE") or pc.world_size
+                local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
                 debug_local_rank_offset = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
-                tpu_local_rank_env = (local_rank_for_init +
-                                      debug_local_rank_offset)
+                tpu_local_rank_env = local_rank_for_init + debug_local_rank_offset
                 tpu_local_world = int(local_world)
                 if debug_local_rank_offset:
                     tpu_local_world = max(
-                        tpu_local_world,
-                        debug_local_rank_offset + pc.world_size)
+                        tpu_local_world, debug_local_rank_offset + pc.world_size
+                    )
                     logger.info(
                         "DEBUG TPU local rank offset applied: rank=%d "
                         "local_rank=%d DEBUG_TPU_LOCAL_RANK_OFFSET=%d -> "
-                        "tpu_local_rank=%d tpu_local_world=%d", self.rank,
-                        self.local_rank, debug_local_rank_offset,
-                        tpu_local_rank_env, tpu_local_world)
+                        "tpu_local_rank=%d tpu_local_world=%d",
+                        self.rank,
+                        self.local_rank,
+                        debug_local_rank_offset,
+                        tpu_local_rank_env,
+                        tpu_local_world,
+                    )
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
-                _configure_tpu_process_env(self.rank, tpu_local_rank_env,
-                                           pc.world_size, tpu_local_world)
+                _configure_tpu_process_env(
+                    self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
+                )
             if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
@@ -377,8 +403,8 @@ class TPUWorker(WorkerBase):
             self.devices = [torch.device("tpu")]
 
         from vllm.platforms import current_platform
-        dist_backend = current_platform.get_worker_distributed_backend(
-            dist_world_size)
+
+        dist_backend = current_platform.get_worker_distributed_backend(dist_world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
@@ -393,16 +419,15 @@ class TPUWorker(WorkerBase):
         # group, so this is the first point it can be asked -- and the last
         # point the answer can still be applied.
         group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
-        with set_current_vllm_config(self.vllm_config), \
-                pcp_topology_order(group_ranks_by_name):
+        with (
+            set_current_vllm_config(self.vllm_config),
+            pcp_topology_order(group_ranks_by_name),
+        ):
             ensure_model_parallel_initialized(
-                tensor_model_parallel_size=self.parallel_config.
-                tensor_parallel_size,
-                pipeline_model_parallel_size=self.parallel_config.
-                pipeline_parallel_size,
+                tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
+                pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
-                decode_context_model_parallel_size=self.parallel_config.
-                decode_context_parallel_size,
+                decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
         # The patch above substitutes rank lists on the way in; this reads the
         # built groups back, so a patch that silently stopped applying fails
@@ -418,13 +443,16 @@ class TPUWorker(WorkerBase):
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
-            profiler_world_size=self.profile_world_size)
-        logger.info(f"Init worker | "
-                    f"rank={self.rank} | "
-                    f"is_first_rank={is_first_rank} | "
-                    f"is_last_rank={is_last_rank} | "
-                    f"node_id={dist_utils.get_node_id()} | "
-                    f"is_driver_worker={self.is_driver_worker} | ")
+            profiler_world_size=self.profile_world_size,
+        )
+        logger.info(
+            f"Init worker | "
+            f"rank={self.rank} | "
+            f"is_first_rank={is_first_rank} | "
+            f"is_last_rank={is_last_rank} | "
+            f"node_id={dist_utils.get_node_id()} | "
+            f"is_driver_worker={self.is_driver_worker} | "
+        )
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
 
@@ -433,14 +461,16 @@ class TPUWorker(WorkerBase):
         # setup, users can run vllm without this flag, and collect the
         # total_hbm_avail_gb value logged later in this function.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            msg = ("kv_cache_memory_bytes in cache_config is specified."
-                   "This does not respect the gpu_memory_utilization config. "
-                   "Only use kv_cache_memory_bytes config "
-                   "when you want manual control of KV cache memory size. "
-                   "If OOM'ed, check the difference of initial free "
-                   "memory between the current run and the previous run "
-                   "where kv_cache_memory_bytes is suggested and update it "
-                   "correspondingly.")
+            msg = (
+                "kv_cache_memory_bytes in cache_config is specified."
+                "This does not respect the gpu_memory_utilization config. "
+                "Only use kv_cache_memory_bytes config "
+                "when you want manual control of KV cache memory size. "
+                "If OOM'ed, check the difference of initial free "
+                "memory between the current run and the previous run "
+                "where kv_cache_memory_bytes is suggested and update it "
+                "correspondingly."
+            )
             logger.info(msg)
             return kv_cache_memory_bytes
 
@@ -457,28 +487,32 @@ class TPUWorker(WorkerBase):
         # to reserve and subtract from the KV-cache budget. Returns 0 if no
         # connector needs a reserve. The connector owns the size formula.
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config)
+            self.vllm_config
+        )
         available = budget.available - kv_connector_hbm_reserve
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
-        kv_connector_hbm_reserve_gb = round(
-            kv_connector_hbm_reserve / utils.GBYTES, 2)
+        kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
-        logger.info(f"Memory statistics | "
-                    f"{total_hbm_limit_gb=}GiB | "
-                    f"{total_hbm_limit_cap_gb=}GiB | "
-                    f"{total_hbm_used_gb=}GiB | "
-                    f"{kv_connector_hbm_reserve_gb=}GiB | "
-                    f"{total_hbm_avail_gb=}GiB")
+        logger.info(
+            f"Memory statistics | "
+            f"{total_hbm_limit_gb=}GiB | "
+            f"{total_hbm_limit_cap_gb=}GiB | "
+            f"{total_hbm_used_gb=}GiB | "
+            f"{kv_connector_hbm_reserve_gb=}GiB | "
+            f"{total_hbm_avail_gb=}GiB"
+        )
 
         if available <= 0:
-            raise ValueError(f"{total_hbm_used_gb=}GiB exceeds "
-                             f"{total_hbm_limit_cap_gb=}GiB by "
-                             f"{-total_hbm_avail_gb}GiB. Please consider "
-                             f"increasing --gpu-memory-utilization from "
-                             f"{gpu_memory_utilization} to a larger value.")
+            raise ValueError(
+                f"{total_hbm_used_gb=}GiB exceeds "
+                f"{total_hbm_limit_cap_gb=}GiB by "
+                f"{-total_hbm_avail_gb}GiB. Please consider "
+                f"increasing --gpu-memory-utilization from "
+                f"{gpu_memory_utilization} to a larger value."
+            )
         return available
 
     def execute_model(self, scheduler_output):
@@ -507,18 +541,18 @@ class TPUWorker(WorkerBase):
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.
             dummy_tokens = runner.num_tokens_paddings[0]
-            runner._dummy_run(dummy_tokens,
-                              runner.num_reqs_max_model_len,
-                              runner.max_num_blocks_per_req,
-                              use_max_model_len=True)
+            runner._dummy_run(
+                dummy_tokens,
+                runner.num_reqs_max_model_len,
+                runner.max_num_blocks_per_req,
+                use_max_model_len=True,
+            )
             return
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)
 
-    def profile(self,
-                is_start: bool = True,
-                profile_prefix: str | None = None):
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         if envs.USE_PHASED_PROFILER:
             # A phased run captures one trace per inference phase rather than
             # a single continuous one, driven from TPUModelRunner since phase
@@ -536,30 +570,32 @@ class TPUWorker(WorkerBase):
 
         if is_start:
             if self.profile_context is not None:
-                logger.warning(
-                    "Profiler is already running. Ignoring start request.")
+                logger.warning("Profiler is already running. Ignoring start request.")
                 return
-            from vllm_torchtpu.tracing.options import \
-                resolve_profile_dir_and_opts
+            from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
+
             profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
-                self.profile_dir, profile_prefix)
+                self.profile_dir, profile_prefix
+            )
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
             self.profile_run_dir = profile_dir
             self.profile_session_key = self._next_profile_session_key()
             self.profile_canonical_ts = profiler_trace.resolve_canonical_dst_ts(
-                profile_dir,
-                self.profile_rank,
-                session_key=self.profile_session_key)
+                profile_dir, self.profile_rank, session_key=self.profile_session_key
+            )
             self.profile_capture_dir = profiler_trace.rank_capture_dir(
-                profile_dir, self.profile_rank)
+                profile_dir, self.profile_rank
+            )
             os.makedirs(self.profile_capture_dir, exist_ok=True)
 
-            logger.info("Starting TorchTPU profiler trace at %s...",
-                        self.profile_capture_dir)
+            logger.info(
+                "Starting TorchTPU profiler trace at %s...", self.profile_capture_dir
+            )
             handler = torch.profiler.tensorboard_trace_handler(
-                dir_name=self.profile_capture_dir, use_gzip=True)
+                dir_name=self.profile_capture_dir, use_gzip=True
+            )
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
                 host_tracer_level=standard_opts["host_tracer_level"],
@@ -582,8 +618,7 @@ class TPUWorker(WorkerBase):
                 raise
         else:
             if self.profile_context is None:
-                logger.warning(
-                    "Profiler context is not set. Cannot stop profiler.")
+                logger.warning("Profiler context is not set. Cannot stop profiler.")
                 return
             logger.info("Stopping TorchTPU profiler trace...")
             try:
@@ -606,7 +641,8 @@ class TPUWorker(WorkerBase):
                 )
                 if self.profile_rank == 0:
                     profiler_trace.clear_canonical_ts_marker(
-                        profile_dir, self.profile_session_key)
+                        profile_dir, self.profile_session_key
+                    )
             logger.info("Profiler trace saved to %s", profile_dir)
             self.profile_run_dir = None
             self.profile_capture_dir = None
@@ -620,8 +656,7 @@ class TPUWorker(WorkerBase):
         keeps back-to-back runs into the same directory from reusing an
         earlier run's marker.
         """
-        key = (f"{profiler_trace.profile_session_id()}"
-               f"_{self.profile_session_index}")
+        key = f"{profiler_trace.profile_session_id()}_{self.profile_session_index}"
         self.profile_session_index += 1
         return key
 
@@ -653,8 +688,7 @@ class TPUWorker(WorkerBase):
         kernel compile instead.
         """
         if not envs.TPU_KERNEL_ITER_MODE:
-            raise RuntimeError(
-                "reload_kernels requires TPU_KERNEL_ITER_MODE=1")
+            raise RuntimeError("reload_kernels requires TPU_KERNEL_ITER_MODE=1")
         from vllm_torchtpu.compilation import kernel_reload
 
         start = time.perf_counter()
@@ -694,15 +728,16 @@ class TPUWorker(WorkerBase):
         n_cfg = dist_utils.get_transfer_channel_number()
         n_channels = tp_size if n_cfg <= 0 else min(n_cfg, tp_size)
         n_channels = max(1, n_channels)
-        base_port = int(
-            dist_utils.get_kv_transfer_port()) + node_id * n_channels
+        base_port = int(dist_utils.get_kv_transfer_port()) + node_id * n_channels
         return (node_id, ip, base_port)
 
-    def sync_weights(self,
-                     updated_weights,
-                     mappings: dict[str, tuple[str, tuple[str]]],
-                     transpose_keys: dict[str, tuple[int]],
-                     reshard_fn=None) -> None:
+    def sync_weights(
+        self,
+        updated_weights,
+        mappings: dict[str, tuple[str, tuple[str]]],
+        transpose_keys: dict[str, tuple[int]],
+        reshard_fn=None,
+    ) -> None:
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,
             mappings=mappings,

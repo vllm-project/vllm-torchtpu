@@ -22,7 +22,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
 
 class MetadataTest(parameterized.TestCase):
-
     @parameterized.named_parameters(
         (
             "standard_decode",
@@ -132,18 +131,18 @@ class MetadataTest(parameterized.TestCase):
 
         # Check start_seq_idx is batch_tile_idx per tile
         np.testing.assert_array_equal(
-            np.array(meta.start_seq_idx)[:6], [0, 0, 2, 2, 2, 2])
+            np.array(meta.start_seq_idx)[:6], [0, 0, 2, 2, 2, 2]
+        )
 
         # For tile 0 (seq 0..1): max(64, 128) = 128 -> nbkv=2 (bkv 0..1)
         # For tile 1 (seq 2..3): max(256, 32) = 256 -> nbkv=4 (bkv 0..3)
         # Total tiles = 2 + 4 = 6
         self.assertEqual(int(meta.num_steps[0]), 6)
         np.testing.assert_array_equal(
-            np.array(meta.batch_tile_idx)[:6], [0, 0, 2, 2, 2, 2])
-        np.testing.assert_array_equal(
-            np.array(meta.bq_idx)[:6], [0, 0, 0, 0, 0, 0])
-        np.testing.assert_array_equal(
-            np.array(meta.bkv_idx)[:6], [0, 1, 0, 1, 2, 3])
+            np.array(meta.batch_tile_idx)[:6], [0, 0, 2, 2, 2, 2]
+        )
+        np.testing.assert_array_equal(np.array(meta.bq_idx)[:6], [0, 0, 0, 0, 0, 0])
+        np.testing.assert_array_equal(np.array(meta.bkv_idx)[:6], [0, 1, 0, 1, 2, 3])
 
     def test_compute_per_seq_metadata_prefill(self):
         seq_lens = jnp.array([128, 256], dtype=jnp.int32)
@@ -168,16 +167,14 @@ class MetadataTest(parameterized.TestCase):
             static_q_len=None,
         )
 
-        np.testing.assert_array_equal(
-            np.array(meta.start_seq_idx)[:4], [0, 0, 0, 0])
+        np.testing.assert_array_equal(np.array(meta.start_seq_idx)[:4], [0, 0, 0, 0])
 
         # seq 0: q_len=64 -> nbq=2 (bq 0..1), kv_len=128 -> nbkv=2 (bkv 0..1) => 4 tiles
         # seq 1: q_len=192 -> nbq=6 (bq 0..5), kv_len=256 -> nbkv=4 (bkv 0..3) => 24 tiles
         # Total tiles = 4 + 24 = 28
         self.assertEqual(int(meta.num_steps[0]), 28)
         # Check seq 0 tiles (first 4)
-        np.testing.assert_array_equal(
-            np.array(meta.batch_tile_idx)[:4], [0, 0, 0, 0])
+        np.testing.assert_array_equal(np.array(meta.batch_tile_idx)[:4], [0, 0, 0, 0])
         np.testing.assert_array_equal(np.array(meta.bq_idx)[:4], [0, 0, 1, 1])
         np.testing.assert_array_equal(np.array(meta.bkv_idx)[:4], [0, 1, 0, 1])
 
@@ -186,7 +183,8 @@ class MetadataTest(parameterized.TestCase):
         S_list = [128, 64, 32, 256, 128, 128, 64, 32, 256, 128, 32, 64, 256]
         seq_lens = jnp.array(S_list, dtype=jnp.int32)
         cu_q_lens = jnp.array(
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 266, 268, 276], dtype=jnp.int32)
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 266, 268, 276], dtype=jnp.int32
+        )
         bq_sz = 64
         bkv_p = 2
         page_size = 64
@@ -292,20 +290,23 @@ class MetadataTest(parameterized.TestCase):
                 start_s = int(meta.start_seq_idx[p])
                 bq = int(meta.bq_idx[p])
                 bkv = int(meta.bkv_idx[p])
-                seq_str = (f"seqs {s_idx}..{s_idx + 3}"
-                           if "Batched" in label else f"seq {s_idx}")
-                schedule.append((
-                    tile_count,
-                    f"{label} ({seq_str}) [start_seq={start_s}]",
-                    bq,
-                    bkv,
-                ))
+                seq_str = (
+                    f"seqs {s_idx}..{s_idx + 3}"
+                    if "Batched" in label
+                    else f"seq {s_idx}"
+                )
+                schedule.append(
+                    (
+                        tile_count,
+                        f"{label} ({seq_str}) [start_seq={start_s}]",
+                        bq,
+                        bkv,
+                    )
+                )
                 tile_count += 1
 
         for tile_id, phase, bq, bkv in schedule:
-            print(
-                f"Tile {tile_id:02d}: {phase:<38s} | bq_idx={bq} | bkv_idx={bkv}"
-            )
+            print(f"Tile {tile_id:02d}: {phase:<38s} | bq_idx={bq} | bkv_idx={bkv}")
 
         print("=" * 60 + "\n")
 
@@ -367,7 +368,8 @@ class ChunkedMetadataTest(parameterized.TestCase):
         every kv block of the sequence.
         """
         cu_q_lens = np.array(
-            cu_q_lens if cu_q_lens is not None else self.CHUNK_CU_Q_LENS)
+            cu_q_lens if cu_q_lens is not None else self.CHUNK_CU_Q_LENS
+        )
         kv_lens = np.array(self.CHUNK_SEQ_LENS)
         num_bkv = np.maximum(1, -(-kv_lens // self.CHUNK_BKV_SZ))
         out = []
@@ -375,8 +377,7 @@ class ChunkedMetadataTest(parameterized.TestCase):
             steps = 0
             for s in range(len(kv_lens)):
                 lo = np.clip(start, cu_q_lens[s], cu_q_lens[s + 1])
-                hi = np.clip(start + chunk_tokens, cu_q_lens[s],
-                             cu_q_lens[s + 1])
+                hi = np.clip(start + chunk_tokens, cu_q_lens[s], cu_q_lens[s + 1])
                 steps += -(-(hi - lo) // self.CHUNK_BQ_SZ) * num_bkv[s]
             out.append(int(steps))
         return out
@@ -388,20 +389,22 @@ class ChunkedMetadataTest(parameterized.TestCase):
         `num_steps[0]` are unaffected.
         """
         self.assertEqual(
-            self._chunk_meta(None, chunk_tokens=None).num_steps.shape, (1, ))
-        self.assertEqual(self._chunk_meta(0).num_steps.shape, (1, ))
-        self.assertEqual(
-            self._chunk_meta((0, 256, 512, 768)).num_steps.shape, (4, ))
+            self._chunk_meta(None, chunk_tokens=None).num_steps.shape, (1,)
+        )
+        self.assertEqual(self._chunk_meta(0).num_steps.shape, (1,))
+        self.assertEqual(self._chunk_meta((0, 256, 512, 768)).num_steps.shape, (4,))
 
     @parameterized.named_parameters(("first_chunk", 0), ("middle_chunk", 512))
     def test_scalar_chunk_start_matches_the_one_tuple(self, start):
         """A bare int and a 1-tuple of it are the same single-chunk schedule."""
         scalar = self._chunk_meta(start)
-        tupled = self._chunk_meta((start, ))
+        tupled = self._chunk_meta((start,))
         for name in ("num_steps", "batch_tile_idx", "bq_idx", "bkv_idx"):
-            np.testing.assert_array_equal(np.array(getattr(scalar, name)),
-                                          np.array(getattr(tupled, name)),
-                                          err_msg=name)
+            np.testing.assert_array_equal(
+                np.array(getattr(scalar, name)),
+                np.array(getattr(tupled, name)),
+                err_msg=name,
+            )
 
     def test_each_chunk_slice_matches_its_standalone_schedule(self):
         """The property the kernel's `step_offset` rests on.
@@ -416,13 +419,13 @@ class ChunkedMetadataTest(parameterized.TestCase):
         for m, start in enumerate(starts):
             solo = self._chunk_meta(start)
             n = int(solo.num_steps[0])
-            self.assertEqual(int(combined.num_steps[m]), n,
-                             f"chunk {m} step count")
+            self.assertEqual(int(combined.num_steps[m]), n, f"chunk {m} step count")
             for name in ("batch_tile_idx", "bq_idx", "bkv_idx"):
                 np.testing.assert_array_equal(
-                    np.array(getattr(combined, name))[offset:offset + n],
+                    np.array(getattr(combined, name))[offset : offset + n],
                     np.array(getattr(solo, name))[:n],
-                    err_msg=f"chunk {m} at step offset {offset}: {name}")
+                    err_msg=f"chunk {m} at step offset {offset}: {name}",
+                )
             offset += n
 
     def test_aligned_chunks_are_the_unchunked_schedule_cut_up(self):
@@ -434,11 +437,11 @@ class ChunkedMetadataTest(parameterized.TestCase):
         self.assertEqual(int(plain.num_steps[0]), self.CHUNK_UNCHUNKED_STEPS)
         self.assertEqual(total, self.CHUNK_UNCHUNKED_STEPS)
         for name in ("batch_tile_idx", "bq_idx", "bkv_idx"):
-            np.testing.assert_array_equal(np.array(getattr(combined,
-                                                           name))[:total],
-                                          np.array(getattr(plain,
-                                                           name))[:total],
-                                          err_msg=name)
+            np.testing.assert_array_equal(
+                np.array(getattr(combined, name))[:total],
+                np.array(getattr(plain, name))[:total],
+                err_msg=name,
+            )
 
     @parameterized.named_parameters(
         ("two_chunks", 512),
@@ -446,8 +449,7 @@ class ChunkedMetadataTest(parameterized.TestCase):
         ("eight_chunks", 128),
         ("sixteen_chunks", 64),
     )
-    def test_whole_sweep_of_chunks_fits_and_keeps_every_step(
-            self, chunk_tokens):
+    def test_whole_sweep_of_chunks_fits_and_keeps_every_step(self, chunk_tokens):
         """`max_steps` has to scale with the chunk count, not the chunk.
 
         All the chunks live in one set of arrays now, so a bound sized for a
@@ -457,9 +459,10 @@ class ChunkedMetadataTest(parameterized.TestCase):
         meta_ = self._chunk_meta(starts, chunk_tokens=chunk_tokens)
 
         num_steps = np.array(meta_.num_steps)
-        self.assertEqual(num_steps.shape, (len(starts), ))
+        self.assertEqual(num_steps.shape, (len(starts),))
         np.testing.assert_array_equal(
-            num_steps, self._expected_num_steps(starts, chunk_tokens))
+            num_steps, self._expected_num_steps(starts, chunk_tokens)
+        )
         # Cuts are aligned here, so the split is exact however fine it gets.
         self.assertEqual(int(num_steps.sum()), self.CHUNK_UNCHUNKED_STEPS)
         self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
@@ -472,14 +475,14 @@ class ChunkedMetadataTest(parameterized.TestCase):
         """
         cu_q_lens = (0, 100, 512, 1024, 1024)
         starts = (0, 256, 512, 768)
-        meta_ = self._chunk_meta(starts,
-                                 cu_q_lens=jnp.array(cu_q_lens,
-                                                     dtype=jnp.int32))
+        meta_ = self._chunk_meta(
+            starts, cu_q_lens=jnp.array(cu_q_lens, dtype=jnp.int32)
+        )
 
         num_steps = np.array(meta_.num_steps)
         np.testing.assert_array_equal(
-            num_steps,
-            self._expected_num_steps(starts, 256, cu_q_lens=cu_q_lens))
+            num_steps, self._expected_num_steps(starts, 256, cu_q_lens=cu_q_lens)
+        )
         # Seam duplication only ever adds work, and never more than the arrays
         # can hold.
         self.assertGreaterEqual(int(num_steps.sum()), 1)

@@ -1,6 +1,6 @@
 """TPU Multi Connector wrapper for combining disagg and offloading."""
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import \
-    MultiConnector
+
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
 
 class TPUMultiConnector(MultiConnector):
@@ -45,6 +45,7 @@ class TPUMultiConnector(MultiConnector):
                 raise RuntimeError(
                     "Conflicting KV-load-error group indices across child "
                     f"connectors: {index} vs {child_index}; cannot scope "
-                    "invalid blocks to a single cache group")
+                    "invalid blocks to a single cache group"
+                )
             index = child_index
         return index

@@ -26,8 +26,7 @@ _ROUTE_BLOCK_SIZE = 128
 _VMEM_WORKSPACE_MARGIN_BYTES = 4 * 1024 * 1024
 
 
-def _explicit_vmem_bytes(route_capacity: int, hidden_size: int,
-                         num_tokens: int) -> int:
+def _explicit_vmem_bytes(route_capacity: int, hidden_size: int, num_tokens: int) -> int:
     """Size of the explicitly allocated VMEM buffers used by the kernel."""
     owner_and_store = num_tokens * hidden_size * (4 + 2)
     double_buffered_routes = 2 * _ROUTE_BLOCK_SIZE * hidden_size * 2
@@ -47,15 +46,15 @@ def can_use_blockwise_onehot_unpermute(
     if route_output.ndim != 2 or route_output.dtype != jnp.bfloat16:
         return False
     route_capacity, hidden_size = route_output.shape
-    if token_indices_sorted.shape != (route_capacity, ):
+    if token_indices_sorted.shape != (route_capacity,):
         return False
     if token_indices_sorted.dtype != jnp.int32:
         return False
-    if topk_weights_sorted.shape != (route_capacity, ):
+    if topk_weights_sorted.shape != (route_capacity,):
         return False
     if topk_weights_sorted.dtype != jnp.bfloat16:
         return False
-    if valid_count.shape != (1, ) or valid_count.dtype != jnp.int32:
+    if valid_count.shape != (1,) or valid_count.dtype != jnp.int32:
         return False
 
     tpu_info = pltpu.get_tpu_info()
@@ -67,8 +66,9 @@ def can_use_blockwise_onehot_unpermute(
         return False
     vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.9)
     required_vmem_bytes = (
-        _explicit_vmem_bytes(route_capacity, hidden_size, num_tokens) +
-        _VMEM_WORKSPACE_MARGIN_BYTES)
+        _explicit_vmem_bytes(route_capacity, hidden_size, num_tokens)
+        + _VMEM_WORKSPACE_MARGIN_BYTES
+    )
     return required_vmem_bytes <= vmem_limit_bytes
 
 
@@ -112,8 +112,7 @@ def _accumulate_route_block(
     # invalid rows before the dot. The predicate is constructed directly at
     # the 2-D route shape because Mosaic cannot lay out a [128] -> [128, 1]
     # predicate reshape.
-    route_rows = jnp.where(route_row_valid, route_rows,
-                           jnp.zeros_like(route_rows))
+    route_rows = jnp.where(route_row_valid, route_rows, jnp.zeros_like(route_rows))
 
     mxu_size = pltpu.get_tpu_info().mxu_column_size
     for n_start in range(0, route_rows.shape[-1], mxu_size):
@@ -123,8 +122,7 @@ def _accumulate_route_block(
             route_rows[:, n_start:n_end],
             preferred_element_type=jnp.float32,
         )
-        owner_ref[:,
-                  n_start:n_end] = (owner_ref[:, n_start:n_end] + block_owner)
+        owner_ref[:, n_start:n_end] = owner_ref[:, n_start:n_end] + block_owner
 
 
 def _pipeline_body(
@@ -139,18 +137,21 @@ def _pipeline_body(
 ) -> None:
     """Accumulate one HBM-streamed route block into a VMEM owner buffer."""
     block_id = pl.program_id(0)
-    route_start = pl.multiple_of(block_id * _ROUTE_BLOCK_SIZE,
-                                 _ROUTE_BLOCK_SIZE)
+    route_start = pl.multiple_of(block_id * _ROUTE_BLOCK_SIZE, _ROUTE_BLOCK_SIZE)
     route_slice = pl.ds(route_start, _ROUTE_BLOCK_SIZE)
     valid_count = jnp.clip(valid_count_ref[0], 0, route_capacity)
     route_lanes = jnp.arange(_ROUTE_BLOCK_SIZE, dtype=jnp.int32)
     route_valid = route_start + route_lanes < valid_count
     route_rows = route_block_ref[...]
-    route_row_valid = (route_start + lax.broadcasted_iota(
-        jnp.int32,
-        route_rows.shape,
-        0,
-    ) < valid_count)
+    route_row_valid = (
+        route_start
+        + lax.broadcasted_iota(
+            jnp.int32,
+            route_rows.shape,
+            0,
+        )
+        < valid_count
+    )
     _accumulate_route_block(
         route_rows,
         owner_ref,
@@ -205,10 +206,10 @@ def _kernel(
             route_capacity=route_capacity,
             num_tokens=num_tokens,
         ),
-        grid=(num_route_blocks, ),
-        in_specs=(route_block_spec, ),
+        grid=(num_route_blocks,),
+        in_specs=(route_block_spec,),
         out_specs=(),
-        dimension_semantics=("arbitrary", ),
+        dimension_semantics=("arbitrary",),
     )
     pipeline_fn(route_hbm_ref, scratches=[owner_ref])
 
@@ -235,11 +236,13 @@ def _validate_inputs(
     except TypeError as exc:
         raise TypeError("num_tokens must be a static Python integer") from exc
 
-    if not can_use_blockwise_onehot_unpermute(route_output,
-                                              token_indices_sorted,
-                                              topk_weights_sorted,
-                                              valid_count,
-                                              num_tokens=num_tokens):
+    if not can_use_blockwise_onehot_unpermute(
+        route_output,
+        token_indices_sorted,
+        topk_weights_sorted,
+        valid_count,
+        num_tokens=num_tokens,
+    ):
         raise ValueError(
             "blockwise one-hot unpermute does not support the requested "
             "dtype, shape, alignment, or VMEM requirement; got "
@@ -249,7 +252,7 @@ def _validate_inputs(
     return route_capacity, hidden_size, num_tokens
 
 
-@jax.jit(static_argnames=("num_tokens", ))
+@jax.jit(static_argnames=("num_tokens",))
 def blockwise_onehot_unpermute(
     route_output: jax.Array,
     token_indices_sorted: jax.Array,
@@ -297,15 +300,17 @@ def blockwise_onehot_unpermute(
             scratch_shapes=[
                 pltpu.VMEM((num_tokens, hidden_size), jnp.float32),
                 pltpu.VMEM((num_tokens, hidden_size), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((1, )),
+                pltpu.SemaphoreType.DMA((1,)),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=(f"blockwise_onehot_unpermute-r_{route_capacity}"
-              f"-h_{hidden_size}-t_{num_tokens}-rb_{_ROUTE_BLOCK_SIZE}"),
+        name=(
+            f"blockwise_onehot_unpermute-r_{route_capacity}"
+            f"-h_{hidden_size}-t_{num_tokens}-rb_{_ROUTE_BLOCK_SIZE}"
+        ),
         metadata={
             "onehot_unpermute.route_block_size": _ROUTE_BLOCK_SIZE,
             "onehot_unpermute.route_capacity": route_capacity,

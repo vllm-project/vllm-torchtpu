@@ -31,7 +31,9 @@ import torch
 
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    VllmFp8Config, VllmFp8LinearMethodTPU)
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+)
 
 
 def test_fp8_config_accepts_default_store_dtype():
@@ -41,31 +43,41 @@ def test_fp8_config_accepts_default_store_dtype():
 
 def test_fp8_config_rejects_store_dtype():
     with pytest.raises(NotImplementedError, match="store_dtype"):
-        VllmFp8Config.from_config({
-            "activation_scheme": "dynamic",
-            "store_dtype": "mxfp4",
-        })
+        VllmFp8Config.from_config(
+            {
+                "activation_scheme": "dynamic",
+                "store_dtype": "mxfp4",
+            }
+        )
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("block_size,shard_size,deepseek_v4",
-                         [([128, 128], 256, False), ([128, 128], 192, False),
-                          (None, 256, False), ([128, 128], 256, True)])
-def test_fp8_routed_experts_checkpoint_allocation(monkeypatch, block_size,
-                                                  shard_size, deepseek_v4):
+@pytest.mark.parametrize(
+    "block_size,shard_size,deepseek_v4",
+    [
+        ([128, 128], 256, False),
+        ([128, 128], 192, False),
+        (None, 256, False),
+        ([128, 128], 256, True),
+    ],
+)
+def test_fp8_routed_experts_checkpoint_allocation(
+    monkeypatch, block_size, shard_size, deepseek_v4
+):
     """Exercise upstream construction and loading with TPU checkpoint geometry."""
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.fused_moe.config import (
-        FusedMoEConfig, FusedMoEParallelConfig, MoEActivation,
-        RoutingMethodType)
-    from vllm.model_executor.layers.fused_moe.expert_map_manager import \
-        ExpertMapManager
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-        VllmFp8MoEMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     parallel = FusedMoEParallelConfig(
         tp_size=2,
@@ -79,59 +91,71 @@ def test_fp8_routed_experts_checkpoint_allocation(monkeypatch, block_size,
         sp_size=1,
         use_ep=False,
         all2all_backend="allgather_reducescatter",
-        enable_eplb=False)
-    config = FusedMoEConfig(num_experts=2,
-                            experts_per_token=1,
-                            hidden_dim=256,
-                            intermediate_size=2 * shard_size,
-                            num_local_experts=2,
-                            num_logical_experts=2,
-                            activation=MoEActivation.SILU,
-                            device=torch.device("cpu"),
-                            routing_method=RoutingMethodType.Renormalize,
-                            moe_parallel_config=parallel,
-                            in_dtype=torch.bfloat16)
-    expert_map = ExpertMapManager(max_num_batched_tokens=16,
-                                  top_k=1,
-                                  global_num_experts=2,
-                                  num_redundant_experts=0,
-                                  num_expert_group=None,
-                                  moe_parallel_config=parallel,
-                                  placement_strategy="linear",
-                                  enable_eplb=False)
+        enable_eplb=False,
+    )
+    config = FusedMoEConfig(
+        num_experts=2,
+        experts_per_token=1,
+        hidden_dim=256,
+        intermediate_size=2 * shard_size,
+        num_local_experts=2,
+        num_logical_experts=2,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    expert_map = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=1,
+        global_num_experts=2,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
-        "get_tensor_model_parallel_world_size", lambda: 2)
+        "get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
     quant_cls = VllmFp8Config
     if deepseek_v4:
-        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import \
-            VllmDeepseekV4Fp8Config
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+            VllmDeepseekV4Fp8Config,
+        )
+
         quant_cls = VllmDeepseekV4Fp8Config
-    quant = quant_cls(is_checkpoint_fp8_serialized=True,
-                      activation_scheme="dynamic",
-                      weight_block_size=block_size)
+    quant = quant_cls(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=block_size,
+    )
     quant.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(enable_expert_parallel=False),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(
-            expert_dtype="fp8")))
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+    )
     with set_current_vllm_config(quant.vllm_config):
-        layer = RoutedExperts(layer_name="model.layers.0.mlp.experts",
-                              params_dtype=torch.bfloat16,
-                              moe_config=config,
-                              quant_config=quant,
-                              expert_map_manager=expert_map)
+        layer = RoutedExperts(
+            layer_name="model.layers.0.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=config,
+            quant_config=quant,
+            expert_map_manager=expert_map,
+        )
 
     assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
-    padded = ((shard_size + 127) // 128 * 128 if block_size else shard_size)
+    padded = (shard_size + 127) // 128 * 128 if block_size else shard_size
     assert layer.w13_weight.shape == (2, 2 * padded, 256)
     assert layer.w2_weight.shape == (2, 256, padded)
     assert layer.w13_weight.dtype == layer.w2_weight.dtype == torch.float8_e4m3fn
     suffix = "weight_scale_inv" if block_size else "weight_scale"
     w13_scale = getattr(layer, f"w13_{suffix}")
     w2_scale = getattr(layer, f"w2_{suffix}")
-    assert w13_scale.shape == ((2, 2 * padded // 128, 2) if block_size else
-                               (2, 2))
-    assert w2_scale.shape == ((2, 2, padded // 128) if block_size else (2, ))
+    assert w13_scale.shape == ((2, 2 * padded // 128, 2) if block_size else (2, 2))
+    assert w2_scale.shape == ((2, 2, padded // 128) if block_size else (2,))
     assert w13_scale.dtype == w2_scale.dtype == torch.float32
     assert layer.w13_weight.weight_loader == layer.weight_loader
     assert w13_scale.weight_loader == layer.weight_loader
@@ -147,10 +171,12 @@ def test_fp8_routed_experts_checkpoint_allocation(monkeypatch, block_size,
 class FakeQuant:
     """Minimal quant config for testing."""
 
-    def __init__(self,
-                 weight_block_size=None,
-                 activation_scheme="dynamic",
-                 is_checkpoint_fp8_serialized=True):
+    def __init__(
+        self,
+        weight_block_size=None,
+        activation_scheme="dynamic",
+        is_checkpoint_fp8_serialized=True,
+    ):
         self.weight_block_size = weight_block_size
         self.activation_scheme = activation_scheme
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -174,24 +200,25 @@ class FakeActivation:
 class FakeFusedMoELayer(torch.nn.Module):
     """Minimal FusedMoE-like layer for testing process_weights_after_loading."""
 
-    def __init__(self,
-                 w13_weight,
-                 w2_weight,
-                 w13_scale,
-                 w2_scale,
-                 activation="silu",
-                 has_bias=False,
-                 experts_per_token=2):
+    def __init__(
+        self,
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        activation="silu",
+        has_bias=False,
+        experts_per_token=2,
+    ):
         super().__init__()
         self.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         self.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        self.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
-                                                       requires_grad=False)
-        self.w2_weight_scale_inv = torch.nn.Parameter(w2_scale,
-                                                      requires_grad=False)
+        self.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
+        self.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
         self.activation = FakeActivation(activation)
-        self.moe_config = FakeMoEConfig(has_bias=has_bias,
-                                        experts_per_token=experts_per_token)
+        self.moe_config = FakeMoEConfig(
+            has_bias=has_bias, experts_per_token=experts_per_token
+        )
 
     # Make isinstance(layer, FusedMoE) work via duck typing in the assert
     def __class_getitem__(cls, item):
@@ -201,13 +228,17 @@ class FakeFusedMoELayer(torch.nn.Module):
 class TestFp8MoEScaleReshape:
     """Tests for block-quantized FP8 MoE scale reshaping."""
 
-    @pytest.mark.parametrize("num_experts,intermediate,hidden,block_size", [
-        (4, 256, 512, 128),
-        (8, 384, 768, 128),
-        (2, 128, 256, 128),
-    ])
-    def test_scale_output_shape(self, device, num_experts, intermediate,
-                                hidden, block_size):
+    @pytest.mark.parametrize(
+        "num_experts,intermediate,hidden,block_size",
+        [
+            (4, 256, 512, 128),
+            (8, 384, 768, 128),
+            (2, 128, 256, 128),
+        ],
+    )
+    def test_scale_output_shape(
+        self, device, num_experts, intermediate, hidden, block_size
+    ):
         """Verify scales are reshaped to [E, in/B, 1, out_dim] for GMM."""
         E, inter, H, B = num_experts, intermediate, hidden, block_size
 
@@ -219,8 +250,11 @@ class TestFp8MoEScaleReshape:
         # Step 1: transpose [E, out/B, in/B] -> [E, in/B, out/B]
         w13_out = w13_scale.transpose(1, 2)
         # Step 2: expand by block_h then reshape
-        w13_out = w13_out.unsqueeze(-1).expand(*w13_out.shape, B).reshape(
-            w13_out.shape[0], w13_out.shape[1], -1)
+        w13_out = (
+            w13_out.unsqueeze(-1)
+            .expand(*w13_out.shape, B)
+            .reshape(w13_out.shape[0], w13_out.shape[1], -1)
+        )
         # Step 3: unsqueeze for GMM
         w13_out = w13_out.unsqueeze(2).to(torch.float32)
 
@@ -229,8 +263,11 @@ class TestFp8MoEScaleReshape:
 
         # Same for w2
         w2_out = w2_scale.transpose(1, 2)
-        w2_out = w2_out.unsqueeze(-1).expand(*w2_out.shape, B).reshape(
-            w2_out.shape[0], w2_out.shape[1], -1)
+        w2_out = (
+            w2_out.unsqueeze(-1)
+            .expand(*w2_out.shape, B)
+            .reshape(w2_out.shape[0], w2_out.shape[1], -1)
+        )
         w2_out = w2_out.unsqueeze(2).to(torch.float32)
 
         assert w2_out.shape == (E, inter // B, 1, H)
@@ -240,15 +277,17 @@ class TestFp8MoEScaleReshape:
         E, B = 2, 128
         out_blocks, in_blocks = 4, 2  # out=512, in=256
 
-        scale = torch.arange(E * out_blocks * in_blocks,
-                             dtype=torch.float32,
-                             device=device).reshape(E, out_blocks, in_blocks)
+        scale = torch.arange(
+            E * out_blocks * in_blocks, dtype=torch.float32, device=device
+        ).reshape(E, out_blocks, in_blocks)
 
         # Apply reshape
         out = scale.transpose(1, 2)
-        out = out.unsqueeze(-1).expand(*out.shape,
-                                       B).reshape(out.shape[0], out.shape[1],
-                                                  -1)
+        out = (
+            out.unsqueeze(-1)
+            .expand(*out.shape, B)
+            .reshape(out.shape[0], out.shape[1], -1)
+        )
         out = out.unsqueeze(2)
 
         # Shape: [E, in_blocks, 1, out_blocks * B]
@@ -258,9 +297,10 @@ class TestFp8MoEScaleReshape:
         for e in range(E):
             for ib in range(in_blocks):
                 for ob in range(out_blocks):
-                    chunk = out[e, ib, 0, ob * B:(ob + 1) * B]
-                    assert torch.all(chunk == chunk[0]), \
+                    chunk = out[e, ib, 0, ob * B : (ob + 1) * B]
+                    assert torch.all(chunk == chunk[0]), (
                         f"Scale not constant within block at e={e}, ib={ib}, ob={ob}"
+                    )
 
 
 class TestFp8LinearRuntimeQuant:
@@ -271,30 +311,26 @@ class TestFp8LinearRuntimeQuant:
         out_dim, in_dim = 256, 512
         block_h, block_w = 128, 128
 
-        weight_fp8 = torch.randn(out_dim,
-                                 in_dim,
-                                 device=device,
-                                 dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-        scale_inv = torch.ones(out_dim // block_h,
-                               in_dim // block_w,
-                               device=device,
-                               dtype=torch.float32)
+        weight_fp8 = torch.randn(
+            out_dim, in_dim, device=device, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
+        scale_inv = torch.ones(
+            out_dim // block_h, in_dim // block_w, device=device, dtype=torch.float32
+        )
 
         layer = torch.nn.Module()
         layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
-        layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
-                                                    requires_grad=False)
+        layer.weight_scale_inv = torch.nn.Parameter(scale_inv, requires_grad=False)
 
-        method = VllmFp8LinearMethodTPU(
-            FakeQuant(weight_block_size=[block_h, block_w]))
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
         # Canonical (k, n): the runtime matmul is (m, k) @ (k, n), so the
         # checkpoint's [n_out, n_in] weight is stored transposed.
         assert layer.weight.shape == (in_dim, out_dim)
         assert layer.weight.dtype == torch.float8_e4m3fn
-        assert layer.weight_scale.shape == (out_dim, )
+        assert layer.weight_scale.shape == (out_dim,)
         assert layer.weight_scale.dtype == torch.float32
         assert not hasattr(layer, "weight_scale_inv")
 
@@ -304,23 +340,20 @@ class TestFp8LinearRuntimeQuant:
         block_h, block_w = 128, 128
 
         # Use ones as FP8 weight — after dequant, result should equal scale
-        weight_fp8 = torch.ones(out_dim,
-                                in_dim,
-                                device=device,
-                                dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        weight_fp8 = torch.ones(
+            out_dim, in_dim, device=device, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
         # Set different scales per block
-        scale_inv = torch.tensor([[1.0, 2.0], [3.0, 4.0]],
-                                 device=device,
-                                 dtype=torch.float32)
+        scale_inv = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]], device=device, dtype=torch.float32
+        )
 
         layer = torch.nn.Module()
         layer.logical_widths = None
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
-        layer.weight_scale_inv = torch.nn.Parameter(scale_inv,
-                                                    requires_grad=False)
+        layer.weight_scale_inv = torch.nn.Parameter(scale_inv, requires_grad=False)
 
-        method = VllmFp8LinearMethodTPU(
-            FakeQuant(weight_block_size=[block_h, block_w]))
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
         # Weight is stored (k, n), so it indexes [in, out] and the
@@ -333,31 +366,26 @@ class TestFp8LinearRuntimeQuant:
         # scale_inv[1,0] -> w[:128, 128:]  ~3.0
         # scale_inv[0,1] -> w[128:, :128]  ~2.0
         # scale_inv[1,1] -> w[128:, 128:]  ~4.0
-        assert torch.allclose(w[:128, :128].mean(),
-                              torch.tensor(1.0, device=device),
-                              rtol=0.06,
-                              atol=0.05)
-        assert torch.allclose(w[:128, 128:].mean(),
-                              torch.tensor(3.0, device=device),
-                              rtol=0.06,
-                              atol=0.05)
-        assert torch.allclose(w[128:, :128].mean(),
-                              torch.tensor(2.0, device=device),
-                              rtol=0.06,
-                              atol=0.05)
-        assert torch.allclose(w[128:, 128:].mean(),
-                              torch.tensor(4.0, device=device),
-                              rtol=0.06,
-                              atol=0.05)
+        assert torch.allclose(
+            w[:128, :128].mean(), torch.tensor(1.0, device=device), rtol=0.06, atol=0.05
+        )
+        assert torch.allclose(
+            w[:128, 128:].mean(), torch.tensor(3.0, device=device), rtol=0.06, atol=0.05
+        )
+        assert torch.allclose(
+            w[128:, :128].mean(), torch.tensor(2.0, device=device), rtol=0.06, atol=0.05
+        )
+        assert torch.allclose(
+            w[128:, 128:].mean(), torch.tensor(4.0, device=device), rtol=0.06, atol=0.05
+        )
 
     def test_per_tensor_dequant(self, device):
         """Per-tensor (non-block) dequant should scale entire weight."""
         out_dim, in_dim = 64, 128
 
-        weight_fp8 = torch.ones(out_dim,
-                                in_dim,
-                                device=device,
-                                dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        weight_fp8 = torch.ones(
+            out_dim, in_dim, device=device, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
         scale = torch.tensor([2.5], device=device, dtype=torch.float32)
 
         layer = torch.nn.Module()
@@ -369,14 +397,14 @@ class TestFp8LinearRuntimeQuant:
         method.process_weights_after_loading(layer)
 
         assert layer.weight.dtype == torch.float8_e4m3fn
-        assert layer.weight_scale.shape == (out_dim, )
+        assert layer.weight_scale.shape == (out_dim,)
         # fp8 ones * 2.5 should be ~2.5
         # (k, n) storage: scale is per output channel, so it broadcasts
         # along the trailing axis.
         runtime_deq = layer.weight.float() * layer.weight_scale[None, :]
-        assert torch.allclose(runtime_deq.mean(),
-                              torch.tensor(2.5, device=device),
-                              atol=0.1)
+        assert torch.allclose(
+            runtime_deq.mean(), torch.tensor(2.5, device=device), atol=0.1
+        )
 
     def test_per_tensor_dequant_with_logical_widths(self, device):
         """Per-tensor dequant with multiple scales should use logical_widths repeat_interleave."""
@@ -385,13 +413,10 @@ class TestFp8LinearRuntimeQuant:
         out_dim = sum(logical_widths)
         in_dim = 128
 
-        weight_fp8 = torch.ones(out_dim,
-                                in_dim,
-                                device=device,
-                                dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-        scale = torch.tensor([1.0, 2.0, 3.0],
-                             device=device,
-                             dtype=torch.float32)
+        weight_fp8 = torch.ones(
+            out_dim, in_dim, device=device, dtype=torch.bfloat16
+        ).to(torch.float8_e4m3fn)
+        scale = torch.tensor([1.0, 2.0, 3.0], device=device, dtype=torch.float32)
 
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
@@ -402,18 +427,14 @@ class TestFp8LinearRuntimeQuant:
         method.process_weights_after_loading(layer)
 
         assert layer.weight.dtype == torch.float8_e4m3fn
-        assert layer.weight_scale.shape == (out_dim, )
+        assert layer.weight_scale.shape == (out_dim,)
 
         w = layer.weight.float() * layer.weight_scale[:, None]
-        assert torch.allclose(w[:64].mean(),
-                              torch.tensor(1.0, device=device),
-                              atol=0.1)
-        assert torch.allclose(w[64:96].mean(),
-                              torch.tensor(2.0, device=device),
-                              atol=0.1)
-        assert torch.allclose(w[96:].mean(),
-                              torch.tensor(3.0, device=device),
-                              atol=0.1)
+        assert torch.allclose(w[:64].mean(), torch.tensor(1.0, device=device), atol=0.1)
+        assert torch.allclose(
+            w[64:96].mean(), torch.tensor(2.0, device=device), atol=0.1
+        )
+        assert torch.allclose(w[96:].mean(), torch.tensor(3.0, device=device), atol=0.1)
 
     def test_apply_is_linear(self, device):
         """apply() should use the runtime FP8 quantized matmul."""
@@ -423,30 +444,28 @@ class TestFp8LinearRuntimeQuant:
         out_dim, in_dim = 64, 128
         batch = 4
 
-        method = VllmFp8LinearMethodTPU(
-            FakeQuant(weight_block_size=[128, 128]))
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[128, 128]))
 
         layer = torch.nn.Module()
         # apply() consumes the canonical (k, n) layout that
         # process_weights_after_loading produces, i.e. [n_in, n_out].
-        layer.weight = torch.nn.Parameter(torch.ones(in_dim,
-                                                     out_dim,
-                                                     device=device,
-                                                     dtype=torch.bfloat16).to(
-                                                         torch.float8_e4m3fn),
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.ones(
-            out_dim, device=device, dtype=torch.float32),
-                                                requires_grad=False)
+        layer.weight = torch.nn.Parameter(
+            torch.ones(in_dim, out_dim, device=device, dtype=torch.bfloat16).to(
+                torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.ones(out_dim, device=device, dtype=torch.float32), requires_grad=False
+        )
 
         x = torch.ones(batch, in_dim, device=device, dtype=torch.bfloat16)
         result = method.apply(layer, x)
 
         assert result.shape == (batch, out_dim)
-        expected = torch.full((batch, out_dim),
-                              float(in_dim),
-                              device=device,
-                              dtype=torch.bfloat16)
+        expected = torch.full(
+            (batch, out_dim), float(in_dim), device=device, dtype=torch.bfloat16
+        )
         assert torch.allclose(result, expected, rtol=0.01, atol=0.01)
 
     def test_blockwise_runtime_scale_shape(self, device, monkeypatch):
@@ -459,21 +478,23 @@ class TestFp8LinearRuntimeQuant:
 
         layer = torch.nn.Module()
         layer.logical_widths = None
-        layer.weight = torch.nn.Parameter(torch.ones(out_dim,
-                                                     in_dim,
-                                                     device=device,
-                                                     dtype=torch.bfloat16).to(
-                                                         torch.float8_e4m3fn),
-                                          requires_grad=False)
-        layer.weight_scale_inv = torch.nn.Parameter(torch.ones(
-            out_dim // block_h,
-            in_dim // block_w,
-            device=device,
-            dtype=torch.float32),
-                                                    requires_grad=False)
+        layer.weight = torch.nn.Parameter(
+            torch.ones(out_dim, in_dim, device=device, dtype=torch.bfloat16).to(
+                torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.ones(
+                out_dim // block_h,
+                in_dim // block_w,
+                device=device,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
 
-        method = VllmFp8LinearMethodTPU(
-            FakeQuant(weight_block_size=[block_h, block_w]))
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[block_h, block_w]))
         method.process_weights_after_loading(layer)
 
         assert layer.weight.dtype == torch.float8_e4m3fn
@@ -580,9 +601,7 @@ class TestOnlineFp8Quantization:
 
         from vllm_torchtpu.layers.core.quantization import quantize_tensor
 
-        w13_q, w13_s = quantize_tensor(w13,
-                                       quant_dtype=torch.float8_e4m3fn,
-                                       axis=-1)
+        w13_q, w13_s = quantize_tensor(w13, quant_dtype=torch.float8_e4m3fn, axis=-1)
         w13_deq = w13_q.to(torch.float32) * w13_s
 
         rel_err = (w13 - w13_deq).abs().mean() / (w13.abs().mean() + 1e-8)
@@ -594,18 +613,22 @@ class TestOnlineFp8Quantization:
 
         from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-        from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-            _quantize_bf16_moe_weights
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _quantize_bf16_moe_weights,
+        )
 
         E, inter, H = 4, 64, 128
         layer = MagicMock(spec=RoutedExperts)
         layer.w13_weight = torch.nn.Parameter(
-            torch.randn(E, 2 * inter, H, dtype=torch.bfloat16))
+            torch.randn(E, 2 * inter, H, dtype=torch.bfloat16)
+        )
         layer.w2_weight = torch.nn.Parameter(
-            torch.randn(E, H, inter, dtype=torch.bfloat16))
+            torch.randn(E, H, inter, dtype=torch.bfloat16)
+        )
 
-        w13, w13_s, w2, w2_s, dtype_name, block_size = (
-            _quantize_bf16_moe_weights(layer, activation="silu"))
+        w13, w13_s, w2, w2_s, dtype_name, block_size = _quantize_bf16_moe_weights(
+            layer, activation="silu"
+        )
 
         # _quantize_and_format_moe_weights rounds the intermediate size up to
         # a multiple of 128 before quantizing, padding w13/w2 accordingly.
@@ -626,8 +649,7 @@ class TestOnlineFp8Quantization:
         """FP8 apply_monolithic should use custom_routing_function when present."""
         from unittest.mock import MagicMock, patch
 
-        from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-            VllmFp8MoEMethodTPU
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
         # Create mock layer with custom routing
         layer = MagicMock()
@@ -636,8 +658,8 @@ class TestOnlineFp8Quantization:
         layer.renormalize = True
 
         mock_routing = MagicMock(
-            return_value=(torch.ones(4, 2),
-                          torch.zeros(4, 2, dtype=torch.int32)))
+            return_value=(torch.ones(4, 2), torch.zeros(4, 2, dtype=torch.int32))
+        )
         layer.custom_routing_function = mock_routing
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
@@ -647,11 +669,10 @@ class TestOnlineFp8Quantization:
 
         # Call the real apply_monolithic
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.fp8.fused_moe_gmm",
-                return_value=x,
+            "vllm_torchtpu.layers.adapter.quantization.fp8.fused_moe_gmm",
+            return_value=x,
         ):
-            VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x,
-                                                 router_logits)
+            VllmFp8MoEMethodTPU.apply_monolithic(method, layer, x, router_logits)
 
         mock_routing.assert_called_once()
 
@@ -682,30 +703,26 @@ class TestInt8MoERequantization:
         gen = torch.Generator().manual_seed(0)
         E, inter, H, B = self.E, self.INTER, self.H, self.BLOCK
         layer = FakeFusedMoELayer(
-            (torch.randn(E, 2 * inter, H, generator=gen) * 40).to(
-                torch.float8_e4m3fn),
-            (torch.randn(E, H, inter, generator=gen) * 40).to(
-                torch.float8_e4m3fn),
+            (torch.randn(E, 2 * inter, H, generator=gen) * 40).to(torch.float8_e4m3fn),
+            (torch.randn(E, H, inter, generator=gen) * 40).to(torch.float8_e4m3fn),
             torch.rand(E, 2 * inter // B, H // B, generator=gen) + 0.5,
             torch.rand(E, H // B, inter // B, generator=gen) + 0.5,
         )
         layer.moe_config = FakeInt8MoEConfig(inter)
         return layer
 
-    def test_int8_requant_produces_int8_weights_rounded_to_nearest(
-            self, monkeypatch):
-        from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-            _process_fp8_moe_weights
+    def test_int8_requant_produces_int8_weights_rounded_to_nearest(self, monkeypatch):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _process_fp8_moe_weights,
+        )
         from vllm_torchtpu.layers.core.quantization import dequantize_tensor
 
         monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "int8")
         layer = self._layer()
 
-        w13, w13_scale, w2, _, dtype_name, block_size = (
-            _process_fp8_moe_weights(layer,
-                                     weight_block_size=(self.BLOCK,
-                                                        self.BLOCK),
-                                     activation="silu"))
+        w13, w13_scale, w2, _, dtype_name, block_size = _process_fp8_moe_weights(
+            layer, weight_block_size=(self.BLOCK, self.BLOCK), activation="silu"
+        )
 
         assert dtype_name == "int8" and block_size is None
         assert w13.dtype == torch.int8 and w2.dtype == torch.int8
@@ -715,12 +732,13 @@ class TestInt8MoERequantization:
 
         # Per-channel scale over the contracting axis, broadcast back to [E, out, in].
         scale = w13_scale.reshape(self.E, 1, -1).transpose(1, 2)
-        reference = dequantize_tensor(layer.w13_weight.data,
-                                      layer.w13_weight_scale_inv.data,
-                                      axis=(1, 2),
-                                      out_dtype=torch.float32)
-        err_lsb = (w13.float().transpose(1, 2) * scale -
-                   reference).abs() / scale
+        reference = dequantize_tensor(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            axis=(1, 2),
+            out_dtype=torch.float32,
+        )
+        err_lsb = (w13.float().transpose(1, 2) * scale - reference).abs() / scale
         # Round-to-nearest bounds this by half an LSB; truncation gives a full one.
         assert err_lsb.max().item() <= 0.5 + 1e-4
 
@@ -740,34 +758,31 @@ class TestMoERequantizationChunks:
         def param(t):
             return torch.nn.Parameter(t, requires_grad=False)
 
-        w13 = torch.randn(num_experts,
-                          2 * inter,
-                          hidden,
-                          device=device,
-                          dtype=torch.bfloat16).to(dtype)
-        w2 = torch.randn(num_experts,
-                         hidden,
-                         inter,
-                         device=device,
-                         dtype=torch.bfloat16).to(dtype)
+        w13 = torch.randn(
+            num_experts, 2 * inter, hidden, device=device, dtype=torch.bfloat16
+        ).to(dtype)
+        w2 = torch.randn(
+            num_experts, hidden, inter, device=device, dtype=torch.bfloat16
+        ).to(dtype)
         layer = SimpleNamespace(
             w13_weight=param(w13),
             w2_weight=param(w2),
             w13_weight_scale_inv=param(
-                torch.rand(num_experts,
-                           2 * inter // block,
-                           hidden // block,
-                           device=device) + 0.5),
+                torch.rand(
+                    num_experts, 2 * inter // block, hidden // block, device=device
+                )
+                + 0.5
+            ),
             w2_weight_scale_inv=param(
-                torch.rand(num_experts,
-                           hidden // block,
-                           inter // block,
-                           device=device) + 0.5),
+                torch.rand(num_experts, hidden // block, inter // block, device=device)
+                + 0.5
+            ),
             moe_config=SimpleNamespace(
                 intermediate_size_per_partition=inter,
                 intermediate_size_per_partition_unpadded=inter,
                 tp_size=1,
-                tp_rank=0),
+                tp_rank=0,
+            ),
         )
         # w13 chunks of two experts: 2 * (2*inter*hidden) float32 bytes
         return layer, 2 * 2 * inter * hidden * 4
@@ -780,6 +795,7 @@ class TestMoERequantizationChunks:
 
     def test_fp8_checkpoint(self, device, monkeypatch):
         from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
         torch.manual_seed(0)
         layer, chunk_bytes = self._layer(device, torch.float8_e4m3fn)
         kwargs = dict(weight_block_size=(128, 128), activation="silu")
@@ -790,6 +806,7 @@ class TestMoERequantizationChunks:
 
     def test_bf16_checkpoint(self, device, monkeypatch):
         from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
         torch.manual_seed(0)
         layer, chunk_bytes = self._layer(device, torch.bfloat16)
         whole = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")

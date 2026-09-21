@@ -11,7 +11,8 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 GCE_TPU_ACCELERATOR_ENDPOINT = (
-    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/")
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/"
+)
 GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
 
 
@@ -21,14 +22,17 @@ def get_tpu_metadata(key: str = "") -> str:
             os.path.join(GCE_TPU_ACCELERATOR_ENDPOINT, key),
             headers=GCE_TPU_HEADERS,
         )
-        if (accelerator_type_request.status_code == 200
-                and accelerator_type_request.text):
+        if (
+            accelerator_type_request.status_code == 200
+            and accelerator_type_request.text
+        ):
             return accelerator_type_request.text
         else:
             logger.error(
                 "Unable to poll TPU GCE Metadata. Got "
                 f"status code: {accelerator_type_request.status_code} and "
-                f"content: {accelerator_type_request.text}")
+                f"content: {accelerator_type_request.text}"
+            )
     except requests.RequestException as e:
         logger.error("Unable to poll the TPU GCE Metadata: %s", e)
     return None
@@ -61,7 +65,9 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     except ValueError:
         logger.warning(
             "Unrecognized TPU accelerator type %r; defaulting to TPU7x "
-            "static geometry.", accelerator_type)
+            "static geometry.",
+            accelerator_type,
+        )
         return pltpu.ChipVersion.TPU_7X
 
 
@@ -95,9 +101,7 @@ def get_num_chips() -> int:
         return len(accel_files)
     try:
         vfio_entries = os.listdir("/dev/vfio")
-        numeric_entries = [
-            int(entry) for entry in vfio_entries if entry.isdigit()
-        ]
+        numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
         return len(numeric_entries)
     except FileNotFoundError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)

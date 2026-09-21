@@ -26,10 +26,13 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention, gdn_attention_core_tpu_pcp_prefill)
+    VllmGatedDeltaNetAttention,
+    gdn_attention_core_tpu_pcp_prefill,
+)
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    set_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -48,11 +51,13 @@ def _mesh():
     return SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
 
 
-def _vllm_config(*,
-                 pcp_size: int = 1,
-                 interleave_size: int = 16,
-                 block_size: int = 16,
-                 mamba_page_size_padded: int | None = None):
+def _vllm_config(
+    *,
+    pcp_size: int = 1,
+    interleave_size: int = 16,
+    block_size: int = 16,
+    mamba_page_size_padded: int | None = None,
+):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
@@ -82,13 +87,16 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
     attn.head_v_dim = 128
     attn.conv_kernel_size = 4
     attn.num_spec = 0
-    attn.conv1d = SimpleNamespace(bias=torch.randn(64) if bias else None, )
+    attn.conv1d = SimpleNamespace(
+        bias=torch.randn(64) if bias else None,
+    )
     attn.model_config = SimpleNamespace(
         dtype=torch.bfloat16,
         architecture="Qwen3_5MoeForCausalLM",
     )
-    attn.cache_config = SimpleNamespace(mamba_cache_dtype="bfloat16",
-                                        mamba_ssm_cache_dtype="float32")
+    attn.cache_config = SimpleNamespace(
+        mamba_cache_dtype="bfloat16", mamba_ssm_cache_dtype="float32"
+    )
     return attn
 
 
@@ -100,20 +108,21 @@ def _qwen38_gdn_attn(prefix: str):
 
 
 class TestVllmGatedDeltaNetAttention:
-
     @pytest.mark.parametrize("page_size", [128, 256, 512])
-    @pytest.mark.parametrize("num_kv_heads,kv_packing,head_dim,dtype", [
-        (1, 4, 256, jnp.float8_e4m3fn),
-        (1, 2, 256, jnp.bfloat16),
-        (2, 2, 256, jnp.bfloat16),
-        (4, 4, 256, jnp.float8_e4m3fn),
-    ])
-    def test_seq_on_lane_native_pool_plan(self, monkeypatch, page_size,
-                                          num_kv_heads, kv_packing, head_dim,
-                                          dtype):
+    @pytest.mark.parametrize(
+        "num_kv_heads,kv_packing,head_dim,dtype",
+        [
+            (1, 4, 256, jnp.float8_e4m3fn),
+            (1, 2, 256, jnp.bfloat16),
+            (2, 2, 256, jnp.bfloat16),
+            (4, 4, 256, jnp.float8_e4m3fn),
+        ],
+    )
+    def test_seq_on_lane_native_pool_plan(
+        self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim, dtype
+    ):
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        from vllm_torchtpu.layers.core.gdn_attention import \
-            _build_v3_pool_state_plan
+        from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
 
         manager_block_size = 4096 if page_size == 512 else 4352
         num_kv_heads_x2 = num_kv_heads * 2
@@ -137,12 +146,15 @@ class TestVllmGatedDeltaNetAttention:
         assert plan.conv.view_dtype == jnp.bfloat16
         assert plan.whole_block_dma is True
 
-    @patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-           "run_jax_gdn_attention_pcp_tp_prefill")
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+        "run_jax_gdn_attention_pcp_tp_prefill"
+    )
     def test_pcp_core_updates_only_widened_conv_state_prefix(self, mock_run):
         kernel_size = 4
-        conv_state = jnp.arange(2 * kernel_size * 3,
-                                dtype=jnp.float32).reshape(2, kernel_size, 3)
+        conv_state = jnp.arange(2 * kernel_size * 3, dtype=jnp.float32).reshape(
+            2, kernel_size, 3
+        )
         recurrent_state = jnp.zeros((2, 1, 1, 1), dtype=jnp.float32)
         new_prefix = jnp.full((2, kernel_size - 1, 3), 77, dtype=jnp.float32)
         new_recurrent = jnp.ones_like(recurrent_state)
@@ -151,10 +163,10 @@ class TestVllmGatedDeltaNetAttention:
 
         new_conv, returned_recurrent, returned_output = (
             gdn_attention_core_tpu_pcp_prefill(
-                *(jnp.zeros((1, ), dtype=jnp.float32) for _ in range(3)),
+                *(jnp.zeros((1,), dtype=jnp.float32) for _ in range(3)),
                 conv_state,
                 recurrent_state,
-                *(jnp.zeros((1, ), dtype=jnp.float32) for _ in range(8)),
+                *(jnp.zeros((1,), dtype=jnp.float32) for _ in range(8)),
                 mesh=MagicMock(),
                 n_kq=1,
                 n_v=1,
@@ -163,19 +175,22 @@ class TestVllmGatedDeltaNetAttention:
                 kernel_size=kernel_size,
                 pcp_size=2,
                 interleave_size=1,
-            ))
+            )
+        )
 
         kernel_conv_state = mock_run.call_args.args[3]
         assert kernel_conv_state.shape == (2, kernel_size - 1, 3)
-        np.testing.assert_array_equal(np.asarray(kernel_conv_state),
-                                      np.asarray(conv_state[:, :-1, :]))
+        np.testing.assert_array_equal(
+            np.asarray(kernel_conv_state), np.asarray(conv_state[:, :-1, :])
+        )
         np.testing.assert_array_equal(np.asarray(new_conv[:, :-1, :]), 77)
-        np.testing.assert_array_equal(np.asarray(new_conv[:, -1:, :]),
-                                      np.asarray(conv_state[:, -1:, :]))
-        np.testing.assert_array_equal(np.asarray(returned_recurrent),
-                                      np.asarray(new_recurrent))
-        np.testing.assert_array_equal(np.asarray(returned_output),
-                                      np.asarray(output))
+        np.testing.assert_array_equal(
+            np.asarray(new_conv[:, -1:, :]), np.asarray(conv_state[:, -1:, :])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(returned_recurrent), np.asarray(new_recurrent)
+        )
+        np.testing.assert_array_equal(np.asarray(returned_output), np.asarray(output))
 
     @pytest.mark.parametrize("interleaved", [False, True])
     @pytest.mark.parametrize(
@@ -185,18 +200,24 @@ class TestVllmGatedDeltaNetAttention:
             ("bfloat16", jnp.bfloat16),
         ],
     )
-    @pytest.mark.parametrize("projection_dtype",
-                             [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("projection_dtype", [torch.bfloat16, torch.float8_e4m3fn])
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
-        return_value=8)
+        return_value=8,
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype, projection_dtype, interleaved,
-            cpu_vllm_config_context):
+        self,
+        mock_get_pcp_mesh,
+        _mock_get_pcp_world_size,
+        ssm_cache_dtype,
+        expected_dtype,
+        projection_dtype,
+        interleaved,
+        cpu_vllm_config_context,
+    ):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -210,23 +231,27 @@ class TestVllmGatedDeltaNetAttention:
             return torch.full_like(pool, 7), output, output + 1
 
         fake_jax_op = MagicMock(side_effect=fake_op)
-        with set_vllm_model_wrapper_context(
-                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pcp_streaming_jax_op",
-                 return_value=fake_jax_op,
-             ) as mock_pcp_jax_op, \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "run_jax_gdn_attention_pooled_pcp_prefill_projection",
-             ) as mock_run:
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pcp_streaming_jax_op",
+                return_value=fake_jax_op,
+            ) as mock_pcp_jax_op,
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+            ) as mock_run,
+        ):
             mock_run.return_value = (MagicMock(), MagicMock(), MagicMock())
             pooled_pcp_impl = attn._build_pooled_pcp_gdn_op()
             mock_pcp_jax_op.call_args.args[1](*([MagicMock()] * 14))
 
-        weight_scale = (torch.ones(192)
-                        if projection_dtype == torch.float8_e4m3fn else None)
+        weight_scale = (
+            torch.ones(192) if projection_dtype == torch.float8_e4m3fn else None
+        )
         output, z = pooled_pcp_impl(
             torch.zeros((2, 64)),
             torch.zeros((192, 64), dtype=projection_dtype),
@@ -244,16 +269,18 @@ class TestVllmGatedDeltaNetAttention:
             torch.zeros(2, dtype=torch.int32),
         )
 
-        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (4, )
+        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (4,)
         assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
-            expected_dtype)
+            expected_dtype
+        )
         op_args = fake_jax_op.call_args.args
         assert op_args[4] is pool
         assert op_args[-1] is weight_scale
         # Optional bias/scale must not shift the runtime pool donation index.
         assert [arg for arg in op_args if arg is not None][4] is pool
-        fake_pool, fake_output, fake_z = (
-            fake_jax_op.register_fake.call_args.args[0](*op_args))
+        fake_pool, fake_output, fake_z = fake_jax_op.register_fake.call_args.args[0](
+            *op_args
+        )
         assert fake_pool.shape == pool.shape
         assert fake_output.shape == fake_z.shape == output.shape
         assert "gqa_interleaved_layout" not in mock_run.call_args.kwargs
@@ -264,12 +291,14 @@ class TestVllmGatedDeltaNetAttention:
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
-        return_value=8)
+        return_value=8,
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pooled_pcp_seq_on_lane_uses_native_pool_layout(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch):
+        self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch
+    ):
         vllm_envs.disable_envs_cache()
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         attn = _qwen35_397b_gdn_attn("seq_on_lane_test_layer")
@@ -288,18 +317,19 @@ class TestVllmGatedDeltaNetAttention:
             captured["pool_block_tokens"] = kwargs["pool_block_tokens"]
             return args[5], MagicMock(), MagicMock()
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=vllm_config), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pcp_streaming_jax_op",
-                 side_effect=fake_pcp_jax_op,
-             ), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "run_jax_gdn_attention_pooled_pcp_prefill_projection",
-                 side_effect=fake_run,
-             ):
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=vllm_config),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pcp_streaming_jax_op",
+                side_effect=fake_pcp_jax_op,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+                side_effect=fake_run,
+            ),
+        ):
             attn._build_pooled_pcp_gdn_op()
             args = [MagicMock()] * 14
             args[4] = raw_pool  # Pool is the donated argument; scale is last.
@@ -310,8 +340,7 @@ class TestVllmGatedDeltaNetAttention:
         assert new_pool.shape == raw_pool.shape
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
 
         full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
@@ -341,53 +370,55 @@ class TestVllmGatedDeltaNetAttention:
         assert local_spec.shapes[1] == (4, 128, 128)
         assert local_spec.page_size_bytes == (3 * 768 * 2 + 4 * 128 * 128 * 4)
 
-    def test_get_kv_cache_spec_drops_full_unpadded_padding_after_localizing(
-            self):
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+    def test_get_kv_cache_spec_drops_full_unpadded_padding_after_localizing(self):
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
         full_spec = attn.get_kv_cache_spec(_vllm_config(pcp_size=1))
         assert isinstance(full_spec, MambaSpec)
 
         local_spec = attn.get_kv_cache_spec(
-            _vllm_config(pcp_size=8,
-                         mamba_page_size_padded=full_spec.page_size_bytes))
+            _vllm_config(pcp_size=8, mamba_page_size_padded=full_spec.page_size_bytes)
+        )
 
         assert isinstance(local_spec, MambaSpec)
         assert local_spec.page_size_padded is None
         assert local_spec.page_size_bytes == full_spec.page_size_bytes // 8
 
     def test_get_kv_cache_spec_rejects_dim_first_state_for_pcp(self):
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
                 "is_conv_state_dim_first",
                 return_value=True,
-        ), pytest.raises(NotImplementedError,
-                         match="VLLM_SSM_CONV_STATE_LAYOUT=SD"):
+            ),
+            pytest.raises(NotImplementedError, match="VLLM_SSM_CONV_STATE_LAYOUT=SD"),
+        ):
             attn.get_kv_cache_spec(_vllm_config(pcp_size=8))
 
     def test_init_builds_only_regular_gdn_op_without_pcp(self):
         regular_op = MagicMock()
         pooled_op = MagicMock()
 
-        with patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"), \
-             set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config()), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "QwenGatedDeltaNetAttention.__init__",
-                 return_value=None,
-             ), \
-             patch.object(VllmGatedDeltaNetAttention,
-                          "_build_gdn_op",
-                          return_value=regular_op) as mock_build, \
-             patch.object(VllmGatedDeltaNetAttention,
-                          "_build_pooled_gdn_op",
-                          return_value=pooled_op) as mock_build_pooled:
+        with (
+            patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "QwenGatedDeltaNetAttention.__init__",
+                return_value=None,
+            ),
+            patch.object(
+                VllmGatedDeltaNetAttention, "_build_gdn_op", return_value=regular_op
+            ) as mock_build,
+            patch.object(
+                VllmGatedDeltaNetAttention,
+                "_build_pooled_gdn_op",
+                return_value=pooled_op,
+            ) as mock_build_pooled,
+        ):
             attn = VllmGatedDeltaNetAttention()
 
         mock_build.assert_called_once_with()
@@ -404,25 +435,32 @@ class TestVllmGatedDeltaNetAttention:
         pcp_op = MagicMock()
         pooled_pcp_op = MagicMock()
 
-        with patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"), \
-             set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config(
-                                                pcp_size=8)), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "QwenGatedDeltaNetAttention.__init__",
-                 return_value=None,
-             ), \
-             patch.object(VllmGatedDeltaNetAttention,
-                          "_build_gdn_op",
-                          side_effect=[regular_op, pcp_op]) as mock_build, \
-             patch.object(VllmGatedDeltaNetAttention,
-                          "_build_pooled_gdn_op",
-                          return_value=pooled_op) as mock_build_pooled, \
-             patch.object(
-                 VllmGatedDeltaNetAttention,
-                 "_build_pooled_pcp_gdn_op",
-                 return_value=pooled_pcp_op) as mock_build_pooled_pcp:
+        with (
+            patch.object(VllmGatedDeltaNetAttention, "_create_conv1d"),
+            set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "QwenGatedDeltaNetAttention.__init__",
+                return_value=None,
+            ),
+            patch.object(
+                VllmGatedDeltaNetAttention,
+                "_build_gdn_op",
+                side_effect=[regular_op, pcp_op],
+            ) as mock_build,
+            patch.object(
+                VllmGatedDeltaNetAttention,
+                "_build_pooled_gdn_op",
+                return_value=pooled_op,
+            ) as mock_build_pooled,
+            patch.object(
+                VllmGatedDeltaNetAttention,
+                "_build_pooled_pcp_gdn_op",
+                return_value=pooled_pcp_op,
+            ) as mock_build_pooled_pcp,
+        ):
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
@@ -441,9 +479,9 @@ class TestVllmGatedDeltaNetAttention:
             ("bfloat16", jnp.bfloat16),
         ],
     )
-    def test_pooled_op_reads_block_size_at_call_time(self, ssm_cache_dtype,
-                                                     expected_dtype,
-                                                     cpu_vllm_config_context):
+    def test_pooled_op_reads_block_size_at_call_time(
+        self, ssm_cache_dtype, expected_dtype, cpu_vllm_config_context
+    ):
         """The pooled op must not freeze cache_config.block_size at build.
 
         Hybrid models construct GDN layers during load_model(), but the
@@ -455,8 +493,7 @@ class TestVllmGatedDeltaNetAttention:
         Only reproduces when --block-size is not passed explicitly, which
         is why every earlier unified-pool run missed it.
         """
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         # Pre-adjustment value, i.e. what a GDN layer sees during load.
         vllm_config = _vllm_config(block_size=16)
@@ -466,17 +503,18 @@ class TestVllmGatedDeltaNetAttention:
             captured["wrapped_fn"] = wrapped_fn
             return MagicMock()
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=vllm_config), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pallas.jax_op",
-                 side_effect=fake_jax_op,
-             ), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "gdn_attention_pooled_core_tpu",
-             ) as mock_core:
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=vllm_config),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pallas.jax_op",
+                side_effect=fake_jax_op,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "gdn_attention_pooled_core_tpu",
+            ) as mock_core,
+        ):
             attn._build_pooled_gdn_op()
 
             # The executor finalizes the manager block size only after
@@ -485,11 +523,13 @@ class TestVllmGatedDeltaNetAttention:
             captured["wrapped_fn"](*([MagicMock()] * 12))
 
         assert mock_core.call_args.kwargs["pool_block_tokens"] == 256
-        assert mock_core.call_args.kwargs[
-            "recurrent_state_dtype"] == jnp.dtype(expected_dtype)
+        assert mock_core.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
+            expected_dtype
+        )
 
     def test_pooled_impl_forwards_every_operand_the_forward_passes(
-            self, cpu_vllm_config_context):
+        self, cpu_vllm_config_context
+    ):
         """`gdn_impl` must accept exactly what `forward` calls it with.
 
         The pooled operand list is threaded through four layers (forward ->
@@ -499,8 +539,7 @@ class TestVllmGatedDeltaNetAttention:
         parameter. Calling it with the full positional list here catches it
         on CPU instead.
         """
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         pool = torch.zeros((4, 8), dtype=torch.float32)
         captured = {}
 
@@ -509,13 +548,14 @@ class TestVllmGatedDeltaNetAttention:
             return torch.zeros_like(pool), torch.zeros((2, 64, 128))
 
         fake_jax_op = MagicMock(side_effect=fake_op)
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config()), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pallas.jax_op",
-                 return_value=fake_jax_op,
-             ):
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pallas.jax_op",
+                return_value=fake_jax_op,
+            ),
+        ):
             gdn_impl = attn._build_pooled_gdn_op()
 
         # Mirrors the operand order at the forward's call site, ending with
@@ -543,100 +583,107 @@ class TestVllmGatedDeltaNetAttention:
         assert captured["args"][-1] is operands[-1]
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
-        attn0 = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
-        attn1 = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.30.linear_attn")
+        attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+        attn1 = _qwen35_397b_gdn_attn("language_model.model.layers.30.linear_attn")
         fake_jax_op = MagicMock()
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config()), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pallas.jax_op",
-                 return_value=fake_jax_op,
-             ) as mock_jax_op:
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pallas.jax_op",
+                return_value=fake_jax_op,
+            ) as mock_jax_op,
+        ):
             attn0._build_gdn_op()
             attn1._build_gdn_op()
 
         assert mock_jax_op.call_count == 2
         assert mock_jax_op.call_args_list[0].args[0] == (
-            "pallas::gdn_attention_"
-            "language_model_model_layers_0_linear_attn")
+            "pallas::gdn_attention_language_model_model_layers_0_linear_attn"
+        )
         assert mock_jax_op.call_args_list[1].args[0] == (
-            "pallas::gdn_attention_"
-            "language_model_model_layers_30_linear_attn")
+            "pallas::gdn_attention_language_model_model_layers_30_linear_attn"
+        )
         assert fake_jax_op.register_fake.call_count == 2
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
-        return_value=8)
+        return_value=8,
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
-    def test_build_gdn_op_keeps_pcp_jax_op_per_layer(self, mock_get_pcp_mesh,
-                                                     _mock_get_pcp_world_size):
-        attn0 = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
-        attn1 = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.30.linear_attn")
+    def test_build_gdn_op_keeps_pcp_jax_op_per_layer(
+        self, mock_get_pcp_mesh, _mock_get_pcp_world_size
+    ):
+        attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+        attn1 = _qwen35_397b_gdn_attn("language_model.model.layers.30.linear_attn")
         fake_jax_op = MagicMock()
         pcp_mesh = SimpleNamespace(shape={"pcp": 8})
         mock_get_pcp_mesh.return_value = pcp_mesh
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config(
-                                                pcp_size=8)), \
-             patch(
-                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                 "pcp_streaming_jax_op",
-                 return_value=fake_jax_op,
-             ) as mock_pcp_jax_op:
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pcp_streaming_jax_op",
+                return_value=fake_jax_op,
+            ) as mock_pcp_jax_op,
+        ):
             attn0._build_gdn_op(pcp_streaming=True)
             attn1._build_gdn_op(pcp_streaming=True)
 
         assert mock_pcp_jax_op.call_count == 2
         assert mock_pcp_jax_op.call_args_list[0].args[0] == (
-            "pallas::gdn_attention_pcp_"
-            "language_model_model_layers_0_linear_attn")
+            "pallas::gdn_attention_pcp_language_model_model_layers_0_linear_attn"
+        )
         assert mock_pcp_jax_op.call_args_list[1].args[0] == (
-            "pallas::gdn_attention_pcp_"
-            "language_model_model_layers_30_linear_attn")
+            "pallas::gdn_attention_pcp_language_model_model_layers_30_linear_attn"
+        )
         assert mock_pcp_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
         assert mock_pcp_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
-        assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "input_partition_specs"][3] == PartitionSpec(None, None, "pcp")
-        assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "input_partition_specs"][4] == PartitionSpec(
-                None, "pcp", None, None)
-        assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "output_partition_specs"][:2] == (
-                PartitionSpec(None, None, "pcp"),
-                PartitionSpec(None, "pcp", None, None),
-            )
+        assert mock_pcp_jax_op.call_args_list[0].kwargs["input_partition_specs"][
+            3
+        ] == PartitionSpec(None, None, "pcp")
+        assert mock_pcp_jax_op.call_args_list[0].kwargs["input_partition_specs"][
+            4
+        ] == PartitionSpec(None, "pcp", None, None)
+        assert mock_pcp_jax_op.call_args_list[0].kwargs["output_partition_specs"][
+            :2
+        ] == (
+            PartitionSpec(None, None, "pcp"),
+            PartitionSpec(None, "pcp", None, None),
+        )
         assert fake_jax_op.register_fake.call_count == 2
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
-        return_value=8)
+        return_value=8,
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_compact_and_unified_ops_construct_with_mtp_k1(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
-            cpu_vllm_config_context):
-        attn = _qwen35_397b_gdn_attn(
-            "language_model.model.layers.0.linear_attn")
+        self, mock_get_pcp_mesh, _mock_get_pcp_world_size, cpu_vllm_config_context
+    ):
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn.num_spec = 1
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
         fake_jax_op = MagicMock()
 
-        with set_vllm_model_wrapper_context(
-                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), patch(
-                    "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                    "pcp_streaming_jax_op",
-                    return_value=fake_jax_op,
-                ):
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pcp_streaming_jax_op",
+                return_value=fake_jax_op,
+            ),
+        ):
             compact_op = attn._build_gdn_op(pcp_streaming=True)
             unified_op = attn._build_pooled_pcp_gdn_op()
 
@@ -645,22 +692,28 @@ class TestVllmGatedDeltaNetAttention:
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
-        return_value=8)
+        return_value=8,
+    )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
     def test_pcp_ops_construct_with_replicated_kq_heads(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+        self, mock_get_pcp_mesh, _mock_get_pcp_world_size
+    ):
         attn = _qwen38_gdn_attn("language_model.model.layers.0.linear_attn")
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
         fake_jax_op = MagicMock()
 
-        with set_vllm_model_wrapper_context(
-                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), patch(
-                    "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
-                    "pcp_streaming_jax_op",
-                    return_value=fake_jax_op,
-                ) as mock_pcp_jax_op:
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pcp_streaming_jax_op",
+                return_value=fake_jax_op,
+            ) as mock_pcp_jax_op,
+        ):
             compact_op = attn._build_gdn_op(pcp_streaming=True)
             unified_op = attn._build_pooled_pcp_gdn_op()
 
@@ -744,8 +797,7 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[6] is attn.conv1d.bias
         assert core_args[7] is attn.A_log
         assert core_args[8] is attn.dt_bias
-        assert torch.all(
-            core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
+        assert torch.all(core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
         assert core_args[10] is mock_attn_metadata.query_start_loc
         assert core_args[11] is mock_attn_metadata.request_distribution
 
@@ -763,7 +815,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_uses_canonical_projection_for_interleaved_checkpoint(
-            self, mock_get_forward_context):
+        self, mock_get_forward_context
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 0
         attn.head_v_dim = 16
@@ -797,8 +850,10 @@ class TestVllmGatedDeltaNetAttention:
         z = torch.randn(num_tokens, 4, 16)
         b = torch.randn(num_tokens, 4)
         a = torch.randn(num_tokens, 4)
-        attn.in_proj_qkvz.return_value = (torch.cat((mixed_qkv, z.flatten(1)),
-                                                    dim=-1), None)
+        attn.in_proj_qkvz.return_value = (
+            torch.cat((mixed_qkv, z.flatten(1)), dim=-1),
+            None,
+        )
         attn.in_proj_ba.return_value = (torch.cat((b, a), dim=-1), None)
 
         norm_out = torch.randn(num_tokens, 4, 16)
@@ -840,8 +895,7 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[6] is attn.conv1d.bias
         assert core_args[7] is attn.A_log
         assert core_args[8] is attn.dt_bias
-        assert torch.all(
-            core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
+        assert torch.all(core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
         assert core_args[10] is mock_attn_metadata.query_start_loc
         assert core_args[11] is mock_attn_metadata.request_distribution
 
@@ -857,8 +911,7 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
-    def test_forward_uses_compact_mamba_state_indices(
-            self, mock_get_forward_context):
+    def test_forward_uses_compact_mamba_state_indices(self, mock_get_forward_context):
         """Compact mamba: when attn_metadata.mamba_state_indices is set, the op
         passes it through verbatim and ignores block_tables[:, 0]."""
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
@@ -899,8 +952,7 @@ class TestVllmGatedDeltaNetAttention:
         # block_tables would yield [5, 7] via the fallback; the compact slot
         # ids [3, 1] must win instead.
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
-        mock_attn_metadata.mamba_state_indices = torch.tensor(
-            [3, 1], dtype=torch.int32)
+        mock_attn_metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         # Non-spec path: the runner leaves these unset (None) unless
@@ -914,17 +966,18 @@ class TestVllmGatedDeltaNetAttention:
 
         assert attn.gdn_op.call_count == 1
         core_args = attn.gdn_op.call_args[0]
-        assert torch.all(
-            core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
+        assert torch.all(core_args[9] == torch.tensor([3, 1], dtype=torch.int32))
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_rank",
-        return_value=1)
+        return_value=1,
+    )
     def test_forward_uses_native_gdn_pcp_op_for_pcp_prefill(
-            self, _mock_rank, mock_get_forward_context):
+        self, _mock_rank, mock_get_forward_context
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
         attn.head_v_dim = 16
@@ -957,29 +1010,27 @@ class TestVllmGatedDeltaNetAttention:
         a_local = torch.full((num_tokens, 16), -3.0)
         attn.in_proj_qkv.return_value = (mixed_local, None)
         attn.in_proj_z.return_value = (torch.randn(num_tokens, 64), None)
-        attn.in_proj_ba.return_value = (torch.cat((b_local, a_local),
-                                                  dim=-1), None)
+        attn.in_proj_ba.return_value = (torch.cat((b_local, a_local), dim=-1), None)
         attn.norm.side_effect = lambda core, _z: core
         attn.out_proj.return_value = (torch.ones(num_tokens, 64) * 5, None)
-        native_output = torch.stack([
-            torch.full((64, ), 10.0),
-            torch.full((64, ), 11.0),
-            torch.full((64, ), 12.0),
-            torch.full((64, ), 13.0),
-        ])
+        native_output = torch.stack(
+            [
+                torch.full((64,), 10.0),
+                torch.full((64,), 11.0),
+                torch.full((64,), 12.0),
+                torch.full((64,), 13.0),
+            ]
+        )
         attn.gdn_pcp_op.return_value = native_output
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
         mock_attn_metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
-        mock_attn_metadata.mamba_state_indices = torch.tensor(
-            [3, 1], dtype=torch.int32)
-        mock_attn_metadata.sequence_layout_kind = (
-            SequenceLayoutKind.PARTIAL.value)
+        mock_attn_metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
+        mock_attn_metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
         mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
-        mock_attn_metadata.query_start_loc = torch.tensor([0, 4],
-                                                          dtype=torch.int32)
+        mock_attn_metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         # PCP prefill does not consume non-PCP verify rollback offsets.
         mock_attn_metadata.mamba_request_distribution = None
@@ -988,8 +1039,8 @@ class TestVllmGatedDeltaNetAttention:
         mock_get_forward_context.return_value = mock_fc
 
         with set_vllm_model_wrapper_context(
-                mesh=_mesh(),
-                vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=2, interleave_size=1)
+        ):
             output = attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()
@@ -1006,39 +1057,41 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[12] is mock_attn_metadata.seq_lens
         assert len(core_args) == 13
         expected_local = torch.stack(
-            [torch.full((4, 16), 12.0),
-             torch.full((4, 16), 13.0)])
+            [torch.full((4, 16), 12.0), torch.full((4, 16), 13.0)]
+        )
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
         assert torch.all(output == 5)
 
-    @pytest.mark.parametrize("shape", [(), (1, ), (192, ), (6, 2),
-                                       (1, 2, 1, 192)])
+    @pytest.mark.parametrize("shape", [(), (1,), (192,), (6, 2), (1, 2, 1, 192)])
     def test_pcp_projection_accepts_fp8_scale_layouts(self, shape):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.gqa_interleaved_layout = False
         weight = torch.ones((192, 256), dtype=torch.float8_e4m3fn)
         scale = torch.ones(shape, dtype=torch.float32)
-        attn.in_proj_qkvz = SimpleNamespace(weight=weight,
-                                            weight_scale=scale,
-                                            bias=None)
+        attn.in_proj_qkvz = SimpleNamespace(
+            weight=weight, weight_scale=scale, bias=None
+        )
         result = attn._require_pcp_projection_parameters()
         assert result[0] is weight and result[1] is scale
 
-    @pytest.mark.parametrize("dtype,scale_size,bias,error", [
-        (torch.bfloat16, 192, False, "must not have a scale"),
-        (torch.float8_e4m3fn, None, False, "FP32 scale"),
-        (torch.float8_e4m3fn, 3, False, "scale must"),
-        (torch.float32, None, False, "BF16 or"),
-        (torch.bfloat16, None, True, "bias-free"),
-    ])
-    def test_pcp_projection_rejects_invalid_parameters(self, dtype, scale_size,
-                                                       bias, error):
+    @pytest.mark.parametrize(
+        "dtype,scale_size,bias,error",
+        [
+            (torch.bfloat16, 192, False, "must not have a scale"),
+            (torch.float8_e4m3fn, None, False, "FP32 scale"),
+            (torch.float8_e4m3fn, 3, False, "scale must"),
+            (torch.float32, None, False, "BF16 or"),
+            (torch.bfloat16, None, True, "bias-free"),
+        ],
+    )
+    def test_pcp_projection_rejects_invalid_parameters(
+        self, dtype, scale_size, bias, error
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.gqa_interleaved_layout = False
         attn.in_proj_qkvz = SimpleNamespace(
             weight=torch.ones((192, 64), dtype=dtype),
-            weight_scale=None
-            if scale_size is None else torch.ones(scale_size),
+            weight_scale=None if scale_size is None else torch.ones(scale_size),
             bias=torch.zeros(192) if bias else None,
         )
         with pytest.raises(RuntimeError, match=error):
@@ -1048,7 +1101,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_non_pcp_spec_verify_still_requires_slot_offsets(
-            self, mock_get_forward_context):
+        self, mock_get_forward_context
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
         attn.head_v_dim = 16
@@ -1056,8 +1110,7 @@ class TestVllmGatedDeltaNetAttention:
         attn.tp_size = 1
         attn.prefix = "test_layer"
         attn.gqa_interleaved_layout = True
-        attn.conv1d = SimpleNamespace(weight=torch.randn(1),
-                                      bias=torch.randn(1))
+        attn.conv1d = SimpleNamespace(weight=torch.randn(1), bias=torch.randn(1))
         attn.A_log = torch.randn(1)
         attn.dt_bias = torch.randn(1)
         attn.kv_cache = (torch.ones(1), torch.ones(1))
@@ -1079,25 +1132,24 @@ class TestVllmGatedDeltaNetAttention:
             mamba_slot_read_offsets=None,
         )
         mock_get_forward_context.return_value = SimpleNamespace(
-            attn_metadata={"test_layer": metadata})
+            attn_metadata={"test_layer": metadata}
+        )
 
-        with pytest.raises(AssertionError,
-                           match="requires mamba_slot_read_offsets"):
+        with pytest.raises(AssertionError, match="requires mamba_slot_read_offsets"):
             attn.forward(torch.randn(2, 64))
 
         attn.gdn_op.assert_not_called()
         attn.gdn_pcp_op.assert_not_called()
 
-    @pytest.mark.parametrize("projection_dtype",
-                             [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("projection_dtype", [torch.bfloat16, torch.float8_e4m3fn])
     @pytest.mark.parametrize("projection_bias", [False, True])
     @pytest.mark.parametrize("interleaved", [False, True])
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_uses_fused_projection_for_pooled_pcp_prefill(
-            self, mock_get_forward_context, projection_dtype, interleaved,
-            projection_bias):
+        self, mock_get_forward_context, projection_dtype, interleaved, projection_bias
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
         attn.head_v_dim = 16
@@ -1113,14 +1165,17 @@ class TestVllmGatedDeltaNetAttention:
         attn.conv1d.bias = torch.randn(1)
         attn.A_log = torch.randn(1)
         attn.dt_bias = torch.randn(1)
-        attn.kv_cache = (torch.ones(1), )
+        attn.kv_cache = (torch.ones(1),)
         attn.gdn_op = MagicMock()
         attn.gdn_pooled_op = MagicMock()
         attn.gdn_pooled_pcp_op = MagicMock()
 
         qkvz_weight = torch.ones((192, 64), dtype=projection_dtype)
-        qkvz_weight_scale = (torch.ones(192, dtype=torch.float32) if
-                             projection_dtype == torch.float8_e4m3fn else None)
+        qkvz_weight_scale = (
+            torch.ones(192, dtype=torch.float32)
+            if projection_dtype == torch.float8_e4m3fn
+            else None
+        )
         attn.in_proj_qkvz = SimpleNamespace(
             weight=qkvz_weight,
             weight_scale=qkvz_weight_scale,
@@ -1155,11 +1210,12 @@ class TestVllmGatedDeltaNetAttention:
         metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
         metadata.request_distribution = torch.zeros(3, dtype=torch.int32)
         mock_get_forward_context.return_value = SimpleNamespace(
-            attn_metadata={"test_layer": metadata})
+            attn_metadata={"test_layer": metadata}
+        )
 
         with set_vllm_model_wrapper_context(
-                mesh=_mesh(),
-                vllm_config=_vllm_config(pcp_size=2, interleave_size=1)):
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=2, interleave_size=1)
+        ):
             if projection_bias:
                 with pytest.raises(RuntimeError, match="bias-free"):
                     attn.forward(hidden_states)
@@ -1193,7 +1249,8 @@ class TestVllmGatedDeltaNetAttention:
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_pcp_prefill_requires_initialized_pcp_op(
-            self, mock_get_forward_context):
+        self, mock_get_forward_context
+    ):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 0
         attn.head_v_dim = 16
@@ -1231,10 +1288,8 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata = MagicMock()
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
-        mock_attn_metadata.mamba_state_indices = torch.tensor(
-            [3, 1], dtype=torch.int32)
-        mock_attn_metadata.sequence_layout_kind = (
-            SequenceLayoutKind.PARTIAL.value)
+        mock_attn_metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
+        mock_attn_metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
         mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
@@ -1245,10 +1300,10 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                            vllm_config=_vllm_config()):
-            with pytest.raises(RuntimeError,
-                               match="GDN PCP prefill op was not initialized"):
+        with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+            with pytest.raises(
+                RuntimeError, match="GDN PCP prefill op was not initialized"
+            ):
                 attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()
@@ -1333,8 +1388,7 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[6] is attn.conv1d.bias
         assert core_args[7] is attn.A_log
         assert core_args[8] is attn.dt_bias
-        assert torch.all(
-            core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
+        assert torch.all(core_args[9] == torch.tensor([5, 7], dtype=torch.int32))
         assert core_args[10] is mock_attn_metadata.query_start_loc
         assert core_args[11] is mock_attn_metadata.request_distribution
 
@@ -1358,8 +1412,7 @@ class TestConvWeightReHome:
         weight = torch.nn.Parameter(base.unsqueeze(1), requires_grad=False)
         attn.conv1d = SimpleNamespace(weight=weight)
         aliased_ptr = weight.data_ptr()
-        VllmGatedDeltaNetAttention.process_weights_after_loading(
-            attn, torch.bfloat16)
+        VllmGatedDeltaNetAttention.process_weights_after_loading(attn, torch.bfloat16)
         w = attn.conv1d.weight
         assert w is weight
         assert tuple(w.shape) == (6, 1, 4)
@@ -1371,7 +1424,8 @@ class TestConvWeightReHome:
 @pytest.mark.parametrize("pcp_size,expected", [(1, False), (8, True)])
 def test_pcp_streaming_follows_the_declared_pcp_width(pcp_size, expected):
     with set_vllm_model_wrapper_context(
-            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=pcp_size)):
+        mesh=_mesh(), vllm_config=_vllm_config(pcp_size=pcp_size)
+    ):
         assert VllmGatedDeltaNetAttention._pcp_streaming_enabled() is expected
 
 

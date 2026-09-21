@@ -56,23 +56,20 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
-    cache_kv: jax.
-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
     kv_lens_to_attend: jax.Array,  # i32[max_num_tokens]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     attention_sinks: jax.Array,  # float32[actual_num_q_heads]
-    swa_accumution: jax.
-    Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    swa_accumution: jax.Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
     swa_l: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     swa_m: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     *,
     sm_scale: float = 1.0,
     mask_value: float | None = DEFAULT_MASK_VALUE,
 ):
-
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
@@ -94,8 +91,7 @@ def ref_implementation(
     page_size = page_size_per_kv_packing * kv_packing
     assert lkv_dim == q.shape[-1]
 
-    kv_c_cache = cache_kv[..., :lkv_dim].reshape(total_num_pages, page_size,
-                                                 lkv_dim)
+    kv_c_cache = cache_kv[..., :lkv_dim].reshape(total_num_pages, page_size, lkv_dim)
 
     outputs = []
     for i in range(distribution[-1]):
@@ -113,12 +109,12 @@ def ref_implementation(
         indices = page_indices[indices_start:indices_end]
 
         # Gather paged kv_c and k_pe
-        gathered_kv_c = kv_c_cache[
-            indices]  # [num_pages_i, page_size, lkv_dim]
+        gathered_kv_c = kv_c_cache[indices]  # [num_pages_i, page_size, lkv_dim]
 
         # Flatten pages to sequence
         flat_kv_c = gathered_kv_c.reshape(
-            -1, lkv_dim)  # [num_pages_i * page_size, lkv_dim]
+            -1, lkv_dim
+        )  # [num_pages_i * page_size, lkv_dim]
 
         # Prepare k and v for attention
         k_i = flat_kv_c[:kv_len]  # [kv_len, lkv_dim]
@@ -129,10 +125,7 @@ def ref_implementation(
         # k:[kv_len, lkv_dim+r_dim]
         # v:[kv_len, lkv_dim]
         # attn: [actual_num_q_heads, q_len, kv_len]
-        attn = jnp.einsum("qnh,kh->nqk",
-                          q_i,
-                          k_i,
-                          preferred_element_type=jnp.float32)
+        attn = jnp.einsum("qnh,kh->nqk", q_i, k_i, preferred_element_type=jnp.float32)
         attn *= sm_scale
 
         kv_lens_to_attend_i = kv_lens_to_attend[q_start:q_end]
@@ -163,7 +156,7 @@ def ref_implementation(
 
 
 def generate_attention_sinks(rng, num_heads):
-    return jnp.array(rng.random(size=(num_heads, ), dtype=np.float32))
+    return jnp.array(rng.random(size=(num_heads,), dtype=np.float32))
 
 
 def gen_random(rng, shape, dtype):
@@ -175,11 +168,13 @@ def gen_random_int(rng, shape, low, high):
 
 
 def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
-    cache_kv_base = (gen_random(
-        rng,
-        get_kv_cache_shape(total_pages, page_size, head_dim, kv_dtype),
-        jnp.float32,
-    )).astype(kv_dtype)
+    cache_kv_base = (
+        gen_random(
+            rng,
+            get_kv_cache_shape(total_pages, page_size, head_dim, kv_dtype),
+            jnp.float32,
+        )
+    ).astype(kv_dtype)
 
     kernel_cache = cache_kv_base.reshape(total_pages, page_size, 4, 128)
     kernel_cache = jax.lax.bitcast_convert_type(kernel_cache, jnp.uint8)
@@ -189,7 +184,6 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
-
     def test_correctness(self):
         rng = np.random.default_rng(1234)
 
@@ -204,18 +198,20 @@ class CorrectnessTest(parameterized.TestCase):
         num_decode_seqs = batch_size // 2
         new_kv_lens = gen_random_int(
             rng,
-            (batch_size - num_decode_seqs, ),
+            (batch_size - num_decode_seqs,),
             4,
             60,
         )
-        new_kv_lens = jnp.concatenate([
-            jnp.ones((num_decode_seqs, ), dtype=jnp.int32),
-            new_kv_lens,
-        ])
+        new_kv_lens = jnp.concatenate(
+            [
+                jnp.ones((num_decode_seqs,), dtype=jnp.int32),
+                new_kv_lens,
+            ]
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
-        kv_lens = new_kv_lens + gen_random_int(rng, (batch_size, ), 30, 200)
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        kv_lens = new_kv_lens + gen_random_int(rng, (batch_size,), 30, 200)
         total_tokens = jnp.sum(new_kv_lens)
 
         # Deterministic Inputs for debugging
@@ -239,16 +235,17 @@ class CorrectnessTest(parameterized.TestCase):
         # Cache setup
         total_pages = batch_size * pages_per_seq
 
-        cache_kv_base, kernel_cache = create_cache(rng, total_pages, page_size,
-                                                   head_dim, kv_dtype)
+        cache_kv_base, kernel_cache = create_cache(
+            rng, total_pages, page_size, head_dim, kv_dtype
+        )
 
         distribution = jnp.array(
-            [num_decode_seqs, num_decode_seqs, batch_size], dtype=jnp.int32)
+            [num_decode_seqs, num_decode_seqs, batch_size], dtype=jnp.int32
+        )
 
         attention_sinks = generate_attention_sinks(rng, num_heads)
 
-        swa_accumution = gen_random(rng, (total_tokens, num_heads, head_dim),
-                                    q_dtype)
+        swa_accumution = gen_random(rng, (total_tokens, num_heads, head_dim), q_dtype)
         swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
         swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
 

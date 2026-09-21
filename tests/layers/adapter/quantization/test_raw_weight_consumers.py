@@ -22,17 +22,19 @@ making the consumer consistent rather than by exempting the layer:
 
 import torch
 
-from vllm_torchtpu.layers.adapter.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
-                                                        WEIGHT_FLIPPED_ATTR)
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedLinearMethod
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
 
 
 def _linear(n_in=8, n_out=16):
     """A layer shaped like vLLM's: weight is `[n_out, n_in]`."""
     layer = torch.nn.Module()
-    layer.weight = torch.nn.Parameter(torch.randn(n_out, n_in),
-                                      requires_grad=False)
+    layer.weight = torch.nn.Parameter(torch.randn(n_out, n_in), requires_grad=False)
     return layer
 
 
@@ -47,8 +49,9 @@ def test_marked_layer_keeps_the_vllm_layout():
     layer = _linear()
     setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
     VllmUnquantizedLinearMethod().process_weights_after_loading(layer)
-    assert layer.weight.shape == (16, 8), "must stay [n_out, n_in] for the "\
-                                          "consumer that reads it raw"
+    assert layer.weight.shape == (16, 8), (
+        "must stay [n_out, n_in] for the consumer that reads it raw"
+    )
     assert not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
 
 

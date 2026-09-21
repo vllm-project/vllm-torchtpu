@@ -21,6 +21,7 @@ def apply_omni_tpu_patches() -> None:
     # -> OmniTpuPlatform -> patches -> diffusion_engine -> stage_utils ->
     # current_omni_platform).
     from vllm_omni.diffusion import diffusion_engine
+
     diffusion_engine._ASYNC_OUTPUT_TIMEOUT = 1800.0
     logger.info("Applied TPU patch: extended _ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
@@ -36,10 +37,10 @@ def apply_omni_tpu_patches() -> None:
         **kwargs: Any,
     ) -> torch.Tensor:
         if input.device.type == "tpu" and mode == "linear":
-            return orig_interpolate(input.cpu(), size, scale_factor, mode,
-                                    *args, **kwargs).to(input.device)
-        return orig_interpolate(input, size, scale_factor, mode, *args,
-                                **kwargs)
+            return orig_interpolate(
+                input.cpu(), size, scale_factor, mode, *args, **kwargs
+            ).to(input.device)
+        return orig_interpolate(input, size, scale_factor, mode, *args, **kwargs)
 
     torch.nn.functional.interpolate = _safe_interpolate
     logger.info(

@@ -16,6 +16,7 @@ substituted with lightweight in-memory test doubles:
 Event loops governed by timeouts substitute `_stop_event` with `_ScriptedEvent`
 to execute deterministic, single-sweep passes without sleeping on the clock.
 """
+
 import hashlib
 import itertools
 import os
@@ -33,9 +34,11 @@ import zmq
 
 from vllm_torchtpu.distributed.kv_transfer import zmq_shm_base as zsb
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
-    LoadMeta, SendMeta, TPUConnectorMetadata)
-from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
-                                                               PoolSpec)
+    LoadMeta,
+    SendMeta,
+    TPUConnectorMetadata,
+)
+from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import HostKVShmPool, PoolSpec
 
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
 
@@ -91,11 +94,7 @@ class _FakeSocket:
     Any Exception instance present in `inbound` is raised on recv_multipart().
     """
 
-    def __init__(self,
-                 inbound=None,
-                 on_exhausted=None,
-                 send_error=None,
-                 empty_polls=0):
+    def __init__(self, inbound=None, on_exhausted=None, send_error=None, empty_polls=0):
         self.inbound = list(inbound or [])
         self.on_exhausted = on_exhausted
         self.send_error = send_error
@@ -150,7 +149,6 @@ class _FakeSocket:
 
 
 class _FakeContext:
-
     def __init__(self):
         self.sockets: list[_FakeSocket] = []
         self.destroyed = False
@@ -204,8 +202,9 @@ class _RecordingPool(HostKVShmPool):
 
 
 def _make_pool(*, num_slots=2, ranks_per_host=1) -> _RecordingPool:
-    pool = _RecordingPool.create(_pool_spec(num_slots, ranks_per_host),
-                                 f"test_zmq_shm_{uuid.uuid4().hex}")
+    pool = _RecordingPool.create(
+        _pool_spec(num_slots, ranks_per_host), f"test_zmq_shm_{uuid.uuid4().hex}"
+    )
     _POOLS.append(pool)
     return pool
 
@@ -216,7 +215,7 @@ def _pool_spec(num_slots=2, ranks_per_host=1) -> PoolSpec:
         tp_size=ranks_per_host,
         num_layers=_NUM_LAYERS,
         max_blocks=_CACHE_BLOCKS,
-        layer_shard_shape=(_CACHE_BLOCKS, ) + _BLOCK_SHAPE,
+        layer_shard_shape=(_CACHE_BLOCKS,) + _BLOCK_SHAPE,
         dtype=_DTYPE,
     )
 
@@ -281,7 +280,8 @@ class _FakeConnector(zsb.ZmqShmKvConnectorBase):
 
     def _try_fast_scatter(self, device_shards, kv_caches, local_blocks):
         self.fast_scatter_calls.append(
-            (len(device_shards), len(kv_caches), list(local_blocks)))
+            (len(device_shards), len(kv_caches), list(local_blocks))
+        )
         return [c.clone() for c in kv_caches]
 
     def _maybe_enable_kv_scatter(self):
@@ -361,11 +361,9 @@ def _shutdown_connectors(monkeypatch):
             pass
 
 
-def _make_vllm_config(*,
-                      is_producer=True,
-                      block_size=1,
-                      max_model_len=_CACHE_BLOCKS,
-                      dp_rank=0):
+def _make_vllm_config(
+    *, is_producer=True, block_size=1, max_model_len=_CACHE_BLOCKS, dp_rank=0
+):
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.cache_config.block_size = block_size
@@ -375,43 +373,61 @@ def _make_vllm_config(*,
     return cfg
 
 
-def _make_conn(cls=_FakeConnector,
-               *,
-               tp_rank=0,
-               tp_size=1,
-               is_producer=True,
-               dp_rank=0,
-               node_id=0,
-               channel_number=0,
-               latency_interval=0.0,
-               coord_workers=0,
-               channel_workers=0,
-               stage_pool_size=0,
-               stage_wait_timeout=30.0,
-               cfg=None):
-    cfg = cfg if cfg is not None else _make_vllm_config(
-        is_producer=is_producer, dp_rank=dp_rank)
+def _make_conn(
+    cls=_FakeConnector,
+    *,
+    tp_rank=0,
+    tp_size=1,
+    is_producer=True,
+    dp_rank=0,
+    node_id=0,
+    channel_number=0,
+    latency_interval=0.0,
+    coord_workers=0,
+    channel_workers=0,
+    stage_pool_size=0,
+    stage_wait_timeout=30.0,
+    cfg=None,
+):
+    cfg = (
+        cfg
+        if cfg is not None
+        else _make_vllm_config(is_producer=is_producer, dp_rank=dp_rank)
+    )
     ctx = _FakeContext()
-    with patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=tp_rank), \
-         patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=tp_size), \
-         patch(f"{_BASE}.dist_utils.get_node_id", return_value=node_id), \
-         patch(f"{_BASE}.dist_utils.get_host_ip", return_value="10.0.0.1"), \
-         patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"), \
-         patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"), \
-         patch(f"{_BASE}.dist_utils.get_transfer_channel_number",
-               return_value=channel_number), \
-         patch(f"{_BASE}.dist_utils.get_kv_latency_log_interval",
-               return_value=latency_interval), \
-         patch(f"{_BASE}.dist_utils.get_kv_coord_executor_max_workers",
-               return_value=coord_workers), \
-         patch(f"{_BASE}.dist_utils.get_kv_channel_executor_max_workers",
-               return_value=channel_workers), \
-         patch(f"{_BASE}.dist_utils.get_kv_stage_waiter_pool_size",
-               return_value=stage_pool_size), \
-         patch(f"{_BASE}.dist_utils.get_kv_stage_wait_timeout_secs",
-               return_value=stage_wait_timeout), \
-         patch(f"{_BASE}.zmq",
-               new=_ModuleStub(zmq, Context=lambda *a, **kw: ctx)):
+    with (
+        patch(f"{_BASE}.get_tensor_model_parallel_rank", return_value=tp_rank),
+        patch(f"{_BASE}.get_tensor_model_parallel_world_size", return_value=tp_size),
+        patch(f"{_BASE}.dist_utils.get_node_id", return_value=node_id),
+        patch(f"{_BASE}.dist_utils.get_host_ip", return_value="10.0.0.1"),
+        patch(f"{_BASE}.dist_utils.get_kv_transfer_port", return_value="9100"),
+        patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"),
+        patch(
+            f"{_BASE}.dist_utils.get_transfer_channel_number",
+            return_value=channel_number,
+        ),
+        patch(
+            f"{_BASE}.dist_utils.get_kv_latency_log_interval",
+            return_value=latency_interval,
+        ),
+        patch(
+            f"{_BASE}.dist_utils.get_kv_coord_executor_max_workers",
+            return_value=coord_workers,
+        ),
+        patch(
+            f"{_BASE}.dist_utils.get_kv_channel_executor_max_workers",
+            return_value=channel_workers,
+        ),
+        patch(
+            f"{_BASE}.dist_utils.get_kv_stage_waiter_pool_size",
+            return_value=stage_pool_size,
+        ),
+        patch(
+            f"{_BASE}.dist_utils.get_kv_stage_wait_timeout_secs",
+            return_value=stage_wait_timeout,
+        ),
+        patch(f"{_BASE}.zmq", new=_ModuleStub(zmq, Context=lambda *a, **kw: ctx)),
+    ):
         conn = cls(cfg)
     _LIVE.append(conn)
     return conn
@@ -421,25 +437,21 @@ def _make_runner(num_layers=_NUM_LAYERS):
     return SimpleNamespace(
         device=torch.device("cpu"),
         kv_caches=[
-            torch.zeros((_CACHE_BLOCKS, ) + _BLOCK_SHAPE, dtype=torch.float32)
+            torch.zeros((_CACHE_BLOCKS,) + _BLOCK_SHAPE, dtype=torch.float32)
             for _ in range(num_layers)
         ],
     )
 
 
-def _attach_runner(conn,
-                   *,
-                   ranks_per_host=1,
-                   num_slots=2,
-                   runner=None,
-                   pool=True):
+def _attach_runner(conn, *, ranks_per_host=1, num_slots=2, runner=None, pool=True):
     """Initialize connector runner state normally configured during register_runner."""
     conn.runner = runner if runner is not None else _make_runner()
     conn.device = conn.runner.device
     conn._extract_kv_layout()
     if pool:
-        conn._coord_pool = _make_pool(num_slots=num_slots,
-                                      ranks_per_host=ranks_per_host)
+        conn._coord_pool = _make_pool(
+            num_slots=num_slots, ranks_per_host=ranks_per_host
+        )
         conn._coord_pool_spec = conn._coord_pool.spec
     return conn
 
@@ -456,32 +468,38 @@ def _drain_ipc(conn) -> list[tuple]:
 
 
 def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
-    entry = zsb._CoordSendEntry(req_id=req_id,
-                                slot_idx=slot_idx,
-                                num_blocks=num_blocks,
-                                expiration_time=time.perf_counter() + ttl,
-                                tp_size=conn.tp_size)
+    entry = zsb._CoordSendEntry(
+        req_id=req_id,
+        slot_idx=slot_idx,
+        num_blocks=num_blocks,
+        expiration_time=time.perf_counter() + ttl,
+        tp_size=conn.tp_size,
+    )
     conn._coord_send[uuid] = entry
     return entry
 
 
-def _recv_entry(conn,
-                uuid=11,
-                req_id="d0",
-                slot_idx=0,
-                num_blocks=2,
-                remote_host="10.0.0.2",
-                remote_port=9100,
-                side_port=None):
-    entry = zsb._CoordRecvEntry(req_id=req_id,
-                                uuid=uuid,
-                                slot_idx=slot_idx,
-                                num_blocks=num_blocks,
-                                local_blocks=[0, 1],
-                                remote_blocks=[4, 5],
-                                remote_host=remote_host,
-                                remote_port=remote_port,
-                                remote_side_channel_port=side_port)
+def _recv_entry(
+    conn,
+    uuid=11,
+    req_id="d0",
+    slot_idx=0,
+    num_blocks=2,
+    remote_host="10.0.0.2",
+    remote_port=9100,
+    side_port=None,
+):
+    entry = zsb._CoordRecvEntry(
+        req_id=req_id,
+        uuid=uuid,
+        slot_idx=slot_idx,
+        num_blocks=num_blocks,
+        local_blocks=[0, 1],
+        remote_blocks=[4, 5],
+        remote_host=remote_host,
+        remote_port=remote_port,
+        remote_side_channel_port=side_port,
+    )
     conn._coord_recv[uuid] = entry
     return entry
 
@@ -497,7 +515,6 @@ def _derived_key(machine_id: str) -> bytes:
 
 
 class TestIpcAuth:
-
     def test_env_key_wins(self, monkeypatch):
         monkeypatch.setenv("VLLM_TORCHTPU_IPC_KEY", "hunter2")
         assert zsb._get_default_ipc_key() == b"hunter2"
@@ -506,11 +523,11 @@ class TestIpcAuth:
         monkeypatch.delenv("VLLM_TORCHTPU_IPC_KEY", raising=False)
         machine_id = tmp_path / "machine-id"
         machine_id.write_text("abc123\n")
-        fake_path = _ModuleStub(os.path,
-                                exists=lambda path: path == "/etc/machine-id")
-        with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)), \
-             patch(f"{_BASE}.open", create=True,
-                   return_value=open(machine_id)):
+        fake_path = _ModuleStub(os.path, exists=lambda path: path == "/etc/machine-id")
+        with (
+            patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)),
+            patch(f"{_BASE}.open", create=True, return_value=open(machine_id)),
+        ):
             key = zsb._get_default_ipc_key()
         assert key == _derived_key("abc123")
 
@@ -524,8 +541,10 @@ class TestIpcAuth:
     def test_derived_key_survives_unreadable_machine_id(self, monkeypatch):
         monkeypatch.delenv("VLLM_TORCHTPU_IPC_KEY", raising=False)
         fake_path = _ModuleStub(os.path, exists=lambda _path: True)
-        with patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)), \
-             patch(f"{_BASE}.open", create=True, side_effect=OSError("nope")):
+        with (
+            patch(f"{_BASE}.os", new=_ModuleStub(os, path=fake_path)),
+            patch(f"{_BASE}.open", create=True, side_effect=OSError("nope")),
+        ):
             key = zsb._get_default_ipc_key()
         assert key == _derived_key("")
 
@@ -545,7 +564,6 @@ class TestIpcAuth:
 
 
 class TestRemoveIpcEndpoint:
-
     def test_ignores_non_ipc_path(self, tmp_path):
         target = tmp_path / "keep.sock"
         target.write_text("")
@@ -571,7 +589,6 @@ class TestRemoveIpcEndpoint:
 
 
 class TestLatencyTracker:
-
     def test_summary_reports_count_average_min_and_max_per_phase(self):
         tracker = zsb._LatencyTracker("who", log_interval_s=0.01)
         for value in (5.0, 1.0, 9.0):
@@ -585,8 +602,7 @@ class TestLatencyTracker:
         assert "wire: n=1 avg=4.0ms min=4.0ms max=4.0ms" in summary
 
     def test_negative_interval_is_clamped_to_zero(self):
-        assert zsb._LatencyTracker("who", log_interval_s=-3.0)._log_interval_s \
-            == 0.0
+        assert zsb._LatencyTracker("who", log_interval_s=-3.0)._log_interval_s == 0.0
 
     def test_summary_is_suppressed_inside_the_interval(self):
         tracker = zsb._LatencyTracker("who", log_interval_s=1000.0)
@@ -596,35 +612,36 @@ class TestLatencyTracker:
 
 
 class TestCoordEntries:
-
     def test_send_entry_sizes_one_event_per_rank(self):
-        entry = zsb._CoordSendEntry(req_id="r",
-                                    slot_idx=0,
-                                    num_blocks=1,
-                                    expiration_time=0.0,
-                                    tp_size=4)
+        entry = zsb._CoordSendEntry(
+            req_id="r", slot_idx=0, num_blocks=1, expiration_time=0.0, tp_size=4
+        )
         assert len(entry.staged_events) == 4
         assert not entry.stage_complete.is_set()
 
     def test_send_entry_keeps_supplied_events(self):
         events = [threading.Event()]
-        entry = zsb._CoordSendEntry(req_id="r",
-                                    slot_idx=0,
-                                    num_blocks=1,
-                                    expiration_time=0.0,
-                                    tp_size=4,
-                                    staged_events=events)
+        entry = zsb._CoordSendEntry(
+            req_id="r",
+            slot_idx=0,
+            num_blocks=1,
+            expiration_time=0.0,
+            tp_size=4,
+            staged_events=events,
+        )
         assert entry.staged_events is events
 
     def test_recv_entry_defaults(self):
-        entry = zsb._CoordRecvEntry(req_id="r",
-                                    uuid=1,
-                                    slot_idx=0,
-                                    num_blocks=1,
-                                    local_blocks=[0],
-                                    remote_blocks=[1],
-                                    remote_host="h",
-                                    remote_port=1)
+        entry = zsb._CoordRecvEntry(
+            req_id="r",
+            uuid=1,
+            slot_idx=0,
+            num_blocks=1,
+            local_blocks=[0],
+            remote_blocks=[1],
+            remote_host="h",
+            remote_port=1,
+        )
         assert not entry.pull_ok and not entry.reported_done
         assert entry.copied == set()
 
@@ -635,7 +652,6 @@ class TestCoordEntries:
 
 
 class TestInit:
-
     def test_producer_defaults(self):
         conn = _make_conn()
         assert conn.is_producer
@@ -656,18 +672,16 @@ class TestInit:
         assert not conn._is_host_coordinator
         assert not conn._coord_workers_ready.is_set()
 
-    def test_local_rank_zero_on_second_host_is_a_coordinator(
-            self, monkeypatch):
+    def test_local_rank_zero_on_second_host_is_a_coordinator(self, monkeypatch):
         monkeypatch.setenv("TPU_NUM_HOSTS", "2")
         conn = _make_conn(tp_rank=4, tp_size=8)
         assert conn.local_tp_rank == 0
         assert conn._is_host_coordinator
 
     def test_explicit_executor_sizes_are_honoured(self):
-        conn = _make_conn(tp_size=4,
-                          coord_workers=3,
-                          channel_workers=5,
-                          stage_pool_size=2)
+        conn = _make_conn(
+            tp_size=4, coord_workers=3, channel_workers=5, stage_pool_size=2
+        )
         assert conn._coord_executor._max_workers == 3
         assert conn._coord_channel_executor._max_workers == 5
         assert conn._coord_stage_waiter_pool._max_workers == 2
@@ -704,13 +718,13 @@ class TestInit:
 
 
 class TestRegisterRunner:
-
     def test_extracts_layout_and_runs_setup(self):
         conn = _make_conn()
         runner = _make_runner()
-        with patch.object(conn, "_coord_setup") as setup, \
-             patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled",
-                   return_value=False):
+        with (
+            patch.object(conn, "_coord_setup") as setup,
+            patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled", return_value=False),
+        ):
             conn.register_runner(runner)
         assert conn.num_layers == _NUM_LAYERS
         assert conn.shape == [_CACHE_BLOCKS, *_BLOCK_SHAPE]
@@ -727,25 +741,27 @@ class TestRegisterRunner:
 
     def test_warmup_runs_when_enabled(self):
         conn = _make_conn()
-        with patch.object(conn, "_coord_setup"), \
-             patch.object(conn, "_warmup_kv_ops") as warmup, \
-             patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled",
-                   return_value=True):
+        with (
+            patch.object(conn, "_coord_setup"),
+            patch.object(conn, "_warmup_kv_ops") as warmup,
+            patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled", return_value=True),
+        ):
             conn.register_runner(_make_runner())
         assert warmup.called
 
     def test_warmup_failure_is_swallowed(self):
         conn = _make_conn()
-        with patch.object(conn, "_coord_setup"), \
-             patch.object(conn, "_warmup_kv_ops",
-                          side_effect=RuntimeError("compile blew up")), \
-             patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled",
-                   return_value=True):
+        with (
+            patch.object(conn, "_coord_setup"),
+            patch.object(
+                conn, "_warmup_kv_ops", side_effect=RuntimeError("compile blew up")
+            ),
+            patch(f"{_BASE}.dist_utils.get_kv_warmup_enabled", return_value=True),
+        ):
             conn.register_runner(_make_runner())
 
 
 class TestWarmup:
-
     def test_block_sizes_round_up_to_whole_blocks(self):
         cfg = _make_vllm_config(block_size=16, max_model_len=33)
         conn = _make_conn(cfg=cfg)
@@ -754,8 +770,7 @@ class TestWarmup:
     def test_producer_warmup_uses_the_sync_stage_path(self):
         conn = _attach_runner(_make_conn())
         conn._warmup_kv_ops()
-        assert conn.stage_sync_calls == [(0, _CACHE_BLOCKS,
-                                          list(range(_CACHE_BLOCKS)))]
+        assert conn.stage_sync_calls == [(0, _CACHE_BLOCKS, list(range(_CACHE_BLOCKS)))]
 
     def test_zero_block_sizes_are_skipped(self):
         conn = _attach_runner(_make_conn())
@@ -775,12 +790,10 @@ class TestWarmup:
         originals = list(conn.runner.kv_caches)
         conn._warmup_coord_once(2)
         assert conn.fast_scatter_calls == [(_NUM_LAYERS, _NUM_LAYERS, [0, 1])]
-        assert all(new is not old
-                   for new, old in zip(conn.runner.kv_caches, originals))
+        assert all(new is not old for new, old in zip(conn.runner.kv_caches, originals))
 
 
 class TestPoolSpec:
-
     def test_spec_is_derived_from_the_budget(self):
         cfg = _make_vllm_config(block_size=1, max_model_len=_CACHE_BLOCKS)
         conn = _attach_runner(_make_conn(cfg=cfg))
@@ -788,7 +801,7 @@ class TestPoolSpec:
             spec = conn._build_pool_spec()
         assert spec.num_layers == _NUM_LAYERS
         assert spec.max_blocks == _CACHE_BLOCKS
-        assert spec.layer_shard_shape == (_CACHE_BLOCKS, ) + _BLOCK_SHAPE
+        assert spec.layer_shard_shape == (_CACHE_BLOCKS,) + _BLOCK_SHAPE
         assert spec.dtype == torch.float32
         assert spec.num_slots >= 1
 
@@ -808,23 +821,27 @@ class TestPoolSpec:
 
 
 class TestCoordSetup:
-
     def _setup(self, conn, *, pin=False):
         """Execute _coord_setup with termination events preset to suppress background threads."""
         conn._stop_event.set()
-        with patch(f"{_BASE}.dist_utils.get_kv_shm_pool_gb", return_value=1.0), \
-             patch(f"{_BASE}.dist_utils.get_kv_pin_shm", return_value=pin), \
-             patch(f"{_BASE}.dist_utils.get_shm_name", return_value="shm0"), \
-             patch(f"{_BASE}.dist_utils.get_ipc_socket_path",
-                   return_value="ipc:///tmp/tpu-test.sock"), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1), \
-             patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()), \
-             patch(f"{_BASE}._try_remove_ipc_endpoint"), \
-             patch.object(conn, "_pool_create",
-                          side_effect=lambda spec, name: _make_pool()), \
-             patch.object(conn, "_pool_attach",
-                          side_effect=lambda spec, name: _make_pool()):
+        with (
+            patch(f"{_BASE}.dist_utils.get_kv_shm_pool_gb", return_value=1.0),
+            patch(f"{_BASE}.dist_utils.get_kv_pin_shm", return_value=pin),
+            patch(f"{_BASE}.dist_utils.get_shm_name", return_value="shm0"),
+            patch(
+                f"{_BASE}.dist_utils.get_ipc_socket_path",
+                return_value="ipc:///tmp/tpu-test.sock",
+            ),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+            patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()),
+            patch(f"{_BASE}._try_remove_ipc_endpoint"),
+            patch.object(
+                conn, "_pool_create", side_effect=lambda spec, name: _make_pool()
+            ),
+            patch.object(
+                conn, "_pool_attach", side_effect=lambda spec, name: _make_pool()
+            ),
+        ):
             conn._coord_setup()
 
     def test_rank0_producer_binds_ipc_and_spawns_loops(self):
@@ -834,8 +851,11 @@ class TestCoordSetup:
         assert conn._coord_ipc_sock.socket_type == zmq.ROUTER
         names = {t.name for t in conn._coord_threads}
         assert {
-            "tpu_conn_ipc", "tpu_conn_stage_wait", "tpu_conn_expire",
-            "tpu_conn_data_ch0", "tpu_conn_notif"
+            "tpu_conn_ipc",
+            "tpu_conn_stage_wait",
+            "tpu_conn_expire",
+            "tpu_conn_data_ch0",
+            "tpu_conn_notif",
         } <= names
 
     def test_rank0_consumer_has_no_external_servers(self):
@@ -868,8 +888,10 @@ class TestCoordSetup:
                 raise FileNotFoundError(name)
             return pool
 
-        with patch.object(conn, "_pool_attach", side_effect=flaky), \
-             patch(f"{_BASE}.time", new=_ModuleStub(time, sleep=lambda _s: None)):
+        with (
+            patch.object(conn, "_pool_attach", side_effect=flaky),
+            patch(f"{_BASE}.time", new=_ModuleStub(time, sleep=lambda _s: None)),
+        ):
             assert conn._coord_attach_shm_with_retry(object(), "shm") is pool
         assert attempts["n"] == 3
 
@@ -878,13 +900,16 @@ class TestCoordSetup:
         # Simulate two retries within the deadline before advancing time past
         # the timeout threshold.
         clock = itertools.chain([0.0, 0.0], itertools.repeat(99.0))
-        with patch.object(conn, "_pool_attach",
-                          side_effect=FileNotFoundError("shm")), \
-             patch(f"{_BASE}.time",
-                   new=_ModuleStub(time,
-                                   sleep=lambda _s: None,
-                                   perf_counter=lambda: next(clock))), \
-             pytest.raises(RuntimeError, match="could not attach"):
+        with (
+            patch.object(conn, "_pool_attach", side_effect=FileNotFoundError("shm")),
+            patch(
+                f"{_BASE}.time",
+                new=_ModuleStub(
+                    time, sleep=lambda _s: None, perf_counter=lambda: next(clock)
+                ),
+            ),
+            pytest.raises(RuntimeError, match="could not attach"),
+        ):
             conn._coord_attach_shm_with_retry(object(), "shm")
 
 
@@ -894,7 +919,6 @@ class TestCoordSetup:
 
 
 class TestIpcEnvelopes:
-
     def test_worker_send_enqueues_an_unaddressed_frame(self):
         conn = _make_conn(tp_rank=1, tp_size=2)
         conn._coord_send_ipc(zsb._IPC_COPY_DONE, (9, 1))
@@ -903,13 +927,15 @@ class TestIpcEnvelopes:
     def test_broadcast_addresses_every_known_rank(self):
         conn = _make_conn(tp_size=3)
         conn._coord_rank_to_identity = {1: b"r1", 2: b"r2"}
-        conn._coord_broadcast(zsb._IPC_DROP, (4, ))
-        assert sorted(_drain_ipc(conn)) == [(b"r1", zsb._IPC_DROP, (4, )),
-                                            (b"r2", zsb._IPC_DROP, (4, ))]
+        conn._coord_broadcast(zsb._IPC_DROP, (4,))
+        assert sorted(_drain_ipc(conn)) == [
+            (b"r1", zsb._IPC_DROP, (4,)),
+            (b"r2", zsb._IPC_DROP, (4,)),
+        ]
 
     def test_broadcast_with_no_peers_sends_nothing(self):
         conn = _make_conn()
-        conn._coord_broadcast(zsb._IPC_DROP, (4, ))
+        conn._coord_broadcast(zsb._IPC_DROP, (4,))
         assert _drain_ipc(conn) == []
 
     def test_drain_sends_dealer_and_router_shapes(self):
@@ -930,7 +956,6 @@ class TestIpcEnvelopes:
 
 
 class TestTeardown:
-
     def test_teardown_is_safe_before_setup(self):
         conn = _make_conn()
         _LIVE.remove(conn)
@@ -940,8 +965,12 @@ class TestTeardown:
     def test_teardown_before_init_finished(self):
         conn = _make_conn()
         _LIVE.remove(conn)
-        for attr in ("_stage_pending_q", "_coord_executor",
-                     "_coord_channel_executor", "_coord_stage_waiter_pool"):
+        for attr in (
+            "_stage_pending_q",
+            "_coord_executor",
+            "_coord_channel_executor",
+            "_coord_stage_waiter_pool",
+        ):
             delattr(conn, attr)
         conn._coord_teardown()
         assert conn._stop_event.is_set()
@@ -949,8 +978,9 @@ class TestTeardown:
     def test_a_full_stage_queue_does_not_block_teardown(self):
         conn = _attach_runner(_make_conn())
         _LIVE.remove(conn)
-        conn._stage_pending_q = SimpleNamespace(put_nowait=MagicMock(
-            side_effect=queue.Full()))
+        conn._stage_pending_q = SimpleNamespace(
+            put_nowait=MagicMock(side_effect=queue.Full())
+        )
         conn._coord_teardown()
         assert conn._coord_pool.closed
 
@@ -969,14 +999,11 @@ class TestTeardown:
 
 
 class TestProcessSendLoad:
-
     def test_coordinator_handles_sends_and_loads(self):
         conn = _attach_runner(_make_conn())
         meta = TPUConnectorMetadata(
             reqs_to_send={
-                "r1": SendMeta(uuid=1,
-                               local_block_ids=[0, 1],
-                               expiration_time=0.0)
+                "r1": SendMeta(uuid=1, local_block_ids=[0, 1], expiration_time=0.0)
             },
             reqs_to_load={},
         )
@@ -989,9 +1016,7 @@ class TestProcessSendLoad:
         conn._coord_workers_ready = _ScriptedEvent([False])
         meta = TPUConnectorMetadata(
             reqs_to_send={
-                "r1": SendMeta(uuid=1,
-                               local_block_ids=[0],
-                               expiration_time=0.0)
+                "r1": SendMeta(uuid=1, local_block_ids=[0], expiration_time=0.0)
             },
             reqs_to_load={},
         )
@@ -1010,23 +1035,26 @@ class TestProcessSendLoad:
         conn = _attach_runner(_make_conn(is_producer=False))
         meta = TPUConnectorMetadata(
             reqs_to_load={
-                "d1":
-                LoadMeta(uuid=2,
-                         local_block_ids=[0],
-                         remote_block_ids=[3],
-                         remote_host="h",
-                         remote_port=1)
-            })
+                "d1": LoadMeta(
+                    uuid=2,
+                    local_block_ids=[0],
+                    remote_block_ids=[3],
+                    remote_host="h",
+                    remote_port=1,
+                )
+            }
+        )
         with patch.object(conn, "_coord_rank0_handle_new_load") as handle:
             conn._coord_process_send_load(meta)
         handle.assert_called_once()
 
     def test_non_coordinator_stages_inline(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
-        meta = TPUConnectorMetadata(reqs_to_send={
-            "r1":
-            SendMeta(uuid=1, local_block_ids=[0], expiration_time=0.0)
-        })
+        meta = TPUConnectorMetadata(
+            reqs_to_send={
+                "r1": SendMeta(uuid=1, local_block_ids=[0], expiration_time=0.0)
+            }
+        )
         with patch.object(conn, "_coord_worker_stage_inline") as stage:
             conn._coord_process_send_load(meta)
         stage.assert_called_once_with(1, "r1")
@@ -1035,21 +1063,24 @@ class TestProcessSendLoad:
         conn = _attach_runner(_make_conn(is_producer=False))
         meta = TPUConnectorMetadata(
             reqs_to_load={
-                "d1":
-                LoadMeta(uuid=2,
-                         local_block_ids=[0],
-                         remote_block_ids=None,
-                         remote_host="h",
-                         remote_port=1)
-            })
-        with patch.object(conn, "_coord_rank0_handle_new_load"), \
-             patch.object(conn, "_coord_drain_scatter") as drain:
+                "d1": LoadMeta(
+                    uuid=2,
+                    local_block_ids=[0],
+                    remote_block_ids=None,
+                    remote_host="h",
+                    remote_port=1,
+                )
+            }
+        )
+        with (
+            patch.object(conn, "_coord_rank0_handle_new_load"),
+            patch.object(conn, "_coord_drain_scatter") as drain,
+        ):
             conn._coord_process_send_load(meta)
         drain.assert_called_once()
 
 
 class TestSmallHelpers:
-
     def test_blocks_token_counts_blocks(self):
         assert _make_conn()._blocks_token([1, 2, 3]) == 3
 
@@ -1079,24 +1110,26 @@ class TestSmallHelpers:
 
     def test_get_finished_delegates_to_the_coordinator_path(self):
         conn = _make_conn()
-        with patch.object(conn,
-                          "_coord_get_finished",
-                          return_value=({"a"}, {"b"})) as inner:
+        with patch.object(
+            conn, "_coord_get_finished", return_value=({"a"}, {"b"})
+        ) as inner:
             assert conn.get_finished({"x"}) == ({"a"}, {"b"})
         assert inner.called
 
 
 class TestAbstractHooks:
-
-    @pytest.mark.parametrize(("name", "args"), (
-        ("_stage_d2h", (0, 1, [0])),
-        ("_stage_d2h_sync", (0, 1, [0])),
-        ("_wait_stage", (None, )),
-        ("_h2d_into_device", ([], )),
-        ("_h2d_into_device_async", ([], )),
-        ("_synchronize_device", (None, )),
-        ("_try_fast_scatter", ([], [], [])),
-    ))
+    @pytest.mark.parametrize(
+        ("name", "args"),
+        (
+            ("_stage_d2h", (0, 1, [0])),
+            ("_stage_d2h_sync", (0, 1, [0])),
+            ("_wait_stage", (None,)),
+            ("_h2d_into_device", ([],)),
+            ("_h2d_into_device_async", ([],)),
+            ("_synchronize_device", (None,)),
+            ("_try_fast_scatter", ([], [], [])),
+        ),
+    )
     def test_transport_hooks_are_abstract(self, name, args):
         conn = _make_conn(cls=zsb.ZmqShmKvConnectorBase)
         with pytest.raises(NotImplementedError):
@@ -1109,20 +1142,19 @@ class TestAbstractHooks:
 
 
 class TestHandleNewSend:
-
     def test_acquires_a_slot_broadcasts_and_stages(self):
         conn = _attach_runner(_make_conn(tp_size=2))
         conn._coord_rank_to_identity = {1: b"r1"}
-        meta = SendMeta(uuid=42,
-                        local_block_ids=[0, 1, 2],
-                        expiration_time=time.perf_counter() + 30)
+        meta = SendMeta(
+            uuid=42, local_block_ids=[0, 1, 2], expiration_time=time.perf_counter() + 30
+        )
         conn._coord_rank0_handle_new_send("req-a", meta)
         entry = conn._coord_send[42]
-        assert (entry.req_id, entry.slot_idx, entry.num_blocks) == ("req-a", 0,
-                                                                    3)
+        assert (entry.req_id, entry.slot_idx, entry.num_blocks) == ("req-a", 0, 3)
         assert len(entry.staged_events) == 2
-        assert _drain_ipc(conn) == [(b"r1", zsb._IPC_STAGE_NOTIFY,
-                                     (42, 0, 3, [0, 1, 2]))]
+        assert _drain_ipc(conn) == [
+            (b"r1", zsb._IPC_STAGE_NOTIFY, (42, 0, 3, [0, 1, 2]))
+        ]
         assert conn.stage_calls == [(0, 3, [0, 1, 2])]
 
     def test_pool_exhaustion_surfaces_done_sending(self):
@@ -1158,7 +1190,6 @@ class TestHandleNewSend:
 
 
 class TestWorkerStageInline:
-
     def test_stages_once_stage_notify_lands(self):
         conn = _attach_runner(_make_conn(tp_rank=1, tp_size=2))
         conn._worker_pending_stage[5] = (1, 3, [7, 8, 9])
@@ -1197,7 +1228,6 @@ class TestWorkerStageInline:
 
 
 class TestStageShardAndWaiter:
-
     def test_stage_shard_enqueues_an_in_flight_entry(self):
         conn = _attach_runner(_make_conn())
         conn._coord_stage_shard(9, 1, 2, [0, 1])
@@ -1294,7 +1324,6 @@ class TestStageShardAndWaiter:
 
 
 class TestSignalStageDone:
-
     def test_coordinator_marks_its_own_rank(self):
         conn = _attach_runner(_make_conn())
         entry = _send_entry(conn, uuid=3)
@@ -1315,11 +1344,9 @@ class TestSignalStageDone:
 
     def test_an_entry_without_per_rank_events_still_completes(self):
         conn = _attach_runner(_make_conn())
-        entry = zsb._CoordSendEntry(req_id="r",
-                                    slot_idx=0,
-                                    num_blocks=1,
-                                    expiration_time=0.0,
-                                    tp_size=1)
+        entry = zsb._CoordSendEntry(
+            req_id="r", slot_idx=0, num_blocks=1, expiration_time=0.0, tp_size=1
+        )
         entry.staged_events = []
         conn._coord_send[3] = entry
         conn._signal_stage_done(3)
@@ -1344,23 +1371,25 @@ class TestSignalStageDone:
 # ---------------------------------------------------------------------------
 
 
-def _load_meta(uuid=11,
-               local_blocks=(0, 1),
-               remote_blocks=(4, 5),
-               host="10.0.0.2",
-               port=9100,
-               side_port=None):
-    return LoadMeta(uuid=uuid,
-                    local_block_ids=list(local_blocks),
-                    remote_block_ids=None
-                    if remote_blocks is None else list(remote_blocks),
-                    remote_host=host,
-                    remote_port=port,
-                    remote_side_channel_port=side_port)
+def _load_meta(
+    uuid=11,
+    local_blocks=(0, 1),
+    remote_blocks=(4, 5),
+    host="10.0.0.2",
+    port=9100,
+    side_port=None,
+):
+    return LoadMeta(
+        uuid=uuid,
+        local_block_ids=list(local_blocks),
+        remote_block_ids=None if remote_blocks is None else list(remote_blocks),
+        remote_host=host,
+        remote_port=port,
+        remote_side_channel_port=side_port,
+    )
 
 
 class TestHandleNewLoad:
-
     def test_admits_a_new_load_and_submits_the_pull(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_executor = _InlineExecutor()
@@ -1375,7 +1404,7 @@ class TestHandleNewLoad:
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
         conn._coord_rank_to_identity = {1: b"r1"}
         conn._coord_rank0_handle_new_load("d1", _load_meta(remote_blocks=None))
-        assert _drain_ipc(conn) == [(b"r1", zsb._IPC_LOAD_SKIP, (11, ))]
+        assert _drain_ipc(conn) == [(b"r1", zsb._IPC_LOAD_SKIP, (11,))]
 
     def test_drain_tick_for_a_known_uuid_broadcasts_nothing(self):
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
@@ -1387,8 +1416,9 @@ class TestHandleNewLoad:
     def test_preempted_reemit_updates_blocks_while_the_pull_is_in_flight(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         entry = _recv_entry(conn, uuid=11)
-        conn._coord_rank0_handle_new_load("d1-again",
-                                          _load_meta(local_blocks=(6, 7, 8)))
+        conn._coord_rank0_handle_new_load(
+            "d1-again", _load_meta(local_blocks=(6, 7, 8))
+        )
         assert entry.local_blocks == [6, 7, 8]
         assert entry.num_blocks == 3
         assert entry.req_id == "d1-again"
@@ -1399,8 +1429,7 @@ class TestHandleNewLoad:
         conn._coord_rank_to_identity = {1: b"r1"}
         entry = _recv_entry(conn, uuid=11)
         entry.load_complete.set()
-        conn._coord_rank0_handle_new_load("d1-again",
-                                          _load_meta(local_blocks=(6, 7)))
+        conn._coord_rank0_handle_new_load("d1-again", _load_meta(local_blocks=(6, 7)))
         [(_ident, tag, notify)] = _drain_ipc(conn)
         assert (tag, notify) == (zsb._IPC_LOAD_NOTIFY, (11, 0, 2, [6, 7]))
 
@@ -1419,35 +1448,32 @@ class TestHandleNewLoad:
             conn._coord_rank0_handle_new_load("d1", _load_meta())
 
 
-def _pull_frames(*,
-                 ranks=(0, ),
-                 num_blocks=2,
-                 num_layers=_NUM_LAYERS,
-                 with_header=True,
-                 uuid_echo=b"11"):
+def _pull_frames(
+    *,
+    ranks=(0,),
+    num_blocks=2,
+    num_layers=_NUM_LAYERS,
+    with_header=True,
+    uuid_echo=b"11",
+):
     """Construct a producer PULL response frame sequence with patterned per-layer test data."""
-    frames = [
-        _frame(zsb._MSG_OK),
-        _frame(uuid_echo),
-        _frame(str(len(ranks)).encode())
-    ]
+    frames = [_frame(zsb._MSG_OK), _frame(uuid_echo), _frame(str(len(ranks)).encode())]
     if with_header:
         frames.append(_frame(zsb._secure_dumps({"tp_size": 1})))
     for rank in ranks:
         frames.append(_frame(str(rank).encode()))
         frames.extend(
             _frame(_layer_payload(num_blocks, 0xA0 + layer))
-            for layer in range(num_layers))
+            for layer in range(num_layers)
+        )
     return frames
 
 
 class TestRank0Pull:
-
     def _prepare(self, conn, sockets):
         """Configure make_zmq_socket to return the provided _FakeSocket instances in sequence."""
         handed = iter(sockets)
-        return patch(f"{_BASE}.make_zmq_socket",
-                     side_effect=lambda **kw: next(handed))
+        return patch(f"{_BASE}.make_zmq_socket", side_effect=lambda **kw: next(handed))
 
     def test_successful_pull_unpacks_and_broadcasts_load_notify(self):
         conn = _attach_runner(_make_conn(is_producer=False))
@@ -1455,9 +1481,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames()])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert entry.pull_ok
         assert entry.load_complete.is_set()
@@ -1476,44 +1503,48 @@ class TestRank0Pull:
     def test_multi_host_pull_uses_one_socket_per_host_and_channel(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_channel_executor = _InlineExecutor()
-        entry = _recv_entry(conn,
-                            uuid=11,
-                            remote_host=["h0", "h1"],
-                            remote_port=[9100, 9200])
+        entry = _recv_entry(
+            conn, uuid=11, remote_host=["h0", "h1"], remote_port=[9100, 9200]
+        )
         socks = [
             _FakeSocket(inbound=[_pull_frames(ranks=())]),
-            _FakeSocket(inbound=[_pull_frames(ranks=(0, ))]),
+            _FakeSocket(inbound=[_pull_frames(ranks=(0,))]),
         ]
-        with self._prepare(conn, socks), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, socks),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert entry.pull_ok
         assert len(conn._coord_pool.unpacked) == 1
         assert all(s.closed for s in socks)
 
     def test_parallel_channels_each_carry_their_own_ranks(self):
-        conn = _attach_runner(_make_conn(is_producer=False, tp_size=2),
-                              ranks_per_host=2)
+        conn = _attach_runner(
+            _make_conn(is_producer=False, tp_size=2), ranks_per_host=2
+        )
         conn._coord_local_to_global_rank = {0: 0, 1: 1}
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         socks = [
-            _FakeSocket(inbound=[_pull_frames(ranks=(0, ))]),
-            _FakeSocket(
-                inbound=[_pull_frames(ranks=(1, ), with_header=False)]),
+            _FakeSocket(inbound=[_pull_frames(ranks=(0,))]),
+            _FakeSocket(inbound=[_pull_frames(ranks=(1,), with_header=False)]),
         ]
-        with self._prepare(conn, socks), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, socks),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert entry.pull_ok
-        assert sorted(conn._coord_pool.unpacked) == [(0, 0, 2, _NUM_LAYERS),
-                                                     (0, 1, 2, _NUM_LAYERS)]
+        assert sorted(conn._coord_pool.unpacked) == [
+            (0, 0, 2, _NUM_LAYERS),
+            (0, 1, 2, _NUM_LAYERS),
+        ]
 
     def test_errors_on_every_channel_fail_the_pull_once(self):
-        conn = _attach_runner(_make_conn(is_producer=False, tp_size=2),
-                              ranks_per_host=2)
+        conn = _attach_runner(
+            _make_conn(is_producer=False, tp_size=2), ranks_per_host=2
+        )
         conn._coord_channel_executor = _InlineExecutor()
         conn._coord_rank_to_identity = {1: b"r1"}
         entry = _recv_entry(conn, uuid=11, req_id="d1")
@@ -1521,9 +1552,10 @@ class TestRank0Pull:
             _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]]),
             _FakeSocket(inbound=[[_frame(zsb._MSG_ERR)]]),
         ]
-        with self._prepare(conn, socks), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, socks),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
         assert all(s.closed for s in socks)
@@ -1539,9 +1571,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames()], empty_polls=2)
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=5):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=5),
+        ):
             conn._coord_rank0_pull(entry)
         assert entry.pull_ok
         assert sock.polls == 3
@@ -1551,9 +1584,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames(ranks=(0, 5))])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert entry.pull_ok
         assert conn._coord_pool.unpacked == [(0, 0, 2, _NUM_LAYERS)]
@@ -1564,9 +1598,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[[_frame(zsb._MSG_ERR), _frame(b"11")]])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
         assert 11 not in conn._coord_recv
@@ -1579,9 +1614,10 @@ class TestRank0Pull:
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
-        with self._prepare(conn, [_FakeSocket()]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=0):
+        with (
+            self._prepare(conn, [_FakeSocket()]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=0),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
 
@@ -1590,9 +1626,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames(ranks=(0, 0))])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
 
@@ -1601,9 +1638,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames(with_header=False)])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
 
@@ -1611,8 +1649,7 @@ class TestRank0Pull:
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11, remote_host=[], remote_port=[])
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
 
@@ -1621,9 +1658,10 @@ class TestRank0Pull:
         conn._coord_channel_executor = _InlineExecutor()
         entry = _recv_entry(conn, uuid=11)
         sock = _FakeSocket(inbound=[_pull_frames(ranks=())])
-        with self._prepare(conn, [sock]), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            self._prepare(conn, [sock]),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_pull(entry)
         assert not entry.pull_ok
 
@@ -1634,7 +1672,6 @@ class TestRank0Pull:
 
 
 class TestScatter:
-
     def test_empty_block_list_is_a_no_op(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_scatter_shard(0, 0, [])
@@ -1643,8 +1680,7 @@ class TestScatter:
     def test_naive_path_index_puts_every_layer(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         for layer_idx in range(_NUM_LAYERS):
-            conn._coord_pool.layer_view(0, 0, layer_idx,
-                                        2).fill_(layer_idx + 1.0)
+            conn._coord_pool.layer_view(0, 0, layer_idx, 2).fill_(layer_idx + 1.0)
         conn._coord_scatter_shard(0, 2, [4, 9])
         assert len(conn.sync_calls) == _NUM_LAYERS
         assert conn.fast_scatter_calls == []
@@ -1653,8 +1689,8 @@ class TestScatter:
         # indices without modifying other cache blocks.
         for layer_idx, cache in enumerate(conn.runner.kv_caches):
             assert torch.equal(
-                cache[[4, 9]], torch.full((2, ) + _BLOCK_SHAPE,
-                                          layer_idx + 1.0))
+                cache[[4, 9]], torch.full((2,) + _BLOCK_SHAPE, layer_idx + 1.0)
+            )
             assert torch.count_nonzero(cache) == 2 * cache[0].numel()
 
     def test_fast_path_replaces_the_runner_caches(self):
@@ -1663,8 +1699,7 @@ class TestScatter:
         originals = list(conn.runner.kv_caches)
         conn._coord_scatter_shard(0, 2, [0, 1])
         assert conn.fast_scatter_calls == [(_NUM_LAYERS, _NUM_LAYERS, [0, 1])]
-        assert all(new is not old
-                   for new, old in zip(conn.runner.kv_caches, originals))
+        assert all(new is not old for new, old in zip(conn.runner.kv_caches, originals))
 
     def test_scatter_and_ack_registers_the_copy_on_the_coordinator(self):
         conn = _attach_runner(_make_conn(is_producer=False))
@@ -1673,23 +1708,24 @@ class TestScatter:
         reg.assert_called_once_with(11, 0)
 
     def test_scatter_and_ack_acks_over_ipc_on_other_ranks(self):
-        conn = _attach_runner(
-            _make_conn(is_producer=False, tp_rank=1, tp_size=2))
+        conn = _attach_runner(_make_conn(is_producer=False, tp_rank=1, tp_size=2))
         conn._coord_scatter_and_ack("d1", 11, 0, 2, [0, 1])
         [(_ident, tag, ack)] = _drain_ipc(conn)
         assert (tag, ack) == (zsb._IPC_COPY_DONE, (11, 1))
 
     def test_scatter_failure_still_acks(self):
         conn = _attach_runner(_make_conn(is_producer=False))
-        with patch.object(conn, "_coord_scatter_shard",
-                          side_effect=RuntimeError("hbm fault")), \
-             patch.object(conn, "_coord_rank0_register_copy") as reg:
+        with (
+            patch.object(
+                conn, "_coord_scatter_shard", side_effect=RuntimeError("hbm fault")
+            ),
+            patch.object(conn, "_coord_rank0_register_copy") as reg,
+        ):
             conn._coord_scatter_and_ack("d1", 11, 0, 2, [0, 1])
         assert reg.called
 
 
 class TestDrainScatter:
-
     def test_coordinator_scatters_a_completed_pull(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         entry = _recv_entry(conn, uuid=11)
@@ -1707,22 +1743,22 @@ class TestDrainScatter:
     def test_failed_pull_only_notifies_the_producer(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         _recv_entry(conn, uuid=11)
-        with patch.object(conn, "_coord_rank0_send_notify") as notify, \
-             patch.object(conn, "_coord_scatter_and_ack") as scatter:
+        with (
+            patch.object(conn, "_coord_rank0_send_notify") as notify,
+            patch.object(conn, "_coord_scatter_and_ack") as scatter,
+        ):
             conn._coord_drain_scatter("d1", _load_meta(remote_blocks=None))
         assert notify.called and not scatter.called
 
     def test_worker_scatters_after_load_notify(self):
-        conn = _attach_runner(
-            _make_conn(is_producer=False, tp_rank=1, tp_size=2))
+        conn = _attach_runner(_make_conn(is_producer=False, tp_rank=1, tp_size=2))
         conn._worker_pending_load[11] = (1, 3, [2, 3, 4])
         with patch.object(conn, "_coord_scatter_and_ack") as scatter:
             conn._coord_drain_scatter("d1", _load_meta(remote_blocks=None))
         scatter.assert_called_once_with("d1", 11, 1, 3, [2, 3, 4])
 
     def test_worker_skips_when_the_coordinator_dropped_the_request(self):
-        conn = _attach_runner(
-            _make_conn(is_producer=False, tp_rank=1, tp_size=2))
+        conn = _attach_runner(_make_conn(is_producer=False, tp_rank=1, tp_size=2))
         conn._worker_pending_load[11] = None
         with patch.object(conn, "_coord_scatter_and_ack") as scatter:
             conn._coord_drain_scatter("d1", _load_meta(remote_blocks=None))
@@ -1730,7 +1766,6 @@ class TestDrainScatter:
 
 
 class TestWorkerWaitLoad:
-
     def test_returns_the_pending_entry(self):
         conn = _make_conn(tp_rank=1, tp_size=2)
         conn._worker_pending_load[3] = (1, 2, [0, 1])
@@ -1748,7 +1783,6 @@ class TestWorkerWaitLoad:
 
 
 class TestRegisterCopy:
-
     def test_partial_copies_keep_the_slot(self):
         conn = _attach_runner(_make_conn(is_producer=False, tp_size=2))
         entry = _recv_entry(conn, uuid=11)
@@ -1769,9 +1803,12 @@ class TestRegisterCopy:
     def test_slot_is_released_even_if_notify_raises(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         _recv_entry(conn, uuid=11, slot_idx=1)
-        with patch.object(conn, "_coord_rank0_send_notify",
-                          side_effect=RuntimeError("no route")), \
-             pytest.raises(RuntimeError):
+        with (
+            patch.object(
+                conn, "_coord_rank0_send_notify", side_effect=RuntimeError("no route")
+            ),
+            pytest.raises(RuntimeError),
+        ):
             conn._coord_rank0_register_copy(11, 0)
         assert conn._coord_pool.released == [1]
 
@@ -1781,7 +1818,6 @@ class TestRegisterCopy:
 
 
 class TestSendNotify:
-
     def _consumer(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         conn._coord_notif_sockets = {}
@@ -1803,17 +1839,16 @@ class TestSendNotify:
         socks = [_FakeSocket(), _FakeSocket()]
         handed = iter(socks)
         meta = _load_meta(host=["h0", "h1"], port=[1, 2], side_port=9700)
-        with patch(f"{_BASE}.make_zmq_socket",
-                   side_effect=lambda **kw: next(handed)):
+        with patch(f"{_BASE}.make_zmq_socket", side_effect=lambda **kw: next(handed)):
             conn._coord_rank0_send_notify(meta, 11)
-        assert sorted(
-            conn._coord_notif_sockets) == ["tcp://h0:9700", "tcp://h1:9701"]
+        assert sorted(conn._coord_notif_sockets) == ["tcp://h0:9700", "tcp://h1:9701"]
 
     def test_falls_back_to_the_local_side_channel_base(self):
         conn = self._consumer()
-        with patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()), \
-             patch(f"{_BASE}.dist_utils.get_side_channel_port",
-                   return_value="9600"):
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()),
+            patch(f"{_BASE}.dist_utils.get_side_channel_port", return_value="9600"),
+        ):
             conn._coord_rank0_send_notify(_load_meta(), 11)
         assert list(conn._coord_notif_sockets) == ["tcp://10.0.0.2:9600"]
 
@@ -1832,7 +1867,6 @@ def _dealer_frame(tag: bytes, payload) -> list[bytes]:
 
 
 class TestRank0IpcLoop:
-
     def _run(self, conn, inbound):
         sock = _FakeSocket(inbound=inbound, on_exhausted=conn._stop_event.set)
         conn._coord_ipc_sock = sock
@@ -1856,23 +1890,20 @@ class TestRank0IpcLoop:
         conn = _attach_runner(_make_conn(tp_size=2))
         entry = _send_entry(conn, uuid=7)
         entry.staged.add(0)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, False))])
+        self._run(conn, [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, False))])
         assert entry.stage_complete.is_set()
         assert entry.staged_events[1].is_set()
 
     def test_stage_done_before_all_ranks_leaves_completion_clear(self):
         conn = _attach_runner(_make_conn(tp_size=4))
         entry = _send_entry(conn, uuid=7)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, True))])
+        self._run(conn, [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 1, True))])
         assert entry.stage_failed
         assert not entry.stage_complete.is_set()
 
     def test_stage_done_for_an_unknown_uuid_is_dropped(self):
         conn = _attach_runner(_make_conn(tp_size=2))
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (99, 1, False))])
+        self._run(conn, [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (99, 1, False))])
 
     def test_stage_done_from_an_out_of_range_rank_is_counted(self):
         # TODO(#771): Rank identifiers in STAGE_DONE payloads are not validated
@@ -1881,8 +1912,7 @@ class TestRank0IpcLoop:
         # This test pins existing behavior until strict rank validation is added.
         conn = _attach_runner(_make_conn(tp_size=2))
         entry = _send_entry(conn, uuid=7)
-        self._run(conn,
-                  [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 9, False))])
+        self._run(conn, [_router_frame(b"r1", zsb._IPC_STAGE_DONE, (7, 9, False))])
         assert entry.staged == {9}
         assert not entry.stage_complete.is_set()
         assert not any(ev.is_set() for ev in entry.staged_events)
@@ -1891,8 +1921,7 @@ class TestRank0IpcLoop:
         conn = _attach_runner(_make_conn(is_producer=False))
         _recv_entry(conn, uuid=11, slot_idx=1)
         with patch.object(conn, "_coord_rank0_send_notify") as notify:
-            self._run(conn,
-                      [_router_frame(b"r1", zsb._IPC_COPY_DONE, (11, 0))])
+            self._run(conn, [_router_frame(b"r1", zsb._IPC_COPY_DONE, (11, 0))])
         assert notify.called
         assert conn._coord_pool.released == [1]
 
@@ -1910,7 +1939,7 @@ class TestRank0IpcLoop:
     def test_unknown_tag_is_logged(self):
         conn = _attach_runner(_make_conn())
         with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [_router_frame(b"r1", b"NOPE", (1, ))])
+            self._run(conn, [_router_frame(b"r1", b"NOPE", (1,))])
         assert log.warning.called
 
     def test_malformed_frame_count_is_dropped(self):
@@ -1943,7 +1972,6 @@ class TestRank0IpcLoop:
 
 
 class TestWorkerIpcLoop:
-
     def _worker(self, tp_size=2):
         return _attach_runner(_make_conn(tp_rank=1, tp_size=tp_size))
 
@@ -1955,39 +1983,35 @@ class TestWorkerIpcLoop:
 
     def test_stage_notify_lands_in_pending_stage(self):
         conn = self._worker()
-        self._run(conn,
-                  [_dealer_frame(zsb._IPC_STAGE_NOTIFY, (5, 1, 3, [7, 8, 9]))])
+        self._run(conn, [_dealer_frame(zsb._IPC_STAGE_NOTIFY, (5, 1, 3, [7, 8, 9]))])
         assert conn._worker_pending_stage[5] == (1, 3, [7, 8, 9])
 
     def test_load_notify_four_tuple(self):
         conn = self._worker()
-        self._run(conn,
-                  [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, 1, 2, [0, 1]))])
+        self._run(conn, [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, 1, 2, [0, 1]))])
         assert conn._worker_pending_load[5] == (1, 2, [0, 1])
 
     def test_load_notify_five_tuple_carries_a_req_id(self):
         conn = self._worker()
-        self._run(
-            conn,
-            [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, "req", 1, 2, [0, 1]))])
+        self._run(conn, [_dealer_frame(zsb._IPC_LOAD_NOTIFY, (5, "req", 1, 2, [0, 1]))])
         assert conn._worker_pending_load[5] == (1, 2, [0, 1])
 
     def test_load_skip_stores_the_none_sentinel(self):
         conn = self._worker()
-        self._run(conn, [_dealer_frame(zsb._IPC_LOAD_SKIP, (5, ))])
+        self._run(conn, [_dealer_frame(zsb._IPC_LOAD_SKIP, (5,))])
         assert conn._worker_pending_load[5] is None
 
     def test_drop_clears_pending_stage_and_skips_the_load(self):
         conn = self._worker()
         conn._worker_pending_stage[5] = (0, 1, [0])
-        self._run(conn, [_dealer_frame(zsb._IPC_DROP, (5, ))])
+        self._run(conn, [_dealer_frame(zsb._IPC_DROP, (5,))])
         assert conn._worker_pending_load[5] is None
         assert 5 not in conn._worker_pending_stage
 
     def test_unknown_tag_is_logged(self):
         conn = self._worker()
         with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [_dealer_frame(b"NOPE", (1, ))])
+            self._run(conn, [_dealer_frame(b"NOPE", (1,))])
         assert log.warning.called
 
     def test_malformed_frame_count_is_dropped(self):
@@ -2024,57 +2048,73 @@ class TestWorkerIpcLoop:
 
 
 class TestExternalDataLoop:
-
     def _run(self, conn, inbound, *, response=None, send_error=None):
-        sock = _FakeSocket(inbound=inbound,
-                           on_exhausted=conn._stop_event.set,
-                           send_error=send_error)
+        sock = _FakeSocket(
+            inbound=inbound, on_exhausted=conn._stop_event.set, send_error=send_error
+        )
         conn._coord_channel_executor = _InlineExecutor()
         ctx = patch(f"{_BASE}.make_zmq_socket", return_value=sock)
-        timeout = patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                        return_value=1)
+        timeout = patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1)
         if response is None:
             with ctx, timeout:
                 conn._coord_rank0_external_data_loop(0)
         else:
-            with ctx, timeout, patch.object(
-                    conn, "_coord_rank0_build_pull_response", **response):
+            with (
+                ctx,
+                timeout,
+                patch.object(conn, "_coord_rank0_build_pull_response", **response),
+            ):
                 conn._coord_rank0_external_data_loop(0)
         return sock
 
     def test_serves_a_pull_with_the_prepared_frames(self):
         conn = _attach_runner(_make_conn())
         frames = [zsb._MSG_OK, b"7", b"1"]
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"blocks"]],
-                         response={"return_value": frames})
+        sock = self._run(
+            conn,
+            [[b"client", zsb._MSG_PULL, b"7", b"blocks"]],
+            response={"return_value": frames},
+        )
         assert sock.sent == [[b"client", *frames]]
 
     def test_build_failure_answers_err(self):
         conn = _attach_runner(_make_conn())
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
-                         response={"side_effect": RuntimeError("no entry")})
+        sock = self._run(
+            conn,
+            [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+            response={"side_effect": RuntimeError("no entry")},
+        )
         assert sock.sent == [[b"client", zsb._MSG_ERR, b"7"]]
 
     def test_none_response_answers_err(self):
         conn = _attach_runner(_make_conn())
-        sock = self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
-                         response={"return_value": None})
+        sock = self._run(
+            conn,
+            [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+            response={"return_value": None},
+        )
         assert sock.sent == [[b"client", zsb._MSG_ERR, b"7"]]
 
     def test_send_errors_are_logged_not_raised(self):
         conn = _attach_runner(_make_conn())
         with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
-                      response={"return_value": [zsb._MSG_OK]},
-                      send_error=zmq.ZMQError("EHOSTUNREACH"))
+            self._run(
+                conn,
+                [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+                response={"return_value": [zsb._MSG_OK]},
+                send_error=zmq.ZMQError("EHOSTUNREACH"),
+            )
         assert log.warning.called
 
     def test_err_send_errors_are_logged_not_raised(self):
         conn = _attach_runner(_make_conn())
         with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"7", b"b"]],
-                      response={"return_value": None},
-                      send_error=zmq.ZMQError("EHOSTUNREACH"))
+            self._run(
+                conn,
+                [[b"client", zsb._MSG_PULL, b"7", b"b"]],
+                response={"return_value": None},
+                send_error=zmq.ZMQError("EHOSTUNREACH"),
+            )
         assert log.warning.called
 
     def test_non_numeric_uuid_answers_bad_uuid(self):
@@ -2085,8 +2125,11 @@ class TestExternalDataLoop:
     def test_bad_uuid_send_error_is_logged(self):
         conn = _attach_runner(_make_conn())
         with patch(f"{_BASE}.logger") as log:
-            self._run(conn, [[b"client", zsb._MSG_PULL, b"nope"]],
-                      send_error=zmq.ZMQError("EHOSTUNREACH"))
+            self._run(
+                conn,
+                [[b"client", zsb._MSG_PULL, b"nope"]],
+                send_error=zmq.ZMQError("EHOSTUNREACH"),
+            )
         assert log.warning.called
 
     def test_malformed_request_is_dropped(self):
@@ -2104,21 +2147,19 @@ class TestExternalDataLoop:
         conn = _attach_runner(_make_conn())
         sock = _FakeSocket(inbound=[zmq.ContextTerminated()])
         conn._coord_channel_executor = _InlineExecutor()
-        with patch(f"{_BASE}.make_zmq_socket", return_value=sock), \
-             patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with (
+            patch(f"{_BASE}.make_zmq_socket", return_value=sock),
+            patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1),
+        ):
             conn._coord_rank0_external_data_loop(0)
         assert not conn._stop_event.is_set()
 
 
 class TestBuildPullResponse:
-
     def test_unknown_uuid_returns_none(self):
         conn = _attach_runner(_make_conn())
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=0):
-            assert conn._coord_rank0_build_pull_response(7, b"7", 0,
-                                                         [0]) is None
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=0):
+            assert conn._coord_rank0_build_pull_response(7, b"7", 0, [0]) is None
 
     def test_a_pull_that_beats_its_send_metadata_backs_off_and_retries(self):
         conn = _attach_runner(_make_conn())
@@ -2131,8 +2172,7 @@ class TestBuildPullResponse:
         thread = threading.Thread(target=register_late)
         thread.start()
         try:
-            with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                       return_value=5):
+            with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=5):
                 frames = conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
         finally:
             thread.join()
@@ -2142,8 +2182,7 @@ class TestBuildPullResponse:
         conn = _attach_runner(_make_conn())
         entry = _send_entry(conn, uuid=7, num_blocks=2)
         entry.staged_events[0].set()
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             frames = conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
         assert frames[0] == zsb._MSG_OK
         assert frames[1] == b"7"
@@ -2157,8 +2196,7 @@ class TestBuildPullResponse:
         conn._coord_local_to_global_rank = {0: 0, 1: 1}
         entry = _send_entry(conn, uuid=7, num_blocks=2)
         entry.staged_events[1].set()
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             frames = conn._coord_rank0_build_pull_response(7, b"7", 1, [1])
         assert frames[3] == b"1"
         assert len(frames) == 4 + _NUM_LAYERS
@@ -2167,50 +2205,41 @@ class TestBuildPullResponse:
         conn = _attach_runner(_make_conn())
         entry = _send_entry(conn, uuid=7, ttl=-100.0)
         entry.staged_events[0].set()
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
         assert entry.expiration_time > time.perf_counter()
 
     def test_stage_timeout_returns_none(self):
         conn = _attach_runner(_make_conn())
         _send_entry(conn, uuid=7)
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=0.01):
-            assert conn._coord_rank0_build_pull_response(7, b"7", 0,
-                                                         [0]) is None
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=0.01):
+            assert conn._coord_rank0_build_pull_response(7, b"7", 0, [0]) is None
 
     def test_stage_failure_returns_none(self):
         conn = _attach_runner(_make_conn())
         entry = _send_entry(conn, uuid=7)
         entry.staged_events[0].set()
         entry.stage_failed = True
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
-            assert conn._coord_rank0_build_pull_response(7, b"7", 0,
-                                                         [0]) is None
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
+            assert conn._coord_rank0_build_pull_response(7, b"7", 0, [0]) is None
 
     def test_out_of_range_rank_falls_back_to_the_global_event(self):
         conn = _attach_runner(_make_conn(), ranks_per_host=4)
         entry = _send_entry(conn, uuid=7)
         entry.stage_complete.set()
         conn._coord_local_to_global_rank[3] = 3
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             frames = conn._coord_rank0_build_pull_response(7, b"7", 0, [3])
         assert frames[4] == b"3"
 
     def test_out_of_range_rank_can_also_time_out(self):
         conn = _attach_runner(_make_conn())
         _send_entry(conn, uuid=7)
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=0.01):
-            assert conn._coord_rank0_build_pull_response(7, b"7", 0,
-                                                         [3]) is None
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=0.01):
+            assert conn._coord_rank0_build_pull_response(7, b"7", 0, [3]) is None
 
 
 class TestExternalNotifLoop:
-
     def _run(self, conn, inbound):
         sock = _FakeSocket(inbound=inbound, on_exhausted=conn._stop_event.set)
         with patch(f"{_BASE}.make_zmq_socket", return_value=sock):
@@ -2248,7 +2277,6 @@ class TestExternalNotifLoop:
 
 
 class TestExpireLoop:
-
     def test_expired_entries_release_their_slot(self):
         conn = _attach_runner(_make_conn())
         _send_entry(conn, uuid=7, req_id="r7", slot_idx=1, ttl=-1.0)
@@ -2290,7 +2318,6 @@ class TestExpireLoop:
 
 
 class TestGetFinished:
-
     def test_completed_loads_are_reported_exactly_once(self):
         conn = _attach_runner(_make_conn(is_producer=False))
         entry = _recv_entry(conn, uuid=11, req_id="d11")
@@ -2311,7 +2338,6 @@ class TestGetFinished:
 
 
 class TestConnectorStats:
-
     def test_producer_records_the_prefill_queue_length(self):
         conn = _attach_runner(_make_conn())
         _send_entry(conn, uuid=7)
@@ -2354,14 +2380,13 @@ class TestCoordinatorWorkerHandoff:
 
     def test_stage_notify_round_trip_serves_a_pull(self):
         coord = _attach_runner(_make_conn(tp_size=2), ranks_per_host=2)
-        worker = _attach_runner(_make_conn(tp_rank=1, tp_size=2),
-                                ranks_per_host=2)
+        worker = _attach_runner(_make_conn(tp_rank=1, tp_size=2), ranks_per_host=2)
         coord._coord_local_to_global_rank = {0: 0, 1: 1}
         coord._coord_rank_to_identity = {1: b"tpu_rank_1"}
 
-        meta = SendMeta(uuid=42,
-                        local_block_ids=[0, 1],
-                        expiration_time=time.perf_counter() + 30)
+        meta = SendMeta(
+            uuid=42, local_block_ids=[0, 1], expiration_time=time.perf_counter() + 30
+        )
         coord._coord_rank0_handle_new_send("req-a", meta)
 
         # Forward IPC_STAGE_NOTIFY to the worker, then trigger local staging.
@@ -2369,8 +2394,7 @@ class TestCoordinatorWorkerHandoff:
         assert tag == zsb._IPC_STAGE_NOTIFY
         uuid, slot_idx, num_blocks, block_ids = notify
         with worker._worker_pending_stage_cv:
-            worker._worker_pending_stage[uuid] = (slot_idx, num_blocks,
-                                                  block_ids)
+            worker._worker_pending_stage[uuid] = (slot_idx, num_blocks, block_ids)
         worker._coord_worker_stage_inline(uuid, "req-a", timeout=1.0)
         worker._coord_stage_wait_worker(worker._stage_pending_q.get_nowait())
 
@@ -2381,11 +2405,14 @@ class TestCoordinatorWorkerHandoff:
 
         # Complete rank 0 local D2H transfer and verify all ranks finish staging.
         coord._coord_stage_wait_worker(coord._stage_pending_q.get_nowait())
-        sock = _FakeSocket(inbound=[
-            _router_frame(b"tpu_rank_1", zsb._IPC_STAGE_DONE,
-                          (done_uuid, rank, failed))
-        ],
-                           on_exhausted=coord._stop_event.set)
+        sock = _FakeSocket(
+            inbound=[
+                _router_frame(
+                    b"tpu_rank_1", zsb._IPC_STAGE_DONE, (done_uuid, rank, failed)
+                )
+            ],
+            on_exhausted=coord._stop_event.set,
+        )
         coord._coord_ipc_sock = sock
         coord._coord_rank0_ipc_loop()
 
@@ -2393,20 +2420,18 @@ class TestCoordinatorWorkerHandoff:
         assert entry.stage_complete.is_set()
 
         coord._stop_event.clear()
-        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout",
-                   return_value=1):
-            frames = coord._coord_rank0_build_pull_response(
-                42, b"42", 0, [0, 1])
+        with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
+            frames = coord._coord_rank0_build_pull_response(42, b"42", 0, [0, 1])
         assert frames[2] == b"2"
         assert frames[4] == b"0"
 
     def test_copy_done_round_trip_releases_the_slot(self):
-        coord = _attach_runner(_make_conn(is_producer=False, tp_size=2),
-                               ranks_per_host=2)
-        worker = _attach_runner(_make_conn(is_producer=False,
-                                           tp_rank=1,
-                                           tp_size=2),
-                                ranks_per_host=2)
+        coord = _attach_runner(
+            _make_conn(is_producer=False, tp_size=2), ranks_per_host=2
+        )
+        worker = _attach_runner(
+            _make_conn(is_producer=False, tp_rank=1, tp_size=2), ranks_per_host=2
+        )
         coord._coord_notif_sockets = {}
         coord._coord_sockets_lock = threading.Lock()
         _recv_entry(coord, uuid=11, slot_idx=1, side_port=9700)
@@ -2419,8 +2444,10 @@ class TestCoordinatorWorkerHandoff:
         [(_ident, tag, ack)] = _drain_ipc(worker)
         assert tag == zsb._IPC_COPY_DONE
 
-        sock = _FakeSocket(inbound=[_router_frame(b"tpu_rank_1", tag, ack)],
-                           on_exhausted=coord._stop_event.set)
+        sock = _FakeSocket(
+            inbound=[_router_frame(b"tpu_rank_1", tag, ack)],
+            on_exhausted=coord._stop_event.set,
+        )
         coord._coord_ipc_sock = sock
         with patch(f"{_BASE}.make_zmq_socket", return_value=_FakeSocket()):
             coord._coord_rank0_ipc_loop()

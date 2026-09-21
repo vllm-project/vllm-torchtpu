@@ -37,8 +37,9 @@ class CosSinRef(pltpu.BufferedRef):
     tile_n: int = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create(cls, *, spec: pl.BlockSpec, dtype: jnp.dtype, buffer_count: int,
-               tile_n: int) -> "CosSinRef":
+    def create(
+        cls, *, spec: pl.BlockSpec, dtype: jnp.dtype, buffer_count: int, tile_n: int
+    ) -> "CosSinRef":
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype,
@@ -55,8 +56,11 @@ class CosSinRef(pltpu.BufferedRef):
             },
         )
 
-    def copy_in(self, src_ref: tuple[jax.Ref, jax.Ref],
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def copy_in(
+        self,
+        src_ref: tuple[jax.Ref, jax.Ref],
+        grid_indices: tuple[int | jax.Array, ...],
+    ) -> None:
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
@@ -71,29 +75,31 @@ class CosSinRef(pltpu.BufferedRef):
             src = cos_sin_cache_ref.at[position, pl.ds(0, width)]
             pltpu.make_async_copy(src, dest_ref.at[i, :], sem).start()
 
-    def wait_in(self, src_ref: tuple[jax.Ref, jax.Ref],
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def wait_in(
+        self,
+        src_ref: tuple[jax.Ref, jax.Ref],
+        grid_indices: tuple[int | jax.Array, ...],
+    ) -> None:
         del src_ref, grid_indices
         slot = self.current_wait_in_slot
         vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref,
-                              self.sem_recvs.at[slot]).wait()
+        pltpu.make_async_copy(vmem_ref, vmem_ref, self.sem_recvs.at[slot]).wait()
 
 
 def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
     """``out[b..., i] = operand[b..., indices[i]]`` over the last axis.
 
-  The leading axes come along as batch dimensions. ``indices`` is a constant
-  1-D array.
-  """
+    The leading axes come along as batch dimensions. ``indices`` is a constant
+    1-D array.
+    """
     rank = operand.ndim
     lanes = indices.shape[0]
     coords = jnp.broadcast_to(indices, (*operand.shape[:-1], lanes))[..., None]
     batching = tuple(range(rank - 1))
     dimension_numbers = jax.lax.GatherDimensionNumbers(
         offset_dims=(),
-        collapsed_slice_dims=(rank - 1, ),
-        start_index_map=(rank - 1, ),
+        collapsed_slice_dims=(rank - 1,),
+        start_index_map=(rank - 1,),
         operand_batching_dims=batching,
         start_indices_batching_dims=batching,
     )
@@ -101,30 +107,31 @@ def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
         operand,
         coords,
         dimension_numbers=dimension_numbers,
-        slice_sizes=(1, ) * rank,
+        slice_sizes=(1,) * rank,
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
     )
 
 
-def _cos_sin_lanes(cos_sin: jax.Array, *, rotary_dim: int,
-                   inverse: bool) -> tuple[jax.Array, jax.Array]:
+def _cos_sin_lanes(
+    cos_sin: jax.Array, *, rotary_dim: int, inverse: bool
+) -> tuple[jax.Array, jax.Array]:
     """The reference's ``np.split`` + ``np.repeat(..., 2)``, over a whole block.
 
-  ``cos_sin`` is one packed ``[cos | sin]`` row per token. The reference splits
-  it in half, repeats each half so both channels of a pair share a frequency,
-  rotates ``x[..., -rotary_dim:]`` and concatenates the NoPE part back on.
+    ``cos_sin`` is one packed ``[cos | sin]`` row per token. The reference splits
+    it in half, repeats each half so both channels of a pair share a frequency,
+    rotates ``x[..., -rotary_dim:]`` and concatenates the NoPE part back on.
 
-  A kernel block is ``LANE`` lanes wide and the roped channels are its tail, so
-  rather than slicing them out we widen cos/sin to the full block and hand the
-  NoPE lanes the identity rotation -- multiplying by ``cos = 1``, ``sin = 0``
-  is exactly the reference's pass-through concatenation::
+    A kernel block is ``LANE`` lanes wide and the roped channels are its tail, so
+    rather than slicing them out we widen cos/sin to the full block and hand the
+    NoPE lanes the identity rotation -- multiplying by ``cos = 1``, ``sin = 0``
+    is exactly the reference's pass-through concatenation::
 
-      lane      0 ... 63 | 64  65  66  67 ...   (LANE 128, rotary_dim 64)
-      channel   -- NoPE -|  0   1   2   3
-      cos       1 ...  1 | c0  c0  c1  c1       <- np.repeat(cos, 2)
-      sin       0 ...  0 | s0  s0  s1  s1
-  """
+        lane      0 ... 63 | 64  65  66  67 ...   (LANE 128, rotary_dim 64)
+        channel   -- NoPE -|  0   1   2   3
+        cos       1 ...  1 | c0  c0  c1  c1       <- np.repeat(cos, 2)
+        sin       0 ...  0 | s0  s0  s1  s1
+    """
     half = rotary_dim // 2
     channel = jnp.arange(LANE) - (LANE - rotary_dim)  # < 0 on the NoPE lanes
     is_rot = channel >= 0
@@ -142,11 +149,11 @@ def _cos_sin_lanes(cos_sin: jax.Array, *, rotary_dim: int,
 def _rotate_gptj(x: jax.Array) -> jax.Array:
     """The reference's ``rotated``: ``[-x1, x0, -x3, x2, ...]`` along the lanes.
 
-  ``np.stack([-x[..., 1::2], x[..., 0::2]], -1).reshape(...)`` says, lane by
-  lane, "take the partner lane ``i ^ 1``, negated on the even ones" -- a
-  constant-index lane shuffle and a sign, no reshape. Lane parity may be read
-  for channel parity because ``LANE - rotary_dim`` is even.
-  """
+    ``np.stack([-x[..., 1::2], x[..., 0::2]], -1).reshape(...)`` says, lane by
+    lane, "take the partner lane ``i ^ 1``, negated on the even ones" -- a
+    constant-index lane shuffle and a sign, no reshape. Lane parity may be read
+    for channel parity because ``LANE - rotary_dim`` is even.
+    """
     lane = jnp.arange(LANE)
     sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
     return _lane_gather(x, lane ^ 1) * sign
@@ -163,14 +170,12 @@ def _rope_body(
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
-  Without ``quant_dtype`` the rotation is written back into ``x_ref`` in place.
-  With it, the rotated chunk is quantized along the lanes and written to the
-  ``(q_ref, scale_ref)`` outputs instead.
-  """
+    Without ``quant_dtype`` the rotation is written back into ``x_ref`` in place.
+    With it, the rotated chunk is quantized along the lanes and written to the
+    ``(q_ref, scale_ref)`` outputs instead.
+    """
     x = x_ref[...].astype(jnp.float32)
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...],
-                              rotary_dim=rotary_dim,
-                              inverse=inverse)
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
     if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
         cos = cos[:, None, :]
         sin = sin[:, None, :]
@@ -212,40 +217,36 @@ def _kernel(
     cos_sin_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
 ) -> None:
-
     def x_index_map(i):
         if len(x_block_shape) == 3:
             return (i, 0, lane_block)
         return (i, lane_block)
 
-    x_spec = pl.BlockSpec(block_shape=x_block_shape,
-                          memory_space=pltpu.VMEM,
-                          index_map=x_index_map)
+    x_spec = pl.BlockSpec(
+        block_shape=x_block_shape, memory_space=pltpu.VMEM, index_map=x_index_map
+    )
 
     cos_sin_spec = pl.BlockSpec(
         block_shape=(tile_n, rotary_dim),
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(spec=cos_sin_spec,
-                                     dtype=cos_sin_dtype,
-                                     buffer_count=2,
-                                     tile_n=tile_n)
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
 
     if quant_dtype is None:
         del x_hbm_ref  # aliased to the output; read/written through the latter.
-        (out_hbm_ref, ) = out_hbm_refs
-        x_ref_args = (out_hbm_ref, )
+        (out_hbm_ref,) = out_hbm_refs
+        x_ref_args = (out_hbm_ref,)
         out_ref_args = ()
         out_specs = []
         # input_output since we only update the last rope_dim channels in place.
-        x_alloc = pltpu.BufferedRef.input_output(x_spec,
-                                                 out_dtype,
-                                                 buffer_count=2)
+        x_alloc = pltpu.BufferedRef.input_output(x_spec, out_dtype, buffer_count=2)
         out_allocs = ()
     else:
         q_hbm_ref, scale_hbm_ref = out_hbm_refs
-        x_ref_args = (x_hbm_ref, )
+        x_ref_args = (x_hbm_ref,)
         out_ref_args = (q_hbm_ref, scale_hbm_ref)
         q_spec = pl.BlockSpec(
             block_shape=x_block_shape,
@@ -273,7 +274,7 @@ def _kernel(
             out_dtype=out_dtype,
             quant_dtype=quant_dtype,
         ),
-        grid=(num_tiles, ),
+        grid=(num_tiles,),
         in_specs=[x_spec, cos_sin_spec],
         out_specs=out_specs,
     )
@@ -302,9 +303,9 @@ def _qnorm_rope_body(
 ) -> None:
     """Process one ``(tile_n, num_heads, head_dim)`` chunk.
 
-  Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
-  rotation ``_rope_body`` applies.
-  """
+    Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
+    rotation ``_rope_body`` applies.
+    """
     x = x_ref[...].astype(jnp.float32)
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
@@ -312,16 +313,13 @@ def _qnorm_rope_body(
     # Only the last lane block holds roped channels; the rest of the row passes
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...],
-                              rotary_dim=rotary_dim,
-                              inverse=inverse)
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
     assert tail.ndim == 3
     cos = cos[:, None, :]
     sin = sin[:, None, :]
     roped = tail * cos + _rotate_gptj(tail) * sin
 
-    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped],
-                                   axis=-1).astype(out_dtype)
+    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
 
 
 def _qnorm_rope_kernel(
@@ -352,10 +350,9 @@ def _qnorm_rope_kernel(
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(spec=cos_sin_spec,
-                                     dtype=cos_sin_dtype,
-                                     buffer_count=2,
-                                     tile_n=tile_n)
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
 
     pipeline = pltpu.emit_pipeline(
         functools.partial(
@@ -365,7 +362,7 @@ def _qnorm_rope_kernel(
             inverse=inverse,
             out_dtype=in_dtype,
         ),
-        grid=(num_tiles, ),
+        grid=(num_tiles,),
         in_specs=[x_spec, cos_sin_spec],
         out_specs=[x_spec],
     )
@@ -413,14 +410,12 @@ def _rope_call(
         # Only the last lane block is pipelined in, but the scale is a reduction
         # over the whole row, so the two have to coincide (the indexer's head_dim
         # is exactly LANE).
-        raise ValueError(
-            f"quantization requires head_dim == {LANE}, got {head_dim}")
+        raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
 
     tile_n = largest_divisor(num_tokens, cap=128)
     assert num_tokens % tile_n == 0
 
-    x_block_shape = ((tile_n, rows_per_token, LANE) if x.ndim == 3 else
-                     (tile_n, LANE))
+    x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
     # One scale per row: x.shape minus the channel axis.
     scale_block_shape = x_block_shape[:-1]
     kernel = functools.partial(
@@ -429,8 +424,7 @@ def _rope_call(
         tile_n=tile_n,
         x_block_shape=x_block_shape,
         scale_block_shape=scale_block_shape,
-        lane_block=head_dim // LANE -
-        1,  # last lane block has the roped channels
+        lane_block=head_dim // LANE - 1,  # last lane block has the roped channels
         rotary_dim=rotary_dim,
         inverse=inverse,
         in_dtype=x.dtype,
@@ -479,7 +473,7 @@ def _rope_call(
 @functools.partial(
     jax.jit,
     static_argnames=("inverse", "name"),
-    donate_argnames=("x", ),
+    donate_argnames=("x",),
 )
 def rope(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
@@ -491,19 +485,19 @@ def rope(
 ) -> jax.Array:
     """Applies DeepSeek-V4 RoPE to the trailing ``rotary_dim`` channels of ``x``.
 
-  Args:
-    x: ``[num_tokens, head_dim]`` or ``[num_tokens, num_heads, head_dim]``.
-    positions: ``[num_tokens]``, the RoPE position of each token.
-    cos_sin_cache: ``[max_position, rotary_dim]``, ``[cos | sin]`` packed side
-      by side (``rotary_dim // 2`` columns each), as built by
-      ``DeepseekV4ScalingRotaryEmbedding``.
-    inverse: negate ``sin``, i.e. apply the transposed rotation.
-    name: kernel name.
+    Args:
+      x: ``[num_tokens, head_dim]`` or ``[num_tokens, num_heads, head_dim]``.
+      positions: ``[num_tokens]``, the RoPE position of each token.
+      cos_sin_cache: ``[max_position, rotary_dim]``, ``[cos | sin]`` packed side
+        by side (``rotary_dim // 2`` columns each), as built by
+        ``DeepseekV4ScalingRotaryEmbedding``.
+      inverse: negate ``sin``, i.e. apply the transposed rotation.
+      name: kernel name.
 
-  Returns:
-    ``x`` with the trailing ``rotary_dim`` channels rotated, same shape and
-    dtype. ``x`` is donated -- the kernel updates the buffer in place.
-  """
+    Returns:
+      ``x`` with the trailing ``rotary_dim`` channels rotated, same shape and
+      dtype. ``x`` is donated -- the kernel updates the buffer in place.
+    """
     return _rope_call(
         x,
         positions,
@@ -517,7 +511,7 @@ def rope(
 @functools.partial(
     jax.jit,
     static_argnames=("eps", "inverse", "name"),
-    donate_argnames=("x", ),
+    donate_argnames=("x",),
 )
 def qnorm_rope(
     x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, head_dim]
@@ -588,9 +582,9 @@ def rope_quant(
 ) -> tuple[jax.Array, jax.Array]:
     """RoPE fused with per-row dynamic quantization of the rotated values.
 
-  Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
-  inside the kernel.
-  """
+    Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
+    inside the kernel.
+    """
     return _rope_call(
         x,
         positions,

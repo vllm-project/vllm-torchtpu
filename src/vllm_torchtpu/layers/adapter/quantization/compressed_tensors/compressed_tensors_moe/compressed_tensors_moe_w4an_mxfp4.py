@@ -4,20 +4,27 @@ import zlib
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import \
-    CompressedTensorsW4A4Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (
+    CompressedTensorsW4A4Mxfp4MoEMethod,
+)
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
-from vllm_torchtpu.layers.adapter.fused_moe import (TpuMoEActivationMixin,
-                                                    fused_moe_gmm,
-                                                    load_kmajor_fp4,
-                                                    prebuild_fused_moe_kernel,
-                                                    requant_load_kmajor_fp4)
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
+    fused_moe_gmm,
+    load_kmajor_fp4,
+    prebuild_fused_moe_kernel,
+    requant_load_kmajor_fp4,
+)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
+    enable_pipelined_collective_and_compute,
+    pipelined_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
-    get_cpu_weight_loader_hook, release_memory_to_os)
+    get_cpu_weight_loader_hook,
+    release_memory_to_os,
+)
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -29,7 +36,8 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
-        TpuMoEActivationMixin, CompressedTensorsW4A4Mxfp4MoEMethod):
+    TpuMoEActivationMixin, CompressedTensorsW4A4Mxfp4MoEMethod
+):
     """
     TPU compressed-tensors packed-weight W4AN MXFP4 MoE implementation.
     Accommodates both W4A4 and W4A16.
@@ -57,8 +65,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         scratch = getattr(parameter, "_cpu_scratch", None)
         return parameter.data if scratch is None else scratch.data
 
-    def _initialize_dummy_quantized_weights(self,
-                                            layer: RoutedExperts) -> None:
+    def _initialize_dummy_quantized_weights(self, layer: RoutedExperts) -> None:
         """Use finite, nonzero random FP4 weights for meaningful dummy runs.
 
         The upstream dummy loader skips integer checkpoint containers. Encode
@@ -73,8 +80,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         load_format = getattr(load_format, "value", load_format)
         if str(load_format).lower() != "dummy":
             return
-        seed = zlib.crc32(
-            str(getattr(layer, "layer_name", "experts")).encode())
+        seed = zlib.crc32(str(getattr(layer, "layer_name", "experts")).encode())
         seed += 1234 + int(self.moe.ep_rank) * 104729 + int(self.moe.tp_rank)
         generator = torch.Generator(device="cpu").manual_seed(seed)
         for packed_param, scale_param in (
@@ -82,12 +88,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             (layer.w2_weight_packed, layer.w2_weight_scale),
         ):
             packed = self._loaded_data(packed_param)
-            value = torch.randint(0,
-                                  256,
-                                  packed.shape,
-                                  dtype=torch.uint8,
-                                  device="cpu",
-                                  generator=generator)
+            value = torch.randint(
+                0,
+                256,
+                packed.shape,
+                dtype=torch.uint8,
+                device="cpu",
+                generator=generator,
+            )
             value.bitwise_and_(0x88).bitwise_or_(0x11)
             packed.copy_(value)
             fan_in = packed.shape[-1] * 2
@@ -111,11 +119,17 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             orig_loader,
             self.moe.tp_size,
             self.moe.tp_rank,
-            is_param_transposed=False)
+            is_param_transposed=False,
+        )
 
-        super().create_weights(layer, num_experts, hidden_size,
-                               intermediate_size_per_partition, params_dtype,
-                               **extra_weight_attrs)
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
 
     def _neutralize_padded_scales(self, layer: RoutedExperts) -> None:
         """Make unloaded E8M0 padding finite without initializing full buffers.
@@ -135,13 +149,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         if unpadded_size % self.group_size != 0:
             raise ValueError(
                 "MXFP4 unpadded intermediate size per partition must be "
-                f"divisible by {self.group_size}, got {unpadded_size}.")
+                f"divisible by {self.group_size}, got {unpadded_size}."
+            )
 
         w13_scale = self._loaded_data(layer.w13_weight_scale)
         w2_scale = self._loaded_data(layer.w2_weight_scale)
         w13_scale[:, unpadded_size:padded_size, :].zero_()
-        w13_scale[:, padded_size + unpadded_size:2 * padded_size, :].zero_()
-        w2_scale[:, :, unpadded_size // self.group_size:].zero_()
+        w13_scale[:, padded_size + unpadded_size : 2 * padded_size, :].zero_()
+        w2_scale[:, :, unpadded_size // self.group_size :].zero_()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
@@ -150,8 +165,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         self._neutralize_padded_scales(layer)
 
         # Retrieve scratchpad or directly materialized weights and move to TPU.
-        w13_weight_packed = self._loaded_data(
-            layer.w13_weight_packed).to("tpu")
+        w13_weight_packed = self._loaded_data(layer.w13_weight_packed).to("tpu")
         w13_weight_scale = self._loaded_data(layer.w13_weight_scale).to("tpu")
         w2_weight_packed = self._loaded_data(layer.w2_weight_packed).to("tpu")
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
@@ -175,9 +189,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
             # Apply XLA fused requantization and kmajor layout shift
             w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w13_weight_packed), w13_scale, requant_block)
+                _fresh(w13_weight_packed), w13_scale, requant_block
+            )
             w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w2_weight_packed), w2_scale, requant_block)
+                _fresh(w2_weight_packed), w2_scale, requant_block
+            )
         else:
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -194,18 +210,20 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             w2_weight = load_kmajor_fp4(_fresh(w2_weight_packed))
 
         # Clean up CPU scratchpads
-        for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
-                          layer.w2_weight_packed, layer.w2_weight_scale):
+        for parameter in (
+            layer.w13_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_packed,
+            layer.w2_weight_scale,
+        ):
             if hasattr(parameter, "_cpu_scratch"):
                 delattr(parameter, "_cpu_scratch")
 
         # Update layer parameters
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d,
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_4d,
-                                                   requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_4d, requires_grad=False)
 
         # Remove packed attributes
         delattr(layer, "w13_weight_packed")
@@ -217,12 +235,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         layer.w2_bias = None
 
         if layer.w13_weight.device.type == "tpu":
-            synchronize_tensors([
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
-            ])
+            synchronize_tensors(
+                [
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale,
+                ]
+            )
 
         release_memory_to_os()
 
@@ -230,8 +250,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         use_ep = layer.moe_config.moe_parallel_config.use_ep
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
-        moe_routing.register_experts_start_buffer(
-            layer, device=layer.w13_weight.device)
+        moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -256,7 +275,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             x,
             topk_weights,
             topk_ids,
-            pipelined=enable_pipelined_collective_and_compute())
+            pipelined=enable_pipelined_collective_and_compute(),
+        )
 
     def apply_with_routing(
         self,
@@ -274,13 +294,15 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         """
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
-            "[moe] process_weights_after_loading did not run for this layer")
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
         # Ensure correct type for routing inputs
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights, is_local_tensor=pipelined)
+            topk_ids, topk_weights, is_local_tensor=pipelined
+        )
 
         kwargs = {
             "hidden_states": x,

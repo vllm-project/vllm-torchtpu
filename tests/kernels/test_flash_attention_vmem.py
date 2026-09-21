@@ -19,11 +19,17 @@ import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.kernels.flash_attention import kernel, tuned_params
-from vllm_torchtpu.kernels.flash_attention.kernel import (BlockSizes,
-                                                          SegmentIds,
-                                                          flash_attention)
+from vllm_torchtpu.kernels.flash_attention.kernel import (
+    BlockSizes,
+    SegmentIds,
+    flash_attention,
+)
 from vllm_torchtpu.kernels.flash_attention.tuned_params import (
-    TunableParams, get_tuned_params, make_tuning_key, tuned_params_mapping)
+    TunableParams,
+    get_tuned_params,
+    make_tuning_key,
+    tuned_params_mapping,
+)
 
 _VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
@@ -34,11 +40,9 @@ def _qkv(num_heads: int, seq_len: int, head_dim: int):
     return qkv, SegmentIds(q=segment, kv=segment)
 
 
-def _tuning_params(num_heads: int,
-                   seq_len: int,
-                   head_dim: int,
-                   *,
-                   has_segment_ids: bool = True) -> TunableParams | None:
+def _tuning_params(
+    num_heads: int, seq_len: int, head_dim: int, *, has_segment_ids: bool = True
+) -> TunableParams | None:
     qkv, _ = _qkv(num_heads, seq_len, head_dim)
     key = make_tuning_key(
         qkv,
@@ -61,15 +65,14 @@ def test_tuned_entries_use_valid_blocks() -> None:
 
 
 def test_tuning_table_has_requested_vision_grids() -> None:
-    kimi_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-                     67328)
+    kimi_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 67328)
     qwen_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
-    expected = ({(12, 128, seq_len)
-                 for seq_len in kimi_seq_lens}
-                | {(16, 80, seq_len)
-                   for seq_len in qwen_seq_lens})
-    actual = {(key.num_heads, key.head_dim, key.q_seq_len)
-              for key in tuned_params_mapping}
+    expected = {(12, 128, seq_len) for seq_len in kimi_seq_lens} | {
+        (16, 80, seq_len) for seq_len in qwen_seq_lens
+    }
+    actual = {
+        (key.num_heads, key.head_dim, key.q_seq_len) for key in tuned_params_mapping
+    }
 
     assert actual == expected
 
@@ -88,9 +91,9 @@ def test_tuning_table_has_requested_vision_grids() -> None:
         (16, 65536, 80, TunableParams(512, 16384, 512, 1)),
     ),
 )
-def test_representative_vision_tuning(num_heads: int, seq_len: int,
-                                      head_dim: int,
-                                      expected: TunableParams) -> None:
+def test_representative_vision_tuning(
+    num_heads: int, seq_len: int, head_dim: int, expected: TunableParams
+) -> None:
     assert _tuning_params(num_heads, seq_len, head_dim) == expected
 
 
@@ -118,9 +121,9 @@ def _selected_block_sizes(
     monkeypatch.setattr(
         kernel.pltpu,
         "get_tpu_info",
-        lambda: SimpleNamespace(num_lanes=128,
-                                num_sublanes=8,
-                                vmem_capacity_bytes=_VMEM_LIMIT_BYTES),
+        lambda: SimpleNamespace(
+            num_lanes=128, num_sublanes=8, vmem_capacity_bytes=_VMEM_LIMIT_BYTES
+        ),
     )
     monkeypatch.setattr(kernel, "_flash_attention", capture)
     kernel.flash_attention.__wrapped__(
@@ -135,32 +138,35 @@ def _selected_block_sizes(
 
 
 def test_fitting_unknown_shape_uses_single_step(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert _selected_block_sizes(monkeypatch, seq_len=21760) == BlockSizes(
-        128, 21760, 21760, 1)
+        128, 21760, 21760, 1
+    )
 
 
 def test_unspecified_vmem_limit_uses_device_capacity(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _selected_block_sizes(monkeypatch,
-                                 seq_len=21760,
-                                 vmem_limit_bytes=None) == BlockSizes(
-                                     128, 21760, 21760, 1)
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _selected_block_sizes(
+        monkeypatch, seq_len=21760, vmem_limit_bytes=None
+    ) == BlockSizes(128, 21760, 21760, 1)
 
 
 def test_oversized_unknown_shape_uses_safe_default(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _selected_block_sizes(monkeypatch,
-                                 seq_len=44032) == BlockSizes.get_default(
-                                     1, 1, 44032, 44032, 128)
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _selected_block_sizes(monkeypatch, seq_len=44032) == BlockSizes.get_default(
+        1, 1, 44032, 44032, 128
+    )
 
 
-def test_explicit_block_sizes_take_precedence(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+def test_explicit_block_sizes_take_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     explicit = BlockSizes(256, 512, 256, 1)
 
-    assert _selected_block_sizes(monkeypatch, seq_len=21760,
-                                 explicit=explicit) == explicit
+    assert (
+        _selected_block_sizes(monkeypatch, seq_len=21760, explicit=explicit) == explicit
+    )
 
 
 @pytest.mark.parametrize(
@@ -175,8 +181,9 @@ def test_explicit_block_sizes_take_precedence(
         (16, 65536, 80, True),
     ),
 )
-def test_profile_compiles(num_heads: int, seq_len: int, head_dim: int,
-                          has_tuning: bool) -> None:
+def test_profile_compiles(
+    num_heads: int, seq_len: int, head_dim: int, has_tuning: bool
+) -> None:
     devices = jax.local_devices()
     if not devices or devices[0].platform != "tpu":
         pytest.skip("requires a TPU compiler")
@@ -184,8 +191,7 @@ def test_profile_compiles(num_heads: int, seq_len: int, head_dim: int,
         pytest.skip("tuned for TPU7x")
 
     qkv, segment_ids = _qkv(num_heads, seq_len, head_dim)
-    assert (_tuning_params(num_heads, seq_len, head_dim)
-            is not None) is has_tuning
+    assert (_tuning_params(num_heads, seq_len, head_dim) is not None) is has_tuning
 
     try:
         flash_attention.lower(

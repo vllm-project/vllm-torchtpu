@@ -51,19 +51,23 @@ _UNIFORM_RANDOM = "uniform_random"
 _SIMULATION_STRATEGY = None
 _strategy_name = vllm_envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
 if _strategy_name:
-    from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import \
-        RoutingSimulator
+    from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
+        RoutingSimulator,
+    )
+
     _available = RoutingSimulator.get_available_strategies()
     if _strategy_name not in _available:
         raise ValueError(
             f"VLLM_MOE_ROUTING_SIMULATION_STRATEGY={_strategy_name!r} is not a "
-            f"known routing strategy. Available strategies: {_available}.")
+            f"known routing strategy. Available strategies: {_available}."
+        )
     _SIMULATION_STRATEGY = RoutingSimulator._routing_strategies[_strategy_name]
     logger.warning(
         "VLLM_MOE_ROUTING_SIMULATION_STRATEGY=%s: MoE expert routing is "
         "SIMULATED. This is a test/profiling-only feature and model output is "
         "meaningless. Never enable it for serving or accuracy evaluation.",
-        _strategy_name)
+        _strategy_name,
+    )
 
 
 def _uniform_random_routing(
@@ -93,9 +97,9 @@ def _uniform_random_routing(
     # identical expert choice; the point is the graph edge, not the value.
     noise = noise + router_logits.float().mean()
     _, topk_ids = torch.topk(noise, k=topk, dim=-1)
-    topk_weights = torch.ones((router_logits.shape[0], topk),
-                              dtype=torch.float32,
-                              device=router_logits.device)
+    topk_weights = torch.ones(
+        (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
+    )
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
@@ -168,8 +172,7 @@ def route(
     )
 
 
-def _apply_scoring_fn(scoring_fn: str,
-                      router_logits: torch.Tensor) -> torch.Tensor:
+def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
     scores = router_logits.float()
     if scoring_fn == "softmax":
         return scores.softmax(dim=-1)
@@ -177,9 +180,11 @@ def _apply_scoring_fn(scoring_fn: str,
         return scores.sigmoid()
     if scoring_fn == "sqrtsoftplus":
         import torch.nn.functional as F
+
         return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
-        f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
+        f"FusedMoE does not support {scoring_fn} scoring function for TPU."
+    )
 
 
 def _hash_moe_select(
@@ -203,7 +208,8 @@ def _hash_moe_select(
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
+        )
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
@@ -236,8 +242,9 @@ def select_experts(
     if simulated is not None:
         return simulated
 
-    hash_indices_table = getattr(layer, "hash_indices_table",
-                                 None) if layer is not None else None
+    hash_indices_table = (
+        getattr(layer, "hash_indices_table", None) if layer is not None else None
+    )
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
         routed_scaling_factor = layer.routed_scaling_factor
@@ -250,12 +257,17 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    use_grouped = (layer is not None and layer.use_grouped_topk
-                   and layer.num_expert_group > 1
-                   and layer.topk_group < layer.num_expert_group)
+    use_grouped = (
+        layer is not None
+        and layer.use_grouped_topk
+        and layer.num_expert_group > 1
+        and layer.topk_group < layer.num_expert_group
+    )
     if use_grouped:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
-            grouped_topk
+        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+            grouped_topk,
+        )
+
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -270,8 +282,9 @@ def select_experts(
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
-    e_score_correction_bias = (layer.e_score_correction_bias
-                               if layer is not None else None)
+    e_score_correction_bias = (
+        layer.e_score_correction_bias if layer is not None else None
+    )
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
@@ -284,9 +297,9 @@ def select_experts(
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
-    routed_scaling_factor = (layer.routed_scaling_factor
-                             if layer is not None else 1.0)
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
+        )
+    routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
@@ -306,8 +319,7 @@ def get_experts_start(layer) -> int | None:
         return None
     base = layer.global_num_experts // layer.moe_config.ep_size
     remainder = layer.global_num_experts % layer.moe_config.ep_size
-    return (layer.moe_config.ep_rank * base +
-            min(layer.moe_config.ep_rank, remainder))
+    return layer.moe_config.ep_rank * base + min(layer.moe_config.ep_rank, remainder)
 
 
 def register_experts_start_buffer(layer, *, device: torch.device) -> None:
@@ -330,8 +342,11 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     the compiled graph as runtime data, not compile-time constants.
     """
     experts_start = get_experts_start(layer)
-    buffer = (torch.tensor(experts_start, dtype=torch.int32, device=device)
-              if experts_start is not None else None)
+    buffer = (
+        torch.tensor(experts_start, dtype=torch.int32, device=device)
+        if experts_start is not None
+        else None
+    )
     layer.register_buffer("_experts_start", buffer, persistent=False)
 
 
@@ -345,4 +360,5 @@ def validate_linear_ep_placement(layer) -> None:
     if strategy != "linear":
         raise NotImplementedError(
             "fused MoE kernel currently requires linear EP placement; got "
-            f"expert_placement_strategy={strategy!r}.")
+            f"expert_placement_strategy={strategy!r}."
+        )

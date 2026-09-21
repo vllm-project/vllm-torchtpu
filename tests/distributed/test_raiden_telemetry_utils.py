@@ -2,8 +2,12 @@
 """Unit tests for TPU Raiden telemetry utility functions."""
 
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
-    _UNESCAPE_PATTERN, RAIDEN_METRIC_PREFIX, _unescape_match,
-    normalize_raiden_metric_name, parse_raiden_metric_key)
+    _UNESCAPE_PATTERN,
+    RAIDEN_METRIC_PREFIX,
+    _unescape_match,
+    normalize_raiden_metric_name,
+    parse_raiden_metric_key,
+)
 
 
 def test_parse_raiden_metric_key_unlabeled():
@@ -15,8 +19,7 @@ def test_parse_raiden_metric_key_unlabeled():
     assert base == "tpu_raiden:custom_latency:seconds"
     assert labels == {}
 
-    base, labels = parse_raiden_metric_key(
-        "   tpu_raiden_h2d_transfer_time_ms   ")
+    base, labels = parse_raiden_metric_key("   tpu_raiden_h2d_transfer_time_ms   ")
     assert base == "tpu_raiden_h2d_transfer_time_ms"
     assert labels == {}
 
@@ -31,14 +34,16 @@ def test_parse_raiden_metric_key_unlabeled():
 
 def test_parse_raiden_metric_key_single_label():
     base, labels = parse_raiden_metric_key(
-        'tpu_raiden_sent_bytes_total{direction="push"}')
+        'tpu_raiden_sent_bytes_total{direction="push"}'
+    )
     assert base == "tpu_raiden_sent_bytes_total"
     assert labels == {"direction": "push"}
 
 
 def test_parse_raiden_metric_key_multiple_labels():
     base, labels = parse_raiden_metric_key(
-        'tpu_raiden_transfer_duration_ms{direction="pull",mode="direct"}')
+        'tpu_raiden_transfer_duration_ms{direction="pull",mode="direct"}'
+    )
     assert base == "tpu_raiden_transfer_duration_ms"
     assert labels == {"direction": "pull", "mode": "direct"}
 
@@ -51,7 +56,8 @@ def test_parse_raiden_metric_key_multiple_labels():
 
 def test_parse_raiden_metric_key_escaping():
     base, labels = parse_raiden_metric_key(
-        'tpu_raiden_failures{error="msg=\\"timeout\\""}')
+        'tpu_raiden_failures{error="msg=\\"timeout\\""}'
+    )
     assert base == "tpu_raiden_failures"
     assert labels == {"error": 'msg="timeout"'}
 
@@ -68,22 +74,22 @@ def test_parse_raiden_metric_key_escaping():
 
 def test_parse_raiden_metric_key_special_characters():
     base, labels = parse_raiden_metric_key(
-        'tpu_raiden_metric{pattern="{foo}", key = "val" }')
+        'tpu_raiden_metric{pattern="{foo}", key = "val" }'
+    )
     assert base == "tpu_raiden_metric"
     assert labels == {"pattern": "{foo}", "key": "val"}
 
     base, labels = parse_raiden_metric_key(
-        'tpu_raiden_metric{tags="a,b,c",stage="decode"}')
+        'tpu_raiden_metric{tags="a,b,c",stage="decode"}'
+    )
     assert base == "tpu_raiden_metric"
     assert labels == {"tags": "a,b,c", "stage": "decode"}
 
-    base, labels = parse_raiden_metric_key(
-        'tpu_raiden_metric{expr="k=v",flag="true"}')
+    base, labels = parse_raiden_metric_key('tpu_raiden_metric{expr="k=v",flag="true"}')
     assert base == "tpu_raiden_metric"
     assert labels == {"expr": "k=v", "flag": "true"}
 
-    base, labels = parse_raiden_metric_key(
-        'tpu_raiden_metric{empty="",nonempty="val"}')
+    base, labels = parse_raiden_metric_key('tpu_raiden_metric{empty="",nonempty="val"}')
     assert base == "tpu_raiden_metric"
     assert labels == {"empty": "", "nonempty": "val"}
 
@@ -116,13 +122,13 @@ def test_parse_raiden_metric_key_malformed_and_edge_cases():
 
 def test_unescape_match_fallback():
     # Directly test _unescape_match for quote and backslash pass-through
-    match_quote = _UNESCAPE_PATTERN.search(r'\"')
+    match_quote = _UNESCAPE_PATTERN.search(r"\"")
     assert match_quote is not None
     assert _unescape_match(match_quote) == '"'
 
-    match_slash = _UNESCAPE_PATTERN.search(r'\\')
+    match_slash = _UNESCAPE_PATTERN.search(r"\\")
     assert match_slash is not None
-    assert _unescape_match(match_slash) == '\\'
+    assert _unescape_match(match_slash) == "\\"
 
 
 def test_constants():
@@ -131,9 +137,13 @@ def test_constants():
 
 def test_normalize_raiden_metric_name():
     # Prefixed name returns unchanged
-    assert (normalize_raiden_metric_name("tpu_raiden_sent_bytes_total") ==
-            "tpu_raiden_sent_bytes_total")
+    assert (
+        normalize_raiden_metric_name("tpu_raiden_sent_bytes_total")
+        == "tpu_raiden_sent_bytes_total"
+    )
 
     # Unprefixed name gets prefixed
-    assert (normalize_raiden_metric_name("sent_bytes_total") ==
-            "tpu_raiden_sent_bytes_total")
+    assert (
+        normalize_raiden_metric_name("sent_bytes_total")
+        == "tpu_raiden_sent_bytes_total"
+    )

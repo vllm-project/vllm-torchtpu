@@ -10,6 +10,7 @@ strided views into shared pool tensors.
 
 Runs on CPU tensors: the canonicalization is pure storage arithmetic.
 """
+
 from types import SimpleNamespace
 
 import torch
@@ -24,8 +25,8 @@ def _fake_connector(num_groups: int):
     captured: list = []
     worker = SimpleNamespace(
         kv_cache_config=SimpleNamespace(
-            num_blocks=NUM_BLOCKS,
-            kv_cache_groups=[object() for _ in range(num_groups)]),
+            num_blocks=NUM_BLOCKS, kv_cache_groups=[object() for _ in range(num_groups)]
+        ),
         _init_worker=captured.append,
     )
     return SimpleNamespace(connector_worker=worker), captured
@@ -56,8 +57,10 @@ def test_register_kv_caches_canonicalizes_unified_pool():
         assert entry.tensor.dtype == torch.int8
         assert entry.tensor.shape == (NUM_BLOCKS, 128)
         assert entry.page_size_bytes == 128
-        assert entry.tensor.untyped_storage().data_ptr() == \
-            pool.untyped_storage().data_ptr()
+        assert (
+            entry.tensor.untyped_storage().data_ptr()
+            == pool.untyped_storage().data_ptr()
+        )
 
     # The canonical view aliases the pool: bytes written through the pool
     # tensor are visible through the registered int8 view.
@@ -67,8 +70,7 @@ def test_register_kv_caches_canonicalizes_unified_pool():
     # One ref per canonical tensor for each KV cache group.
     assert len(canonical.group_data_refs) == 2
     for refs in canonical.group_data_refs:
-        assert [(r.tensor_idx, r.page_size_bytes) for r in refs] == \
-            [(0, 128), (1, 128)]
+        assert [(r.tensor_idx, r.page_size_bytes) for r in refs] == [(0, 128), (1, 128)]
 
 
 def test_register_kv_caches_ds_v4_alias_groups():

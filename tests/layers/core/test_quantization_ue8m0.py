@@ -15,19 +15,16 @@
 
 import torch
 
-from vllm_torchtpu.layers.core.quantization import (e8m0_to_fp32,
-                                                    quantize_tensor)
+from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32, quantize_tensor
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 
 
 def _quantize_ue8m0(tensor: torch.Tensor, block_size: int | None = None):
-    return quantize_tensor(tensor,
-                           FP8_DTYPE,
-                           axis=-1,
-                           block_size=block_size,
-                           use_ue8m0=True)
+    return quantize_tensor(
+        tensor, FP8_DTYPE, axis=-1, block_size=block_size, use_ue8m0=True
+    )
 
 
 def test_scale_is_a_ue8m0_byte(device):
@@ -41,8 +38,7 @@ def test_scale_is_a_ue8m0_byte(device):
     # torch's own e8m0 encoder.
     decoded = e8m0_to_fp32(scale)
     assert torch.equal(torch.exp2(torch.log2(decoded).round()), decoded)
-    assert torch.equal(
-        decoded.to(torch.float8_e8m0fnu).view(torch.uint8), scale)
+    assert torch.equal(decoded.to(torch.float8_e8m0fnu).view(torch.uint8), scale)
 
 
 def test_dequantized_values_are_close(device):
@@ -50,8 +46,9 @@ def test_dequantized_values_are_close(device):
     tensor = torch.randn(16, 512, device=device, dtype=torch.bfloat16) * 3.0
 
     quantized, scale = _quantize_ue8m0(tensor, block_size=128)
-    dequantized = quantized.float().reshape(
-        16, 4, 128) * e8m0_to_fp32(scale).unsqueeze(-1)
+    dequantized = quantized.float().reshape(16, 4, 128) * e8m0_to_fp32(scale).unsqueeze(
+        -1
+    )
     dequantized = dequantized.reshape(16, 512)
 
     # A ue8m0 scale wastes up to one octave of fp8 range, so the relative

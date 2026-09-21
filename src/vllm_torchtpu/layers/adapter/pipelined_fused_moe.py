@@ -43,8 +43,9 @@ def enable_pipelined_collective_and_compute() -> bool:
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 
 
-def calculate_moe_chunks(seq_len: int, parallel_size: int,
-                         chunk_size: int) -> tuple[int, int]:
+def calculate_moe_chunks(
+    seq_len: int, parallel_size: int, chunk_size: int
+) -> tuple[int, int]:
     """Calculate the number of chunks and local chunk size for MoE chunk pipelining.
 
     Uses ceiling division so `chunk_size` acts as a maximum global chunk threshold:
@@ -86,7 +87,8 @@ def _get_moe_collective_group():
     if pcp_size > 1 and dp_size > 1:
         raise NotImplementedError(
             "MoE collective chunking does not yet support simultaneous "
-            f"PCP ({pcp_size}) and DP ({dp_size}).")
+            f"PCP ({pcp_size}) and DP ({dp_size})."
+        )
     if pcp_size > 1:
         return pcp_group, "PCP"
     return dp_group, "DP"
@@ -96,12 +98,15 @@ def _get_moe_collective_group():
 def _log_active_chunk_pipeline() -> None:
     """Emit trace-time evidence without passing symbolic values to logging."""
     collective_group, collective_kind = _get_moe_collective_group()
-    parallel_size = (int(collective_group.world_size)
-                     if collective_group is not None else 1)
+    parallel_size = (
+        int(collective_group.world_size) if collective_group is not None else 1
+    )
     logger.info_once(
-        "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, "
-        "threshold=%d", collective_kind, parallel_size,
-        envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
+        "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
+        collective_kind,
+        parallel_size,
+        envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+    )
 
 
 def pipelined_fused_moe_gmm(
@@ -158,19 +163,26 @@ def pipelined_fused_moe_gmm(
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
-    parallel_size = (int(collective_group.world_size)
-                     if collective_group is not None else 1)
+    parallel_size = (
+        int(collective_group.world_size) if collective_group is not None else 1
+    )
     num_chunks, chunk_size_local = calculate_moe_chunks(
-        seq_len, parallel_size, chunk_size)
+        seq_len, parallel_size, chunk_size
+    )
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            ag_hidden_states = collective_group.all_gather(hidden_states,
-                                                           dim=0)
-            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
-                               if topk_weights is not None else None)
-            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
-                           if topk_ids is not None else None)
+            ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+            ag_topk_weights = (
+                collective_group.all_gather(topk_weights, dim=0)
+                if topk_weights is not None
+                else None
+            )
+            ag_topk_ids = (
+                collective_group.all_gather(topk_ids, dim=0)
+                if topk_ids is not None
+                else None
+            )
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
@@ -201,24 +213,38 @@ def pipelined_fused_moe_gmm(
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
-        hidden_states[i * chunk_size_local:(i + 1) * chunk_size_local]
+        hidden_states[i * chunk_size_local : (i + 1) * chunk_size_local]
         for i in range(num_chunks)
     ]
-    weights_slices = [
-        topk_weights[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_weights is not None else [None] * num_chunks
-    ids_slices = [
-        topk_ids[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_ids is not None else [None] * num_chunks
+    weights_slices = (
+        [
+            topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
+            for i in range(num_chunks)
+        ]
+        if topk_weights is not None
+        else [None] * num_chunks
+    )
+    ids_slices = (
+        [
+            topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
+            for i in range(num_chunks)
+        ]
+        if topk_ids is not None
+        else [None] * num_chunks
+    )
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
-                  if weights_slices[0] is not None else None)
-    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
-                  if ids_slices[0] is not None else None)
+    ag_tw_curr = (
+        collective_group.all_gather(weights_slices[0], dim=0)
+        if weights_slices[0] is not None
+        else None
+    )
+    ag_ti_curr = (
+        collective_group.all_gather(ids_slices[0], dim=0)
+        if ids_slices[0] is not None
+        else None
+    )
 
     rs_outputs = []
 
@@ -226,11 +252,16 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
-                                                      dim=0)
-                          if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
-                          if ids_slices[i + 1] is not None else None)
+            ag_tw_next = (
+                collective_group.all_gather(weights_slices[i + 1], dim=0)
+                if weights_slices[i + 1] is not None
+                else None
+            )
+            ag_ti_next = (
+                collective_group.all_gather(ids_slices[i + 1], dim=0)
+                if ids_slices[i + 1] is not None
+                else None
+            )
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
