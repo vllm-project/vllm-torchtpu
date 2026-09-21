@@ -99,7 +99,6 @@ PATCHES = (
         _ACTIVE),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging",
           _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
           _ENGINE,
           refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings"),
