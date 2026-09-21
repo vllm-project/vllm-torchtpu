@@ -143,6 +143,10 @@ markers = [
 # makes `exclude` hold for both `ruff format .` and the hook.
 force-exclude = true
 
+# protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
+# would make every regeneration produce a spurious diff.
+exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
 # I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
@@ -178,12 +182,115 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# isort and yapf still own these paths. The same list appears in `exclude`
-# under [tool.ruff.format] and in the isort and yapf excludes in
-# .pre-commit-config.yaml; all three move together, otherwise two tools format the
-# same file.
-"src/**" = ["I"]
-"tests/**" = ["I"]
+# Paths isort still owns, one per line, so a migration PR deletes exactly the
+# lines for the paths it converts. Every entry has a twin in `exclude` under
+# [tool.ruff.format] and in `files` on the isort and yapf hooks in
+# .pre-commit-config.yaml. All three move together, otherwise two tools format
+# the same file. Use `dir/**` or a full path: in a `*` pattern the star also
+# matches `/`, so `dir/*.py` silently covers the whole subtree.
+# kernels/experimental
+"src/vllm_torchtpu/kernels/experimental/**" = ["I"]
+
+# kernels/deepseek_v4
+"src/vllm_torchtpu/kernels/deepseek_v4/**" = ["I"]
+
+# kernels: fused_moe, gdn, kimi_k3
+"src/vllm_torchtpu/kernels/fused_moe/**" = ["I"]
+"src/vllm_torchtpu/kernels/gdn/**" = ["I"]
+"src/vllm_torchtpu/kernels/kimi_k3/**" = ["I"]
+
+# kernels: attention and the rest
+"src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
+"src/vllm_torchtpu/kernels/collectives/**" = ["I"]
+"src/vllm_torchtpu/kernels/flash_attention/**" = ["I"]
+"src/vllm_torchtpu/kernels/megablox/**" = ["I"]
+"src/vllm_torchtpu/kernels/mla/**" = ["I"]
+"src/vllm_torchtpu/kernels/quantized_matmul/**" = ["I"]
+"src/vllm_torchtpu/kernels/ragged_paged_attention/**" = ["I"]
+"src/vllm_torchtpu/kernels/sparse_core/**" = ["I"]
+"src/vllm_torchtpu/kernels/__init__.py" = ["I"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["I"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["I"]
+"src/vllm_torchtpu/kernels/router_topk.py" = ["I"]
+"src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
+
+# tests/kernels
+"tests/kernels/**" = ["I"]
+
+# layers/adapter (src)
+"src/vllm_torchtpu/layers/adapter/**" = ["I"]
+
+# tests/layers
+"tests/layers/**" = ["I"]
+
+# layers/core
+"src/vllm_torchtpu/layers/core/**" = ["I"]
+"src/vllm_torchtpu/layers/__init__.py" = ["I"]
+
+# distributed
+"src/vllm_torchtpu/distributed/**" = ["I"]
+"tests/distributed/**" = ["I"]
+"tests/disagg/**" = ["I"]
+
+# runner
+"src/vllm_torchtpu/runner/**" = ["I"]
+"tests/runner/**" = ["I"]
+
+# models, spec_decode, offload
+"src/vllm_torchtpu/models/**" = ["I"]
+"src/vllm_torchtpu/offload/**" = ["I"]
+"src/vllm_torchtpu/spec_decode/**" = ["I"]
+"tests/models/**" = ["I"]
+"tests/offload/**" = ["I"]
+"tests/spec_decode/**" = ["I"]
+
+# platforms, executors, worker, compilation, entrypoints
+"src/vllm_torchtpu/compilation/**" = ["I"]
+"src/vllm_torchtpu/executors/**" = ["I"]
+"src/vllm_torchtpu/platforms/**" = ["I"]
+"src/vllm_torchtpu/worker/**" = ["I"]
+"tests/compilation/**" = ["I"]
+"tests/entrypoints/**" = ["I"]
+"tests/executors/**" = ["I"]
+"tests/platforms/**" = ["I"]
+"tests/worker/**" = ["I"]
+
+# core, tracing, omni, tools, loose modules
+"src/vllm_torchtpu/core/**" = ["I"]
+"src/vllm_torchtpu/omni/**" = ["I"]
+"src/vllm_torchtpu/tools/**" = ["I"]
+"src/vllm_torchtpu/tracing/**" = ["I"]
+"tests/model_loader/**" = ["I"]
+"tests/omni/**" = ["I"]
+"tests/scripts/**" = ["I"]
+"tests/tools/**" = ["I"]
+"tests/tracing/**" = ["I"]
+"src/sitecustomize.py" = ["I"]
+"src/vllm_torchtpu/__init__.py" = ["I"]
+"src/vllm_torchtpu/env_override.py" = ["I"]
+"src/vllm_torchtpu/envs.py" = ["I"]
+"src/vllm_torchtpu/gdn_pool_layout.py" = ["I"]
+"src/vllm_torchtpu/kv_cache_materializer.py" = ["I"]
+"src/vllm_torchtpu/kv_cache_spec_normalizer.py" = ["I"]
+"src/vllm_torchtpu/logger.py" = ["I"]
+"src/vllm_torchtpu/model_loader_patches.py" = ["I"]
+"src/vllm_torchtpu/patch_registry.py" = ["I"]
+"src/vllm_torchtpu/profiler_trace.py" = ["I"]
+"src/vllm_torchtpu/tokenizers.py" = ["I"]
+"src/vllm_torchtpu/tpu_info.py" = ["I"]
+"src/vllm_torchtpu/utils.py" = ["I"]
+"tests/conftest.py" = ["I"]
+"tests/test_envs.py" = ["I"]
+"tests/test_envs_builders.py" = ["I"]
+"tests/test_package_import.py" = ["I"]
+"tests/test_pp_chunk_scheduler.py" = ["I"]
+"tests/test_pp_chunks.py" = ["I"]
+"tests/test_profiler_trace.py" = ["I"]
+"tests/test_token_padding.py" = ["I"]
+"tests/test_tokenizers.py" = ["I"]
+"tests/test_tpu_release.py" = ["I"]
+"tests/test_tpu_scheduler.py" = ["I"]
+"tests/tpu_release.py" = ["I"]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
@@ -199,8 +306,112 @@ ignore = [
 [tool.ruff.format]
 docstring-code-format = true
 
-# Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["src/**", "tests/**"]
+# Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
+exclude = [
+    # kernels/experimental
+    "src/vllm_torchtpu/kernels/experimental/**",
+
+    # kernels/deepseek_v4
+    "src/vllm_torchtpu/kernels/deepseek_v4/**",
+
+    # kernels: fused_moe, gdn, kimi_k3
+    "src/vllm_torchtpu/kernels/fused_moe/**",
+    "src/vllm_torchtpu/kernels/gdn/**",
+    "src/vllm_torchtpu/kernels/kimi_k3/**",
+
+    # kernels: attention and the rest
+    "src/vllm_torchtpu/kernels/causal_conv1d/**",
+    "src/vllm_torchtpu/kernels/collectives/**",
+    "src/vllm_torchtpu/kernels/flash_attention/**",
+    "src/vllm_torchtpu/kernels/megablox/**",
+    "src/vllm_torchtpu/kernels/mla/**",
+    "src/vllm_torchtpu/kernels/quantized_matmul/**",
+    "src/vllm_torchtpu/kernels/ragged_paged_attention/**",
+    "src/vllm_torchtpu/kernels/sparse_core/**",
+    "src/vllm_torchtpu/kernels/__init__.py",
+    "src/vllm_torchtpu/kernels/partial_kv_update.py",
+    "src/vllm_torchtpu/kernels/pool_adapters.py",
+    "src/vllm_torchtpu/kernels/router_topk.py",
+    "src/vllm_torchtpu/kernels/typed_ldst.py",
+
+    # tests/kernels
+    "tests/kernels/**",
+
+    # layers/adapter (src)
+    "src/vllm_torchtpu/layers/adapter/**",
+
+    # tests/layers
+    "tests/layers/**",
+
+    # layers/core
+    "src/vllm_torchtpu/layers/core/**",
+    "src/vllm_torchtpu/layers/__init__.py",
+
+    # distributed
+    "src/vllm_torchtpu/distributed/**",
+    "tests/distributed/**",
+    "tests/disagg/**",
+
+    # runner
+    "src/vllm_torchtpu/runner/**",
+    "tests/runner/**",
+
+    # models, spec_decode, offload
+    "src/vllm_torchtpu/models/**",
+    "src/vllm_torchtpu/offload/**",
+    "src/vllm_torchtpu/spec_decode/**",
+    "tests/models/**",
+    "tests/offload/**",
+    "tests/spec_decode/**",
+
+    # platforms, executors, worker, compilation, entrypoints
+    "src/vllm_torchtpu/compilation/**",
+    "src/vllm_torchtpu/executors/**",
+    "src/vllm_torchtpu/platforms/**",
+    "src/vllm_torchtpu/worker/**",
+    "tests/compilation/**",
+    "tests/entrypoints/**",
+    "tests/executors/**",
+    "tests/platforms/**",
+    "tests/worker/**",
+
+    # core, tracing, omni, tools, loose modules
+    "src/vllm_torchtpu/core/**",
+    "src/vllm_torchtpu/omni/**",
+    "src/vllm_torchtpu/tools/**",
+    "src/vllm_torchtpu/tracing/**",
+    "tests/model_loader/**",
+    "tests/omni/**",
+    "tests/scripts/**",
+    "tests/tools/**",
+    "tests/tracing/**",
+    "src/sitecustomize.py",
+    "src/vllm_torchtpu/__init__.py",
+    "src/vllm_torchtpu/env_override.py",
+    "src/vllm_torchtpu/envs.py",
+    "src/vllm_torchtpu/gdn_pool_layout.py",
+    "src/vllm_torchtpu/kv_cache_materializer.py",
+    "src/vllm_torchtpu/kv_cache_spec_normalizer.py",
+    "src/vllm_torchtpu/logger.py",
+    "src/vllm_torchtpu/model_loader_patches.py",
+    "src/vllm_torchtpu/patch_registry.py",
+    "src/vllm_torchtpu/profiler_trace.py",
+    "src/vllm_torchtpu/tokenizers.py",
+    "src/vllm_torchtpu/tpu_info.py",
+    "src/vllm_torchtpu/utils.py",
+    "tests/conftest.py",
+    "tests/test_envs.py",
+    "tests/test_envs_builders.py",
+    "tests/test_package_import.py",
+    "tests/test_pp_chunk_scheduler.py",
+    "tests/test_pp_chunks.py",
+    "tests/test_profiler_trace.py",
+    "tests/test_token_padding.py",
+    "tests/test_tokenizers.py",
+    "tests/test_tpu_release.py",
+    "tests/test_tpu_scheduler.py",
+    "tests/tpu_release.py",
+]
 
 [tool.pyrefly]
 project-includes = ["src"]
