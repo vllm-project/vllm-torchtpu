@@ -109,7 +109,8 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
 
     Each group contains Q/K and its associated V/Z channels, or B/A channels.
     Only the latter channels split when several TP ranks share a Q/K head.
-    The resulting rank-local tensor retains the checkpoint's group ordering.
+    The rank-local parameter uses canonical Q/K/V/Z or B/A segment ordering;
+    checkpoint interleaving never reaches the compute path.
     """
 
     def __init__(self,
@@ -170,8 +171,10 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
             for piece, width, shared in zip(groups.split(
                 sizes, dim=1), local_sizes, self.replicated_segments)
         ]
-        local = torch.cat(pieces,
-                          dim=1).flatten(0, 1).movedim(0, param.output_dim)
+        # Flatten each segment's head groups before concatenating segments.
+        # Scales take exactly the same permutation as their weight rows.
+        local = torch.cat([piece.flatten(0, 1) for piece in pieces],
+                          dim=0).movedim(0, param.output_dim)
         assert local.shape == param.shape
         param.data.copy_(local)
 

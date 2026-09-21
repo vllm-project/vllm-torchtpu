@@ -645,8 +645,6 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     pytest.param(jnp.float8_e4m3fn, "block_k", id="fp8-block-k128"),
     pytest.param(jnp.float8_e4m3fn, "block_nk", id="fp8-block-n512-k128"),
 ])
-@pytest.mark.parametrize("gqa_interleaved_layout", [False, True],
-                         ids=["qwen35", "qwen3next"])
 @pytest.mark.parametrize(
     ("pcp_size", "n_kq", "n_v", "hidden_size", "lengths", "token_owner_starts",
      "request_absolute_starts", "recurrent_state_dtype", "pool_block_tokens"),
@@ -655,7 +653,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
 def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         pcp_size, n_kq, n_v, hidden_size, lengths, token_owner_starts,
         request_absolute_starts, recurrent_state_dtype, pool_block_tokens,
-        projection_dtype, weight_scheme, gqa_interleaved_layout):
+        projection_dtype, weight_scheme):
     """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
     lengths = np.asarray(lengths, dtype=np.int32)
     token_owner_starts = (np.zeros_like(lengths) if token_owner_starts is None
@@ -738,25 +736,6 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
                           x_scale).astype(jnp.bfloat16)
     mixed_qkv = projected_qkvz[:, :qkv_dim]
     ref_z = projected_qkvz[:, qkv_dim:]
-    if gqa_interleaved_layout:
-        # Emulate the native Qwen3Next checkpoint, leaving the baseline in
-        # canonical Q/K/V/Z order. Scales must follow the same permutation.
-        def interleave_rows(tensor):
-            splits = np.cumsum([n_kq * d_k, n_kq * d_k, n_v * d_v])
-            groups = [
-                part.reshape(n_kq, -1, *tensor.shape[1:])
-                for part in jnp.split(tensor, splits, axis=0)
-            ]
-            return jnp.concatenate(groups, axis=1).reshape(tensor.shape)
-
-        qkvz_weight = interleave_rows(qkvz_weight)
-        if weight_scheme == "channel":
-            qkvz_weight_scale = interleave_rows(qkvz_weight_scale)
-        elif weight_scheme in ("block_k", "block_nk"):
-            # Permute N scales with the native rows; preserve K blocks.
-            qkvz_weight_scale = interleave_rows(
-                full_scale[:, ::128]).T[None, :, None, :]
-
     b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
     conv_state = jnp.zeros((num_blocks, kernel_size - 1, qkv_dim),
@@ -884,7 +863,6 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
             interleave_size=interleave_size,
             mesh=mesh,
             recurrent_state_dtype=recurrent_state_dtype,
-            gqa_interleaved_layout=gqa_interleaved_layout,
         ))
 
     def restore_request_order(tensor):

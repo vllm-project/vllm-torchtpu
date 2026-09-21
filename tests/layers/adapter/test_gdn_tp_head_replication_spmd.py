@@ -78,25 +78,39 @@ def _checkpoint(num_key_heads, num_value_heads, quantization):
 
 
 def _load_weights(make_gdn_attention, checkpoint, num_key_heads,
-                  num_value_heads, tp_size, rank, quantization):
+                  num_value_heads, tp_size, rank, quantization, interleaved):
     layer, _ = make_gdn_attention(tp_size,
                                   rank,
                                   quantization,
                                   num_key_heads=num_key_heads,
-                                  num_value_heads=num_value_heads)
+                                  num_value_heads=num_value_heads,
+                                  gqa_interleaved_layout=interleaved)
     qkvz, conv, ba, a_log, dt_bias = checkpoint
     proj = layer.in_proj_qkvz
 
+    def interleave(segments):
+        return torch.cat([
+            segment.reshape(num_key_heads, -1, *segment.shape[1:])
+            for segment in segments
+        ],
+                         dim=1).flatten(0, 1)
+
     def load_segments(param, segments):
-        param.weight_loader(param, torch.cat(segments[:3]), (0, 1, 2))
-        param.weight_loader(param, segments[3], 3)
+        if interleaved:
+            param.weight_loader(param, interleave(segments))
+        else:
+            param.weight_loader(param, torch.cat(segments[:3]), (0, 1, 2))
+            param.weight_loader(param, segments[3], 3)
 
     load_segments(proj.weight, qkvz)
     if quantization != "bf16":
         scale = proj.weight_scale
         if quantization == "fp8_tensor":
-            scale.weight_loader(scale, torch.tensor(0.125), (0, 1, 2))
-            scale.weight_loader(scale, torch.tensor(0.25), 3)
+            if interleaved:
+                scale.weight_loader(scale, torch.tensor(0.125))
+            else:
+                scale.weight_loader(scale, torch.tensor(0.125), (0, 1, 2))
+                scale.weight_loader(scale, torch.tensor(0.25), 3)
         else:
             divisor = 128 if quantization == "fp8_block" else 1
             segments = [
@@ -107,9 +121,13 @@ def _load_weights(make_gdn_attention, checkpoint, num_key_heads,
         proj.quant_method.process_weights_after_loading(proj)
 
     layer.conv1d.weight.weight_loader(layer.conv1d.weight, conv)
-    for shard, segment in enumerate(ba.chunk(2)):
-        layer.in_proj_ba.weight.weight_loader(layer.in_proj_ba.weight, segment,
-                                              shard)
+    if interleaved:
+        layer.in_proj_ba.weight.weight_loader(layer.in_proj_ba.weight,
+                                              interleave(ba.chunk(2)))
+    else:
+        for shard, segment in enumerate(ba.chunk(2)):
+            layer.in_proj_ba.weight.weight_loader(layer.in_proj_ba.weight,
+                                                  segment, shard)
     layer.A_log.weight_loader(layer.A_log, a_log)
     layer.dt_bias.weight_loader(layer.dt_bias, dt_bias)
     layer.process_weights_after_loading(torch.bfloat16)
@@ -258,9 +276,11 @@ def _build_spmd(devices, weights, conv, recurrent):
     ids=["shard", "replicate2", "replicate4", "replicate4_v2"])
 @pytest.mark.parametrize("quantization",
                          ["bf16", "fp8_tensor", "fp8_channel", "fp8_block"])
+@pytest.mark.parametrize("interleaved", [False, True],
+                         ids=["contiguous", "interleaved"])
 def test_loaded_tp_gdn_matches_tp1_spmd(make_gdn_attention, monkeypatch,
                                         num_key_heads, num_value_heads,
-                                        tp_size, quantization):
+                                        tp_size, quantization, interleaved):
     devices = jax.local_devices()
     if len(devices) < tp_size or devices[0].platform != "tpu":
         pytest.skip(f"requires {tp_size} local TPU devices")
@@ -281,7 +301,8 @@ def test_loaded_tp_gdn_matches_tp1_spmd(make_gdn_attention, monkeypatch,
         for rank in range(size):
             weights.append(
                 _load_weights(make_gdn_attention, checkpoint, num_key_heads,
-                              num_value_heads, size, rank, quantization))
+                              num_value_heads, size, rank, quantization,
+                              interleaved))
             columns, v = _head_columns(num_key_heads, num_value_heads, size,
                                        rank, False)
             conv_shards.append(conv[..., columns])

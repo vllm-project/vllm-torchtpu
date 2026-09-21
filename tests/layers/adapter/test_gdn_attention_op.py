@@ -256,8 +256,7 @@ class TestVllmGatedDeltaNetAttention:
             fake_jax_op.register_fake.call_args.args[0](*op_args))
         assert fake_pool.shape == pool.shape
         assert fake_output.shape == fake_z.shape == output.shape
-        assert mock_run.call_args.kwargs[
-            "gqa_interleaved_layout"] is interleaved
+        assert "gqa_interleaved_layout" not in mock_run.call_args.kwargs
         assert pool.untyped_storage().data_ptr() == original_storage
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
@@ -763,11 +762,15 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
-    def test_forward_cuda_non_lora_gqa(self, mock_get_forward_context):
+    def test_forward_uses_canonical_projection_for_interleaved_checkpoint(
+            self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 0
         attn.head_v_dim = 16
         attn.num_v_heads = 4
+        attn.num_k_heads = 4
+        attn.head_k_dim = 8
+        attn.value_dim = 64
         attn.tp_size = 1
         attn.prefix = "test_layer"
         attn.gqa_interleaved_layout = True
@@ -784,25 +787,19 @@ class TestVllmGatedDeltaNetAttention:
         # Mocks for non-LoRA GQA path
         attn.in_proj_qkvz = MagicMock()
         attn.in_proj_ba = MagicMock()
-        attn.fix_query_key_value_ordering = MagicMock()
         attn.norm = MagicMock()
         attn.out_proj = MagicMock()
 
         num_tokens = 2
         hidden_states = torch.randn(num_tokens, 64)
 
-        attn.in_proj_qkvz.return_value = (torch.randn(num_tokens, 192), None)
-        attn.in_proj_ba.return_value = (torch.randn(num_tokens, 32), None)
-
-        query = torch.randn(num_tokens, 4, 8)
-        key = torch.randn(num_tokens, 4, 8)
-        value = torch.randn(num_tokens, 4, 8)
+        mixed_qkv = torch.randn(num_tokens, 128)
         z = torch.randn(num_tokens, 4, 16)
-        b = torch.randn(num_tokens, 16)
-        a = torch.randn(num_tokens, 16)
-
-        attn.fix_query_key_value_ordering.return_value = (query, key, value, z,
-                                                          b, a)
+        b = torch.randn(num_tokens, 4)
+        a = torch.randn(num_tokens, 4)
+        attn.in_proj_qkvz.return_value = (torch.cat((mixed_qkv, z.flatten(1)),
+                                                    dim=-1), None)
+        attn.in_proj_ba.return_value = (torch.cat((b, a), dim=-1), None)
 
         norm_out = torch.randn(num_tokens, 4, 16)
         attn.norm.return_value = norm_out
@@ -830,16 +827,13 @@ class TestVllmGatedDeltaNetAttention:
 
         attn.in_proj_qkvz.assert_called_once_with(hidden_states)
         attn.in_proj_ba.assert_called_once_with(hidden_states)
-        attn.fix_query_key_value_ordering.assert_called_once()
 
         assert attn.gdn_op.call_count == 1
         core_args = attn.gdn_op.call_args[0]
 
-        # mixed_qkv should be cat of rearranged query, key, value
-        # rearranged from "l p d -> l (p d)", e.g. 2x(4*8) = 2x32 -> cat into 2x96
-        assert core_args[0].shape == (num_tokens, 96)
-        assert core_args[1].shape == (num_tokens, 16)
-        assert core_args[2].shape == (num_tokens, 16)
+        torch.testing.assert_close(core_args[0], mixed_qkv)
+        torch.testing.assert_close(core_args[1], b)
+        torch.testing.assert_close(core_args[2], a)
         assert core_args[3] is attn.kv_cache[0]
         assert core_args[4] is attn.kv_cache[1]
         assert core_args[5] is attn.conv1d.weight
@@ -1140,12 +1134,8 @@ class TestVllmGatedDeltaNetAttention:
         hidden_states = torch.randn(num_tokens, 64)
         b_local = torch.arange(num_tokens * 4).reshape(num_tokens, 4).float()
         a_local = b_local + 100
-        if interleaved:
-            ba = torch.cat((b_local.reshape(
-                num_tokens, 2, 2), a_local.reshape(num_tokens, 2, 2)),
-                           dim=-1)
-        else:
-            ba = torch.cat((b_local, a_local), dim=-1)
+        # Both checkpoint formats have already been normalized by loading.
+        ba = torch.cat((b_local, a_local), dim=-1)
         attn.in_proj_ba.return_value = (ba.reshape(num_tokens, -1), None)
 
         fused_output = torch.arange(

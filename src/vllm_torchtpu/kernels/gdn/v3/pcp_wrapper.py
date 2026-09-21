@@ -13,7 +13,8 @@
 # limitations under the License.
 """PCP projection/communication fused with the GDN v3 compute pipeline.
 
-The BF16/FP8 entry projects QKVZ in-kernel and interleaves all but the first
+The BF16/FP8 entry consumes canonical QKVZ weights normalized during loading.
+It projects QKVZ in-kernel and interleaves all but the first
 projection block with GDN tiles. BA exchange, gated normalization, and the
 final output projection remain outside. GDN state streams directly to and from
 the unified KV pool through a StateSourcePlan. QKV is written directly into a
@@ -53,9 +54,6 @@ class _ProjectionConfig:
     qkv_dim: int
     full_key_dim: int
     kq_replication_factor: int
-    gqa_interleaved_layout: bool
-    key_head_dim: int
-    group_value_dim: int
 
 
 _TPU_TILE_ROWS = 8
@@ -570,54 +568,24 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     sem=projection_scale_sem,
                 ).start()
 
-        def _start_projection_weights(destination, *, is_qkv: bool) -> None:
-            kq_destination = destination // projection_cfg.kq_replication_factor
-            # Both layouts use the same DMA and matmul tiles. Only the source
-            # columns differ; these Python branches specialize at trace time.
-            if projection_cfg.gqa_interleaved_layout:
-                key_width = projection_cfg.key_head_dim
-                num_groups = shard_key_dim // key_width
-                value_width = shard_value_dim // num_groups
-                group_stride = 2 * key_width + 2 * projection_cfg.group_value_dim
-                q_col = kq_destination * num_groups * group_stride
-                k_col = q_col + key_width
-                replica_offset = lax.rem(
-                    destination,
-                    projection_cfg.kq_replication_factor) * shard_value_dim
-                v_col = q_col + 2 * key_width + replica_offset
-                z_col = v_col + projection_cfg.group_value_dim
-            else:
-                num_groups = 1
-                key_width = shard_key_dim
-                value_width = shard_value_dim
-                group_stride = 0
-                q_col = kq_destination * shard_key_dim
-                k_col = full_key_dim + q_col
-                v_col = 2 * full_key_dim + destination * shard_value_dim
-                z_col = projection_cfg.qkv_dim + destination * shard_value_dim
-
-            for group in range(num_groups):
-                source_offset = group * group_stride
-                if is_qkv:
-                    _start_weight_piece(q_col + source_offset,
-                                        group * key_width, key_width)
-                    _start_weight_piece(k_col + source_offset,
-                                        shard_key_dim + group * key_width,
-                                        key_width)
-                    _start_weight_piece(
-                        v_col + source_offset,
-                        2 * shard_key_dim + group * value_width, value_width)
-                else:
-                    _start_weight_piece(z_col + source_offset,
-                                        group * value_width, value_width)
-
         @pl.when(is_qkv)
         def _start_qkv() -> None:
-            _start_projection_weights(destination, is_qkv=True)
+            kq_destination = destination // projection_cfg.kq_replication_factor
+            q_col = kq_destination * shard_key_dim
+            k_col = full_key_dim + kq_destination * shard_key_dim
+            v_col = 2 * full_key_dim + destination * shard_value_dim
+            _start_weight_piece(q_col, 0, shard_key_dim)
+            _start_weight_piece(k_col, shard_key_dim, shard_key_dim)
+            _start_weight_piece(
+                v_col,
+                2 * shard_key_dim,
+                shard_value_dim,
+            )
 
         @pl.when(jnp.logical_not(is_qkv))
         def _start_z_group() -> None:
-            _start_projection_weights(z_group, is_qkv=False)
+            z_col = projection_cfg.qkv_dim + z_group * shard_value_dim
+            _start_weight_piece(z_col, 0, shard_value_dim)
 
     def _wait_projection_output() -> None:
         pending = projection_pending_out_ref[0]
@@ -1308,7 +1276,6 @@ def _validate_compact_state_writeback_plan(
         "mesh_axis_names",
         "pcp_axis_name",
         "state_plan",
-        "gqa_interleaved_layout",
     ),
 )
 def fused_qkvz_projection_pcp_gdn(
@@ -1339,7 +1306,6 @@ def fused_qkvz_projection_pcp_gdn(
     state_plan: config.StateSourcePlan,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    gqa_interleaved_layout: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run ragged PCP prefill with fused QKVZ projection and communication.
 
@@ -1349,8 +1315,6 @@ def fused_qkvz_projection_pcp_gdn(
     describes its conv and recurrent byte regions. Runtime stage metadata
     handles mixed request lengths and arbitrary absolute query offsets without
     expanding active work to the compile bucket.
-    With gqa_interleaved_layout, weight/scale rows are read in Qwen3Next's
-    per-Q/K-head [Q, K, V, Z] order inside the projection kernel.
     """
     if pcp_size <= 1:
         raise ValueError("The PCP fused GDN kernel requires pcp_size > 1.")
@@ -1453,9 +1417,6 @@ def fused_qkvz_projection_pcp_gdn(
         qkv_dim=expected_local_qkv_dim,
         full_key_dim=full_key_dim,
         kq_replication_factor=geometry.kq_replication_factor,
-        gqa_interleaved_layout=gqa_interleaved_layout,
-        key_head_dim=d_k,
-        group_value_dim=n_v // n_kq * d_v,
     )
 
     if b.shape[1] != local_n_v:

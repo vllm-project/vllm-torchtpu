@@ -363,25 +363,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return super().create_ba_proj(hidden_size, num_v_heads, quant_config,
                                       prefix)
 
-    def fix_query_key_value_ordering(self, mixed_qkvz: torch.Tensor,
-                                     mixed_ba: torch.Tensor):
-        """Unpack rank-local groups after whole-head Q/K replication."""
-        geometry = self.tp_head_geometry
-        groups = geometry.local_num_kq_heads
-        group_v = geometry.local_num_v_heads // groups
-        q, k, v, z = mixed_qkvz.reshape(
-            *mixed_qkvz.shape[:-1], groups, -1).split([
-                self.head_k_dim, self.head_k_dim, group_v * self.head_v_dim,
-                group_v * self.head_v_dim
-            ],
-                                                      dim=-1)
-        b, a = mixed_ba.reshape(*mixed_ba.shape[:-1], groups, -1).chunk(2,
-                                                                        dim=-1)
-        return (q, k, v.reshape(-1, geometry.local_num_v_heads,
-                                self.head_v_dim),
-                z.reshape(-1, geometry.local_num_v_heads,
-                          self.head_v_dim), b.flatten(-2), a.flatten(-2))
-
     def _create_conv1d(self) -> None:
         # Upstream constructs conv1d directly and installs its Mamba loader
         # after create_qkvz_proj. Replace it before checkpoint loading, using
@@ -773,7 +754,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
-                gqa_interleaved_layout=self.gqa_interleaved_layout,
             )
 
         op_name = ("pallas::gdn_attention_pooled_pcp_fused_"
@@ -847,7 +827,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return BF16/FP8 QKVZ parameters in their native checkpoint layout."""
+        """Return BF16/FP8 QKVZ parameters in canonical runtime layout."""
         if hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz"):
             raise RuntimeError("GDN pooled PCP prefill requires a combined "
                                "QKVZ projection.")
@@ -907,13 +887,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = (
             self._require_pcp_projection_parameters())
         ba, _ = self.in_proj_ba(hidden_states)
-        if self.gqa_interleaved_layout:
-            # Qwen3Next stores [b_group, a_group] for each Q/K head.
-            ba = ba.reshape(hidden_states.shape[0],
-                            self.tp_head_geometry.local_num_kq_heads, -1)
         b, a = ba.chunk(2, dim=-1)
-        b = b.reshape(hidden_states.shape[0], -1).contiguous()
-        a = a.reshape(hidden_states.shape[0], -1).contiguous()
+        b = b.contiguous()
+        a = a.contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
@@ -967,24 +943,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
 
-            if self.gqa_interleaved_layout:
-                # Qwen3-Next: unpack the interleaved GQA layout
-                query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                    mixed_qkvz, ba)
-                query, key, value = map(
-                    lambda x: rearrange(x, "l p d -> l (p d)"),
-                    (query, key, value))
-                mixed_qkv = torch.cat((query, key, value), dim=-1)
-            else:
-                # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-                qkv_size = self.tp_head_geometry.local_conv_dim(
-                    self.head_k_dim, self.head_v_dim)
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
-                b = b.contiguous()
-                a = a.contiguous()
+            # Every checkpoint loader produces [q, k, v, z] and [b, a].
+            qkv_size = self.tp_head_geometry.local_conv_dim(
+                self.head_k_dim, self.head_v_dim)
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = ba.chunk(2, dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
