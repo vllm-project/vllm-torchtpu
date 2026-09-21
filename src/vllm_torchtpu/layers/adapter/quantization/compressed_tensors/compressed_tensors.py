@@ -46,13 +46,13 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _is_weight_fp8(weight_quant: Optional[QuantizationArgs]) -> bool:
+def _is_weight_fp8(weight_quant: QuantizationArgs | None) -> bool:
     return (weight_quant is not None
             and weight_quant.type == QuantizationType.FLOAT
             and weight_quant.num_bits == 8)
 
 
-def _is_int4_w4aN(weight_quant: Optional[QuantizationArgs]) -> bool:
+def _is_int4_w4aN(weight_quant: QuantizationArgs | None) -> bool:
     if weight_quant is None:
         return False
     is_int4_weight = (int(weight_quant.num_bits) == 4
@@ -67,7 +67,7 @@ def _is_int4_w4aN(weight_quant: Optional[QuantizationArgs]) -> bool:
 
 def _build_fp8_config(
     weight_quant: QuantizationArgs,
-    input_quant: Optional[QuantizationArgs],
+    input_quant: QuantizationArgs | None,
 ) -> VllmFp8Config:
     """Adapt a matched compressed-tensors FP8 scheme into a VllmFp8Config.
 
@@ -91,7 +91,7 @@ def _build_fp8_config(
 def _build_fp8_linear_method(
     layer: LinearBase,
     weight_quant: QuantizationArgs,
-    input_quant: Optional[QuantizationArgs],
+    input_quant: QuantizationArgs | None,
 ) -> VllmFp8LinearMethodTPU:
     fp8_config = _build_fp8_config(weight_quant, input_quant)
     return VllmFp8LinearMethodTPU(fp8_config,
@@ -120,10 +120,11 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         # vllm_config -- so it must be populated too, not just ours.
         VllmFp8Config.set_configs(vllm_config)
 
-    def get_scheme(self,
-                   layer: torch.nn.Module,
-                   layer_name: Optional[str] = None
-                   ) -> Optional["CompressedTensorsScheme"]:
+    def get_scheme(
+            self,
+            layer: torch.nn.Module,
+            layer_name: str | None = None
+    ) -> Optional["CompressedTensorsScheme"]:
         """
         compressed-tensors supports non uniform in the following way:
 
@@ -181,7 +182,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         if should_ignore_layer(prefix,
                                ignore=self.ignore,
                                fused_mapping=self.packed_modules_mapping):

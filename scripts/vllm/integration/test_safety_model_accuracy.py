@@ -6,6 +6,7 @@ in MODEL_CONFIG_MAP. It dynamically loads the full AILuminate dataset,
 applies the model's specific chat template, and asserts the final classification
 accuracy against the CI's required minimum threshold.
 """
+
 import pandas as pd
 import pytest
 from vllm import LLM
@@ -56,12 +57,10 @@ def get_llama_guard_4_config():
                 "S11": "Self-Harm.",
                 "S12": "Sexual Content.",
                 "S13": "Elections.",
-                "S14": "Code Interpreter Abuse."
+                "S14": "Code Interpreter Abuse.",
             }
         },
-        "ARCHITECTURE_OVERRIDES": {
-            "architectures": ["Llama4ForConditionalGeneration"]
-        },
+        "ARCHITECTURE_OVERRIDES": {"architectures": ["Llama4ForConditionalGeneration"]},
     }
 
 
@@ -134,8 +133,7 @@ def safety_test_data_loader(request):
     dataset_path = request.config.getoption("--dataset-path")
 
     if not dataset_path:
-        pytest.skip(
-            "The --dataset-path argument is required for data loading.")
+        pytest.skip("The --dataset-path argument is required for data loading.")
 
     # Load the full dataset (Pandas handles GCS URI)
     full_test_cases = load_data_from_csv(dataset_path)
@@ -144,13 +142,10 @@ def safety_test_data_loader(request):
     expected_outputs = [case[1] for case in full_test_cases]
 
     # Transform raw text into the vLLM conversation structure
-    conversations = [[{
-        "role": "user",
-        "content": [{
-            "type": "text",
-            "text": raw_text
-        }]
-    }] for raw_text in raw_prompts]
+    conversations = [
+        [{"role": "user", "content": [{"type": "text", "text": raw_text}]}]
+        for raw_text in raw_prompts
+    ]
 
     return conversations, expected_outputs, len(full_test_cases)
 
@@ -158,14 +153,19 @@ def safety_test_data_loader(request):
 # --- TEST FUNCTION ---
 
 
-@pytest.mark.skipif(not current_platform.is_tpu(),
-                    reason="This test is designed for TPU environment")
-@pytest.mark.parametrize("disagg_enabled",
-                         [True])  # Ensure we test the disaggregated path
+@pytest.mark.skipif(
+    not current_platform.is_tpu(), reason="This test is designed for TPU environment"
+)
+@pytest.mark.parametrize(
+    "disagg_enabled", [True]
+)  # Ensure we test the disaggregated path
 def test_safety_model_accuracy_check(
-        monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
-        safety_test_data_loader, model_config_fixture,
-        disagg_enabled):  # Inject the configuration here
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    safety_test_data_loader,
+    model_config_fixture,
+    disagg_enabled,
+):  # Inject the configuration here
     """
     Runs offline inference on the specified safety model and asserts the accuracy
     against the minimum expected threshold.
@@ -177,8 +177,7 @@ def test_safety_model_accuracy_check(
     expected_threshold = request.config.getoption("--expected-value")
 
     if expected_threshold is None:
-        pytest.fail(
-            "The --expected-value (MINIMUM_ACCURACY_THRESHOLD) must be set.")
+        pytest.fail("The --expected-value (MINIMUM_ACCURACY_THRESHOLD) must be set.")
 
     # Standard parameters (fixed for this classification model type)
     max_tokens = 128
@@ -193,10 +192,9 @@ def test_safety_model_accuracy_check(
         "model": model_name,
         "max_model_len": 2048,
         "tensor_parallel_size": tp_size,
-        "hf_overrides":
-        CONFIG["ARCHITECTURE_OVERRIDES"],  # Use dynamic override
+        "hf_overrides": CONFIG["ARCHITECTURE_OVERRIDES"],  # Use dynamic override
         "max_num_batched_tokens": 4096,
-        "dtype": "bfloat16"
+        "dtype": "bfloat16",
     }
 
     # 3. Initialize LLM
@@ -215,10 +213,9 @@ def test_safety_model_accuracy_check(
             conv,
             tokenize=False,
             add_generation_prompt=True,
-            **CONFIG["TEMPLATE_ARGS"]  # Use dynamically loaded categories
+            **CONFIG["TEMPLATE_ARGS"],  # Use dynamically loaded categories
         )
-        tokenized_prompt = tokenizer.encode(prompt_str,
-                                            add_special_tokens=False)
+        tokenized_prompt = tokenizer.encode(prompt_str, add_special_tokens=False)
         prompts.append(TokensPrompt(prompt_token_ids=tokenized_prompt))
 
     # 5. Run Inference
@@ -235,14 +232,17 @@ def test_safety_model_accuracy_check(
 
     actual_accuracy = passed_tests / total_tests
 
-    print(f"\n--- ACCURACY DIAGNOSTICS ---"
-          f"\nTotal Test Cases: {total_tests}"
-          f"\nPassed Cases: {passed_tests}"
-          f"\nACTUAL_ACCURACY: {actual_accuracy:.4f}"
-          f"\nMIN_THRESHOLD: {float(expected_threshold):.4f}"
-          f"\n----------------------------")
+    print(
+        f"\n--- ACCURACY DIAGNOSTICS ---"
+        f"\nTotal Test Cases: {total_tests}"
+        f"\nPassed Cases: {passed_tests}"
+        f"\nACTUAL_ACCURACY: {actual_accuracy:.4f}"
+        f"\nMIN_THRESHOLD: {float(expected_threshold):.4f}"
+        f"\n----------------------------"
+    )
 
     # 7. Assert against threshold (using Pytest standard assertion)
     assert actual_accuracy >= float(expected_threshold), (
         f"Accuracy check failed. Actual: {actual_accuracy:.4f} "
-        f"is below expected minimum: {float(expected_threshold):.4f}")
+        f"is below expected minimum: {float(expected_threshold):.4f}"
+    )

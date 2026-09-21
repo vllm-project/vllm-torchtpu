@@ -1,14 +1,19 @@
-site_name: vLLM TPU
+site_name: vLLM TorchTPU
 site_url: !ENV READTHEDOCS_CANONICAL_URL
 repo_url: https://github.com/vllm-project/vllm-torchtpu
 edit_uri: edit/main/docs/
 docs_dir: docs
+# Theme override templates live under docs/ but are not site content.
+exclude_docs: |
+  overrides/
 strict: true
 
 theme:
   name: material
-  logo: https://docs.vllm.ai/en/latest/assets/logos/vllm-logo-only-light.ico
-  favicon: https://docs.vllm.ai/en/latest/assets/logos/vllm-logo-only-light.ico
+  custom_dir: docs/overrides
+  # The header logo is a composite (vLLM + PyTorch) rendered by
+  # docs/overrides/partials/logo.html, so theme.logo is not set here.
+  favicon: assets/logos/vllm-logo-only-light.png
   palette:
     # Palette toggle for automatic mode
     - media: "(prefers-color-scheme)"
@@ -41,14 +46,14 @@ theme:
     - toc.follow
 
 nav:
-  - Home: index.md
-  - Developer Guides:
-    - Pre-Public Dev Guide: PRE_PUBLIC_DEV_GUIDE.md
-    - TorchTPU Compilation: torch_tpu_compilation.md
-    - 'TPU patch mechanism': tpu_patch_mechanism.md
-    - Profiling: profiling.md
-    - Docker: docker.md
-  - Contributing: https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md
+  - 'Home': README.md
+  - 'Features & Usage':
+    - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
+    - 'Docker': docker.md
+  - 'Developers Guides':
+    - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
+    - 'TPU Patch Mechanism': tpu_patch_mechanism.md
+    - 'Profiling': developers_guide/profiling.md
 
 validation:
   nav:
@@ -58,6 +63,7 @@ validation:
     not_found: ignore
     absolute_links: ignore
     unrecognized_links: ignore
+
 plugins:
   - search
   - same-dir
@@ -102,8 +108,13 @@ markdown_extensions:
   - mdx_math:
       enable_dollar_delimiter: true
 
+extra_css:
+  - mkdocs/stylesheets/extra.css
+  - mkdocs/stylesheets/interactive.css
+
 extra_javascript:
   - https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS_HTML
+  - mkdocs/javascripts/interactive.js
 
 use_directory_urls: true
 

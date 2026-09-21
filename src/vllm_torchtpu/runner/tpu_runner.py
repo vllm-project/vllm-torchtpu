@@ -10,12 +10,12 @@ import copy
 import math
 import os
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -43,7 +43,6 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
@@ -290,11 +289,6 @@ def _build_kv_connector_output(
     }
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
     return KVConnectorOutput(**kwargs)
 
 
@@ -1280,10 +1274,12 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        return self.kv_cache_manager.get_kv_cache_spec()
+        with set_current_vllm_config(self.vllm_config):
+            return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        with set_current_vllm_config(self.vllm_config):
+            self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -1386,11 +1382,11 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        layer_to_raw: dict[str, torch.Tensor] = {}
-        for raw, kv_cache_tensor in zip(raw_tensors,
-                                        kv_cache_config.kv_cache_tensors):
-            for layer_name in kv_cache_tensor.shared_by:
-                layer_to_raw[layer_name] = raw
+        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+        layer_to_raw = {
+            name: raw_tensors[index]
+            for name, index in layer_to_pool_index(kv_cache_config).items()
+        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -4121,7 +4117,8 @@ class TPUModelRunner(GPUModelRunner):
             use_max_model_len)
         capacity = self._attention_capacity.get((num_seqs, pages_per_seq))
         if capacity is None:
-            layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_kv_cache_layout()]
+            layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+                self.cache_config.get_resolved_kv_cache_layout()]
             shared = dict(
                 num_q_heads=self.model_config.get_num_attention_heads(
                     self.parallel_config),
@@ -4895,11 +4892,17 @@ class TPUModelRunner(GPUModelRunner):
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P,
+                    greedy)
         try:
-            # ---- batched prefill of R requests (disjoint top-of-pool blocks) --
+            # Match the low-block working set used by the LIFO BlockPool
+            # workaround. High physical block ids can trigger the v7x SC2
+            # indexed-KV halt even though they are inside the allocated pool.
+            # Warmup runs before serving, with no live scheduler requests;
+            # reserve block 0 and keep each synthetic request's range disjoint.
             new_reqs = []
             for j, rid in enumerate(rids):
-                lo = top - (j + 1) * nblk
+                lo = 1 + j * nblk
                 new_reqs.append(
                     NewRequestData(req_id=rid,
                                    prompt_token_ids=[0] * P,
@@ -4977,10 +4980,11 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Blocks from the TOP of the pool so the first real allocations (low ids)
-        # don't collide. Page CONTENTS are value-insensitive and KV writes use
-        # empty_slot_mappings, so stale pages are safe; each request is fully torn
-        # down before the next. Cover the highest context this request reaches.
+        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
+        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # of the pool. Warmup runs before serving and tears down each request;
+        # real requests overwrite their valid KV positions on first prefill.
+        # Cover the highest context this request reaches, reserving block 0.
         # Count blocks per kv-cache group at that group's own block size:
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
@@ -4992,7 +4996,7 @@ class TPUModelRunner(GPUModelRunner):
         for group in self.kv_cache_config.kv_cache_groups:
             gbs = int(group.kv_cache_spec.block_size)
             g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
-            block_ids_per_group.append(list(range(top - g_nblk, top)))
+            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning(

@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
@@ -179,6 +180,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
+        # None means unchunked. The kernel falls back to a single unpipelined
+        # pass when `max_num_tokens` is not a multiple of the chunk.
+        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
 
         def _streamidx_topk_jax(
                 q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -230,6 +234,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
 
@@ -653,7 +658,7 @@ class VllmTPUMLAAttention(MLAAttention):
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
-        for key in kv_b_proj_params.keys():
+        for key in kv_b_proj_params:
             if key in self.kv_b_proj._parameters:
                 self.kv_b_proj._parameters[key] = None
             elif hasattr(self.kv_b_proj, key):
@@ -684,10 +689,6 @@ class VllmTPUMLAAttention(MLAAttention):
                 k_pe: torch.Tensor,
                 output: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe,
-                                                self.layer_name)
-
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
         return self.impl.forward(
@@ -756,6 +757,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 "Fused MLA gating requires fused_qkv_a_proj")
             assert self.g_proj is None, (
                 "Fused MLA gating cannot also use g_proj")
+        self.kimi_preprocess = None
+        self.register_buffer('kimi_gate_weight', None, persistent=False)
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
@@ -806,12 +809,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prefill_group=None,
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
         output_gate = None
 
-        if self.q_lora_rank is not None:
+        if self.kimi_preprocess is not None:
+            q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
+                hidden_states, self.fused_qkv_a_proj.weight,
+                self.kimi_gate_weight, self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight, prefill_group is not None)
+            q = self.q_b_proj(q_c)[0]
+        elif self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None")
             assert self.q_a_layernorm is not None, (
@@ -847,9 +857,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
-                                   dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self.kimi_preprocess is None:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
@@ -859,7 +870,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
+            q_pe_dtype = q_pe.dtype
+            k_pe_dtype = k_pe.dtype
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            # RoPE caches/frequencies can be fp32 and promote the rotated
+            # tensors.  Dense MLA requires new KV values to exactly match the
+            # cache dtype, and queries should remain in the activation dtype.
+            q_pe = q_pe.to(dtype=q_pe_dtype)
+            k_pe = k_pe.to(dtype=k_pe_dtype)
 
         topk_indices = None
         if self.is_sparse:
@@ -881,8 +899,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_heads * self.v_head_dim),
+            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
         )
 
@@ -890,6 +907,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= output_gate.sigmoid()
         elif self.g_proj is not None:
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        if prefill_group is not None:
+            return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]
 
 

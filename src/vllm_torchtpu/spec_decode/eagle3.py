@@ -105,7 +105,7 @@ class Eagle3Proposer:
 
     def __init__(
         self,
-        runner: "TPUModelRunner",
+        runner: TPUModelRunner,
         vllm_config: VllmConfig,
     ):
         self.runner = runner

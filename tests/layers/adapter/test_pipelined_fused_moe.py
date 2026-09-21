@@ -85,7 +85,7 @@ def test_enable_pipelined_collective_allows_pcp():
 )
 def test_supports_internal_mk_property(method_cls):
     """Verify supports_internal_mk is True when chunk_size > 0, False when 0 across all 6 quantization classes."""
-    prop = getattr(method_cls, "supports_internal_mk")
+    prop = method_cls.supports_internal_mk
     assert isinstance(prop, property)
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
@@ -560,7 +560,9 @@ class TestMoEForwardPrecisionBranches:
         layer.w2_weight_scale = torch.ones(4, 1, 1, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
 
-        method = MagicMock(spec=VllmCompressedTensorsW4ANMxfp4MoEMethod)
+        # Exercise the real apply_with_routing helper, not a MagicMock child.
+        method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
+            VllmCompressedTensorsW4ANMxfp4MoEMethod)
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)

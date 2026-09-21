@@ -18,8 +18,6 @@ This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
-from typing import Optional
-
 import torch
 from vllm.distributed.parallel_state import get_dp_group
 
@@ -110,17 +108,17 @@ def pipelined_fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    w1_bias: Optional[torch.Tensor],
-    w2_bias: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    experts_start: Optional[torch.Tensor],
+    experts_start: torch.Tensor | None,
     topk: int,
     activation: str,
     rhs_quant_dtype=None,
-    skip_padded_tokens: Optional[bool] = None,
+    skip_padded_tokens: bool | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 

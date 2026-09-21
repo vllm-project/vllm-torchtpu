@@ -214,19 +214,13 @@ def test_no_forward_output_preserves_invalid_block_ids():
     with patch(
             "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
             return_value=False):
-        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-            with pytest.raises(RuntimeError,
-                               match="cache-group-scoped KV load failure"):
-                TPUModelRunner.kv_connector_no_forward(runner,
-                                                       scheduler_output,
-                                                       vllm_config)
-            return
         output = TPUModelRunner.kv_connector_no_forward(
             runner, scheduler_output, vllm_config)
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
-    assert output.kv_connector_output.invalid_block_group_index == 2
+    if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+        assert output.kv_connector_output.invalid_block_group_index == 2
 
 
 def test_build_kv_connector_output_supports_vllm_023():
@@ -252,19 +246,22 @@ def test_build_kv_connector_output_supports_vllm_023():
     )
 
 
-def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
+def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery(
+):
     with patch.object(
             tpu_runner,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
-    ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
-        tpu_runner._build_kv_connector_output(
+    ):
+        out = tpu_runner._build_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
         )
+        assert out.finished_recving == {"failed-load"}
+        assert out.invalid_block_ids == {41, 43}
 
 
 def _fake_phased_runner(additional_config=None,
@@ -1426,15 +1423,14 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     the layout against an ambient config and the gap stays hidden. Missing it
     both ways is what let this reach CI as an `AssertionError: Current vLLM
     config is not set` at server startup."""
+    from vllm.config import CacheConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
     from vllm_torchtpu.layers.adapter.attention import \
         PallasBatchedRPAAttentionBackend
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            block_size=16,
-            user_specified_block_size=False,
-            block_size_unaligned=16,
-        ),
+        cache_config=CacheConfig(),
         model_config=SimpleNamespace(
             use_mla=False,
             is_hybrid=False,
@@ -1446,6 +1442,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         kv_transfer_config=None,
     )
+    resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
     with patch.object(TpuPlatform,
                       "_find_non_ssm_backend",
                       return_value=PallasBatchedRPAAttentionBackend):

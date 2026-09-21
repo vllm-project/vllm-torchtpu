@@ -33,8 +33,8 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 import sympy
 import torch

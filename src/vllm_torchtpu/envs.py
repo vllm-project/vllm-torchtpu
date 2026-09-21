@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
@@ -76,8 +78,8 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
-    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
-    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -311,7 +313,27 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
+def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+    """Optional size knob that must be greater than zero when it is set.
+
+    Unset or empty reads as ``None``, meaning the feature is off.
+    """
+    parse_int = env_optional_int(env_name)
+
+    def _get_positive_int_or_none_env() -> int | None:
+        value = parse_int()
+        if value is not None and value <= 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_or_none_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt in to K3 TP32/EP32 sequence-parallel prefill.
+    "TPU_K3_SP_PREFILL":
+    env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -330,10 +352,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
@@ -603,6 +625,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
+    # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
+    # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
+    # Unset means unchunked: one single pass, no pipelining.
+    "TPU_STREAMIDX_CHUNK_TOKENS":
+    env_positive_int_or_none("TPU_STREAMIDX_CHUNK_TOKENS"),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":

@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -45,11 +45,13 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
                         kda_state_dtype)
+from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
@@ -122,18 +124,23 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residuals: torch.Tensor | None,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-            hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.self_attn(positions,
+                                           hidden_states,
+                                           sequence_parallel=sequence_parallel)
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             if self.is_moe:
-                hidden_states = self.block_sparse_moe(hidden_states)
+                hidden_states = self.block_sparse_moe(
+                    hidden_states, sequence_parallel=sequence_parallel)
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states,
+                                         sequence_parallel=sequence_parallel)
             return residual + hidden_states, None
 
         assert block_residuals is not None
@@ -147,14 +154,18 @@ class KimiDecoderLayer(nn.Module):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(positions,
+                                       hidden_states,
+                                       sequence_parallel=sequence_parallel)
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
-            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = self.block_sparse_moe(
+                hidden_states, sequence_parallel=sequence_parallel)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states,
+                                     sequence_parallel=sequence_parallel)
         return prefix_sum + hidden_states, block_residuals
 
 
@@ -179,6 +190,16 @@ class KimiModel(nn.Module):
             config.attn_res_block_size,
         )
         self.attn_res_block_size = config.attn_res_block_size
+        self.sp_prefill = envs.TPU_K3_SP_PREFILL
+        if self.sp_prefill:
+            parallel = vllm_config.parallel_config
+            if (parallel.tensor_parallel_size != 32
+                    or not parallel.enable_expert_parallel
+                    or parallel.pipeline_parallel_size != 1
+                    or parallel.data_parallel_size != 1):
+                raise ValueError(
+                    "K3 SP prefill requires TP32/EP32 and PP1/DP1")
+            self.sp_group = TokenShardCollectives(get_tp_group())
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -194,6 +215,7 @@ class KimiModel(nn.Module):
             ) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
@@ -209,27 +231,49 @@ class KimiModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
-        block_residuals = (hidden_states.new_empty(
-            hidden_states.shape[0],
-            0,
-            hidden_states.shape[1],
-        ) if self.attn_res_block_size is not None else None)
+        num_tokens = hidden_states.shape[0]
+        sequence_parallel = (self.sp_prefill and num_tokens > 0
+                             and num_tokens % self.sp_group.world_size == 0)
+        if sequence_parallel:
+            hidden_states = hidden_states.reshape(
+                self.sp_group.world_size, -1, hidden_states.shape[-1])[
+                    self.sp_group.rank_in_group].contiguous()
+        # A view avoids passing a symbolic local token count to TorchTPU's
+        # concrete-size allocation kernel during the dynamic trace.
+        block_residuals = (hidden_states.unsqueeze(1)[:, :0, :]
+                           if self.attn_res_block_size is not None else None)
         assert hidden_states is not None
 
-        for layer in self.layers:
+        aux_hidden_states: list[torch.Tensor] = []
+        if 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
+
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, block_residuals = layer(
                 positions,
                 hidden_states,
                 block_residuals,
+                sequence_parallel=sequence_parallel,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(hidden_states,
                                                  block_residuals)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if sequence_parallel:
+            hidden_states = self.sp_group.all_gather(hidden_states, dim=0)
+            aux_hidden_states = [
+                self.sp_group.all_gather(state, dim=0)
+                for state in aux_hidden_states
+            ]
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -285,6 +329,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        invalid = [
+            idx for idx in layers if idx < 0 or idx > len(self.model.layers)
+        ]
+        if invalid:
+            raise ValueError(
+                f"Invalid Kimi aux hidden-state layers: {invalid}")
+        self.model.aux_hidden_state_layers = tuple(layers)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -313,6 +366,10 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         for module in self.modules():
             if isinstance(module, AttentionResidual):
                 module.process_weights_after_loading()
+            elif isinstance(module, KimiMoE):
+                module.initialize_dummy_router()
+            elif isinstance(module, MultiHeadLatentAttention):
+                module.prepare_sp_mla_gate()
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -404,14 +461,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 else:
                     yield name, loaded_weight
 
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."]
-                           if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
+        skip_mapper = (WeightsMapper(orig_to_new_prefix={"lm_head.": None})
+                       if self.config.tie_word_embeddings else None)
         # load_weights fully consumes the generator before returning, so
         # loaded_experts is complete when the union is taken.
-        ordinary_loaded = loader.load_weights(_ordinary_weights())
+        ordinary_loaded = loader.load_weights(_ordinary_weights(),
+                                              mapper=skip_mapper)
         return loaded_experts | ordinary_loaded
 
 
@@ -495,6 +551,12 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
                 architectures=["KimiLinearForCausalLM"],
             )
         self.media_placeholder = config.media_placeholder_token_id
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if not hasattr(self.language_model, "set_aux_hidden_state_layers"):
+            raise RuntimeError(
+                "Kimi language model does not expose aux hidden states")
+        self.language_model.set_aux_hidden_state_layers(layers)
 
     @staticmethod
     def _maybe_ignore_quant_config(

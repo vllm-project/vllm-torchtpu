@@ -492,7 +492,7 @@ def test_non_spec_crossing_keeps_the_state_block_source():
 
 def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
     """Run `_build_mamba_copy_plan` on a minimal config; return the split."""
-    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.kv_cache_interface import KVCacheTensor, MambaSpec
 
     spec = MambaSpec(
         shapes=((3, 4), (2, 2)),
@@ -500,8 +500,15 @@ def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
         block_size=manager_tokens,
         page_size_padded=page_bytes,
     )
+    raw = torch.zeros(raw_shape, dtype=raw_dtype)
     kv_cache_config = SimpleNamespace(
-        kv_cache_tensors=[SimpleNamespace(shared_by=["model.layers.0.lin"])],
+        num_blocks=raw.nbytes // page_bytes,
+        kv_cache_tensors=[
+            KVCacheTensor(size=raw.nbytes,
+                          layers=["model.layers.0.lin"],
+                          layer_stride=raw.nbytes,
+                          block_stride=page_bytes)
+        ],
         kv_cache_groups=[
             SimpleNamespace(kv_cache_spec=spec,
                             layer_names=["model.layers.0.lin"])

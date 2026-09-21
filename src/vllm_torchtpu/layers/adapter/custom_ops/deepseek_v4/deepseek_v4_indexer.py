@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import functools
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -110,7 +109,7 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             num_kv_heads=1,
             head_size=align_to(128 + 1, 128),
             dtype=torch.uint8,
-            compress_ratio=min(self.compress_ratio, block_size),
+            tokens_per_state=min(self.compress_ratio, block_size),
             alignment=None,
         )
 
@@ -188,7 +187,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
-        slot_mapping: Optional[torch.Tensor] = None,
+        slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(query)
         q = q.view(-1, self.n_head, self.head_dim)

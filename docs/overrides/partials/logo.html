@@ -1,0 +1,10 @@
+{#-
+  Composite header logo: vLLM mark + "+" + PyTorch mark.
+  Overrides mkdocs-material's partials/logo.html (used by the header and the
+  mobile navigation drawer). Styled in docs/mkdocs/stylesheets/extra.css.
+-#}
+<span class="md-logo__composite">
+  <img src="{{ 'assets/logos/vllm-logo-only-light.png' | url }}" alt="vLLM logo">
+  <span class="md-logo__plus" aria-hidden="true">+</span>
+  <img src="{{ 'assets/logos/pytorch-icon-fullcolor.png' | url }}" alt="PyTorch logo">
+</span>

@@ -999,7 +999,7 @@ def derive_offload_namespace(
         num_kv_cache_groups: int,
         num_kv_cache_tensors: int,
         cp_geometry: tuple[int, ...] = (),
-        block_major_contract: "BlockMajorContract | None" = None) -> bytes:
+        block_major_contract: BlockMajorContract | None = None) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and registry key.
 
     Ensures cache keys never collide across incompatible engine deployments by
@@ -1083,7 +1083,7 @@ def _resolve_multi_shapes_kv_geometry(
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
     for leaf in mla_leaves:
-        shape = (leaf.storage_block_size, leaf.num_kv_heads, leaf.head_size)
+        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
         per_block_shapes.add(shape)
         kv_dtypes.add(leaf.dtype)
     return block_size, per_block_shapes, kv_dtypes, block_size

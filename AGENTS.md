@@ -33,7 +33,7 @@ pre-commit run
 pre-commit run --all-files
 
 # Run a specific hook:
-pre-commit run ruff --all-files
+pre-commit run ruff-check --all-files
 ```
 
 ### DCO sign-off

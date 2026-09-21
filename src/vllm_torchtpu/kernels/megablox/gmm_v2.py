@@ -15,7 +15,8 @@
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -353,7 +354,7 @@ class IndexMaps:
 
 def generate_block_specs(
         metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> Tuple[Tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
+) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
     index_map = IndexMaps(metadata_ref, cfgs)

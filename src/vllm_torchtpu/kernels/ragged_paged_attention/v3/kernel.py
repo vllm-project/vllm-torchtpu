@@ -1481,11 +1481,11 @@ def static_validate_inputs(
         if block_sizes is None:
             return
         bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
-        if not (0 < bq_csz and bq_sz % bq_csz == 0):
+        if not (bq_csz > 0 and bq_sz % bq_csz == 0):
             raise ValueError(
                 f"{prefix} {bq_csz=} and {bq_sz=} must satisfy (0 < bq_csz and bq_sz"
                 " % bq_csz == 0).")
-        if not (0 < bkv_csz and bkv_sz % bkv_csz == 0):
+        if not (bkv_csz > 0 and bkv_sz % bkv_csz == 0):
             raise ValueError(
                 f"{prefix} {bkv_csz=} and {bkv_sz=} must satisfy (0 < bkv_csz and"
                 " bkv_sz % bkv_csz == 0).")

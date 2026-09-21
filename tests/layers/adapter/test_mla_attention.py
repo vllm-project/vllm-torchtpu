@@ -296,6 +296,51 @@ def test_vllm_multi_head_latent_attention_wrapper():
             "non_causal_multi_token_decode"] is True
 
 
+def test_mla_wrapper_rope_preserves_activation_dtype():
+    wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
+        VllmMultiHeadLatentAttentionWrapper)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
+    wrapper.q_lora_rank = None
+    wrapper.kv_lora_rank = 4
+    wrapper.qk_nope_head_dim = 3
+    wrapper.qk_rope_head_dim = 2
+    wrapper.qk_head_dim = 5
+    wrapper.num_heads = 2
+    wrapper.v_head_dim = 2
+    wrapper.kv_a_proj_with_mqa = lambda hidden: (
+        torch.ones((hidden.shape[0], 6), dtype=hidden.dtype),
+        None,
+    )
+    wrapper.q_proj = lambda hidden: (
+        torch.ones((hidden.shape[0], 10), dtype=hidden.dtype),
+        None,
+    )
+    wrapper.kv_a_layernorm = lambda value: value
+    wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(),
+                                                         k_pe.float())
+    wrapper.is_sparse = False
+    wrapper.g_proj = None
+    wrapper.gate_is_fused = False
+    wrapper.mla_attn = MagicMock(
+        return_value=torch.ones((3, 4), dtype=torch.bfloat16))
+    wrapper.o_proj = lambda value: (value, None)
+
+    hidden_states = torch.ones((3, 8), dtype=torch.bfloat16)
+    output = VllmMultiHeadLatentAttentionWrapper.forward(
+        wrapper,
+        positions=torch.tensor([0, 1, 2]),
+        hidden_states=hidden_states,
+    )
+
+    (q_nope, q_pe), kv_c, k_pe = wrapper.mla_attn.call_args.args[:3]
+    assert q_nope.dtype == hidden_states.dtype
+    assert q_pe.dtype == hidden_states.dtype
+    assert kv_c.dtype == hidden_states.dtype
+    assert k_pe.dtype == hidden_states.dtype
+    assert output.dtype == hidden_states.dtype
+
+
 def test_pallas_mla_backend_impl():
     impl = PallasMLAttentionBackendImpl(
         num_heads=16,
@@ -579,13 +624,6 @@ def test_mla_requires_declared_g_proj():
         _gate_wrapper(modules, 2)
 
 
-def test_mla_requires_calculate_kv_scales():
-    attention = VllmMLAAttention.__new__(VllmMLAAttention)
-    torch.nn.Module.__init__(attention)
-    with pytest.raises(AttributeError, match="calculate_kv_scales"):
-        attention(None, None, None)
-
-
 @pytest.mark.parametrize("layout", ["flipped", "unflipped", "packed"])
 def test_mla_weight_layout_is_restored_on_error(layout):
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
@@ -637,12 +675,9 @@ def test_tpu_platform_keeps_the_selected_backend_without_mla(
     assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
 
 
-@pytest.mark.parametrize("calculate_kv_scales", [False, True])
-def test_mla_forward_calculates_kv_scales_only_when_declared(
-        calculate_kv_scales):
+def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
-    attention.calculate_kv_scales = calculate_kv_scales
     attention.layer_name = "model.layers.0.attn"
     attention.impl = MagicMock()
     attention.impl.forward.return_value = "out"
@@ -653,10 +688,7 @@ def test_mla_forward_calculates_kv_scales_only_when_declared(
                           "mla_attention_op.get_attention_context",
                           return_value=("meta", None, "cache", None)):
         assert attention(q, kv_c_normed, k_pe) == "out"
-    assert calc_scales.call_count == int(calculate_kv_scales)
-    if calculate_kv_scales:
-        calc_scales.assert_called_once_with(q, kv_c_normed, k_pe,
-                                            "model.layers.0.attn")
+    calc_scales.assert_not_called()
     attention.impl.forward.assert_called_once()
     assert attention.impl.forward.call_args.kwargs["attn_metadata"] == "meta"
     assert attention.impl.forward.call_args.kwargs["kv_cache"] == "cache"

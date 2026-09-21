@@ -50,6 +50,7 @@ def _run_swa(
     sliding_window: int,
     logical_page_size: int,
     swa_only: bool,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
@@ -78,6 +79,7 @@ def _run_swa(
         num_queries_per_block=(1, 32, 32),
         q_compute_block_size=4,
         unnormalized_output=not swa_only,
+        non_causal_block=non_causal_block,
     )
 
 
@@ -103,6 +105,7 @@ def _attention_hca(
     logical_page_size: int,
     swa_only: bool,
     two_caches_same_buffer: bool,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers, and HCA layers over a single raw-bf16 latent array."""
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
@@ -126,6 +129,7 @@ def _attention_hca(
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
         swa_only=swa_only,
+        non_causal_block=non_causal_block,
     )
 
     if swa_only:
@@ -178,6 +182,7 @@ def _attention_csa(
     logical_page_size: int,
     swa_only: bool,
     two_caches_same_buffer: bool,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
@@ -199,6 +204,7 @@ def _attention_csa(
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
         swa_only=False,
+        non_causal_block=non_causal_block,
     )
 
     if two_caches_same_buffer:
@@ -217,8 +223,6 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        gather_and_attention_chunk_size=64,
-        attention_kernel_batch_size=16,
     )
     return output, updated_sw_cache
 
@@ -249,8 +253,15 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         dtype: torch.dtype,
         prefix: str,
         cache_config,
+        backend_cls: type[AttentionBackend] | None = None,
     ) -> None:
-        super().__init__(head_dim, window_size, dtype, prefix, cache_config)
+        super().__init__(head_dim,
+                         window_size,
+                         dtype,
+                         prefix,
+                         cache_config,
+                         backend_cls=backend_cls
+                         or VllmDeepseekSparseSWABackend)
         # Initialize with default block size at construction time;
         # get_kv_cache_spec recomputes self.block_size from finalized runtime config.
         self.block_size = self._swa_block_size(cache_config.block_size,
@@ -288,6 +299,3 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=None,
         )
-
-    def get_attn_backend(self) -> type[AttentionBackend]:
-        return VllmDeepseekSparseSWABackend

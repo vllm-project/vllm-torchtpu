@@ -114,6 +114,7 @@ def _build_layer_and_method(device):
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size,
             params_dtype=torch.bfloat16,
+            weight_loader=layer.weight_loader,
         )
 
         # Reassign CPU-created Parameters onto target TPU device.

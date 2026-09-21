@@ -13,9 +13,10 @@ import importlib.util
 import json
 import os
 import pickle
+from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch._guards
@@ -182,6 +183,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # K3 custom-op registration, sharding, and Attention Residual bridges.
+    "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
 

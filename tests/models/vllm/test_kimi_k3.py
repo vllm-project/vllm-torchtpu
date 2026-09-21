@@ -40,6 +40,26 @@ from vllm_torchtpu.models.vllm.kimi_k3.layers import (AttentionResidual,
                                                       SituAndMul)
 
 
+@pytest.fixture(autouse=True)
+def _cpu_model_tests(monkeypatch):
+    # These model tests use CPU tensors and stubbed custom ops. Dynamo still
+    # queries registered devices; keep it from opening a distributed TPU
+    # client merely to inspect the current device while tracing CPU code.
+    #
+    # torch.tpu is registered by importing torch_tpu, which the cpu_test job
+    # never does: tests/conftest.py imports it only under --use-tpu, and
+    # importing it here would claim the accelerator in the pytest parent and
+    # lock out every spawned child. With no device module registered there is
+    # nothing for Dynamo to query, so there is nothing to stub either.
+    tpu = getattr(torch, "tpu", None)
+    if tpu is None:
+        return
+    monkeypatch.setattr(tpu, "is_available", lambda: False)
+    monkeypatch.setattr(tpu, "current_device", lambda: 0)
+    monkeypatch.setattr(tpu, "device_count", lambda: 0)
+    monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+
+
 def test_kimi_architectures_are_registered() -> None:
     architectures = {
         "KimiLinearForCausalLM": KimiLinearForCausalLM,
@@ -185,6 +205,49 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
         ]))
     assert name == "model.layers.1.self_attn.fused_qkv_a_proj.weight"
     assert weight.shard_id == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_weight_loader_preserves_lm_head_skip_and_streaming(tied) -> None:
+    model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=None,
+                                   q_lora_rank=None,
+                                   tie_word_embeddings=tied)
+    model.model = nn.Module()
+    model.model.embed_tokens = nn.Embedding(2, 3)
+    # The production constructor creates a separate head even with the flag
+    # enabled; native alias detection alone cannot replace its skip policy.
+    model.lm_head = nn.Linear(3, 2, bias=False)
+    model.lm_head_extra = nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        model.lm_head.weight.fill_(-1)
+    embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    head = embedding + 10
+    extra = embedding + 20
+
+    def checkpoint():
+        yield "language_model.model.embed_tokens.weight", embedding
+        yield "language_model.lm_head.weight", head
+        # Verify dense checkpoint tensors are consumed before advancing the
+        # stream, rather than first being retained in a full-checkpoint list.
+        torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+        if tied:
+            yield "language_model.lm_head.extra.unexpected.weight", head
+        yield "language_model.lm_head_extra.weight", extra
+
+    loaded = model.load_weights(checkpoint())
+    expected = {"model.embed_tokens.weight", "lm_head_extra.weight"}
+    if not tied:
+        expected.add("lm_head.weight")
+    assert loaded == expected
+    torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+    torch.testing.assert_close(model.lm_head_extra.weight, extra)
+    torch.testing.assert_close(model.lm_head.weight,
+                               torch.full_like(head, -1) if tied else head)
+    with pytest.raises(ValueError, match="not_in_model"):
+        model.load_weights([("not_in_model.weight", head)])
 
 
 def test_expert_weight_loader_uses_current_fused_moe_names() -> None:
@@ -455,6 +518,8 @@ def test_model_is_registered_for_torch_compile() -> None:
 
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     monkeypatch: pytest.MonkeyPatch, ) -> None:
+    group = SimpleNamespace(all_reduce=lambda x: x)
+    monkeypatch.setattr(kimi_attention, "get_tp_group", lambda: group)
 
     class FakeLinear(nn.Module):
 
@@ -472,9 +537,13 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args, gate_is_fused) -> None:
+        def __init__(self,
+                     *args,
+                     gate_is_fused,
+                     non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
         def forward(self, positions, hidden_states):
             return hidden_states
@@ -514,6 +583,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     assert layer.q_proj is not None
     assert layer.kv_a_proj_with_mqa is not None
     assert layer.fused_qkv_a_proj is None
+    assert layer.mla_attn.non_causal_multi_token_decode is False
     hidden_states = torch.randn(2, config.hidden_size)
     torch.testing.assert_close(
         layer(torch.arange(2), hidden_states),
@@ -537,10 +607,14 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args, gate_is_fused) -> None:
+        def __init__(self,
+                     *args,
+                     gate_is_fused,
+                     non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
             self.gate_is_fused = gate_is_fused
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
     monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
                         FakeMLAWrapper)
@@ -575,6 +649,7 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
     assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
     assert layer.g_proj is None
     assert layer.mla_attn.gate_is_fused is True
+    assert layer.mla_attn.non_causal_multi_token_decode is False
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
@@ -748,7 +823,10 @@ class _ConvWeight(nn.Module):
         self.weight = nn.Parameter(torch.ones(4, 1, 3))
 
 
-def test_kda_forward_dispatches_to_both_custom_ops() -> None:
+def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
+    group = SimpleNamespace(all_reduce=lambda x: x)
+    monkeypatch.setattr(kimi_attention, "get_tp_group", lambda: group)
+
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.fused_qkvb_proj = _Projection(14)
@@ -781,6 +859,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
+        mamba_slot_read_offsets=None,
     )
     layer._metadata = lambda: metadata
 
@@ -804,7 +884,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     )
 
 
-def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
+        monkeypatch) -> None:
     """A one-tensor kv_cache means the unified pool: the layer must take the
     pooled op and never the dense dispatched op."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
@@ -854,6 +935,8 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
 
         return op
 
+    monkeypatch.setattr(kimi_attention, 'get_tp_group',
+                        lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer.pooled_kda_op = pooled_kda_op
     layer.dispatched_kda_op = unexpected("dispatched_kda_op")
     layer.sconv_op = unexpected("sconv_op")
@@ -994,15 +1077,30 @@ def test_kda_construction_rejects_duplicate_prefix(
                                               prefix="model.layers.0.kda")
 
 
-def test_kda_construction_rejects_speculative_decode() -> None:
-    """TPU KDA does not support speculative decoding. This is the very first
-    check in the constructor, so a bare object with a `speculative_config`
-    attribute is enough to reach it."""
+@pytest.mark.parametrize("num_spec_tokens", [0, 5, 7])
+def test_kda_construction_passes_speculative_window_to_op(
+        monkeypatch: pytest.MonkeyPatch, num_spec_tokens: int) -> None:
+    """Ordinary decode and speculative decode pass their window to the op."""
+    _patch_kda_construction_deps(monkeypatch)
     config = _kda_config()
-    fake_vllm_config = SimpleNamespace(speculative_config=object())
+    vllm_config = VllmConfig()
+    vllm_config.speculative_config = (SimpleNamespace(
+        num_speculative_tokens=num_spec_tokens) if num_spec_tokens else None)
+    received = {}
 
-    with pytest.raises(NotImplementedError, match="speculative decode"):
-        kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="x")
+    def build_op(prefix, **kwargs):
+        received.update(kwargs)
+        return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(kimi_attention, "build_kimi_dispatched_kda_op",
+                        build_op)
+    with set_current_vllm_config(vllm_config):
+        layer = kimi_attention.KimiDeltaAttention(config,
+                                                  vllm_config,
+                                                  prefix="model.layers.0.kda")
+
+    assert layer.num_spec_tokens == num_spec_tokens
+    assert received["num_spec_tokens"] == num_spec_tokens
 
 
 def test_kda_construction_rejects_missing_linear_attn_config() -> None:
@@ -1052,6 +1150,7 @@ def _kda_metadata() -> SimpleNamespace:
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
         mamba_slot_read_offsets=None,
     )
 
@@ -1116,13 +1215,15 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     ["no_metadata", "no_cache", "empty_cache"],
 )
 def test_kda_forward_returns_zeros_when_it_cannot_run_the_op(
-        setup: str) -> None:
+        setup: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """`forward` has three reasons to skip the KDA op and return zeros: no
     per-layer metadata, no cache bound yet, or a cache bound with no
     storage (what the runner hands out during profiling). Each case is set
     up so only that one condition holds, and both ops are tripwires, so the
     test fails if `forward` reaches a dispatch.
     """
+    monkeypatch.setattr(kimi_attention, "get_tp_group",
+                        lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer = _make_bare_kda_layer()
     if setup == "no_metadata":
         layer._metadata = lambda: None
@@ -1137,13 +1238,18 @@ def test_kda_forward_returns_zeros_when_it_cannot_run_the_op(
     torch.testing.assert_close(output, torch.zeros(2, 4))
 
 
-def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op() -> None:
+def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """With `use_full_rank_gate=True`, `forward` computes the output gate
     from `g_proj` directly (not from a `g_b_proj` over a split of a fused
     projection) and the recurrence gate from `f_b_proj(f_a_proj(x))`. A
     two-tensor cache is bound so `forward` reaches the dispatched op, and
     the op stub checks it was handed exactly those two tensors."""
+    monkeypatch.setattr(kimi_attention, "get_tp_group",
+                        lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer = _make_bare_kda_layer(use_full_rank_gate=True)
+    metadata = layer._metadata()
+    layer._metadata = lambda: metadata
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
     layer.kv_cache = (sconv_cache, recurrent_cache)
@@ -1155,6 +1261,8 @@ def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op() -> None:
         received["output_gate"] = output_gate
         assert args[0] is sconv_cache
         assert args[1] is recurrent_cache
+        assert args[-2] is metadata.request_distribution
+        assert args[-1] is metadata.mamba_state_indices
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     layer.dispatched_kda_op = dispatched_kda_op
@@ -1257,6 +1365,8 @@ def test_core_attention_pooled_requires_state_indices(
 
 def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch: pytest.MonkeyPatch, ) -> None:
+    group = SimpleNamespace(all_reduce=lambda x: x)
+    monkeypatch.setattr(kimi_attention, "get_tp_group", lambda: group)
 
     def jax_op(name, function, donate_argnums=()):
         del function, donate_argnums
@@ -1277,9 +1387,12 @@ def test_kda_custom_ops_compile_as_one_full_graph(
             state_indices: torch.Tensor,
             seq_lens: torch.Tensor,
             distribution: torch.Tensor,
+            window_distribution: torch.Tensor,
+            slot_read_offsets: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-            del conv_weight, distribution
+            del conv_weight, distribution, window_distribution
+            del slot_read_offsets
             del query_start_loc, state_indices, seq_lens
             num_heads, head_dim = recurrent_state.shape[1:3]
             output = mixed_qkv[:, :num_heads * head_dim]
@@ -1330,6 +1443,8 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
+        mamba_slot_read_offsets=None,
     )
     layer._metadata = lambda: metadata
     hidden_states = torch.ones(2, 4)
@@ -1552,3 +1667,688 @@ def test_kimi_model_wires_declared_optional_features(
         assert hasattr(layer, "mlp_res") is uses_residual_blocks
         assert layer.mlp.kwargs["situ_beta"] == 1.5
         assert layer.mlp.kwargs["situ_linear_beta"] == 0.5
+
+
+@pytest.mark.parametrize('transposed', [False, True])
+def test_dummy_router_is_fixed_random_and_layer_specific(
+        monkeypatch, transposed):
+    config = SimpleNamespace(load_config=SimpleNamespace(load_format="dummy"))
+    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
+                        lambda: config)
+    module = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(module)
+    module.prefix = "model.layers.1.block_sparse_moe"
+    module.gate = nn.Module()
+    module.gate.input_size = 128
+    module.gate.e_score_correction_bias = nn.Parameter(torch.zeros(896))
+    shape = (128, 896) if transposed else (896, 128)
+    module.gate.weight = nn.Parameter(torch.zeros(shape))
+    module.initialize_dummy_router()
+    first = module.gate.e_score_correction_bias.detach().clone()
+    first_weight = module.gate.weight.detach().clone()
+    assert 0.015 < first.std().item() < 0.025
+    assert 0.95 < first_weight.std().item() * 128**0.5 < 1.05
+    assert torch.all(first != 0)
+    module.initialize_dummy_router()
+    torch.testing.assert_close(first,
+                               module.gate.e_score_correction_bias,
+                               rtol=0,
+                               atol=0)
+    torch.testing.assert_close(first_weight,
+                               module.gate.weight,
+                               rtol=0,
+                               atol=0)
+    module.prefix = "model.layers.2.block_sparse_moe"
+    module.initialize_dummy_router()
+    assert not torch.equal(first, module.gate.e_score_correction_bias)
+    assert not torch.equal(first_weight, module.gate.weight)
+    checkpoint_bias = module.gate.e_score_correction_bias.detach().clone()
+    checkpoint_weight = module.gate.weight.detach().clone()
+    config.load_config.load_format = "safetensors"
+    module.initialize_dummy_router()
+    torch.testing.assert_close(checkpoint_bias,
+                               module.gate.e_score_correction_bias,
+                               rtol=0,
+                               atol=0)
+    torch.testing.assert_close(checkpoint_weight,
+                               module.gate.weight,
+                               rtol=0,
+                               atol=0)
+
+
+def test_attention_residual_bridge_fake_shape():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import \
+        _build_attention_residual_op
+
+    op = _build_attention_residual_op(1e-5)
+    assert op is _build_attention_residual_op(1e-5)
+    with FakeTensorMode():
+        prefix = torch.empty(256, 7168, dtype=torch.bfloat16)
+        history = torch.empty(256, 8, 7168, dtype=torch.bfloat16)
+        weight = torch.empty(7168, dtype=torch.float32)
+        output = op(prefix, history, weight)
+        assert output.shape == prefix.shape
+        assert output.dtype == prefix.dtype
+
+
+@pytest.mark.parametrize('sequence_parallel', [False, True])
+def test_chip_shared_expert_matches_full_projection(sequence_parallel):
+    """Pair TP reproduces a full FFN and returns the owner's token slice."""
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import KimiMLP
+
+    torch.manual_seed(73)
+    x = torch.randn(8, 4)
+    gate = torch.randn(6, 4)
+    up = torch.randn(6, 4)
+    down = torch.randn(4, 6)
+    contributions = []
+    for rank in range(2):
+        g = x @ gate.chunk(2)[rank].T
+        u = x @ up.chunk(2)[rank].T
+        contributions.append(
+            (torch.nn.functional.silu(g) * u) @ down.chunk(2, dim=1)[rank].T)
+    reference = (torch.nn.functional.silu(x @ gate.T) * (x @ up.T)) @ down.T
+    for rank in range(2):
+
+        class Group:
+
+            def all_gather(self, local, dim):
+                assert dim == 0
+                torch.testing.assert_close(local, x.chunk(2)[rank])
+                return x
+
+            def all_reduce(self, partial):
+                torch.testing.assert_close(partial, contributions[rank])
+                return partial + contributions[1 - rank]
+
+            def reduce_scatter(self, partial, dim):
+                assert dim == 0
+                return self.all_reduce(partial).chunk(2)[rank]
+
+        class Projection(nn.Module):
+
+            def forward(self, value):
+                return torch.cat((value @ gate.chunk(2)[rank].T,
+                                  value @ up.chunk(2)[rank].T),
+                                 dim=-1), None
+
+        module = KimiMLP.__new__(KimiMLP)
+        nn.Module.__init__(module)
+        module.tp_group = Group()
+        module.sp_group = None
+        module.gate_up_proj = Projection()
+        module.act_fn = lambda value: (torch.nn.functional.silu(
+            value.chunk(2, -1)[0]) * value.chunk(2, -1)[1])
+        module.down_proj = SimpleNamespace(quant_method=SimpleNamespace(
+            apply=lambda layer, value, bias: value @ down.chunk(2, 1)[rank].T))
+        actual = module(x.chunk(2)[rank] if sequence_parallel else x,
+                        sequence_parallel=sequence_parallel)
+        expected = reference.chunk(2)[rank] if sequence_parallel else reference
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize('gather_mode', ['plain', 'joint', 'wide_ids'])
+def test_sp_moe_reduces_latent_before_norm_and_up_projection(
+        monkeypatch, gather_mode):
+    from vllm_torchtpu.models.vllm.kimi_k3 import moe as module
+
+    calls = []
+
+    class Group:
+
+        def all_gather(self, x, dim):
+            calls.append(('gather', x.shape, x.dtype))
+            return x.repeat(32, 1)
+
+        def reduce_scatter(self, x, dim):
+            calls.append(('scatter', x.shape, x.dtype))
+            return x[:1] * 32
+
+    class Projection(nn.Module):
+
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def forward(self, x):
+            return self.fn(x), None
+
+    def experts(layer, latent, weights, ids):
+        assert latent.shape == (32, 2)
+        torch.testing.assert_close(weights,
+                                   torch.full((32, 2), .5, dtype=latent.dtype))
+        assert ids.dtype == torch.int32
+        torch.testing.assert_close(
+            ids,
+            torch.tensor([[3, 9]], dtype=torch.int32).repeat(32, 1))
+        return latent * 2
+
+    model = module.KimiMoE.__new__(module.KimiMoE)
+    nn.Module.__init__(model)
+    group = module.FusedPrefillCollectives.__new__(
+        module.FusedPrefillCollectives)
+    group.all_gather = Group().all_gather
+    group.reduce_scatter = Group().reduce_scatter
+
+    def gather_joint(latent, weights, ids):
+        calls.append(('joint', latent.shape, latent.dtype))
+        return tuple(a.repeat(32, 1) for a in (latent, weights, ids))
+
+    group._moe_gather_op = gather_joint
+    model.prefill_group = group
+    model.gate = Projection(lambda x: torch.zeros(x.shape[0], 896))
+    model.gate.output_size = 65536 if gather_mode == 'wide_ids' else 896
+    model.routed_expert_down_proj = Projection(lambda x: x[:, :2])
+    model.routed_expert_norm = lambda x: x / x.square().mean(-1, keepdim=True
+                                                             ).sqrt()
+    model.routed_expert_up_proj = Projection(lambda x: x.repeat(1, 2))
+    model.shared_experts = None
+    model.experts = SimpleNamespace(routed_experts=SimpleNamespace(
+        quant_method=SimpleNamespace(apply_with_routing=experts)))
+    monkeypatch.setattr(
+        module.moe_routing, 'route', lambda *args: (torch.full(
+            (1, 2), .5), torch.tensor([[3, 9]])))
+    dtype = torch.float32 if gather_mode == 'plain' else torch.bfloat16
+    x = torch.tensor([[1., 3., 4., 6.]], dtype=dtype)
+    actual = model._forward_expert_parallel(x, True)
+    expected = (x[:, :2] /
+                (x[:, :2].square().mean(-1, keepdim=True).sqrt())).repeat(
+                    1, 2)
+    torch.testing.assert_close(actual, expected)
+    expected_calls = [
+        'joint', 'scatter'
+    ] if gather_mode == 'joint' else ['gather'] * 3 + ['scatter']
+    assert [entry[0] for entry in calls] == expected_calls
+    assert calls[-1][1] == (32, 2)
+    assert all(entry[1][-1] == 2 for entry in calls)
+
+
+def test_sp_prefill_trace_accepts_dynamic_token_dimension():
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
+    from vllm_torchtpu.models.vllm.kimi_k3.model import KimiModel
+
+    # Exercise the real model's token slicing and the collective shape guard,
+    # without attention/weights or a TPU client. The compiler must retain a
+    # divisibility guard without forcing mark_dynamic's token dimension
+    # to the initial bucket size.
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    group.ag = lambda x: x.repeat(32, 1)
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    model.sp_prefill = True
+    model.sp_group = SimpleNamespace(rank_in_group=0,
+                                     world_size=32,
+                                     all_gather=group.all_gather)
+    model.aux_hidden_state_layers = ()
+    model.attn_res_block_size = 12
+    model.output_attn_res = _attention_residual_stub(hidden=3584, eps=1e-5)
+    model.layers = nn.ModuleList()
+    model.norm = nn.Identity()
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    hidden = torch.zeros(8192, 3584, dtype=torch.bfloat16)
+    mark_dynamic(hidden, 0)
+    torch._dynamo.reset()
+    with fx_config.patch(backed_size_oblivious=True):
+        fn = torch.compile(model.forward,
+                           backend=capture,
+                           fullgraph=True,
+                           dynamic=False)
+        out = fn(None, torch.arange(8192), inputs_embeds=hidden)
+    assert out.shape == hidden.shape
+    env = trace_shape_env(graphs[0])
+    assert unsupported_reason(env, 8192) is None
+    for size in (2048, 4096, 16384):
+        assert unsupported_reason(env, size) is None
+    for size in (1, 8, 2049, 8191):
+        assert unsupported_reason(env, size) is not None
+
+
+@pytest.mark.parametrize('flipped', [False, True])
+def test_attention_project_rs_preserves_linear_layout(flipped):
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+        FusedPrefillCollectives, _build_project_op)
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
+    tables = np.zeros((3, 3, 32), np.int32)
+    op = _build_project_op(mesh, tables, 29000)
+    assert _build_project_op(mesh, tables, 29000) is op
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    group.project_rs = op
+    calls = []
+
+    class Projection:
+        bias = None
+
+        def __call__(self, x):
+            calls.append('linear')
+            return x.new_empty((x.shape[0], 7168)), None
+
+    def scatter(x, dim):
+        calls.append('scatter')
+        return x.new_empty((x.shape[0] // 32, x.shape[1]))
+
+    group.reduce_scatter = scatter
+    projection = Projection()
+    setattr(projection, WEIGHT_FLIPPED_ATTR, flipped)
+    with FakeTensorMode():
+        projection.weight = torch.empty((384, 7168) if flipped else
+                                        (7168, 384),
+                                        dtype=torch.bfloat16)
+        x = torch.empty((8192, 384), dtype=torch.bfloat16)
+        result = group.project_reduce_scatter(x, projection)
+        assert result.shape == (256, 7168)
+        assert result.dtype == torch.bfloat16
+    assert calls == ([] if flipped else ['linear', 'scatter'])
+
+
+def test_kda_prefill_packing_preserves_projection_and_reload():
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
+
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefill_group = FusedPrefillCollectives.__new__(
+        FusedPrefillCollectives)
+    layer.use_full_rank_gate = True
+    layer.num_heads, layer.head_dim = 3, 128
+    generator = torch.Generator().manual_seed(19)
+    for name, width in [('fused_qkvb_proj', 1155), ('g_proj', 384),
+                        ('f_a_proj', 128)]:
+        projection = nn.Module()
+        projection.weight = nn.Parameter(
+            torch.randn(
+                (7168, width), generator=generator, dtype=torch.bfloat16) *
+            .01)
+        setattr(projection, WEIGHT_FLIPPED_ATTR, True)
+        setattr(layer, name, projection)
+    x = torch.randn((2, 7168), generator=generator)
+    for reload in (False, True):
+        if reload:
+            with torch.no_grad():
+                layer.fused_qkvb_proj.weight.add_(.02)
+        layer._pack_prefill_projection()
+        output = x @ layer.packed_prefill_weight.float()
+        qkvb = x @ layer.fused_qkvb_proj.weight.float()
+        torch.testing.assert_close(output[:, :1155], qkvb)
+        assert torch.count_nonzero(output[:, 1155:1280]) == 0
+        torch.testing.assert_close(output[:, 1280:1664],
+                                   x @ layer.g_proj.weight.float())
+        torch.testing.assert_close(output[:, 1664:],
+                                   x @ layer.f_a_proj.weight.float())
+    layer.use_full_rank_gate = False
+    layer._pack_prefill_projection()
+    assert layer.packed_prefill_weight is None
+
+
+def test_gather_projection_bridge_has_rank_local_output():
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        _build_gather_project_op
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
+    tables = np.zeros((3, 3, 32), np.int32)
+    op = _build_gather_project_op(mesh, tables, 29001)
+    assert _build_gather_project_op(mesh, tables, 29001) is op
+    with FakeTensorMode():
+        result = op(torch.empty((256, 7168), dtype=torch.bfloat16),
+                    torch.empty((7168, 1792), dtype=torch.bfloat16))
+        assert result.shape == (8192, 1792)
+        assert result.dtype == torch.bfloat16
+
+
+def test_moe_gather_bridge_shapes_and_registration_cache():
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        _build_moe_gather_op
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
+    tables = np.zeros((3, 3, 32), np.int32)
+    op = _build_moe_gather_op(mesh, tables, 29003)
+    assert _build_moe_gather_op(mesh, tables, 29003) is op
+    with FakeTensorMode():
+        latent, weights, ids = op(
+            torch.empty((256, 3584), dtype=torch.bfloat16),
+            torch.empty((256, 16), dtype=torch.bfloat16),
+            torch.empty((256, 16), dtype=torch.int32))
+        assert latent.shape == (8192, 3584)
+        assert latent.dtype == torch.bfloat16
+        assert weights.shape == ids.shape == (8192, 16)
+        assert weights.dtype == torch.bfloat16
+        assert ids.dtype == torch.int32
+
+
+def _trace_input_signature(fn, args):
+    from vllm_torchtpu.compilation.shape_variants import graph_signature
+
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        # Inspect the real Dynamo graph without executing its TPU custom ops.
+        return lambda *_args: (torch.empty(0), )
+
+    for arg in args:
+        mark_dynamic(arg, 0)
+    torch._dynamo.reset()
+    with fx_config.patch(backed_size_oblivious=True):
+        torch.compile(fn, backend=capture, fullgraph=True,
+                      dynamic=False)(*args)
+    assert len(graphs) == 1
+    return graph_signature(graphs[0])
+
+
+def test_packed_kda_keeps_parameter_abi_across_token_buckets(monkeypatch):
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+        FusedPrefillCollectives, _build_gather_project_op, _build_project_op)
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
+    tables = np.zeros((3, 3, 32), np.int32)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    group.gather_project = _build_gather_project_op(mesh, tables, 29002)
+    group.project_rs = _build_project_op(mesh, tables, 29003)
+    group.base = SimpleNamespace(all_reduce=lambda x: x)
+    monkeypatch.setattr(kimi_attention, 'get_tp_group', lambda: group)
+
+    class Projection(nn.Module):
+
+        def __init__(self, inputs, outputs):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(inputs, outputs, dtype=torch.bfloat16))
+            self.bias = None
+            setattr(self, WEIGHT_FLIPPED_ATTR, True)
+
+        def forward(self, x):
+            return x @ self.weight, None
+
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefill_group = group
+    layer.use_full_rank_gate = True
+    layer.num_heads, layer.head_dim, layer.local_projection_size = 3, 128, 384
+    layer.register_buffer('packed_prefill_weight',
+                          torch.empty(7168, 1792, dtype=torch.bfloat16))
+    layer.f_b_proj = Projection(128, 384)
+    layer.o_proj = Projection(384, 7168)
+    layer._metadata = lambda: None
+    layer.kv_cache = None
+
+    def forward(x):
+        sp = x.shape[0] >= 8192
+        if sp:
+            x = x.narrow(0, 0, 256)
+        return layer(None, x, sequence_parallel=sp)
+
+    signatures = [
+        _trace_input_signature(forward,
+                               (torch.empty(n, 7168, dtype=torch.bfloat16), ))
+        for n in (2048, 8192)
+    ]
+    assert signatures[0] == signatures[1]
+
+
+def test_mla_keeps_weight_cache_abi_across_token_buckets(monkeypatch):
+    from vllm_torchtpu.layers.adapter.attention import \
+        PallasMLAttentionBackendImpl
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla
+
+    @torch.library.custom_op('kimi_abi_test::latent_attention',
+                             mutates_args=())
+    def latent_attention(cache: torch.Tensor, q: torch.Tensor,
+                         qr: torch.Tensor, kv: torch.Tensor, kr: torch.Tensor,
+                         lens: torch.Tensor, blocks: torch.Tensor,
+                         starts: torch.Tensor,
+                         distribution: torch.Tensor) -> torch.Tensor:
+        return q.clone()
+
+    latent_attention.register_fake(lambda cache, q, *args: torch.empty_like(q))
+    layer = mla.VllmTPUMLAAttention.__new__(mla.VllmTPUMLAAttention)
+    nn.Module.__init__(layer)
+    layer.layer_name = 'test_mla_parameter_abi'
+    layer.calculate_kv_scales = False
+    layer.num_heads, layer.qk_nope_head_dim = 3, 128
+    layer.qk_rope_head_dim, layer.kv_lora_rank, layer.v_head_dim = 64, 512, 128
+    layer.scale = 192**-0.5
+    layer.kv_cache_quantized_dtype = None
+    layer._q_scale_float = layer._k_scale_float = layer._v_scale_float = 1.
+    layer.W_UK_T = nn.Parameter(torch.empty(3, 128, 512, dtype=torch.bfloat16))
+    layer.W_UV = nn.Parameter(torch.empty(3, 512, 128, dtype=torch.bfloat16))
+    layer.impl = PallasMLAttentionBackendImpl.__new__(
+        PallasMLAttentionBackendImpl)
+    layer.mla_op = latent_attention
+    cache = torch.empty((64, 128, 2, 640), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        seq_lens=torch.zeros(8, dtype=torch.int32),
+        block_tables=torch.zeros(320, dtype=torch.int32),
+        query_start_loc=torch.zeros(9, dtype=torch.int32),
+        request_distribution=torch.zeros(3, dtype=torch.int32))
+    monkeypatch.setattr(mla, 'get_attention_context', lambda name:
+                        (metadata, None, cache, None))
+
+    def forward(x):
+        # The production wrapper computes these activations before entering
+        # attention. Keep them internal to the trace, as in the full model.
+        q, qr, kv, kr = x.split([384, 192, 512, 64], dim=-1)
+        return layer((q.reshape(-1, 3, 128), qr.reshape(-1, 3, 64)), kv,
+                     kr.reshape(-1, 1, 64))
+
+    signatures = [
+        _trace_input_signature(forward,
+                               (torch.empty(n, 1152, dtype=torch.bfloat16), ))
+        for n in (2048, 8192)
+    ]
+    assert signatures[0] == signatures[1]
+
+
+def test_mla_preprocess_keeps_prefill_parameter_abi(monkeypatch):
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.models.vllm.kimi_k3 import collective_ops
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
+    pairs = tuple((2 * i, 2 * i + 1) for i in range(16))
+    monkeypatch.setattr(collective_ops, 'mla_chip_layout',
+                        lambda devices, owners: (pairs, (), ()))
+    pack, op = collective_ops._build_mla_ops(mesh, tuple(range(32)), 29005,
+                                             1e-5)
+    assert collective_ops._build_mla_ops(mesh, tuple(range(32)), 29005,
+                                         1e-5) == (pack, op)
+    with FakeTensorMode():
+        weight = torch.empty(7168, 2496, dtype=torch.bfloat16)
+        gate = pack(weight)
+        assert gate.shape == (7168, 6144)
+        for sp, rows in ((True, 256), (False, 2048), (False, 1)):
+            out = op(torch.empty(rows, 7168, dtype=torch.bfloat16), weight,
+                     gate, torch.empty(1536, dtype=torch.bfloat16),
+                     torch.empty(512, dtype=torch.bfloat16), sp)
+            expected_rows = rows * 32 if sp else rows
+            assert [x.shape for x in out] == [(expected_rows, n)
+                                              for n in (1536, 512, 64, 384)]
+
+    class Preprocess(nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(7168, 2496, dtype=torch.bfloat16))
+            self.register_buffer('gate',
+                                 torch.empty(7168, 6144, dtype=torch.bfloat16))
+            self.qnorm = nn.Parameter(torch.empty(1536, dtype=torch.bfloat16))
+            self.kvnorm = nn.Parameter(torch.empty(512, dtype=torch.bfloat16))
+
+        def forward(self, x):
+            sp = x.shape[0] >= 8192
+            if sp:
+                x = x.narrow(0, 0, 256)
+            return op(x, self.weight, self.gate, self.qnorm, self.kvnorm,
+                      sp)[0]
+
+    model = Preprocess()
+    signatures = [
+        _trace_input_signature(model,
+                               (torch.empty(n, 7168, dtype=torch.bfloat16), ))
+        for n in (2048, 8192)
+    ]
+    assert signatures[0] == signatures[1]
+
+
+def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
+
+    layer = kimi_attention.MultiHeadLatentAttention.__new__(
+        kimi_attention.MultiHeadLatentAttention)
+    nn.Module.__init__(layer)
+    layer.mla_gate_is_fused = True
+    layer.fused_qkv_a_proj = nn.Module()
+    layer.fused_qkv_a_proj.weight = nn.Parameter(
+        torch.empty(7168, 2496, dtype=torch.bfloat16, device='meta'))
+    setattr(layer.fused_qkv_a_proj, WEIGHT_FLIPPED_ATTR, True)
+    layer.q_a_layernorm = SimpleNamespace(variance_epsilon=1e-5)
+    layer.kv_a_layernorm = SimpleNamespace(variance_epsilon=1e-5)
+    layer.mla_attn = nn.Module()
+    layer.mla_attn.register_buffer('kimi_gate_weight', None, persistent=False)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    calls = []
+
+    def op(*args):
+        return args
+
+    def pack(weight):
+        calls.append(weight)
+        return torch.tensor([len(calls)], dtype=torch.bfloat16)
+
+    group.mla_ops = lambda eps: (pack, op)
+    layer.prefill_group = group
+    original = layer.fused_qkv_a_proj.weight
+    for expected in (1, 2):
+        layer.prepare_sp_mla_gate()
+        assert layer.mla_attn.kimi_gate_weight.item() == expected
+        assert layer.mla_attn.kimi_preprocess is op
+        assert layer.fused_qkv_a_proj.weight is original
+    assert all(weight is original for weight in calls)
+    assert not any('kimi_gate_weight' in key for key in layer.state_dict())
+
+
+def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import \
+        VllmTPUMultiHeadLatentAttentionWrapper
+
+    wrapper = VllmTPUMultiHeadLatentAttentionWrapper.__new__(
+        VllmTPUMultiHeadLatentAttentionWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.fused_qkv_a_proj = SimpleNamespace(weight=torch.empty(0))
+    wrapper.kimi_gate_weight = torch.empty(0)
+    wrapper.q_a_layernorm = SimpleNamespace(weight=torch.empty(0))
+    wrapper.kv_a_layernorm = SimpleNamespace(weight=torch.empty(0))
+    wrapper.num_heads = 3
+    wrapper.v_head_dim = wrapper.qk_nope_head_dim = 128
+    wrapper.qk_rope_head_dim = 64
+    wrapper.qk_head_dim = 192
+    wrapper.rotary_emb = None
+    wrapper.is_sparse = False
+    wrapper.o_proj = object()
+    calls = []
+
+    def preprocess(x, *args):
+        assert x.shape[0] == 2 and args[-1] is True
+        return tuple(
+            torch.zeros(64, n, dtype=torch.bfloat16)
+            for n in (1536, 512, 64, 384))
+
+    wrapper.kimi_preprocess = preprocess
+    wrapper.q_b_proj = lambda q: (torch.zeros(q.shape[0], 576, dtype=q.dtype),
+                                  None)
+
+    def attend(q, kv, rope, *, output_shape, **kwargs):
+        assert q[0].shape == (64, 3, 128)
+        assert kv.shape == (64, 512) and rope.shape == (64, 1, 64)
+        assert output_shape == (64, 384)
+        return torch.ones(output_shape, dtype=torch.bfloat16)
+
+    wrapper.mla_attn = attend
+    group = SimpleNamespace(
+        project_reduce_scatter=lambda x, w: calls.append(x) or x[:2])
+    result = wrapper(torch.arange(64),
+                     torch.empty(2, 7168, dtype=torch.bfloat16),
+                     prefill_group=group)
+    assert result.shape == (2, 384)
+    torch.testing.assert_close(
+        calls[0], torch.full((64, 384), 0.5, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    "tokens", [0, 1, 8, 31, 32, 64, 96, 1024, 1056, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("rank", [0, 7, 31])
+@pytest.mark.parametrize("capture_aux", [False, True])
+def test_sp_prefill_divisible_shapes_preserve_token_ownership(
+        tokens, rank, capture_aux):
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    model.sp_prefill = True
+    model.aux_hidden_state_layers = (1, ) if capture_aux else ()
+    model.attn_res_block_size = None
+    model.norm = nn.Identity()
+    hidden = torch.arange(tokens * 4, dtype=torch.float32).reshape(tokens, 4)
+    positions = torch.arange(tokens)
+    expected_sp = tokens > 0 and tokens % 32 == 0
+    calls = []
+
+    class Layer(nn.Module):
+
+        def forward(self, pos, value, residual, *, sequence_parallel):
+            assert sequence_parallel == expected_sp
+            assert pos is positions
+            expected = hidden.reshape(32, -1,
+                                      4)[rank] if expected_sp else hidden
+            torch.testing.assert_close(value, expected)
+            return value + 1, residual
+
+    def gather(value, dim):
+        calls.append(dim)
+        torch.testing.assert_close(value, hidden.reshape(32, -1, 4)[rank] + 1)
+        return hidden + 1
+
+    model.sp_group = SimpleNamespace(world_size=32,
+                                     rank_in_group=rank,
+                                     all_gather=gather)
+    model.layers = nn.ModuleList([Layer()])
+    actual = model.forward(None, positions, inputs_embeds=hidden)
+    if capture_aux:
+        actual, auxiliary = actual
+        assert len(auxiliary) == 1
+        torch.testing.assert_close(auxiliary[0], hidden + 1)
+    torch.testing.assert_close(actual, hidden + 1)
+    assert calls == ([0] * (2 if capture_aux else 1) if expected_sp else [])

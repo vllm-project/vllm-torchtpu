@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    _hybrid_mamba_state_layout, update_tpu_block_size_and_slot_config)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -70,6 +71,25 @@ class FakeQwenMambaModel:
     def get_mamba_state_shape_from_config(vllm_config):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         return ((3, 4096 // tp_size), (16 // tp_size, 128, 128))
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.bfloat16, torch.float32)
+
+
+class FakeConfiguredGdnModel:
+
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        local_kq_heads = hf_config.linear_num_key_heads // tp_size
+        local_v_heads = hf_config.linear_num_value_heads // tp_size
+        conv_dim = (2 * local_kq_heads * hf_config.linear_key_head_dim +
+                    local_v_heads * hf_config.linear_value_head_dim)
+        return ((hf_config.linear_conv_kernel_dim - 1, conv_dim),
+                (local_v_heads, hf_config.linear_value_head_dim,
+                 hf_config.linear_key_head_dim))
 
     @staticmethod
     def get_mamba_state_dtype_from_config(_):
@@ -142,6 +162,13 @@ def vllm_config():
     vllm_config.model_config = MagicMock(spec=ModelConfig)
     vllm_config.model_config.dtype = torch.bfloat16
     vllm_config.model_config.is_hybrid = False
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
     vllm_config.model_config.get_num_kv_heads.return_value = 1
     vllm_config.model_config.get_head_size.return_value = 256
     vllm_config.cache_config = MagicMock(spec=CacheConfig)
@@ -165,8 +192,14 @@ def _configure_hybrid(vllm_config,
                       tp_size=1,
                       kv_transfer_config=None):
     vllm_config.model_config.is_hybrid = True
-    vllm_config.model_config.architecture = (
-        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.model_config.architecture = ("Qwen3_5MoeForCausalLM")
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
     vllm_config.cache_config.block_size = block_size
     vllm_config.cache_config.user_specified_block_size = user_specified
     vllm_config.cache_config.mamba_block_size = block_size
@@ -260,6 +293,8 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
 
 def test_fit_has_no_fixed_16_token_alignment(vllm_config):
     _configure_hybrid(vllm_config)
+    # This artificial state shape tests pool alignment, not Qwen's heads.
+    vllm_config.model_config.architecture = "CompactHybridForCausalLM"
 
     _update(vllm_config,
             backend_cls=FakePlainAttentionBackend,
@@ -306,6 +341,63 @@ def test_pcp_uses_effective_tp_mamba_state(vllm_config):
     # Effective TP = 1 * 4 = 4. Fit = 272 -> aligned to 256 kernel block is 512.
     assert vllm_config.cache_config.block_size == 512
     assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"])
+def test_pcp_kimi_pool_keeps_model_state_geometry(vllm_config, architecture):
+    _configure_hybrid(vllm_config, tp_size=2)
+    vllm_config.model_config.architecture = architecture
+    # Kimi has separate Q/K/V axes and no Qwen linear_num_* config fields.
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_attn_config=dict(
+            num_heads=32, head_dim=128, short_conv_kernel_size=4))
+    vllm_config.parallel_config.prefill_context_parallel_size = 4
+
+    class KimiModel:
+
+        @staticmethod
+        def get_mamba_state_shape_from_config(config):
+            kda = config.model_config.hf_text_config.linear_attn_config
+            heads = kda[
+                "num_heads"] // config.parallel_config.tensor_parallel_size
+            return ((kda["short_conv_kernel_size"] - 1, 3, heads,
+                     kda["head_dim"]), (heads, kda["head_dim"],
+                                        kda["head_dim"]))
+
+        @staticmethod
+        def get_mamba_state_dtype_from_config(config):
+            return torch.bfloat16, torch.float32
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(KimiModel, None)):
+        layout = _hybrid_mamba_state_layout(vllm_config, 1024)
+    assert layout.ssm_bytes == 4 * 128 * 128 * 4
+    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 2
+    assert vllm_config.parallel_config.tensor_parallel_size == 2
+
+
+def test_pcp_gdn_pool_sizes_replicated_kq_state(vllm_config):
+    _configure_hybrid(vllm_config)
+    vllm_config.parallel_config.prefill_context_parallel_size = 8
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=4,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+    _update(vllm_config,
+            backend_cls=FakePlainAttentionBackend,
+            model_cls=FakeConfiguredGdnModel)
+
+    # Local SSM: 4*128*128*4 = 256 KiB (256 rows). Local Conv:
+    # 3*(1Q+1K+4V)*128*2 = 4608 B, rounded to 8 physical rows.
+    assert vllm_config.cache_config.block_size == 264
+    assert vllm_config.cache_config.mamba_block_size == 264
+    assert vllm_config.cache_config.mamba_page_size_padded == 264 * 1024
 
 
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):

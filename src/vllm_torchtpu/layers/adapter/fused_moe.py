@@ -15,7 +15,8 @@
 
 import enum
 import functools
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch_tpu._internal import pallas
@@ -29,7 +30,7 @@ _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
-_quantize_native_fp4_kmajor_ops: dict[int, Callable] = {}
+_quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -114,14 +115,27 @@ def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,
 
 
 def quantize_native_fp4_kmajor(
-        w: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an already-dequantized, K-major float weight to native FP4."""
-    op = _quantize_native_fp4_kmajor_ops.get(block)
+        w: torch.Tensor,
+        block: int,
+        pack: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an already-dequantized, K-major float weight to native FP4.
+
+    ``pack=False`` hands the weight back as ``torch.float4_e2m1fn_x2`` rather
+    than packed uint8 -- the form the fused EP MoE kernel takes. The two are
+    distinct traced programs with distinct op names, so the cache is keyed on
+    both: one qualname serving two closures would silently dispatch to
+    whichever registered first.
+    """
+    key = (block, pack)
+    op = _quantize_native_fp4_kmajor_ops.get(key)
     if op is None:
         op = pallas.jax_op(
-            f"pallas::nvfp4_quantize_native_kmajor_b{block}",
-            functools.partial(quantize_to_native_fp4_kmajor, block=block))
-        _quantize_native_fp4_kmajor_ops[block] = op
+            f"pallas::nvfp4_quantize_native_kmajor_b{block}"
+            f"{'' if pack else '_unpacked'}",
+            functools.partial(quantize_to_native_fp4_kmajor,
+                              block=block,
+                              pack=pack))
+        _quantize_native_fp4_kmajor_ops[key] = op
     return op(w)
 
 
@@ -183,7 +197,7 @@ def _get_fused_moe_custom_op(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
-    skip_padded_tokens: Optional[bool] = None,
+    skip_padded_tokens: bool | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -206,7 +220,7 @@ def prebuild_fused_moe_kernel(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
-    skip_padded_tokens: Optional[bool] = None,
+    skip_padded_tokens: bool | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -222,17 +236,17 @@ def fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    w1_bias: Optional[torch.Tensor],
-    w2_bias: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    experts_start: Optional[torch.Tensor],
+    experts_start: torch.Tensor | None,
     topk: int,
     activation: str,
     rhs_quant_dtype=None,
-    skip_padded_tokens: Optional[bool] = None,
+    skip_padded_tokens: bool | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 

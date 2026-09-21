@@ -13,17 +13,25 @@
 # limitations under the License.
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
+import functools
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 try:
-    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import \
-        streamindex_topk
+    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (
+        KVLayout, convert_cache_to_seq_along_lane, streamindex_topk)
 except ImportError:
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
-        streamindex_topk
+    # `convert_cache_to_seq_along_lane` is not re-exported by the package's
+    # `__init__`, and the package attribute `streamindex_topk` is the jitted
+    # function rather than the submodule, so it is imported by name here.
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout, streamindex_topk)
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import \
+        convert_cache_to_seq_along_lane
 
 
 # =====================================================================
@@ -728,6 +736,710 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     # positions 60..63, so they keep 61..64 positions respectively.
     kept = [int(np.count_nonzero(row >= 0)) for row in early]
     assert kept == [61, 62, 63, 64], kept
+
+
+def test_pallas_smem_oom_when_unclamped(monkeypatch):
+    """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM"""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
+
+    orig_compute_metadata = metadata.compute_metadata
+
+    def _mock_compute_metadata(*args, **kwargs):
+        res = orig_compute_metadata(*args, **kwargs)
+        # Return metadata arrays of length 100,000.
+        # In Pallas, 100,000 steps require ~2.4 MB of SMEM.
+        return metadata.MetadataRef.create(
+            num_steps=res.num_steps,
+            batch_tile_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+            bq_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+            bkv_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+        )
+
+    monkeypatch.setattr(metadata, "compute_metadata", _mock_compute_metadata)
+
+    num_seqs = 32
+    seq_len = 128
+    num_pages_per_seq = seq_len // 128
+    total_pages = num_seqs * num_pages_per_seq
+    head_dim = 128
+    width = 256
+
+    q = jnp.zeros((num_seqs * seq_len, 1, head_dim), dtype=jnp.float32)
+    weights = jnp.ones((num_seqs * seq_len, 1), dtype=jnp.float32)
+    cache_kv = jnp.zeros((total_pages, 32, 4, width), dtype=np.uint8)
+    seq_lens = jnp.full((num_seqs, ), seq_len, dtype=jnp.int32)
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+    cu_q_lens = jnp.arange(0, (num_seqs + 1) * seq_len,
+                           seq_len,
+                           dtype=jnp.int32)
+    distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+
+    with pytest.raises(Exception) as exc_info:
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=512,
+            compression_ratio=1,
+            num_kv_pages_per_block=1,
+            num_queries_per_block=1,
+        )
+    err_str = str(exc_info.value).lower()
+    assert "smem" in err_str, f"Expected SMEM OOM error, got: {exc_info.value}"
+
+
+def test_streamindex_topk_buffer_count():
+    """Verifies configurable buffer_count parameter behavior."""
+    B = 2
+    T = 4
+    S = 16
+    page_size = 128
+    H_I = 4
+    D = 16
+    k = 16
+    comp_ratio = 1
+    bq_sz = 8
+    bkv_p = 2
+
+    total_tokens = B * T
+    max_blocks = 2
+    num_pages = max_blocks * B
+    q_lkv_dim = ((D + 127) // 128) * 128
+    record_width = q_lkv_dim + (q_lkv_dim // 128)
+    width = ((record_width + 127) // 128) * 128
+
+    rng = np.random.default_rng(42)
+    q = jnp.array(rng.standard_normal((total_tokens, H_I, D)),
+                  dtype=jnp.float32)
+    weights = jnp.array(rng.standard_normal((total_tokens, H_I)),
+                        dtype=jnp.float32)
+    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width),
+                         dtype=jnp.uint8)
+    seq_lens = jnp.array([S] * B, dtype=jnp.int32)
+    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, T, 2 * T], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, B], dtype=jnp.int32)
+
+    # 1. Custom integer buffer_count
+    topk_int = streamindex_topk(
+        q=q,
+        indexer_weights=weights,
+        cache_kv=cache_kv,
+        seq_lens=seq_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=k,
+        compression_ratio=comp_ratio,
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=bq_sz,
+        buffer_count=2,
+    )
+    assert topk_int.shape == (total_tokens, k)
+
+    # 2. Custom tuple buffer_count
+    topk_tuple = streamindex_topk(
+        q=q,
+        indexer_weights=weights,
+        cache_kv=cache_kv,
+        seq_lens=seq_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=k,
+        compression_ratio=comp_ratio,
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=bq_sz,
+        buffer_count=(2, 2, 2),
+    )
+    assert topk_tuple.shape == (total_tokens, k)
+    np.testing.assert_array_equal(np.array(topk_int), np.array(topk_tuple))
+
+    # 3. Invalid buffer_count length raises ValueError
+    with pytest.raises(ValueError, match="buffer_count must be a 3-tuple"):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            buffer_count=(2, 2),
+        )
+
+
+def test_streamindex_topk_return_scores_and_validation():
+    q_dtype = jnp.float8_e4m3fn
+    kv_dtype = jnp.uint8
+    b = 2
+    t = 4
+    s = 128
+    total_tokens = b * t
+    h_i = 4
+    d_i = 128
+    k = 16
+    comp_ratio = 1
+    page_size = 64
+    bkv_p = 2
+    bq_sz = 4
+    width = 256
+
+    num_pages = b * (s // page_size)
+    q = jnp.ones((total_tokens, h_i, d_i), dtype=q_dtype)
+    weights = jnp.ones((total_tokens, h_i), dtype=jnp.float32)
+    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=kv_dtype)
+    seq_lens = jnp.array([s] * b, dtype=jnp.int32)
+    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, t, 2 * t], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, b], dtype=jnp.int32)
+
+    # 1. return_scores=True
+    idxs, scores = streamindex_topk(
+        q=q,
+        indexer_weights=weights,
+        cache_kv=cache_kv,
+        seq_lens=seq_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=k,
+        compression_ratio=comp_ratio,
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=bq_sz,
+        return_scores=True,
+    )
+    assert idxs.shape == (total_tokens, k)
+    assert scores.shape == (total_tokens, k)
+
+    # 2. cp_size < 1 raises ValueError
+    with pytest.raises(ValueError, match="cp_size must be >= 1"):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            cp_size=0,
+        )
+
+    # 3. interleave_size not multiple of compression_ratio
+    with pytest.raises(ValueError,
+                       match="must be a multiple of compression_ratio"):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=2,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            cp_size=2,
+            interleave_size=3,
+        )
+
+    # 4. enable_early_exit with cp_size > 1
+    with pytest.raises(
+            NotImplementedError,
+            match="enable_early_exit is not supported with cp_size > 1",
+    ):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            enable_early_exit=True,
+            cp_size=2,
+        )
+
+    # 5. return_scores with enable_early_exit
+    with pytest.raises(
+            NotImplementedError,
+            match="return_scores is not supported with enable_early_exit",
+    ):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            enable_early_exit=True,
+            return_scores=True,
+        )
+
+
+# =====================================================================
+# Chunked query-token axis (TPU_STREAMIDX_CHUNK_TOKENS)
+# =====================================================================
+
+
+def align_to(x: int, a: int) -> int:
+    return ((x + a - 1) // a) * a
+
+
+def _verify_padding_at_end(actual_topk_np):
+    """Verifies that -1 is only at the end of the innermost dimension."""
+    is_minus_one = (actual_topk_np == -1).astype(np.int32)
+    violations = np.diff(is_minus_one, axis=-1) < 0
+    assert not np.any(violations), (
+        "Padding (-1) is not at the end of the innermost dimension")
+
+
+# `streamindex_topk`'s default `decode_req_batch_size`. `chunk_tokens` must be
+# a multiple of it or the kernel raises.
+CHUNK_DECODE_REQ_BATCH_SIZE = 4
+
+_HAS = KVLayout.HEAD_ALONG_SUBLANE
+# SEQ_ALONG_LANE has its own `copy_in`, which gathers a page into a lane window
+# instead of a sublane window and reads the schedule independently, so it needs
+# its own coverage rather than sharing HEAD_ALONG_SUBLANE's.
+_SAL = KVLayout.SEQ_ALONG_LANE
+
+
+class _ChunkInputs(NamedTuple):
+    q: np.ndarray
+    weights: np.ndarray
+    cache_kv: np.ndarray
+    # None when the page size is not a multiple of the 128-lane register
+    # width, where the SEQ_ALONG_LANE layout does not exist.
+    cache_kv_lane: np.ndarray | None
+    # [pages, page_size, 1, D], exactly the values the kernel reads back out
+    # of the fp8 cache, for the naive reference below.
+    dequantized_kv: np.ndarray
+    block_table: np.ndarray
+    page_indices: np.ndarray
+
+
+def _fragmented_pages(num_seqs, pages_per_seq=4):
+    """Shuffled page assignment, so logical order never matches physical."""
+    pages = list(range(num_seqs * pages_per_seq))
+    np.random.default_rng(0).shuffle(pages)
+    return tuple(
+        tuple(pages[i * pages_per_seq:(i + 1) * pages_per_seq])
+        for i in range(num_seqs))
+
+
+@functools.cache
+def _chunk_inputs(T_list, block_table_list, page_size, H_I, D) -> _ChunkInputs:
+    """Randomized fp8-packed cache and queries for one chunked geometry.
+
+    Only MQA (one KV head) is built: chunking indexes the schedule, which does
+    not depend on the KV head count, and every case below uses H_KV = 1.
+
+    Cached because several parameterizations share a geometry and the packing
+    runs one JAX quantize per physical page.
+    """
+    np.random.seed(42)
+    num_tokens = sum(T_list)
+    q = np.random.randn(num_tokens, H_I, D).astype(np.float32)
+    weights = np.random.uniform(-1.5, 1.5,
+                                size=(num_tokens, H_I)).astype(np.float32)
+
+    num_pages = max(p for row in block_table_list for p in row) + 1
+    float32_kv = np.random.randn(num_pages, page_size, D).astype(np.float32)
+
+    q_lkv_dim = align_to(D, 128)
+    width = align_to(q_lkv_dim + q_lkv_dim // 128, 128)
+    cache_kv = np.zeros((num_pages, page_size // 4, 4, width), dtype=np.uint8)
+    dequantized_kv = np.zeros((num_pages, page_size, 1, D), dtype=np.float32)
+    for p in range(num_pages):
+        quant, scale = quantize_fp8_ue8m0(jnp.array(float32_kv[p]), D)
+        dequantized_kv[p, :, 0] = (np.array(quant).astype(np.float32) *
+                                   np.array(scale).astype(np.float32))
+        record = np.concatenate([
+            np.array(_to_byte_lane(quant)),
+            np.array(_to_byte_lane(scale)),
+        ],
+                                axis=-1)
+        record = np.pad(record, ((0, 0), (0, width - record.shape[-1])))
+        # Token `s` of a page lives at [s // 4, s % 4], the same layout the
+        # packing loop in the numerical test above builds element by element.
+        cache_kv[p] = record.reshape(page_size // 4, 4, width)
+
+    return _ChunkInputs(
+        q=q,
+        weights=weights,
+        cache_kv=cache_kv,
+        cache_kv_lane=(np.array(
+            convert_cache_to_seq_along_lane(jnp.array(cache_kv), D))
+                       if page_size % 128 == 0 else None),
+        dequantized_kv=dequantized_kv,
+        block_table=np.array(block_table_list, dtype=np.int32),
+        page_indices=np.array([p for row in block_table_list for p in row],
+                              dtype=np.int32),
+    )
+
+
+def _chunk_call_kwargs(
+    inputs: _ChunkInputs,
+    T_list,
+    S_list,
+    k,
+    comp_ratio,
+    bq_sz,
+    bkv_p,
+    kv_layout,
+    chunk_tokens,
+    return_scores=False,
+):
+    """Call kwargs for one case; unchunked when `chunk_tokens` is None."""
+    # Leading single-token sequences are decodes, the same rule the numerical
+    # test above uses to build its distribution.
+    num_decodes = 0
+    while num_decodes < len(T_list) and T_list[num_decodes] == 1:
+        num_decodes += 1
+
+    cache_kv = (inputs.cache_kv_lane if kv_layout == _SAL else inputs.cache_kv)
+    assert cache_kv is not None, "SEQ_ALONG_LANE needs page_size % 128 == 0"
+    return dict(
+        q=jnp.array(inputs.q),
+        indexer_weights=jnp.array(inputs.weights),
+        cache_kv=jnp.array(cache_kv),
+        seq_lens=jnp.array(np.array(S_list, dtype=np.int32)),
+        page_indices=jnp.array(inputs.page_indices),
+        cu_q_lens=jnp.array(
+            np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32)),
+        distribution=(num_decodes, num_decodes, len(T_list)),
+        k=k,
+        compression_ratio=comp_ratio,
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=bq_sz,
+        # The early-exit fast path returns `arange` without entering Pallas,
+        # which would make every comparison below vacuous.
+        enable_early_exit=False,
+        return_scores=return_scores,
+        kv_layout=kv_layout,
+        chunk_tokens=chunk_tokens,
+    )
+
+
+@pytest.mark.parametrize("chunk_tokens", [32, 64])
+@pytest.mark.parametrize(
+    "T_list",
+    [(64, 64), (40, 88)],
+    ids=["cuts_on_a_sequence_boundary", "cuts_mid_sequence"],
+)
+def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
+    """The chunked kernel reproduces the ground truth wherever the cuts land.
+
+    `TestChunkedPipelining` below only compares chunked against unchunked, so
+    a fault shared by both paths would survive it. This one holds the chunked
+    output against absolute truth instead, over the two cut positions that
+    matter: 64/64 lands every cut on a sequence boundary, 40/88 lands every
+    cut inside a sequence, so the seam blocks are recomputed and each chunk
+    has to rebuild the per-sequence position bookkeeping from its own start.
+    """
+    page_size, H_I, H_KV, D = 128, 4, 1, 128
+    comp_ratio, bq_sz, bkv_p = 1, 8, 2
+    S_list = (512, 512)
+    # k == the number of candidate positions, so the reference selects every
+    # visible column and no tie can make two correct answers differ.
+    k = 512
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(2), page_size, H_I, D)
+    kwargs = _chunk_call_kwargs(inputs, T_list, S_list, k, comp_ratio, bq_sz,
+                                bkv_p, _HAS, chunk_tokens)
+
+    hlo = streamindex_topk.lower(**kwargs).as_text()
+    assert "_scheduling_group_id" in hlo, (
+        f"chunk_tokens={chunk_tokens} did not chunk: no scheduling group id "
+        "reached the HLO, so the kernel took the single-pass fallback and "
+        "this test would prove nothing")
+
+    actual = np.array(streamindex_topk(**kwargs))
+    expected = streamindex_topk_ref(
+        q=inputs.q,
+        weights=inputs.weights,
+        kv=inputs.dequantized_kv,
+        block_table=inputs.block_table,
+        T_list=list(T_list),
+        S_list=list(S_list),
+        cu_q_lens=np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32),
+        k=k,
+        comp_ratio=comp_ratio,
+        H_I=H_I,
+        H_KV=H_KV,
+    )
+
+    _verify_padding_at_end(actual)
+    np.testing.assert_array_equal(
+        np.sort(actual, axis=-1),
+        np.sort(expected, axis=-1),
+        err_msg=f"chunked (chunk_tokens={chunk_tokens}) top-k did not match "
+        "the naive ground truth",
+    )
+
+
+class TestChunkedPipelining:
+    """Chunking the token axis must not change which candidates are selected.
+
+    Chunking splits the score matrix along tokens while the top-k reduces
+    along KV positions, so no reduction is ever split and the chunked result
+    has to agree with the unchunked one exactly.
+    """
+
+    # yapf: disable
+    @pytest.mark.parametrize(
+        "B, T_list, S_list, page_size, H_I, D, k, comp_ratio, bq_sz, bkv_p,"
+        " block_table_list, chunk_tokens, kv_layout",
+        [
+            # 1. Single sequence, highly fragmented block table. Every chunk
+            # holds the same tile, so this is the case chunking is most likely
+            # to get right; it guards the simple path against regressions.
+            pytest.param(
+                1, (64,), (512,), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(1), 16, _HAS,
+                id="single_seq_fragmented",
+            ),
+            # 2. Batched decode (T=1 for every sequence).
+            pytest.param(
+                8, (1,) * 8, (512,) * 8, 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(8), 4, _HAS,
+                id="batched_decode",
+            ),
+            # 3. High GQA (8 query heads, 1 KV head).
+            pytest.param(
+                2, (32, 32), (512, 512), 128, 8, 128, 128, 1, 8, 2,
+                _fragmented_pages(2), 16, _HAS,
+                id="high_gqa",
+            ),
+            # 4. Multi-batch prefill, sequence boundary inside a chunk.
+            pytest.param(
+                2, (40, 88), (512, 512), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(2), 32, _HAS,
+                id="boundary_inside_a_chunk",
+            ),
+            # 5. Multi-batch prefill, sequence boundary exactly on a chunk
+            # edge.
+            pytest.param(
+                2, (64, 64), (512, 512), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(2), 32, _HAS,
+                id="boundary_on_a_chunk_edge",
+            ),
+            # 6. Dummy sequence / padding: sequence 1 has no query tokens.
+            pytest.param(
+                3, (32, 0, 32), (512, 0, 512), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(3), 16, _HAS,
+                id="empty_sequence_in_the_middle",
+            ),
+            # 7. Mixed batch: eight decodes then one prefill. This runs three
+            # passes, each chunked off its own schedule. Eight decodes (not
+            # four) makes the prefill pass's first chunk hold fewer query
+            # blocks than the chunks after it, which is what a missing step
+            # offset needs in order to show up at all.
+            pytest.param(
+                9, (1,) * 8 + (120,), (512,) * 9, 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(9), 32, _HAS,
+                id="mixed_decode_and_prefill",
+            ),
+            # 8. Compression ratio 2, so the candidate count is half the
+            # sequence length.
+            pytest.param(
+                2, (32, 32), (512, 512), 128, 4, 128, 128, 2, 8, 2,
+                _fragmented_pages(2), 16, _HAS,
+                id="compression_ratio_2",
+            ),
+            # 9. k above the candidate count, so every candidate is selected
+            # and the output is insensitive to score values. Weak on its own,
+            # but it is the regime the `enable_early_exit` fast path targets.
+            pytest.param(
+                2, (32, 32), (512, 512), 128, 4, 128, 1024, 1, 8, 2,
+                _fragmented_pages(2), 16, _HAS,
+                id="k_above_candidate_count",
+            ),
+            # 10. SEQ_ALONG_LANE, boundary inside a chunk.
+            pytest.param(
+                2, (40, 88), (512, 512), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(2), 32, _SAL,
+                id="seq_along_lane_boundary_inside",
+            ),
+            # 11. SEQ_ALONG_LANE with a larger query block and a wider KV
+            # block. `num_bq` is the only schedule term that varies per chunk,
+            # because `metadata.py` tiles `num_bkv` across chunks, so the
+            # query block size sets how many schedule rows each chunk owns.
+            pytest.param(
+                2, (64, 64), (512, 512), 128, 4, 128, 128, 1, 16, 4,
+                _fragmented_pages(2), 32, _SAL,
+                id="seq_along_lane_bq16_bkv4",
+            ),
+            # 12. SEQ_ALONG_LANE over 256-token pages, so a page spans two
+            # lane windows instead of one.
+            pytest.param(
+                2, (64, 64), (512, 512), 256, 4, 128, 128, 1, 8, 1,
+                _fragmented_pages(2, pages_per_seq=2), 32, _SAL,
+                id="seq_along_lane_page256",
+            ),
+            # 13. A chunk edge that cuts a query block in half.
+            pytest.param(
+                2, (20, 44), (512, 512), 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(2), 16, _HAS,
+                id="partial_query_block",
+            ),
+            # 14. Ten decodes, so `decode_batch_end` is 10 // 4 * 4 = 8 and
+            # the ragged remainder pass (seq_batch_size=1) covers sequences
+            # [8, 10).
+            pytest.param(
+                11, (1,) * 10 + (118,), (512,) * 11, 128, 4, 128, 128, 1, 8, 2,
+                _fragmented_pages(11), 32, _HAS,
+                id="ragged_decode_remainder",
+            ),
+        ],
+    )
+    # yapf: enable
+    def test_chunking_matches_unchunked(
+        self,
+        B,
+        T_list,
+        S_list,
+        page_size,
+        H_I,
+        D,
+        k,
+        comp_ratio,
+        bq_sz,
+        bkv_p,
+        block_table_list,
+        chunk_tokens,
+        kv_layout,
+    ):
+        """Runs one configuration chunked and unchunked, compares selections."""
+        assert len(T_list) == B and len(S_list) == B
+        assert (page_size * bkv_p) % 256 == 0, (
+            f"bkv_sz ({page_size} * {bkv_p}) must be a multiple of 256 for TPU"
+            " bfloat16 DMA alignment.")
+        assert chunk_tokens % CHUNK_DECODE_REQ_BATCH_SIZE == 0, (
+            f"chunk_tokens={chunk_tokens} must be a multiple of"
+            f" {CHUNK_DECODE_REQ_BATCH_SIZE}, or a cut can land inside a"
+            " batched decode group")
+        assert sum(T_list) % chunk_tokens == 0, (
+            f"chunk_tokens={chunk_tokens} does not divide {sum(T_list)}"
+            " tokens; the kernel would silently fall back to a single"
+            " unchunked pass")
+
+        inputs = _chunk_inputs(T_list, block_table_list, page_size, H_I, D)
+        common = (inputs, T_list, S_list, k, comp_ratio, bq_sz, bkv_p,
+                  kv_layout)
+        chunked_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
+
+        # The per-chunk scheduling annotation is the only externally visible
+        # proof that more than one chunk was emitted. Without it this would be
+        # comparing the unchunked kernel against itself.
+        hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
+        assert "_scheduling_group_id" in hlo, (
+            "no scheduling group annotation: the kernel ran a single unchunked"
+            " pass and this comparison would pass trivially")
+
+        chunked = np.array(streamindex_topk(**chunked_kwargs))
+        unchunked = np.array(
+            streamindex_topk(**_chunk_call_kwargs(*common, None)))
+
+        _verify_padding_at_end(chunked)
+        # Top-k returns its indices in unspecified order, so compare them as
+        # sets. The scores are distinct by construction, so the set is exact.
+        np.testing.assert_array_equal(
+            np.sort(chunked, axis=-1),
+            np.sort(unchunked, axis=-1),
+            err_msg=(f"chunk_tokens={chunk_tokens} changed the selection for"
+                     f" T_list={T_list}, bq_sz={bq_sz},"
+                     f" kv_layout={kv_layout}; chunking the token axis must be"
+                     " exact"),
+        )
+
+    def test_chunking_matches_unchunked_with_return_scores(self):
+        """`return_scores` adds a second output concatenated per chunk.
+
+        `need_scores` gates a `topk_scores_list` accumulated once per chunk
+        and concatenated at the end, and DCP reaches the same code through
+        `cp_size > 1`. Every case in the matrix leaves `return_scores` off, so
+        without this the per-chunk concatenation is never exercised; the
+        existing unchunked scores test only ever runs with one chunk.
+        """
+        T_list, S_list, chunk_tokens = (40, 88), (512, 512), 32
+        inputs = _chunk_inputs(T_list, _fragmented_pages(2), 128, 4, 128)
+        common = (inputs, T_list, S_list, 128, 1, 8, 2, _HAS)
+
+        chunked_kwargs = _chunk_call_kwargs(*common,
+                                            chunk_tokens,
+                                            return_scores=True)
+        hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
+        assert "_scheduling_group_id" in hlo, (
+            "no scheduling group annotation: the kernel ran a single unchunked"
+            " pass and this comparison would pass trivially")
+
+        chunked_idx, chunked_scores = streamindex_topk(**chunked_kwargs)
+        unchunked_idx, unchunked_scores = streamindex_topk(
+            **_chunk_call_kwargs(*common, None, return_scores=True))
+        chunked_idx = np.array(chunked_idx)
+        chunked_scores = np.array(chunked_scores)
+        unchunked_idx = np.array(unchunked_idx)
+        unchunked_scores = np.array(unchunked_scores)
+
+        _verify_padding_at_end(chunked_idx)
+        # Order is unspecified, so sort each side by its own indices and
+        # compare the pairs. Sorting the scores independently would lose the
+        # pairing.
+        order_c = np.argsort(chunked_idx, axis=-1)
+        order_u = np.argsort(unchunked_idx, axis=-1)
+        np.testing.assert_array_equal(
+            np.take_along_axis(chunked_idx, order_c, axis=-1),
+            np.take_along_axis(unchunked_idx, order_u, axis=-1),
+            err_msg="chunking changed the selected indices under return_scores",
+        )
+        np.testing.assert_array_equal(
+            np.take_along_axis(chunked_scores, order_c, axis=-1),
+            np.take_along_axis(unchunked_scores, order_u, axis=-1),
+            err_msg="chunking changed the scores attached to the same indices",
+        )
+
+    def test_indivisible_chunk_tokens_runs_a_single_pass(self):
+        """A `chunk_tokens` that does not divide the bucket disables chunking.
+
+        The kernel falls back to one pass instead of raising, so a case that
+        picks such a size stops covering the chunked path with no visible
+        signal. That is exactly how an earlier version of this coverage became
+        vacuous, so the rule the cases above depend on is pinned here.
+        """
+        T_list, S_list, chunk_tokens = (64, 64), (512, 512), 48
+        assert sum(T_list) % chunk_tokens != 0, "pick an indivisible size"
+
+        inputs = _chunk_inputs(T_list, _fragmented_pages(2), 128, 4, 128)
+        hlo = streamindex_topk.lower(
+            **_chunk_call_kwargs(inputs, T_list, S_list, 128, 1, 8, 2, _HAS,
+                                 chunk_tokens)).as_text()
+        assert "_scheduling_group_id" not in hlo, (
+            "an indivisible chunk_tokens emitted more than one chunk; the"
+            " fallback that the cases above rely on has changed")
 
 
 def main(argv):

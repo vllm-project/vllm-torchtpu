@@ -81,34 +81,34 @@ def test_ragged_kv_cache_update_signature_and_wiring():
 
     # Verify when env var is True
     with patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"},
-                    clear=True):
-        with patch.object(ragged_kv_cache_update,
-                          "_kv_cache_update") as mock_update:
-            ragged_kv_cache_update.kv_cache_update.__wrapped__(
-                mock_new_kv,
-                MagicMock(),
-                mock_kv,
-                MagicMock(),
-                num_slices_per_block=4)
-            mock_update.assert_called_once()
-            _, kwargs = mock_update.call_args
-            assert kwargs["pipelined_dma"] is True
+                    clear=True), patch.object(
+                        ragged_kv_cache_update,
+                        "_kv_cache_update") as mock_update:
+        ragged_kv_cache_update.kv_cache_update.__wrapped__(
+            mock_new_kv,
+            MagicMock(),
+            mock_kv,
+            MagicMock(),
+            num_slices_per_block=4)
+        mock_update.assert_called_once()
+        _, kwargs = mock_update.call_args
+        assert kwargs["pipelined_dma"] is True
 
     # Verify explicit override pipelined_dma=False when env var is True
     with patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"},
-                    clear=True):
-        with patch.object(ragged_kv_cache_update,
-                          "_kv_cache_update") as mock_update:
-            ragged_kv_cache_update.kv_cache_update.__wrapped__(
-                mock_new_kv,
-                MagicMock(),
-                mock_kv,
-                MagicMock(),
-                num_slices_per_block=4,
-                pipelined_dma=False)
-            mock_update.assert_called_once()
-            _, kwargs = mock_update.call_args
-            assert kwargs["pipelined_dma"] is False
+                    clear=True), patch.object(
+                        ragged_kv_cache_update,
+                        "_kv_cache_update") as mock_update:
+        ragged_kv_cache_update.kv_cache_update.__wrapped__(
+            mock_new_kv,
+            MagicMock(),
+            mock_kv,
+            MagicMock(),
+            num_slices_per_block=4,
+            pipelined_dma=False)
+        mock_update.assert_called_once()
+        _, kwargs = mock_update.call_args
+        assert kwargs["pipelined_dma"] is False
 
 
 def test_kernel_v3_prepare_inputs_outputs_wiring():

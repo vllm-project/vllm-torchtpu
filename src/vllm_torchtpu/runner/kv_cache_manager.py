@@ -27,12 +27,11 @@ from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
-from vllm.v1.worker.kv_connector_model_runner_mixin import \
-    KVConnectorModelRunnerMixin
 from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
@@ -220,7 +219,6 @@ class KVCacheManager:
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
-                            indexes_kv_by_block_stride=True,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -229,7 +227,6 @@ class KVCacheManager:
                             head_size=attn_module.head_size,
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
-                            indexes_kv_by_block_stride=True,
                         )
                 elif attn_module.attn_type in (
                         AttentionType.ENCODER,
@@ -262,7 +259,6 @@ class KVCacheManager:
                     dtype=self.runner.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
-                    indexes_kv_by_block_stride=True,
                 )
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 # DSA indexer K cache: the module declares its own uint8 spec
@@ -276,13 +272,59 @@ class KVCacheManager:
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        kv_cache_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
             exempt_layers=ds_v4_layers,
             attention_backend=backend_cls,
         )
+        if (hma_enabled and has_attention and not has_mamba
+                and not ds_v4_layers and not self.runner._unified_kv_layout):
+            kv_cache_spec = self._pad_native_attention_regions(
+                kv_cache_spec, backend_cls)
+        return kv_cache_spec
+
+    def _pad_native_attention_regions(
+        self,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        backend_cls: type[AttentionBackend],
+    ) -> dict[str, KVCacheSpec]:
+        # vLLM overlays groups in one byte allocation, but TPU attention
+        # kernels donate native typed arrays. Different geometries need
+        # separate arrays; identical geometries can share an array across
+        # groups because each block ID belongs to only one group at a time.
+        groups = get_kv_cache_groups(self.runner.vllm_config,
+                                     kv_cache_specs.copy())
+        if len(groups) <= 1:
+            return kv_cache_specs
+        native_pages = {}
+        for group in groups:
+            spec = group.kv_cache_spec
+            assert isinstance(spec, AttentionSpec), (
+                "Pure-attention HMA groups must have one attention spec", spec)
+            backend = (PallasMLAttentionBackend if isinstance(
+                spec, MLAAttentionSpec) else backend_cls)
+            shape = tuple(
+                backend.get_kv_cache_shape(1, spec.block_size,
+                                           spec.num_kv_heads, spec.head_size,
+                                           spec.dtype))
+            native_pages[shape,
+                         spec.dtype] = math.prod(shape) * spec.dtype.itemsize
+        if len(native_pages) <= 1:
+            return kv_cache_specs
+        # Each layer position can contain at most one array of each native
+        # geometry. Repeated groups with the same geometry add no HBM cost.
+        page_bytes = max(
+            sum(native_pages.values()),
+            max(spec.page_size_bytes for spec in kv_cache_specs.values()))
+        logger.info(
+            "Pure-attention HMA: budgeting %d native cache geometries per "
+            "layer region, %d bytes per block", len(native_pages), page_bytes)
+        return {
+            name: dataclasses.replace(spec, page_size_padded=page_bytes)
+            for name, spec in kv_cache_specs.items()
+        }
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -355,7 +397,7 @@ class KVCacheManager:
         allocated_layer_names = {
             layer_name
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors
-            for layer_name in kv_cache_tensor.shared_by
+            for layer_name in kv_cache_tensor.layers
         }
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items(
         ):
@@ -476,36 +518,13 @@ class KVCacheManager:
         """Pad attention and mamba page sizes so vLLM's num_blocks matches
         what the TPU allocates per layer.
 
-        For hybrid attention+mamba models, vLLM groups a tensor's memory so
-        that one `KVCacheTensor` is `shared_by` one layer from each kv-cache
-        group (e.g., Qwen3.5: 1 full-attn + 3 linear-attn per shared_by).
-        vLLM's scheduler assumes these layers share a single physical
-        tensor at the byte level — each layer's block_table indexes into
-        disjoint slots of the same backing allocation, and device kernels
-        reinterpret the bytes as attention KV or mamba state depending on
-        which layer is accessing the slot.
-
-        TPU `jax.Array`s are strongly typed, so we cannot overlay an
-        attention tensor and a mamba tensor on the same bytes.
-        `initialize_kv_cache` therefore allocates one physical array per
-        layer in the `shared_by` group, carving the group's byte budget
-        into separate per-layer tensors. Without the compensation done
-        here, vLLM's block pool would hold `num_shared_layers`× more
-        block IDs than each per-layer array has slots — the scheduler
-        would hand out block IDs beyond a layer's leading dimension,
-        JAX's indexed writes would silently clip them, and multiple
-        requests' mamba recurrent states would collapse onto the same
-        slot (corrupted state → gibberish generation).
-
-        The fix: set every layer's reported `page_size_padded` equal to the
-        full per-`shared_by` footprint — `num_attn_groups × attn_page +
-        num_mamba_groups × mamba_unpadded`, where `attn_page` is the
-        TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
-        which accounts for dtype packing like fp8) and `mamba_unpadded` is
-        the natural `prod(shape) × dtype_size`. vLLM then computes a
-        smaller `num_blocks` that exactly matches what we allocate per layer
-        on the TPU side. HBM usage is unchanged; only the block-ID
-        accounting lines up.
+        vLLM overlays cache groups in the same backing allocation: one
+        layer position from every group shares each region's block IDs.
+        TPU's non-unified path keeps separate typed arrays for those layers.
+        Report a uniform page equal to the sum of their physical pages
+        (`num_attn_groups * attn_page + num_mamba_groups * mamba_unpadded`),
+        so the scheduler's block count fits every array within the HBM budget.
+        Attention bytes include TPU dtype packing and head/lane padding.
 
         Args:
             layers: A dictionary mapping layer names to their corresponding
@@ -547,10 +566,9 @@ class KVCacheManager:
             first_mamba_spec, page_size_padded=None).page_size_bytes
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
-        # equal-sized groups of `group_size` layers, then allocates
-        # `group_size` `KVCacheTensor`s, each `shared_by` one layer from
-        # every group — so each tensor covers `num_attn_groups +
-        # num_mamba_groups` layers.
+        # equal-sized groups of `group_size` layers. Their native placements
+        # overlay the same `group_size` regions, so each region backs one
+        # layer from every group.
         #
         # Choosing `group_size` trades off padding vs. number of groups:
         #   * group_size = max_count → fewer groups (often 1 per type),
@@ -672,7 +690,7 @@ class KVCacheManager:
 
         Sizing math
         -----------
-        vLLM allocates `group_size` KVCacheTensors, each shared across
+        vLLM allocates `group_size` layer regions, each shared across
         `num_attn_groups` attention layers + `num_mamba_groups` mamba layers.
         With per-tensor budget `B = avail / group_size` and
         `N_mamba = max_num_reqs + 1`,
@@ -691,7 +709,7 @@ class KVCacheManager:
                 (`prod(shape) × dtype_size`, no padding).
             num_attn_groups: # attention layers backed by each KVCacheTensor.
             num_mamba_groups: # mamba layers backed by each KVCacheTensor.
-            group_size: # KVCacheTensors vLLM allocates (= layers per
+            group_size: # layer regions vLLM allocates (= layers per
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
 
@@ -732,7 +750,7 @@ class KVCacheManager:
         if attn_per_tensor_avail <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: mamba slots alone need "
-                f"{mamba_per_tensor} B per KVCacheTensor (mamba_num_blocks="
+                f"{mamba_per_tensor} B per layer region (mamba_num_blocks="
                 f"{mamba_num_blocks} x num_mamba_groups={num_mamba_groups} x "
                 f"mamba_unpadded={unpadded_mamba_page_size_bytes}), but the "
                 f"per-tensor KV budget is {avail_per_tensor} B. Raise "
@@ -750,7 +768,7 @@ class KVCacheManager:
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self.runner._mamba_num_blocks = int(mamba_num_blocks)
 
-        # Total HBM = group_size KVCacheTensors, each holding num_attn_groups
+        # Total HBM = group_size regions, each holding num_attn_groups
         # attention blocks + num_mamba_groups mamba slots.
         attn_bytes = (group_size * num_attn_groups * attn_num_blocks *
                       attn_page_size_bytes)
@@ -793,7 +811,7 @@ class KVCacheManager:
             attn_page_size_bytes: TPU-actual bytes per block for one
                 attention layer, from `get_attention_page_size_bytes`
                 (accounts for dtype packing like fp8).
-            uniform_page_size_bytes: bytes per block for one `KVCacheTensor`
+            uniform_page_size_bytes: bytes per block for one overlaid layer region
                 shared across `num_attn_groups + num_mamba_groups` layers
                 (the `_hybrid_uniform_page_size_bytes` value set above).
             group_size: number of layers per vLLM kv-cache group, used by
@@ -927,9 +945,6 @@ class KVCacheManager:
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(kv_cache_config,
                                                materialized.raw_tensors)
-        if kv_cache_config.has_mamba_layers:
-            self.runner._update_hybrid_attention_mamba_layout(
-                kv_caches, kernel_block_sizes)
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items(
         ):
@@ -1160,104 +1175,93 @@ class KVCacheManager:
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: heterogeneous attention "
                     f"specs {attn_keys} cannot share one bundle")
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                shared_by = kv_cache_tensor.shared_by
+                layer_names = kv_cache_tensor.layers
                 if not all(
                         isinstance(layer_name_to_spec[n], AttentionSpec)
-                        for n in shared_by):
+                        for n in layer_names):
                     raise NotImplementedError(
                         "VLLM_TPU_BLOCK_MAJOR_KV=1: kv_cache_tensor "
-                        f"shared by non-attention layers {shared_by}")
+                        f"containing non-attention layers {layer_names}")
 
-            # Allocate via vLLM's uniform cross-layer KV machinery. Given the Pallas backend's
-            # stride order (num_blocks outermost, num_layers second), the returned cross-layer
-            # tensor is identical to the canonical block-major bundle.
-            # Validate uniform cross-layer KV requirements (single uniform attention group,
-            # cross-layer connector preference, and no per-token-head KV quantization).
-            if not KVConnectorModelRunnerMixin.use_uniform_kv_cache(
-                    self.runner.attn_groups):
+            if len(kv_cache_config.kv_cache_groups) != 1:
                 raise NotImplementedError(
-                    "VLLM_TPU_BLOCK_MAJOR_KV=1: "
-                    "KVConnectorModelRunnerMixin.use_uniform_kv_cache "
-                    "rejected this configuration (needs a single uniform "
-                    "attention group, a connector preferring cross-layer "
-                    "blocks, and no per-token-head KV quantization)")
-            attn_group = self.runner.attn_groups[0][0]
-            # Bind PallasAttentionBackend explicitly for uniform KV cache allocation.
-            attn_group.backend = PallasAttentionBackend
-            sample_spec = next(iter(attn_specs))
-            # Pass resolved KV datatype (e.g. torch.bfloat16) to ensure exact memory tiling.
-            uniform_views, bundle, _ = (
-                KVConnectorModelRunnerMixin.allocate_uniform_kv_caches(
-                    kv_cache_config,
-                    self.runner.attn_groups,
-                    self.runner.kv_cache_dtype,
-                    self.runner.device,
-                    kernel_block_sizes=[sample_spec.block_size],
-                ))
-            # Bundle shape: (num_blocks, num_layers, block_size, K2/p, p, H).
-            # The bundled RPA kernel executes directly on the top-level bundle to preserve JAX buffer donation.
-            # Bound per-layer strided views are retained for vLLM metadata probing and storage deduplication.
-            logger.info(
-                "Block-major KV cache: allocated bundle of shape %s "
-                "dtype=%s via allocate_uniform_kv_caches; attention "
-                "routes through the bundled RPA kernel with dynamic "
-                "layer_idx.", tuple(bundle.shape), bundle.dtype)
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1 requires a single uniform "
+                    "attention group")
+            from vllm_torchtpu.offload.block_major_layout import \
+                block_major_layer_indices
+            sample_spec = attn_specs[0]
+            page_shape = PallasAttentionBackend.get_kv_cache_shape(
+                1, sample_spec.block_size, sample_spec.num_kv_heads,
+                sample_spec.head_size, self.runner.kv_cache_dtype)[1:]
+            page_bytes = math.prod(page_shape) * sample_spec.dtype.itemsize
+            indices = block_major_layer_indices(kv_cache_config, page_bytes)
+            bundle = torch.zeros(
+                (kv_cache_config.num_blocks, len(set(
+                    indices.values())), *page_shape),
+                dtype=sample_spec.dtype,
+                device=self.runner.device)
+            # Kernels donate the full bundle; views serve metadata and DMA
+            # registration, retaining the native descriptor's byte offsets.
             self.runner._kv_cache_bundle = bundle
-            # Synchronize HBM allocation immediately to prevent deadlocks in Raiden's KVCacheManager
-            # during connector registration prior to forward execution.
-            synchronize_tensors(self.runner._kv_cache_bundle, wait=True)
-            # Map layer names to bundle layer dimension indices matching the layout contract.
-            for idx, kv_cache_tensor in enumerate(
-                    kv_cache_config.kv_cache_tensors):
-                for name in kv_cache_tensor.shared_by:
-                    self.runner._kv_cache_bundle_layer_index[name] = idx
-                    bundle_view_by_name[name] = uniform_views[name]
+            synchronize_tensors(bundle, wait=True)
+            for name, index in indices.items():
+                self.runner._kv_cache_bundle_layer_index[name] = index
+                bundle_view_by_name[name] = bundle[:, index]
+            logger.info("Block-major KV cache: allocated native bundle %s %s",
+                        tuple(bundle.shape), bundle.dtype)
 
         if _is_ds_v4:
             self.ds_v4._initialize_ds_v4_kv_cache(kv_cache_config,
                                                   _per_layer_spec, kv_caches,
                                                   kv_cache_config.num_blocks)
 
+        # Pure-attention HMA groups overlay native placement regions. The
+        # non-unified Mamba path instead budgets separate typed arrays in
+        # _update_mamba_page_size_padded and must keep those allocations.
+        share_attention_regions = not kv_cache_config.has_mamba_layers
+        attention_regions: dict[tuple[int, int],
+                                dict[tuple[tuple[tuple[int, ...], torch.dtype],
+                                           ...], tuple[torch.Tensor,
+                                                       ...]]] = {}
+
+        def allocate_attention_region(
+            region: tuple[int, int],
+            geometry: list[tuple[tuple[int, ...], torch.dtype]],
+        ) -> tuple[torch.Tensor, ...]:
+            if share_attention_regions:
+                native_caches = attention_regions.setdefault(region, {})
+                key = tuple(geometry)
+                if key in native_caches:
+                    return native_caches[key]
+                allocated_bytes = sum(cache.nbytes
+                                      for caches in native_caches.values()
+                                      for cache in caches)
+                required_bytes = sum(
+                    math.prod(shape) * dtype.itemsize
+                    for shape, dtype in geometry)
+                budget = kv_cache_config.num_blocks * region[1]
+                assert allocated_bytes + required_bytes <= budget, (
+                    "Native TPU attention arrays exceed the padded region "
+                    f"budget: region={region}, allocated={allocated_bytes}, "
+                    f"required={required_bytes}, budget={budget}")
+            caches = tuple(
+                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                for shape, dtype in geometry)
+            if share_attention_regions:
+                native_caches[key] = caches
+            return caches
+
         for kv_cache_tensor in ([] if _is_ds_v4 else
                                 kv_cache_config.kv_cache_tensors):
-            # If the KV cache tensor is shared by multiple layers, then we
-            # duplicate cache for each layer and `num_blocks` is calculated
-            # based on the total size of the shared cache.
-            # Otherwise, `num_blocks` is calculated based on the size of the
-            # single layer's KV cache spec.
-            tensor_size = kv_cache_tensor.size
-            shared_by = kv_cache_tensor.shared_by
-            if len(shared_by) > 1:
-                total_group_page_size = 0
-                for name in shared_by:
-                    spec = layer_name_to_spec[name]
-                    # Use the per-layer *TPU-actual* per-block bytes so the
-                    # sum equals the `page_size_padded` that
-                    # `update_mamba_page_size_padded` installed on every
-                    # spec (== attn_page + N × mamba_unpadded). For
-                    # attention, the TPU-actual size includes dtype-
-                    # specific packing (e.g., fp8 KV packs 4 elements per
-                    # 32-bit word) which `spec.real_page_size_bytes`
-                    # doesn't account for — on fp8 models they differ by
-                    # 2×, which would break the num_blocks match here.
-                    if isinstance(spec, MambaSpec):
-                        total_group_page_size += dataclasses.replace(
-                            spec, page_size_padded=None).page_size_bytes
-                    elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                            spec.block_size,
-                            spec.num_kv_heads,
-                            spec.head_size,
-                            spec.dtype,
-                        )
-                    else:
-                        raise NotImplementedError
-                num_blocks = tensor_size // total_group_page_size
-            else:
-                num_blocks = kv_cache_config.num_blocks
-
-            for layer_name in shared_by:
+            # Each descriptor names layers within the whole backing allocation;
+            # its size is not a per-layer budget. TPU's separate typed caches
+            # use the scheduler's block count and the normalized page geometry.
+            num_blocks = kv_cache_config.num_blocks
+            for layer_index, layer_name in enumerate(kv_cache_tensor.layers):
                 kv_cache_spec = _per_layer_spec(layer_name)
+                region = (kv_cache_tensor.offset +
+                          layer_index * kv_cache_tensor.layer_stride,
+                          kv_cache_tensor.block_stride)
 
                 if isinstance(kv_cache_spec, MambaSpec):
                     # Compact-mamba: allocate only `_mamba_num_blocks`
@@ -1290,9 +1294,9 @@ class KVCacheManager:
                                 kv_cache_spec.dtype,
                             ))
                         attn_module.mla_kv_spec = specs
-                        kv_caches[layer_name] = tuple(
-                            torch.zeros(spec.shape, dtype=spec.torch_dtype).to(
-                                self.runner.device) for spec in specs)
+                        kv_caches[layer_name] = allocate_attention_region(
+                            region, [(tuple(spec.shape), spec.torch_dtype)
+                                     for spec in specs])
                         continue
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
                     # Because MLA maps all attention heads onto a single joint compressed latent key-value
@@ -1308,10 +1312,8 @@ class KVCacheManager:
                         kv_cache_spec.dtype,
                     )
                     dtype = kv_cache_spec.dtype
-                    tpu_kv_cache = torch.zeros(kv_cache_shape, dtype=dtype).to(
-                        self.runner.device)
-
-                    kv_caches[layer_name] = tpu_kv_cache
+                    kv_caches[layer_name] = allocate_attention_region(
+                        region, [(tuple(kv_cache_shape), dtype)])[0]
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.runner.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads
@@ -1333,9 +1335,8 @@ class KVCacheManager:
                             kv_cache_spec.dtype,
                         )
                         dtype = kv_cache_spec.dtype
-                        tpu_kv_cache = torch.zeros(
-                            kv_cache_shape, dtype=dtype).to(self.runner.device)
-                        kv_caches[layer_name] = tpu_kv_cache
+                        kv_caches[layer_name] = allocate_attention_region(
+                            region, [(tuple(kv_cache_shape), dtype)])[0]
                 else:
                     raise NotImplementedError
 

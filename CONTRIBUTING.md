@@ -1,7 +1,7 @@
 # Contributing to TorchTPU-vLLM
 
 > [!IMPORTANT] Pre-Public Development Governance
-> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
+> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
 
 Thank you for your interest in contributing to TorchTPU-vLLM! Our community is open to everyone and welcomes all kinds of contributions, no matter how small or large. There are several ways you can contribute to the project:
 
@@ -29,7 +29,7 @@ We choose to follow a similar directory structure as vLLM:
   * `vllm` contains model implementations and architectures supported on TPU
 
 ## Finding Reviewers
-Not sure who to ask for a review? `scripts/find_owners.py` matches your changed files against [.github/CODEOWNERS](.github/CODEOWNERS) and prints the owners of each area you touched, plus the smallest set of reviewers that covers all of them.
+Not sure who to ask for a review? `scripts/find_owners.py` matches your changed files against [.github/CODEOWNERS](https://github.com/vllm-project/vllm-torchtpu/blob/main/.github/CODEOWNERS) and prints the owners of each area you touched, plus the smallest set of reviewers that covers all of them.
 
 ```bash
 # Owners of the changes on your current branch
@@ -48,7 +48,7 @@ When checking in a new feature, we expect that you add relevant unit tests as we
 
 ## Setting up linting, formatting, and static type checking
 
-Make sure to activate the virtual environment created during [installation](README.md#2-install-vllm-torchtpu-and-dependencies) before installing and running `pre-commit`. Running `pre-commit` from a global installation or outside the virtual environment can cause hook version mismatches and missing dependency errors.
+Make sure to activate the virtual environment created during [installation](https://github.com/vllm-project/vllm-torchtpu#2-install-vllm-torchtpu-and-dependencies) before installing and running `pre-commit`. Running `pre-commit` from a global installation or outside the virtual environment can cause hook version mismatches and missing dependency errors.
 
 ```bash
 # Activate your virtual environment
@@ -63,6 +63,23 @@ pre-commit install --hook-type pre-commit --hook-type commit-msg
 # You can manually run pre-commit with
 pre-commit run --all-files
 ```
+
+## Building the documentation
+
+The documentation site is built with [MkDocs](https://www.mkdocs.org/) and the Material theme from the sources in `docs/`, using the same setup as [tpu-inference](https://github.com/vllm-project/tpu-inference). Read the Docs builds it from `mkdocs.yml` on every push. To preview it locally:
+
+```bash
+# From the repository root, inside your virtual environment
+pip install -r docs/requirements.txt
+
+# Serve with live reload at http://127.0.0.1:8000
+mkdocs serve
+
+# Or build once with the same strict checks Read the Docs uses
+mkdocs build --strict
+```
+
+Pages are listed in the `nav` section of `mkdocs.yml`. Because the build runs in strict mode, every page in `nav` must exist and every relative link must resolve to another page in `docs/`. Link to source files with full GitHub URLs.
 
 ## Thank You!
 We wanted to thank you for taking the time to read these guidelines and for your interest in contributing to TorchTPU-vLLM. All of your contributions help make TorchTPU-vLLM a better tool and community for everyone.

@@ -35,6 +35,14 @@ from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 # count against it, because the kernel requires one equal block per shard.
 _STUB_EP = 2
 
+# Positions in `_build_op`'s positional argument list, which is what the tests
+# below inspect: (mesh, topk, renormalize, activation, mesh_expert_order,
+# sharded_plan, weight_format, rhs_qb, scoring_fn, has_score_bias,
+# routed_scaling_factor).
+_MESH_ORDER_ARG = 4
+_SHARDED_PLAN_ARG = 5
+_WEIGHT_FORMAT_ARG = 6
+
 
 def _layer(experts=4, hidden=8, inter=16, **overrides):
     """A layer whose weights and routing the kernel would accept."""
@@ -59,7 +67,9 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
-            moe_parallel_config=SimpleNamespace(use_ep=True, pcp_size=1),
+            moe_parallel_config=SimpleNamespace(use_ep=True,
+                                                pcp_size=1,
+                                                is_sequence_parallel=False),
         ),
     )
     for name, value in overrides.items():
@@ -73,6 +83,7 @@ def _prebuild(layer,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
               ep_order=None,
+              replica_groups=((0, ), (1, )),
               build_op=None,
               **kwargs):
     """Call prebuild with the distributed lookups stubbed out.
@@ -84,10 +95,12 @@ def _prebuild(layer,
     """
     mesh = (SimpleNamespace(
         shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None)
-    build_op = build_op or (lambda *_args: "op")
+    build_op = build_op or (lambda *_args, **_kwargs: "op")
     with patch.object(bridge, "build_ep_mesh", return_value=mesh), \
             patch.object(bridge, "ep_mesh_index", return_value=0), \
             patch.object(bridge, "ep_rank_order", return_value=ep_order), \
+            patch.object(bridge, "ep_token_replica_groups",
+                         return_value=replica_groups), \
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
@@ -111,21 +124,92 @@ def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
 
 
+def test_native_replica_groups_reach_prebuilt_op():
+    groups = ((0, 1), )
+    seen = []
+    assert _prebuild(
+        _layer(),
+        replica_groups=groups,
+        build_op=lambda *args, **kw: seen.append(kw) or "op") == "op"
+    assert seen[0]["token_replica_groups"] == groups
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True])
+@pytest.mark.parametrize("scoring_fn,has_bias,scale", [
+    ("softmax", False, 1.0),
+    ("sigmoid", True, 2.5),
+    ("sqrtsoftplus", True, 0.75),
+])
+def test_replica_groups_are_part_of_op_cache_and_kernel_call(
+        monkeypatch, sharded_plan, scoring_fn, has_bias, scale):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "sharded_jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    groups = ((0, 1), )
+    args = (None, 2, True, "silu", None, sharded_plan)
+    options = dict(scoring_fn=scoring_fn,
+                   has_score_bias=has_bias,
+                   routed_scaling_factor=scale,
+                   token_replica_groups=groups)
+    replicated = bridge._build_op(*args, **options)
+    assert bridge._build_op(*args, **options) is replicated
+    # Every independent routing setting and the TP membership separate caches.
+    for changed in (
+            dict(token_replica_groups=((0, ), (1, ))),
+            dict(scoring_fn="sigmoid" if scoring_fn ==
+                 "softmax" else "softmax"),
+            dict(has_score_bias=not has_bias),
+            dict(routed_scaling_factor=scale + 1.0),
+    ):
+        assert bridge._build_op(*args, **(options | changed)) is not replicated
+    assert len(closures) == 5
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    bias = jnp.arange(4, dtype=jnp.bfloat16)
+    operands = (x, None, None, None, None, jnp.zeros(
+        (8, 4)), jnp.zeros((1, 1), dtype=jnp.int32))
+    if has_bias:
+        operands += (bias, )
+    assert closures[0](*operands) is x
+    forwarded = kernel.call_args.kwargs
+    assert forwarded["token_replica_groups"] == groups
+    assert forwarded["scoring_fn"] == scoring_fn
+    assert forwarded["routed_scaling_factor"] == scale
+    assert forwarded["sharded_plan"] is sharded_plan
+    if has_bias:
+        np.testing.assert_array_equal(forwarded["score_bias"], bias)
+        assert forwarded["score_bias"].dtype == jnp.float32
+    else:
+        assert "score_bias" not in forwarded
+
+
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
-            _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-1] is True
+            _layer(),
+            build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+    assert seen and seen[0][_SHARDED_PLAN_ARG] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
     order = (1, 0)
     seen = []
-    assert _prebuild(_layer(),
-                     ep_order=order,
-                     build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] == order
+    assert _prebuild(
+        _layer(),
+        ep_order=order,
+        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+    assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
 def test_refused_without_the_env_flag():
@@ -214,17 +298,13 @@ def test_refused_when_the_layer_carries_expert_biases():
 
 @pytest.mark.parametrize("routing", [
     dict(custom_routing_function=lambda **_: None),
-    dict(scoring_func="sigmoid"),
-    dict(e_score_correction_bias=torch.zeros(8)),
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
     dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-    dict(routed_scaling_factor=2.5),
-    dict(routed_scaling_factor=0.0),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
-    """The fused path never calls `moe_routing.route`: the kernel scores with
-    a plain softmax and selects top-k itself. Anything else routes tokens to a
-    different set of experts, so it is refused rather than run."""
+    """The fused path never calls `moe_routing.route`: the kernel selects
+    top-k itself. Anything it cannot reproduce routes tokens to a different
+    set of experts, so it is refused rather than run."""
     assert _prebuild(_layer(**routing)) is None
 
 
@@ -497,11 +577,12 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
 @pytest.mark.parametrize("block", [64, 128, 256, 512, 1024])
 def test_nvfp4_aligned_block_arms_and_passes_format(block):
     seen = []
-    assert _prebuild(_fp4_layer(block, hidden=1024, inter=1024),
-                     weight_format="fp4",
-                     rhs_qb=block,
-                     build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen[0][-2:] == ("fp4", block)
+    assert _prebuild(
+        _fp4_layer(block, hidden=1024, inter=1024),
+        weight_format="fp4",
+        rhs_qb=block,
+        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+    assert seen[0][_WEIGHT_FORMAT_ARG:_WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
 
 
 @pytest.mark.parametrize("block", [None, 0, -64, 16, 32, 96, 192, 1024])
@@ -525,7 +606,7 @@ def test_nvfp4_refuses_invalid_contract(fault, block):
     elif fault == "dtype":
         layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float8_e4m3fn)
     elif fault == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     else:
         layer.w2_bias = torch.zeros(1, 512)
     assert _prebuild(layer, weight_format="fp4", rhs_qb=block) is None
@@ -588,7 +669,9 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     layer.global_num_experts = _STUB_EP
     layer.moe_config = SimpleNamespace(experts_per_token=2,
                                        moe_parallel_config=SimpleNamespace(
-                                           use_ep=use_ep, pcp_size=1))
+                                           use_ep=use_ep,
+                                           pcp_size=1,
+                                           is_sequence_parallel=False))
     return layer
 
 
@@ -800,7 +883,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     elif refusal == "smem":
         admission["smem_bytes"] = 1
     elif refusal == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     elif refusal == "experts":
         layer.global_num_experts = 3
     elif refusal == "activation":

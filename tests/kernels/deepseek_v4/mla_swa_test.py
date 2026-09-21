@@ -135,6 +135,7 @@ def ref_implementation(
     sliding_window: int,
     sm_scale: float = 1.0,
     mask_value: float | None = DEFAULT_MASK_VALUE,
+    non_causal_block: bool = False,
 ):
 
     if mask_value is None:
@@ -219,6 +220,12 @@ def ref_implementation(
         mask = q_span < kv_span
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
+        if non_causal_block:
+            # Draft-block mode: the final q_len positions attend
+            # bidirectionally within themselves (kv_span < kv_len is
+            # inherent -- k_i is sliced to kv_len above).
+            in_block = kv_span >= (kv_len - q_len)
+            mask = jnp.logical_and(mask, jnp.logical_not(in_block))
         attn = jnp.where(mask, mask_value, attn)
         m = jnp.max(attn, axis=-1, keepdims=True)
         l_sum = jnp.sum(jnp.exp(attn - m), axis=-1, keepdims=True)
@@ -325,8 +332,15 @@ class CorrectnessTest(parameterized.TestCase):
                                    rtol=0.1,
                                    atol=0.1)
 
-    def run_and_compare_outputs(self, q, new_kv, kv_lens, cu_q_lens,
-                                distribution):
+    def run_and_compare_outputs(self,
+                                q,
+                                new_kv,
+                                kv_lens,
+                                cu_q_lens,
+                                distribution,
+                                non_causal_block=False,
+                                num_queries_per_block=8,
+                                num_kv_pages_per_block=2):
         total_tokens = q.shape[0]
         out_base, self.ref_cache, l_base, m_base = ref_implementation(
             q,
@@ -339,6 +353,7 @@ class CorrectnessTest(parameterized.TestCase):
             self.attention_sinks,
             sm_scale=1.0,
             sliding_window=self.sliding_window,
+            non_causal_block=non_causal_block,
         )
 
         out, self.swc_cache, l_sum, m = (
@@ -353,10 +368,11 @@ class CorrectnessTest(parameterized.TestCase):
                 self.attention_sinks,
                 sm_scale=1.0,
                 sliding_window=self.sliding_window,
-                num_queries_per_block=8,
-                num_kv_pages_per_block=2,
+                num_queries_per_block=num_queries_per_block,
+                num_kv_pages_per_block=num_kv_pages_per_block,
                 q_compute_block_size=2,
                 logical_page_size=self.page_size,
+                non_causal_block=non_causal_block,
             ))
 
         # Compare output
@@ -454,6 +470,68 @@ class CorrectnessTest(parameterized.TestCase):
             dtype=jnp.int32)
         self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
                                      distribution)
+
+    @parameterized.named_parameters(
+        # bq >= block: the block sits in one query block.
+        ("one_bq_block", 8, 2),
+        # bq < block and bkv small enough that the single-bkv-block
+        # shortcut is off: the block spans three query blocks, so the
+        # walked key range must reach kv_len, not just each bq block's
+        # last query.
+        ("spans_bq_blocks", 2, 1),
+    )
+    def test_non_causal_block(self, num_queries_per_block,
+                              num_kv_pages_per_block):
+        """Draft (DSpark/DFlash) block mode: bidirectional in-block attention.
+
+        Step 1 builds per-sequence context causally (also revalidating the
+        default path); step 2 presents one draft block per sequence with
+        ``non_causal_block=True``, covering contexts below, at, and above
+        the sliding window.
+        """
+        print(f"JAX Backend: {jax.default_backend()}")
+
+        # Step 1: causal context prefill. Context lengths straddle the
+        # window (W=16): nearly-pure-block, sub-window, and beyond-window.
+        ctx_pattern = [1, 8, 40]
+        new_kv_lens = jnp.array(
+            [ctx_pattern[i % 3] for i in range(self.batch_size)],
+            dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]),
+             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
+        self.kv_lens += new_kv_lens
+        total_tokens = jnp.sum(new_kv_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
+                            self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
+                                     distribution)
+
+        # Step 2: one non-causal draft block per sequence (K=5 and K+1=6,
+        # the DSpark dense and bonus-anchor block sizes; both <= W).
+        block_lens = jnp.array(
+            [5 if i % 2 == 0 else 6 for i in range(self.batch_size)],
+            dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]),
+             jnp.cumulative_sum(block_lens, dtype=jnp.int32)])
+        self.kv_lens += block_lens
+        total_tokens = jnp.sum(block_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
+                            self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
+        self.run_and_compare_outputs(
+            q,
+            new_kv,
+            self.kv_lens,
+            cu_q_lens,
+            distribution,
+            non_causal_block=True,
+            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=num_kv_pages_per_block)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ Modes:
 
   CSA:
     - State Bytes: 2048 (dim) x 4 (bytes per fp32) = 8192 bytes
-    - Head Dim:    448 fp8 + 7 scale = 462 bytes -> 512 bytes
+    - Head Dim:    448 fp8 + 64 lane-periodic scales = 512 bytes
     - Cache:       [num_pages, _, 4, 128] uint8 (where _ = state_block_size * 16
     or kv_block_size)
 

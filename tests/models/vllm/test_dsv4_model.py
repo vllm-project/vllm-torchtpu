@@ -20,12 +20,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
+from vllm.config import (CacheConfig, CompilationMode, SchedulerConfig,
+                         VllmConfig, set_current_vllm_config)
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.utils import WeightsMapper
+from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+    VllmDeepseekSparseSWABackend, VllmDeepseekV4SWACache)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
+    VllmDeepseekV4Indexer
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v4 import DeepseekV4ForCausalLM
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
+    VllmDeepseekV4MLAAttention
 
 
 def test_deepseek_v4_model_registration():
@@ -35,6 +44,42 @@ def test_deepseek_v4_model_registration():
     assert entry is not None, "DeepseekV4ForCausalLM is not registered"
     model_cls = entry.load_model_cls()
     assert model_cls is DeepseekV4ForCausalLM
+
+
+@pytest.mark.cpu_test
+def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
+    model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.embed_tokens = nn.Embedding(2, 3)
+    model.model.mtp_adapter = nn.Linear(3, 2, bias=False)
+    model.lm_head = nn.Linear(3, 2, bias=False)
+    # A rename that introduces the skipped substring distinguishes filtering
+    # mapped names from filtering only raw checkpoint names.
+    model.hf_to_vllm_mapper |= WeightsMapper(
+        orig_to_new_prefix={"draft.": "model.mtp."})
+    embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    head = embedding + 10
+    adapter = embedding + 20
+    loaded = model.load_weights(
+        iter([
+            ("mtp.0.weight", head),
+            ("layers.0.mtp.weight", head),
+            ("layers.0.aux_mtp.weight", head),
+            ("draft.0.weight", head),
+            ("embed.weight", embedding),
+            ("head.weight", head),
+            ("model.mtp_adapter.weight", adapter),
+        ]))
+    assert loaded == {
+        "model.embed_tokens.weight", "lm_head.weight",
+        "model.mtp_adapter.weight"
+    }
+    torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
+    torch.testing.assert_close(model.lm_head.weight, head)
+    torch.testing.assert_close(model.model.mtp_adapter.weight, adapter)
+    with pytest.raises(ValueError, match="not_in_model"):
+        model.load_weights([("not_in_model.weight", head)])
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +180,63 @@ def dist_ctx():
     with set_current_vllm_config(VllmConfig()):
         ensure_model_parallel_initialized(1, 1)
     yield
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+def test_attention_constructs_tpu_swa_cache(monkeypatch, request,
+                                            compress_ratio):
+    """Exercise upstream construction, including its SWA backend argument."""
+    from vllm.platforms import current_platform
+
+    # CPU CI has no TPU device registered with PyTorch. Keep both the Gloo
+    # group and the compressor's parameter allocations on CPU.
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
+    # Only skip Pallas op registration, which needs the worker's TPU mesh.
+    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op",
+                        lambda self: None)
+    hf_config = DeepseekV4Config(
+        hidden_size=128,
+        num_attention_heads=2,
+        q_lora_rank=128,
+        o_lora_rank=64,
+        head_dim=512,
+        qk_rope_head_dim=64,
+        o_groups=1,
+        sliding_window=128,
+        num_hidden_layers=1,
+        compress_ratios=[compress_ratio],
+        rms_norm_eps=1e-6,
+        max_position_embeddings=256,
+        compress_rope_theta=10000.0,
+        rope_parameters={"rope_type": "default"},
+        index_topk=4,
+        index_n_heads=2,
+        index_head_dim=128,
+    )
+    config = VllmConfig()
+    config.model_config = SimpleNamespace(hf_config=hf_config,
+                                          dtype=torch.bfloat16,
+                                          max_model_len=256)
+    config.cache_config = CacheConfig(block_size=1024, cache_dtype="fp8_e4m3")
+    config.scheduler_config = SchedulerConfig(max_model_len=256,
+                                              is_encoder_decoder=False,
+                                              max_num_seqs=1,
+                                              max_num_batched_tokens=128)
+    prefix = "model.layers.0.self_attn"
+    with set_current_vllm_config(config):
+        attention = VllmDeepseekV4MLAAttention(config, prefix=prefix)
+    cache = attention.swa_cache_layer
+    assert isinstance(cache, VllmDeepseekV4SWACache)
+    assert cache.get_attn_backend() is VllmDeepseekSparseSWABackend
+    assert config.compilation_config.static_forward_context[
+        f"{prefix}.swa_cache"] is cache
+    spec = cache.get_kv_cache_spec(config)
+    assert spec.block_size == 128
+    assert spec.sliding_window == 128
+    assert spec.dtype == torch.uint8
 
 
 @pytest.fixture()
