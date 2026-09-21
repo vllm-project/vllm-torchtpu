@@ -20,6 +20,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.moe_dense_expert import (
+    can_use_dense_expert, dense_expert_moe)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
@@ -52,6 +54,8 @@ ragged_gather_reduce = _select_ragged_gather_reduce(
     envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
+# Fixed at import, like the other MoE algorithm selectors.
+_DECODE_IMPL = envs.TPU_MOE_DECODE_IMPL
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -572,6 +576,21 @@ def fused_moe_func(
         topk_weights = jnp.where(valid, topk_weights,
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if _DECODE_IMPL == "dense_expert" and can_use_dense_expert(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens):
+        logger.info_once("Selected experimental dense-expert decode MoE")
+        return dense_expert_moe(hidden_states, w1, w2, w1_scale, w2_scale,
+                                topk_weights, topk_ids)
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
      token_indices_sorted) = prepare_routed_gmm_inputs(
