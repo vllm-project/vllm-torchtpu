@@ -51,7 +51,9 @@ class BaseSparsityResolver(BaseResolver):
 
         ordered = sorted(sparse_indices)
         if resolver_config.get("allow_nonprefix_splice"):
-            print(">>> [RESOLVER] Proceeding because allow_nonprefix_splice is set.")
+            print(
+                ">>> [RESOLVER] Proceeding because allow_nonprefix_splice is set."
+            )
             return
 
         raise ValueError(
@@ -199,7 +201,8 @@ class BaseSparsityResolver(BaseResolver):
         # 2. Fast cross-shard layer splicing from 100% sparse reference model
         if reference_sparse_model and os.path.exists(reference_sparse_model):
             sparse_indices = set(range(min_layer, max_layer))
-            BaseSparsityResolver._assert_spliceable(sparse_indices, strategy, resolver_config)
+            BaseSparsityResolver._assert_spliceable(sparse_indices, strategy,
+                                                    resolver_config)
             print(
                 f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
             )
