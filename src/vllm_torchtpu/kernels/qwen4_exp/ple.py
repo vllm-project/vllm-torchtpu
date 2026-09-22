@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact PLE hash, compact FP8 resident lookup, and packed causal convolution."""
+"""Exact PLE hash, compact resident lookup, and packed causal convolution."""
 
 import functools
 import math
@@ -51,7 +51,7 @@ def compute_ngram_ids(
 
 
 def compact_rows(table, ids):
-    """Four 160B rows occupy five 128B segments; no flattened byte indices.
+    """Four 160-element rows occupy five 128-element segments, for either dtype.
 
     IDs are bounded local int32 row indices. Complete groups of four rows
     are required. The largest supported carrier has <2**31 segments.
@@ -76,27 +76,44 @@ def _bf16(x):
     return jax.lax.optimization_barrier(x.astype(jnp.bfloat16))
 
 
-def resident_lookup(table, ids, scale, *, vocab_start: int, local_rows: int):
-    """Owner-masked BF16 [T,2560]; caller performs the TP BF16 all-reduce.
+def resident_lookup_raw(table, ids, *, vocab_start: int, local_rows: int):
+    """Owner-masked integer bits [T,2560]: INT8 for FP8, INT16 for BF16.
 
     Fixed eight-query chunks are required for full-size SparseCore gather
     lowering. Pad/crop only the queries, never the persistent 6.4GB table.
     """
     token_count = ids.shape[0]
+    carrier = jnp.int16 if table.dtype == jnp.int16 else jnp.int8
     if token_count == 0:
-        return jnp.zeros((0, 2560), jnp.bfloat16)
-    padded = jnp.pad(ids.astype(jnp.int32), ((0, (-token_count) % 8), (0, 0)))
+        return jnp.zeros((0, 2560), carrier)
+    padded = jnp.pad(
+        ids.astype(jnp.int32), ((0, (-token_count) % 8), (0, 0)), constant_values=-1
+    )
 
     def gather(chunk):
         owned = (chunk >= vocab_start) & (chunk < vocab_start + local_rows)
         local = jnp.where(owned, chunk - vocab_start, 0)
         bits = compact_rows(table, local)
-        values = jax.lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
-        values = _bf16(_bf16(values) * scale.astype(jnp.bfloat16))
-        return jnp.where(owned[..., None], values, jnp.bfloat16(0))
+        bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
+        return jax.lax.bitcast_convert_type(bits, carrier)
 
     result = jax.lax.map(gather, padded.reshape(-1, 8, 16))
     return result.reshape(-1, 2560)[:token_count]
+
+
+def decode_embeddings(raw_embeddings, scale):
+    if raw_embeddings.dtype == jnp.int16:
+        return jax.lax.bitcast_convert_type(raw_embeddings, jnp.bfloat16)
+    values = jax.lax.bitcast_convert_type(raw_embeddings, jnp.float8_e4m3fn)
+    return _bf16(_bf16(values) * scale.astype(jnp.bfloat16))
+
+
+def resident_lookup(table, ids, scale, *, vocab_start: int, local_rows: int):
+    """Local numerical entry sharing exactly the production raw lookup."""
+    return decode_embeddings(
+        resident_lookup_raw(table, ids, vocab_start=vocab_start, local_rows=local_rows),
+        scale,
+    )
 
 
 def _norm(x, weight):
@@ -182,6 +199,37 @@ def short_conv(x, weight, history, query_start_loc, state_indices, has_initial_s
     destinations = jnp.where((lengths > 0) & (slots >= 0), slots, history.shape[0])
     history = history.at[destinations].set(updated, mode="drop")
     return output, history
+
+
+@functools.cache
+def build_raw_lookup_op(vocab_start: int, local_rows: int):
+    def fn(table: jax.Array, ids: jax.Array) -> jax.Array:
+        return resident_lookup_raw(
+            table, ids, vocab_start=vocab_start, local_rows=local_rows
+        )
+
+    op = pallas.jax_op(f"qwen4_exp::ple_raw_lookup_{vocab_start}_{local_rows}", fn)
+
+    @op.register_fake
+    def fake(table, ids):
+        dtype = torch.int16 if table.dtype == torch.int16 else torch.int8
+        return table.new_empty((ids.shape[0], 2560), dtype=dtype)
+
+    return op
+
+
+@functools.cache
+def build_decode_op():
+    def fn(raw_embeddings: jax.Array, scale: jax.Array) -> jax.Array:
+        return decode_embeddings(raw_embeddings, scale)
+
+    op = pallas.jax_op("qwen4_exp::ple_decode", fn)
+
+    @op.register_fake
+    def fake(raw_embeddings, scale):
+        return torch.empty_like(raw_embeddings, dtype=torch.bfloat16)
+
+    return op
 
 
 @functools.cache

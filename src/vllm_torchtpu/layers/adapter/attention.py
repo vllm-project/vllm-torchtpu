@@ -99,6 +99,7 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "float": torch.float,
     "fp8": torch.float8_e4m3fn,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "fp8_per_token_head": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,

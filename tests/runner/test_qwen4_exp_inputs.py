@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Input contracts: history rows, persistent slots and native pages differ."""
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -62,16 +63,19 @@ def test_old_model_has_no_adapter():
         NS(model_config=NS(architecture='Qwen3ForCausalLM'))) is None
 
 
+@pytest.mark.parametrize('tp', [1, 2])
 def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
-        monkeypatch):
+        monkeypatch, tp):
     from contextlib import nullcontext
 
     from vllm_torchtpu.models.vllm.qwen4_exp import inputs
 
     captured = {}
+    logits = Mock(return_value=torch.zeros((8, 1)))
 
     def context(metadata, *args, **kwargs):
         captured['metadata'] = metadata
+        captured['context_kwargs'] = kwargs
         return nullcontext()
 
     def forward(**kwargs):
@@ -83,6 +87,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
                         lambda **kw: nullcontext())
     monkeypatch.setattr(inputs, 'synchronize_tensors', lambda tensor: None)
     runner = NS(device='cpu',
+                parallel_config=NS(tensor_parallel_size=tp),
                 scheduler_config=NS(max_num_seqs=1),
                 input_batch=NS(num_reqs=0,
                                token_ids_cpu_tensor=torch.zeros(
@@ -90,7 +95,10 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
                 max_model_len=4096,
                 vllm_config=NS(),
                 mesh=None,
-                forward_model=forward)
+                _dp_num_tokens_across_dp=lambda n: torch.full(
+                    (8, ), n, dtype=torch.int32),
+                forward_model=forward,
+                compute_selected_logits=logits)
     adapter = Qwen4ExpAdapter(runner)
     allocations = []
     adapter.cache = NS(allocate=lambda: allocations.append(True),
@@ -114,6 +122,39 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     assert kwargs['main_block_table'].max().item() == 1
     assert adapter.token_store.shape == (8, 4096)
     assert kwargs['ngram_context'].tolist() == [[248044, 248044]] * 8
+    logits.assert_not_called()
     runner.input_batch.num_reqs = 1
     with pytest.raises(AssertionError, match='no live requests'):
         adapter.dummy_run(128, 8)
+    # An idle DP may still own active requests and serve remote embedding/
+    # expert work. Its synthetic step must neither rebind owners nor replace
+    # the history snapshot; explicit physical counts avoid another CPU sync.
+    before = adapter.token_store
+    before.fill_(123)
+    adapter.cache.allocate = lambda: pytest.fail(
+        'idle must not allocate/rebind cache')
+    adapter.dummy_run(128, 8, dp_lockstep=True)
+    # Idle TP groups must also issue the LM-head collective before returning
+    # to DP coordination, or busy ranks cannot materialize their sample.
+    if tp > 1:
+        logits.assert_called_once()
+        hidden, indices = logits.call_args.args
+        assert hidden.shape == (128, 2560)
+        assert indices.shape == (8, ) and indices.dtype == torch.int32
+        assert not indices.any()
+    else:
+        logits.assert_not_called()  # TP1 has no LM-head collective to pair.
+    assert adapter.token_store is before
+    assert (adapter.token_store == 123).all()
+    kwargs = captured['model_kwargs']
+    md = captured['metadata']['gdn']
+    assert not kwargs['valid_tokens'].any()
+    assert kwargs['state_slots'].tolist() == [-1] * 8
+    assert kwargs['ngram_context'].tolist() == [[248044, 248044]] * 8
+    for value in (kwargs['query_start_loc'], kwargs['context_lens'],
+                  kwargs['main_block_table'], kwargs['compressed_block_table'],
+                  md.seq_lens, md.request_distribution,
+                  md.mamba_state_indices):
+        assert not value.any()
+    assert captured['context_kwargs']['num_tokens_across_dp'].tolist(
+    ) == [128] * 8

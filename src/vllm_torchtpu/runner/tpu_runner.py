@@ -4001,7 +4001,10 @@ class TPUModelRunner(GPUModelRunner):
         time in ms is returned once its outputs have materialized.
         """
         if (adapter := getattr(self, "model_adapter", None)) is not None:
-            return adapter.dummy_run(num_tokens, num_reqs, profile_prefix)
+            return adapter.dummy_run(num_tokens,
+                                     num_reqs,
+                                     profile_prefix,
+                                     dp_lockstep=dp_lockstep)
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 

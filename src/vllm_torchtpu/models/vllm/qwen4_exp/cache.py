@@ -13,6 +13,8 @@ from vllm_torchtpu.layers.core.attention_metadata import \
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
+from .config import native_cache_capacity
+
 logger = init_logger(__name__)
 TEMP_HEADROOM = 8 * 1024**3
 
@@ -22,8 +24,10 @@ class Qwen4ExpCache:
     def __init__(self, runner, model):
         self.runner, self.model = runner, model
         self.slots = runner.max_num_reqs + 1
-        self.pages = 1 + runner.scheduler_config.max_num_seqs * (
-            math.ceil(runner.max_model_len / 128) + 11)
+        self.pages = native_cache_capacity(
+            runner.max_model_len, runner.scheduler_config.max_num_seqs,
+            runner.vllm_config.parallel_config.tensor_parallel_size,
+            runner.cache_config.cache_dtype)
         self.owners = {}
         self.specs = {}
         self.group_ids = {}
@@ -70,12 +74,7 @@ class Qwen4ExpCache:
         runner = self.runner
         before = compute_hbm_budget([runner.device],
                                     runner.cache_config.gpu_memory_utilization)
-        # Observed-layout allowance, including independently allocated states
-        # and padding. Actual allocator deltas govern admission after materialization.
-        estimate = (12 * self.pages * (2 * 128 * 256 + 32 * 128) * 2 +
-                    36 * self.slots * (8 * 1280 + 6 * 128 * 128) * 4 +
-                    math.ceil(self.slots / 8) * 8 * 9 * 10240 * 2 +
-                    12 * self.slots * 8192)
+        estimate = self.allocation_allowance_bytes()
         if before.available < estimate + TEMP_HEADROOM:
             raise ValueError(
                 "Qwen4Exp cache allocation would consume reserved temporary headroom"
@@ -98,33 +97,47 @@ class Qwen4ExpCache:
                         ), layer.linear_attn.get_state_dtype()))
             else:
                 base_q = base + ".self_attn."
-                layer.self_attn.bind_kv_cache(
-                    (alloc(base_q + "main_k", (self.pages, 128, 1, 256),
-                           torch.bfloat16),
-                     alloc(base_q + "main_v", (self.pages, 128, 1, 256),
-                           torch.bfloat16),
-                     alloc(base_q + "compressed_k", (self.pages, 32, 1, 128),
-                           torch.bfloat16),
-                     alloc(base_q + "raw_ring", (self.slots, 8, 128),
-                           torch.bfloat16),
-                     alloc(base_q + "raw_positions", (self.slots, 8),
-                           torch.int64, -1)))
+                heads = layer.self_attn.num_kv_heads
+                auxiliary = (alloc(base_q + "compressed_k",
+                                   (self.pages, 32, 1, 128), torch.bfloat16),
+                             alloc(base_q + "raw_ring", (self.slots, 8, 128),
+                                   torch.bfloat16),
+                             alloc(base_q + "raw_positions", (self.slots, 8),
+                                   torch.int64, -1))
+                if layer.self_attn.fp8_kv:
+                    # Each word carries four FP8 bytes. K256/V256 together
+                    # fill 128 INT32 lanes without padding either half.
+                    owners = (alloc(base_q + "packed_kv",
+                                    (self.pages, 128, heads, 128),
+                                    torch.int32), *auxiliary,
+                              *(alloc(base_q + role, (self.pages * heads, 128),
+                                      torch.float32, 1)
+                                for role in ("k_scale", "v_scale")))
+                else:
+                    owners = (*(alloc(base_q + role,
+                                      (self.pages, 128, heads, 256),
+                                      torch.bfloat16)
+                                for role in ("main_k", "main_v")), *auxiliary)
+                layer.self_attn.bind_kv_cache(owners)
             if layer.ple is not None:
                 layer.ple.bind_history(
                     alloc(base + ".ple.history", (self.slots, 9, 10240),
                           torch.bfloat16))
+        fields = 133 + (12 if runner.cache_config.cache_dtype
+                        == "fp8_per_token_head" else 0)
         assert len(
-            self.owners) == 133, "Qwen4Exp must bind all 133 persistent fields"
+            self.owners) == fields, "Qwen4Exp must bind every persistent field"
         assert len({id(t)
                     for t in self.owners.values()
-                    }) == 133, "Typed owners must not alias"
+                    }) == fields, "Typed owners must not alias"
         synchronize_tensors(list(self.owners.values()))
         buffers = {
             t.untyped_storage().data_ptr()
             for t in self.owners.values()
         }
         assert len(
-            buffers) == 133, "Qwen4Exp typed owners unexpectedly share storage"
+            buffers
+        ) == fields, "Qwen4Exp typed owners unexpectedly share storage"
         after = compute_hbm_budget([runner.device],
                                    runner.cache_config.gpu_memory_utilization)
         self.physical_allocation_bytes = after.total_used - before.total_used
@@ -138,6 +151,45 @@ class Qwen4ExpCache:
             self.pages, self.slots, len(self.owners),
             self.physical_allocation_bytes, estimate, after.total_used,
             after.available, TEMP_HEADROOM)
+
+    def allocation_allowance_bytes(self):
+        """Conservative typed-owner allowance for the admitted TP1/8 shapes.
+
+        State widths/dtypes come from layers. Conv rows and PLE slots carry
+        eight-row padding allowances from the TP8 layout evidence; QSA ring
+        specs reserve 8192 bytes/slot for ring and INT64 tags. This is a
+        precheck, not a promise about TP1 lowering: materialized allocator
+        deltas and the independent 8 GiB headroom check remain authoritative.
+        """
+        total = 0
+        for i, layer in enumerate(self.model.model.layers):
+            base = f"model.layers.{i}"
+            if layer.layer_type == "linear_attention":
+                shapes = layer.linear_attn.get_state_shape()
+                dtypes = layer.linear_attn.get_state_dtype()
+                for index, (shape, dtype) in enumerate(zip(shapes, dtypes)):
+                    rows = math.ceil(shape[0] /
+                                     8) * 8 if index == 0 else shape[0]
+                    total += self.slots * rows * math.prod(
+                        shape[1:]) * (torch.finfo(dtype).bits // 8)
+            else:
+                for role in ("self_attn", "self_attn.compressed_k"):
+                    total += self.pages * self.specs[base + "." +
+                                                     role].page_size_bytes
+                if layer.self_attn.fp8_kv:
+                    # Each scale owner is [pages*H,128], with T(8,128)
+                    # allowance on its first dimension, not 128-wide head padding.
+                    total += 2 * (
+                        (-self.pages * layer.self_attn.num_kv_heads) %
+                        8) * 128 * 4
+                total += self.slots * self.specs[
+                    base + ".self_attn.raw_ring"].page_size_bytes
+            if layer.ple is not None:
+                for shape, dtype in zip(layer.ple.get_state_shape(),
+                                        layer.ple.get_state_dtype()):
+                    total += math.ceil(self.slots / 8) * 8 * math.prod(
+                        shape) * (torch.finfo(dtype).bits // 8)
+        return total
 
     def initialize(self, config):
         runner = self.runner

@@ -7,18 +7,25 @@ import torch
 from vllm.config.cache import CacheConfig
 from vllm.v1.core.kv_cache_utils import (get_kv_cache_config_from_groups,
                                          get_kv_cache_groups)
-from vllm.v1.kv_cache_interface import (CircularBufferSpec, FullAttentionSpec,
-                                        MLAAttentionSpec)
+from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 
 from vllm_torchtpu.models.vllm.qwen4_exp.cache import Qwen4ExpCache
+from vllm_torchtpu.models.vllm.qwen4_exp.config import native_cache_capacity
+from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
 
 
-@pytest.mark.parametrize('seqs,context,expected', [(1, 4096, 44),
-                                                   (8, 8192, 601),
-                                                   (64, 8192, 4801)])
-def test_native_groups_last_blocks_and_real_capacity(seqs, context, expected,
+@pytest.mark.parametrize('tp', [1, 2, 4, 8])
+@pytest.mark.parametrize('dtype', ['auto', 'fp8_per_token_head'])
+@pytest.mark.parametrize('seqs', [1, 8, 64])
+@pytest.mark.parametrize('context', [128, 4096, 8192])
+def test_native_groups_last_blocks_and_real_capacity(tp, dtype, seqs, context,
                                                      monkeypatch):
+    # TP1/2 require 36 native recurrent groups, TP4 eighteen and TP8 nine.
+    # The actual planner/allocator below independently verifies
+    # the model capacity formula, including full exhaustion and reuse.
+    expected = native_cache_capacity(context, seqs, tp, dtype)
     cc = CacheConfig(block_size=128,
+                     cache_dtype=dtype,
                      enable_prefix_caching=False,
                      mamba_cache_mode='none')
     cfg = NS(cache_config=cc,
@@ -26,26 +33,29 @@ def test_native_groups_last_blocks_and_real_capacity(seqs, context, expected,
              speculative_config=None,
              kv_transfer_config=None,
              model_config=NS(max_model_len=context),
-             parallel_config=NS(decode_context_parallel_size=1,
+             parallel_config=NS(tensor_parallel_size=tp,
+                                decode_context_parallel_size=1,
                                 prefill_context_parallel_size=1))
-    qsa = NS(get_kv_cache_spec=lambda _: FullAttentionSpec(
-        block_size=128, num_kv_heads=1, head_size=256, dtype=torch.bfloat16),
-             get_auxiliary_cache_specs=lambda: {
-                 'compressed_k':
-                 MLAAttentionSpec(block_size=128,
-                                  num_kv_heads=1,
-                                  head_size=128,
-                                  dtype=torch.bfloat16,
-                                  tokens_per_state=4),
-                 'raw_ring':
-                 CircularBufferSpec(block_size=4,
-                                    num_kv_heads=1,
-                                    head_size=132,
-                                    head_size_v=0,
-                                    dtype=torch.bfloat16,
-                                    page_size_padded=8192)
-             })
-    gdn = NS(get_state_shape=lambda: ((3, 1280), (6, 128, 128)),
+    qsa = NS(
+        num_kv_heads=max(2 // tp, 1),
+        fp8_kv=dtype == 'fp8_per_token_head',
+        get_kv_cache_spec=lambda cfg: Qwen4ExpQSA.get_kv_cache_spec(qsa, cfg),
+        get_auxiliary_cache_specs=lambda: {
+            'compressed_k':
+            MLAAttentionSpec(block_size=128,
+                             num_kv_heads=1,
+                             head_size=128,
+                             dtype=torch.bfloat16,
+                             tokens_per_state=4),
+            'raw_ring':
+            CircularBufferSpec(block_size=4,
+                               num_kv_heads=1,
+                               head_size=132,
+                               head_size_v=0,
+                               dtype=torch.bfloat16,
+                               page_size_padded=8192)
+        })
+    gdn = NS(get_state_shape=lambda: ((3, 10240 // tp), (48 // tp, 128, 128)),
              get_state_dtype=lambda: (torch.float32, torch.float32))
     ple = NS(get_state_shape=lambda: ((9, 10240), ),
              get_state_dtype=lambda: (torch.bfloat16, ))
@@ -64,8 +74,20 @@ def test_native_groups_last_blocks_and_real_capacity(seqs, context, expected,
     specs = cache.get_specs()
     groups = get_kv_cache_groups(cfg, specs)
     native = get_kv_cache_config_from_groups(cfg, groups, 32 * 1024**3)
-    assert (len(specs), len(groups), len(native.kv_cache_tensors)) == (73, 12,
-                                                                       13)
+    expected_groups = ({
+        1: 39,
+        2: 39,
+        4: 39,
+        8: 21
+    } if qsa.fp8_kv else {
+        1: 39,
+        2: 39,
+        4: 21,
+        8: 12
+    })[tp]
+    assert (len(specs), len(groups),
+            len(native.kv_cache_tensors)) == (73, expected_groups,
+                                              expected_groups + 1)
     assert native.num_blocks == expected
     assert cache.slots == max(seqs, 8) + 1
     for descriptor in native.kv_cache_tensors:
@@ -76,6 +98,13 @@ def test_native_groups_last_blocks_and_real_capacity(seqs, context, expected,
     needed = sum(
         g.kv_cache_spec.max_num_blocks_per_req(cfg, context) for g in groups)
     assert needed * seqs + 1 == expected
+    # The allowance must cover all logical owners, with actual TP widths.
+    main_bytes = 128 * qsa.num_kv_heads * (520 if qsa.fp8_kv else 1024)
+    logical = (12 * expected * (main_bytes + 32 * 128 * 2) + 36 * cache.slots *
+               (3 * (10240 // tp) +
+                (48 // tp) * 128 * 128) * 4 + cache.slots * 9 * 10240 * 2 +
+               12 * cache.slots * (8 * 128 * 2 + 8 * 8))
+    assert cache.allocation_allowance_bytes() >= logical
 
     # Static max_num_blocks_per_req is not the allocator's admission rule.
     # Exercise full-ISL admission, chunk growth, exhaustion and actual reuse.
@@ -128,6 +157,60 @@ def test_native_groups_last_blocks_and_real_capacity(seqs, context, expected,
     from vllm_torchtpu.layers.core.attention_metadata import \
         AttentionMetadataBuilderContext
     from vllm_torchtpu.models.vllm.qwen4_exp import cache as cache_module
+
+    # Exercise the actual allocation/binding path without allocating GiBs of
+    # CPU memory. Each stand-in records the requested shape/dtype and owns a
+    # distinct storage identity, just as the private allocator contract asks.
+    class Owner:
+
+        def __init__(self, shape, dtype):
+            self.shape, self.dtype = shape, dtype
+
+        def untyped_storage(self):
+            return NS(data_ptr=lambda: id(self))
+
+    def bind_qsa(owners):
+        auxiliary_shapes = [(expected, 32, 1, 128), (cache.slots, 8, 128),
+                            (cache.slots, 8)]
+        auxiliary_dtypes = [torch.bfloat16, torch.bfloat16, torch.int64]
+        if qsa.fp8_kv:
+            shapes = [(expected, 128, qsa.num_kv_heads, 128),
+                      *auxiliary_shapes,
+                      *[(expected * qsa.num_kv_heads, 128)] * 2]
+            dtypes = [
+                torch.int32, *auxiliary_dtypes, torch.float32, torch.float32
+            ]
+        else:
+            shapes = [(expected, 128, qsa.num_kv_heads, 256)
+                      ] * 2 + auxiliary_shapes
+            dtypes = [torch.bfloat16] * 2 + auxiliary_dtypes
+        assert [x.shape for x in owners] == shapes
+        assert [x.dtype for x in owners] == dtypes
+
+    qsa.bind_kv_cache = bind_qsa
+    ple.bind_history = lambda owner: None
+    runner.device = 'cpu'
+    with monkeypatch.context() as allocation_patch:
+        allocation_patch.setattr(
+            torch, 'full',
+            lambda shape, fill, dtype, device: Owner(shape, dtype))
+        allocation_patch.setattr(cache_module, 'synchronize_tensors',
+                                 lambda *args: None)
+        allocation_patch.setattr(
+            cache_module, 'compute_hbm_budget',
+            lambda *args: NS(available=64 * 1024**3, total_used=0))
+        cache.allocate()
+    assert len(cache.owners) == (145 if qsa.fp8_kv else 133)
+    assert cache.owners[
+        'model.layers.0.linear_attn.conv'].dtype == torch.float32
+    assert cache.owners[
+        'model.layers.0.linear_attn.recurrent'].dtype == torch.float32
+    assert cache.owners['model.layers.0.linear_attn.conv'].shape == (
+        cache.slots, 3, 10240 // tp)
+    assert cache.owners['model.layers.0.linear_attn.recurrent'].shape == (
+        cache.slots, 48 // tp, 128, 128)
+    assert cache.owners['model.layers.1.ple.history'].shape == (cache.slots, 9,
+                                                                10240)
     monkeypatch.setattr(cache, 'allocate', lambda: None)
     monkeypatch.setattr(cache_module, 'compute_hbm_budget',
                         lambda *args: NS(available=32 * 1024**3))

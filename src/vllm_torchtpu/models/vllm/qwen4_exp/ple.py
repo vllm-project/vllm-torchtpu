@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen4Exp resident FP8 PLE; private history-major cache and explicit metadata."""
+"""Qwen4Exp resident BF16/FP8 PLE and private history-major cache."""
 import re
 from collections.abc import Iterable
 
@@ -7,10 +7,9 @@ import torch
 from torch import nn
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 
-from vllm_torchtpu.kernels.qwen4_exp.ple import (build_lookup_op,
-                                                 build_short_conv_op,
-                                                 build_values_op,
-                                                 compute_ngram_ids)
+from vllm_torchtpu.kernels.qwen4_exp import ple as ple_kernels
+
+from .parallel import PLEParallel
 
 
 class ResidentPLEEmbedding(nn.Module):
@@ -20,6 +19,8 @@ class ResidentPLEEmbedding(nn.Module):
     the deployment's 6.4GB/rank. No decoded copy of the table is retained.
     ``load_weights`` accepts names relative to ``ngram_embedding.`` and
     accounts for every supplied global shard, including non-owned shards.
+    ``tp_rank/tp_size`` describe the embedding partition (ETP), which may
+    differ from ordinary model TP when embedding_across_dp is enabled.
     """
 
     def __init__(self,
@@ -51,10 +52,13 @@ class ResidentPLEEmbedding(nn.Module):
             "weight_scale", torch.empty(1, dtype=torch.bfloat16,
                                         device=device))
         self._staging = None
+        self._weight_dtype = None
         self._scale = None
         self._shards = set()
         self._finalized = False
         self._lookup = None
+        self._raw_lookup = None
+        self._decode = None
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -63,6 +67,9 @@ class ResidentPLEEmbedding(nn.Module):
         loaded = set()
         for name, tensor in weights:
             if name == "weight_scale":
+                if self._weight_dtype == torch.bfloat16:
+                    raise ValueError(
+                        "BF16 PLE must not have an FP8 weight_scale")
                 if tensor.shape != (1, ) or tensor.dtype != torch.bfloat16:
                     raise ValueError(
                         "PLE weight_scale must be a BF16 [1] global scale")
@@ -89,10 +96,18 @@ class ResidentPLEEmbedding(nn.Module):
                 raise ValueError(f"Duplicate PLE checkpoint shard {index}")
             start = index * self.shard_rows
             rows = max(0, min(self.shard_rows, self.total_rows - start))
-            if tensor.shape != (rows,
-                                160) or tensor.dtype != torch.float8_e4m3fn:
+            if tensor.shape != (rows, 160) or tensor.dtype not in (
+                    torch.float8_e4m3fn, torch.bfloat16):
                 raise ValueError(
-                    f"PLE shard {index} requires FP8 e4m3fn [{rows},160]")
+                    f"PLE shard {index} requires BF16 or FP8 e4m3fn [{rows},160]"
+                )
+            if self._weight_dtype not in (None, tensor.dtype):
+                raise ValueError("PLE checkpoint shards must have one dtype")
+            if tensor.dtype == torch.bfloat16 and self._scale is not None:
+                raise ValueError("BF16 PLE must not have an FP8 weight_scale")
+            self._weight_dtype = tensor.dtype
+            carrier = (torch.int16
+                       if tensor.dtype == torch.bfloat16 else torch.uint8)
             overlap = compute_ple_shard_overlap(checkpoint_start=start,
                                                 checkpoint_rows=rows,
                                                 tp_start=self.vocab_start,
@@ -101,11 +116,10 @@ class ResidentPLEEmbedding(nn.Module):
             if overlap is not None:
                 if self._staging is None:
                     self._staging = torch.empty((self.local_rows, 160),
-                                                dtype=torch.uint8,
+                                                dtype=carrier,
                                                 device="cpu")
-                source = tensor.detach().narrow(0, overlap.source_start,
-                                                overlap.row_count).view(
-                                                    torch.uint8)
+                source = tensor.detach().narrow(
+                    0, overlap.source_start, overlap.row_count).view(carrier)
                 self._staging.narrow(0, overlap.destination_start,
                                      overlap.row_count).copy_(source)
             self._shards.add(index)
@@ -119,20 +133,34 @@ class ResidentPLEEmbedding(nn.Module):
         if missing:
             raise ValueError(
                 f"Missing PLE checkpoint shards: {sorted(missing)}")
-        if self._scale is None:
+        if self._weight_dtype == torch.float8_e4m3fn and self._scale is None:
             raise ValueError("Missing PLE global weight_scale")
         assert self._staging is not None, "Complete checkpoint must cover this TP range"
         self.table = self._staging.reshape(-1,
                                            128).to(device=self.table.device)
-        self.weight_scale.copy_(self._scale)
+        if self._scale is None:
+            self.weight_scale.fill_(1)
+        else:
+            self.weight_scale.copy_(self._scale)
         self._staging = None
         self._scale = None
-        self._lookup = build_lookup_op(self.vocab_start, self.local_rows)
+        self._lookup = ple_kernels.build_lookup_op(self.vocab_start,
+                                                   self.local_rows)
+        self._raw_lookup = ple_kernels.build_raw_lookup_op(
+            self.vocab_start, self.local_rows)
+        self._decode = ple_kernels.build_decode_op()
         self._finalized = True
 
     def forward(self, ids):
         assert self._finalized, "PLE finalize_weights must run before inference"
         return self._lookup(self.table, ids, self.weight_scale)
+
+    def lookup_raw(self, ids):
+        assert self._finalized, "PLE finalize_weights must run before inference"
+        return self._raw_lookup(self.table, ids)
+
+    def decode(self, raw_embeddings):
+        return self._decode(raw_embeddings, self.weight_scale)
 
 
 class _HashEmbedding(nn.Module):
@@ -148,15 +176,17 @@ class _HashEmbedding(nn.Module):
                                                     tp_size=tp_size,
                                                     device=device)
 
-    def forward(self, tokens, starts, context, eos_token_id):
-        ids = compute_ngram_ids(tokens,
-                                starts,
-                                context,
-                                self.layer_multipliers,
-                                self.ngram_heads_vocab_sizes,
-                                self.ngram_heads_offsets,
-                                eos_token_id=eos_token_id)
-        return self.ngram_embedding(ids)
+    def forward(self, tokens, starts, context, eos_token_id, valid_tokens):
+        ids = ple_kernels.compute_ngram_ids(tokens,
+                                            starts,
+                                            context,
+                                            self.layer_multipliers,
+                                            self.ngram_heads_vocab_sizes,
+                                            self.ngram_heads_offsets,
+                                            eos_token_id=eos_token_id)
+        # Keep the signed INT64 hash through remainder, then use the bounded
+        # global IDs as an INT32 collective carrier. Padding has no owner.
+        return torch.where(valid_tokens[:, None], ids, -1).to(torch.int32)
 
 
 class _NormWeight(nn.Module):
@@ -170,7 +200,7 @@ class _NormWeight(nn.Module):
 
 
 class Qwen4ExpPLE(nn.Module):
-    """S1 TP8/DP1 PLE delta; caller adds the hidden residual exactly once.
+    """Resident PLE delta; caller adds the hidden residual exactly once.
 
     Loader names are relative to ``model.language_model.layers.1.ple.``.
     Construct/load on CPU then move and finalize, or construct on device and
@@ -181,16 +211,15 @@ class Qwen4ExpPLE(nn.Module):
 
     def __init__(self,
                  *,
-                 tp_rank: int,
-                 tp_size: int = 8,
+                 parallel: PLEParallel,
                  device=None,
                  prefix: str = "",
                  eos_token_id: int = 248044):
         super().__init__()
-        if tp_size != 8 or not 0 <= tp_rank < tp_size:
-            raise ValueError("Qwen4Exp S1 PLE requires TP8")
+        self.parallel = parallel
         self.prefix, self.eos_token_id = prefix, eos_token_id
-        self.ple_embedding = _HashEmbedding(tp_rank, tp_size, device)
+        self.ple_embedding = _HashEmbedding(parallel.rank, parallel.world_size,
+                                            device)
         self.key_proj = nn.Linear(2560,
                                   10240,
                                   bias=False,
@@ -275,19 +304,22 @@ class Qwen4ExpPLE(nn.Module):
                 sizes.sum()) > embedding.ngram_embedding.total_rows:
             raise ValueError("Invalid PLE checkpoint vocabulary sizes/offsets")
         embedding.ngram_embedding.finalize_weights()
-        self._values, self._conv = build_values_op(), build_short_conv_op()
+        self._values, self._conv = ple_kernels.build_values_op(
+        ), ple_kernels.build_short_conv_op()
         self._finalized = True
 
     def forward(self, hidden_states, input_ids, query_start_loc, ngram_context,
-                state_indices, has_initial_states):
-        from vllm.distributed import tensor_model_parallel_all_reduce
-
+                state_indices, has_initial_states, valid_tokens):
         assert self._finalized, "PLE finalize_weights must run before inference"
         assert len(
             self.kv_cache) == 1, "PLE history must be bound before inference"
-        embeddings = self.ple_embedding(input_ids, query_start_loc,
-                                        ngram_context, self.eos_token_id)
-        embeddings = tensor_model_parallel_all_reduce(embeddings)
+        ids = self.ple_embedding(input_ids, query_start_loc, ngram_context,
+                                 self.eos_token_id, valid_tokens)
+        ids = self.parallel.gather_ids(ids)
+        embedding = self.ple_embedding.ngram_embedding
+        raw = embedding.lookup_raw(ids)
+        raw = self.parallel.combine(raw, input_ids.shape[0])
+        embeddings = embedding.decode(raw)
         gated, normalized = self._values(embeddings, hidden_states,
                                          self.key_proj.weight,
                                          self.value_proj.weight,

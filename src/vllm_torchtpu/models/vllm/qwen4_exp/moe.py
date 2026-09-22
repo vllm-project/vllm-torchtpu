@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen4Exp EP8 W8A16 experts, FP32 routing/combine and BF16 shared expert.
 
-S1 owns identical tokens on TP8/DP1 ranks. Each rank computes 64 complete
-experts, then the existing TP group sums FP32 contributions. The replicated
-shared expert is added once, after that collective. DP token exchange belongs
-to the later model admission/integration, not this local math component.
+Router/shared work stays local. The existing EP group dispatches physical DP
+slots to complete owned experts and combines FP32 weighted contributions.
+The TP sum preserves TP8/DP1 semantics; TP1 adds its local shared expert once.
 """
 import functools
 from collections.abc import Iterable
@@ -128,8 +127,51 @@ class _SharedExpert(nn.Module):
                           device=device))
 
 
+@functools.cache
+def build_local_routing_op():
+
+    def fn(
+        x: jax.Array, router: jax.Array, gate: jax.Array, up: jax.Array,
+        down: jax.Array, shared_gate: jax.Array, valid_tokens: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        # GDN need not initialize padding output. Zero it before routing and
+        # remote expert computation, without changing any valid row's math.
+        x = jnp.where(valid_tokens[:, None], x, 0)
+        probs, ids, _ = route_tokens(x, router, valid_tokens)
+        shared = shared_expert(x, gate, up, down, shared_gate)
+        return x, probs, ids, jnp.where(valid_tokens[:, None], shared, 0)
+
+    op = pallas.jax_op("qwen4_exp::moe_local_routes_shared", fn)
+
+    @op.register_fake
+    def fake(x, *args):
+        return (torch.empty_like(x),
+                x.new_empty((x.shape[0], 10), dtype=torch.float32),
+                x.new_empty((x.shape[0], 10),
+                            dtype=torch.int32), torch.empty_like(x))
+
+    return op
+
+
+@functools.cache
+def build_routed_experts_op():
+
+    def fn(x: jax.Array, w13: jax.Array, s13: jax.Array, w2: jax.Array,
+           s2: jax.Array, probs: jax.Array, ids: jax.Array,
+           experts_start: jax.Array) -> jax.Array:
+        return routed_experts(x, w13, s13, w2, s2, probs, ids, experts_start)
+
+    op = pallas.jax_op("qwen4_exp::moe_owned_w8a16_experts", fn)
+
+    @op.register_fake
+    def fake(x, *args):
+        return torch.empty_like(x, dtype=torch.float32)
+
+    return op
+
+
 class Qwen4ExpSparseMoeBlock(nn.Module):
-    """Direct Task4 entry for the admitted TP8/DP1/EP8 deployment.
+    """Complete owned experts for the admitted TP8/DP1 or TP1/DP8 deployment.
 
     ``load_weights`` takes names relative to ``mlp.`` in arbitrary order.
     ``finalize_weights`` verifies every owned tensor was supplied and builds
@@ -174,7 +216,8 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                              requires_grad=False))
         self._pending = {}
         self._loaded = set()
-        self._op = None
+        self._local_op = None
+        self._experts_op = None
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -245,17 +288,23 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 nn.Parameter(value.to(self.gate.weight.device),
                              requires_grad=False))
         self._packed.clear()
-        self._op = build_moe_op()
+        self._local_op = build_local_routing_op()
+        self._experts_op = build_routed_experts_op()
 
     def forward(self, hidden_states, valid_tokens):
-        from vllm.distributed import tensor_model_parallel_all_reduce
+        from vllm.distributed import (get_ep_group,
+                                      tensor_model_parallel_all_reduce)
 
-        routed, shared = self._op(hidden_states, self.gate.weight, self.w13,
-                                  self.s13, self.w2, self.s2,
-                                  self.shared_expert.gate_proj.weight,
-                                  self.shared_expert.up_proj.weight,
-                                  self.shared_expert.down_proj.weight,
-                                  self.shared_expert_gate.weight,
-                                  self.experts_start, valid_tokens)
+        x, probs, ids, shared = self._local_op(
+            hidden_states, self.gate.weight,
+            self.shared_expert.gate_proj.weight,
+            self.shared_expert.up_proj.weight,
+            self.shared_expert.down_proj.weight,
+            self.shared_expert_gate.weight, valid_tokens)
+        ep = get_ep_group()
+        x, probs, ids = ep.dispatch(x, probs, ids)
+        routed = self._experts_op(x, self.w13, self.s13, self.w2, self.s2,
+                                  probs, ids, self.experts_start)
+        routed = ep.combine(routed)
         routed = tensor_model_parallel_all_reduce(routed).to(torch.bfloat16)
         return routed + shared

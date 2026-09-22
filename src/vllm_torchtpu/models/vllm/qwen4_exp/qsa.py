@@ -11,7 +11,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                ReplicatedLinear)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (CircularBufferSpec, FullAttentionSpec,
-                                        MLAAttentionSpec)
+                                        KVQuantMode, MLAAttentionSpec)
 
 from vllm_torchtpu.kernels.qwen4_exp.qsa import build_qsa_op
 
@@ -46,7 +46,7 @@ def make_rope_cache(max_positions: int = 8192):
 
 class Qwen4ExpQSABackend(AttentionBackend):
     supported_dtypes = [torch.bfloat16]
-    supported_kv_cache_dtypes = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes = ["auto", "bfloat16", "fp8_per_token_head"]
 
     @staticmethod
     def get_name():
@@ -124,11 +124,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                  tp_rank: int,
                  tp_size: int = 8,
                  device=None,
+                 cache_dtype: str = "auto",
                  prefix: str = ""):
         super().__init__()
         if tp_size not in (1, 2, 4, 8) or not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires TP1/2/4/8 and an in-range rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
+        self.fp8_kv = cache_dtype == "fp8_per_token_head"
         self.num_heads, self.num_kv_heads = 24 // tp_size, max(2 // tp_size, 1)
         kv_size, kv_rank = min(tp_size, 2), tp_rank // max(tp_size // 2, 1)
         with torch.device(device or "cpu"):
@@ -171,16 +173,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                              persistent=False)
         self.kv_cache = ()
         self._loaded = set()
-        self._op = build_qsa_op()
+        self._op = build_qsa_op(self.fp8_kv)
 
     def get_attn_backend(self):
         return Qwen4ExpQSABackend
 
     def get_kv_cache_spec(self, vllm_config):
-        return FullAttentionSpec(block_size=128,
-                                 num_kv_heads=self.num_kv_heads,
-                                 head_size=256,
-                                 dtype=torch.bfloat16)
+        return FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=self.num_kv_heads,
+            head_size=256,
+            dtype=torch.float8_e4m3fn if self.fp8_kv else torch.bfloat16,
+            kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD
+            if self.fp8_kv else KVQuantMode.NONE,
+            state_content_bytes=520 if self.fp8_kv else None)
 
     def get_auxiliary_cache_specs(self):
         """Planner discovers side owners without registering public GPU classes.
@@ -212,19 +218,29 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         }
 
     def bind_kv_cache(self, kv_cache):
-        if len(kv_cache) != 5:
+        if len(kv_cache) != (6 if self.fp8_kv else 5):
             raise ValueError(
-                "QSA binds main K, main V, compressed K, raw ring, raw positions"
-            )
-        k, v, c, r, p = kv_cache
-        if (k.ndim != 4 or k.shape[1:] != (128, self.num_kv_heads, 256)
-                or v.shape != k.shape or c.ndim != 4
-                or c.shape[1:] != (32, 1, 128) or r.ndim != 3
-                or r.shape[1:] != (8, 128) or p.shape != r.shape[:2]
-                or p.dtype != torch.int64 or any(x.dtype != torch.bfloat16
-                                                 for x in (k, v, c, r))):
+                "QSA cache owner count does not match its precision")
+        if self.fp8_kv:
+            packed, c, r, p, ks, vs = kv_cache
+            main_valid = (packed.ndim == 4
+                          and packed.shape[1:] == (128, self.num_kv_heads, 128)
+                          and packed.dtype == torch.int32 and all(
+                              x.shape == (packed.shape[0] * self.num_kv_heads,
+                                          128) and x.dtype == torch.float32
+                              for x in (ks, vs)))
+        else:
+            k, v, c, r, p = kv_cache
+            main_valid = (k.ndim == 4
+                          and k.shape[1:] == (128, self.num_kv_heads, 256)
+                          and v.shape == k.shape
+                          and k.dtype == v.dtype == torch.bfloat16)
+        if (not main_valid or c.ndim != 4 or c.shape[1:] != (32, 1, 128)
+                or r.ndim != 3 or r.shape[1:] != (8, 128)
+                or p.shape != r.shape[:2] or p.dtype != torch.int64
+                or c.dtype != torch.bfloat16 or r.dtype != torch.bfloat16):
             raise ValueError(
-                "QSA requires typed P128 BF16 caches, R8 raw storage and int64 positions"
+                "QSA requires P128 main owners, FP32 scales for packed FP8, BF16 indexer and int64 tags"
             )
         self.kv_cache = tuple(kv_cache)
 
@@ -269,9 +285,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
     def forward_with_indices(self, hidden, positions, metadata: QSAMetadata):
-        assert len(
-            self.kv_cache
-        ) == 5, "Task4 must bind real or profiling scratch QSA owners"
+        assert len(self.kv_cache) == (
+            6 if self.fp8_kv else
+            5), "Task4 must bind real or profiling scratch QSA owners"
         output, selected = self._op(
             self.q_proj(hidden), self.k_proj(hidden), self.v_proj(hidden),
             self.indexer.index_qk_proj(hidden), self.q_norm.weight,

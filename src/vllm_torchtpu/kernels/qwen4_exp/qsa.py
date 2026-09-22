@@ -92,6 +92,14 @@ def _token_metadata(count, starts, context, slots):
     return req, logical, valid
 
 
+def quantize_kv(value):
+    """vLLM per-token-head E4M3 contract; scale is FP32, separate for K/V."""
+    value = value.astype(jnp.float32)
+    scale = jnp.maximum(jnp.max(jnp.abs(value), axis=-1) * jnp.float32(1 / 448), 1e-6)
+    encoded = jnp.clip(value * (1 / scale[..., None]), -448, 448)
+    return encoded.astype(jnp.float8_e4m3fn), scale
+
+
 def update_caches(
     key,
     value,
@@ -120,12 +128,45 @@ def update_caches(
     if count == 0 or len(slots) == 0:
         return main_k, main_v, compressed, ring, tags
     req, logical, valid = _token_metadata(count, starts, context, slots)
-    safe_slots = jnp.maximum(slots, 0)
     page = main_table[req, logical // 128]
     page = jnp.where(valid, page, main_k.shape[0])
     main_k = main_k.at[page, logical % 128].set(key, mode="drop")
     main_v = main_v.at[page, logical % 128].set(value, mode="drop")
 
+    compressed, ring, tags = _update_indexer(
+        raw,
+        positions,
+        compressed,
+        ring,
+        tags,
+        norm_k,
+        trig,
+        starts,
+        context,
+        slots,
+        compressed_table,
+    )
+    return main_k, main_v, compressed, ring, tags
+
+
+def _update_indexer(
+    raw,
+    positions,
+    compressed,
+    ring,
+    tags,
+    norm_k,
+    trig,
+    starts,
+    context,
+    slots,
+    compressed_table,
+):
+    count = len(raw)
+    if count == 0 or len(slots) == 0:
+        return compressed, ring, tags
+    req, logical, valid = _token_metadata(count, starts, context, slots)
+    safe_slots = jnp.maximum(slots, 0)
     group_start = logical // 4 * 4
     members = group_start[:, None] + jnp.arange(4)[None]
     chunk_indices = starts[req, None] + members - context[req, None]
@@ -168,7 +209,70 @@ def update_caches(
     dest = jnp.where((lengths > 0) & (slots >= 0), slots, ring.shape[0])
     ring = ring.at[dest].set(rr, mode="drop")
     tags = tags.at[dest].set(tt, mode="drop")
-    return main_k, main_v, compressed, ring, tags
+    return compressed, ring, tags
+
+
+def pack_fp8_kv(key, value):
+    """K256/V256 FP8 bytes -> 128 INT32 words, with no arithmetic conversion."""
+    joined = jnp.concatenate((key, value), axis=-1)
+    return jax.lax.bitcast_convert_type(
+        joined.reshape(*joined.shape[:-1], 128, 4), jnp.int32
+    )
+
+
+def unpack_fp8_kv(words):
+    joined = jax.lax.bitcast_convert_type(words, jnp.float8_e4m3fn).reshape(
+        *words.shape[:-1], 512
+    )
+    return joined[..., :256], joined[..., 256:]
+
+
+def update_caches_fp8(
+    key,
+    value,
+    raw,
+    positions,
+    packed_kv,
+    compressed,
+    ring,
+    tags,
+    k_scale,
+    v_scale,
+    norm_k,
+    trig,
+    starts,
+    context,
+    slots,
+    main_table,
+    compressed_table,
+):
+    if len(raw) == 0 or len(slots) == 0:
+        return packed_kv, compressed, ring, tags, k_scale, v_scale
+    req, logical, valid = _token_metadata(len(raw), starts, context, slots)
+    page = jnp.where(valid, main_table[req, logical // 128], packed_kv.shape[0])
+    key, ks = quantize_kv(key)
+    value, vs = quantize_kv(value)
+    packed_kv = packed_kv.at[page, logical % 128].set(
+        pack_fp8_kv(key, value), mode="drop"
+    )
+    heads = packed_kv.shape[2]
+    rows = page[:, None] * heads + jnp.arange(heads)[None]
+    k_scale = k_scale.at[rows, logical[:, None] % 128].set(ks, mode="drop")
+    v_scale = v_scale.at[rows, logical[:, None] % 128].set(vs, mode="drop")
+    compressed, ring, tags = _update_indexer(
+        raw,
+        positions,
+        compressed,
+        ring,
+        tags,
+        norm_k,
+        trig,
+        starts,
+        context,
+        slots,
+        compressed_table,
+    )
+    return packed_kv, compressed, ring, tags, k_scale, v_scale
 
 
 def select_groups(query, compressed, logical):
@@ -220,6 +324,9 @@ def qsa_attention(
     slots,
     main_table,
     compressed_table,
+    k_scale=None,
+    v_scale=None,
+    packed_kv=None,
 ):
     """Only selected-token softmax; at most eight queries gather KV together."""
     count = len(q)
@@ -242,7 +349,8 @@ def qsa_attention(
         pad(valid, False).reshape(-1, 8),
     )
     group_ids = jnp.arange(compressed_table.shape[1] * 32, dtype=jnp.int32)
-    head_map = jnp.arange(q.shape[1]) // (q.shape[1] // main_k.shape[2])
+    heads = (main_k if packed_kv is None else packed_kv).shape[2]
+    head_map = jnp.arange(q.shape[1]) // (q.shape[1] // heads)
 
     def attend(args):
         qq, indexq, gg, rr, pp, vv = args
@@ -252,8 +360,17 @@ def qsa_attention(
         selected = jnp.where(vv[:, None], selected, -1)
         safe = jnp.maximum(selected, 0)
         pages = main_table[rr[:, None], safe // 128]
-        key = main_k[pages, safe % 128][:, :, head_map, :]
-        value = main_v[pages, safe % 128][:, :, head_map, :]
+        if packed_kv is None:
+            key = main_k[pages, safe % 128]
+            value = main_v[pages, safe % 128]
+        else:
+            key, value = unpack_fp8_kv(packed_kv[pages, safe % 128])
+            rows = pages[..., None] * heads + jnp.arange(heads)
+            ks = k_scale[rows, (safe % 128)[..., None]]
+            vs = v_scale[rows, (safe % 128)[..., None]]
+            key = bf16(key.astype(jnp.float32) * ks[..., None])
+            value = bf16(value.astype(jnp.float32) * vs[..., None])
+        key, value = key[:, :, head_map, :], value[:, :, head_map, :]
         score = (
             jnp.einsum(
                 "qhd,qshd->qhs",
@@ -336,8 +453,179 @@ def qsa_step(
     return (*state, output.reshape(len(qgate), qgate.shape[1] // 2), selected)
 
 
+def qsa_step_fp8(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    packed_kv: jax.Array,
+    compressed: jax.Array,
+    ring: jax.Array,
+    tags: jax.Array,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    slots: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
+    q, k, v, gate, iq, raw = produce(
+        qgate, key, value, index_qk, nq, nk, niq, positions, trig
+    )
+    state = update_caches_fp8(
+        k,
+        v,
+        raw,
+        positions,
+        packed_kv,
+        compressed,
+        ring,
+        tags,
+        k_scale,
+        v_scale,
+        nik,
+        trig,
+        starts,
+        context,
+        slots,
+        main_table,
+        compressed_table,
+    )
+    output, selected = qsa_attention(
+        q,
+        iq,
+        gate,
+        None,
+        None,
+        state[1],
+        starts,
+        context,
+        slots,
+        main_table,
+        compressed_table,
+        k_scale=state[4],
+        v_scale=state[5],
+        packed_kv=state[0],
+    )
+    return (*state, output.reshape(len(qgate), qgate.shape[1] // 2), selected)
+
+
 @functools.cache
-def build_qsa_op():
+def build_fp8_qsa_op():
+    op = pallas.jax_op(
+        "qwen4_exp::qsa_sparse_fp8_packed",
+        qsa_step_fp8,
+        donate_argnums=(10, 11, 12, 13, 14, 15),
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        packed_kv,
+        compressed,
+        ring,
+        tags,
+        k_scale,
+        v_scale,
+        *metadata,
+    ):
+        return (
+            *(
+                torch.empty_like(x)
+                for x in (packed_kv, compressed, ring, tags, k_scale, v_scale)
+            ),
+            qgate.new_empty((qgate.shape[0], qgate.shape[1] // 2)),
+            positions.new_empty((qgate.shape[0], 2051)),
+        )
+
+    def run(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        packed_kv,
+        compressed,
+        ring,
+        tags,
+        k_scale,
+        v_scale,
+        starts,
+        context,
+        slots,
+        main_table,
+        compressed_table,
+    ):
+        planes = torch.stack((tags.to(torch.int32), (tags >> 32).to(torch.int32)), -1)
+        packed, c, r, p, ks, vs, output, selected = op(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions.to(torch.int32),
+            trig,
+            packed_kv,
+            compressed,
+            ring,
+            planes,
+            k_scale,
+            v_scale,
+            starts.to(torch.int32),
+            context.to(torch.int32),
+            slots.to(torch.int32),
+            main_table.to(torch.int32),
+            compressed_table.to(torch.int32),
+        )
+        for owner, updated in zip(
+            (packed_kv, compressed, ring, k_scale, v_scale), (packed, c, r, ks, vs)
+        ):
+            owner.copy_(updated)
+        tags.copy_(
+            (p[..., 1].to(torch.int64) << 32) | (p[..., 0].to(torch.int64) & 0xFFFFFFFF)
+        )
+        return output, selected
+
+    return run
+
+
+@functools.cache
+def build_qsa_op(fp8_kv=False):
+    if fp8_kv:
+        return build_fp8_qsa_op()
     op = pallas.jax_op(
         "qwen4_exp::qsa_sparse", qsa_step, donate_argnums=(10, 11, 12, 13, 14)
     )

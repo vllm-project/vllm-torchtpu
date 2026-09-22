@@ -87,8 +87,15 @@ class Qwen4ExpAdapter:
                     main_block_table=tables[0],
                     compressed_block_table=tables[1])
 
-    def dummy_run(self, num_tokens, num_reqs, profile_prefix=None):
+    def dummy_run(self,
+                  num_tokens,
+                  num_reqs,
+                  profile_prefix=None,
+                  *,
+                  dp_lockstep=False):
         runner = self.runner
+        if dp_lockstep:
+            return self._idle_run(num_tokens, num_reqs)
         assert runner.input_batch.num_reqs == 0, "S1 dummy calls require no live requests"
         self.cache.allocate()
         lengths = dummy_query_lengths(num_tokens, num_reqs,
@@ -142,7 +149,6 @@ class Qwen4ExpAdapter:
                                      query_start_loc=starts,
                                      request_distribution=distribution,
                                      mamba_state_indices=slots.clamp(min=0))
-        per_layer = {name: metadata for name in self.cache.specs}
         self.token_store = torch.zeros_like(
             runner.input_batch.token_ids_cpu_tensor,
             device="cpu").to(runner.device)
@@ -162,13 +168,77 @@ class Qwen4ExpAdapter:
         ids = (
             torch.arange(num_tokens, dtype=torch.int32, device=runner.device) *
             37 + 17) % 248320
-        with set_forward_context(per_layer, runner.vllm_config, num_tokens=num_tokens), \
+        return self._dummy_forward(ids, positions, kwargs, metadata,
+                                   num_tokens, profile_prefix)
+
+    def _idle_run(self, num_tokens, num_reqs):
+        """Participate in remote work without touching local live owners."""
+        device = self.runner.device
+        starts = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
+        context = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+        slots = torch.full((num_reqs, ), -1, dtype=torch.int32, device=device)
+        positions = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        table = torch.zeros(
+            (num_reqs, math.ceil(self.runner.max_model_len / 128)),
+            dtype=torch.int32,
+            device=device)
+        metadata = AttentionMetadata(
+            input_positions=positions,
+            block_tables=table.reshape(-1),
+            seq_lens=torch.zeros(num_reqs, dtype=torch.int32, device=device),
+            query_start_loc=starts,
+            request_distribution=torch.zeros(3,
+                                             dtype=torch.int32,
+                                             device=device),
+            mamba_state_indices=torch.zeros_like(slots))
+        kwargs = dict(query_start_loc=starts,
+                      ngram_context=torch.full((num_reqs, 2),
+                                               248044,
+                                               dtype=torch.int64,
+                                               device=device),
+                      state_slots=slots,
+                      context_lens=context,
+                      valid_tokens=torch.zeros(num_tokens,
+                                               dtype=torch.bool,
+                                               device=device),
+                      main_block_table=table,
+                      compressed_block_table=table)
+        return self._dummy_forward(torch.zeros_like(positions),
+                                   positions,
+                                   kwargs,
+                                   metadata,
+                                   num_tokens,
+                                   None,
+                                   dp_lockstep=True)
+
+    def _dummy_forward(self,
+                       ids,
+                       positions,
+                       kwargs,
+                       metadata,
+                       num_tokens,
+                       profile_prefix,
+                       *,
+                       dp_lockstep=False):
+        runner = self.runner
+        per_layer = {name: metadata for name in self.cache.specs}
+        with set_forward_context(per_layer, runner.vllm_config, num_tokens=num_tokens,
+                                 num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens)), \
                 set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=runner.vllm_config):
             started = time.perf_counter()
             out, _ = runner.forward_model(input_ids=ids,
                                           positions=positions,
                                           model_kwargs=kwargs)
-            synchronize_tensors(out)
+            if dp_lockstep and runner.parallel_config.tensor_parallel_size > 1:
+                # Match the generic runner's idle-DP protocol. The LM head
+                # has a TP collective even when this DP has no live tokens;
+                # omitting it leaves busy DP engines waiting on their logits.
+                indices = torch.zeros(kwargs["state_slots"].shape[0],
+                                      dtype=torch.int32,
+                                      device=out.device)
+                runner.compute_selected_logits(out, indices)
+            else:
+                synchronize_tensors(out)
         runner._hidden_states_dtype = out.dtype
         return (time.perf_counter() -
                 started) * 1000 if profile_prefix is not None else None

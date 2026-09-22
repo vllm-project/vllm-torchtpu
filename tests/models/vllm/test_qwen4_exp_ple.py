@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent PLE hash, checkpoint bytes and request-owned history contracts."""
 import os
+from types import SimpleNamespace as NS
 
 import jax.numpy as jnp
 import numpy as np
@@ -8,7 +9,11 @@ import pytest
 import torch
 
 from vllm_torchtpu.kernels.qwen4_exp.ple import (compute_ngram_ids,
-                                                 resident_lookup, short_conv)
+                                                 decode_embeddings,
+                                                 resident_lookup,
+                                                 resident_lookup_raw,
+                                                 short_conv)
+from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import ResidentPLEEmbedding
 
 TPU = pytest.mark.skipif(os.environ.get("Q38_TEST_TPU") != "1",
@@ -199,6 +204,68 @@ def test_loader_missing_conflicting_and_invalid_weights_fail():
         m.finalize_weights()
     with pytest.raises(ValueError, match="FP8"):
         new().load_weights([(weights[0][0], weights[0][1].float())])
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_bf16_checkpoint_lookup_preserves_bits_without_scale(rank):
+    # Includes signed zero, infinities and NaN payloads: transport must not
+    # numerically add/dequantize the embedding. Uneven checkpoint partitions
+    # also cut through complete resident four-row groups.
+    bits = torch.arange(48 * 160).mul(37).to(torch.int16).reshape(48, 160)
+    embedding = ResidentPLEEmbedding(tp_rank=rank,
+                                     tp_size=4,
+                                     total_rows=48,
+                                     checkpoint_shards=5,
+                                     device="cpu")
+    weights = [(f"shard_{i}.weight",
+                bits[i * 10:min((i + 1) * 10, 48)].view(torch.bfloat16))
+               for i in range(5)]
+    embedding.load_weights(reversed(weights))
+    embedding.finalize_weights()
+    actual_table = embedding.table.reshape(12, 160).view(torch.int16)
+    torch.testing.assert_close(actual_table,
+                               bits[rank * 12:(rank + 1) * 12],
+                               rtol=0,
+                               atol=0)
+    assert embedding._staging is None
+    ids = np.resize(np.array([-1, 0, 11, 12, 23, 24, 35, 36, 47, 48]), (7, 16))
+    raw = resident_lookup_raw(jnp.asarray(embedding.table.numpy()),
+                              jnp.asarray(ids),
+                              vocab_start=rank * 12,
+                              local_rows=12)
+    owned = (ids >= rank * 12) & (ids < (rank + 1) * 12)
+    expected = np.where(owned[..., None],
+                        bits.numpy()[ids.clip(0, 47)], 0).reshape(7, -1)
+    assert raw.dtype == jnp.int16
+    np.testing.assert_array_equal(np.asarray(raw), expected)
+    decoded = decode_embeddings(raw, jnp.ones(1, jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(decoded).view(np.int16), expected)
+
+
+def test_bf16_checkpoint_rejects_mixed_dtype_or_fp8_scale():
+
+    def new():
+        return ResidentPLEEmbedding(tp_rank=0,
+                                    tp_size=1,
+                                    total_rows=8,
+                                    checkpoint_shards=2,
+                                    device="cpu")
+
+    bf16 = torch.ones((4, 160), dtype=torch.bfloat16)
+    embedding = new()
+    embedding.load_weights([("shard_0.weight", bf16)])
+    with pytest.raises(ValueError, match="dtype"):
+        embedding.load_weights([("shard_1.weight",
+                                 bf16.to(torch.float8_e4m3fn))])
+    with pytest.raises(ValueError, match="scale"):
+        embedding.load_weights([("weight_scale",
+                                 torch.ones(1, dtype=torch.bfloat16))])
+    embedding = new()
+    embedding.load_weights([("weight_scale", torch.ones(1,
+                                                        dtype=torch.bfloat16))
+                            ])
+    with pytest.raises(ValueError, match="scale"):
+        embedding.load_weights([("shard_0.weight", bf16)])
 
 
 def conv_reference(x, weight, state, starts, slots, initial):
@@ -464,7 +531,11 @@ def test_full_resident_tpu_carrier_high_addresses():
 
 def test_module_checkpoint_names_missing_hash_and_history_binding():
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLE
-    module = Qwen4ExpPLE(tp_rank=0, device="cpu")
+    local = NS(rank_in_group=0, world_size=1, all_reduce=lambda x: x)
+    module = Qwen4ExpPLE(parallel=PLEParallel(local,
+                                              local,
+                                              embedding_across_dp=False),
+                         device="cpu")
     assert module.get_state_shape() == ((9, 10240), )
     assert module.get_state_dtype() == (torch.bfloat16, )
     state = torch.zeros(3, 9, 10240, dtype=torch.bfloat16)
@@ -498,3 +569,42 @@ def test_module_checkpoint_names_missing_hash_and_history_binding():
                                    atol=0)
     with pytest.raises(ValueError, match="shards"):
         module.finalize_weights()
+
+
+def test_raw_owner_bytes_all_encodings_padding_and_single_scale():
+    # Every FP8 bit encoding (including signed zero/NaNs) must survive the
+    # owner sum. Numerical assertions apply only to finite encodings.
+    bits = np.resize(np.arange(256, dtype=np.uint8), (256, 160))
+    ids = np.resize(
+        np.array(
+            [-1, 0, 3, 31, 32, 63, 64, 127, 128, 191, 192, 223, 224, 254,
+             255]), (7, 16))
+    parts = [
+        np.asarray(
+            resident_lookup_raw(jnp.asarray(bits[r * 32:(r + 1) * 32].reshape(
+                -1, 128)),
+                                jnp.asarray(ids),
+                                vocab_start=r * 32,
+                                local_rows=32)) for r in range(8)
+    ]
+    combined = np.sum(np.stack(parts).astype(np.int32), axis=0).astype(np.int8)
+    full = np.asarray(
+        resident_lookup_raw(jnp.asarray(bits.reshape(-1, 128)),
+                            jnp.asarray(ids),
+                            vocab_start=0,
+                            local_rows=256))
+    expected = np.where((ids >= 0)[..., None], bits[np.clip(ids, 0, 255)],
+                        0).reshape(7, 2560)
+    np.testing.assert_array_equal(combined.view(np.uint8), expected)
+    np.testing.assert_array_equal(full, combined)
+    assert set(combined.view(np.uint8).flat) == set(range(256))
+    scale = torch.tensor([.03125], dtype=torch.bfloat16)
+    oracle = (torch.from_numpy(expected.copy()).view(
+        torch.float8_e4m3fn).bfloat16() * scale).float().numpy()
+    decoded = np.asarray(
+        decode_embeddings(jnp.asarray(combined),
+                          jnp.asarray(scale.float().numpy()))).astype(
+                              np.float32)
+    finite = np.isfinite(oracle)
+    np.testing.assert_array_equal(decoded[finite], oracle[finite])
+    np.testing.assert_array_equal(np.isnan(decoded), np.isnan(oracle))

@@ -124,6 +124,111 @@ def fixture_cache(pages=4, slots=4, kv=1):
             jnp.full((slots, 8, 2), -1, jnp.int32))
 
 
+def test_fp8_cache_per_head_scaling_and_page_ownership():
+    # Quantization is independently specified with NumPy FP32 and E4M3.
+    # Distinct head magnitudes catch accidentally shared scales. Poisoned
+    # page zero catches padded requests writing either payload or scale.
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import (quantize_kv,
+                                                     update_caches_fp8)
+    values = bf(np.linspace(-900, 900, 3 * 2 * 256).reshape(3, 2, 256))
+    values[0, 0] = 0
+    values[:, 1] *= np.float32(0.0001)
+    values = bf(values)
+    expected_scale = np.maximum(
+        np.abs(values).max(-1) * np.float32(1 / 448), 1e-6)
+    expected_bits = np.clip(values * (1 / expected_scale[..., None]), -448,
+                            448).astype(ml_dtypes.float8_e4m3fn)
+    bits, scale = jax.jit(quantize_kv)(jnp.asarray(values, jnp.bfloat16))
+    np.testing.assert_array_equal(
+        np.asarray(bits).view(np.uint8), expected_bits.view(np.uint8))
+    np.testing.assert_allclose(scale, expected_scale, rtol=1e-7)
+    assert scale.dtype == jnp.float32
+    state = [
+        jnp.full((4, 128, 2, 128), 0x51515151,
+                 jnp.int32), *fixture_cache(kv=2)[2:],
+        *[jnp.full((8, 128), 19, jnp.float32) for _ in range(2)]
+    ]
+    updated = update_caches_fp8(
+        jnp.asarray(values, jnp.bfloat16), jnp.asarray(-values, jnp.bfloat16),
+        jnp.zeros((3, 128), jnp.bfloat16), jnp.arange(3), *state,
+        jnp.zeros(128, jnp.bfloat16),
+        jnp.asarray(make_rope_cache().float().numpy(), jnp.bfloat16),
+        jnp.array([0, 2, 2]), jnp.array([127, 0]), jnp.array([2, -1]),
+        jnp.array([[3, 1], [0, 0]]), jnp.array([[2, 0], [0, 0]]))
+    for i, (page, token) in enumerate(((3, 127), (1, 0))):
+        bits = np.asarray(updated[0][page,
+                                     token]).view(np.uint8).reshape(2, 512)
+        np.testing.assert_array_equal(bits[:, :256],
+                                      expected_bits[i].view(np.uint8))
+        np.testing.assert_allclose(updated[4][page * 2 + jnp.arange(2), token],
+                                   expected_scale[i],
+                                   rtol=1e-7)
+    np.testing.assert_array_equal(np.asarray(updated[0][0]), 0x51515151)
+    np.testing.assert_array_equal(np.asarray(updated[4][:2]), 19)
+    assert updated[1].dtype == updated[2].dtype == jnp.bfloat16
+
+
+def test_fp8_kv_word_packing_preserves_all_payload_bits():
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import pack_fp8_kv, unpack_fp8_kv
+    raw = np.arange(7 * 2 * 512,
+                    dtype=np.uint16).astype(np.uint8).reshape(7, 2, 512)
+    key = jnp.asarray(raw[..., :256].view(ml_dtypes.float8_e4m3fn))
+    value = jnp.asarray(raw[..., 256:].view(ml_dtypes.float8_e4m3fn))
+    packed = jax.jit(pack_fp8_kv)(key, value)
+    assert packed.shape == (7, 2, 128) and packed.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(packed), raw.view(np.int32))
+    decoded = jax.jit(unpack_fp8_kv)(packed)
+    np.testing.assert_array_equal(
+        np.asarray(decoded[0]).view(np.uint8), raw[..., :256])
+    np.testing.assert_array_equal(
+        np.asarray(decoded[1]).view(np.uint8), raw[..., 256:])
+
+
+@pytest.mark.parametrize("dtype", ["auto", "fp8_per_token_head"])
+def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
+    # Kernel-only tests cannot detect the model passing the wrong number or
+    # order of persistent owners. Fake dispatch checks the real op schema.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        lambda: 0)
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1)
+    with torch.device("cpu"), FakeTensorMode():
+        model = Qwen4ExpQSA(tp_size=1, tp_rank=0, cache_dtype=dtype)
+        auxiliary = [
+            torch.empty(4, 32, 1, 128, dtype=torch.bfloat16),
+            torch.empty(3, 8, 128, dtype=torch.bfloat16),
+            torch.empty(3, 8, dtype=torch.int64)
+        ]
+        if dtype == "auto":
+            owners = [
+                *[
+                    torch.empty(4, 128, 2, 256, dtype=torch.bfloat16)
+                    for _ in range(2)
+                ], *auxiliary
+            ]
+        else:
+            owners = [
+                torch.empty(4, 128, 2, 128, dtype=torch.int32), *auxiliary,
+                *[torch.empty(8, 128, dtype=torch.float32) for _ in range(2)]
+            ]
+        model.bind_kv_cache(owners)
+        metadata = QSAMetadata(torch.empty(3, dtype=torch.int32),
+                               torch.empty(2, dtype=torch.int32),
+                               torch.empty(2, dtype=torch.int32),
+                               torch.empty(2, 2, dtype=torch.int32),
+                               torch.empty(2, 2, dtype=torch.int32))
+        output, selected = model.forward_with_indices(
+            torch.empty(7, 2560, dtype=torch.bfloat16),
+            torch.empty(7, dtype=torch.int64), metadata)
+        assert output.shape == (7, 2560) and output.dtype == torch.bfloat16
+        assert selected.shape == (7, 2051)
+
+
 def test_raw_ring_three_then_two_and_slot_reuse():
     rng = np.random.default_rng(4)
     raw = bf(rng.normal(size=(5, 128)))
@@ -269,23 +374,39 @@ def attention_oracle(q, k, v, gate, selected):
     return np.asarray(result)
 
 
-def streaming_contract(device=False):
+def fp8_reference(values):
+    values = np.asarray(values, np.float32)
+    # Match the explicit FP32 reciprocal multiply, including halfway values.
+    scale = np.maximum(np.abs(values).max(-1) * np.float32(1 / 448), 1e-6)
+    encoded = np.clip(values * (1 / scale[..., None]), -448,
+                      448).astype(ml_dtypes.float8_e4m3fn)
+    return encoded, scale, bf(encoded.astype(np.float32) * scale[..., None])
+
+
+def streaming_contract(device=False,
+                       fp8_kv=False,
+                       kv_heads=1,
+                       q_heads=3,
+                       pages=4):
     """Independent whole-sequence oracle vs <=128-token steps and reordered slots."""
-    from vllm_torchtpu.kernels.qwen4_exp.qsa import build_qsa_op, qsa_step
+    from vllm_torchtpu.kernels.qwen4_exp.qsa import (build_qsa_op, qsa_step,
+                                                     qsa_step_fp8)
     rng = np.random.default_rng(386)
     trig = make_rope_cache().float().numpy()
     weights = [bf(rng.normal(size=n) * .1) for n in (256, 256, 128, 128)]
     sequences = []
     for request, length in enumerate((132, 7)):
-        qg = bf(rng.normal(size=(length, 1536)))
-        k = bf(rng.normal(size=(length, 256)))
-        v = bf(rng.normal(size=(length, 256)) + (100 if request else 0))
+        qg = bf(rng.normal(size=(length, q_heads * 512)))
+        k = bf(rng.normal(size=(length, kv_heads * 256)))
+        v = bf(
+            rng.normal(size=(length, kv_heads * 256)) +
+            (100 if request else 0))
         ix = bf(rng.normal(size=(length, 640)))
         positions = np.arange(length, dtype=np.int32) + 97 + request * 256
         query = rope_oracle(
-            norm(qg.reshape(length, 3, 512)[..., :256], weights[0]), positions,
-            trig, False)
-        key = rope_oracle(norm(k.reshape(length, 1, 256), weights[1]),
+            norm(qg.reshape(length, q_heads, 512)[..., :256], weights[0]),
+            positions, trig, False)
+        key = rope_oracle(norm(k.reshape(length, kv_heads, 256), weights[1]),
                           positions, trig, False)
         indexq = rope_oracle(
             norm(ix[:, :512].reshape(length, 4, 128), weights[2]), positions,
@@ -294,27 +415,41 @@ def streaming_contract(device=False):
         ids = np.stack([
             selection_oracle(indexq[i], compressed, i) for i in range(length)
         ])
-        expected = attention_oracle(query, key.repeat(3, 1),
-                                    v[:, None].repeat(3, 1),
-                                    qg.reshape(length, 3, 512)[..., 256:], ids)
+        attention_key = fp8_reference(key)[2] if fp8_kv else key
+        head_values = v.reshape(length, kv_heads, 256)
+        attention_value = fp8_reference(
+            head_values)[2] if fp8_kv else head_values
+        expected = attention_oracle(
+            query, attention_key.repeat(q_heads // kv_heads, 1),
+            attention_value.repeat(q_heads // kv_heads, 1),
+            qg.reshape(length, q_heads, 512)[..., 256:], ids)
         sequences.append(
             (qg, k, v, ix, positions, key, compressed, ids, expected))
     main_table = np.array([[3, 1], [0, 2]], np.int32)
     compressed_table = np.array([[2, 0], [1, 3]], np.int32)
     slots = np.array([2, 1], np.int32)
     initial = [
-        np.zeros((4, 128, 1, 256), ml_dtypes.bfloat16),
-        np.zeros((4, 128, 1, 256), ml_dtypes.bfloat16),
-        np.zeros((4, 32, 1, 128), ml_dtypes.bfloat16),
+        np.zeros((pages, 128, kv_heads, 256), ml_dtypes.bfloat16),
+        np.zeros((pages, 128, kv_heads, 256), ml_dtypes.bfloat16),
+        np.zeros((pages, 32, 1, 128), ml_dtypes.bfloat16),
         np.zeros((4, 8, 128), ml_dtypes.bfloat16),
         np.full((4, 8), -1, np.int64)
     ]
     initial[-1][3] = (
         1 << 40) + 17  # Untouched tags must survive the int32 bridge exactly.
+    if fp8_kv:
+        initial = [
+            np.zeros((pages, 128, kv_heads, 128), np.int32), *initial[2:],
+            *[np.ones((pages * kv_heads, 128), np.float32) for _ in range(2)]
+        ]
+    tag_index = 3 if fp8_kv else 4
     if device:
 
         def tensor(x):
             a = np.asarray(x)
+            if a.dtype == ml_dtypes.float8_e4m3fn:
+                return torch.from_numpy(a.view(np.uint8).copy()).view(
+                    torch.float8_e4m3fn).to('tpu')
             t = torch.from_numpy(
                 a.astype(np.float32) if a.dtype ==
                 ml_dtypes.bfloat16 else a.copy())
@@ -324,15 +459,18 @@ def streaming_contract(device=False):
 
         state = [tensor(x) for x in initial]
         owners = list(state)
-        op = torch.compile(build_qsa_op(),
+        torch._dynamo.reset()
+        op = torch.compile(build_qsa_op(fp8_kv),
                            backend='tpu',
                            fullgraph=True,
                            dynamic=False)
     else:
-        state = [jnp.asarray(x) for x in initial[:-1]] + [
-            jnp.asarray(initial[-1].view(np.int32).reshape(4, 8, 2))
+        state = [
+            jnp.asarray(
+                x.view(np.int32).reshape(4, 8, 2) if i == tag_index else x)
+            for i, x in enumerate(initial)
         ]
-        op = jax.jit(qsa_step)
+        op = jax.jit(qsa_step_fp8 if fp8_kv else qsa_step)
     offsets = [0, 0]
     for step, lengths in enumerate([(3, 3), (2, 2), (122, 0), (1, 1), (1, 1),
                                     (3, 0)]):
@@ -368,16 +506,25 @@ def streaming_contract(device=False):
             output, ids = output.cpu().float().numpy(), ids.cpu().numpy()
             assert all(a is b for a, b in zip(state, owners))
             current = [
-                x.cpu().float().numpy() if i < 4 else x.cpu().numpy()
-                for i, x in enumerate(state)
+                x.cpu().float().numpy()
+                if x.dtype == torch.bfloat16 else x.cpu().numpy()
+                for x in state
             ]
         else:
             *state, output, ids = op(*[jnp.asarray(x) for x in inputs], *state,
                                      *[jnp.asarray(x) for x in meta])
             output, ids = np.asarray(output, np.float32), np.asarray(ids)
-            current = [np.asarray(x, np.float32) for x in state[:-1]] + [
-                np.asarray(state[-1]).copy().view(np.int64).reshape(4, 8)
+            current = [
+                np.asarray(x, np.float32)
+                if x.dtype == jnp.bfloat16 else np.asarray(x) for x in state
             ]
+            current[tag_index] = current[tag_index].copy().view(
+                np.int64).reshape(4, 8)
+        if fp8_kv:
+            payload = current[0].view(np.uint8).reshape(
+                pages, 128, kv_heads,
+                512).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+            current = [payload[..., :256], payload[..., 256:], *current[1:]]
         expected = np.concatenate([
             sequences[r][8][offsets[r]:offsets[r] + lengths[r]] for r in order
         ]).reshape(sum(lengths), -1)
@@ -392,9 +539,17 @@ def streaming_contract(device=False):
             offsets[r] += lengths[r]
             # Main, compressed and raw owners use three intentionally different mappings.
             for logical in range(offsets[r]):
+                expected_v = sequences[r][2][logical].reshape(kv_heads, 256)
+                if fp8_kv:
+                    expected_v, expected_scale, _ = fp8_reference(expected_v)
+                    np.testing.assert_allclose(
+                        current[6][main_table[r, logical // 128] * kv_heads +
+                                   np.arange(kv_heads), logical % 128],
+                        expected_scale,
+                        rtol=1e-7)
                 np.testing.assert_array_equal(
-                    current[1][main_table[r, logical // 128], logical % 128,
-                               0], sequences[r][2][logical])
+                    current[1][main_table[r, logical // 128], logical % 128],
+                    expected_v.astype(np.float32))
             groups = offsets[r] // 4
             if groups:
                 produced = np.stack([
@@ -408,13 +563,30 @@ def streaming_contract(device=False):
                                                                        512:])
                 assert current[4][slots[r],
                                   logical % 4] == sequences[r][4][logical]
-        np.testing.assert_array_equal(current[4][3], initial[4][3])
+        np.testing.assert_array_equal(current[4][3], initial[tag_index][3])
         np.testing.assert_array_equal(current[3][0], 0)
     return state
 
 
 def test_whole_vs_chunked_mixed_requests_and_page_boundaries():
     streaming_contract()
+
+
+@pytest.mark.parametrize("kv_heads,q_heads", [(1, 3), (2, 24)])
+def test_fp8_whole_vs_chunked_mixed_requests_and_page_boundaries(
+        kv_heads, q_heads):
+    streaming_contract(fp8_kv=True, kv_heads=kv_heads, q_heads=q_heads)
+
+
+@TPU
+@pytest.mark.parametrize("kv_heads,q_heads,pages", [(1, 3, 4), (2, 24, 4),
+                                                    (2, 24, 817)])
+def test_tpu_compiled_fp8_sparse_cache_lifecycle(kv_heads, q_heads, pages):
+    streaming_contract(device=True,
+                       fp8_kv=True,
+                       kv_heads=kv_heads,
+                       q_heads=q_heads,
+                       pages=pages)
 
 
 @TPU

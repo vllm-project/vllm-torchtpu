@@ -100,6 +100,16 @@ def _build_worker(vllm_config, rank=0):
         return worker
 
 
+def test_worker_resolves_per_token_head_fp8_cache_dtype():
+    """QSA's logical cache dtype must survive worker startup before allocation."""
+    cfg = _make_vllm_config()
+    cfg.cache_config.cache_dtype = "fp8_per_token_head"
+
+    worker = _build_worker(cfg)
+
+    assert worker.kv_cache_dtype == torch.float8_e4m3fn
+
+
 class TestProfilerDir:
     """Verify profiler_config.torch_profiler_dir logic."""
 

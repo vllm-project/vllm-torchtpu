@@ -186,6 +186,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Qwen4 model-local GDN and MoE custom-op implementations.
+    "vllm_torchtpu/models/vllm/qwen4_exp/gdn.py",
+    "vllm_torchtpu/models/vllm/qwen4_exp/moe.py",
 )
 
 

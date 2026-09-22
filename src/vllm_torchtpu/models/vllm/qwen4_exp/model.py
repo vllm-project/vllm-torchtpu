@@ -6,7 +6,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from .gdn import Qwen4ExpGatedDeltaNetAttention, gdn_state_shapes
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .moe import Qwen4ExpSparseMoeBlock
+from .parallel import PLEParallel
 from .ple import Qwen4ExpPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
@@ -35,10 +36,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, cfg, index, prefix):
         super().__init__()
         t = cfg.model_config.hf_text_config
-        rank = get_tensor_model_parallel_rank()
+        tp, ep = get_tp_group(), get_ep_group()
+        engram = cfg.additional_config.get("qwen4_exp",
+                                           {}).get("engram_config", {})
         self.ple = (Qwen4ExpPLE(
-            tp_rank=rank, prefix=prefix +
-            ".ple", eos_token_id=t.eos_token_id) if index == 1 else None)
+            parallel=PLEParallel(tp,
+                                 get_dp_group(),
+                                 embedding_across_dp=engram.get(
+                                     "embedding_across_dp", False)),
+            prefix=prefix + ".ple",
+            eos_token_id=t.eos_token_id) if index == 1 else None)
         self.layer_type = t.layer_types[index]
         if self.layer_type == "linear_attention":
             dense_cfg = copy.copy(cfg)
@@ -49,12 +56,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False)
         else:
-            self.self_attn = Qwen4ExpQSA(tp_rank=rank,
-                                         device=cfg.device_config.device,
-                                         prefix=prefix + ".self_attn")
+            self.self_attn = Qwen4ExpQSA(
+                tp_rank=tp.rank_in_group,
+                tp_size=tp.world_size,
+                device=cfg.device_config.device,
+                cache_dtype=cfg.cache_config.cache_dtype,
+                prefix=prefix + ".self_attn")
             cfg.compilation_config.static_forward_context[
                 prefix + ".self_attn"] = self.self_attn
-        self.mlp = Qwen4ExpSparseMoeBlock(ep_rank=rank)
+        self.mlp = Qwen4ExpSparseMoeBlock(ep_rank=ep.rank_in_group,
+                                          ep_size=ep.world_size)
         self.attn_hyper_connection = GatedResidual(hc_config(t))
         self.mlp_hyper_connection = GatedResidual(hc_config(t))
 
@@ -64,7 +75,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.ple is not None:
             hidden = hidden + self.ple(hidden, input_ids, query_start_loc,
                                        ngram_context, state_slots, context_lens
-                                       > 0)
+                                       > 0, valid_tokens)
         block, residual = self.attn_hyper_connection.mix(hidden)
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
@@ -228,7 +239,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             prefix = f"model.layers.{i}.mlp."
             required = {
                 f"{prefix}experts.{e}.{p}.{f}"
-                for e in range(512)
+                for e in range(layer.mlp.ep_rank *
+                               64, (layer.mlp.ep_rank + 1) * 64)
                 for p in ("gate_proj", "up_proj", "down_proj")
                 for f in ("weight", "weight_scale_inv")
             }
