@@ -551,7 +551,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     f"TP size {self.tp_size} does not match mesh shape "
                     f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
             derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                         pcp_size)
+                                     pcp_size)
             op_name = ("pallas::gdn_attention_pcp_"
                        f"{self.prefix.replace('.', '_')}")
             wrapped_fn = functools.partial(
@@ -820,7 +820,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"TP size {self.tp_size} does not match mesh shape "
                 f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
         derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                     pcp_size)
+                                 pcp_size)
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim

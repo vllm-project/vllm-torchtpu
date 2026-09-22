@@ -310,7 +310,10 @@ class TestVllmGatedDeltaNetAttention:
         vllm_envs.disable_envs_cache()
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         attn = _qwen35_397b_gdn_attn("seq_on_lane_test_layer")
-        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={
+            "pcp": 8,
+            "tp": 1
+        })
         vllm_config = _vllm_config(pcp_size=8, block_size=4096)
         captured = {}
 
@@ -779,7 +782,6 @@ class TestVllmGatedDeltaNetAttention:
         assert pooled_specs["input_partition_specs"] == (
             PartitionSpec("pcp", None),
             PartitionSpec("tp"),
-            PartitionSpec("tp"),
             PartitionSpec("pcp", "tp"),
             PartitionSpec("pcp", "tp"),
             PartitionSpec(("tp", "pcp")),
@@ -791,6 +793,7 @@ class TestVllmGatedDeltaNetAttention:
             PartitionSpec(),
             PartitionSpec(),
             PartitionSpec(),
+            PartitionSpec("tp"),
         )
         assert pooled_specs["output_partition_specs"] == (
             PartitionSpec(("tp", "pcp")),
