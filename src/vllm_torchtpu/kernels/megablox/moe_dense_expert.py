@@ -15,6 +15,26 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_MAX_EXPERT_BUFFERS = 3
+
+
+def _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes):
+    """Choose up to three slots, reserving 20% for padding and temporaries.
+
+    Count explicit VMEM inputs, output and scratch, including quantization
+    scales expanded over 128 lanes. As in RPA, this is a sizing heuristic;
+    the compiler still decides resource feasibility, even for one slot.
+    """
+    expert_bytes = 3 * h * i + 4 * (2 * i + h)
+    # Hidden input/output, quantized hidden, and FP32 output accumulator.
+    fixed_bytes = m * h * (2 + 2 + 1 + 4)
+    # BF16 activation, FP8 activation, and the two BF16 quantization scales.
+    fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
+    fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
+    budget = vmem_capacity_bytes * 4 // 5
+    return max(
+        1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
+
 
 def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
                          rhs_quant_dtype, skip_padded_tokens):
@@ -64,7 +84,7 @@ def _quantize(x, q_ref, scale_ref):
 def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
             out_ref, w1_ref, w2_ref, s1_ref, s2_ref, xq_ref, xs_ref, a_ref,
             aq_ref, asc_ref, owner_ref, active_ids_ref, sem_ref, *, m, h, i,
-            experts):
+            experts, num_buffers):
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     _quantize(x_ref[...], xq_ref, xs_ref)
     expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
@@ -122,7 +142,7 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
     count = lax.fori_loop(0, experts, compact, jnp.int32(0))
 
     def transfers(step):
-        e, slot = active_ids_ref[step], step % 2
+        e, slot = active_ids_ref[step], step % num_buffers
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot],
                                   sem_ref.at[slot, 0]),
@@ -136,24 +156,34 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
 
     @pl.when(count > 0)
     def run_experts():
-        for copy in transfers(jnp.int32(0)):
-            copy.start()
+        for initial in range(num_buffers - 1):
+
+            @pl.when(count > initial)
+            def prime():
+                for copy in transfers(jnp.int32(initial)):
+                    copy.start()
 
         def expert_body(step, _):
+            if num_buffers == 1:
+                for copy in transfers(step):
+                    copy.start()
             for copy in transfers(step):
                 copy.wait()
 
-            @pl.when(step + 1 < count)
-            def prefetch():
-                for copy in transfers(step + 1):
-                    copy.start()
+            if num_buffers > 1:
 
-            slot = step % 2
+                @pl.when(step + num_buffers - 1 < count)
+                def prefetch():
+                    for copy in transfers(step + num_buffers - 1):
+                        copy.start()
+
+            slot = step % num_buffers
             compute(active_ids_ref[step], w1_ref.at[slot], w2_ref.at[slot],
                     s1_ref.at[slot], s2_ref.at[slot])
             return None
 
-        # Double-buffered weights overlap the next expert DMA with compute.
+        # Prefetch up to num_buffers - 1 experts ahead. With one slot, each
+        # expert finishes computing before the next DMA overwrites its inputs.
         # Compacting the local-expert active bitmap uses only scalar SMEM ops.
         lax.fori_loop(0, count, expert_body, None)
 
@@ -170,6 +200,8 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
     """
     m, h = hidden.shape
     experts, i, _ = w2.shape
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    num_buffers = _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes)
     # Dense route coefficients are only [tokens, local experts], not expert
     # output tensors. Accumulation handles repeated IDs without reloading an
     # expert. Unroll the static top-k dimension to avoid the [M,K,E] reduction
@@ -184,7 +216,12 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
     return pl.pallas_call(
-        functools.partial(_kernel, m=m, h=h, i=i, experts=experts),
+        functools.partial(_kernel,
+                          m=m,
+                          h=h,
+                          i=i,
+                          experts=experts,
+                          num_buffers=num_buffers),
         out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -195,10 +232,10 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=[
-                pltpu.VMEM((2, h, 2 * i), jnp.float8_e4m3fn),
-                pltpu.VMEM((2, i, h), jnp.float8_e4m3fn),
-                pltpu.VMEM((2, 1, 2 * i), jnp.float32),
-                pltpu.VMEM((2, 1, h), jnp.float32),
+                pltpu.VMEM((num_buffers, h, 2 * i), jnp.float8_e4m3fn),
+                pltpu.VMEM((num_buffers, i, h), jnp.float8_e4m3fn),
+                pltpu.VMEM((num_buffers, 1, 2 * i), jnp.float32),
+                pltpu.VMEM((num_buffers, 1, h), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float8_e4m3fn),
                 pltpu.VMEM((h // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.bfloat16),
@@ -206,7 +243,10 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
                 pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.SMEM((experts, ), jnp.int32),
-                pltpu.SemaphoreType.DMA((2, 4)),
+                pltpu.SemaphoreType.DMA((num_buffers, 4)),
             ]),
-        name=f'dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}',
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_capacity_bytes),
+        name=(f'dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}'
+              f'-buffers_{num_buffers}'),
     )(active, hidden, coeff, w1, w2, s1, s2)

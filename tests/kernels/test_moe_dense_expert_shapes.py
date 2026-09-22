@@ -6,6 +6,7 @@ Run with JAX_PLATFORMS=cpu. Interpretation checks routing/DMA indexing and
 arithmetic, not TPU resource capacity or compiled device performance.
 """
 import functools
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +14,28 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox import moe_dense_expert as kernel
+
+
+@pytest.mark.parametrize('capacity_mib, expected', [(128, 3), (64, 3), (48, 2),
+                                                    (32, 1)])
+def test_qwen_buffers_follow_vmem_capacity(capacity_mib, expected):
+    # The performance UT's local kernel sees all 256 tokens and 64 experts.
+    assert kernel._select_expert_buffers(256, 4096, 1024, 64,
+                                         capacity_mib * 1024**2) == expected
+
+
+@pytest.mark.parametrize('shape, expected', [((256, 4096, 2048, 64), 1),
+                                             ((1024, 4096, 1024, 64), 1),
+                                             ((256, 4096, 1024, 8192), 2),
+                                             ((16, 512, 512, 4), 3)])
+def test_buffer_budget_includes_weights_activations_and_routes(
+        shape, expected):
+    assert kernel._select_expert_buffers(*shape, 64 * 1024**2) == expected
+
+
+def test_buffer_selection_leaves_resource_failure_to_compiler():
+    assert kernel._select_expert_buffers(1024, 8192, 4096, 512,
+                                         16 * 1024**2) == 1
 
 
 def _shapes(m, h, i, e):
@@ -120,6 +143,9 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     monkeypatch.setattr(
         kernel.pl, 'pallas_call',
         functools.partial(kernel.pl.pallas_call, interpret=True))
+    monkeypatch.setattr(
+        kernel.pltpu, 'get_tpu_info',
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2))
     kernel.dense_expert_moe.clear_cache()
     try:
         actual = np.asarray(kernel.dense_expert_moe(x, w1, w2, s1, s2, weights,

@@ -29,7 +29,7 @@ DP all-gather 后，每个 EP rank 处理 256 个 token；512 个 routed expert
    实现按本地 expert ID 遍历，语义等价于逐 token 遍历时记录已处理的专家。
 4. hidden 加载到 VMEM，按 512-wide block 动态量化为 FP8，在专家间复用。
 5. 每个命中专家的 gate/up、down 权重及 scale DMA 一次，计算全部 token。
-   双缓冲提前发起下一个专家的权重搬运。
+   按 VMEM 预算选择 1–3 个缓冲，最多提前发起后续两个专家的权重搬运。
 6. 专家输出按路由系数加权，直接累加到一个 FP32 `[token, hidden]`
    VMEM accumulator；零系数显式屏蔽，避免 `NaN * 0` 污染输出。
 7. 全部专家完成后，将 accumulator 转为 BF16，写回 HBM 一次。
@@ -67,10 +67,23 @@ activation quantization 和 BF16 中间舍入，最终专家加权累加使用 F
 
 若本 rank 命中 32 个专家，一次完整权重读取约 384.75 MiB。
 这只是权重字节量，不是整层 MoE 的实测 HBM 流量，也不能直接据此给出 MBU。
-`[256,4096]` FP32 accumulator 为 4 MiB，显式 VMEM scratch 合计约 34.6 MiB，
-包含双缓冲权重。这是已测形状的占用，不作为其他形状的准入上限。
+`[256,4096]` FP32 accumulator 为 4 MiB。该形状的双缓冲版本在 LLO 中声明的
+VMEM allocation 合计约 34.62 MiB，三缓冲约 46.64 MiB；这不是按生命周期
+重建的精确峰值，也不作为其他形状的准入上限。
 后续放宽尺寸限制时移除了原有 60 MiB 编译预算和 64 MiB 硬件门槛，
 资源是否足够由编译器判断。
+
+当前在编译时通过 `pltpu.get_tpu_info().vmem_capacity_bytes` 获取设备容量，
+并将该容量传给当前 Pallas kernel 的 `CompilerParams.vmem_limit_bytes`。
+参考 RPA，以容量的 80% 作为显式 buffer 估算预算，剩余空间留给布局 padding
+和编译器临时值。估算包含 hidden 输入输出、量化激活及 scale、路由系数、
+FP32 accumulator，以及每个 slot 的专家权重和 scale。
+buffer 数取预算内的最大值，上限为 3、下限为 1；单缓冲仍放不下时由编译器
+报告资源错误，不添加 shape 准入限制或编译失败回退。
+单缓冲先加载再计算；双缓冲提前一个专家，三缓冲提前两个专家，均在复用 slot
+前完成其计算。选择没有逐次 forward 的运行时开销，kernel 名称携带
+`buffers_1`、`buffers_2` 或 `buffers_3`，便于检查编译结果。
+当前 M=256、H=4096、I=1024、E=64 的 UT 在 64 MiB VMEM 上自动选择 3。
 
 第一版 activation scale 使用 `[tokens, Kblocks, 128]`。
 LLO 与源码对应分析发现，读取固定 K block 的非连续平面产生大量
@@ -139,7 +152,7 @@ export TPU_MOE_DECODE_IMPL=dense_expert
 简单问答和算子 UT 不等于完整模型精度评测，也不保证任意 prompt 输出完全一致。
 
 放宽限制新增 CPU 验证覆盖 M=272、H/I=1536、E=129，以及非法对齐和
-显式实现选择。Pallas 解释模式执行真实 kernel 的路由、双缓冲 DMA 索引和
+显式实现选择。Pallas 解释模式执行真实 kernel 的路由、缓冲 DMA 索引和
 算术，与独立参考对照，包含专家 127/128、重复 ID、无效 ID 和零权重行。
 解释模式只在测试中注入，不进入生产 kernel；不验证 TPU 编译资源或性能。
 通过模拟资源异常验证新实现错误传播，不进入原 GMM。

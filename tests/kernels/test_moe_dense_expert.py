@@ -26,15 +26,23 @@ def tensors():
     return x, w1, w2, s1, s2
 
 
-@pytest.mark.parametrize('case',
-                         ['mixed', 'single', 'empty', 'zero', 'duplicate'])
-def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case):
+@pytest.mark.parametrize(
+    'case', ['mixed', 'single', 'three', 'empty', 'zero', 'duplicate'])
+@pytest.mark.parametrize('num_buffers', [1, 2, 3])
+def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers):
+    # Exercise each DMA schedule, including wraparound and short pipelines,
+    # without requiring a different physical TPU for every capacity.
+    monkeypatch.setattr(kernel, '_select_expert_buffers',
+                        lambda *args: num_buffers)
+    kernel.dense_expert_moe.clear_cache()
     x, w1, w2, s1, s2 = tensors
     ids = np.tile(np.array([[64, 65, 63, 68]], np.int32), (16, 1))
     ids[8:, :2] = [66, 67]
     weights = np.tile(np.array([[.125, .25, .375, .25]], np.float32), (16, 1))
     if case == 'single':
         ids[:, :] = [67, 0, 1, 2]
+    elif case == 'three':
+        ids[:, :] = [64, 65, 66, 0]
     elif case == 'empty':
         ids[:, :] = [0, 1, 2, 3]
     elif case == 'zero':
@@ -58,6 +66,7 @@ def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case):
                                                    **kwargs)).astype('float32')
         hlo = wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
         assert 'dense_expert_moe-e_4' in hlo
+        assert f'buffers_{num_buffers}' in hlo
         assert 'blockwise_onehot_unpermute' not in hlo
         assert np.isfinite(actual).all()
         if case in ('empty', 'zero'):
@@ -67,6 +76,7 @@ def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case):
             assert rel < .008, rel
     finally:
         wrapper.fused_moe_func.clear_cache()
+        kernel.dense_expert_moe.clear_cache()
 
 
 @pytest.mark.parametrize(
