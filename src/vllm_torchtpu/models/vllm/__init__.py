@@ -24,3 +24,11 @@ def register_models() -> None:
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+    for architecture in ("Qwen4ExpForCausalLM",
+                         "Qwen4ExpForConditionalGeneration"):
+        ModelRegistry.register_model(
+            architecture,
+            "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM")
+        MODELS_CONFIG_MAP[architecture] = TPUQwen4ExpConfig

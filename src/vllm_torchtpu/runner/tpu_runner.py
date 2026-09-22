@@ -494,6 +494,7 @@ class TPUModelRunner(GPUModelRunner):
         # override runs (and stays None if it is skipped, e.g. CPU-only tests
         # or a user-pinned num_gpu_blocks_override) — in which case mamba and
         # attention share the uniform `num_blocks` as before.
+        self.model_adapter = None
         self._mamba_num_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and returned when it leaves
@@ -2798,6 +2799,9 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
 
+        step_token_store = (self.model_adapter.begin_step()
+                            if self.model_adapter is not None else None)
+
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
         if self.phase_based_profiler:
             self.batch_counter += 1
@@ -2982,6 +2986,14 @@ class TPUModelRunner(GPUModelRunner):
                     trace_kwargs[target_key] = batch_composition_stats.get(
                         src_key, "UNKNOWN" if src_key == "phase" else 0)
 
+            model_kwargs = None
+            if self.model_adapter is not None:
+                from vllm_torchtpu.runner.model_adapters import \
+                    ModelInputSnapshot
+                model_kwargs = self.model_adapter.prepare_inputs(
+                    ModelInputSnapshot(step_token_store, start_index, num_reqs,
+                                       num_tokens_padded, attn_metadata))
+
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (f", kv_len min={trace_kwargs['min_kv_len']} "
@@ -3008,6 +3020,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
                 )
 
             if not self._pp_is_last:
@@ -3823,6 +3836,9 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        from vllm_torchtpu.runner.model_adapters import select_model_adapter
+        self.model_adapter = select_model_adapter(self)
+        self.kv_cache_manager.model_adapter = self.model_adapter
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -3856,6 +3872,8 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        if self.model_adapter is not None:
+            self.model_adapter.bind_model(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -3982,6 +4000,8 @@ class TPUModelRunner(GPUModelRunner):
         program: only the metadata values differ), and the forward's wall
         time in ms is returned once its outputs have materialized.
         """
+        if (adapter := getattr(self, "model_adapter", None)) is not None:
+            return adapter.dummy_run(num_tokens, num_reqs, profile_prefix)
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -5398,10 +5418,11 @@ class TPUModelRunner(GPUModelRunner):
                       input_ids,
                       positions,
                       inputs_embeds=None,
-                      intermediate_tensors=None):
+                      intermediate_tensors=None,
+                      model_kwargs=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
-        kwargs = {}
+        kwargs = {} if model_kwargs is None else dict(model_kwargs)
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(input_ids=input_ids,
