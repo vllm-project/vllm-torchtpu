@@ -155,7 +155,8 @@ def gemma4_sequential(model, dataloader, dev, args):
         gpts = {}
 
         sparse_indices = getattr(args, "sparse_layer_indices", None)
-        is_pruned = (i in sparse_indices) if sparse_indices is not None else (args.minlayer <= i < args.maxlayer)
+        is_pruned = (i in sparse_indices) if sparse_indices is not None else (
+            args.minlayer <= i < args.maxlayer)
         status_tag = f"PRUNING ({sparsity_ratio} SparseGPT)" if is_pruned else "DENSE (Preserved)"
         print(
             f"\n>>> [Layer {i:02d}/{total_layers:02d} - {progress_pct:4.1f}%] Type: {layer_type:<18} | Status: {status_tag}"
@@ -201,7 +202,8 @@ def gemma4_sequential(model, dataloader, dev, args):
             # If use_lrc is set, applies Low-Rank Compression (Frantar & Alistarh):
             #   argmin_{S, U, V} || (W - S - U @ V) X ||^2_2
             # Otherwise runs canonical SparseGPT with 2nd-order OBS weight compensation.
-            is_lrc = getattr(args, "use_lrc", False) or getattr(args, "lrc", False)
+            is_lrc = getattr(args, "use_lrc", False) or getattr(
+                args, "lrc", False)
             lrc_rank = getattr(args, "lrc_rank", getattr(args, "lrc_k", 128))
             lrc_iters = getattr(args, "lrc_iters", getattr(args, "lrc_T", 3))
 
@@ -214,7 +216,9 @@ def gemma4_sequential(model, dataloader, dev, args):
                           flush=True)
                     if is_lrc:
                         gpts[name].lrc_prune(
-                            sparsity=args.sparsity if hasattr(args, "sparsity") and args.sparsity > 0 else 0.5,
+                            sparsity=args.sparsity
+                            if hasattr(args, "sparsity") and args.sparsity > 0
+                            else 0.5,
                             prunen=args.prunen,
                             prunem=args.prunem,
                             percdamp=args.percdamp,
