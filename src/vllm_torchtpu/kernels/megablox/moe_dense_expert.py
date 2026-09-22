@@ -171,10 +171,16 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
     m, h = hidden.shape
     experts, i, _ = w2.shape
     # Dense route coefficients are only [tokens, local experts], not expert
-    # output tensors. Sum handles repeated IDs without reloading an expert.
-    selector = jax.nn.one_hot(local_ids, experts, dtype=jnp.float32)
-    coeff = jnp.sum(selector * topk_weights.astype(jnp.float32)[..., None],
-                    axis=1)
+    # output tensors. Accumulation handles repeated IDs without reloading an
+    # expert. Unroll the static top-k dimension to avoid the [M,K,E] reduction
+    # whose layout copies can be offloaded to SparseCore and delay all-gather.
+    expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
+    weights = topk_weights.astype(jnp.float32)
+    coeff = jnp.zeros((m, experts), jnp.float32)
+    for route in range(local_ids.shape[1]):
+        selected = (local_ids[:, route:route + 1] == expert_ids)
+        coeff = coeff + selected.astype(jnp.float32) * weights[:,
+                                                               route:route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
     return pl.pallas_call(

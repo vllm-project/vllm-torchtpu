@@ -294,3 +294,83 @@ JAX profiler 与本机 libtpu 的 ABI 不匹配，runner 使用实际 TorchTPU a
 gs://xiaohao-tran/xiaohao_ignore/moe-llo-source-analysis-20260921T060341Z.tar.gz
 SHA256: bf4435e16efc62468294ca06062e3d037b41916e89b657a53a695d54efe8ad49
 ```
+
+## UPDATE 2026-09-22：消除路由系数的 SparseCore 格式转换
+
+将路由系数构造从 `[M,K,E]` one-hot 广播后沿 K 归约，改为静态展开 K，
+直接累加 `[M,E]` FP32 系数。重复专家 ID 仍累加权重，外部接口、准入条件、
+active bitmap、padding 和专家计算 Pallas kernel 均不变。
+没有添加全局 offload-disable flag、`optimization_barrier`、新的尺寸限制或 fallback。
+
+原 HLO 在 top-k 权重、专家 ID 和最终系数上生成三次 layout copy，随后由
+`sparsecore-data-format-offloader` 放到 SparseCore。队列调度把 token all-gather
+排在这些转换后面。改写后，当前编译器生成的最终 HLO 不再包含这三次独立的
+routing layout copy，8 个 rank 的 trace 中对应的格式转换调用均为零，
+token all-gather 也能更早提交。布局仍由编译器选择，没有手动指定物理布局。
+
+### 更新后的 UT profiling
+
+沿用 pool32、256 tokens、DP4/TP2/EP8、seed=20260921；20 次预热，
+每 rank 采集 20 次 forward。单位 μs，使用 TPU:0 TensorCore XLA Ops 的均值。
+原 GMM 和上版 dense 数据来自此前对照，新版为本次重新采集。
+
+| 指标 | 原 GMM | 上版 dense | 本次二维系数累加 |
+| --- | ---: | ---: | ---: |
+| 整层算子耗时之和 | 305.71 | 263.72 | 239.41 |
+| Dense-expert 融合 kernel | 不适用 | 158.54 | 158.51 |
+| Token all-gather call-done 等待 | 0.002 | 22.76 | 7.74 |
+
+整层算子耗时相比上版降低约 9.22%，相比原 GMM 降低约 21.69%。
+此前关闭全局 SparseCore copy/reshape offload 的诊断版本为 239.33 μs；
+本次整层耗时与之接近，但残余 all-gather 等待并不相同。
+本次完整 device module span 为 272.73 μs，不能与算子耗时之和混用。
+
+Pool32 输出与上版 dense 逐位一致，相对原算术参考的整体 L2 误差为 0.2671%，
+最坏 token 为 0.4714%。静态展开会改变一般 FP32 输入的求和顺序，
+不保证任意输入都逐位一致；图大小也随 K 增长。本次未重测 pool16/pool64 性能。
+
+完整 XPlane、Chrome trace、HLO 和原型源码已上传：
+
+```text
+gs://xiaohao-tran/xiaohao_ignore/moe-dense-expert-route-unrolled-profile-20260922T033903Z/
+```
+
+### 更新后的端到端吞吐
+
+Qwen3.5-397B-A17B-FP8，64K 输入、1K 输出、256 并发，DP4/TP2/EP8，
+FP32 SSM、FP8 KV。原 GMM 和上版 dense 是 2026-09-21 的历史结果，
+本次只重新测量更新后的 dense；不是同轮三方 A/B。未开启 profiler。
+
+| 指标 | 原 GMM（历史） | 上版 dense（历史） | 本次 |
+| --- | ---: | ---: | ---: |
+| 无缓存：峰值 1 秒 decode 吞吐（tok/s） | 5739 | 5995 | 6193 |
+| 无缓存：峰值窗口活跃请求数 | 248 | 248 | 246 |
+| 无缓存：峰值窗口 TPOT p50（ms） | 44.91 | 42.79 | 42.00 |
+| 无缓存：含 prefill 整轮吞吐（tok/s） | 524.38 | 518.95 | 528.12 |
+| 有缓存：满 256 路平均吞吐，三轮中位数（tok/s） | 5917.03 | 6294.73 | 6398.95 |
+| 有缓存：满 batch 窗口 TPOT p50，三轮中位数（ms） | 43.29 | 40.68 | 40.04 |
+| 有缓存：含剩余 prefill 整轮吞吐，三轮中位数（tok/s） | 3294.63 | 3435.62 | 3439.79 |
+
+缓存组三轮满 batch 吞吐分别为 6398.95、6397.98、6399.30 tok/s。
+中位数相比上版提升 1.66%，相比原 GMM 提升 8.14%；满 batch TPOT 相比上版降低
+1.58%。每轮均有约 38.27 秒持续满 256 路区间，所有请求恰好命中 63360 tokens，
+256/256 请求成功，接收到全部 262144 个输出 token 时间戳，prompt 哈希与历史结果一致。
+
+无缓存使用原 benchmark 脚本测一轮；缓存组预热后测三轮。无缓存各版本均没有
+持续满 256 路的一秒窗口，峰值窗口活跃请求数也不同，因此峰值增幅不能作为
+严格满 batch 加速比。本次无缓存客户端记录 262143 个 token 时间戳，沿用原脚本口径。
+
+本次 E2E 使用独立测试副本，在入口按编译桶选择：DP all-gather 后 M=256 的桶
+使用新 kernel，长 prefill 桶继续使用 GMM。这个测试专用条件没有合入 PR，
+也不是语义上的阶段判断；同一个小桶中的短 prefill 也可能走新 kernel。
+PR 继续保留无 M 上限的显式进程级开关。混合 prefill/decode 服务需要明确的
+部署选择策略，不能把本次结果解释为所有 prefill 都启用新 kernel 的验证。
+
+两种配置各做 8 道简单问答，覆盖全部 4 个 DP rank，回答与上一版完全一致，
+未发现乱码或异常重复。这是简单输出检查，不替代完整精度评测。
+原型通过 11 项 TPU 和 23 项 CPU 测试；提交版本只调整注释/格式，算术 AST
+与采集版本一致，并在 PR 更新前重新执行这两组测试。
+
+[机器可读数据](data/dense_expert_moe_route_update_20260922.json) 保留全部 rank 的 UT
+数据、三轮缓存测量和历史对照。原始 E2E 日志、源码差异及请求时间线位于 benchmark
+项目的 `runs/moe-e2e-route-unrolled-20260922/`。服务已停止，未发布日报。
