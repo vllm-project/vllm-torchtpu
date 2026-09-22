@@ -583,13 +583,25 @@ def sparsecore_topk(
     # Stage 2: Merge the P * k_p candidates to select the final top-k
     cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
 
-    final_cand_slots, final_cand_scores = _sc_topk_direct(
-        cand_scores,
-        k,
-        cand_lengths,
-        write_empty=write_empty_rows,
-        scheduling_group_id=stage2_scheduling_group_id,
-    )
+    if p * k_p > MAX_SLICE_WORDS:
+        # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
+        # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
+        final_cand_slots, final_cand_scores = sparsecore_topk(
+            cand_scores,
+            k,
+            row_lengths=cand_lengths,
+            write_empty_rows=write_empty_rows,
+            scheduling_group_id=stage2_scheduling_group_id,
+            return_scores=True,
+        )
+    else:
+        final_cand_slots, final_cand_scores = _sc_topk_direct(
+            cand_scores,
+            k,
+            cand_lengths,
+            write_empty=write_empty_rows,
+            scheduling_group_id=stage2_scheduling_group_id,
+        )
 
     # Map candidate slots back to original column indices
     safe_slots = jnp.maximum(final_cand_slots, 0)
