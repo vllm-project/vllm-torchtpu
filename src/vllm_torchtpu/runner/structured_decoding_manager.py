@@ -326,4 +326,15 @@ class StructuredDecodingManager:
         # (B, N * 32) -> (B, vocab_size)
         unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0],
                                                     -1)[:, :self.vocab_size]
+        target_dim = logits.shape[-1]
+        if target_dim < self.vocab_size:
+            raise ValueError(
+                f"Logits dimension ({target_dim}) cannot be smaller than "
+                f"vocab_size ({self.vocab_size}).")
+        if target_dim > self.vocab_size:
+            unpacked_bitmask = torch.nn.functional.pad(
+                unpacked_bitmask,
+                (0, target_dim - self.vocab_size),
+                value=True,
+            )
         return torch.where(unpacked_bitmask, float("-inf"), logits)

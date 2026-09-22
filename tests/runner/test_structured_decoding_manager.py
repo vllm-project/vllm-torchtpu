@@ -268,6 +268,43 @@ class TestStructuredDecode:
         expected = reference_apply_bitmask(logits, bitmask, vocab_size)
         assert torch.equal(out, expected)
 
+    @pytest.mark.parametrize("vocab_size,padded_dim", [(64, 128), (50, 64),
+                                                       (50, 128)])
+    def test_apply_grammar_bitmask_with_padded_logits(self, vocab_size,
+                                                      padded_dim):
+        """Verify apply_grammar_bitmask works when logits last dimension is hardware-padded."""
+        torch.manual_seed(0)
+        num_reqs = 4
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(num_reqs, padded_dim)
+        bitmask = torch.randint(torch.iinfo(torch.int32).min,
+                                torch.iinfo(torch.int32).max,
+                                (num_reqs, num_words),
+                                dtype=torch.int32)
+        arange = torch.arange(32)
+
+        out = manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+        assert out.shape == (num_reqs, padded_dim)
+        # 1. Unpadded vocab tokens match reference bitmask behavior.
+        expected_unpadded = reference_apply_bitmask(logits[:, :vocab_size],
+                                                    bitmask, vocab_size)
+        assert torch.equal(out[:, :vocab_size], expected_unpadded)
+        # 2. Hardware-padded slots are masked to -inf to prevent invalid token selection.
+        assert torch.isinf(out[:, vocab_size:]).all()
+
+    def test_apply_grammar_bitmask_raises_on_undersized_logits(self):
+        """Verify apply_grammar_bitmask raises ValueError when logits last dimension is smaller than vocab_size."""
+        manager = make_manager(vocab_size=64)
+        logits = torch.randn(2, 32)
+        bitmask = torch.zeros(2, 2, dtype=torch.int32)
+        arange = torch.arange(32)
+
+        with pytest.raises(ValueError,
+                           match=r"cannot be smaller than vocab_size"):
+            manager.apply_grammar_bitmask(logits, bitmask, arange)
+
     def test_unstructured_rows_pass_through(self):
         torch.manual_seed(0)
         manager = make_manager()
