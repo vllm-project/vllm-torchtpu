@@ -419,9 +419,9 @@ def prebuild_fused_moe_ep(layer,
     # The token-gather table remains in HBM and is streamed through two fixed
     # SMEM windows, so TP and a 4K bucket do not exceed the compile-time SMEM
     # limit. The fused EP program assigns disjoint slices of replicated TP
-    # inputs and restores their outputs using native TP groups. The TPU MoERunner
-    # patch suppresses its explicit PCP all-gather/reduce-scatter only for a
-    # layer this function actually arms; refused layers keep the old fallback.
+    # inputs and restores their outputs using native TP groups. TpuMoERunner
+    # suppresses its explicit PCP all-gather/reduce-scatter only for a layer
+    # this function actually arms; refused layers keep the old fallback.
     # Consequently the kernel is the sole dispatch/combine owner under PCP,
     # independent of whether the separate GMM chunk pipeline is enabled.
     pcp = _pcp_size(layer)

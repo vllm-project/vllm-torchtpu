@@ -1,5 +1,14 @@
 # TPU patch mechanism
 
+Before adding a patch, check whether vLLM already has a supported extension
+point for the behavior: a platform hook, a model-config hook, or out-of-tree
+layer registration (`register_oot`). Prefer those; the patch registry is for
+what they do not cover. For example, `TpuMoERunner` in
+`src/vllm_torchtpu/layers/adapter/moe_runner.py` is registered with
+`MoERunner.register_oot` instead of replacing methods on vLLM's `MoERunner`.
+Registration happens when `vllm_torchtpu.layers` is imported and only affects
+layers built afterwards.
+
 Register all TPU patches and workarounds in the ordered `PATCHES` tuple in
 `src/vllm_torchtpu/patch_registry.py`. This registry defines when each patch runs.
 Keep implementations in the relevant modules; the existing lifecycle entry points
