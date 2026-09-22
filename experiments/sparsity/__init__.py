@@ -30,9 +30,9 @@ def prune_gemma4(model_path: str,
                  save_path: str = "",
                  dev: str = "cpu") -> str:
     """
-    Main entry point for TPU-accelerated SparseGPT pruning on Gemma 4 architectures.
+    Main entry point for SparseGPT pruning on Gemma 4 architectures.
     Captures layer activations sequentially, calculates second-order Hessian matrices,
-    and applies N:M structured sparsity directly on TPU MXUs.
+    and applies N:M structured sparsity on host CPU before serving on TPU.
     """
     from .gemma4 import gemma4_sequential, get_gemma4
 

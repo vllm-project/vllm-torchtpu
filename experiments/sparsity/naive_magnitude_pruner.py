@@ -31,7 +31,13 @@ def prune_tensor_magnitude_nm(w: torch.Tensor,
     w_abs = torch.abs(w_flat.float())
 
     # Double argsort yields rank positions (0 is smallest, prunem-1 is largest)
-    ranks = torch.argsort(torch.argsort(w_abs, dim=-1), dim=-1)
+    assert w.shape[-1] % prunem == 0, (
+        f"Contracting dimension size ({w.shape[-1]}) must be divisible by {prunem} "
+        f"to avoid grouping across row boundaries."
+    )
+    # Double argsort yields rank positions (0 is smallest, prunem-1 is largest).
+    # stable=True makes tie-breaks deterministic and portable across backends.
+    ranks = torch.argsort(torch.argsort(w_abs, dim=-1, stable=True), dim=-1)
 
     # Keep weights whose rank >= prunen (e.g. for 2:4: ranks >= 2 keeps top 2)
     mask = ranks >= prunen
@@ -81,6 +87,8 @@ def prune_model_magnitude(base_model_dir: str,
 
     total_pruned_tensors = 0
     total_unpruned_tensors = 0
+    total_pruned_params = 0
+    total_unpruned_params = 0
 
     # 3. Process each safetensors shard sequentially
     for shard_name in shard_files:
@@ -97,6 +105,11 @@ def prune_model_magnitude(base_model_dir: str,
             if "language_model.layers." in k and "weight" in k and not any(
                     skip in k
                     for skip in ["norm", "embed", "lm_head", "layer_scalar"]):
+                if v.ndim == 3:
+                    raise NotImplementedError(
+                        f"Found 3-D tensor '{k}' (shape {list(v.shape)}) under language_model.layers. "
+                        "Fused MoE expert stacks are not supported in naive magnitude pruning."
+                    )
                 if v.ndim == 2:
                     try:
                         parts = k.split("language_model.layers.")[1].split(".")
@@ -112,9 +125,11 @@ def prune_model_magnitude(base_model_dir: str,
                                                      prunem=prunem)
                 out_tensors[k] = v_pruned
                 total_pruned_tensors += 1
+                total_pruned_params += v.numel()
             else:
                 out_tensors[k] = v
                 total_unpruned_tensors += 1
+                total_unpruned_params += v.numel()
 
         print(
             f">>> Saving pruned shard: {dst_shard_path} ({len(out_tensors)} tensors)"
@@ -123,8 +138,14 @@ def prune_model_magnitude(base_model_dir: str,
 
     print("\n=======================================================")
     print(">>> [SUCCESS] Magnitude Pruning Completed!")
-    print(f">>> Total Pruned Linear Projections:   {total_pruned_tensors}")
-    print(f">>> Total Unpruned Tensors (Dense):     {total_unpruned_tensors}")
+    if total_pruned_tensors == 0:
+        raise RuntimeError(
+            f"No tensors matched the pruning filter in {base_model_dir}. "
+            "Check the parameter-name prefix and --minlayer/--maxlayer."
+        )
+
+    print(f">>> Total Pruned Linear Projections:   {total_pruned_tensors} ({total_pruned_params / 1e9:.2f}B params)")
+    print(f">>> Total Unpruned Tensors (Dense):     {total_unpruned_tensors} ({total_unpruned_params / 1e9:.2f}B params)")
     print(f">>> Saved Checkpoint:                   {output_dir}")
     print("=======================================================\n")
 
