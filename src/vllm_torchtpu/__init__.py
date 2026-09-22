@@ -571,6 +571,8 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
+    from vllm_torchtpu.models.parallel_requirements import \
+        requires_dp_collectives
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
@@ -579,7 +581,12 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
         pc = vllm_config.parallel_config
-        binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
+        binding = get_tpu_worker_binding(
+            pc,
+            rank,
+            local_rank,
+            env=_os.environ,
+            dp_collectives=requires_dp_collectives(vllm_config))
         _os.environ.update(binding.as_env())
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "

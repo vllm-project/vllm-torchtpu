@@ -79,6 +79,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
@@ -2652,11 +2653,10 @@ class TPUModelRunner(GPUModelRunner):
             return input_ids, None
 
     def _dp_lockstep_enabled(self) -> bool:
-        # EP combine reduces partial expert outputs across DP engines; those
-        # ranks must enter the same collectives with matching token buckets.
-        # Non-EP DP engines remain independently schedulable.
+        # Expert exchange and DP-sharded embeddings both require
+        # matching physical token buckets, including idle engines.
         return (utils.get_dp_size(self.parallel_config) > 1
-                and self.parallel_config.enable_expert_parallel)
+                and requires_dp_collectives(self.vllm_config))
 
     def _count_input_chunks(
             self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:

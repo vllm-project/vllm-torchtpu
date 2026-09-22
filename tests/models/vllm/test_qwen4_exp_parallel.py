@@ -88,8 +88,14 @@ def config(tp=1, dp=8):
 
 @pytest.mark.parametrize('tp,dp', [(1, 8), (2, 4), (4, 2), (8, 1)])
 @pytest.mark.parametrize('across', [False, True])
-def test_admitted_topologies_and_engram_modes(tp, dp, across):
+@pytest.mark.parametrize('enable_ep', [False, True])
+def test_admitted_topologies_and_engram_modes(tp, dp, across, enable_ep):
     cfg = config(tp, dp)
+    cfg.parallel_config.enable_expert_parallel = enable_ep
+    if not enable_ep and tp == 1:
+        with pytest.raises(ValueError, match='EP off.*TP>=2'):
+            validate_config(cfg)
+        return
     validate_config(
         cfg)  # Missing embedding_across_dp keeps the upstream default.
     cfg.additional_config = {
@@ -133,7 +139,6 @@ def test_engram_flags_reject_truthiness(flag, value):
 @pytest.mark.parametrize('field,value',
                          [('tensor_parallel_size', 2),
                           ('data_parallel_size', 1),
-                          ('enable_expert_parallel', False),
                           ('expert_placement_strategy', 'round_robin'),
                           ('enable_elastic_ep', True), ('enable_eplb', True),
                           ('enable_dbo', True), ('pipeline_parallel_size', 2),
@@ -224,8 +229,9 @@ def test_ple_owner_ranges_cover_each_table_once(tp, across):
                          [(1, 8, 7, True), (1, 8, 7, False), (2, 4, 7, True),
                           (2, 4, 7, False), (4, 2, 7, True), (4, 2, 7, False),
                           (8, 1, 7, False)])
+@pytest.mark.parametrize('enable_ep', [False, True])
 def test_model_uses_true_tp_ep_and_embedding_geometry(monkeypatch, tp, dp,
-                                                      rank, across):
+                                                      rank, across, enable_ep):
     from vllm_torchtpu.models.vllm.qwen4_exp import model
     cfg = config(tp, dp)
     cfg.additional_config = {
@@ -235,6 +241,7 @@ def test_model_uses_true_tp_ep_and_embedding_geometry(monkeypatch, tp, dp,
             }
         }
     }
+    cfg.parallel_config.enable_expert_parallel = enable_ep
     cfg.device_config = NS(device='cpu')
     cfg.compilation_config = NS(static_forward_context={})
     monkeypatch.setattr(model, 'get_tp_group',
@@ -255,7 +262,13 @@ def test_model_uses_true_tp_ep_and_embedding_geometry(monkeypatch, tp, dp,
     model.Qwen4ExpDecoderLayer(cfg, 3, 'model.layers.3')
     assert qsa.call_args.kwargs['tp_size'] == tp
     assert qsa.call_args.kwargs['tp_rank'] == rank % tp
-    assert moe.call_args.kwargs == {'ep_rank': rank, 'ep_size': 8}
+    assert moe.call_args.kwargs == {
+        'ep_rank': rank,
+        'ep_size': 8,
+        'tp_rank': rank % tp,
+        'tp_size': tp,
+        'enable_ep': enable_ep
+    }
     model.Qwen4ExpDecoderLayer(cfg, 1, 'model.layers.1')
     parallel = ple.call_args.kwargs['parallel']
     assert (parallel.rank, parallel.world_size) == ((rank, 8) if across else
@@ -263,12 +276,15 @@ def test_model_uses_true_tp_ep_and_embedding_geometry(monkeypatch, tp, dp,
 
 
 @pytest.mark.parametrize('rank', [0, 7])
+@pytest.mark.parametrize('enable_ep', [False, True])
 def test_model_loader_accepts_only_owned_experts_and_rejects_missing_owned(
-        rank):
+        rank, enable_ep):
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
     module = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     nn.Module.__init__(module)
+    expert_ids = range(rank * 64, (rank + 1) * 64) if enable_ep else range(512)
     expert = NS(ep_rank=rank,
+                expert_ids=expert_ids,
                 _loaded=set(),
                 _pending={},
                 load_weights=Mock(),
@@ -279,7 +295,7 @@ def test_model_loader_accepts_only_owned_experts_and_rejects_missing_owned(
                self_attn=NS(finalize_weights=Mock()))
     module.model = NS(layers=[layer])
     names = [
-        f'experts.{e}.{p}.{field}' for e in range(rank * 64, (rank + 1) * 64)
+        f'experts.{e}.{p}.{field}' for e in expert_ids
         for p in ('gate_proj', 'up_proj', 'down_proj')
         for field in ('weight', 'weight_scale_inv')
     ]
@@ -303,7 +319,6 @@ def test_model_loader_accepts_only_owned_experts_and_rejects_missing_owned(
     ('model_config', 'max_model_len', 8193),
     ('scheduler_config', 'max_num_batched_tokens', 129),
     ('scheduler_config', 'max_num_seqs', 65),
-    ('scheduler_config', 'async_scheduling', True),
     ('cache_config', 'enable_prefix_caching', True),
     ('cache_config', 'cache_dtype', 'fp8'),
     ('cache_config', 'block_size', 256),
@@ -313,3 +328,151 @@ def test_dp8_does_not_expand_other_admission_limits(section, field, value):
     setattr(getattr(cfg, section), field, value)
     with pytest.raises(ValueError):
         validate_config(cfg)
+
+
+@pytest.mark.parametrize('tp,dp', [(1, 8), (2, 4), (4, 2), (8, 1)])
+def test_non_spec_async_uses_the_same_admitted_topologies(tp, dp):
+    cfg = config(tp, dp)
+    cfg.scheduler_config.async_scheduling = True
+    validate_config(cfg)
+
+
+@pytest.mark.parametrize('tp,rank', [(2, 1), (4, 1), (8, 1), (8, 7)])
+def test_epoff_loader_keeps_global_fp8_blocks_and_all_expert_ids(tp, rank):
+    from vllm_torchtpu.models.vllm.qwen4_exp.moe import Qwen4ExpSparseMoeBlock
+    module = Qwen4ExpSparseMoeBlock(ep_rank=0,
+                                    ep_size=8,
+                                    tp_size=tp,
+                                    tp_rank=rank,
+                                    enable_ep=False,
+                                    device='cpu')
+    width = {2: 384, 4: 256, 8: 256}[tp]
+    begin, end = rank * (640 // tp), (rank + 1) * (640 // tp)
+    offset = begin - begin // 128 * 128
+    assert module.expert_ids == range(512)
+    assert module.experts_start.item() == 0
+    assert module._packed['w13'].shape == (512, 2560, width * 2)
+    assert module._packed['w2'].shape == (512, width, 2560)
+    for projection in ('gate', 'up', 'down'):
+        shape = (2560, 640) if projection == 'down' else (640, 2560)
+        bits = (
+            torch.arange(shape[0] * shape[1], device='cpu').reshape(shape) % 9
+            - 4).to(torch.float8_e4m3fn)
+        scales = (1 + torch.arange(
+            shape[0] // 128 * shape[1] // 128, device='cpu').reshape(
+                shape[0] // 128, shape[1] // 128)).bfloat16()
+        for expert in (0, 511):
+            scale = scales * (1 if expert == 0 else 2)
+            module.load_weights([
+                (f'experts.{expert}.{projection}_proj.weight_scale_inv', scale)
+            ])
+            module.load_weights([(f'experts.{expert}.{projection}_proj.weight',
+                                  bits)])
+            original = bits.float() * scale.float().repeat_interleave(
+                128, 0).repeat_interleave(128, 1)
+            if projection == 'down':
+                packed = module._packed['w2'][expert]
+                decoded = packed.float() * module._packed['s2'][
+                    expert, :, 0].repeat_interleave(128, 0)
+                actual, expected = decoded[offset:offset + end -
+                                           begin], original[:, begin:end].T
+                actual_bits = packed[offset:offset + end - begin].view(
+                    torch.uint8)
+                expected_bits = bits[:, begin:end].T.view(torch.uint8)
+            else:
+                start = 0 if projection == 'gate' else width
+                packed = module._packed['w13'][expert, :, start:start + width]
+                decoded = packed.float() * module._packed['s13'][
+                    expert, :, 0, start:start + width].repeat_interleave(
+                        128, 0)
+                actual, expected = decoded[:, offset:offset + end -
+                                           begin], original[begin:end].T
+                actual_bits = packed[:, offset:offset + end - begin].view(
+                    torch.uint8)
+                expected_bits = bits[begin:end].T.view(torch.uint8)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert torch.equal(actual_bits, expected_bits)
+    assert not module._pending
+    assert module._loaded == {(e, p)
+                              for e in (0, 511)
+                              for p in ('gate_proj', 'up_proj', 'down_proj')}
+    with pytest.raises(ValueError, match='Incomplete'):
+        module.finalize_weights()
+
+
+def test_epoff_forward_reduces_fp32_partials_and_adds_shared_once(monkeypatch):
+    import vllm.distributed as dist
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.moe import Qwen4ExpSparseMoeBlock
+    module = Qwen4ExpSparseMoeBlock(ep_rank=0,
+                                    tp_rank=3,
+                                    tp_size=4,
+                                    enable_ep=False,
+                                    device='cpu')
+    x = torch.ones((2, 2560), dtype=torch.bfloat16, device='cpu')
+    partial = torch.full_like(x, 0.25, dtype=torch.float32)
+    partial[1] = 0
+    shared = torch.full_like(x, 3)
+    shared[1] = 0
+    module._local_op = lambda *args: (x, None, None, shared)
+    module._experts_op = lambda *args: partial
+    monkeypatch.setattr(
+        dist, 'get_ep_group',
+        lambda: pytest.fail('EP off must not dispatch or combine experts'))
+    reduction = Mock(side_effect=lambda value: value * 4)
+    monkeypatch.setattr(dist, 'tensor_model_parallel_all_reduce', reduction)
+    output = module(x, torch.tensor([True, False], device='cpu'))
+    reduction.assert_called_once()
+    assert reduction.call_args.args[0].dtype == torch.float32
+    assert output.dtype == torch.bfloat16
+    assert torch.equal(output[0], torch.full_like(output[0], 4))
+    assert not output[1].any()
+
+
+@pytest.mark.parametrize('architecture',
+                         ['Qwen4ExpForCausalLM', 'Qwen3ForCausalLM'])
+@pytest.mark.parametrize('ep', [False, True])
+@pytest.mark.parametrize('across', [False, True])
+def test_dp_collectives_follow_model_communication_not_only_ep(
+        architecture, ep, across):
+    from vllm_torchtpu.models.parallel_requirements import \
+        requires_dp_collectives
+    cfg = NS(parallel_config=NS(enable_expert_parallel=ep),
+             model_config=NS(architecture=architecture),
+             additional_config={
+                 'qwen4_exp': {
+                     'engram_config': {
+                         'embedding_across_dp': across
+                     }
+                 }
+             })
+    assert requires_dp_collectives(cfg) is (
+        ep or (architecture == 'Qwen4ExpForCausalLM' and across))
+
+
+@pytest.mark.parametrize('tp', [2, 4])
+def test_dp_shared_ple_keeps_one_world_with_ep_off(tp):
+    from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+    assignments = []
+    for rank in range(8):
+        cfg = NS(world_size=tp,
+                 local_world_size=tp,
+                 prefill_context_parallel_size=1,
+                 data_parallel_size=8 // tp,
+                 data_parallel_size_local=8 // tp,
+                 data_parallel_index=rank // tp,
+                 data_parallel_rank_local=rank // tp,
+                 enable_expert_parallel=False)
+        binding = get_tpu_worker_binding(cfg,
+                                         rank % tp,
+                                         rank % tp,
+                                         env={},
+                                         dp_collectives=True)
+        assignments.append(binding.native_local_rank)
+        assert binding.rank == rank and binding.local_rank == rank
+        assert binding.world_size == binding.local_world_size == 8
+        assert binding.init_rank == rank % tp and binding.init_world_size == tp
+        independent = get_tpu_worker_binding(cfg, rank % tp, rank % tp, env={})
+        assert independent.world_size == tp and independent.rank == rank % tp
+        assert independent.native_local_rank == rank
+    assert assignments == list(range(8))

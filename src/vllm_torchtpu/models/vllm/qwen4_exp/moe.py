@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen4Exp EP8 W8A16 experts, FP32 routing/combine and BF16 shared expert.
+"""Qwen4Exp W8A16 experts, FP32 routing/combine and BF16 shared expert.
 
-Router/shared work stays local. The existing EP group dispatches physical DP
-slots to complete owned experts and combines FP32 weighted contributions.
-The TP sum preserves TP8/DP1 semantics; TP1 adds its local shared expert once.
+Router/shared work stays local. EP dispatches physical DP slots to complete
+owned experts. Without EP, every rank evaluates a TP slice of all experts.
+Routed contributions are summed in FP32; the shared expert is added once.
 """
 import functools
 from collections.abc import Iterable
@@ -171,19 +171,32 @@ def build_routed_experts_op():
 
 
 class Qwen4ExpSparseMoeBlock(nn.Module):
-    """Complete owned experts for the admitted TP8/DP1 or TP1/DP8 deployment.
+    """EP owns complete experts; EP off owns a TP slice of every expert.
 
     ``load_weights`` takes names relative to ``mlp.`` in arbitrary order.
     ``finalize_weights`` verifies every owned tensor was supplied and builds
     the custom op outside Dynamo. No default FP8 post-load hook is invoked.
     """
 
-    def __init__(self, *, ep_rank: int, ep_size: int = 8, device=None):
+    def __init__(self,
+                 *,
+                 ep_rank: int,
+                 ep_size: int = 8,
+                 tp_rank: int = 0,
+                 tp_size: int = 1,
+                 enable_ep: bool = True,
+                 device=None):
         super().__init__()
-        if ep_size != 8 or not 0 <= ep_rank < ep_size:
+        if enable_ep and (ep_size != 8 or not 0 <= ep_rank < ep_size):
             raise ValueError(
                 "Qwen4Exp S1 MoE requires EP8, contiguous experts")
         self.ep_rank = ep_rank
+        self.enable_ep = enable_ep
+        self.geometry = (ExpertGeometry() if enable_ep else ExpertGeometry(
+            tp_size, tp_rank))
+        self.expert_ids = (range(ep_rank * 64, (ep_rank + 1) *
+                                 64) if enable_ep else range(512))
+        count, width = len(self.expert_ids), self.geometry.physical_size
         self.gate = nn.Linear(2560,
                               512,
                               bias=False,
@@ -196,19 +209,21 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                                             dtype=torch.bfloat16,
                                             device=device)
         self.register_buffer("experts_start",
-                             torch.tensor(ep_rank * 64,
+                             torch.tensor(self.expert_ids.start,
                                           dtype=torch.int32,
                                           device=device),
                              persistent=False)
         # Stream into one CPU bank per local rank. Device view copy_ can
         # rematerialize an entire TorchTPU parameter for every expert.
         self._packed = {}
-        for name, shape, dtype in (("w13", (64, 2560, 1280),
+        for name, shape, dtype in (("w13", (count, 2560, 2 * width),
                                     torch.float8_e4m3fn),
-                                   ("s13", (64, 20, 1, 1280),
-                                    torch.float32), ("w2", (64, 640, 2560),
+                                   ("s13", (count, 20, 1, 2 * width),
+                                    torch.float32), ("w2", (count, width,
+                                                            2560),
                                                      torch.float8_e4m3fn),
-                                   ("s2", (64, 5, 1, 2560), torch.float32)):
+                                   ("s2", (count, width // 128, 1, 2560),
+                                    torch.float32)):
             self._packed[name] = torch.empty(shape, dtype=dtype, device="cpu")
             self.register_parameter(
                 name,
@@ -240,7 +255,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             expert = int(expert)
             if not 0 <= expert < 512:
                 raise ValueError(f"Invalid expert id: {expert}")
-            if not self.ep_rank * 64 <= expert < (self.ep_rank + 1) * 64:
+            if expert not in self.expert_ids:
                 continue
             if projection not in ("gate_proj", "up_proj",
                                   "down_proj") or field not in (
@@ -254,25 +269,26 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 packed, scale = pack_expert_projection(
                     pair["weight"].unsqueeze(0),
                     pair["weight_scale_inv"].unsqueeze(0),
-                    projection.removesuffix("_proj"), ExpertGeometry())
-                local = expert - self.ep_rank * 64
+                    projection.removesuffix("_proj"), self.geometry)
+                local = expert - self.expert_ids.start
                 with torch.no_grad():
                     if projection == "down_proj":
                         self._packed["w2"][local].copy_(packed[0])
                         self._packed["s2"][local].copy_(scale[0])
                     else:
-                        start = 0 if projection == "gate_proj" else 640
-                        self._packed["w13"][local, :,
-                                            start:start + 640].copy_(packed[0])
-                        self._packed["s13"][local, :, :,
-                                            start:start + 640].copy_(scale[0])
+                        width = self.geometry.physical_size
+                        start = 0 if projection == "gate_proj" else width
+                        self._packed["w13"][local, :, start:start +
+                                            width].copy_(packed[0])
+                        self._packed["s13"][local, :, :, start:start +
+                                            width].copy_(scale[0])
                 self._loaded.add(key)
                 del self._pending[key]
         return loaded
 
     def finalize_weights(self):
         expected = {(e, p)
-                    for e in range(self.ep_rank * 64, (self.ep_rank + 1) * 64)
+                    for e in self.expert_ids
                     for p in ("gate_proj", "up_proj", "down_proj")}
         expected.update(
             ("gate.weight", "shared_expert_gate.weight",
@@ -301,10 +317,12 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             self.shared_expert.up_proj.weight,
             self.shared_expert.down_proj.weight,
             self.shared_expert_gate.weight, valid_tokens)
-        ep = get_ep_group()
-        x, probs, ids = ep.dispatch(x, probs, ids)
+        if self.enable_ep:
+            ep = get_ep_group()
+            x, probs, ids = ep.dispatch(x, probs, ids)
         routed = self._experts_op(x, self.w13, self.s13, self.w2, self.s2,
                                   probs, ids, self.experts_start)
-        routed = ep.combine(routed)
+        if self.enable_ep:
+            routed = ep.combine(routed)
         routed = tensor_model_parallel_all_reduce(routed).to(torch.bfloat16)
         return routed + shared

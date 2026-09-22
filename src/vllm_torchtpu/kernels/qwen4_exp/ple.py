@@ -79,8 +79,9 @@ def _bf16(x):
 def resident_lookup_raw(table, ids, *, vocab_start: int, local_rows: int):
     """Owner-masked integer bits [T,2560]: INT8 for FP8, INT16 for BF16.
 
-    Fixed eight-query chunks are required for full-size SparseCore gather
-    lowering. Pad/crop only the queries, never the persistent 6.4GB table.
+    Use the validated eight-token chunks: unbounded full-table gathers failed
+    in the original FP8 lowering probes. Pad/crop only the queries, keeping
+    the persistent table unchanged.
     """
     token_count = ids.shape[0]
     carrier = jnp.int16 if table.dtype == jnp.int16 else jnp.int8

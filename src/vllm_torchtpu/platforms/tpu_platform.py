@@ -19,6 +19,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import \
     validate_pipeline_parallel_config
@@ -770,9 +771,9 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_master_ip or "localhost")
                 os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
                                       str(portpicker.pick_unused_port()))
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
-                    # DP*TP worker, so torch_tpu needs one shared slice
+                if requires_dp_collectives(vllm_config):
+                    # EP or a DP-sharded model embedding spans all
+                    # DP*TP workers, so torch_tpu needs one shared slice
                     # across all of them; the worker spawn shim exposes a
                     # DP-adjusted chip ordinal to TorchTPU for physical
                     # binding.

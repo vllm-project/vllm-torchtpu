@@ -111,13 +111,14 @@ def validate_config(cfg):
     # rejecting that intermediate property would block every mixed TP/DP.
     if ((p.tensor_parallel_size, p.data_parallel_size) not in ((8, 1), (4, 2),
                                                                (2, 4), (1, 8))
-            or not p.enable_expert_parallel or p.pipeline_parallel_size != 1
+            or (not p.enable_expert_parallel and p.tensor_parallel_size == 1)
+            or p.pipeline_parallel_size != 1
             or p.prefill_context_parallel_size != 1
             or p.decode_context_parallel_size != 1 or p.enable_dbo
             or p.enable_eplb or p.expert_placement_strategy != "linear"
             or p.enable_elastic_ep):
         raise ValueError(
-            "Qwen4Exp TPU requires TP8/DP1, TP4/DP2, TP2/DP4 or TP1/DP8 with EP8, PP/CP1, "
+            "Qwen4Exp TPU requires TP8/DP1, TP4/DP2, TP2/DP4 or TP1/DP8 with EP8 or EP off at TP>=2, PP/CP1, "
             "linear expert placement and no DBO/EPLB/elastic EP")
     if (m.dtype != torch.bfloat16
             or c.cache_dtype not in ("auto", "bfloat16", "fp8_per_token_head")
@@ -131,14 +132,13 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp TPU S1 requires context>=128 for full activation profiling"
         )
-    if (c.enable_prefix_caching or s.async_scheduling
-            or s.disable_hybrid_kv_cache_manager
+    if (c.enable_prefix_caching or s.disable_hybrid_kv_cache_manager
             or cfg.speculative_config is not None
             or cfg.kv_transfer_config is not None
             or cfg.lora_config is not None
             or c.kv_cache_memory_bytes is not None):
         raise ValueError(
-            "Qwen4Exp TPU S1 requires profiled hybrid caches, no APC/async/MTP/transfer/LoRA"
+            "Qwen4Exp TPU S1 requires profiled hybrid caches, no APC/MTP/transfer/LoRA"
         )
     if (envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL is True
             or envs.VLLM_TPU_BLOCK_MAJOR_KV):

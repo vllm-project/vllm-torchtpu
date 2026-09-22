@@ -158,3 +158,28 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
         assert not value.any()
     assert captured['context_kwargs']['num_tokens_across_dp'].tolist(
     ) == [128] * 8
+
+
+def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
+    # The runner substitutes the pending token at context on device. PLE's
+    # history must stop BEFORE that slot, whose CPU value is still -1.
+    host = torch.tensor(
+        [[11, 12, 13, -1, 99], [21, 22, -1, 98, 97], [91, 92, 93, 94, 95]],
+        dtype=torch.int32)
+    order = torch.tensor([1, 2, 0])
+    runner = NS(device='cpu', input_batch=NS(token_ids_cpu_tensor=host[order]))
+    adapter = Qwen4ExpAdapter(runner)
+    snapshot = adapter.begin_step().clone()
+    context = torch.tensor([2, 0, 3])
+    history = ngram_context_from_store(snapshot, torch.arange(3), context)
+    assert history.tolist() == [[21, 22], [248044, 248044], [12, 13]]
+    # End-of-step host commit followed by the next optimistic placeholder.
+    # The prior sample now belongs to history, irrespective of row order.
+    runner.input_batch.token_ids_cpu_tensor[0, 2:4] = torch.tensor([23, -1])
+    runner.input_batch.token_ids_cpu_tensor[2, 3:5] = torch.tensor([14, -1])
+    next_snapshot = adapter.begin_step().clone()
+    next_history = ngram_context_from_store(next_snapshot, torch.arange(3),
+                                            torch.tensor([3, 0, 4]))
+    assert next_history.tolist() == [[22, 23], [248044, 248044], [13, 14]]
+    assert ngram_context_from_store(snapshot, torch.arange(3),
+                                    context).tolist() == history.tolist()

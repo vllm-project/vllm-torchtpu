@@ -64,8 +64,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".self_attn")
             cfg.compilation_config.static_forward_context[
                 prefix + ".self_attn"] = self.self_attn
-        self.mlp = Qwen4ExpSparseMoeBlock(ep_rank=ep.rank_in_group,
-                                          ep_size=ep.world_size)
+        self.mlp = Qwen4ExpSparseMoeBlock(
+            ep_rank=ep.rank_in_group,
+            ep_size=ep.world_size,
+            tp_rank=tp.rank_in_group,
+            tp_size=tp.world_size,
+            enable_ep=cfg.parallel_config.enable_expert_parallel)
         self.attn_hyper_connection = GatedResidual(hc_config(t))
         self.mlp_hyper_connection = GatedResidual(hc_config(t))
 
@@ -216,8 +220,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 if family in ("mlp", "ple", "self_attn"):
                     module = getattr(layer, family)
                     module.load_weights([(relative, weight)])
-                    if family == "mlp" and len(
-                            module._loaded) == 197 and not module._pending:
+                    if family == "mlp" and len(module._loaded) == 3 * len(
+                            module.expert_ids) + 5 and not module._pending:
                         module.finalize_weights()
                         finalized.add(int(idx))
                     continue
@@ -239,8 +243,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             prefix = f"model.layers.{i}.mlp."
             required = {
                 f"{prefix}experts.{e}.{p}.{f}"
-                for e in range(layer.mlp.ep_rank *
-                               64, (layer.mlp.ep_rank + 1) * 64)
+                for e in layer.mlp.expert_ids
                 for p in ("gate_proj", "up_proj", "down_proj")
                 for f in ("weight", "weight_scale_inv")
             }
