@@ -18,6 +18,30 @@ import pytest
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 
+def _runtime_mesh_and_partition(torch, dist):
+    import jax
+    import numpy as np
+    from torch_tpu._internal.distributed import tpu_distributed
+
+    device_id = int(tpu_distributed.global_device_id())
+    local = torch.tensor([device_id], dtype=torch.int32, device='tpu')
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    device_ids = sorted(int(value.cpu().item()) for value in gathered)
+    if len(set(device_ids)) != 8:
+        raise RuntimeError(
+            f'Expected eight distinct TPU devices: {device_ids}')
+    devices = {int(device.id): device for device in jax.devices()}
+    if set(device_ids) != set(devices):
+        raise RuntimeError('Worker devices must cover the JAX runtime: '
+                           f'workers={device_ids}, JAX={sorted(devices)}')
+    # Main's TorchTPU assigns custom-op partitions in device-id order, not
+    # process-rank order. Index inputs and the oracle in that same space.
+    mesh = jax.sharding.Mesh(np.asarray([devices[i] for i in device_ids]),
+                             axis_names=('pcp', ))
+    return mesh, device_ids.index(device_id)
+
+
 def _worker(result_dir):
     out = Path(result_dir)
     rank = int(os.environ['RANK'])
@@ -27,7 +51,6 @@ def _worker(result_dir):
         import torch.distributed as dist
         import torch_tpu  # noqa: F401
         from torch_tpu._internal import sync
-        from torch_tpu._internal.pallas import get_pallas_mesh
 
         from vllm_torchtpu.kernels.experimental.batched_rpa.configs import \
             KVLayout
@@ -37,7 +60,8 @@ def _worker(result_dir):
         dist.init_process_group('tpu_dist')
         torch.empty((1, ), device='tpu').cpu()
         print('BOOTED', rank, flush=True)
-        mesh = get_pallas_mesh(axis_names=('pcp', ))
+        mesh, partition = _runtime_mesh_and_partition(torch, dist)
+        print('PARTITION', rank, partition, flush=True)
         page = 128
         local = 128
         hd = 128
@@ -85,10 +109,10 @@ def _worker(result_dir):
                                     device='tpu')
                     k = torch.zeros_like(q)
                     v_cpu = torch.zeros((local, 2, hd), dtype=torch.bfloat16)
-                    mine = max(0, min(local, n - rank * local))
+                    mine = max(0, min(local, n - partition * local))
                     if mine:
                         v_cpu[:mine] = torch.tensor(
-                            values[rank * local:rank * local + mine],
+                            values[partition * local:partition * local + mine],
                             dtype=torch.bfloat16)[:, None,
                                                   None].expand(mine, 2, hd)
                     v = v_cpu.to('tpu')
@@ -112,7 +136,7 @@ def _worker(result_dir):
                     observed = result.cpu().float()
                     expected = torch.zeros_like(observed)
                     for i in range(mine):
-                        pos = start + rank * local + i
+                        pos = start + partition * local + i
                         expected[i] = sum(history[:pos + 1]) / (pos + 1)
                     finite = bool(torch.isfinite(observed).all())
                     err = float((observed - expected).abs().max())
@@ -123,7 +147,7 @@ def _worker(result_dir):
                         2, page, 4, hd)
                     expected_cache = torch.full_like(logical, -2.)
                     for pos, value in enumerate(history):
-                        if (pos // 128) % 8 != rank:
+                        if (pos // 128) % 8 != partition:
                             continue
                         block = pos // 1024
                         offset = pos % 128
@@ -132,6 +156,7 @@ def _worker(result_dir):
                     cache_finite = bool(torch.isfinite(logical).all())
                     cache_err = float((logical - expected_cache).abs().max())
                     row = dict(rank=rank,
+                               partition=partition,
                                prefill_length=length,
                                step=step,
                                layout=layout.name,
@@ -146,7 +171,7 @@ def _worker(result_dir):
                     (out / f'rank-{rank}.json').write_text(
                         json.dumps(rows, indent=2))
                     print(json.dumps(row), flush=True)
-        _extended_cases(out, rank, mesh, rows)
+        _extended_cases(out, rank, partition, mesh, rows)
         dist.barrier()
         dist.destroy_process_group()
         os._exit(0)
@@ -156,7 +181,7 @@ def _worker(result_dir):
         os._exit(1)
 
 
-def _extended_cases(out, rank, mesh, rows):
+def _extended_cases(out, rank, partition, mesh, rows):
     """Exercise real page sizes, mixed requests and cache-owner boundaries."""
     import torch
     from torch_tpu._internal import sync
@@ -212,12 +237,19 @@ def _extended_cases(out, rank, mesh, rows):
         # Non-identity block tables catch accidental logical/physical mixing.
         table = torch.arange(nblocks).reshape(nseq, blocks_per_seq).flip(1)
 
-        def logical_cache(lengths):
+        def logical_cache(lengths,
+                          *,
+                          case_id=case_id,
+                          nblocks=nblocks,
+                          page=page,
+                          interleave=interleave,
+                          table=table,
+                          nonzero_qk=nonzero_qk):
             sentinel = float('nan') if case_id == 3 else -2.
             logical = torch.full((nblocks, page, heads * 2, hd), sentinel)
             for seq, length in enumerate(lengths):
                 pos = torch.arange(length)
-                mine = (pos // interleave) % 8 == rank
+                mine = (pos // interleave) % 8 == partition
                 owned = pos[mine]
                 offsets = ((owned // (8 * interleave)) * interleave +
                            owned % interleave) % page
@@ -279,7 +311,7 @@ def _extended_cases(out, rank, mesh, rows):
                     ])
                 lengths = [a + b for a, b in zip(lengths, added)]
                 n = sum(added)
-                owned_rows = (torch.arange(n) // interleave) % 8 == rank
+                owned_rows = (torch.arange(n) // interleave) % 8 == partition
                 mine = int(owned_rows.sum())
                 assert mine <= local
                 input_v = torch.zeros((local, heads, hd), dtype=torch.bfloat16)
@@ -335,6 +367,7 @@ def _extended_cases(out, rank, mesh, rows):
                 err = float((observed - expected).abs().max())
                 finite = bool(torch.isfinite(observed).all())
                 row = dict(rank=rank,
+                           partition=partition,
                            case=f'extended-{case_id}',
                            nonzero_qk=nonzero_qk,
                            page_size=page,
