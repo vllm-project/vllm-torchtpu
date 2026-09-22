@@ -1,4 +1,3 @@
-from typing import Optional, Set
 """
 sparsity package
 ----------------
@@ -7,7 +6,9 @@ and TPU-accelerated SparseGPT kernel integrations for LLMs (Gemma 4, LLaMA).
 """
 
 import os
+import shutil
 import time
+from typing import Optional, Set
 
 import torch
 from transformers import AutoTokenizer
@@ -111,15 +112,14 @@ def prune_gemma4(model_path: str,
         print(
             f">>> [SPARSITY ENGINE] Saving pruned checkpoint to {save_path}..."
         )
-        import shutil
 
-        has_safetensors = os.path.exists(model_path) and (
-            os.path.exists(os.path.join(model_path, "model.safetensors.index.json")) or
-            any(f.endswith(".safetensors") for f in os.listdir(model_path))
-        )
+        has_safetensors = os.path.exists(model_path) and (os.path.exists(
+            os.path.join(model_path, "model.safetensors.index.json")) or any(
+                f.endswith(".safetensors") for f in os.listdir(model_path)))
         if has_safetensors:
             from resolvers.model_splicer import ModelSplicer
-            sparse_indices = sparse_layer_indices if sparse_layer_indices is not None else set(range(minlayer, maxlayer))
+            sparse_indices = sparse_layer_indices if sparse_layer_indices is not None else set(
+                range(minlayer, maxlayer))
             ModelSplicer.save_substituted_checkpoint(
                 base_model_dir=model_path,
                 output_dir=save_path,
