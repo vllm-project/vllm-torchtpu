@@ -31,16 +31,16 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     # swap adjacent pairs: [1, 0, 3, 2, ...]
     iota = jnp.arange(128)
     swap_indices = jnp.bitwise_xor(iota, 1)  # (128,)
-    swap_coords = jnp.broadcast_to(swap_indices,
-                                   (tile_n, 128))[:, :,
-                                                  None]  # (tile_n, 128, 1)
+    swap_coords = jnp.broadcast_to(swap_indices, (tile_n, 128))[
+        :, :, None
+    ]  # (tile_n, 128, 1)
 
     gather_dn = jax.lax.GatherDimensionNumbers(
         offset_dims=(),
-        collapsed_slice_dims=(1, ),
-        start_index_map=(1, ),
-        operand_batching_dims=(0, ),
-        start_indices_batching_dims=(0, ),
+        collapsed_slice_dims=(1,),
+        start_index_map=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(0,),
     )
 
     x_swapped_2d = jax.lax.gather(
@@ -107,14 +107,16 @@ def quantize_fp8_tiled(x, block_size):
         end = start + block_size
         x_block = x[:, :, start:end]  # (tile_n, S, block_size) f32
 
-        amax = jnp.clip(jnp.max(jnp.abs(x_block), axis=-1, keepdims=True),
-                        1e-4, None)  # (tile_n, S, 1) f32
+        amax = jnp.clip(
+            jnp.max(jnp.abs(x_block), axis=-1, keepdims=True), 1e-4, None
+        )  # (tile_n, S, 1) f32
 
         log2_val = jnp.log2(amax / fp8_max)  # f32
         scale = jnp.exp2(jnp.ceil(log2_val))  # (tile_n, S, 1) f32
 
         q_block = (x_block * (1.0 / scale)).astype(
-            jnp.float8_e4m3fn)  # (tile_n, S, block_size) fp8
+            jnp.float8_e4m3fn
+        )  # (tile_n, S, block_size) fp8
 
         qs.append(q_block)
         scales.append(scale)
@@ -148,8 +150,9 @@ def quantize_fp8_lane_periodic(x, period, nope_dim):
     _, _, width = x.shape
     assert width == 2 * period, (width, period)
 
-    dim = (jax.lax.broadcasted_iota(jnp.int32, x.shape, 1) * width +
-           jax.lax.broadcasted_iota(jnp.int32, x.shape, 2))
+    dim = jax.lax.broadcasted_iota(
+        jnp.int32, x.shape, 1
+    ) * width + jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
     # Dims past the record's end are dropped by the packer; keeping them out
     # of the amax stops them widening a group they are not stored in.
     a = jnp.where(dim < nope_dim, jnp.abs(x), 0.0)
@@ -157,14 +160,12 @@ def quantize_fp8_lane_periodic(x, period, nope_dim):
     amax = jnp.clip(jnp.max(folded, axis=1, keepdims=True), 1e-4, None)
     scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))  # (tile_n, 1, period)
 
-    q = (x * (1.0 / jnp.concatenate([scale, scale], axis=-1))).astype(
-        jnp.float8_e4m3fn)
+    q = (x * (1.0 / jnp.concatenate([scale, scale], axis=-1))).astype(jnp.float8_e4m3fn)
     scale_u8 = (pltpu.bitcast(scale, jnp.uint32) >> 23).astype(jnp.uint8)
     return q, pltpu.bitcast(scale_u8, jnp.float8_e8m0fnu)
 
 
-def pack_nope_lane_periodic(q, scale, nope_dim, nope_width_bytes,
-                            last_dim_size):
+def pack_nope_lane_periodic(q, scale, nope_dim, nope_width_bytes, last_dim_size):
     """Pack `nope_dim` fp8 values followed by the e8m0 scales."""
     tile_n = q.shape[0]
     q_nope = pltpu.bitcast(q, jnp.uint8).reshape(tile_n, -1)[:, :nope_dim]
@@ -174,12 +175,9 @@ def pack_nope_lane_periodic(q, scale, nope_dim, nope_width_bytes,
     return record.reshape(tile_n, -1, last_dim_size)
 
 
-def pack_nope_tiled(q,
-                    scale,
-                    nope_dim,
-                    block_size,
-                    nope_width_bytes=512,
-                    last_dim_size=128):
+def pack_nope_tiled(
+    q, scale, nope_dim, block_size, nope_width_bytes=512, last_dim_size=128
+):
     # q: (tile_n, S, 128) fp8
     # scale: (tile_n, S, num_blocks) e8m0 (uint8 bitcasted)
     tile_n, _, _ = q.shape
@@ -208,8 +206,9 @@ def pack_nope_tiled(q,
     pad_size = nope_width_bytes - (nope_dim + nope_blocks)
     zeros = jnp.zeros((tile_n, pad_size), dtype=jnp.uint8)
 
-    nope_record_padded = jnp.concatenate([q_nope, scale_nope, zeros],
-                                         axis=1)  # (tile_n, 512)
+    nope_record_padded = jnp.concatenate(
+        [q_nope, scale_nope, zeros], axis=1
+    )  # (tile_n, 512)
     return nope_record_padded.reshape(tile_n, -1, last_dim_size)
 
 
@@ -240,23 +239,23 @@ def pack_rope_tiled(rope_slot_ropped, rope_head_dim_actual, rope_width=128):
 
 
 def merge_slot_updates(
-        slots_val,  # (pack_factor, physical_slot_size) uint8 (the row)
-        kv_slots,  # (tile_n,) int (all slots in tile)
-        val_padded,  # (tile_n, record_subslots, 128) uint8 (all values in tile)
-        n,  # int (current token index)
+    slots_val,  # (pack_factor, physical_slot_size) uint8 (the row)
+    kv_slots,  # (tile_n,) int (all slots in tile)
+    val_padded,  # (tile_n, record_subslots, 128) uint8 (all values in tile)
+    n,  # int (current token index)
 ):
     """multiple KV slots are packed into a single physical 512-byte row in HBM.
 
-  Thus, different slots may map to the same tile.
+    Thus, different slots may map to the same tile.
 
-  We only send the DMA from the first tile that updates a physical row,
-  defined by `is_first_mask`.
+    We only send the DMA from the first tile that updates a physical row,
+    defined by `is_first_mask`.
 
-  In this function, we:
-  1. Read the current value of `slot_val`
-  2. Scan all other tokens in the current tile
-  3. Consolidate all other updates into the single tile.
-  """
+    In this function, we:
+    1. Read the current value of `slot_val`
+    2. Scan all other tokens in the current tile
+    3. Consolidate all other updates into the single tile.
+    """
     tile_n = kv_slots.shape[0]
     curr_slot = kv_slots[n]
     pack_factor = slots_val.shape[0]
@@ -329,8 +328,7 @@ def gather_from_page_buffer(
                 @pl.when(valid_w)
                 def _():
                     row_kv = page_buffer[n, p, kv_row][...]  # shape (4, 256)
-                    row_score = page_buffer[n, p,
-                                            score_row][...]  # shape (4, 256)
+                    row_score = page_buffer[n, p, score_row][...]  # shape (4, 256)
 
                     # `proj_and_save_state` stores the f32 state byte-transposed
                     # (u8[s, l] == byte s of f32 l), so one (4, 256) row holds
@@ -376,11 +374,10 @@ def gather_from_page_buffer(
                 slots_per_token_row = state_rows_per_token
                 if overlap:
                     is_prev = w < (window // 2)
-                    kv_slot_start_row = jax.lax.select(is_prev, 0,
-                                                       slots_per_part_row)
+                    kv_slot_start_row = jax.lax.select(is_prev, 0, slots_per_part_row)
                     score_slot_start_row = jax.lax.select(
-                        is_prev, 2 * slots_per_part_row,
-                        3 * slots_per_part_row)
+                        is_prev, 2 * slots_per_part_row, 3 * slots_per_part_row
+                    )
                 else:
                     kv_slot_start_row = 0
                     score_slot_start_row = slots_per_part_row
@@ -389,13 +386,20 @@ def gather_from_page_buffer(
 
                 @pl.loop(0, slots_per_part_head, unroll=True)
                 def gather_loop(d_idx):
-                    kv_src_row = (offset_in_block * slots_per_token_row +
-                                  kv_slot_start_row + d_idx)
-                    score_src_row = (offset_in_block * slots_per_token_row +
-                                     score_slot_start_row + d_idx)
+                    kv_src_row = (
+                        offset_in_block * slots_per_token_row
+                        + kv_slot_start_row
+                        + d_idx
+                    )
+                    score_src_row = (
+                        offset_in_block * slots_per_token_row
+                        + score_slot_start_row
+                        + d_idx
+                    )
 
-                    kv_window_u8[n, w,
-                                 d_idx, :, :] = page_buffer[n, p,
-                                                            kv_src_row, :, :]
+                    kv_window_u8[n, w, d_idx, :, :] = page_buffer[
+                        n, p, kv_src_row, :, :
+                    ]
                     score_window_u8[n, w, d_idx, :, :] = page_buffer[
-                        n, p, score_src_row, :, :]
+                        n, p, score_src_row, :, :
+                    ]

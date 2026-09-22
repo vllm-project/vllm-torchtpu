@@ -13,15 +13,28 @@
 # limitations under the License.
 """TPU-Friendly StreamIndex Top-K kernel."""
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (bref_override,
-                                                                config,
-                                                                metadata)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    bref_override,
+    config,
+    metadata,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
-    DEFAULT_BUFFER_COUNT, KVLayout, MlaCase)
+    DEFAULT_BUFFER_COUNT,
+    KVLayout,
+    MlaCase,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
-    DCP_AXIS_NAME, DEFAULT_VMEM_LIMIT_BYTES, _select_owned_winners,
-    cp_global_to_local, cp_local_length, cp_local_to_global, cp_owner_rank,
-    cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
+    DCP_AXIS_NAME,
+    DEFAULT_VMEM_LIMIT_BYTES,
+    _select_owned_winners,
+    cp_global_to_local,
+    cp_local_length,
+    cp_local_to_global,
+    cp_owner_rank,
+    cp_rank_as_data,
+    streamindex_topk,
+    streamindex_topk_dcp,
+)
 
 __all__ = [
     "bref_override",

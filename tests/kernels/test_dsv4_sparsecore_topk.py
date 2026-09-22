@@ -54,6 +54,7 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_module
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     LANES,
+    MAX_SLICE_WORDS,
     _align_to,
     _pick_partition,
     sparsecore_topk,
@@ -66,6 +67,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # and bkv_p=2 on the GLM path.
 N_SHORT = 10240  # --max-model-len 9216
 N_128K = 133120  # --max-model-len 132096
+N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
 
 SEED = 20260904
 
@@ -205,6 +207,27 @@ def test_shape_derivation_matches_max_model_len():
     """The 128K shape is derived, not hardcoded, so a page-size change shows."""
     assert _topk_n(9216) == N_SHORT
     assert _topk_n(132096) == N_128K
+    assert _topk_n(1048576, page_size=256) == N_1M
+
+
+@pytest.mark.parametrize("b,k", [(64, 2048), (128, 2048)])
+def test_exact_topk_when_stage_two_needs_its_own_partition(b, k):
+    """`p * k_p` past one slice must recurse, not overflow SparseCore.
+
+    At 1M context `p` reaches 32, so stage 2 sees 65536 candidates. Feeding
+    that straight to `_sc_topk_direct` fails to compile with E3000
+    CompileTimeSparseCoreAllocationFailure in tile_spmem. Below `b=32` the
+    single stage-1 wave keeps the same width inside budget, so the batch sizes
+    here are the ones that actually reproduce it.
+    """
+    p = _pick_partition(b, N_1M, k)
+    assert p * min(k, N_1M // p) > MAX_SLICE_WORDS, (
+        f"{b=} {k=} no longer reaches the recursive stage-2 path (p={p})"
+    )
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, N_1M, rng)
+    row_lengths = np.full(b, N_1M, np.int32)
+    assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
 
 
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)

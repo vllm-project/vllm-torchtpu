@@ -55,8 +55,7 @@ class Mode(enum.Enum):
 
 
 _MODE_DEFAULTS = {
-    Mode.HCA:
-    dict(
+    Mode.HCA: dict(
         head_dim=512,
         rope_head_dim=64,
         compress_ratio=128,
@@ -64,8 +63,7 @@ _MODE_DEFAULTS = {
         overlap=False,
         has_rope_cache=False,
     ),
-    Mode.CSA:
-    dict(
+    Mode.CSA: dict(
         head_dim=512,
         rope_head_dim=64,
         compress_ratio=4,
@@ -73,8 +71,7 @@ _MODE_DEFAULTS = {
         overlap=True,
         has_rope_cache=True,
     ),
-    Mode.CSA_INDEXER:
-    dict(
+    Mode.CSA_INDEXER: dict(
         head_dim=128,
         rope_head_dim=64,
         compress_ratio=4,
@@ -92,8 +89,9 @@ def select_mode(head_dim: int, overlap: bool) -> Mode:
     return Mode.CSA if overlap else Mode.HCA
 
 
-def physical_page_size(mode: Mode, kv_cache_block_size: int,
-                       compress_ratio: int) -> int:
+def physical_page_size(
+    mode: Mode, kv_cache_block_size: int, compress_ratio: int
+) -> int:
     """Rows per page of the uint8 cache array allocated for `mode`.
 
     This must mirror the shapes ``KVCacheManager._create_dsv4_kv_caches``
@@ -114,13 +112,12 @@ def physical_page_size(mode: Mode, kv_cache_block_size: int,
     return storage_block_size * 2
 
 
-def state_host_page_size(mode: Mode, kv_cache_block_size: int,
-                         compress_ratio: int) -> int:
-    """Rows per page of the array that *hosts* ``mode``'s f32 compressor state.
-    """
+def state_host_page_size(
+    mode: Mode, kv_cache_block_size: int, compress_ratio: int
+) -> int:
+    """Rows per page of the array that *hosts* ``mode``'s f32 compressor state."""
     if mode is Mode.HCA:
-        return physical_page_size(Mode.CSA, kv_cache_block_size,
-                                  CSA_COMPRESS_RATIO)
+        return physical_page_size(Mode.CSA, kv_cache_block_size, CSA_COMPRESS_RATIO)
     return physical_page_size(mode, kv_cache_block_size, compress_ratio)
 
 
@@ -146,32 +143,35 @@ def state_rows_per_token(mode: Mode, head_dim: int, overlap: bool) -> int:
     return state_bytes // row_size_bytes(mode)
 
 
-def _state_page_capacity(mode: Mode,
-                         kv_cache_block_size: int,
-                         compress_ratio: int | None = None,
-                         head_dim: int | None = None) -> int:
+def _state_page_capacity(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int | None = None,
+    head_dim: int | None = None,
+) -> int:
     """Token states one page of `mode`'s host array physically holds."""
     defaults = _MODE_DEFAULTS[mode]
-    compress_ratio = (defaults["compress_ratio"]
-                      if compress_ratio is None else compress_ratio)
+    compress_ratio = (
+        defaults["compress_ratio"] if compress_ratio is None else compress_ratio
+    )
     head_dim = defaults["head_dim"] if head_dim is None else head_dim
     page_rows = state_host_page_size(mode, kv_cache_block_size, compress_ratio)
-    return page_rows // state_rows_per_token(mode, head_dim,
-                                             defaults["overlap"])
+    return page_rows // state_rows_per_token(mode, head_dim, defaults["overlap"])
 
 
-def state_block_size(mode: Mode,
-                     kv_cache_block_size: int,
-                     compress_ratio: int | None = None,
-                     head_dim: int | None = None) -> int:
+def state_block_size(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int | None = None,
+    head_dim: int | None = None,
+) -> int:
     """Token states vLLM should page `mode`'s state cache at.
 
     vLLM buckets DeepSeek-V4 cache groups by ``(block_size, sliding_window)``,
     we let CSA attention and the indexer's compressor state to have same block
     size to land in the kv cache group.
     """
-    own = _state_page_capacity(mode, kv_cache_block_size, compress_ratio,
-                               head_dim)
+    own = _state_page_capacity(mode, kv_cache_block_size, compress_ratio, head_dim)
     # CSA and the indexer are each other's peer; HCA has none and pages alone.
     peer_mode = {
         Mode.CSA: Mode.CSA_INDEXER,
@@ -186,6 +186,7 @@ def state_block_size(mode: Mode,
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
     """Tile sizes for the kernel."""
+
     tile_n: int
 
 
@@ -231,6 +232,7 @@ class Dimensions:
 @dataclasses.dataclass(frozen=True)
 class Configs:
     """Configuration for the kernel."""
+
     tile_sizes: TileSizes
     dims: Dimensions
 
@@ -262,9 +264,11 @@ class Configs:
             size_n=size_n,
             physical_page_size=physical_page_size,
             state_block_size=state_block_size,
-            state_physical_page_size=(physical_page_size
-                                      if state_physical_page_size is None else
-                                      state_physical_page_size),
+            state_physical_page_size=(
+                physical_page_size
+                if state_physical_page_size is None
+                else state_physical_page_size
+            ),
             rms_eps=rms_eps,
             **actual_overrides,
         )
@@ -300,8 +304,11 @@ class Configs:
     @property
     def nope_store_dim(self) -> int:
         """Dimension of the nope storage (contains rope if no separate rope cache)."""
-        return (self.dims.head_dim - self.dims.rope_head_dim
-                if self.dims.has_rope_cache else self.dims.head_dim)
+        return (
+            self.dims.head_dim - self.dims.rope_head_dim
+            if self.dims.has_rope_cache
+            else self.dims.head_dim
+        )
 
     @property
     def half_rope(self) -> int:
@@ -375,8 +382,9 @@ class Configs:
     @property
     def state_rows_per_token(self) -> int:
         """Number of physical HBM rows occupied by one token's full state (kv + score)."""
-        return state_rows_per_token(self.dims.mode, self.dims.head_dim,
-                                    self.dims.overlap)
+        return state_rows_per_token(
+            self.dims.mode, self.dims.head_dim, self.dims.overlap
+        )
 
     @property
     def field_rows(self) -> int:
@@ -391,7 +399,7 @@ class Configs:
 
     @property
     def state_block_size(self) -> int:
-        """Number of state tokens per page of the state array. """
+        """Number of state tokens per page of the state array."""
         return self.dims.state_block_size
 
     @property
@@ -422,12 +430,12 @@ class Configs:
     def window_bytes_shape(self) -> tuple[int, ...]:
         """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
 
-    Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
-    (also 4) -- they're numerically equal but mean different things.
+        Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
+        (also 4) -- they're numerically equal but mean different things.
 
-    Returns:
-      The shape of the window bytes scratch.
-    """
+        Returns:
+          The shape of the window bytes scratch.
+        """
         return (
             N_FIELDS,
             self._tile_n,
@@ -468,8 +476,7 @@ class Configs:
 
     def state_cache_shape(self, num_pages: int) -> tuple[int, ...]:
         """Shape of the global HBM array hosting the f32 compressor state."""
-        return (num_pages,
-                self.state_physical_page_size) + self.cache_last_dims
+        return (num_pages, self.state_physical_page_size) + self.cache_last_dims
 
     def rope_cache_shape(self, num_pages: int) -> tuple[int, ...]:
         """Shape of the global HBM RoPE cache."""

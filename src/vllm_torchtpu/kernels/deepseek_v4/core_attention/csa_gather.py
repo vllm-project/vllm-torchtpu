@@ -72,11 +72,7 @@ def main_kernel(
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
     half_streams = num_streams // 2
 
-    def process_rope(gather_ref,
-                     out_ref,
-                     idx_sub,
-                     out_row_base=0,
-                     out_col_base=0):
+    def process_rope(gather_ref, out_ref, idx_sub, out_row_base=0, out_col_base=0):
         # one (1, 128) uint8 is one token's rope data, which encodes 64 bf16
         # values. (0, 64) are the high bits for bf16 data, (64, 128) are the low.
         half = rope_out_cols
@@ -86,13 +82,11 @@ def main_kernel(
         def bf16_bits(k):
             sub = lax.rem(idx_sub[k], in_packing)
             hi = jnp.bitwise_and(
-                jnp.bitwise_right_shift(gather_ref[pl.ds(k, 1), col_hi],
-                                        in_bits * sub),
+                jnp.bitwise_right_shift(gather_ref[pl.ds(k, 1), col_hi], in_bits * sub),
                 in_mask,
             )
             lo = jnp.bitwise_and(
-                jnp.bitwise_right_shift(gather_ref[pl.ds(k, 1), col_lo],
-                                        in_bits * sub),
+                jnp.bitwise_right_shift(gather_ref[pl.ds(k, 1), col_lo], in_bits * sub),
                 in_mask,
             )
             return jnp.bitwise_or(jnp.left_shift(hi, in_bits), lo)
@@ -102,9 +96,9 @@ def main_kernel(
             for pk in range(rope_out_packing):
                 k = t * rope_out_packing + pk
                 packed = jnp.bitwise_or(
-                    packed, jnp.left_shift(bf16_bits(k), pk * rope_out_bits))
-            out_ref[pl.ds(out_row_base + t, 1),
-                    pl.ds(out_col_base, half)] = packed
+                    packed, jnp.left_shift(bf16_bits(k), pk * rope_out_bits)
+                )
+            out_ref[pl.ds(out_row_base + t, 1), pl.ds(out_col_base, half)] = packed
 
     def outer_pipeline(idx_ref, valid_ref):
         valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
@@ -117,20 +111,22 @@ def main_kernel(
         # the first half of the streams serves the low half of the period and
         # the second half the high half.
         def subchunk(r, s):
-            return ((s // half_streams) * (num_row_subchunks // 2) +
-                    r * half_streams + s % half_streams)
+            return (
+                (s // half_streams) * (num_row_subchunks // 2)
+                + r * half_streams
+                + s % half_streams
+            )
 
         def idx_window(r, s):
-            return idx_ref[pl.ds(
-                subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
+            return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
 
         # int32 rows produced per stream in the rope output (2 tokens per row).
         rope_rows_per_stream = row_subchunk_size // rope_out_packing
 
         def _body(*refs):
             r = pl.program_id(0)
-            nope_g = refs[0 * num_streams:1 * num_streams]
-            rope_g = refs[1 * num_streams:2 * num_streams]
+            nope_g = refs[0 * num_streams : 1 * num_streams]
+            rope_g = refs[1 * num_streams : 2 * num_streams]
             rope_o = refs[2 * num_streams]
 
             # nope needs no vector work at all. The nope output keeps the
@@ -173,13 +169,17 @@ def main_kernel(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), nope_in_cols),
                 lambda r, s=s: (idx_window(r, s), 0),
-            ) for s in range(num_streams))
+            )
+            for s in range(num_streams)
+        )
         # rope: gather int32 row == index // in_packing (in_packing entries/row).
         rope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), rope_in_cols),
                 lambda r, s=s: (lax.div(idx_window(r, s), in_packing), 0),
-            ) for s in range(num_streams))
+            )
+            for s in range(num_streams)
+        )
 
         # One merged rope output block, covering all `num_streams` subchunks:
         # `half_streams` subchunks of the low half of the period in lanes
@@ -195,9 +195,9 @@ def main_kernel(
         def _run_gather():
             pltpu.emit_pipeline(
                 _body,
-                grid=(num_row_subchunks // num_streams, ),
+                grid=(num_row_subchunks // num_streams,),
                 in_specs=nope_in_specs + rope_in_specs,
-                out_specs=(rope_out_spec, ),
+                out_specs=(rope_out_spec,),
             )(
                 *([nope_in_i32] * num_streams),
                 *([rope_in_i32] * num_streams),
@@ -206,21 +206,21 @@ def main_kernel(
 
     pltpu.emit_pipeline(
         outer_pipeline,
-        grid=(num_blocks, ),
+        grid=(num_blocks,),
         in_specs=(
             pl.BlockSpec(
-                (row_chunk_size, ),
-                lambda b: (b * num_cores + core_index, ),
+                (row_chunk_size,),
+                lambda b: (b * num_cores + core_index,),
             ),
             pl.BlockSpec(
-                (row_subchunk_size, ),
-                lambda b: (0, ),
+                (row_subchunk_size,),
+                lambda b: (0,),
             ),
         ),
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("rope_period", ))
+@functools.partial(jax.jit, static_argnames=("rope_period",))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -231,28 +231,28 @@ def csa_gather(
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
-  Args:
-    nope_cache: (total_pages, page_size, 4, 128) uint8. Each (4, 128) uint8 is
-      token's nope + nope scales. It encodes 448 fp8 + 7 e8m0 scales + padding.
-    rope_cache: (total_pages, page_size // 4, 4, 128) uint8. Each (1, 128) uint8
-      is token's rope. It encodes 64 bf16.
-    indices: (N,) int32. Token indices into the caches.
-    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
-      gather. Subcores assigned to indices beyond this count skip gathering.
-    rope_period: the consumer's row block (the attention kernel's top-k).
-      `rope_out` pairs entry i of a period with entry i + rope_period // 2.
+    Args:
+      nope_cache: (total_pages, page_size, 4, 128) uint8. Each (4, 128) uint8 is
+        token's nope + nope scales. It encodes 448 fp8 + 7 e8m0 scales + padding.
+      rope_cache: (total_pages, page_size // 4, 4, 128) uint8. Each (1, 128) uint8
+        is token's rope. It encodes 64 bf16.
+      indices: (N,) int32. Token indices into the caches.
+      num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
+        gather. Subcores assigned to indices beyond this count skip gathering.
+      rope_period: the consumer's row block (the attention kernel's top-k).
+        `rope_out` pairs entry i of a period with entry i + rope_period // 2.
 
-  Returns:
-    nope_out: (N, 4, 128) uint8.
-      Each (4, 128) uint8 is token's nope. It will be flattened to (1, 512)
-      downstream.
-    rope_out: (N // 2, 128) bf16.
-      Row `period * (rope_period // 2) + i` holds entry i of that period in
-      lanes 0:64 and entry i + rope_period // 2 in lanes 64:128 -- 128 lanes
-      so XLA does not pad the buffer to twice its size. The consumer restores
-      (rope_period, 64) with
-      `jnp.concatenate([row[:, :64], row[:, 64:]], axis=0)`.
-  """
+    Returns:
+      nope_out: (N, 4, 128) uint8.
+        Each (4, 128) uint8 is token's nope. It will be flattened to (1, 512)
+        downstream.
+      rope_out: (N // 2, 128) bf16.
+        Row `period * (rope_period // 2) + i` holds entry i of that period in
+        lanes 0:64 and entry i + rope_period // 2 in lanes 64:128 -- 128 lanes
+        so XLA does not pad the buffer to twice its size. The consumer restores
+        (rope_period, 64) with
+        `jnp.concatenate([row[:, :64], row[:, 64:]], axis=0)`.
+    """
     assert indices.ndim == 1, "Indices must be 1D."
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
     assert nope_cache.dtype == jnp.uint8, "Caches must be uint8."
@@ -273,33 +273,30 @@ def csa_gather(
     row_subchunk_size = num_simd_lanes
 
     if num_valid_indices is None:
-        valid_indices = jnp.full((row_subchunk_size, ),
-                                 out_size,
-                                 dtype=jnp.int32)
+        valid_indices = jnp.full((row_subchunk_size,), out_size, dtype=jnp.int32)
     else:
-        valid_indices = jnp.full((row_subchunk_size, ),
-                                 num_valid_indices,
-                                 dtype=jnp.int32)
+        valid_indices = jnp.full(
+            (row_subchunk_size,), num_valid_indices, dtype=jnp.int32
+        )
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    assert (rope_period % row_subchunk_size == 0
-            ), f"{rope_period=} must be a multiple of {row_subchunk_size=}."
+    assert rope_period % row_subchunk_size == 0, (
+        f"{rope_period=} must be a multiple of {row_subchunk_size=}."
+    )
     num_row_subchunks = rope_period // row_subchunk_size
-    assert (
-        num_row_subchunks %
-        num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
+    assert num_row_subchunks % num_streams == 0, (
+        f"{num_streams=} must divide {num_row_subchunks=}."
+    )
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
-    out_pad_size = (
-        (out_size + block_size - 1) // block_size) * block_size - out_size
+    out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     if out_pad_size:
         # spread the padding to avoid hotspots
         num_tokens = nope_cache.shape[0] // nope_subrows
-        pad = (jnp.arange(out_pad_size, dtype=indices.dtype) *
-               104729) % num_tokens
+        pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -321,12 +318,12 @@ def csa_gather(
                 jnp.uint8,
             ),
             jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) // 2, 2 * rope_out_cols),
-                jnp.bfloat16),
+                ((out_size + out_pad_size) // 2, 2 * rope_out_cols), jnp.bfloat16
+            ),
         ),
         # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
         # copies issued in `main_kernel`.
-        scratch_types=(pltpu.SemaphoreType.DMA((num_streams, )), ),
+        scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
@@ -337,5 +334,5 @@ def csa_gather(
     )(nope_cache, rope_cache, indices, valid_indices)
     return (
         nope_out.reshape(-1, nope_subrows, nope_out_cols)[:out_size],
-        rope_out[:out_size // 2],
+        rope_out[: out_size // 2],
     )

@@ -112,7 +112,7 @@ run_mp_multihost() {
     ${extra_args}
   )
 
-  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --data-parallel-start-rank=0 --host 0.0.0.0 --port "${PORT}")
+  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --host 0.0.0.0 --port "${PORT}")
 
   WORKER_SERVE_ARGS_ARR=()
   for arg in "${COMMON_SERVE_ARGS_ARR[@]}"; do

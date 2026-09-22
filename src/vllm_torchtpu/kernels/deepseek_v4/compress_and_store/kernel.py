@@ -19,9 +19,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (buffered_ref,
-                                                                  compute,
-                                                                  config)
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    buffered_ref,
+    compute,
+    config,
+)
 
 
 def inner_kernel(
@@ -53,8 +55,9 @@ def inner_kernel(
         start_list.append(positions_ref[safe_idx] - window + 1)
     start = jnp.stack(start_list)  # (tile_n,)
 
-    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(2, tile_n, window,
-                                                       head_tiles, 4, 128)
+    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
+        2, tile_n, window, head_tiles, 4, 128
+    )
     kv_window_u8 = window_u8.at[0]
     score_window_u8 = window_u8.at[1]
 
@@ -76,15 +79,13 @@ def inner_kernel(
 
     kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
     scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
-    rms_weight_tiled = rms_weight_vmem_ref[...].astype(
-        jnp.float32)  # (head_tiles, 128)
+    rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
     curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
     mask = curr_pos >= 0  # (tile_n, window)
     mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None,
-                                     None]  # (tile_n, window, 1, 1)
+    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
     neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
     masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
     weights = jax.nn.softmax(masked_scores, axis=1)
@@ -93,24 +94,25 @@ def inner_kernel(
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
-    normed = (compressed * jax.lax.rsqrt(variance + cfgs.dims.rms_eps) *
-              rms_weight_tiled[None, :, :])  # (tile_n, head_tiles, 128)
+    normed = (
+        compressed
+        * jax.lax.rsqrt(variance + cfgs.dims.rms_eps)
+        * rms_weight_tiled[None, :, :]
+    )  # (tile_n, head_tiles, 128)
 
     # --- rope ---
     rope_ropped = None
     if cfgs.dims.has_rope:
         rope_slot = cfgs.rope_slot
-        rope_val = normed[:, rope_slot:rope_slot + 1]
+        rope_val = normed[:, rope_slot : rope_slot + 1]
 
         cos_sin = cos_sin_vmem[...][:, None, :]
-        cos_val = cos_sin[:, :, :cfgs.half_rope]
-        sin_val = cos_sin[:, :, cfgs.half_rope:]
+        cos_val = cos_sin[:, :, : cfgs.half_rope]
+        sin_val = cos_sin[:, :, cfgs.half_rope :]
 
-        rope_ropped = compute.interleaved_rope_vector(rope_val, cos_val,
-                                                      sin_val)
+        rope_ropped = compute.interleaved_rope_vector(rope_val, cos_val, sin_val)
         if head_tiles > 1:
-            normed = jnp.concatenate([normed[:, :rope_slot], rope_ropped],
-                                     axis=1)
+            normed = jnp.concatenate([normed[:, :rope_slot], rope_ropped], axis=1)
         else:
             normed = rope_ropped
 
@@ -119,7 +121,8 @@ def inner_kernel(
         if cfgs.dims.mode == config.Mode.CSA:
             # CSA's reader wants the scales per lane, not per block.
             q, scale = compute.quantize_fp8_lane_periodic(
-                normed, cfgs.dims.quant_block, cfgs.nope_store_dim)
+                normed, cfgs.dims.quant_block, cfgs.nope_store_dim
+            )
             nope_val_padded = compute.pack_nope_lane_periodic(
                 q,
                 scale,
@@ -128,8 +131,7 @@ def inner_kernel(
                 cfgs.last_dim_size,
             )
         else:
-            q, scale = compute.quantize_fp8_tiled(normed,
-                                                  cfgs.dims.quant_block)
+            q, scale = compute.quantize_fp8_tiled(normed, cfgs.dims.quant_block)
             nope_val_padded = compute.pack_nope_tiled(
                 q,
                 scale,
@@ -162,10 +164,9 @@ def inner_kernel(
         else:
             out_vmem[:, 0] = nope_val_padded
         if cfgs.dims.has_rope_cache:
-
             rope_val_padded = compute.pack_rope_tiled(
-                rope_ropped, cfgs.dims.rope_head_dim,
-                cfgs.dims.rope_width)  # (tile_n, 1, 128)
+                rope_ropped, cfgs.dims.rope_head_dim, cfgs.dims.rope_width
+            )  # (tile_n, 1, 128)
 
             rope_slots_val = rope_out_vmem[...]  # (tile_n, 4, 128)
             kv_slots = []
@@ -186,10 +187,9 @@ def inner_kernel(
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
-        out_vmem[...] = pltpu.bitcast(normed.astype(cfgs.dims.nope_dtype),
-                                      jnp.uint8).reshape(
-                                          tile_n, cfgs.record_rows,
-                                          cfgs.hbm_pack, 128)
+        out_vmem[...] = pltpu.bitcast(
+            normed.astype(cfgs.dims.nope_dtype), jnp.uint8
+        ).reshape(tile_n, cfgs.record_rows, cfgs.hbm_pack, 128)
 
 
 def kernel_fn(
@@ -234,7 +234,7 @@ def kernel_fn(
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(inner_kernel, cfgs=cfgs),
-        grid=(grid_size, ),
+        grid=(grid_size,),
         in_specs=in_specs,
         out_specs=[],
     )
@@ -261,8 +261,9 @@ def _select_mode(head_dim: int, overlap: bool) -> config.Mode:
     return config.select_mode(head_dim, overlap)
 
 
-def derive_aliases(has_rope: bool, has_rope_cache: bool,
-                   num_scalar_prefetch: int) -> dict[int, int]:
+def derive_aliases(
+    has_rope: bool, has_rope_cache: bool, num_scalar_prefetch: int
+) -> dict[int, int]:
     cache_index = num_scalar_prefetch + 1 + int(has_rope)
     aliases = {cache_index: 0}
     if has_rope_cache:
@@ -273,16 +274,15 @@ def derive_aliases(has_rope: bool, has_rope_cache: bool,
 def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     """Determines, for every token in a sequence, whether it is the first token within its execution tile to map to a particular physical HBM row.
 
-  If multiple tokens in the same tile map to the same row, only the first one is
-  responsible for writing the merged VMEM row buffer back to HBM. The
-  subsequent tokens in the same tile that conflict will skip the HBM write to
-  prevent overwriting each other's data and reduce memory traffic.
-  """
+    If multiple tokens in the same tile map to the same row, only the first one is
+    responsible for writing the merged VMEM row buffer back to HBM. The
+    subsequent tokens in the same tile that conflict will skip the HBM write to
+    prevent overwriting each other's data and reduce memory traffic.
+    """
     num_tokens = kv_slot_mapping.shape[0]
     pad_len = (tile_n - (num_tokens % tile_n)) % tile_n
     if pad_len > 0:
-        kv_slots_padded = jnp.pad(kv_slot_mapping, (0, pad_len),
-                                  constant_values=-1)
+        kv_slots_padded = jnp.pad(kv_slot_mapping, (0, pad_len), constant_values=-1)
     else:
         kv_slots_padded = kv_slot_mapping
 
@@ -293,7 +293,7 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     row_idxs = kv_slots_tiled // pack_factor
     valid = kv_slots_tiled >= 0
 
-    eq = (row_idxs[:, None, :] == row_idxs[:, :, None])
+    eq = row_idxs[:, None, :] == row_idxs[:, :, None]
     tril = jnp.tril(jnp.ones((tile_n, tile_n), dtype=bool), k=-1)
     conflict = eq & tril[None, :, :] & valid[:, None, :]
     has_conflict = jnp.any(conflict, axis=-1)
@@ -336,7 +336,7 @@ def compress_norm_rope_store(
     interpret: bool = False,
     name: str = "compress_norm_rope_store",
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Compresses, normalizes, applies RoPE and stores to cache. """
+    """Compresses, normalizes, applies RoPE and stores to cache."""
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
@@ -344,8 +344,7 @@ def compress_norm_rope_store(
     head_dim = rms_weight.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
 
-    state_operand = (None if state_cache is None or state_cache is cache else
-                     state_cache)
+    state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
     cfgs = config.Configs.make(
@@ -365,11 +364,11 @@ def compress_norm_rope_store(
     if cfgs.dims.mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
         assert cfgs.tile_sizes.tile_n % 4 == 0, (
             f"tile_n must be a multiple of 4 for {cfgs.dims.mode.value}, "
-            f"got {cfgs.tile_sizes.tile_n}")
+            f"got {cfgs.tile_sizes.tile_n}"
+        )
 
     if cfgs.dims.has_rope_cache and rope_cache is None:
-        raise ValueError(
-            "rope_cache must be provided when has_rope_cache is True")
+        raise ValueError("rope_cache must be provided when has_rope_cache is True")
 
     rms_weight_reshaped = rms_weight.reshape(cfgs.head_tiles, 128)
 
@@ -377,8 +376,7 @@ def compress_norm_rope_store(
     valid = kv_slot_mapping >= 0
     indices = jnp.arange(kv_slot_mapping.shape[0])
     max_idx = jnp.max(jnp.where(valid, indices, -1))
-    grid_size = jnp.where(max_idx >= 0,
-                          pl.cdiv(max_idx + 1, cfgs.tile_sizes.tile_n), 0)
+    grid_size = jnp.where(max_idx >= 0, pl.cdiv(max_idx + 1, cfgs.tile_sizes.tile_n), 0)
 
     is_first_mask = compute_is_first_mask(
         kv_slot_mapping,
@@ -408,27 +406,33 @@ def compress_norm_rope_store(
 
     in_specs = (
         pl.BlockSpec(memory_space=pltpu.VMEM),  # rms_weight
-        (pl.BlockSpec(memory_space=pltpu.HBM)
-         if cfgs.dims.has_rope else None),  # cos_sin
+        (
+            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope else None
+        ),  # cos_sin
         pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-        (pl.BlockSpec(memory_space=pltpu.HBM)
-         if cfgs.dims.has_rope_cache else None),  # rope_cache
-        (pl.BlockSpec(memory_space=pltpu.HBM)
-         if state_operand is not None else None),  # state_cache
+        (
+            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope_cache else None
+        ),  # rope_cache
+        (
+            pl.BlockSpec(memory_space=pltpu.HBM) if state_operand is not None else None
+        ),  # state_cache
     )
     out_specs = (
         pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-        (pl.BlockSpec(memory_space=pltpu.HBM)
-         if cfgs.dims.has_rope_cache else None),  # rope_cache
+        (
+            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope_cache else None
+        ),  # rope_cache
     )
     out_shapes = (
         jax.ShapeDtypeStruct(cache.shape, cache.dtype),
         jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype)
-        if cfgs.dims.has_rope_cache else None,
+        if cfgs.dims.has_rope_cache
+        else None,
     )
 
-    aliases = derive_aliases(cfgs.dims.has_rope, cfgs.dims.has_rope_cache,
-                             len(scalar_prefetch))
+    aliases = derive_aliases(
+        cfgs.dims.has_rope, cfgs.dims.has_rope_cache, len(scalar_prefetch)
+    )
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=len(scalar_prefetch),
@@ -438,9 +442,7 @@ def compress_norm_rope_store(
     )
 
     out_cache, out_rope_cache = pl.pallas_call(
-        functools.partial(kernel_fn,
-                          cfgs=cfgs,
-                          block_table_stride=block_table_stride),
+        functools.partial(kernel_fn, cfgs=cfgs, block_table_stride=block_table_stride),
         out_shape=out_shapes,
         grid_spec=grid_spec,
         input_output_aliases=aliases,

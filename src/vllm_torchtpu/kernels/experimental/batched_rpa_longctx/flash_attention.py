@@ -16,22 +16,21 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, utils
 
 
 def flash_attention_qk_softmax(
-        step: jax.Array,
-        q: jax.Array,  # [B, KV, TQ, H]
-        k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
-        m_prev: jax.Array,  # [KV, TQ, 128]
-        l_prev: jax.Array,  # [KV, TQ, 128]
-        is_last_k: jax.Ref,  # [B]
-        *,
-        custom_mask: jax.Array,
-        cfgs: configs.RpaConfigs,
-        bq_start: int,
-        k_scale: jax.Array | float | None = None,  # [B, KV, S]
+    step: jax.Array,
+    q: jax.Array,  # [B, KV, TQ, H]
+    k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
+    m_prev: jax.Array,  # [KV, TQ, 128]
+    l_prev: jax.Array,  # [KV, TQ, 128]
+    is_last_k: jax.Ref,  # [B]
+    *,
+    custom_mask: jax.Array,
+    cfgs: configs.RpaConfigs,
+    bq_start: int,
+    k_scale: jax.Array | float | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
@@ -111,12 +110,12 @@ def flash_attention_qk_softmax(
 
 
 def flash_attention_pv(
-        p: jax.Array,  # [B, KV, TQ, S]
-        v: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
-        alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
-        o_prev: jax.Array,  # [KV, TQ, H]
-        cfgs: configs.RpaConfigs,
-        v_scale: jax.Array | None = None,  # [B, KV, S]
+    p: jax.Array,  # [B, KV, TQ, S]
+    v: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
+    alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
+    o_prev: jax.Array,  # [KV, TQ, H]
+    cfgs: configs.RpaConfigs,
+    v_scale: jax.Array | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, s = p.shape

@@ -43,8 +43,7 @@ def _build_chunk_metadata(segment_ids, chunk_size):
     batch, tokens = segment_ids.shape
     block_tokens = int(chunk_size)
     num_blocks = tokens // block_tokens
-    seg = segment_ids.astype(jnp.int32).reshape(batch, num_blocks,
-                                                block_tokens)
+    seg = segment_ids.astype(jnp.int32).reshape(batch, num_blocks, block_tokens)
     seg_first = seg[:, :, 0]
     valid_mask = seg > 0
     pos = jnp.arange(block_tokens, dtype=jnp.int32)
@@ -79,8 +78,9 @@ def _build_chunk_metadata(segment_ids, chunk_size):
             ),
         ),
     )
-    seg_id = jnp.where(chunk_kind == CHUNK_KIND_FULL_IN_SEGMENT, seg_first,
-                       0).astype(jnp.int32)
+    seg_id = jnp.where(chunk_kind == CHUNK_KIND_FULL_IN_SEGMENT, seg_first, 0).astype(
+        jnp.int32
+    )
     if orig_ndim == 1:
         return chunk_kind[0], seg_first[0], seg_last[0], seg_id[0]
     return chunk_kind, seg_first, seg_last, seg_id
@@ -162,7 +162,7 @@ def _fwd_mega_kernel_native_segids(
         if BT == 128:
             return seg_full
         seg_first_half = seg_full[:BT]
-        seg_second_half = seg_full[BT:2 * BT]
+        seg_second_half = seg_full[BT : 2 * BT]
         use_second = ((i_c * BT) % 128) >= BT
         return jnp.where(use_second, seg_second_half, seg_first_half)
 
@@ -212,8 +212,9 @@ def _fwd_mega_kernel_native_segids(
                 Aqk_ref[:, 0] = jnp.zeros([MB, BT, BT], dtype=Aqk_ref.dtype)
                 Akk_ref[:, 0] = jnp.zeros([MB, BT, BT], dtype=Akk_ref.dtype)
 
-            g_cumsum_out_ref[:, 0] = jnp.zeros([MB, BT, K_PAD],
-                                               dtype=g_cumsum_out_ref.dtype)
+            g_cumsum_out_ref[:, 0] = jnp.zeros(
+                [MB, BT, K_PAD], dtype=g_cumsum_out_ref.dtype
+            )
 
     # FULL_IN_SEGMENT fast path ---------------------------------------
     @pl.when(kind == CHUNK_KIND_FULL_IN_SEGMENT)
@@ -228,8 +229,9 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, prev_seg)
                 else:
-                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(
-                        ht_ref.dtype)[:, None, :, :]
+                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
         @pl.when(seg_changed)
         def _init():
@@ -268,10 +270,11 @@ def _fwd_mega_kernel_native_segids(
             k = k_ref[:, 0, :, :].astype(jnp.float32)
             v = v_ref[:, 0, :, :].astype(jnp.float32)
             g_raw = g_ref[:, 0, :, :].astype(jnp.float32)
-        beta = (beta_ref[0,
-                         0].transpose(1, 0).astype(jnp.float32) if BATCH_FIRST
-                and beta_ref.ndim == 4 else beta_ref[:, 0, 0,
-                                                     0, :].astype(jnp.float32))
+        beta = (
+            beta_ref[0, 0].transpose(1, 0).astype(jnp.float32)
+            if BATCH_FIRST and beta_ref.ndim == 4
+            else beta_ref[:, 0, 0, 0, :].astype(jnp.float32)
+        )
         if CLIP_BETA_IN_KERNEL:
             beta = jnp.clip(beta, 0, 1)
         if NORMALIZE_QK:
@@ -289,8 +292,7 @@ def _fwd_mega_kernel_native_segids(
             if lower_bound is None:
                 g_f32 = -A_scale[:, None, None] * jax.nn.softplus(g_f32)
             else:
-                g_f32 = lower_bound * jax.nn.sigmoid(
-                    A_scale[:, None, None] * g_f32)
+                g_f32 = lower_bound * jax.nn.sigmoid(A_scale[:, None, None] * g_f32)
 
         g_cumsum = g_f32 * cumsum_scale
         shift = 1
@@ -317,10 +319,10 @@ def _fwd_mega_kernel_native_segids(
         prev_gn = None
         for i_sc in range(NC):
             i_s = i_sc * BC
-            q_i, k_i = q[:, i_s:i_s + BC], k[:, i_s:i_s + BC]
-            g_i = g_cumsum[:, i_s:i_s + BC]
-            beta_i = beta_f32[:, i_s:i_s + BC]
-            gn = g_i[:, ref_idx:ref_idx + 1, :]
+            q_i, k_i = q[:, i_s : i_s + BC], k[:, i_s : i_s + BC]
+            g_i = g_cumsum[:, i_s : i_s + BC]
+            beta_i = beta_f32[:, i_s : i_s + BC]
+            gn = g_i[:, ref_idx : ref_idx + 1, :]
             diff_i = g_i - gn
             exp_i = jnp.exp2(diff_i)
             q_eg, k_eg = q_i * exp_i, k_i * exp_i
@@ -338,9 +340,11 @@ def _fwd_mega_kernel_native_segids(
             qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
             qk_dot_valid = jax.lax.dot_general(
                 qk_eg,
-                k_eng_prefix, (((2, ), (2, )), ((0, ), (0, ))),
+                k_eng_prefix,
+                (((2,), (2,)), ((0,), (0,))),
                 precision=OUTPUT_PRECISION,
-                preferred_element_type=jnp.float32)
+                preferred_element_type=jnp.float32,
+            )
             if j_end < BT:
                 qk_dot = jnp.concatenate(
                     [
@@ -360,7 +364,7 @@ def _fwd_mega_kernel_native_segids(
             Aqk_rows.append(Aqk_r)
             L_rows.append(Akk_r)
 
-        g_last = g_cumsum[:, BT - 1:BT, :]
+        g_last = g_cumsum[:, BT - 1 : BT, :]
         kg = k_eng_prefix * jnp.exp2(g_last - prev_gn)
         Aqk = jnp.concatenate(Aqk_rows, axis=1)
         L = jnp.concatenate(L_rows, axis=1)
@@ -370,9 +374,11 @@ def _fwd_mega_kernel_native_segids(
         I_bt = jnp.eye(BT, dtype=jnp.float32)
         _dot = lambda a, b: jax.lax.dot_general(
             a,
-            b, (((2, ), (1, )), ((0, ), (0, ))),
+            b,
+            (((2,), (1,)), ((0,), (0,))),
             precision=OUTPUT_PRECISION,
-            preferred_element_type=jnp.float32)
+            preferred_element_type=jnp.float32,
+        )
 
         if USE_NEUMANN:
             BC_inv = INV_BC
@@ -389,11 +395,13 @@ def _fwd_mega_kernel_native_segids(
                 pair_mb = MB // 2
                 L_pair = L_inv.reshape(pair_mb, 2, BT, BT)
                 z = jnp.zeros_like(L_pair[:, 0])
-                L_inv = jnp.concatenate([
-                    jnp.concatenate([L_pair[:, 0], z], axis=2),
-                    jnp.concatenate([z, L_pair[:, 1]], axis=2)
-                ],
-                                        axis=1)
+                L_inv = jnp.concatenate(
+                    [
+                        jnp.concatenate([L_pair[:, 0], z], axis=2),
+                        jnp.concatenate([z, L_pair[:, 1]], axis=2),
+                    ],
+                    axis=1,
+                )
                 solve_bt = 2 * BT
                 solve_I = jnp.eye(solve_bt, dtype=inv_dt)
             _idx = jnp.arange(solve_bt, dtype=jnp.int32)
@@ -410,8 +418,8 @@ def _fwd_mega_kernel_native_segids(
                 S = _dot(S, solve_I[None] + Mk)
             P = S
             rhs = jnp.concatenate(
-                [v_beta.astype(inv_dt),
-                 k_eg_beta.astype(inv_dt)], axis=-1)
+                [v_beta.astype(inv_dt), k_eg_beta.astype(inv_dt)], axis=-1
+            )
             if PACK_HEAD_INV:
                 rhs = rhs.reshape(MB // 2, 2 * BT, V_PAD + K_PAD)
             if NC_inv == 1:
@@ -438,19 +446,20 @@ def _fwd_mega_kernel_native_segids(
                     rhs_and_inverse = jnp.concatenate([P_rhs, P], axis=-1)
                     result_and_inverse = _dot(inv_I_G, rhs_and_inverse)
 
-                    result = result_and_inverse[:, :, :V_PAD + K_PAD]
-                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD:]
+                    result = result_and_inverse[:, :, : V_PAD + K_PAD]
+                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD :]
                 else:
                     result = _dot(inv_I_G, P_rhs)
             if PACK_HEAD_INV:
                 result = result.reshape(MB, BT, V_PAD + K_PAD)
             u = result[:, :, :V_PAD]
-            w = result[:, :, V_PAD:V_PAD + K_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
             if NC_inv == 1:
                 A_inv = P
         else:
             raise NotImplementedError(
-                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path"
+            )
 
         # --- Stage 3+4: State + Output ---
         b_h = scratch_ref[...]
@@ -468,8 +477,9 @@ def _fwd_mega_kernel_native_segids(
         if SKIP_STAGE4_MASK:
             b_A = Aqk.astype(jnp.float32)
         else:
-            m_s = (jnp.arange(BT)[:, None]
-                   >= jnp.arange(BT)[None, :]).astype(jnp.float32)
+            m_s = (jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]).astype(
+                jnp.float32
+            )
             b_A = jnp.where(m_s[None, :, :], Aqk.astype(jnp.float32), 0.0)
         b_o_h = jnp.matmul(
             jnp.concatenate([b_A, kg.transpose(0, 2, 1)], axis=1),
@@ -494,7 +504,7 @@ def _fwd_mega_kernel_native_segids(
                 Aqk_ref[:, 0] = Aqk.astype(Aqk_ref.dtype)
                 Akk_ref[:, 0] = A_inv.astype(Akk_ref.dtype)
             g_cumsum_out_ref[:, 0] = g_cumsum.astype(g_cumsum_out_ref.dtype)
-        prev_seg_ref[...] = jnp.broadcast_to(first_seg, (128, ))
+        prev_seg_ref[...] = jnp.broadcast_to(first_seg, (128,))
 
         if STORE_FINAL_STATE:
 
@@ -503,8 +513,9 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, first_seg)
                 else:
-                    ht_ref[first_seg - 1,
-                           ...] = b_h_new.astype(ht_ref.dtype)[:, None, :, :]
+                    ht_ref[first_seg - 1, ...] = b_h_new.astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
     # PARTIAL_PAD ------------------------------------------------------
     @pl.when(kind == CHUNK_KIND_PARTIAL_PAD)
@@ -520,8 +531,9 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, prev_seg)
                 else:
-                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(
-                        ht_ref.dtype)[:, None, :, :]
+                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
         @pl.when(seg_changed)
         def _init():
@@ -551,22 +563,20 @@ def _fwd_mega_kernel_native_segids(
 
         vm = (seg > 0).astype(jnp.float32)  # [BT] valid mask
         if BATCH_FIRST:
-            q = q_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :,
-                                                                     None]
-            k = k_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :,
-                                                                     None]
-            v = v_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :,
-                                                                     None]
-            g_raw = g_ref[0].transpose(1, 0, 2).astype(
-                jnp.float32) * vm[None, :, None]
+            q = q_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :, None]
+            k = k_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :, None]
+            v = v_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :, None]
+            g_raw = g_ref[0].transpose(1, 0, 2).astype(jnp.float32) * vm[None, :, None]
         else:
             q = q_ref[:, 0, :, :].astype(jnp.float32) * vm[None, :, None]
             k = k_ref[:, 0, :, :].astype(jnp.float32) * vm[None, :, None]
             v = v_ref[:, 0, :, :].astype(jnp.float32) * vm[None, :, None]
             g_raw = g_ref[:, 0, :, :].astype(jnp.float32) * vm[None, :, None]
-        beta = (beta_ref[0, 0].transpose(1, 0).astype(jnp.float32)
-                if BATCH_FIRST and beta_ref.ndim == 4 else
-                beta_ref[:, 0, 0, 0, :].astype(jnp.float32)) * vm[None, :]
+        beta = (
+            beta_ref[0, 0].transpose(1, 0).astype(jnp.float32)
+            if BATCH_FIRST and beta_ref.ndim == 4
+            else beta_ref[:, 0, 0, 0, :].astype(jnp.float32)
+        ) * vm[None, :]
         if CLIP_BETA_IN_KERNEL:
             beta = jnp.clip(beta, 0, 1)
         if NORMALIZE_QK:
@@ -584,8 +594,7 @@ def _fwd_mega_kernel_native_segids(
             if lower_bound is None:
                 g_f32 = -A_scale[:, None, None] * jax.nn.softplus(g_f32)
             else:
-                g_f32 = lower_bound * jax.nn.sigmoid(
-                    A_scale[:, None, None] * g_f32)
+                g_f32 = lower_bound * jax.nn.sigmoid(A_scale[:, None, None] * g_f32)
             g_f32 = g_f32 * vm[None, :, None]
 
         g_cumsum = g_f32 * cumsum_scale
@@ -612,10 +621,10 @@ def _fwd_mega_kernel_native_segids(
         prev_gn = None
         for i_sc in range(NC):
             i_s = i_sc * BC
-            q_i, k_i = q[:, i_s:i_s + BC], k[:, i_s:i_s + BC]
-            g_i = g_cumsum[:, i_s:i_s + BC]
-            beta_i = beta_f32[:, i_s:i_s + BC]
-            gn = g_i[:, ref_idx:ref_idx + 1, :]
+            q_i, k_i = q[:, i_s : i_s + BC], k[:, i_s : i_s + BC]
+            g_i = g_cumsum[:, i_s : i_s + BC]
+            beta_i = beta_f32[:, i_s : i_s + BC]
+            gn = g_i[:, ref_idx : ref_idx + 1, :]
             diff_i = g_i - gn
             exp_i = jnp.exp2(diff_i)
             q_eg, k_eg = q_i * exp_i, k_i * exp_i
@@ -633,11 +642,12 @@ def _fwd_mega_kernel_native_segids(
             qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
             qk_dot_valid = jax.lax.dot_general(
                 qk_eg,
-                k_eng_prefix, (((2, ), (2, )), ((0, ), (0, ))),
+                k_eng_prefix,
+                (((2,), (2,)), ((0,), (0,))),
                 precision=OUTPUT_PRECISION,
-                preferred_element_type=jnp.float32)
+                preferred_element_type=jnp.float32,
+            )
             if j_end < BT:
-
                 qk_dot = jnp.concatenate(
                     [
                         qk_dot_valid,
@@ -662,9 +672,11 @@ def _fwd_mega_kernel_native_segids(
         I_bt = jnp.eye(BT, dtype=jnp.float32)
         _dot = lambda a, b: jax.lax.dot_general(
             a,
-            b, (((2, ), (1, )), ((0, ), (0, ))),
+            b,
+            (((2,), (1,)), ((0,), (0,))),
             precision=OUTPUT_PRECISION,
-            preferred_element_type=jnp.float32)
+            preferred_element_type=jnp.float32,
+        )
         if USE_NEUMANN:
             BC_inv = INV_BC
             NC_inv = BT // BC_inv
@@ -684,8 +696,8 @@ def _fwd_mega_kernel_native_segids(
                 S = _dot(S, I_bt[None] + Mk)
             P = S
             rhs = jnp.concatenate(
-                [v_beta.astype(inv_dt),
-                 k_eg_beta.astype(inv_dt)], axis=-1)
+                [v_beta.astype(inv_dt), k_eg_beta.astype(inv_dt)], axis=-1
+            )
             if NC_inv == 1:
                 result = _dot(P, rhs)
             else:
@@ -709,17 +721,18 @@ def _fwd_mega_kernel_native_segids(
                 if STORE_RESIDUALS:
                     rhs_and_inverse = jnp.concatenate([P_rhs, P], axis=-1)
                     result_and_inverse = _dot(inv_I_G, rhs_and_inverse)
-                    result = result_and_inverse[:, :, :V_PAD + K_PAD]
-                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD:]
+                    result = result_and_inverse[:, :, : V_PAD + K_PAD]
+                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD :]
                 else:
                     result = _dot(inv_I_G, P_rhs)
             u = result[:, :, :V_PAD]
-            w = result[:, :, V_PAD:V_PAD + K_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
             if NC_inv == 1:
                 A_inv = P
         else:
             raise NotImplementedError(
-                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path"
+            )
         g_last = (g_cumsum * vm[None, :, None]).min(axis=1, keepdims=True)
         kg = k * jnp.exp2(g_last - g_cumsum) * vm[None, :, None]
 
@@ -738,8 +751,9 @@ def _fwd_mega_kernel_native_segids(
         if SKIP_STAGE4_MASK:
             b_A = Aqk.astype(jnp.float32)
         else:
-            m_s = (jnp.arange(BT)[:, None]
-                   >= jnp.arange(BT)[None, :]).astype(jnp.float32)
+            m_s = (jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]).astype(
+                jnp.float32
+            )
             b_A = jnp.where(m_s[None, :, :], Aqk.astype(jnp.float32), 0.0)
         b_o_h = jnp.matmul(
             jnp.concatenate([b_A, kg.transpose(0, 2, 1)], axis=1),
@@ -761,8 +775,7 @@ def _fwd_mega_kernel_native_segids(
             if MANUAL_HT_DMA:
                 _dma_state_to_ht(scratch_ref, first_seg)
             else:
-                ht_ref[first_seg - 1,
-                       ...] = b_h_new.astype(ht_ref.dtype)[:, None, :, :]
+                ht_ref[first_seg - 1, ...] = b_h_new.astype(ht_ref.dtype)[:, None, :, :]
         if STORE_RESIDUALS:
             if RESIDUAL_CHUNK_LAYOUT:
                 Aqk_ref[:, 0, 0] = Aqk.astype(Aqk_ref.dtype)
@@ -771,7 +784,7 @@ def _fwd_mega_kernel_native_segids(
                 Aqk_ref[:, 0] = Aqk.astype(Aqk_ref.dtype)
                 Akk_ref[:, 0] = A_inv.astype(Akk_ref.dtype)
             g_cumsum_out_ref[:, 0] = g_cumsum.astype(g_cumsum_out_ref.dtype)
-        prev_seg_ref[...] = jnp.broadcast_to(first_seg, (128, ))
+        prev_seg_ref[...] = jnp.broadcast_to(first_seg, (128,))
 
         if STORE_FINAL_STATE:
 
@@ -780,8 +793,9 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, first_seg)
                 else:
-                    ht_ref[first_seg - 1,
-                           ...] = b_h_new.astype(ht_ref.dtype)[:, None, :, :]
+                    ht_ref[first_seg - 1, ...] = b_h_new.astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
     # BOUNDARY: two segments in one chunk -----------------------------
     @pl.when(kind == CHUNK_KIND_BOUNDARY)
@@ -797,8 +811,9 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, prev_seg)
                 else:
-                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(
-                        ht_ref.dtype)[:, None, :, :]
+                    ht_ref[prev_seg - 1, ...] = scratch_ref[...].astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
         @pl.when(seg_changed)
         def _init():
@@ -847,7 +862,6 @@ def _fwd_mega_kernel_native_segids(
 
         # --- FULL-style computation (backward-compatible) ---
         if BATCH_FIRST:
-
             q = q_ref[0].transpose(1, 0, 2).astype(jnp.float32)
             k = k_ref[0].transpose(1, 0, 2).astype(jnp.float32)
             v = v_ref[0].transpose(1, 0, 2).astype(jnp.float32)
@@ -857,10 +871,11 @@ def _fwd_mega_kernel_native_segids(
             k = k_ref[:, 0, :, :].astype(jnp.float32)
             v = v_ref[:, 0, :, :].astype(jnp.float32)
             g_raw = g_ref[:, 0, :, :].astype(jnp.float32)
-        beta = (beta_ref[0,
-                         0].transpose(1, 0).astype(jnp.float32) if BATCH_FIRST
-                and beta_ref.ndim == 4 else beta_ref[:, 0, 0,
-                                                     0, :].astype(jnp.float32))
+        beta = (
+            beta_ref[0, 0].transpose(1, 0).astype(jnp.float32)
+            if BATCH_FIRST and beta_ref.ndim == 4
+            else beta_ref[:, 0, 0, 0, :].astype(jnp.float32)
+        )
         if CLIP_BETA_IN_KERNEL:
             beta = jnp.clip(beta, 0, 1)
         if NORMALIZE_QK:
@@ -878,8 +893,7 @@ def _fwd_mega_kernel_native_segids(
             if lower_bound is None:
                 g_f32 = -A_scale[:, None, None] * jax.nn.softplus(g_f32)
             else:
-                g_f32 = lower_bound * jax.nn.sigmoid(
-                    A_scale[:, None, None] * g_f32)
+                g_f32 = lower_bound * jax.nn.sigmoid(A_scale[:, None, None] * g_f32)
 
         g_cumsum = g_f32 * cumsum_scale
         shift = 1
@@ -906,11 +920,11 @@ def _fwd_mega_kernel_native_segids(
         prev_gn = None
         for i_sc in range(NC):
             i_s = i_sc * BC
-            q_i = q[:, i_s:i_s + BC]
-            k_i = k[:, i_s:i_s + BC]
-            g_i = g_cumsum[:, i_s:i_s + BC]
-            beta_i = beta_f32[:, i_s:i_s + BC]
-            gn = g_i[:, ref_idx:ref_idx + 1, :]
+            q_i = q[:, i_s : i_s + BC]
+            k_i = k[:, i_s : i_s + BC]
+            g_i = g_cumsum[:, i_s : i_s + BC]
+            beta_i = beta_f32[:, i_s : i_s + BC]
+            gn = g_i[:, ref_idx : ref_idx + 1, :]
             diff_i = g_i - gn
             exp_i = jnp.exp2(diff_i)
             q_eg = q_i * exp_i
@@ -929,8 +943,10 @@ def _fwd_mega_kernel_native_segids(
             qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
             qk_dot_valid = jax.lax.dot_general(
                 qk_eg,
-                k_eng_prefix, (((2, ), (2, )), ((0, ), (0, ))),
-                preferred_element_type=jnp.float32)
+                k_eng_prefix,
+                (((2,), (2,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
             if j_end < BT:
                 qk_dot = jnp.concatenate(
                     [
@@ -953,8 +969,10 @@ def _fwd_mega_kernel_native_segids(
         L = jnp.concatenate(L_rows, axis=1)
 
         # Mask L for segment-independent solve
-        same_seg_L = (seg_A_mask[:, None] * seg_A_mask[None, :] +
-                      seg_B_mask[:, None] * seg_B_mask[None, :])
+        same_seg_L = (
+            seg_A_mask[:, None] * seg_A_mask[None, :]
+            + seg_B_mask[:, None] * seg_B_mask[None, :]
+        )
         L = L * same_seg_L[None]
 
         # Solve (same as FULL)
@@ -962,9 +980,8 @@ def _fwd_mega_kernel_native_segids(
         k_eg_beta = k * jnp.exp2(g_cumsum) * beta_f32
         I_bt = jnp.eye(BT, dtype=jnp.float32)
         _dot = lambda a, b: jax.lax.dot_general(
-            a,
-            b, (((2, ), (1, )), ((0, ), (0, ))),
-            preferred_element_type=jnp.float32)
+            a, b, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32
+        )
 
         if USE_NEUMANN:
             BC_inv = INV_BC
@@ -977,11 +994,13 @@ def _fwd_mega_kernel_native_segids(
                 pair_mb = MB // 2
                 L_pair = L_inv.reshape(pair_mb, 2, BT, BT)
                 z = jnp.zeros_like(L_pair[:, 0])
-                L_inv = jnp.concatenate([
-                    jnp.concatenate([L_pair[:, 0], z], axis=2),
-                    jnp.concatenate([z, L_pair[:, 1]], axis=2)
-                ],
-                                        axis=1)
+                L_inv = jnp.concatenate(
+                    [
+                        jnp.concatenate([L_pair[:, 0], z], axis=2),
+                        jnp.concatenate([z, L_pair[:, 1]], axis=2),
+                    ],
+                    axis=1,
+                )
                 solve_bt = 2 * BT
                 solve_I = jnp.eye(solve_bt, dtype=inv_dt)
             _idx = jnp.arange(solve_bt, dtype=jnp.int32)
@@ -998,8 +1017,8 @@ def _fwd_mega_kernel_native_segids(
                 S = _dot(S, solve_I[None] + Mk)
             P = S
             rhs = jnp.concatenate(
-                [v_beta.astype(inv_dt),
-                 k_eg_beta.astype(inv_dt)], axis=-1)
+                [v_beta.astype(inv_dt), k_eg_beta.astype(inv_dt)], axis=-1
+            )
             if PACK_HEAD_INV:
                 rhs = rhs.reshape(MB // 2, 2 * BT, V_PAD + K_PAD)
             if NC_inv == 1:
@@ -1026,17 +1045,18 @@ def _fwd_mega_kernel_native_segids(
                 if STORE_RESIDUALS:
                     rhs_and_inverse = jnp.concatenate([P_rhs, P], axis=-1)
                     result_and_inverse = _dot(inv_I_G, rhs_and_inverse)
-                    result = result_and_inverse[:, :, :V_PAD + K_PAD]
-                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD:]
+                    result = result_and_inverse[:, :, : V_PAD + K_PAD]
+                    A_inv = result_and_inverse[:, :, V_PAD + K_PAD :]
                 else:
                     result = _dot(inv_I_G, P_rhs)
             if PACK_HEAD_INV:
                 result = result.reshape(MB, BT, V_PAD + K_PAD)
             u = result[:, :, :V_PAD]
-            w = result[:, :, V_PAD:V_PAD + K_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
         else:
             raise NotImplementedError(
-                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+                "mega KDA supports only the Kimi-K3 bfloat16 Neumann path"
+            )
 
         if HAS_H0:
             if MANUAL_H0_DMA:
@@ -1060,11 +1080,10 @@ def _fwd_mega_kernel_native_segids(
             else:
                 final_state_dma_ref[...] = _read_h0(last_seg)
         else:
-            final_state_dma_ref[...] = jnp.zeros([MB, K_PAD, V_PAD],
-                                                 dtype=jnp.float32)
+            final_state_dma_ref[...] = jnp.zeros([MB, K_PAD, V_PAD], dtype=jnp.float32)
         h_B_initial = final_state_dma_ref[...]
 
-        g_last = g_cumsum[:, BT - 1:BT, :]
+        g_last = g_cumsum[:, BT - 1 : BT, :]
         kg = k * jnp.exp2(g_last - g_cumsum)
 
         # --- Output + State ---
@@ -1098,10 +1117,10 @@ def _fwd_mega_kernel_native_segids(
         if SKIP_STAGE4_MASK:
             Aqk_stage4 = Aqk_seg.astype(jnp.float32)
         else:
-            m_s = (jnp.arange(BT)[:, None]
-                   >= jnp.arange(BT)[None, :]).astype(jnp.float32)
-            Aqk_stage4 = jnp.where(m_s[None, :, :],
-                                   Aqk_seg.astype(jnp.float32), 0.0)
+            m_s = (jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]).astype(
+                jnp.float32
+            )
+            Aqk_stage4 = jnp.where(m_s[None, :, :], Aqk_seg.astype(jnp.float32), 0.0)
         mask_A = seg_A_mask[None, :, None]
         mask_B = seg_B_mask[None, :, None]
         v_new_B = (u - w_h_B) * mask_B
@@ -1112,19 +1131,21 @@ def _fwd_mega_kernel_native_segids(
             precision=OUTPUT_PRECISION,
             preferred_element_type=jnp.float32,
         )
-        b_o = ((state_o + intra_o) * mask_A + (state_o_B + intra_o) * mask_B)
+        b_o = (state_o + intra_o) * mask_A + (state_o_B + intra_o) * mask_B
         if BATCH_FIRST:
             o_ref[0] = b_o.transpose(1, 0, 2).astype(o_ref.dtype)
         else:
             o_ref[:, 0] = b_o.astype(o_ref.dtype)
 
         # State: per-segment
-        g_A_total = jnp.sum(g_f32 * seg_A_mask[None, :, None],
-                            axis=1,
-                            keepdims=True) * cumsum_scale
-        g_B_total = jnp.sum(g_f32 * seg_B_mask[None, :, None],
-                            axis=1,
-                            keepdims=True) * cumsum_scale
+        g_A_total = (
+            jnp.sum(g_f32 * seg_A_mask[None, :, None], axis=1, keepdims=True)
+            * cumsum_scale
+        )
+        g_B_total = (
+            jnp.sum(g_f32 * seg_B_mask[None, :, None], axis=1, keepdims=True)
+            * cumsum_scale
+        )
         # Mask the exponent before exp2. Masking the result afterwards can
         # produce inf * 0 = NaN for tokens belonging to the other segment.
         kg_A_exp = jnp.where(mask_A != 0, g_A_total - g_cumsum, 0.0)
@@ -1138,7 +1159,8 @@ def _fwd_mega_kernel_native_segids(
             kg_A.transpose(0, 2, 1),
             b_v_new * seg_A_mask[None, :, None],
             precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32)
+            preferred_element_type=jnp.float32,
+        )
         if STORE_FINAL_STATE:
             if MANUAL_HT_DMA:
                 final_state_dma_ref[...] = h_A_new
@@ -1159,24 +1181,21 @@ def _fwd_mega_kernel_native_segids(
                 else:
                     _dma_state_to_ht(final_state_dma_ref, first_seg)
             else:
-                ht_ref[first_seg - 1,
-                       ...] = h_A_new.astype(ht_ref.dtype)[:, None, :, :]
+                ht_ref[first_seg - 1, ...] = h_A_new.astype(ht_ref.dtype)[:, None, :, :]
 
         # seg_B starts inside this chunk and therefore uses its own h0.
-        h_B_new = (h_B_initial * jnp.exp2(g_B_total[:, 0, :])[:, :, None] +
-                   jnp.matmul(
-                       kg_B.transpose(0, 2, 1),
-                       v_new_B,
-                       precision=jax.lax.Precision.HIGHEST,
-                       preferred_element_type=jnp.float32,
-                   ))
+        h_B_new = h_B_initial * jnp.exp2(g_B_total[:, 0, :])[:, :, None] + jnp.matmul(
+            kg_B.transpose(0, 2, 1),
+            v_new_B,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
         scratch_ref[...] = h_B_new
         if STORE_FINAL_STATE and MANUAL_HT_DMA and OVERLAP_HT_DMA:
             ht_A_copy.wait()
         if STORE_FINAL_STATE:
             if not MANUAL_HT_DMA:
-                ht_ref[last_seg - 1,
-                       ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
+                ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
 
         if STORE_RESIDUALS:
             if RESIDUAL_CHUNK_LAYOUT:
@@ -1186,7 +1205,7 @@ def _fwd_mega_kernel_native_segids(
                 Aqk_ref[:, 0] = Aqk.astype(Aqk_ref.dtype)
                 Akk_ref[:, 0] = A_inv.astype(Akk_ref.dtype)
             g_cumsum_out_ref[:, 0] = g_cumsum.astype(g_cumsum_out_ref.dtype)
-        prev_seg_ref[...] = jnp.broadcast_to(last_seg, (128, ))
+        prev_seg_ref[...] = jnp.broadcast_to(last_seg, (128,))
 
         if STORE_FINAL_STATE:
 
@@ -1195,12 +1214,12 @@ def _fwd_mega_kernel_native_segids(
                 if MANUAL_HT_DMA:
                     _dma_state_to_ht(scratch_ref, last_seg)
                 else:
-                    ht_ref[last_seg - 1,
-                           ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
+                    ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[
+                        :, None, :, :
+                    ]
 
 
-def _fwd_mega_kernel_native_segids_packed(packed_metadata_ref, *args,
-                                          **kwargs):
+def _fwd_mega_kernel_native_segids_packed(packed_metadata_ref, *args, **kwargs):
     return _fwd_mega_kernel_native_segids(
         packed_metadata_ref,
         packed_metadata_ref,
@@ -1264,7 +1283,8 @@ def _chunk_kda_fwd_native_segids_impl(
     BT = chunk_size
     if only_fwd and (disable_recompute or store_h or store_v_new):
         raise ValueError(
-            "only_fwd=True is incompatible with backward-intermediate storage")
+            "only_fwd=True is incompatible with backward-intermediate storage"
+        )
     if disable_recompute:
         store_h = True
 
@@ -1276,8 +1296,7 @@ def _chunk_kda_fwd_native_segids_impl(
 
     NT = T // BT
     packed_metadata = only_fwd and envs.KDA_PACKED_METADATA
-    chunk_kind, seg_first, seg_last, seg_id = _build_chunk_metadata(
-        segment_ids, BT)
+    chunk_kind, seg_first, seg_last, seg_id = _build_chunk_metadata(segment_ids, BT)
     next_kind = jnp.concatenate(
         [
             chunk_kind[:, 1:],
@@ -1285,13 +1304,16 @@ def _chunk_kda_fwd_native_segids_impl(
         ],
         axis=1,
     )
-    is_last_real_chunk = ((chunk_kind != CHUNK_KIND_ALL_PAD)
-                          & (next_kind == CHUNK_KIND_ALL_PAD))
-    chunk_kind = chunk_kind | (is_last_real_chunk.astype(jnp.int32) *
-                               CHUNK_FLAG_LAST_REAL)
+    is_last_real_chunk = (chunk_kind != CHUNK_KIND_ALL_PAD) & (
+        next_kind == CHUNK_KIND_ALL_PAD
+    )
+    chunk_kind = chunk_kind | (
+        is_last_real_chunk.astype(jnp.int32) * CHUNK_FLAG_LAST_REAL
+    )
     if N_max is None:
-        N_max = int(segment_ids.max()
-                    )  # Fallback: should not happen when called via dispatch
+        N_max = int(
+            segment_ids.max()
+        )  # Fallback: should not happen when called via dispatch
     # The packed representation uses 3 kind/flag bits and two 14-bit segment IDs.
     # Preserve the legacy three-prefetch ABI for unusually large N_max.
     if packed_metadata and N_max >= 16384:
@@ -1307,21 +1329,27 @@ def _chunk_kda_fwd_native_segids_impl(
         p = t - x.shape[-1]
         return jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, p))) if p > 0 else x
 
-    q_t, k_t, v_t, g_t = _pad(q, K_PAD), _pad(k, K_PAD), _pad(v,
-                                                              V_ALIGNED), _pad(
-                                                                  g, K_PAD)
+    q_t, k_t, v_t, g_t = (
+        _pad(q, K_PAD),
+        _pad(k, K_PAD),
+        _pad(v, V_ALIGNED),
+        _pad(g, K_PAD),
+    )
     # Pad segment_ids to [B, T_PAD_S] (128-aligned in T dim)
     if segment_ids.shape[-1] < T_PAD_S:
-        segment_ids = jnp.pad(segment_ids,
-                              ((0, 0), (0, T_PAD_S - segment_ids.shape[-1])))
+        segment_ids = jnp.pad(
+            segment_ids, ((0, 0), (0, T_PAD_S - segment_ids.shape[-1]))
+        )
 
     # Rebuild metadata with padded T (chunk_size still BT, but more chunks now due to padding)
     # Metadata arrays need last dim >= 128 or == array dim. Pad NT to 128 if needed.
     NT_meta = T // BT  # original number of chunks
     NT_meta_PAD = max(int(align_up(NT_meta, 128)), 128)  # at least 128
-    chunk_kind_padded = jnp.pad(chunk_kind,
-                                ((0, 0), (0, NT_meta_PAD - NT_meta)),
-                                constant_values=CHUNK_KIND_ALL_PAD)
+    chunk_kind_padded = jnp.pad(
+        chunk_kind,
+        ((0, 0), (0, NT_meta_PAD - NT_meta)),
+        constant_values=CHUNK_KIND_ALL_PAD,
+    )
     seg_first_padded = jnp.pad(seg_first, ((0, 0), (0, NT_meta_PAD - NT_meta)))
     seg_last_padded = jnp.pad(seg_last, ((0, 0), (0, NT_meta_PAD - NT_meta)))
 
@@ -1344,8 +1372,11 @@ def _chunk_kda_fwd_native_segids_impl(
     # head dimension. Smaller head groups use the head-first layout whose last
     # dimension is the complete 64-token block and therefore TPU legal.
     beta_batch_first = batch_first and only_fwd and MB == H
-    beta_t = (beta.reshape(B, NT, BT, H) if beta_batch_first else
-              beta.transpose(2, 0, 1).reshape(H, B, NT, 1, BT))
+    beta_t = (
+        beta.reshape(B, NT, BT, H)
+        if beta_batch_first
+        else beta.transpose(2, 0, 1).reshape(H, B, NT, 1, BT)
+    )
 
     use_neumann = q.dtype == jnp.bfloat16
     # With gate values as low as -5, a 32-token block can form masked
@@ -1363,7 +1394,7 @@ def _chunk_kda_fwd_native_segids_impl(
     # 64x64 mask on the Stage 4 dependency chain.  Keep the training lowering
     # unchanged because it shares this kernel body.
     skip_stage4_mask = only_fwd
-    pack_head_inv = (only_fwd and MB % 2 == 0 and envs.KDA_PACK_HEAD_INV)
+    pack_head_inv = only_fwd and MB % 2 == 0 and envs.KDA_PACK_HEAD_INV
     clip_beta_in_kernel = only_fwd
     overlap_h0_dma = only_fwd and envs.KDA_OVERLAP_H0_DMA
     overlap_ht_dma = only_fwd and envs.KDA_OVERLAP_HT_DMA
@@ -1373,18 +1404,19 @@ def _chunk_kda_fwd_native_segids_impl(
     # can read its own MB-sized block via _h0_map (avoids OOB on dim1).
     has_h0 = initial_state is not None
     state_dma_override = envs.KDA_MANUAL_STATE_DMA
-    manual_state_dma = (N_max >= 6
-                        if state_dma_override is None else state_dma_override)
+    manual_state_dma = N_max >= 6 if state_dma_override is None else state_dma_override
     h0_dma_override = envs.KDA_MANUAL_H0_DMA
     manual_h0_dma = (
-        only_fwd and has_h0
-        and (N_max > 6 if h0_dma_override is None else h0_dma_override))
+        only_fwd
+        and has_h0
+        and (N_max > 6 if h0_dma_override is None else h0_dma_override)
+    )
     if has_h0:
         h0 = initial_state
         if h0.ndim == 4:
             h0 = h0[None, ...]  # [1, N, H, K, V]
         if h0.shape[0] < B:
-            h0 = jnp.broadcast_to(h0, (B, ) + h0.shape[1:])
+            h0 = jnp.broadcast_to(h0, (B,) + h0.shape[1:])
 
         # Pass ALL N_max initial states for per-segment loading
         # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad -> [N_max, H, B, K_PAD, V_ALIGNED]
@@ -1392,8 +1424,7 @@ def _chunk_kda_fwd_native_segids_impl(
         if K_PAD > K:
             h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, 0)))
         if V_ALIGNED > V:
-            h0 = jnp.pad(h0,
-                         ((0, 0), (0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
+            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
         h0_in = h0.astype(jnp.float32)  # [N_max, H, B, K_PAD, V_ALIGNED]
     else:
         h0_in = None
@@ -1402,8 +1433,11 @@ def _chunk_kda_fwd_native_segids_impl(
     if use_gate_in_kernel and A_log is not None:
         H_A = A_log.shape[0]
         n_rep = H // H_A
-        A_expanded = (jnp.repeat(A_log.astype(jnp.float32), n_rep)
-                      if n_rep > 1 else A_log.astype(jnp.float32))
+        A_expanded = (
+            jnp.repeat(A_log.astype(jnp.float32), n_rep)
+            if n_rep > 1
+            else A_log.astype(jnp.float32)
+        )
         A_scale_in = jnp.exp(A_expanded).reshape(H, 1, 1, 1)
     else:
         A_scale_in = jnp.zeros((H, 1, 1, 1), dtype=jnp.float32)
@@ -1411,8 +1445,7 @@ def _chunk_kda_fwd_native_segids_impl(
     if use_gate_in_kernel and dt_bias is not None:
         H_A = A_log.shape[0]
         n_rep = H // H_A
-        db_2d = dt_bias.reshape(-1)[:H_A * K].reshape(H_A,
-                                                      K).astype(jnp.float32)
+        db_2d = dt_bias.reshape(-1)[: H_A * K].reshape(H_A, K).astype(jnp.float32)
         if n_rep > 1:
             db_2d = jnp.repeat(db_2d, n_rep, axis=0)
         db_in = db_2d[:, None, None, :].astype(jnp.float32)  # [H, 1, 1, K]
@@ -1466,14 +1499,23 @@ def _chunk_kda_fwd_native_segids_impl(
         [1, BT, MB, K_PAD] if batch_first else [MB, 1, BT, K_PAD],
         index_map=_in_map,
     )
-    beta_spec = (pl.BlockSpec([1, 1, BT, MB], index_map=_beta_map)
-                 if beta_batch_first else pl.BlockSpec([MB, 1, 1, 1, BT],
-                                                       index_map=_beta_map))
-    h0_spec = ((pl.BlockSpec(
-        memory_space=pl.ANY) if manual_h0_dma else pl.BlockSpec(
-            [N_max, MB, 1, K_PAD, V_ALIGNED],
-            index_map=_h0_map,
-        )) if has_h0 else None)
+    beta_spec = (
+        pl.BlockSpec([1, 1, BT, MB], index_map=_beta_map)
+        if beta_batch_first
+        else pl.BlockSpec([MB, 1, 1, 1, BT], index_map=_beta_map)
+    )
+    h0_spec = (
+        (
+            pl.BlockSpec(memory_space=pl.ANY)
+            if manual_h0_dma
+            else pl.BlockSpec(
+                [N_max, MB, 1, K_PAD, V_ALIGNED],
+                index_map=_h0_map,
+            )
+        )
+        if has_h0
+        else None
+    )
 
     def _alog_map(h, b, c, *refs):
         return (h, 0, 0, 0)
@@ -1494,53 +1536,91 @@ def _chunk_kda_fwd_native_segids_impl(
     store_final_state = output_final_state or store_h
     ht_dma_override = envs.KDA_MANUAL_HT_DMA
     manual_ht_dma = (
-        only_fwd and store_final_state
-        and (manual_state_dma if ht_dma_override is None else ht_dma_override))
-    ht_spec = ((pl.BlockSpec(
-        memory_space=pl.ANY) if manual_ht_dma else pl.BlockSpec(
-            [N_max, MB, 1, K_PAD, V_ALIGNED],
-            index_map=_ht_map,
-        )) if store_final_state else None)
+        only_fwd
+        and store_final_state
+        and (manual_state_dma if ht_dma_override is None else ht_dma_override)
+    )
+    ht_spec = (
+        (
+            pl.BlockSpec(memory_space=pl.ANY)
+            if manual_ht_dma
+            else pl.BlockSpec(
+                [N_max, MB, 1, K_PAD, V_ALIGNED],
+                index_map=_ht_map,
+            )
+        )
+        if store_final_state
+        else None
+    )
 
     store_residuals = not only_fwd
     store_chunk_h = store_residuals and store_h
-    aqk_spec = (pl.BlockSpec(
-        [MB, 1, 1, BT, BT] if residual_chunk_layout else [MB, 1, BT, BT],
-        index_map=_out_chunk_map if residual_chunk_layout else _out_map,
-    ) if store_residuals else None)
-    akk_spec = (pl.BlockSpec(
-        [MB, 1, 1, BT, BT] if residual_chunk_layout else [MB, 1, BT, BT],
-        index_map=_out_chunk_map if residual_chunk_layout else _out_map,
-    ) if store_residuals else None)
-    g_cumsum_spec = (pl.BlockSpec([MB, 1, BT, K_PAD], index_map=_out_map)
-                     if store_residuals else None)
-    chunk_h_spec = (pl.BlockSpec(
-        [MB, 1, 1, K_PAD, V_ALIGNED],
-        index_map=lambda h, b, c, *r: (h, b, c, 0, 0),
-    ) if store_chunk_h else None)
+    aqk_spec = (
+        pl.BlockSpec(
+            [MB, 1, 1, BT, BT] if residual_chunk_layout else [MB, 1, BT, BT],
+            index_map=_out_chunk_map if residual_chunk_layout else _out_map,
+        )
+        if store_residuals
+        else None
+    )
+    akk_spec = (
+        pl.BlockSpec(
+            [MB, 1, 1, BT, BT] if residual_chunk_layout else [MB, 1, BT, BT],
+            index_map=_out_chunk_map if residual_chunk_layout else _out_map,
+        )
+        if store_residuals
+        else None
+    )
+    g_cumsum_spec = (
+        pl.BlockSpec([MB, 1, BT, K_PAD], index_map=_out_map)
+        if store_residuals
+        else None
+    )
+    chunk_h_spec = (
+        pl.BlockSpec(
+            [MB, 1, 1, K_PAD, V_ALIGNED],
+            index_map=lambda h, b, c, *r: (h, b, c, 0, 0),
+        )
+        if store_chunk_h
+        else None
+    )
 
-    aqk_shape = (jax.ShapeDtypeStruct(
-        (H, B, NT, BT, BT) if residual_chunk_layout else (H, B, T, BT),
-        q.dtype,
-    ) if store_residuals else None)
-    akk_shape = (jax.ShapeDtypeStruct(
-        (H, B, NT, BT, BT) if residual_chunk_layout else (H, B, T, BT),
-        q.dtype,
-    ) if store_residuals else None)
-    g_cumsum_shape = (jax.ShapeDtypeStruct(
-        (H, B, T, K_PAD), jnp.float32) if store_residuals else None)
+    aqk_shape = (
+        jax.ShapeDtypeStruct(
+            (H, B, NT, BT, BT) if residual_chunk_layout else (H, B, T, BT),
+            q.dtype,
+        )
+        if store_residuals
+        else None
+    )
+    akk_shape = (
+        jax.ShapeDtypeStruct(
+            (H, B, NT, BT, BT) if residual_chunk_layout else (H, B, T, BT),
+            q.dtype,
+        )
+        if store_residuals
+        else None
+    )
+    g_cumsum_shape = (
+        jax.ShapeDtypeStruct((H, B, T, K_PAD), jnp.float32) if store_residuals else None
+    )
 
-    chunk_h_shape = (jax.ShapeDtypeStruct(
-        (H, B, NT, K_PAD, V_ALIGNED), jnp.float32) if store_chunk_h else None)
+    chunk_h_shape = (
+        jax.ShapeDtypeStruct((H, B, NT, K_PAD, V_ALIGNED), jnp.float32)
+        if store_chunk_h
+        else None
+    )
 
     grid = (H // MB, B, NT)
     if packed_metadata:
         native_kernel = _fwd_mega_kernel_native_segids_packed
         scalar_prefetch_count = 1
-        packed_meta = (chunk_kind_padded.astype(jnp.int32)
-                       | (seg_first_padded.astype(jnp.int32) << jnp.int32(3))
-                       | (seg_last_padded.astype(jnp.int32) << jnp.int32(17)))
-        scalar_inputs = (packed_meta, )
+        packed_meta = (
+            chunk_kind_padded.astype(jnp.int32)
+            | (seg_first_padded.astype(jnp.int32) << jnp.int32(3))
+            | (seg_last_padded.astype(jnp.int32) << jnp.int32(17))
+        )
+        scalar_inputs = (packed_meta,)
     else:
         native_kernel = _fwd_mega_kernel_native_segids
         scalar_prefetch_count = 3
@@ -1589,9 +1669,11 @@ def _chunk_kda_fwd_native_segids_impl(
                 (B, T, H, V_ALIGNED) if batch_first else (H, B, T, V_ALIGNED),
                 v.dtype,
             ),
-            (jax.ShapeDtypeStruct(
-                (N_max, H, B, K_PAD,
-                 V_ALIGNED), jnp.float32) if store_final_state else None),
+            (
+                jax.ShapeDtypeStruct((N_max, H, B, K_PAD, V_ALIGNED), jnp.float32)
+                if store_final_state
+                else None
+            ),
             aqk_shape,
             akk_shape,
             g_cumsum_shape,
@@ -1621,7 +1703,7 @@ def _chunk_kda_fwd_native_segids_impl(
             ],
             scratch_shapes=[
                 pltpu.VMEM((MB, K_PAD, V_ALIGNED), jnp.float32),
-                pltpu.VMEM((128, ), jnp.int32),
+                pltpu.VMEM((128,), jnp.int32),
                 pltpu.VMEM((MB, K_PAD, V_ALIGNED), jnp.float32),
                 pltpu.SemaphoreType.DMA,
             ],
@@ -1648,8 +1730,7 @@ def _chunk_kda_fwd_native_segids_impl(
     o_out = o_out[..., :V]
     # ht_out: [1, H, B, K_PAD, V_ALIGNED] -> [B, 1, H, K, V]
     if ht_out is not None:
-        ht_out = ht_out[:, :, :, :K, :V].transpose(2, 0, 1, 3,
-                                                   4)  # [B, N_max, H, K, V]
+        ht_out = ht_out[:, :, :, :K, :V].transpose(2, 0, 1, 3, 4)  # [B, N_max, H, K, V]
 
     final_state = ht_out if store_final_state else None
 
@@ -1659,7 +1740,20 @@ def _chunk_kda_fwd_native_segids_impl(
 
     if chunk_h_out is not None:
         chunk_h_out = chunk_h_out[:, :, :, :K, :V]
-    return o_out, final_state, g_cumsum_out, Aqk_out, Akk_out, None, None, None, None, None, chunk_h_out, None
+    return (
+        o_out,
+        final_state,
+        g_cumsum_out,
+        Aqk_out,
+        Akk_out,
+        None,
+        None,
+        None,
+        None,
+        None,
+        chunk_h_out,
+        None,
+    )
 
 
 _chunk_kda_fwd_native_segids = jax.jit(
