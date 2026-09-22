@@ -35,31 +35,29 @@ class GdnHeadGeometry:
 
     def kq_shard_index(self, rank: int) -> int:
         if not 0 <= rank < self.parallel_size:
-            raise ValueError(
-                f"rank={rank} must be in [0, {self.parallel_size}).")
+            raise ValueError(f"rank={rank} must be in [0, {self.parallel_size}).")
         return rank // self.kq_replication_factor
 
     def local_conv_dim(self, d_k: int, d_v: int) -> int:
         if d_k <= 0 or d_v <= 0:
             raise ValueError(
-                f"GDN head dimensions must be positive, got {d_k=} {d_v=}.")
-        return (2 * self.local_num_kq_heads * d_k +
-                self.local_num_v_heads * d_v)
+                f"GDN head dimensions must be positive, got {d_k=} {d_v=}."
+            )
+        return 2 * self.local_num_kq_heads * d_k + self.local_num_v_heads * d_v
 
     def local_state_shapes(
-            self,
-            shapes: tuple[tuple[int, ...], ...],
-            d_k: int,
-            d_v: int,
-            *,
-            conv_dim_axis: int = -1
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        d_k: int,
+        d_v: int,
+        *,
+        conv_dim_axis: int = -1,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Apply head ownership, preserving tap/speculation and layout axes."""
         conv_shape, recurrent_shape = shapes
         conv_shape = list(conv_shape)
         conv_shape[conv_dim_axis] = self.local_conv_dim(d_k, d_v)
-        return (tuple(conv_shape), (self.local_num_v_heads,
-                                    *recurrent_shape[1:]))
+        return (tuple(conv_shape), (self.local_num_v_heads, *recurrent_shape[1:]))
 
 
 def derive_gdn_head_geometry(
@@ -69,28 +67,35 @@ def derive_gdn_head_geometry(
 ) -> GdnHeadGeometry:
     """Derive the native sharding/replication relationship for GDN TP and PCP."""
     if num_kq_heads <= 0 or num_v_heads <= 0 or parallel_size <= 0:
-        raise ValueError("GDN head counts and parallel size must be positive: "
-                         f"{num_kq_heads=} {num_v_heads=} {parallel_size=}.")
+        raise ValueError(
+            "GDN head counts and parallel size must be positive: "
+            f"{num_kq_heads=} {num_v_heads=} {parallel_size=}."
+        )
     if num_v_heads % parallel_size:
-        raise ValueError(f"num_v_heads={num_v_heads} must be divisible by "
-                         f"parallel_size={parallel_size}.")
+        raise ValueError(
+            f"num_v_heads={num_v_heads} must be divisible by "
+            f"parallel_size={parallel_size}."
+        )
 
     num_unique_kq_shards = min(num_kq_heads, parallel_size)
     if num_kq_heads % num_unique_kq_shards:
         raise ValueError(
             f"num_kq_heads={num_kq_heads} must be divisible by "
-            f"parallel_size={parallel_size} when Q/K heads are sharded.")
+            f"parallel_size={parallel_size} when Q/K heads are sharded."
+        )
     if parallel_size % num_unique_kq_shards:
         raise ValueError(
             f"parallel_size={parallel_size} must be divisible by "
-            f"num_kq_heads={num_kq_heads} when Q/K heads are replicated.")
+            f"num_kq_heads={num_kq_heads} when Q/K heads are replicated."
+        )
 
     local_num_kq_heads = num_kq_heads // num_unique_kq_shards
     local_num_v_heads = num_v_heads // parallel_size
     if local_num_v_heads % local_num_kq_heads:
         raise ValueError(
             "Each rank-local Q/K head must own an integer number of V heads: "
-            f"{local_num_kq_heads=} {local_num_v_heads=}.")
+            f"{local_num_kq_heads=} {local_num_v_heads=}."
+        )
 
     return GdnHeadGeometry(
         num_kq_heads=num_kq_heads,

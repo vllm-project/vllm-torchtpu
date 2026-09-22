@@ -15,6 +15,7 @@
 expert half of an MoE layer for one expert-parallel shard and pushes each
 result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
+
 import functools
 import threading
 
@@ -27,20 +28,27 @@ from jax.experimental.pallas import tpu as pltpu
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
 from vllm_torchtpu.kernels.fused_moe.v2 import host
-from vllm_torchtpu.kernels.fused_moe.v2.host import (FP4, FP8, FP8_MAX,
-                                                     HIDDEN_LANE_BLOCK, NBUF,
-                                                     OUT_PARITIES, PACK4, QB4,
-                                                     ROWBLK,
-                                                     WEIGHT_PREFETCH_DISTANCE)
+from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    FP4,
+    FP8,
+    FP8_MAX,
+    HIDDEN_LANE_BLOCK,
+    NBUF,
+    OUT_PARITIES,
+    PACK4,
+    QB4,
+    ROWBLK,
+    WEIGHT_PREFETCH_DISTANCE,
+)
+
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from vllm_torchtpu.kernels.megablox.gmm_v2 import (silu_and_mul_with_clamp,
-                                                   swigluoai)
+from vllm_torchtpu.kernels.megablox.gmm_v2 import silu_and_mul_with_clamp, swigluoai
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-DN = (((1, ), (0, )), ((), ()))
+DN = (((1,), (0,)), ((), ()))
 # The single-axis mesh name the layer's shard_map uses.
 AXIS = "d"
 # Columns of the intermediate the requantization does at a time. Chunking
@@ -85,8 +93,14 @@ N_COUNT_TABLES = 1  # shard_count_vector: [N_COUNTS, ep] i32
 # partitioning"). Passing the index as data is what the PCP streaming kernels
 # in this tree already do for the same reason.
 N_RANK_TABLES = 1
-N_PREFETCH = (N_TRANSPORT_TABLES + N_PUSH_TABLES + N_SLAB_TABLES +
-              N_VISIT_TABLES + N_COUNT_TABLES + N_RANK_TABLES)
+N_PREFETCH = (
+    N_TRANSPORT_TABLES
+    + N_PUSH_TABLES
+    + N_SLAB_TABLES
+    + N_VISIT_TABLES
+    + N_COUNT_TABLES
+    + N_RANK_TABLES
+)
 # The HBM operands, in the order the kernel body unpacks them. Only these
 # two are on every build: the rest -- the activation row scale, the two
 # weight scale tables, the two expert bias tables -- are there where the
@@ -117,7 +131,8 @@ def _apply_act(gate, up, act_fn):
     if act_fn == "silu_and_mul_with_clamp":
         return silu_and_mul_with_clamp(gate, up)
     raise NotImplementedError(
-        f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
+        f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
+    )
 
 
 def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
@@ -137,9 +152,13 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     what a shard's `g_local` experts actually expect to hold.
     """
     step = tile_m // HEIGHT_RUNGS
-    if (HEIGHT_RUNGS < 2 or step % ROWBLK or step * HEIGHT_RUNGS != tile_m
-            or rows_alloc > ep * g_local * tile_m):
-        return (tile_m, )
+    if (
+        HEIGHT_RUNGS < 2
+        or step % ROWBLK
+        or step * HEIGHT_RUNGS != tile_m
+        or rows_alloc > ep * g_local * tile_m
+    ):
+        return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
 
 
@@ -179,13 +198,9 @@ def _quant_apply(x, sinv_native, usable):
     return jnp.where(usable, x * sinv_native, jnp.zeros_like(x)).astype(FP8)
 
 
-def wire_row_and_scale(acc2,
-                       mid_scale,
-                       *,
-                       w2s=None,
-                       w2b=None,
-                       wire_dtype=FP8,
-                       tile_m=None):
+def wire_row_and_scale(
+    acc2, mid_scale, *, w2s=None, w2b=None, wire_dtype=FP8, tile_m=None
+):
     """One tile's rows as they go on the wire, and the scale that rides with
     them.
 
@@ -226,14 +241,7 @@ def wire_row_and_scale(acc2,
     return down_bf16, jnp.ones((rows, 1), jnp.float32)
 
 
-def _intermediate_rows(acc1,
-                       act_scale,
-                       inter,
-                       *,
-                       w1s,
-                       act_fn,
-                       w1b,
-                       requantize=True):
+def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=True):
     """acc1's gate and up halves through the activation, as the second
     matmul's left-hand side.
 
@@ -271,20 +279,19 @@ def _intermediate_rows(acc1,
         # against the wrong scale. w1b is the [1, 2 * inter] gate|up row.
         if w1b is not None:
             gate = gate + w1b[:, c0:c1]
-            up = up + w1b[:, inter + c0:inter + c1]
+            up = up + w1b[:, inter + c0 : inter + c1]
         chunk = _apply_act(gate, up, act_fn).astype(jnp.bfloat16)
         mid_chunks.append(chunk)
         if requantize:
             chunk_amax = _absmax_rows(chunk)
-            amax = chunk_amax if amax is None else jnp.maximum(
-                amax, chunk_amax)
+            amax = chunk_amax if amax is None else jnp.maximum(amax, chunk_amax)
     if not requantize:
         return jnp.concatenate(mid_chunks, axis=-1), None
     mid_scale, mid_sinv, usable = _row_scale(amax)
     sinv_bf16 = mid_sinv.astype(jnp.bfloat16)
     mid_q = jnp.concatenate(
-        [_quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks],
-        axis=-1)
+        [_quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks], axis=-1
+    )
     return mid_q, mid_scale
 
 
@@ -299,10 +306,12 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     """
     acc = None
     for b in range(n_chunks):
-        part = lax.dot_general(lhs[:, b * kb:(b + 1) * kb],
-                               rhs_chunk(b),
-                               DN,
-                               preferred_element_type=jnp.float32)
+        part = lax.dot_general(
+            lhs[:, b * kb : (b + 1) * kb],
+            rhs_chunk(b),
+            DN,
+            preferred_element_type=jnp.float32,
+        )
         acc = part if acc is None else acc + part
     return acc
 
@@ -317,26 +326,25 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
     """
     inter = w1.shape[-1] // 2
     acc1 = lax.dot_general(act_q, w1, DN, preferred_element_type=jnp.float32)
-    mid_q, mid_scale = _intermediate_rows(acc1,
-                                          act_scale,
-                                          inter,
-                                          w1s=w1s,
-                                          act_fn=act_fn,
-                                          w1b=w1b)
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
+    )
     acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
     return acc2, mid_scale
 
 
-def expert_ffn_blockscale(act_q,
-                          act_scale,
-                          w1_block,
-                          w2_block,
-                          w1s_blocks,
-                          w2s_blocks,
-                          *,
-                          qb=QB4,
-                          act_fn="silu",
-                          w1b=None):
+def expert_ffn_blockscale(
+    act_q,
+    act_scale,
+    w1_block,
+    w2_block,
+    w1s_blocks,
+    w2s_blocks,
+    *,
+    qb=QB4,
+    act_fn="silu",
+    w1b=None,
+):
     """One expert's FFN on block-scaled weights: the same body as
     expert_ffn_fp8 with each matmul summed over contraction blocks carrying
     their own scales, w1s_blocks [nb1, 2*inter] and w2s_blocks [nb2, hidden].
@@ -354,26 +362,27 @@ def expert_ffn_blockscale(act_q,
     inter = w1s_blocks.shape[-1] // 2
     acc1 = None
     for b in range(n_blocks1):
-        part = lax.dot_general(act_q[:, b * qb:(b + 1) * qb],
-                               w1_block(b),
-                               DN,
-                               preferred_element_type=jnp.float32)
+        part = lax.dot_general(
+            act_q[:, b * qb : (b + 1) * qb],
+            w1_block(b),
+            DN,
+            preferred_element_type=jnp.float32,
+        )
         part = part * w1s_blocks[b][None, :]
         acc1 = part if acc1 is None else acc1 + part
     # The block scales are already inside acc1, so the halves this builds
     # are the true activation values and owe no further weight scale.
-    mid_q, mid_scale = _intermediate_rows(acc1,
-                                          act_scale,
-                                          inter,
-                                          w1s=None,
-                                          act_fn=act_fn,
-                                          w1b=w1b)
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
+    )
     acc2 = None
     for b in range(n_blocks2):
-        part = lax.dot_general(mid_q[:, b * qb:(b + 1) * qb],
-                               w2_block(b),
-                               DN,
-                               preferred_element_type=jnp.float32)
+        part = lax.dot_general(
+            mid_q[:, b * qb : (b + 1) * qb],
+            w2_block(b),
+            DN,
+            preferred_element_type=jnp.float32,
+        )
         part = part * w2s_blocks[b][None, :]
         acc2 = part if acc2 is None else acc2 + part
     return acc2, mid_scale
@@ -393,27 +402,25 @@ def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
     """
     inter = w1.shape[-1] // 2
     acc1 = lax.dot_general(act, w1, DN, preferred_element_type=jnp.float32)
-    mid, _ = _intermediate_rows(acc1,
-                                None,
-                                inter,
-                                w1s=None,
-                                act_fn=act_fn,
-                                w1b=w1b,
-                                requantize=False)
+    mid, _ = _intermediate_rows(
+        acc1, None, inter, w1s=None, act_fn=act_fn, w1b=w1b, requantize=False
+    )
     acc2 = lax.dot_general(mid, w2, DN, preferred_element_type=jnp.float32)
     return acc2, None
 
 
-def expert_ffn_int8(act,
-                    w1_chunk,
-                    w2_chunk,
-                    w1s,
-                    *,
-                    n_chunks1,
-                    n_chunks2,
-                    kb=host.WIDEN_KCHUNK,
-                    act_fn="silu",
-                    w1b=None):
+def expert_ffn_int8(
+    act,
+    w1_chunk,
+    w2_chunk,
+    w1s,
+    *,
+    n_chunks1,
+    n_chunks2,
+    kb=host.WIDEN_KCHUNK,
+    act_fn="silu",
+    w1b=None,
+):
     """One expert's FFN on eight-bit INTEGER weights with per-channel scales.
 
     TPU v7's matrix unit has no integer input type (a generation with
@@ -435,13 +442,9 @@ def expert_ffn_int8(act,
     """
     inter = w1s.shape[-1] // 2
     acc1 = _chunked_dot(act, w1_chunk, n_chunks1, kb)
-    mid, _ = _intermediate_rows(acc1,
-                                None,
-                                inter,
-                                w1s=w1s,
-                                act_fn=act_fn,
-                                w1b=w1b,
-                                requantize=False)
+    mid, _ = _intermediate_rows(
+        acc1, None, inter, w1s=w1s, act_fn=act_fn, w1b=w1b, requantize=False
+    )
     acc2 = _chunked_dot(mid, w2_chunk, n_chunks2, kb)
     return acc2, None
 
@@ -450,19 +453,23 @@ def _all_pairs_barrier(ep):
     """Barrier over every shard: transport peers are not only neighbours."""
     barrier_sem = pltpu.get_barrier_semaphore()
     for i in range(ep):
-        pl.semaphore_signal(barrier_sem,
-                            inc=1,
-                            device_id=(jnp.int32(i), ),
-                            device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_signal(
+            barrier_sem,
+            inc=1,
+            device_id=(jnp.int32(i),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
     pl.semaphore_wait(barrier_sem, ep)
 
     @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
     def _(second):
         for i in range(ep):
-            pl.semaphore_signal(second,
-                                inc=1,
-                                device_id=(jnp.int32(i), ),
-                                device_id_type=pl.DeviceIdType.MESH)
+            pl.semaphore_signal(
+                second,
+                inc=1,
+                device_id=(jnp.int32(i),),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
         pl.semaphore_wait(second, ep)
 
 
@@ -473,8 +480,7 @@ def _slot_copy(src, vm, sems, slot):
 
 def _rows_wait(sem, ref, rows):
     """Block until `rows` rows' worth of DMAs on `sem` have landed."""
-    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)],
-                          sem).wait()
+    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
 
 
 def _and_nonempty(pred, rows):
@@ -506,22 +512,25 @@ def _tile_row_scales(window, row_base, tile_m):
     return rows.reshape(-1)[:tile_m][:, None]
 
 
-def _build_fused_ep_moe_kernel(*,
-                               g_local,
-                               capacity,
-                               hidden,
-                               inter,
-                               ep,
-                               weight_format=host.WeightFormat.FP8,
-                               rhs_qb=QB4,
-                               ragged_rows_alloc=None,
-                               act_fn="silu",
-                               has_w1_bias=False,
-                               has_w2_bias=False):
+def _build_fused_ep_moe_kernel(
+    *,
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    ep,
+    weight_format=host.WeightFormat.FP8,
+    rhs_qb=QB4,
+    ragged_rows_alloc=None,
+    act_fn="silu",
+    has_w1_bias=False,
+    has_w2_bias=False,
+):
     """Build the pallas_call and the function that invokes it."""
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
-            f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
+            f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
+        )
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
@@ -532,7 +541,8 @@ def _build_fused_ep_moe_kernel(*,
     assert 0 < WEIGHT_PREFETCH_DISTANCE < NBUF, (
         f"weight prefetch distance {WEIGHT_PREFETCH_DISTANCE} must satisfy "
         f"0 < distance < NBUF={NBUF}, so that distance + 1 consecutive "
-        "experts occupy distinct weight slots")
+        "experts occupy distinct weight slots"
+    )
     # Everything from here to the ragged-stride check below tests a value
     # that came IN from the caller -- a model shape, a mesh width, a serving
     # config -- so each one refuses rather than asserts. An assert is the
@@ -544,7 +554,8 @@ def _build_fused_ep_moe_kernel(*,
     if capacity % ROWBLK:
         raise ValueError(
             f"tile height {capacity} is not a whole number of {ROWBLK}-row "
-            "blocks, which is the unit every transport here moves")
+            "blocks, which is the unit every transport here moves"
+        )
     if rhs_packed4:
         # Tested before the modulo below rather than after it: every other
         # guard in this span was converted from an assert so that a caller's
@@ -554,12 +565,14 @@ def _build_fused_ep_moe_kernel(*,
             raise ValueError(
                 f"the four-bit block size is {rhs_qb}; it is the number of "
                 "contraction rows one weight scale covers and there is no "
-                "block smaller than one row")
+                "block smaller than one row"
+            )
         if hidden % rhs_qb or inter % rhs_qb:
             raise ValueError(
                 f"the four-bit block size {rhs_qb} has to divide both "
                 f"hidden={hidden} and inter={inter}; the kernel blocks BOTH "
-                "matmuls at one block size")
+                "matmuls at one block size"
+            )
         # Packed rows per k-block must land on the u32 sublane tile.
         if rhs_qb % (host.U32_SUBLANE_TILE * PACK4):
             raise ValueError(
@@ -567,22 +580,28 @@ def _build_fused_ep_moe_kernel(*,
                 f"the packed-weight row tile "
                 f"({host.U32_SUBLANE_TILE * PACK4} rows): {PACK4} four-bit "
                 f"values pack into a 32-bit word and those words tile to "
-                f"{host.U32_SUBLANE_TILE} sublanes")
+                f"{host.U32_SUBLANE_TILE} sublanes"
+            )
     if weight_format == host.WeightFormat.INT8:
         # The widening chunk has to tile both contractions exactly.
         if hidden % host.WIDEN_KCHUNK or inter % host.WIDEN_KCHUNK:
             raise ValueError(
                 f"integer weights widen one {host.WIDEN_KCHUNK}-row "
                 f"contraction chunk at a time, which has to divide both "
-                f"hidden={hidden} and inter={inter}")
+                f"hidden={hidden} and inter={inter}"
+            )
     # True-length remote pushes: out_vm, contrib and recv take the per-row
     # [rows, lane blocks, 128] geometry, which row-granular offsets require.
-    if (hidden < HIDDEN_LANE_BLOCK or hidden % HIDDEN_LANE_BLOCK
-            or hidden > host.HIDDEN_MAX_BLOCKS * HIDDEN_LANE_BLOCK):
+    if (
+        hidden < HIDDEN_LANE_BLOCK
+        or hidden % HIDDEN_LANE_BLOCK
+        or hidden > host.HIDDEN_MAX_BLOCKS * HIDDEN_LANE_BLOCK
+    ):
         raise ValueError(
             f"hidden {hidden} is not between one and "
             f"{host.HIDDEN_MAX_BLOCKS} whole {HIDDEN_LANE_BLOCK}-lane "
-            "blocks, which the per-row transport geometry requires")
+            "blocks, which the per-row transport geometry requires"
+        )
     # The intermediate axis had no floor at all, so an expert whose FFN has
     # no intermediate channels built a program and cached it: the estimate
     # for it clears the budget comfortably and every divisibility check
@@ -595,19 +614,22 @@ def _build_fused_ep_moe_kernel(*,
         raise ValueError(
             f"inter {inter} is narrower than one {HIDDEN_LANE_BLOCK}-lane "
             "block; an expert whose FFN has no intermediate channels to "
-            "speak of is not a layer this kernel can serve")
+            "speak of is not a layer this kernel can serve"
+        )
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
-    est = host.vmem_estimate_bytes(g_local,
-                                   capacity,
-                                   hidden,
-                                   inter,
-                                   nbuf=NBUF,
-                                   weight_format=weight_format,
-                                   rhs_qb=rhs_qb,
-                                   has_w1_bias=has_w1_bias,
-                                   has_w2_bias=has_w2_bias)
+    est = host.vmem_estimate_bytes(
+        g_local,
+        capacity,
+        hidden,
+        inter,
+        nbuf=NBUF,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+    )
     limit = host.vmem_limit()
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
@@ -620,18 +642,23 @@ def _build_fused_ep_moe_kernel(*,
     # will not fit. It must not be strippable.
     if est > limit:
         raise ValueError(
-            f"the kernel's VMEM buffers need {est/2**20:.1f}MiB, over the "
-            f"{limit/2**20:.1f}MiB budget, for {g_local} local experts of "
-            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}")
+            f"the kernel's VMEM buffers need {est / 2**20:.1f}MiB, over the "
+            f"{limit / 2**20:.1f}MiB budget, for {g_local} local experts of "
+            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}"
+        )
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
     # tail tile reads a full window.
-    if (ragged_rows_alloc is None or ragged_rows_alloc % ROWBLK
-            or ragged_rows_alloc % capacity):
+    if (
+        ragged_rows_alloc is None
+        or ragged_rows_alloc % ROWBLK
+        or ragged_rows_alloc % capacity
+    ):
         raise ValueError(
             f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
             f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
-            "a tail tile reads a full window past the shard's last row")
+            "a tail tile reads a full window past the shard's last row"
+        )
     tile_m = capacity  # the tile height IS the capacity
     tile_blocks = tile_m // ROWBLK
     # The mirror's unit is a tile, the run tables' unit is a block, and the
@@ -676,13 +703,13 @@ def _build_fused_ep_moe_kernel(*,
         #     tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py; that test
         #     is what keeps this derivation honest if recv_base ever changes to
         #     track true lengths.
-        (commit_start_sm, commit_len_sm, contrib_off_sm,
-         push_dst_sm) = (next(it) for _ in range(N_TRANSPORT_TABLES))
+        (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (
+            next(it) for _ in range(N_TRANSPORT_TABLES)
+        )
         # Row-unit push tables, from shard_push_tables_in_rows.
-        (true_rows_sm, ) = (next(it) for _ in range(N_PUSH_TABLES))
+        (true_rows_sm,) = (next(it) for _ in range(N_PUSH_TABLES))
         # (rows, base) i32 [G] row-unit tables from shard_expert_slabs.
-        (expert_rows_sm, expert_base_sm) = (next(it)
-                                            for _ in range(N_SLAB_TABLES))
+        (expert_rows_sm, expert_base_sm) = (next(it) for _ in range(N_SLAB_TABLES))
         # visit_sm[visit_i] is the real expert at compacted step visit_i.
         visit_sm = next(it)
         # The five counts, each still spread over the expert-parallel axis.
@@ -741,7 +768,8 @@ def _build_fused_ep_moe_kernel(*,
                     f"jax {jax.__version__} no longer carries; this kernel "
                     f"was built against jax {_REF_BITCAST_JAX_VERSION}. "
                     "There is no public Pallas equivalent for a ref-level "
-                    "bitcast, so this needs a port rather than a rename.")
+                    "bitcast, so this needs a port rather than a rename."
+                )
             w1_hbm = w1_hbm.bitcast(jnp.uint32)
             w2_hbm = w2_hbm.bitcast(jnp.uint32)
         recv_hbm = next(it)
@@ -784,8 +812,7 @@ def _build_fused_ep_moe_kernel(*,
             mehop_sem = mehop_scl_sem = None
         else:
             commit_sems, send_sem, recv_sem = (next(it) for _ in range(3))
-            (commit_scl_sems, send_scl_sem, recv_scl_sem) = (next(it)
-                                                             for _ in range(3))
+            (commit_scl_sems, send_scl_sem, recv_scl_sem) = (next(it) for _ in range(3))
             # Never cp_sem: its start+wait users must not consume these.
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
@@ -842,13 +869,13 @@ def _build_fused_ep_moe_kernel(*,
 
             def w1_block(b):
                 return pltpu.bitcast(
-                    w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :],
-                    FP4).astype(FP8)
+                    w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                ).astype(FP8)
 
             def w2_block(b):
                 return pltpu.bitcast(
-                    w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :],
-                    FP4).astype(FP8)
+                    w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                ).astype(FP8)
 
             return w1_block, w2_block
 
@@ -863,15 +890,13 @@ def _build_fused_ep_moe_kernel(*,
 
             def w1_chunk(b):
                 return w1_vm[
-                    slot,
-                    pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :].astype(
-                        host.BF16)
+                    slot, pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :
+                ].astype(host.BF16)
 
             def w2_chunk(b):
                 return w2_vm[
-                    slot,
-                    pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :].astype(
-                        host.BF16)
+                    slot, pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :
+                ].astype(host.BF16)
 
             return w1_chunk, w2_chunk
 
@@ -882,8 +907,9 @@ def _build_fused_ep_moe_kernel(*,
             """Aligned HBM base and in-window offset for a slab row."""
             alignment = jnp.int32(host.TOKEN_GATHER_DMA_ALIGNMENT)
             shift = lax.rem(logical_base, alignment)
-            dma_base = pl.multiple_of(logical_base - shift,
-                                      host.TOKEN_GATHER_DMA_ALIGNMENT)
+            dma_base = pl.multiple_of(
+                logical_base - shift, host.TOKEN_GATHER_DMA_ALIGNMENT
+            )
             return dma_base, shift
 
         def issue_gather_window(logical_base, slot):
@@ -894,13 +920,17 @@ def _build_fused_ep_moe_kernel(*,
             def _():
                 pltpu.make_async_copy(
                     token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
-                    token_gather_sm0, token_gather_sem0).start(priority=0)
+                    token_gather_sm0,
+                    token_gather_sem0,
+                ).start(priority=0)
 
             @pl.when(slot == 1)
             def _():
                 pltpu.make_async_copy(
                     token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
-                    token_gather_sm1, token_gather_sem1).start(priority=0)
+                    token_gather_sm1,
+                    token_gather_sem1,
+                ).start(priority=0)
 
         def wait_gather_window(logical_base, slot):
             """Wait for the fixed token-index window in ``slot``."""
@@ -910,27 +940,31 @@ def _build_fused_ep_moe_kernel(*,
             def _():
                 pltpu.make_async_copy(
                     token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
-                    token_gather_sm0, token_gather_sem0).wait()
+                    token_gather_sm0,
+                    token_gather_sem0,
+                ).wait()
 
             @pl.when(slot == 1)
             def _():
                 pltpu.make_async_copy(
                     token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
-                    token_gather_sm1, token_gather_sem1).wait()
+                    token_gather_sm1,
+                    token_gather_sem1,
+                ).wait()
 
-        def lhs_issue_tile(row_base, live_blocks, slot, gather_slot,
-                           gather_offset):
+        def lhs_issue_tile(row_base, live_blocks, slot, gather_slot, gather_offset):
             """Issue one tile's activations using a resident index window."""
 
             def issue_from(gather_smem):
-
                 def issue_block(i, _):
                     """Fetch eight token rows of block i by their numbers."""
                     for r in range(ROWBLK):
                         token = gather_smem[gather_offset + i * ROWBLK + r]
-                        pltpu.make_async_copy(lhs_hbm.at[token],
-                                              lhs_vm.at[slot, i * ROWBLK + r],
-                                              lhs_sems.at[slot]).start()
+                        pltpu.make_async_copy(
+                            lhs_hbm.at[token],
+                            lhs_vm.at[slot, i * ROWBLK + r],
+                            lhs_sems.at[slot],
+                        ).start()
                     return _
 
                 lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
@@ -948,20 +982,24 @@ def _build_fused_ep_moe_kernel(*,
                 # lane-block view of one f32 per row, so a tile's window is
                 # the sublanes its rows fall in, not a row range.
                 pltpu.make_async_copy(
-                    ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK,
-                                    ls_window_rows)], ls_vm.at[slot],
-                    lhs_sems.at[slot]).start()
+                    ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
+                    ls_vm.at[slot],
+                    lhs_sems.at[slot],
+                ).start()
 
         def lhs_ready_tile(live_rows, slot):
             """Wait the token rows and the scale window of one tile."""
             # Sems count bytes, so the split wait is exact under any landing
             # order.
-            pltpu.make_async_copy(lhs_vm.at[slot, pl.ds(0, live_rows)],
-                                  lhs_vm.at[slot, pl.ds(0, live_rows)],
-                                  lhs_sems.at[slot]).wait()
+            pltpu.make_async_copy(
+                lhs_vm.at[slot, pl.ds(0, live_rows)],
+                lhs_vm.at[slot, pl.ds(0, live_rows)],
+                lhs_sems.at[slot],
+            ).wait()
             if has_act_scale:
-                pltpu.make_async_copy(ls_vm.at[slot], ls_vm.at[slot],
-                                      lhs_sems.at[slot]).wait()
+                pltpu.make_async_copy(
+                    ls_vm.at[slot], ls_vm.at[slot], lhs_sems.at[slot]
+                ).wait()
 
         def _mirror_base(e):
             """Sublane expert e's tiles start at in the contribution mirror.
@@ -985,14 +1023,14 @@ def _build_fused_ep_moe_kernel(*,
             start = commit_start_sm[e, d]
             lo = jnp.right_shift(start, tile_block_shift)
             hi = jnp.right_shift(start + region_blocks - 1, tile_block_shift)
-            dst = (jnp.right_shift(push_dst_sm[e, d], tile_block_shift) + 2 *
-                   (me * g_local + e))
+            dst = jnp.right_shift(push_dst_sm[e, d], tile_block_shift) + 2 * (
+                me * g_local + e
+            )
             return _mirror_base(e) + lo, dst, hi - lo + 1
 
         def wait_commits(parity, live_blocks):
             """Wait one tile's commits on `parity`: data rows, then scales."""
-            _rows_wait(commit_sems.at[parity], contrib_hbm,
-                       live_blocks * ROWBLK)
+            _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
             _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
 
@@ -1034,17 +1072,18 @@ def _build_fused_ep_moe_kernel(*,
 
             wait_gather_window(slab_base, wslot)
             _, shift = gather_dma_coords(slab_base)
-            lhs_issue_tile(slab_base,
-                           jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot,
-                           wslot, shift)
+            lhs_issue_tile(
+                slab_base, jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot, wslot, shift
+            )
 
             # Keep group one in flight while tile zero computes. Later group
             # boundaries refill the just-retired alternate slot in the same
             # way, so at most two fixed windows are ever resident.
             @pl.when(rows > gather_payload_rows)
             def _():
-                issue_gather_window(slab_base + gather_payload_rows,
-                                    jnp.int32(1) - wslot)
+                issue_gather_window(
+                    slab_base + gather_payload_rows, jnp.int32(1) - wslot
+                )
 
         def expert_tiles(e, visit_i, carry):
             """One expert step: a fori_loop over its [tile_m, H] tiles."""
@@ -1064,8 +1103,9 @@ def _build_fused_ep_moe_kernel(*,
             # readers, so no wait is needed.
             @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
             def _():
-                refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
-                                      jnp.int32(NBUF))
+                refill_slot = lax.rem(
+                    visit_i + WEIGHT_PREFETCH_DISTANCE, jnp.int32(NBUF)
+                )
                 ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
                 # Weight refills take their own DMA priority to stay off the
                 # in-order token-gather queue.
@@ -1093,8 +1133,7 @@ def _build_fused_ep_moe_kernel(*,
                     run_start = commit_start_sm[e, d]
                     run_len = commit_len_sm[e, d]
                     lo = jnp.maximum(run_start, tile_block_base)
-                    hi = jnp.minimum(run_start + run_len,
-                                     tile_block_base + live_blocks)
+                    hi = jnp.minimum(run_start + run_len, tile_block_base + live_blocks)
                     overlap = jnp.maximum(hi - lo, 0)
                     # An empty intersection leaves lo unclamped, so the
                     # offsets below can point out of range; the copies are
@@ -1106,24 +1145,27 @@ def _build_fused_ep_moe_kernel(*,
                     dst_block = contrib_off_sm[e, d] + (lo - run_start)
 
                     @pl.when(overlap > 0)
-                    def _(src_block=src_block,
-                          dst_block=dst_block,
-                          overlap=overlap,
-                          parity=parity):
+                    def _(
+                        src_block=src_block,
+                        dst_block=dst_block,
+                        overlap=overlap,
+                        parity=parity,
+                    ):
                         pltpu.make_async_copy(
-                            out_vm.at[parity,
-                                      pl.ds(src_block * ROWBLK, overlap *
-                                            ROWBLK)],
-                            contrib_hbm.at[pl.ds(dst_block * ROWBLK,
-                                                 overlap * ROWBLK)],
-                            commit_sems.at[parity]).start()
+                            out_vm.at[
+                                parity, pl.ds(src_block * ROWBLK, overlap * ROWBLK)
+                            ],
+                            contrib_hbm.at[pl.ds(dst_block * ROWBLK, overlap * ROWBLK)],
+                            commit_sems.at[parity],
+                        ).start()
 
                 # The tile's scales are one sublane wherever its rows
                 # went, so they commit once, outside the per-dest loop.
                 pltpu.make_async_copy(
                     oscl_vm.at[parity],
-                    cscl_hbm.at[pl.ds(_mirror_base(e) + t,
-                                      1)], commit_scl_sems.at[parity]).start()
+                    cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                    commit_scl_sems.at[parity],
+                ).start()
 
             def ship_tile(parity, t, tile_block_base, live_blocks):
                 """Ship the tile straight out of `out_vm`, no slab in between.
@@ -1144,8 +1186,7 @@ def _build_fused_ep_moe_kernel(*,
                     run_start = commit_start_sm[e, d]
                     run_len = commit_len_sm[e, d]
                     lo = jnp.maximum(run_start, tile_block_base)
-                    hi = jnp.minimum(run_start + run_len,
-                                     tile_block_base + live_blocks)
+                    hi = jnp.minimum(run_start + run_len, tile_block_base + live_blocks)
                     overlap = jnp.maximum(hi - lo, 0)
                     # An empty intersection leaves lo unclamped, so the
                     # offsets below can point out of range; every copy is
@@ -1156,45 +1197,49 @@ def _build_fused_ep_moe_kernel(*,
                     dst_row = push_dst_sm[e, d] * ROWBLK + into_run
                     # The run's true rows are its leading rows, so this tile
                     # carries whatever is left of them inside its overlap.
-                    true_here = jnp.clip(true_rows_sm[e, d] - into_run, 0,
-                                         overlap * ROWBLK)
+                    true_here = jnp.clip(
+                        true_rows_sm[e, d] - into_run, 0, overlap * ROWBLK
+                    )
                     is_me = jnp.int32(d) == me
                     # One sublane per tile a run spans, at the destination
                     # base that run's own arrival rows give it.
                     dst_sub = (
-                        jnp.right_shift(push_dst_sm[e, d], tile_block_shift) +
-                        2 * (me * g_local + e) + t -
-                        jnp.right_shift(run_start, tile_block_shift))
+                        jnp.right_shift(push_dst_sm[e, d], tile_block_shift)
+                        + 2 * (me * g_local + e)
+                        + t
+                        - jnp.right_shift(run_start, tile_block_shift)
+                    )
 
                     @pl.when(_and_nonempty(jnp.logical_not(is_me), true_here))
-                    def _(src_row=src_row,
-                          dst_row=dst_row,
-                          true_here=true_here,
-                          parity=parity,
-                          d=d):
+                    def _(
+                        src_row=src_row,
+                        dst_row=dst_row,
+                        true_here=true_here,
+                        parity=parity,
+                        d=d,
+                    ):
                         pltpu.make_async_remote_copy(
-                            src_ref=out_vm.at[parity,
-                                              pl.ds(src_row, true_here)],
+                            src_ref=out_vm.at[parity, pl.ds(src_row, true_here)],
                             dst_ref=recv_hbm.at[pl.ds(dst_row, true_here)],
                             send_sem=send_sems.at[parity],
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d), ),
-                            device_id_type=pl.DeviceIdType.MESH).start()
+                            device_id=(jnp.int32(d),),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
 
                     # The own-destination run needs no fabric, and it moves
                     # the ALIGNED region the two-hop path moved: its trailing
                     # padding rows are never read, but leaving them out would
                     # change bytes the arrival buffer already holds.
                     @pl.when(_and_nonempty(is_me, overlap))
-                    def _(src_row=src_row,
-                          dst_row=dst_row,
-                          overlap=overlap,
-                          parity=parity):
+                    def _(
+                        src_row=src_row, dst_row=dst_row, overlap=overlap, parity=parity
+                    ):
                         pltpu.make_async_copy(
-                            out_vm.at[parity,
-                                      pl.ds(src_row, overlap * ROWBLK)],
+                            out_vm.at[parity, pl.ds(src_row, overlap * ROWBLK)],
                             recv_hbm.at[pl.ds(dst_row, overlap * ROWBLK)],
-                            send_sems.at[parity]).start()
+                            send_sems.at[parity],
+                        ).start()
 
                     @pl.when(_and_nonempty(jnp.logical_not(is_me), overlap))
                     def _(dst_sub=dst_sub, parity=parity, d=d):
@@ -1203,17 +1248,19 @@ def _build_fused_ep_moe_kernel(*,
                             dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
                             send_sem=send_scl_sems.at[parity],
                             recv_sem=recv_scl_sem,
-                            device_id=(jnp.int32(d), ),
-                            device_id_type=pl.DeviceIdType.MESH).start()
+                            device_id=(jnp.int32(d),),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
 
                     @pl.when(_and_nonempty(is_me, overlap))
                     def _(dst_sub=dst_sub, parity=parity):
                         pltpu.make_async_copy(
-                            oscl_vm.at[parity], rscl_hbm.at[pl.ds(dst_sub, 1)],
-                            send_scl_sems.at[parity]).start()
+                            oscl_vm.at[parity],
+                            rscl_hbm.at[pl.ds(dst_sub, 1)],
+                            send_scl_sems.at[parity],
+                        ).start()
 
-                    rows_out = rows_out + jnp.where(is_me, overlap * ROWBLK,
-                                                    true_here)
+                    rows_out = rows_out + jnp.where(is_me, overlap * ROWBLK, true_here)
                     subs_out = subs_out + jnp.where(overlap > 0, 1, 0)
                 return rows_out, subs_out
 
@@ -1231,8 +1278,10 @@ def _build_fused_ep_moe_kernel(*,
                 # zeroes them.
                 if push_from_vmem:
                     wait_shipped(
-                        parity, jnp.where(parity == 0, carried[1], carried[2]),
-                        jnp.where(parity == 0, carried[3], carried[4]))
+                        parity,
+                        jnp.where(parity == 0, carried[1], carried[2]),
+                        jnp.where(parity == 0, carried[3], carried[4]),
+                    )
                 else:
                     pending = jnp.where(parity == 0, carried[1], carried[2])
 
@@ -1251,8 +1300,7 @@ def _build_fused_ep_moe_kernel(*,
                     next_group = next_t // gather_tiles
                     next_within = lax.rem(next_t, jnp.int32(gather_tiles))
                     next_group_slot = lax.rem(wslot + next_group, jnp.int32(2))
-                    next_group_base = (slab_base +
-                                       next_group * gather_payload_rows)
+                    next_group_base = slab_base + next_group * gather_payload_rows
 
                     # The next group's window was issued when the previous
                     # group became current. Wait only at the boundary, then
@@ -1267,23 +1315,27 @@ def _build_fused_ep_moe_kernel(*,
                         def _():
                             issue_gather_window(
                                 slab_base + following * gather_payload_rows,
-                                jnp.int32(1) - next_group_slot)
+                                jnp.int32(1) - next_group_slot,
+                            )
 
                     _, next_shift = gather_dma_coords(next_group_base)
                     next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
-                    lhs_issue_tile(slab_base + next_t * tile_m,
-                                   next_rows // ROWBLK, other_parity,
-                                   next_group_slot,
-                                   next_shift + next_within * tile_m)
+                    lhs_issue_tile(
+                        slab_base + next_t * tile_m,
+                        next_rows // ROWBLK,
+                        other_parity,
+                        next_group_slot,
+                        next_shift + next_within * tile_m,
+                    )
 
                 # The next expert's index window, a tile early. This is the
                 # only arrival the kernel waits for with nothing issued
                 # behind it, so a tile of compute is what it costs to hide.
-                @pl.when(
-                    jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
+                @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
                 def _():
-                    issue_gather_window(expert_base_sm[visit_sm[visit_i + 1]],
-                                        next_wslot)
+                    issue_gather_window(
+                        expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                    )
 
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
@@ -1293,13 +1345,14 @@ def _build_fused_ep_moe_kernel(*,
                     rung that still covers them.
                     """
                     full = height == tile_m
-                    act_rows = (lhs_vm[parity]
-                                if full else lhs_vm[parity,
-                                                    pl.ds(0, height)]).reshape(
-                                                        height, hidden)
-                    act_scales = (_tile_row_scales(ls_vm[parity], row_base,
-                                                   height)
-                                  if has_act_scale else None)
+                    act_rows = (
+                        lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
+                    ).reshape(height, hidden)
+                    act_scales = (
+                        _tile_row_scales(ls_vm[parity], row_base, height)
+                        if has_act_scale
+                        else None
+                    )
                     w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
                     if rhs_packed4:
                         # The block scales apply inside
@@ -1308,15 +1361,17 @@ def _build_fused_ep_moe_kernel(*,
                         w1s_blocks = w1s_vm[e]  # [nb1, 2*inter] f32
                         w2s_blocks = w2s_vm[e]  # [nb2, hidden] f32
                         w1_block, w2_block = _fp4_block_readers(slot)
-                        acc2, mid_scale = expert_ffn_blockscale(act_rows,
-                                                                act_scales,
-                                                                w1_block,
-                                                                w2_block,
-                                                                w1s_blocks,
-                                                                w2s_blocks,
-                                                                qb=rhs_qb,
-                                                                act_fn=act_fn,
-                                                                w1b=w1b_row)
+                        acc2, mid_scale = expert_ffn_blockscale(
+                            act_rows,
+                            act_scales,
+                            w1_block,
+                            w2_block,
+                            w1s_blocks,
+                            w2s_blocks,
+                            qb=rhs_qb,
+                            act_fn=act_fn,
+                            w1b=w1b_row,
+                        )
                     elif weight_format == host.WeightFormat.INT8:
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
                         acc2, mid_scale = expert_ffn_int8(
@@ -1327,13 +1382,16 @@ def _build_fused_ep_moe_kernel(*,
                             n_chunks1=hidden // host.WIDEN_KCHUNK,
                             n_chunks2=inter // host.WIDEN_KCHUNK,
                             act_fn=act_fn,
-                            w1b=w1b_row)
+                            w1b=w1b_row,
+                        )
                     elif weight_format == host.WeightFormat.BF16:
-                        acc2, mid_scale = expert_ffn_bf16(act_rows,
-                                                          w1_vm[slot],
-                                                          w2_vm[slot],
-                                                          act_fn=act_fn,
-                                                          w1b=w1b_row)
+                        acc2, mid_scale = expert_ffn_bf16(
+                            act_rows,
+                            w1_vm[slot],
+                            w2_vm[slot],
+                            act_fn=act_fn,
+                            w1b=w1b_row,
+                        )
                     else:
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
@@ -1342,7 +1400,8 @@ def _build_fused_ep_moe_kernel(*,
                             w2_vm[slot],
                             w1s_vm[pl.ds(e, 1), :],
                             act_fn=act_fn,
-                            w1b=w1b_row)
+                            w1b=w1b_row,
+                        )
                     # The destination applies the router weight, not this.
                     # Four-bit weights carry w2s inside the block sums; the
                     # formats whose second matmul took bf16 rows return no row
@@ -1355,13 +1414,18 @@ def _build_fused_ep_moe_kernel(*,
                     wire_rows, wire_scales = wire_row_and_scale(
                         acc2,
                         mid_scale,
-                        w2s=(w2s_vm[pl.ds(e, 1), :] if
-                             (has_scales and not rhs_packed4) else None),
+                        w2s=(
+                            w2s_vm[pl.ds(e, 1), :]
+                            if (has_scales and not rhs_packed4)
+                            else None
+                        ),
                         w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
                         wire_dtype=form.wire_dtype,
-                        tile_m=height)
+                        tile_m=height,
+                    )
                     wire_rows_staged = wire_rows.reshape(
-                        height, lane_blocks, HIDDEN_LANE_BLOCK)
+                        height, lane_blocks, HIDDEN_LANE_BLOCK
+                    )
                     wire_scales_staged = wire_scales.reshape(1, height)
 
                     def store_parity(static_parity):
@@ -1371,10 +1435,10 @@ def _build_fused_ep_moe_kernel(*,
                             out_vm[static_parity] = wire_rows_staged
                             oscl_vm[static_parity] = wire_scales_staged
                         else:
-                            out_vm[static_parity,
-                                   pl.ds(0, height)] = wire_rows_staged
-                            oscl_vm[static_parity, :,
-                                    pl.ds(0, height)] = wire_scales_staged
+                            out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
+                            oscl_vm[static_parity, :, pl.ds(0, height)] = (
+                                wire_scales_staged
+                            )
 
                     # Store slots must be static, so these branches stay
                     # static.
@@ -1394,27 +1458,31 @@ def _build_fused_ep_moe_kernel(*,
                     for rung_i, rung in enumerate(height_rungs):
                         below = height_rungs[rung_i - 1] if rung_i else 0
 
-                        @pl.when(
-                            jnp.logical_and(live_rows > below, live_rows
-                                            <= rung))
+                        @pl.when(jnp.logical_and(live_rows > below, live_rows <= rung))
                         def _(rung=rung):
                             compute_tile(rung)
 
                 if push_from_vmem:
-                    rows_out, subs_out = ship_tile(parity, t, tile_block_base,
-                                                   live_blocks)
-                    return (tile_count + 1,
-                            jnp.where(parity == 0, rows_out, carried[1]),
-                            jnp.where(parity == 1, rows_out, carried[2]),
-                            jnp.where(parity == 0, subs_out, carried[3]),
-                            jnp.where(parity == 1, subs_out,
-                                      carried[4]), wslot)
+                    rows_out, subs_out = ship_tile(
+                        parity, t, tile_block_base, live_blocks
+                    )
+                    return (
+                        tile_count + 1,
+                        jnp.where(parity == 0, rows_out, carried[1]),
+                        jnp.where(parity == 1, rows_out, carried[2]),
+                        jnp.where(parity == 0, subs_out, carried[3]),
+                        jnp.where(parity == 1, subs_out, carried[4]),
+                        wslot,
+                    )
 
                 commit_tile(parity, t, tile_block_base, live_blocks)
 
-                return (tile_count + 1,
-                        jnp.where(parity == 0, live_blocks, carried[1]),
-                        jnp.where(parity == 1, live_blocks, carried[2]), wslot)
+                return (
+                    tile_count + 1,
+                    jnp.where(parity == 0, live_blocks, carried[1]),
+                    jnp.where(parity == 1, live_blocks, carried[2]),
+                    wslot,
+                )
 
             carry = lax.fori_loop(0, n_tiles, tile_body, carry)
             # Cross-expert lookahead: prime the next visited expert's first
@@ -1426,10 +1494,14 @@ def _build_fused_ep_moe_kernel(*,
             @pl.when(visit_i + 1 < n_visit)
             def _():
                 nxt = visit_sm[visit_i + 1]
-                prime_expert(nxt, lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                             next_wslot, jnp.bool_(True))
+                prime_expert(
+                    nxt,
+                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
+                    next_wslot,
+                    jnp.bool_(True),
+                )
 
-            return carry[:-1] + (next_wslot, )
+            return carry[:-1] + (next_wslot,)
 
         def drain_commits(carried):
             """Drain both parities' pending commits, then zero the counts."""
@@ -1458,8 +1530,7 @@ def _build_fused_ep_moe_kernel(*,
 
         @pl.when(n_visit > 0)
         def _():
-            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0),
-                         jnp.bool_(False))
+            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
@@ -1480,14 +1551,17 @@ def _build_fused_ep_moe_kernel(*,
                     def push_run():
                         """The rows themselves, at their true length."""
                         pltpu.make_async_remote_copy(
-                            src_ref=contrib_hbm.at[pl.ds(
-                                contrib_off_sm[e, d] * ROWBLK, true_rows)],
-                            dst_ref=recv_hbm.at[pl.ds(
-                                push_dst_sm[e, d] * ROWBLK, true_rows)],
+                            src_ref=contrib_hbm.at[
+                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                            ],
+                            dst_ref=recv_hbm.at[
+                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                            ],
                             send_sem=send_sem,
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d), ),
-                            device_id_type=pl.DeviceIdType.MESH).start()
+                            device_id=(jnp.int32(d),),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
 
                     # A nonempty region can hold an empty (e, d) run.
                     pl.when(true_rows > 0)(push_run)
@@ -1500,22 +1574,26 @@ def _build_fused_ep_moe_kernel(*,
                         dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
-                        device_id=(jnp.int32(d), ),
-                        device_id_type=pl.DeviceIdType.MESH).start()
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
 
                 # Safe to defer: recv is read only after the drain.
                 @pl.when(_and_nonempty(is_me, region_blocks))
                 def _():
                     pltpu.make_async_copy(
-                        contrib_hbm.at[pl.ds(src_block * ROWBLK,
-                                             region_blocks * ROWBLK)],
-                        recv_hbm.at[pl.ds(dst_block * ROWBLK,
-                                          region_blocks * ROWBLK)],
-                        mehop_sem).start()
+                        contrib_hbm.at[
+                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
+                        ],
+                        recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
+                        mehop_sem,
+                    ).start()
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
-                    pltpu.make_async_copy(cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                                          rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                                          mehop_scl_sem).start()
+                    pltpu.make_async_copy(
+                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        mehop_scl_sem,
+                    ).start()
 
         def visit_step(visit_i, carry):
             """One step of the visit list: compute, then drain and push."""
@@ -1539,8 +1617,7 @@ def _build_fused_ep_moe_kernel(*,
                 # because a peer signals them whatever parity it sent from.
                 drain_shipped(carry_end)
                 _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
-                _rows_wait(recv_scl_sem, rscl_hbm,
-                           count(host.COUNT_RECV_MIRROR))
+                _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
                 return
             # The per-tile head waits consume every commit but the last one
             # per parity; the drains below consume those.
@@ -1567,53 +1644,69 @@ def _build_fused_ep_moe_kernel(*,
     # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
     # tables where the format has them, the bias tables each build asked for,
     # ls_vm where the activations are quantized, out_vm, oscl_vm.
-    scratch = [
-        # Two independent scalar-memory windows keep dynamic slot selection
-        # out of the per-token loop. Their total is fixed at 5 KiB for the
-        # 128-row, four-tile schedule, regardless of request size.
-        pltpu.SMEM((gather_window_rows, ), jnp.int32),
-        pltpu.SMEM((gather_window_rows, ), jnp.int32),
-    ] + [
-        pltpu.VMEM(shape, dtype) for _, shape, dtype in
-        host.vmem_scratch_arrays(g_local,
-                                 capacity,
-                                 hidden,
-                                 inter,
-                                 nbuf=NBUF,
-                                 weight_format=weight_format,
-                                 rhs_qb=rhs_qb,
-                                 has_w1_bias=has_w1_bias,
-                                 has_w2_bias=has_w2_bias)
-    ] + [
-        pltpu.SemaphoreType.DMA,  # token_gather_sem0
-        pltpu.SemaphoreType.DMA,  # token_gather_sem1
-        # lhs_sems. Parity-deep, not NBUF-deep: every index into it, and into
-        # the lhs_vm and ls_vm buffers it guards, is an out-parity.
-        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),
-        pltpu.SemaphoreType.DMA((NBUF, )),  # w1_sems
-        pltpu.SemaphoreType.DMA((NBUF, )),  # w2_sems
-        pltpu.SemaphoreType.DMA,  # cp_sem
-    ] + ([
-        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # send_sems
-        pltpu.SemaphoreType.DMA,  # recv_sem
-        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # send_scl_sems
-        pltpu.SemaphoreType.DMA,  # recv_scl_sem
-    ] if push_from_vmem else [
-        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # commit_sems
-        pltpu.SemaphoreType.DMA,  # send_sem
-        pltpu.SemaphoreType.DMA,  # recv_sem
-        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # commit_scl_sems
-        pltpu.SemaphoreType.DMA,  # send_scl_sem
-        pltpu.SemaphoreType.DMA,  # recv_scl_sem
-        pltpu.SemaphoreType.DMA,  # mehop_sem
-        pltpu.SemaphoreType.DMA,  # mehop_scl_sem
-    ])
+    scratch = (
+        [
+            # Two independent scalar-memory windows keep dynamic slot selection
+            # out of the per-token loop. Their total is fixed at 5 KiB for the
+            # 128-row, four-tile schedule, regardless of request size.
+            pltpu.SMEM((gather_window_rows,), jnp.int32),
+            pltpu.SMEM((gather_window_rows,), jnp.int32),
+        ]
+        + [
+            pltpu.VMEM(shape, dtype)
+            for _, shape, dtype in host.vmem_scratch_arrays(
+                g_local,
+                capacity,
+                hidden,
+                inter,
+                nbuf=NBUF,
+                weight_format=weight_format,
+                rhs_qb=rhs_qb,
+                has_w1_bias=has_w1_bias,
+                has_w2_bias=has_w2_bias,
+            )
+        ]
+        + [
+            pltpu.SemaphoreType.DMA,  # token_gather_sem0
+            pltpu.SemaphoreType.DMA,  # token_gather_sem1
+            # lhs_sems. Parity-deep, not NBUF-deep: every index into it, and into
+            # the lhs_vm and ls_vm buffers it guards, is an out-parity.
+            pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
+            pltpu.SemaphoreType.DMA((NBUF,)),  # w1_sems
+            pltpu.SemaphoreType.DMA((NBUF,)),  # w2_sems
+            pltpu.SemaphoreType.DMA,  # cp_sem
+        ]
+        + (
+            [
+                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # send_sems
+                pltpu.SemaphoreType.DMA,  # recv_sem
+                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # send_scl_sems
+                pltpu.SemaphoreType.DMA,  # recv_scl_sem
+            ]
+            if push_from_vmem
+            else [
+                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # commit_sems
+                pltpu.SemaphoreType.DMA,  # send_sem
+                pltpu.SemaphoreType.DMA,  # recv_sem
+                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # commit_scl_sems
+                pltpu.SemaphoreType.DMA,  # send_scl_sem
+                pltpu.SemaphoreType.DMA,  # recv_scl_sem
+                pltpu.SemaphoreType.DMA,  # mehop_sem
+                pltpu.SemaphoreType.DMA,  # mehop_scl_sem
+            ]
+        )
+    )
     # The staging buffer and the two weight slabs are always operands; the
     # activation row scale, the two weight scale tables and the two bias
     # tables are there only where the build has them.
-    n_inputs = (N_STAGING_INPUTS + N_WEIGHT_SLABS + int(has_act_scale) +
-                N_SCALE_TABLES * int(has_scales) + int(has_w1_bias) +
-                int(has_w2_bias))
+    n_inputs = (
+        N_STAGING_INPUTS
+        + N_WEIGHT_SLABS
+        + int(has_act_scale)
+        + N_SCALE_TABLES * int(has_scales)
+        + int(has_w1_bias)
+        + int(has_w2_bias)
+    )
 
     def make_call(recv_rows):
         """The pallas_call for this build, at this arrival-buffer height."""
@@ -1625,19 +1718,22 @@ def _build_fused_ep_moe_kernel(*,
             raise ValueError(
                 f"the arrival buffer height {recv_rows} is not a whole "
                 f"number of {ROWBLK}-row blocks, which is the unit every "
-                "transport into it moves")
+                "transport into it moves"
+            )
         # contrib and cscl are sized for the no-drop worst case.
         contrib_rows = ragged_rows_alloc
         wire = form.wire_dtype
         out_shape = [
-            jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK),
-                                 wire),
-            jax.ShapeDtypeStruct((host.arrival_mirror_rows(
-                recv_rows, ep * g_local, tile_m), tile_m), jnp.float32),
+            jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
-            jax.ShapeDtypeStruct((host.contrib_mirror_rows(
-                contrib_rows, g_local, tile_m), tile_m), jnp.float32),
+                (host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m), tile_m),
+                jnp.float32,
+            ),
+            jax.ShapeDtypeStruct((contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
+            jax.ShapeDtypeStruct(
+                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), tile_m),
+                jnp.float32,
+            ),
         ]
         # Each suffix appears only when its feature is on, so a kernel that
         # fuses silu on eight-bit float weights with no biases keeps the name
@@ -1649,13 +1745,16 @@ def _build_fused_ep_moe_kernel(*,
             host.WeightFormat.INT8: "_int8w",
             host.WeightFormat.BF16: "_bf16w",
         }[weight_format]
-        bias_tag = (("_w13bias" if has_w1_bias else "") +
-                    ("_w2bias" if has_w2_bias else ""))
-        name = (f"fused_ep_moe_v2"
-                f"{format_tag}"
-                f"{'' if act_fn == 'silu' else '_' + act_fn}"
-                f"{bias_tag}"
-                f"_g{g_local}_c{capacity}_nb{NBUF}")
+        bias_tag = ("_w13bias" if has_w1_bias else "") + (
+            "_w2bias" if has_w2_bias else ""
+        )
+        name = (
+            f"fused_ep_moe_v2"
+            f"{format_tag}"
+            f"{'' if act_fn == 'silu' else '_' + act_fn}"
+            f"{bias_tag}"
+            f"_g{g_local}_c{capacity}_nb{NBUF}"
+        )
         return pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1663,33 +1762,37 @@ def _build_fused_ep_moe_kernel(*,
                 in_specs=[hbm] * n_inputs,
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
-                grid=()),
+                grid=(),
+            ),
             out_shape=out_shape,
             compiler_params=pltpu.CompilerParams(
                 collective_id=COLLECTIVE_ID,
                 vmem_limit_bytes=host.vmem_limit(),
                 # Bounds checks cost time and change no computed value.
-                disable_bounds_checks=True),
+                disable_bounds_checks=True,
+            ),
             name=name,
         )
 
-    def fn(tables,
-           token_gather,
-           expert_rows,
-           expert_base,
-           act_q_gathered,
-           act_scales,
-           w1,
-           w2,
-           w1s,
-           w2s,
-           w1b=None,
-           w2b=None,
-           *,
-           recv_rows,
-           visit,
-           counts,
-           rank):
+    def fn(
+        tables,
+        token_gather,
+        expert_rows,
+        expert_base,
+        act_q_gathered,
+        act_scales,
+        w1,
+        w2,
+        w1s,
+        w2s,
+        w1b=None,
+        w2b=None,
+        *,
+        recv_rows,
+        visit,
+        counts,
+        rank,
+    ):
         """The served ragged transport form; returns arrivals and scales."""
         # tables = the block-unit transport tuple and the row-unit push
         # tuple, (rows, base) from shard_expert_slabs, act_scales the
@@ -1711,14 +1814,13 @@ def _build_fused_ep_moe_kernel(*,
         # None.astype, and a missing bias fails on the pallas_call operand
         # count.) This is also the check that catches "you named bf16 and
         # supplied scales".
-        for operand, present, what in ((act_scales, has_act_scale,
-                                        "activation row scale"),
-                                       (w1s, has_scales, "gate/up weight "
-                                        "scale table"),
-                                       (w2s, has_scales, "down weight scale "
-                                        "table"), (w1b, has_w1_bias,
-                                                   "gate/up bias"),
-                                       (w2b, has_w2_bias, "down bias")):
+        for operand, present, what in (
+            (act_scales, has_act_scale, "activation row scale"),
+            (w1s, has_scales, "gate/up weight scale table"),
+            (w2s, has_scales, "down weight scale table"),
+            (w1b, has_w1_bias, "gate/up bias"),
+            (w2b, has_w2_bias, "down bias"),
+        ):
             if (operand is not None) != present:
                 raise ValueError(
                     f"the kernel was built for weight format "
@@ -1726,21 +1828,37 @@ def _build_fused_ep_moe_kernel(*,
                     f"has_w2_bias={has_w2_bias}, which "
                     f"{'wants' if present else 'has no operand for'} the "
                     f"{what}, and it is "
-                    f"{'present' if operand is not None else 'absent'}")
-        act_scale_arg = ((act_scales.reshape(
-            host.act_scale_slab_rows(ragged_rows_alloc), HIDDEN_LANE_BLOCK), )
-                         if has_act_scale else ())
-        scale_args = ((w1s.astype(jnp.float32),
-                       w2s.astype(jnp.float32)) if has_scales else ())
-        biases = tuple(
-            b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
+                    f"{'present' if operand is not None else 'absent'}"
+                )
+        act_scale_arg = (
+            (
+                act_scales.reshape(
+                    host.act_scale_slab_rows(ragged_rows_alloc), HIDDEN_LANE_BLOCK
+                ),
+            )
+            if has_act_scale
+            else ()
+        )
+        scale_args = (
+            (w1s.astype(jnp.float32), w2s.astype(jnp.float32)) if has_scales else ()
+        )
+        biases = tuple(b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
         call = make_call(recv_rows)
-        res = call(*tables, expert_rows.astype(jnp.int32),
-                   expert_base.astype(jnp.int32), visit.astype(jnp.int32),
-                   counts.astype(jnp.int32), rank.astype(jnp.int32),
-                   token_gather.astype(jnp.int32),
-                   act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
-                   *act_scale_arg, w1, w2, *scale_args, *biases)
+        res = call(
+            *tables,
+            expert_rows.astype(jnp.int32),
+            expert_base.astype(jnp.int32),
+            visit.astype(jnp.int32),
+            counts.astype(jnp.int32),
+            rank.astype(jnp.int32),
+            token_gather.astype(jnp.int32),
+            act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
+            *act_scale_arg,
+            w1,
+            w2,
+            *scale_args,
+            *biases,
+        )
         recv, rscl, _contrib, _contrib_scl = res
         return recv, rscl
 
@@ -1771,9 +1889,11 @@ def build_fused_ep_moe_kernel(**kwargs):
             if fn is None:
                 fn = _build_fused_ep_moe_kernel(**kwargs)
                 _BUILD_CACHE[key] = fn
-                logger.info("fused EP MoE: built program %d for %s",
-                            len(_BUILD_CACHE),
-                            ", ".join(f"{k}={v}" for k, v in key))
+                logger.info(
+                    "fused EP MoE: built program %d for %s",
+                    len(_BUILD_CACHE),
+                    ", ".join(f"{k}={v}" for k, v in key),
+                )
     return fn
 
 
@@ -1836,16 +1956,19 @@ def combine_step_tokens(t_local):
     tb = COMBINE_TOKENS
     while tb >= COMBINE_GROUP:
         steps = t_local // tb
-        if (not t_local % tb and not tb % COMBINE_GROUP
-                and steps > COMBINE_LEAD and steps >= COMBINE_PARITIES
-                and not steps % COMBINE_PARITIES):
+        if (
+            not t_local % tb
+            and not tb % COMBINE_GROUP
+            and steps > COMBINE_LEAD
+            and steps >= COMBINE_PARITIES
+            and not steps % COMBINE_PARITIES
+        ):
             return tb
         tb //= 2
     return 0
 
 
-def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
-                          out_dtype):
+def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype):
     """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
 
     `pos` is a scalar-prefetch table of arrival rows, already clamped into the
@@ -1867,25 +1990,29 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
     groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
 
-    def kernel(pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm,
-               row_sems, out_sems):
-
+    def kernel(
+        pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems
+    ):
         def start_row(base, parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
             # arrival row and an in-order queue retires descriptors at a fixed
             # rate, which for a row this small is slower than the row's own
             # bytes. Both queues signal the one semaphore the step waits on,
             # which counts bytes and not descriptors.
-            pltpu.make_async_copy(arr_hbm.at[pos_sm[(base + i) * topk + k]],
-                                  rows_vm.at[parity, k * tb + i],
-                                  row_sems.at[parity]).start(priority=k % 2)
+            pltpu.make_async_copy(
+                arr_hbm.at[pos_sm[(base + i) * topk + k]],
+                rows_vm.at[parity, k * tb + i],
+                row_sems.at[parity],
+            ).start(priority=k % 2)
 
         def reduce_token(base, parity, i):
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
             for k in range(topk):
-                term = (rows_vm[parity, k * tb + i].astype(jnp.float32) *
-                        coef_sm[(base + i) * topk + k])
+                term = (
+                    rows_vm[parity, k * tb + i].astype(jnp.float32)
+                    * coef_sm[(base + i) * topk + k]
+                )
                 acc = term if acc is None else acc + term
             tile_vm[i] = acc.astype(out_dtype)
 
@@ -1898,13 +2025,15 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
             nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
             base = step * tb
             npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
-            pltpu.make_async_copy(rows_vm.at[parity], rows_vm.at[parity],
-                                  row_sems.at[parity]).wait()
+            pltpu.make_async_copy(
+                rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
+            ).wait()
 
             @pl.when(step >= COMBINE_PARITIES)
             def _():
-                pltpu.make_async_copy(out_vm.at[parity], out_vm.at[parity],
-                                      out_sems.at[parity]).wait()
+                pltpu.make_async_copy(
+                    out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
+                ).wait()
 
             def one_chunk(chunk, carry):
                 for u in range(COMBINE_CHUNK):
@@ -1916,12 +2045,12 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
 
             lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
             for g in range(groups):
-                out_vm[parity,
-                       pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
-                           gt, hidden)
-            pltpu.make_async_copy(out_vm.at[parity],
-                                  out_hbm.at[pl.ds(step * tb, tb)],
-                                  out_sems.at[parity]).start()
+                out_vm[parity, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
+                    gt, hidden
+                )
+            pltpu.make_async_copy(
+                out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
+            ).start()
 
         def step_pair(pair, carry):
             for parity in range(COMBINE_PARITIES):
@@ -1936,11 +2065,9 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
         # The last COMBINE_LEAD steps re-start the final step's rows into the
         # buffers the loop no longer reads; drain them, and the stores.
         for p in range(COMBINE_LEAD):
-            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p],
-                                  row_sems.at[p]).wait()
+            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
         for p in range(COMBINE_PARITIES):
-            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p],
-                                  out_sems.at[p]).wait()
+            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
@@ -1950,17 +2077,20 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
-                pltpu.VMEM((COMBINE_PARITIES, topk * tb, lane_blocks, lanes),
-                           wire_dtype),
+                pltpu.VMEM(
+                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
+                ),
                 pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
                 pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES, )),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES, )),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
             ),
-            grid=()),
+            grid=(),
+        ),
         out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True),
+            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+        ),
         name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
     )
 
@@ -1970,11 +2100,12 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype,
         # address computation. That is also the order the plan builds them in,
         # so neither flatten is a transpose.
         if pos.shape != (t_local, topk) or coef.shape != (t_local, topk):
-            raise ValueError(f"the combine takes token-major "
-                             f"[{t_local}, {topk}] tables, got pos "
-                             f"{pos.shape} and coef {coef.shape}")
-        return call(
-            pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+            raise ValueError(
+                f"the combine takes token-major "
+                f"[{t_local}, {topk}] tables, got pos "
+                f"{pos.shape} and coef {coef.shape}"
+            )
+        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
 
     return fn
 
