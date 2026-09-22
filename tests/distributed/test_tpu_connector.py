@@ -1762,6 +1762,13 @@ def _synthetic_qwen35_unified_pool_materialization(*,
 
 class TestTPURaidenConnectorWorker:
 
+    def test_pcp_tp1_transfer_rank_preserves_main_cache_ownership(self):
+        worker = _make_raiden_worker(tp_size=1, pcp_size=8)
+        with patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1), \
+             patch("vllm_torchtpu.distributed.pcp.get_pcp_cache_rank",
+                   return_value=3):
+            assert worker._local_raiden_transfer_rank() == 3
+
     @pytest.mark.parametrize("pcp,tp,k,v", [(4, 2, 4, 32), (16, 2, 16, 128),
                                             (1, 8, 4, 32), (1, 32, 16, 128),
                                             (8, 1, 8, 32)])

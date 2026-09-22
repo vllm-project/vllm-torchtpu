@@ -1223,8 +1223,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size)
         dcp_size = int(
             self.vllm_config.parallel_config.decode_context_parallel_size)
-        if (int(params.get("dst_tp_size", 0)) != tp_size
-                or int(params.get("dst_dcp_size", 0)) != dcp_size):
+        if (not _uses_tp_stage3_source(self.vllm_config)
+                and (int(params.get("dst_tp_size", 0)) != tp_size
+                     or int(params.get("dst_dcp_size", 0)) != dcp_size)):
             raise ValueError(
                 "Stage-3 metadata requires explicit matching destination "
                 "TP/DCP geometry for the producer's registered spans")
@@ -3538,8 +3539,10 @@ class TPURaidenConnectorWorker:
         if self._raiden_work_unit is None:
             raise RuntimeError(
                 "Stage-3 destination work unit is not registered")
-        tp_group = self._stage3_tp_group() if self._stage3_sharded_consumer(
-        ) else None
+        tp_group = None
+        if self._stage3_sharded_consumer():
+            tp_group = (get_tp_group()
+                        if self._stage3_kimi else self._stage3_tp_group())
 
         for destination_req_id, req_meta in metadata.reqs_to_load.items():
             if not isinstance(req_meta, _Stage3LoadMeta):
