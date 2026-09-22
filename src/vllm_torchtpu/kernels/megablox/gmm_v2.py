@@ -40,12 +40,21 @@ def swigluoai(gate: jax.Array,
     return (up + 1.0) * glu
 
 
-def silu_and_mul_with_clamp(gate: jax.Array,
-                            up: jax.Array,
-                            limit: float = 10.0) -> jax.Array:
+# The clamp `silu_and_mul_with_clamp` applies when no limit is passed. It is
+# DeepSeek-V4's `config.swiglu_limit`, and the models this kernel serves today
+# all carry exactly this value -- but the config is free to say otherwise, and
+# the callers below do not pass it through. Named so a caller can compare its
+# layer's configured limit against what it would actually get; see
+# `mxfp4.VllmDeepseekV4Mxfp4MoEMethod._resolve_tpu_activation`.
+DEFAULT_SWIGLU_CLAMP_LIMIT = 10.0
+
+
+def silu_and_mul_with_clamp(
+        gate: jax.Array,
+        up: jax.Array,
+        limit: float = DEFAULT_SWIGLU_CLAMP_LIMIT) -> jax.Array:
     """Activation used in some models DeepSeek V4."""
-    # The limit value is from DSV4's config.
-    # TODO: pass limit from model config, instead of hardcoding here.
+    # TODO: pass limit from model config, instead of defaulting here.
     gate = jnp.clip(gate, max=limit)
     up = jnp.clip(up, min=-limit, max=limit)
     return jax.nn.silu(gate) * up

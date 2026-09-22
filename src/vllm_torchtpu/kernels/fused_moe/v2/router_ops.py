@@ -37,7 +37,11 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
     x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
-    v = None if v_ref is None else v_ref[...]
+    # The weight table is flushed on the same rule: a slot that fell through
+    # to the sentinel tie reads this table at that column, and a NaN there
+    # would be returned as a real weight. See the module docstring.
+    v = (None if v_ref is None else jnp.where(jnp.isnan(v_ref[...]), NEG,
+                                              v_ref[...]))
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
@@ -85,10 +89,19 @@ def pallas_select(scores,
     """
     R, N = scores.shape
     assert R % block_rows == 0, (R, block_rows)
-    if weight_scores is not None and weight_scores.shape != scores.shape:
-        raise ValueError(
-            f"weight_scores {weight_scores.shape} must match scores "
-            f"{scores.shape}")
+    if weight_scores is not None:
+        if weight_scores.shape != scores.shape:
+            raise ValueError(
+                f"weight_scores {weight_scores.shape} must match scores "
+                f"{scores.shape}")
+        # The dtype as well as the shape: the weights ref this table is read
+        # into is f32, so a bf16 table -- which is what a gate matmul hands
+        # out unless something widens it -- fails as a Mosaic lowering error
+        # that names neither this argument nor this call.
+        if weight_scores.dtype != scores.dtype:
+            raise ValueError(
+                f"weight_scores dtype {weight_scores.dtype} must match "
+                f"scores {scores.dtype}")
     grid = (R // block_rows, )
     out_shapes = (
         jax.ShapeDtypeStruct((R, topk), jnp.float32),

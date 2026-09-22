@@ -403,6 +403,21 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # time instead of storing it here would silently drop the clamp.
         activation_str = super()._resolve_tpu_activation(layer)
         if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
+            # Both TPU paths -- fused EP and the GMM one -- take the kernel's
+            # default clamp, so a checkpoint configuring anything else clips
+            # the routed experts at a different value than the shared expert
+            # beside them (`SiluAndMulWithClamp(swiglu_limit)`), with no
+            # symptom but evals. Say so once; the fix is the TODO on
+            # `gmm_v2.silu_and_mul_with_clamp`.
+            from vllm_torchtpu.kernels.megablox.gmm_v2 import \
+                DEFAULT_SWIGLU_CLAMP_LIMIT
+            limit = getattr(layer, "swiglu_limit", None)
+            if limit is not None and float(
+                    limit) != DEFAULT_SWIGLU_CLAMP_LIMIT:
+                logger.warning_once(
+                    "swiglu_limit=%s is not plumbed through to the TPU MoE "
+                    "kernels; the routed experts clamp at %s.", float(limit),
+                    DEFAULT_SWIGLU_CLAMP_LIMIT)
             return "silu_and_mul_with_clamp"
         return activation_str
 
@@ -542,8 +557,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         activation_str = self._set_tpu_activation(layer)
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason,
-            register_score_bias_buffer)
+            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason)
 
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
@@ -558,6 +572,24 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                                                         orig_intermediate,
                                                         device,
                                                         pack=op is None)
+        if op is not None:
+            reason = fused_moe_ep_unsupported_reason(
+                layer, (w13_weight_processed, w2_weight_processed,
+                        w13_weight_scale, w2_weight_scale),
+                activation_str,
+                weight_format="fp4",
+                rhs_qb=REQUANTIZED_BLOCK_SIZE)
+            # Admission already accepted this exact layout on meta tensors, so
+            # a mismatch here is a preparation bug rather than a fallback case.
+            # Checked before the weights are installed and before the op is
+            # recorded, as nvfp4 does: past that point the layer holds
+            # native-fp4 weights the GMM fallback cannot read and
+            # `fused_moe_ep_supported` already answers True, so a stripped
+            # assert (`python -O`) would serve a mismatched layout unlogged
+            # rather than abort.
+            assert reason is None, (
+                "DeepSeek-V4 MXFP4 fused EP prepared weights violate the "
+                f"admitted layout: {reason}")
         self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
@@ -596,18 +628,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
-            reason = fused_moe_ep_unsupported_reason(
-                layer, (layer.w13_weight, layer.w2_weight,
-                        layer.w13_weight_scale, layer.w2_weight_scale),
-                activation_str,
-                weight_format="fp4",
-                rhs_qb=REQUANTIZED_BLOCK_SIZE)
-            # Admission already accepted this exact layout on meta tensors, so
-            # a mismatch here is a preparation bug rather than a fallback case.
-            assert reason is None, (
-                "DeepSeek-V4 MXFP4 fused EP prepared weights violate the "
-                f"admitted layout: {reason}")
-            register_score_bias_buffer(layer)
+            # The prepared layout was validated above, before any of this was
+            # installed; the score-bias operand was staged by prebuild.
             # The kernel takes [E, K/block, N]; do the squeeze once here
             # rather than per layer per step inside the compiled forward.
             layer.register_buffer(

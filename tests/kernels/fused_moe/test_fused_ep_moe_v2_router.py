@@ -109,6 +109,45 @@ def test_weights_come_from_the_second_table(rows, block_rows):
     np.testing.assert_array_equal(w, ref_w)
 
 
+def test_a_row_with_fewer_finite_scores_than_topk_weighs_finite():
+    """The weight table is NaN-flushed too, not just the selection table.
+
+    A row with fewer finite scores than `topk` runs the selector out of real
+    columns, and every slot past that point falls to the sentinel tie's lowest
+    column -- a NaN column here. In two-table mode that column's WEIGHT is
+    what comes back, and `layer.py` then divides the row by a sum containing
+    it, so one NaN weight makes the whole row NaN. The all-finite mask one
+    layer up does not fire: this row has finite scores.
+    """
+    scores = np.full((8, EXPERTS), np.nan, dtype=np.float32)
+    weights = np.full((8, EXPERTS), np.nan, dtype=np.float32)
+    scores[:, 1:3] = np.array([0.5, 0.25], dtype=np.float32)
+    weights[:, 1:3] = np.array([0.731, 0.622], dtype=np.float32)
+
+    w, i = _select(scores, weights)
+    assert np.isfinite(w).all(), "a NaN weight escaped the selector"
+    # The two finite columns are picked in order and weighed from the second
+    # table; the slots with nothing left to pick carry the sentinel.
+    np.testing.assert_array_equal(i[:, :2], np.tile([1, 2], (8, 1)))
+    np.testing.assert_allclose(w[:, :2],
+                               np.tile([0.731, 0.622], (8, 1)),
+                               rtol=1e-6)
+    assert (w[:, 2:] == router_ops.NEG).all()
+
+
+def test_a_weight_table_of_a_different_dtype_is_refused_here():
+    """A bf16 table stores into the f32 weights ref and fails as a Mosaic
+    lowering error that names neither this argument nor this call. The gate
+    output IS bf16; only an explicit widen on the serving path makes it f32."""
+    scores = jnp.asarray(_scores(8, seed=3))
+    with pytest.raises(ValueError, match="dtype"):
+        router_ops.pallas_select(scores,
+                                 topk=TOPK,
+                                 block_rows=8,
+                                 weight_scores=scores.astype(jnp.bfloat16),
+                                 interpret=True)
+
+
 def test_the_bias_moves_the_selection_and_not_the_weights():
     """The `noaux_tc` call as the layer makes it, end to end.
 

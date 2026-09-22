@@ -42,6 +42,7 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
+import math
 from typing import Any
 
 import jax
@@ -107,6 +108,8 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+
+ADMITTED_ACT_FNS = ("silu", "silu_and_mul_with_clamp")
 
 
 def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
@@ -289,7 +292,9 @@ def fused_moe_ep(
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and must be passed exactly when prebuild saw one on the layer --
     prebuild built the op's signature around that. Getting it wrong is a
-    torch arity error at the first call, not a wrong answer.
+    torch arity error at the first call, not a wrong answer. Always pass
+    `score_bias_operand(layer)`: prebuild staged it, and it is None on exactly
+    the layers whose op takes no bias.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -312,6 +317,9 @@ FUSED_MOE_EP_SCORE_BIAS_ATTR = "_tpu_fused_score_bias"
 
 def register_score_bias_buffer(layer) -> torch.Tensor | None:
     """Stage `e_score_correction_bias` as the f32 operand the op takes.
+
+    Called by `prebuild_fused_moe_ep` on the layers it arms, so a caller only
+    has to read the result back with `score_bias_operand` and pass it.
 
     Done once at weight load for the same reason the scale buffers are: the
     parameter is f32 already on every checkpoint seen so far, but `.float()`
@@ -539,6 +547,7 @@ def prebuild_fused_moe_ep(layer,
             "layer: the kernel routes and exchanges inside its own program.",
             envs.TPU_MOE_SKIP_PADDED_TOKENS,
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
+    register_score_bias_buffer(layer)
     return op
 
 
@@ -557,10 +566,9 @@ def fused_moe_ep_unsupported_reason(layer,
     packing = 2 if weight_format == "fp4" else 1
     if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
-    from vllm_torchtpu.kernels.fused_moe.v2.kernel import ACT_FNS
-    if activation not in ACT_FNS:
-        return (f"activation {activation!r} is not wired to the kernel's "
-                f"ACT_FNS {ACT_FNS}")
+    if activation not in ADMITTED_ACT_FNS:
+        return (f"activation {activation!r} is not one of the forms this "
+                f"bridge admits {ADMITTED_ACT_FNS}")
     if weight_format == "fp4":
         if w1.dtype != torch.float4_e2m1fn_x2 or w2.dtype != w1.dtype:
             return "the FP4 form requires native float4_e2m1fn_x2 weights"
@@ -629,10 +637,13 @@ def _unsupported_routing_reason(layer) -> str | None:
     if layer.custom_routing_function is not None:
         return ("the layer supplies a custom_routing_function; the kernel "
                 "routes with its own top-k")
-    scoring_fn, has_bias, _ = _routing_config(layer)
+    scoring_fn, has_bias, scale = _routing_config(layer)
     if scoring_fn not in SCORING_FNS:
         return (f"scoring_func {scoring_fn!r}; the kernel's router scores "
                 f"with {SCORING_FNS}")
+    if not math.isfinite(scale) or scale <= 0.0:
+        return (f"routed_scaling_factor {scale} is not a positive finite "
+                "number")
     if has_bias:
         bias = layer.e_score_correction_bias
         # The bias is an operand, not a constant, so it has to be a real
@@ -640,6 +651,9 @@ def _unsupported_routing_reason(layer) -> str | None:
         if bias.ndim != 1 or bias.shape[0] != layer.global_num_experts:
             return (f"e_score_correction_bias {tuple(bias.shape)} is not one "
                     f"value per global expert [{layer.global_num_experts}]")
+        if not torch.isfinite(bias).all():
+            return ("e_score_correction_bias holds non-finite values, which "
+                    "would route every affected token to expert 0")
     if (layer.use_grouped_topk and layer.num_expert_group > 1
             and layer.topk_group < layer.num_expert_group):
         return "grouped top-k routing is not implemented in the kernel"

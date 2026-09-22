@@ -347,8 +347,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason,
-            register_score_bias_buffer)
+            FUSED_MOE_EP_OP_ATTR, fused_moe_ep_unsupported_reason)
 
         # Preserve main's explicit requantization recipe for the GMM path.
         # Automatic requantization is committed only for an admitted W4A8 op.
@@ -410,7 +409,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
-            register_score_bias_buffer(layer)
             # Do the scale layout conversion once, outside compiled forward.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",

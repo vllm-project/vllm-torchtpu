@@ -926,11 +926,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            fused_moe_ep, fused_moe_ep_supported, score_bias_operand)
         if fused_moe_ep_supported(self):
             return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
                                 layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+                                layer.w2_weight_scale_inv, router_logits,
+                                score_bias_operand(layer))
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

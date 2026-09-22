@@ -72,6 +72,10 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
                                                 is_sequence_parallel=False),
         ),
     )
+    # `prebuild_fused_moe_ep` stages the score-bias operand on the layers it
+    # arms, which on a real `RoutedExperts` is `torch.nn.Module.register_buffer`.
+    layer.register_buffer = (
+        lambda name, tensor, persistent=True: setattr(layer, name, tensor))
     for name, value in overrides.items():
         setattr(layer, name, value)
     return layer
@@ -289,6 +293,22 @@ def test_refused_on_a_non_silu_activation():
     assert _prebuild(_layer(), activation="gelu") is None
 
 
+def test_the_bridge_admits_fewer_activations_than_the_kernel_fuses():
+    """`swigluoai` is fused by the kernel but must not be admitted here.
+
+    The kernel hardcodes its `alpha` and `limit` while `RoutedExperts` carries
+    per-model ones, and the gpt-oss family that uses it needs the mxfp4
+    method's w13 de-interleave, which no weight contract on this path states.
+    It is refused today only by the expert-bias check further down, which is
+    an ordering rather than a decision.
+    """
+    from vllm_torchtpu.kernels.fused_moe.v2.kernel import ACT_FNS
+
+    assert set(bridge.ADMITTED_ACT_FNS) < set(ACT_FNS)
+    assert "swigluoai" in ACT_FNS
+    assert _prebuild(_layer(), activation="swigluoai") is None
+
+
 def test_refused_when_the_layer_carries_expert_biases():
     """The kernel takes biases; this bridge does not pass them. Dropping one
     is silent -- the output is wrong by the bias term on every routed token."""
@@ -306,6 +326,38 @@ def test_refused_on_routing_the_kernel_does_not_implement(routing):
     top-k itself. Anything it cannot reproduce routes tokens to a different
     set of experts, so it is refused rather than run."""
     assert _prebuild(_layer(**routing)) is None
+
+
+@pytest.mark.parametrize("scale,armed", [(1.0, True), (2.5, True),
+                                         (0.0, False), (-1.0, False),
+                                         (float("nan"), False),
+                                         (float("inf"), False)])
+def test_refused_on_a_routed_scaling_factor_that_is_not_positive_finite(
+        scale, armed):
+    """Zero silently zeroes the routed contribution -- and does so on the GMM
+    path too, so an A/B finds nothing. NaN is worse than wrong output: it is
+    part of `_OPS`' key and of the selector cache's, and NaN != NaN, so every
+    layer misses both and registers another torch op and another export."""
+    assert (_prebuild(_layer(routed_scaling_factor=scale)) == "op") is armed
+
+
+@pytest.mark.parametrize("values,armed", [
+    ([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], True),
+    ([float("nan")] * 8, False),
+    ([0.1, 0.2, 0.3, float("nan"), 0.5, 0.6, 0.7, 0.8], False),
+    ([0.1, 0.2, 0.3, float("inf"), 0.5, 0.6, 0.7, 0.8], False),
+])
+def test_refused_on_a_score_bias_that_is_not_finite(values, armed):
+    """`DeepseekV4MoE` creates this parameter with `torch.empty`, so a
+    checkpoint missing `gate.bias` leaves whatever was in memory.
+
+    Selection runs on `scores + bias`. An all-NaN bias makes the whole
+    selection table sentinel, so every token routes top-k times to expert 0 at
+    equal weight -- and the upstream all-finite mask is computed on `scores`,
+    before the bias, so it stays True and nothing says a word.
+    """
+    bias = torch.tensor(values, dtype=torch.float32)
+    assert (_prebuild(_layer(e_score_correction_bias=bias)) == "op") is armed
 
 
 def test_refused_while_the_routing_simulator_is_on():
