@@ -37,8 +37,8 @@ _NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
 
 
 def reconcile_num_gpu_blocks_override(
-        worker_overrides: list[int | None],
-        workers_per_stage: int | None = None) -> int | None:
+    worker_overrides: list[int | None], workers_per_stage: int | None = None
+) -> int | None:
     """Return the agreed block-count override, or None if no worker set one.
 
     Raises ValueError when the spread across workers exceeds both the
@@ -55,7 +55,8 @@ def reconcile_num_gpu_blocks_override(
     if workers_per_stage and 0 < workers_per_stage < len(worker_overrides):
         stage_values = [
             reconcile_num_gpu_blocks_override(
-                worker_overrides[start:start + workers_per_stage])
+                worker_overrides[start : start + workers_per_stage]
+            )
             for start in range(0, len(worker_overrides), workers_per_stage)
         ]
         if all(value is None for value in stage_values):
@@ -69,7 +70,8 @@ def reconcile_num_gpu_blocks_override(
                 "every stage, and a stage that did not size its own pool has "
                 "no measured capacity for it. Partition the layers so every "
                 "stage holds both attention and mamba layers, or pin "
-                "--num-gpu-blocks-override.")
+                "--num-gpu-blocks-override."
+            )
         return min(stage_values)
     overrides = [ovr for ovr in worker_overrides if ovr is not None]
     if not overrides:
@@ -78,19 +80,27 @@ def reconcile_num_gpu_blocks_override(
     lo, hi = min(overrides), max(overrides)
     tol = max(_NUM_BLOCKS_OVERRIDE_TOL, int(lo * _NUM_BLOCKS_OVERRIDE_REL_TOL))
     if hi - lo > tol:
-        raise ValueError("[kv-sizing] workers disagree on the compact-mamba "
-                         f"attention block count by {hi - lo} blocks "
-                         f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
-                         "sizes the pool from its own measured free HBM, so a "
-                         "spread this large means the workers do not have "
-                         "comparable HBM budgets -- check the per-worker "
-                         "'Compact-mamba KV cache:' lines in "
-                         "tpu_runner._maybe_set_compact_mamba_num_blocks_"
-                         f"override for the outlier. Per-worker values: "
-                         f"{sorted(overrides)}")
+        raise ValueError(
+            "[kv-sizing] workers disagree on the compact-mamba "
+            f"attention block count by {hi - lo} blocks "
+            f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
+            "sizes the pool from its own measured free HBM, so a "
+            "spread this large means the workers do not have "
+            "comparable HBM budgets -- check the per-worker "
+            "'Compact-mamba KV cache:' lines in "
+            "tpu_runner._maybe_set_compact_mamba_num_blocks_"
+            f"override for the outlier. Per-worker values: "
+            f"{sorted(overrides)}"
+        )
     logger.info(
         "[kv-sizing] compact-mamba attention blocks across %d "
         "workers: min=%d max=%d spread=%d (tolerance=%d); "
-        "pinning num_gpu_blocks_override=%d", len(overrides), lo, hi, hi - lo,
-        tol, lo)
+        "pinning num_gpu_blocks_override=%d",
+        len(overrides),
+        lo,
+        hi,
+        hi - lo,
+        tol,
+        lo,
+    )
     return lo

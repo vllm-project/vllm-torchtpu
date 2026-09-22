@@ -84,16 +84,6 @@ repos:
       |tests/offload/
       |tests/spec_decode/
 
-      # platforms, executors, worker, compilation, entrypoints
-      |src/vllm_torchtpu/compilation/
-      |src/vllm_torchtpu/executors/
-      |src/vllm_torchtpu/platforms/
-      |src/vllm_torchtpu/worker/
-      |tests/compilation/
-      |tests/entrypoints/
-      |tests/executors/
-      |tests/platforms/
-      |tests/worker/
 
       # core, tracing, omni, tools, loose modules
       |src/vllm_torchtpu/core/

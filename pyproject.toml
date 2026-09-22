@@ -244,16 +244,6 @@ ignore = [
 "tests/offload/**" = ["I"]
 "tests/spec_decode/**" = ["I"]
 
-# platforms, executors, worker, compilation, entrypoints
-"src/vllm_torchtpu/compilation/**" = ["I"]
-"src/vllm_torchtpu/executors/**" = ["I"]
-"src/vllm_torchtpu/platforms/**" = ["I"]
-"src/vllm_torchtpu/worker/**" = ["I"]
-"tests/compilation/**" = ["I"]
-"tests/entrypoints/**" = ["I"]
-"tests/executors/**" = ["I"]
-"tests/platforms/**" = ["I"]
-"tests/worker/**" = ["I"]
 
 # core, tracing, omni, tools, loose modules
 "src/vllm_torchtpu/core/**" = ["I"]
@@ -364,16 +354,6 @@ exclude = [
     "tests/offload/**",
     "tests/spec_decode/**",
 
-    # platforms, executors, worker, compilation, entrypoints
-    "src/vllm_torchtpu/compilation/**",
-    "src/vllm_torchtpu/executors/**",
-    "src/vllm_torchtpu/platforms/**",
-    "src/vllm_torchtpu/worker/**",
-    "tests/compilation/**",
-    "tests/entrypoints/**",
-    "tests/executors/**",
-    "tests/platforms/**",
-    "tests/worker/**",
 
     # core, tracing, omni, tools, loose modules
     "src/vllm_torchtpu/core/**",
