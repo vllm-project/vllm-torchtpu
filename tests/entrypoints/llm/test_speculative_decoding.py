@@ -274,13 +274,18 @@ def _assert_no_spec_divergence(prompts: list[str],
     and served correctness tests so both apply the same standard.
 
     Greedy decoding of one prompt has a single answer, but on TPU at
-    batch > 1 NEITHER run reproduces it on every row: a row's logits depend
-    on its position in the batch (tiling and reduction order), so a near-tie
-    argmax can flip for one row while its siblings agree. Speculation does
-    not cause this -- the same flip, to the same alternative text, has been
-    observed in the no-spec reference -- and because the two runs batch
-    differently it lands on different rows. Comparing spec[i] to ref[i]
-    positionally charges it to speculation.
+    batch > 1 NEITHER run reproduces it on every row. The observed cause is
+    prefix-cache cross-request contamination: when many rows share one
+    prompt, a row whose prefill is admitted after a sibling started decoding
+    can read that sibling's generated tokens as part of its context on the
+    first post-boot batch, so its output diverges from its siblings'. The
+    divergence is deterministic per engine and reproduces byte-identically
+    across machines; which rows are hit depends on admission timing, so the
+    ref and spec engines can crown different group majorities. Comparing
+    spec[i] to ref[i] positionally charges it to speculation. (Callers that
+    run identical-prompt batches disable prefix caching, which removes the
+    contamination; residual single-row flips from batch-position numerics
+    remain possible.)
 
     Compare each group's majority output instead. Every row of a group is
     the same prompt with the same params, so each run must agree with itself
@@ -288,9 +293,9 @@ def _assert_no_spec_divergence(prompts: list[str],
     group of one degenerates to exact comparison, so unique-prompt callers
     lose no strictness. A systematic masking or rejection bug moves a
     group's majority and is still caught; a single flipped row inside an
-    otherwise-agreeing group is indistinguishable from the tiling noise
-    above and is tolerated -- for structured requests the caller's per-row
-    schema check still covers every row.
+    otherwise-agreeing group is indistinguishable from the noise above and
+    is tolerated -- for structured requests the caller's per-row schema
+    check still covers every row.
 
     Rows are grouped by prompt. Pass `group_keys` when rows sharing a prompt
     do NOT share sampling params (a mixed structured/unconstrained batch):
@@ -1052,6 +1057,12 @@ def test_structured_output_spec_decode_correctness_greedy(
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=False,
             disable_log_stats=False,
+            # All 8 rows share one prompt; with prefix caching on, rows whose
+            # prefill lands after a sibling started decoding inherit that
+            # sibling's generated tokens as part of their prefix (first-batch
+            # cross-request contamination on TPU), which flips group
+            # majorities between the ref and spec engines.
+            enable_prefix_caching=False,
         )
 
         # 1. Reference run: structured outputs, no speculation.
@@ -1083,9 +1094,10 @@ def test_structured_output_spec_decode_correctness_greedy(
 
             # (b) Speculation must not change greedy output. Compared per-group
             # majority, not row-for-row: the unconstrained rows run the full 64
-            # free tokens, and at this batch size either run can flip one row on
-            # a near-tie (see _assert_no_spec_divergence) -- both directions have
-            # been observed here. Structured and unconstrained rows share a
+            # free tokens, and identical-prompt rows can diverge when prefix
+            # caching lets one row read a sibling's generated tokens (see
+            # _assert_no_spec_divergence) -- both directions have been
+            # observed here. Structured and unconstrained rows share a
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
@@ -1216,6 +1228,12 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=async_scheduling,
             disable_log_stats=False,
+            # Identical prompts across rows: with prefix caching on, a row
+            # whose prefill lands after a sibling started decoding inherits
+            # that sibling's generated tokens (first-batch cross-request
+            # contamination on TPU), flipping group majorities between the
+            # ref and spec engines.
+            enable_prefix_caching=False,
         )
 
         # 1. Reference run: structured outputs, no speculation.
@@ -1247,9 +1265,10 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
 
             # (b) Speculation must not change greedy output. Compared per-group
             # majority, not row-for-row: the unconstrained rows run the full 64
-            # free tokens, and at this batch size either run can flip one row on
-            # a near-tie (see _assert_no_spec_divergence) -- both directions have
-            # been observed here. Structured and unconstrained rows share a
+            # free tokens, and identical-prompt rows can diverge when prefix
+            # caching lets one row read a sibling's generated tokens (see
+            # _assert_no_spec_divergence) -- both directions have been
+            # observed here. Structured and unconstrained rows share a
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
