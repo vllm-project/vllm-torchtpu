@@ -1,9 +1,11 @@
 import glob
+import json
 import os
 import shutil
 from typing import Any, Dict, Optional, Set, Tuple
 
 from core.env import SPARSE_CHECKPOINTS_DIR
+from core.model_utils import resolve_model_path
 from resolvers.base_resolver import BaseResolver
 from resolvers.model_splicer import ModelSplicer
 
@@ -34,7 +36,7 @@ class BaseSparsityResolver(BaseResolver):
             if existing_dir != current_target_path and os.path.isdir(
                     existing_dir):
                 print(
-                    f">>> [CLEANUP] Removing previous temporary spliced checkpoint: {existing_dir}"
+                    f">>> [RESOLVER] Removing temporary spliced checkpoint to save disk space: {existing_dir}"
                 )
                 shutil.rmtree(existing_dir, ignore_errors=True)
 
@@ -76,7 +78,13 @@ class BaseSparsityResolver(BaseResolver):
     def resolve(self, current_config: Dict[str, Any],
                 resolver_config: Dict[str, Any]) -> Tuple[str, Set[str]]:
         num_sparse_layers = int(current_config.get("num_sparse_layers", 0))
-        base_model = resolver_config.get("base_model", "")
+        base_sparse_dir = resolver_config.get("checkpoint_base_dir",
+                                              SPARSE_CHECKPOINTS_DIR)
+        base_model = resolve_model_path(resolver_config.get("base_model", ""))
+        reference_sparse_model = resolve_model_path(resolver_config.get(
+            "reference_sparse_model", ""),
+                                                    base_dir=base_sparse_dir)
+
         if not base_model:
             raise ValueError("Resolver config must specify base_model.")
 
@@ -90,15 +98,53 @@ class BaseSparsityResolver(BaseResolver):
         strategy = resolver_config.get("strategy", "first_to_last")
         prunen = resolver_config.get("prunen", 2)
         prunem = resolver_config.get("prunem", 4)
-        base_sparse_dir = resolver_config.get("checkpoint_base_dir",
-                                              SPARSE_CHECKPOINTS_DIR)
-        reference_sparse_model = resolver_config.get("reference_sparse_model",
-                                                     None)
 
-        # If 100% sparse layers requested and full reference model exists, use reference directly
+        # Check if the full reference sparse model exists on disk.
+        # If absent, invoke SparseGPT in memory once across all layers to generate and cache it,
+        # ensuring downstream partial-layer splices have a complete sparse source.
+        if reference_sparse_model and not os.path.exists(
+                reference_sparse_model):
+            print(
+                f">>> [RESOLVER] Reference sparse model not found at {reference_sparse_model}."
+                f" Generating 100% sparse reference model ({total_layers} layers)..."
+            )
+            self.prune_in_memory(base_model=base_model,
+                                 save_path=reference_sparse_model,
+                                 min_layer=0,
+                                 max_layer=total_layers,
+                                 prunen=prunen,
+                                 prunem=prunem,
+                                 resolver_config=resolver_config)
+
+        # When 100% sparse layers are requested, verify that the reference model is fully compatible
+        # with the base model architecture and has all non-transformer multimodal weights
+        # (e.g. model.vision_embedder.*). If compatible, reuse it directly; otherwise fall through
+        # to ModelSplicer to construct a complete checkpoint using the dense base model as template.
         if num_sparse_layers >= total_layers and reference_sparse_model and os.path.exists(
                 reference_sparse_model):
-            return reference_sparse_model, self.CONSUMED_KEYS
+            dense_map = self.splicer.get_weight_map(base_model)
+            sparse_map = self.splicer.get_weight_map(reference_sparse_model)
+            # Ensure every non-layer weight (vision embeddings, embed_tokens, norm) is present in sparse model
+            has_all_non_layers = all(
+                k in sparse_map for k in dense_map
+                if self.splicer.extract_layer_idx(k) is None)
+            dense_cfg_path = os.path.join(base_model, "config.json")
+            sparse_cfg_path = os.path.join(reference_sparse_model,
+                                           "config.json")
+            matching_arch = False
+            if os.path.exists(sparse_cfg_path) and os.path.exists(
+                    dense_cfg_path):
+                with open(dense_cfg_path) as f_d, open(sparse_cfg_path) as f_s:
+                    matching_arch = json.load(f_d).get(
+                        "architectures") == json.load(f_s).get("architectures")
+
+            if has_all_non_layers and matching_arch:
+                return reference_sparse_model, self.CONSUMED_KEYS
+            # If missing multimodal weights or architectures differ, fall through to splice all layers
+            print(
+                f">>> [RESOLVER] Reference sparse model at {reference_sparse_model} is missing "
+                f"base model non-layer weights or matching config. Splicing all {total_layers} layers..."
+            )
 
         min_layer, max_layer = self.compute_layer_range(
             num_sparse_layers=num_sparse_layers,
@@ -116,8 +162,10 @@ class BaseSparsityResolver(BaseResolver):
         ckpt_path = os.path.join(base_sparse_dir, ckpt_name)
 
         # 1. Cache hit on disk
-        has_weights = os.path.exists(os.path.join(ckpt_path, "model.safetensors.index.json")) or \
-                      (os.path.exists(ckpt_path) and any(f.endswith(".safetensors") for f in os.listdir(ckpt_path)))
+        has_weights = os.path.exists(
+            os.path.join(ckpt_path, "model.safetensors.index.json")) or (
+                os.path.exists(ckpt_path) and any(
+                    f.endswith(".safetensors") for f in os.listdir(ckpt_path)))
 
         if has_weights:
             print(
