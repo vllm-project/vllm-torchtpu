@@ -55,7 +55,7 @@ ragged_gather_reduce = _select_ragged_gather_reduce(
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
-_DECODE_IMPL = envs.TPU_MOE_DECODE_IMPL
+_DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -577,7 +577,9 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    if _DECODE_IMPL == "dense_expert" and can_use_dense_expert(
+    # Decode services also compile large prefill buckets. Apply the token
+    # threshold before kernel admission so those buckets retain routed GMM.
+    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
             hidden_states,
             w1,
             w2,

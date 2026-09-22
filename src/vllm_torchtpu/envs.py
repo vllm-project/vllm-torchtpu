@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
-    TPU_MOE_DECODE_IMPL: str = "standard"
+    TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -497,11 +497,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
                      "off", ["off", "on"],
                      case_sensitive=False),
-    # Explicit FP8 MoE opt-in for decode services; no phase/size heuristic.
-    # Unsupported arithmetic/layouts retain GMM. Resource failures propagate.
-    "TPU_MOE_DECODE_IMPL":
-    env_with_choices("TPU_MOE_DECODE_IMPL", "standard",
-                     ["standard", "dense_expert"]),
+    # Maximum hidden-state row count (after any EP all-gather) for dense
+    # expert MoE. 0 disables it; larger shapes and unsupported layouts use
+    # the original GMM path. This counts tokens, not tokens * topk.
+    "TPU_MOE_DENSE_EXPERT_THRESHOLD":
+    env_nonnegative_int("TPU_MOE_DENSE_EXPERT_THRESHOLD", 0),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

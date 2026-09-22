@@ -55,11 +55,11 @@ def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers):
                   topk=4,
                   use_ep=True,
                   onehot_moe_permute_threshold=32768)
-    monkeypatch.setattr(wrapper, '_DECODE_IMPL', 'standard')
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 0)
     wrapper.fused_moe_func.clear_cache()
     expected = np.asarray(wrapper.fused_moe_func(*args,
                                                  **kwargs)).astype('float32')
-    monkeypatch.setattr(wrapper, '_DECODE_IMPL', 'dense_expert')
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 1024)
     wrapper.fused_moe_func.clear_cache()
     try:
         actual = np.asarray(wrapper.fused_moe_func(*args,
@@ -113,10 +113,10 @@ def test_unaligned_entrypoint_falls_back(tensors, monkeypatch):
     x = x[:15]  # An unsupported token alignment still uses GMM.
     args = (x, w1, w2, s1, s2, None, None, jnp.ones(
         (15, 1), jnp.bfloat16), jnp.zeros((15, 1), jnp.int32))
-    monkeypatch.setattr(wrapper, '_DECODE_IMPL', 'standard')
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 0)
     wrapper.fused_moe_func.clear_cache()
     expected = wrapper.fused_moe_func(*args)
-    monkeypatch.setattr(wrapper, '_DECODE_IMPL', 'dense_expert')
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 1024)
     wrapper.fused_moe_func.clear_cache()
     try:
         actual = wrapper.fused_moe_func(*args)
@@ -125,3 +125,41 @@ def test_unaligned_entrypoint_falls_back(tensors, monkeypatch):
             *args).as_text()
     finally:
         wrapper.fused_moe_func.clear_cache()
+
+
+@pytest.mark.parametrize('m', [1024, 1040])
+def test_qwen_threshold_boundary_matches_gmm(tensors, monkeypatch, m):
+    # Qwen's real H/I also checks that the largest enabled bucket compiles.
+    rng = np.random.default_rng(20260922)
+    h, i, e = 4096, 1024, 4
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    w1 = jnp.asarray(rng.integers(-4, 5, size=(e, h, 2 * i)),
+                     jnp.float8_e4m3fn)
+    w2 = jnp.asarray(rng.integers(-4, 5, size=(e, i, h)), jnp.float8_e4m3fn)
+    s1 = jnp.full((e, 1, 1, 2 * i), .01, jnp.float32)
+    s2 = jnp.full((e, 1, 1, h), .01, jnp.float32)
+    ids = jnp.asarray(np.tile([0, 3], (m, 1)), jnp.int32)
+    weights = jnp.full((m, 2), .5, jnp.bfloat16)
+    args = (x, w1, w2, s1, s2, None, None, weights, ids)
+    kwargs = dict(topk=2, use_sparse_core=False)
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 0)
+    wrapper.fused_moe_func.clear_cache()
+    expected = np.asarray(wrapper.fused_moe_func(*args, **kwargs),
+                          dtype=np.float32)
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', 1024)
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        actual = np.asarray(wrapper.fused_moe_func(*args, **kwargs),
+                            dtype=np.float32)
+        hlo = wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
+        assert ('dense_expert_moe-e_' in hlo) == (m <= 1024)
+        assert np.isfinite(actual).all()
+        if m > 1024:
+            np.testing.assert_array_equal(actual, expected)
+        else:
+            relative_l2 = np.linalg.norm(actual -
+                                         expected) / np.linalg.norm(expected)
+            assert relative_l2 < .008, relative_l2
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+        kernel.dense_expert_moe.clear_cache()

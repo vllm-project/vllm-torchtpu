@@ -404,14 +404,17 @@ def main():
     parser.add_argument(
         "--moe-impl",
         choices=["standard", "dense_expert"],
-        default=os.environ.get("TPU_MOE_DECODE_IMPL", "standard"),
+        default="standard",
+        help="Set the dense-expert token threshold to 0 (standard) or 256.",
     )
     args = parser.parse_args()
     if args.iterations < 1 or args.profile_steps < 0:
         parser.error("iterations must be positive and profile-steps nonnegative")
     if args.output.exists() and any(args.output.iterdir()):
         parser.error("output must be a new or empty directory")
-    os.environ["TPU_MOE_DECODE_IMPL"] = args.moe_impl
+    os.environ["TPU_MOE_DENSE_EXPERT_THRESHOLD"] = (
+        "256" if args.moe_impl == "dense_expert" else "0"
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     if args.profile_steps:
         configure_environment()
@@ -451,7 +454,7 @@ def main():
         "environment": {
             key: os.environ.get(key)
             for key in [
-                "TPU_MOE_DECODE_IMPL",
+                "TPU_MOE_DENSE_EXPERT_THRESHOLD",
                 "USE_MOE_SPARSE_CORE",
                 "TPU_MOE_OWNER_OUTPUT_MODE",
                 "ONEHOT_MOE_PERMUTE_THRESHOLD",

@@ -42,7 +42,7 @@ def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
 
     Zero routing coefficients already suppress padded tokens, so either
     skip_padded_tokens setting is supported. There is no prefill/decode
-    inference here: callers opt in only on their decode service.
+    inference here: the MoE entry applies its configurable token threshold.
     """
     if activation != 'silu':
         return False

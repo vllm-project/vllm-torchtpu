@@ -104,14 +104,20 @@ VRF 与 VMEM 间的 spill/fill 也不能算作 HBM 权重流量。
 
 ## 开关、支持范围与回退
 
-这是进程级显式 opt-in，默认关闭。由用户仅在 decode 服务进程开启，
-prefill 服务保持 `standard`；kernel 不自行判断请求阶段。
+这是进程级显式 opt-in，默认关闭。使用 token 阈值同时控制开启和尺寸分流；
+kernel 不自行判断请求阶段，decode 服务中的大 prefill bucket 仍走原 GMM。
 在服务进程启动前设置，重启后生效：
 
 ```bash
-export TPU_MOE_DECODE_IMPL=dense_expert
-# 默认及回退对照：export TPU_MOE_DECODE_IMPL=standard
+export TPU_MOE_DENSE_EXPERT_THRESHOLD=1024
+# 默认及回退对照：export TPU_MOE_DENSE_EXPERT_THRESHOLD=0
 ```
+
+阈值为非负整数，按 MoE 入口 hidden 的行数 M（all-gather 后）计算，
+不是 `M * topk`。`0` 关闭，`0 < M <= threshold` 时才检查新 kernel 的支持条件。
+DP4 下每 rank 64 tokens 对应 M=256；每 rank 4096 的 prefill bucket 对应
+M=16384，超过 1024 后使用原 GMM。小 prefill 也可能进入阈值内，因此这是尺寸分流，
+不是请求阶段识别。旧的 `TPU_MOE_DECODE_IMPL` 已移除，不再控制选择。
 
 入口和输出 shape/dtype 不变。静态条件不满足时保留原 GMM 路径：
 
@@ -119,14 +125,15 @@ export TPU_MOE_DECODE_IMPL=dense_expert
 - SiLU、无 expert bias、无 packed quantization；`rhs_quant_dtype` 可为
   `None` 或与权重相同的 `float8_e4m3fn`。
 - M/H/I/E 均为正；`M % 16 == 0`、`H % 512 == 0`、`I % 512 == 0`。
-- 不限制 M/E 上限，不保留 H/I 白名单或固定 VMEM 门槛。
+- kernel 支持检查不限制 M/E 上限，不保留 H/I 白名单或固定 VMEM 门槛；
+  服务入口单独使用上述 M 阈值选择实现。
 - 路由系数的专家维度向上补齐到 128 的倍数，可跨越 128 专家边界。
 - `skip_padded_tokens` 两种取值均支持：零权重路由已经被屏蔽。
 
-未启用开关或功能/对齐条件不符时保留原 GMM。新 kernel 一旦选中，
+阈值为 0、M 超过阈值或功能/对齐条件不符时保留原 GMM。新 kernel 一旦选中，
 资源不足的编译错误直接传播，不捕获错误重试其他实现。
-去掉 M 上限后，大 prefill 不再自动回退；混合 prefill/decode 服务
-不能依赖旧的尺寸上限来选择阶段。能编译不等于所有大形状都有性能优势。
+阈值不保证资源充足，调大时仍需考虑模型形状和 VMEM 容量。
+能编译不等于所有大形状都有性能优势。
 应从日志确认
 `Selected experimental dense-expert decode MoE`，不能仅根据环境变量判断生效。
 新旧实现应使用独立编译缓存；配套 benchmark 启动脚本已经隔离。

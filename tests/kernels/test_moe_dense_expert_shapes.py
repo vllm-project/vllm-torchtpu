@@ -159,9 +159,18 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     assert relative_l2 < .008, relative_l2
 
 
-@pytest.mark.parametrize('mode', ['standard', 'dense_expert'])
-def test_explicit_selection_and_resource_failure_propagation(
-        mode, monkeypatch):
+@pytest.mark.parametrize('m, threshold, dense', [
+    (256, 0, False),
+    (256, 1024, True),
+    (1024, 1024, True),
+    (1040, 1024, False),
+    (16384, 1024, False),
+    (256, 128, False),
+    (272, 272, True),
+    (15, 1024, False),
+])
+def test_token_threshold_dispatch_and_resource_failure_propagation(
+        m, threshold, dense, monkeypatch):
     from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
 
     class ResourceFailure(RuntimeError):
@@ -176,18 +185,42 @@ def test_explicit_selection_and_resource_failure_propagation(
     def standard_selected(*args, **kwargs):
         raise StandardSelected('original GMM path')
 
-    monkeypatch.setattr(wrapper, '_DECODE_IMPL', mode)
+    monkeypatch.setattr(wrapper, '_DENSE_EXPERT_THRESHOLD', threshold)
     monkeypatch.setattr(wrapper, 'dense_expert_moe', resource_failure)
     monkeypatch.setattr(wrapper, 'prepare_routed_gmm_inputs',
                         standard_selected)
     wrapper.fused_moe_func.clear_cache()
-    x, w1, w2, s1, s2 = _shapes(272, 512, 512, 4)
+    x, w1, w2, s1, s2 = _shapes(m, 512, 512, 4)
     args = (x, w1, w2, s1, s2, None, None,
-            jax.ShapeDtypeStruct((272, 1), jnp.bfloat16),
-            jax.ShapeDtypeStruct((272, 1), jnp.int32))
-    error = ResourceFailure if mode == 'dense_expert' else StandardSelected
+            jax.ShapeDtypeStruct(
+                (m, 10), jnp.bfloat16), jax.ShapeDtypeStruct((m, 10),
+                                                             jnp.int32))
+    error = ResourceFailure if dense else StandardSelected
     try:
         with pytest.raises(error):
-            jax.eval_shape(wrapper.fused_moe_func, *args)
+            jax.eval_shape(wrapper.fused_moe_func, *args, topk=10)
     finally:
         wrapper.fused_moe_func.clear_cache()
+
+
+@pytest.mark.parametrize('value, expected', [(None, 0), ('', 0), ('0', 0),
+                                             ('1024', 1024), ('256', 256)])
+def test_dense_expert_threshold_environment(monkeypatch, value, expected):
+    from vllm_torchtpu import envs
+
+    name = 'TPU_MOE_DENSE_EXPERT_THRESHOLD'
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert envs.environment_variables[name]() == expected
+
+
+@pytest.mark.parametrize('value', ['-1', 'dense_expert', '1.5'])
+def test_dense_expert_threshold_rejects_invalid_value(monkeypatch, value):
+    from vllm_torchtpu import envs
+
+    name = 'TPU_MOE_DENSE_EXPERT_THRESHOLD'
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        envs.environment_variables[name]()
