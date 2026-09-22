@@ -37,7 +37,7 @@ def _target_group_sizes() -> np.ndarray:
         [1, 14, 2, 16, 17, 3] + [3] * 24 + [4, 3] + [4] * 32,
         dtype=np.int32,
     )
-    assert sizes.shape == (64, )
+    assert sizes.shape == (64,)
     assert int(sizes.sum()) == 260
     return sizes
 
@@ -59,13 +59,11 @@ def test_qwen35_target_shape_single_device_smoke() -> None:
     )
 
     with jax.default_device(device):
-        row_factor = (
-            (jnp.arange(route_capacity, dtype=jnp.float32) % 17) - 8) / 32
+        row_factor = ((jnp.arange(route_capacity, dtype=jnp.float32) % 17) - 8) / 32
         k_factor = ((jnp.arange(size_k, dtype=jnp.float32) % 13) - 6) / 16
         lhs = (row_factor[:, None] * k_factor[None, :]).astype(jnp.bfloat16)
 
-        expert_factor = (
-            (jnp.arange(num_experts, dtype=jnp.float32) % 7) + 1) / 32
+        expert_factor = ((jnp.arange(num_experts, dtype=jnp.float32) % 7) + 1) / 32
         n_factor = ((jnp.arange(size_n, dtype=jnp.float32) % 11) - 5) / 16
         rhs = jnp.broadcast_to(
             expert_factor[:, None, None] * n_factor[None, None, :],
@@ -77,17 +75,19 @@ def test_qwen35_target_shape_single_device_smoke() -> None:
         )
 
         group_sizes = jnp.asarray(_target_group_sizes(), dtype=jnp.int32)
-        token_ids = np.full((route_capacity, ), -1, dtype=np.int32)
+        token_ids = np.full((route_capacity,), -1, dtype=np.int32)
         token_ids[:valid_count_value] = (
-            np.arange(valid_count_value, dtype=np.int32) % num_tokens)
+            np.arange(valid_count_value, dtype=np.int32) % num_tokens
+        )
         token_ids = jnp.asarray(token_ids)
         route_weights = np.full(
-            (route_capacity, ),
+            (route_capacity,),
             np.nan,
             dtype=np.float32,
         )
         route_weights[:valid_count_value] = (
-            (np.arange(valid_count_value, dtype=np.float32) % 7) + 1) / 8
+            (np.arange(valid_count_value, dtype=np.float32) % 7) + 1
+        ) / 8
         route_weights = jnp.asarray(route_weights, dtype=jnp.bfloat16)
         valid_count = jnp.asarray([valid_count_value], dtype=jnp.int32)
 
@@ -113,13 +113,18 @@ def test_qwen35_target_shape_single_device_smoke() -> None:
             jnp.asarray([0], dtype=jnp.int32),
             num_tokens=num_tokens,
         )
-        expected = jnp.zeros(
-            (num_tokens, size_n),
-            dtype=jnp.float32,
-        ).at[token_ids[:valid_count_value]].add(
-            baseline_routes[:valid_count_value].astype(jnp.float32) *
-            route_weights[:valid_count_value, None].astype(
-                jnp.float32)).astype(jnp.bfloat16)
+        expected = (
+            jnp.zeros(
+                (num_tokens, size_n),
+                dtype=jnp.float32,
+            )
+            .at[token_ids[:valid_count_value]]
+            .add(
+                baseline_routes[:valid_count_value].astype(jnp.float32)
+                * route_weights[:valid_count_value, None].astype(jnp.float32)
+            )
+            .astype(jnp.bfloat16)
+        )
         candidate.block_until_ready()
         zero_candidate.block_until_ready()
         expected.block_until_ready()
@@ -129,35 +134,23 @@ def test_qwen35_target_shape_single_device_smoke() -> None:
     expected_np = np.asarray(expected, dtype=np.float32)
     diff = candidate_np - expected_np
     result = {
-        "git_commit":
-        os.environ.get("ONEHOT_UNPERMUTE_SMOKE_GIT_COMMIT"),
-        "resolved_vllm_torchtpu_source":
-        os.environ.get("ONEHOT_UNPERMUTE_SMOKE_SOURCE"),
-        "device":
-        str(device),
-        "route_capacity":
-        route_capacity,
-        "valid_count":
-        valid_count_value,
-        "num_tokens":
-        num_tokens,
-        "num_experts":
-        num_experts,
-        "size_k":
-        size_k,
-        "size_n":
-        size_n,
-        "tail_route_weights_are_nan":
-        True,
-        "rmse":
-        float(np.sqrt(np.mean(np.square(diff)))),
-        "max_abs_diff":
-        float(np.max(np.abs(diff))),
-        "zero_route_max_abs":
-        float(np.max(np.abs(zero_np))),
+        "git_commit": os.environ.get("ONEHOT_UNPERMUTE_SMOKE_GIT_COMMIT"),
+        "resolved_vllm_torchtpu_source": os.environ.get(
+            "ONEHOT_UNPERMUTE_SMOKE_SOURCE"
+        ),
+        "device": str(device),
+        "route_capacity": route_capacity,
+        "valid_count": valid_count_value,
+        "num_tokens": num_tokens,
+        "num_experts": num_experts,
+        "size_k": size_k,
+        "size_n": size_n,
+        "tail_route_weights_are_nan": True,
+        "rmse": float(np.sqrt(np.mean(np.square(diff)))),
+        "max_abs_diff": float(np.max(np.abs(diff))),
+        "zero_route_max_abs": float(np.max(np.abs(zero_np))),
     }
-    print("MOE_BLOCKWISE_ONEHOT_UNPERMUTE_SMOKE " +
-          json.dumps(result, sort_keys=True))
+    print("MOE_BLOCKWISE_ONEHOT_UNPERMUTE_SMOKE " + json.dumps(result, sort_keys=True))
     configured_result = os.environ.get("ONEHOT_UNPERMUTE_SMOKE_RESULT")
     if configured_result:
         result_path = Path(configured_result)

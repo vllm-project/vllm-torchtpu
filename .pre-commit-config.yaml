@@ -54,8 +54,6 @@ repos:
       |src/vllm_torchtpu/kernels/router_topk\.py$
       |src/vllm_torchtpu/kernels/typed_ldst\.py$
 
-      # tests/kernels
-      |tests/kernels/
 
       # layers/adapter (src)
       |src/vllm_torchtpu/layers/adapter/

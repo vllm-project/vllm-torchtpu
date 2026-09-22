@@ -20,8 +20,7 @@ import pytest
 from vllm_torchtpu.kernels.gdn.v3 import config, pcp_wrapper
 
 
-def _region(*, kb0: int, nblocks: int, row0: int,
-            nrows: int) -> config.StateRegion:
+def _region(*, kb0: int, nblocks: int, row0: int, nrows: int) -> config.StateRegion:
     return config.StateRegion(
         kb0=kb0,
         nblocks=nblocks,
@@ -38,14 +37,12 @@ def test_compact_state_update_shape_matches_pool_layout():
     hnd_pool = jax.ShapeDtypeStruct((8, 4, 32, 4, 256), jnp.float8_e4m3fn)
     region = _region(kb0=0, nblocks=2, row0=0, nrows=16)
 
-    nhd_shape = pcp_wrapper._compact_state_updates_shape(nhd_pool,
-                                                         3,
-                                                         region,
-                                                         whole_block_dma=False)
-    hnd_shape = pcp_wrapper._compact_state_updates_shape(hnd_pool,
-                                                         3,
-                                                         region,
-                                                         whole_block_dma=True)
+    nhd_shape = pcp_wrapper._compact_state_updates_shape(
+        nhd_pool, 3, region, whole_block_dma=False
+    )
+    hnd_shape = pcp_wrapper._compact_state_updates_shape(
+        hnd_pool, 3, region, whole_block_dma=True
+    )
 
     assert nhd_shape.shape == (3, 2, 16, 1, 4, 128)
     assert hnd_shape.shape == (3, 2, 4, 32, 4, 256)
@@ -72,8 +69,7 @@ def test_nhd_compact_state_scatter_updates_only_selected_rows():
 
 
 def test_hnd_compact_state_scatter_replaces_complete_page():
-    pool = jnp.arange(4 * 2 * 3 * 4 * 8,
-                      dtype=jnp.float32).reshape(4, 2, 3, 4, 8)
+    pool = jnp.arange(4 * 2 * 3 * 4 * 8, dtype=jnp.float32).reshape(4, 2, 3, 4, 8)
     updates = jnp.full((1, 1, 2, 3, 4, 8), 77, dtype=pool.dtype)
     region = _region(kb0=1, nblocks=1, row0=0, nrows=4)
 
@@ -121,7 +117,8 @@ def test_hnd_compact_state_writeback_accepts_disjoint_aligned_pages():
     ],
 )
 def test_hnd_compact_state_writeback_rejects_unsafe_page_plans(
-        conv: config.StateRegion, recurrent: config.StateRegion, message: str):
+    conv: config.StateRegion, recurrent: config.StateRegion, message: str
+):
     plan = config.StateSourcePlan(
         stride=3,
         conv=conv,

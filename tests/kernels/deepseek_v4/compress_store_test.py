@@ -20,11 +20,15 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
-    compress_store_ref, config)
-from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import \
-    kernel as compress_store
-from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import \
-    project_and_save_state_ref as proj_and_save_state_ref
+    compress_store_ref,
+    config,
+)
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    kernel as compress_store,
+)
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    project_and_save_state_ref as proj_and_save_state_ref,
+)
 
 
 def generate_kv_slot_mapping(
@@ -34,7 +38,7 @@ def generate_kv_slot_mapping(
     slots_per_part_out: int,
 ) -> jax.Array:
     """Generates kv_slot_mapping for boundary tokens."""
-    kv_slot_mapping_np = np.full((num_boundary_tokens, ), -1, dtype=np.int32)
+    kv_slot_mapping_np = np.full((num_boundary_tokens,), -1, dtype=np.int32)
     boundary_count = 0
     total_slots_needed = num_boundary_tokens * slots_per_part_out
     pages_needed = (total_slots_needed + page_size - 1) // page_size
@@ -47,7 +51,7 @@ def generate_kv_slot_mapping(
 
 
 def normalize_fp8_zero_sign(arr):
-    is_zero = (arr & 0x7f) == 0
+    is_zero = (arr & 0x7F) == 0
     return jnp.where(is_zero, 0, arr)
 
 
@@ -56,14 +60,13 @@ def normalize_bf16_zero_sign(arr):
     arr_2d = arr.reshape(-1, 2)
     even = arr_2d[..., 0]
     odd = arr_2d[..., 1]
-    is_zero = (even == 0) & ((odd & 0x7f) == 0)
-    new_odd = jnp.where(is_zero, odd & 0x7f, odd)
+    is_zero = (even == 0) & ((odd & 0x7F) == 0)
+    new_odd = jnp.where(is_zero, odd & 0x7F, odd)
     normalized = jnp.stack([even, new_odd], axis=-1)
     return normalized.reshape(orig_shape)
 
 
 class CompressStoreTest(jtu.JaxTestCase):
-
     def run_compress_store_correctness(
         self,
         num_tokens,
@@ -109,9 +112,11 @@ class CompressStoreTest(jtu.JaxTestCase):
         # share a cache group, leaving the tail of every indexer page unused.
         # The capacity itself does not depend on it, so probe for it first.
         state_page_capacity = make_cfgs(1).state_page_capacity
-        state_block_size = (state_page_capacity //
-                            2 if mode is config.Mode.CSA_INDEXER else
-                            state_page_capacity)
+        state_block_size = (
+            state_page_capacity // 2
+            if mode is config.Mode.CSA_INDEXER
+            else state_page_capacity
+        )
         cfgs = make_cfgs(state_block_size)
         if mode is config.Mode.HCA:
             separate_state = True
@@ -134,13 +139,11 @@ class CompressStoreTest(jtu.JaxTestCase):
         # Calculate num_pages
         run_1_tokens = prefill_len if prefill_len is not None else num_tokens
         tokens_per_page = state_block_size
-        pages_for_state = (run_1_tokens + tokens_per_page -
-                           1) // tokens_per_page
+        pages_for_state = (run_1_tokens + tokens_per_page - 1) // tokens_per_page
 
         total_bytes_needed = num_boundary * cfgs.record_bytes
         page_bytes = cfgs.physical_page_size * cfgs.row_size_bytes
-        pages_for_kv_cache = (total_bytes_needed + page_bytes -
-                              1) // page_bytes
+        pages_for_kv_cache = (total_bytes_needed + page_bytes - 1) // page_bytes
         num_pages = pages_for_state + pages_for_kv_cache
 
         # 1. Initialize keys
@@ -163,16 +166,15 @@ class CompressStoreTest(jtu.JaxTestCase):
             page holds `state_page_capacity` states but is only paged at
             `state_block_size` of them.
             """
-            return ((token_index // state_block_size) *
-                    cfgs.state_physical_page_size +
-                    (token_index % state_block_size) * slots_per_token)
+            return (token_index // state_block_size) * cfgs.state_physical_page_size + (
+                token_index % state_block_size
+            ) * slots_per_token
 
         run_1_slot_mapping = state_slot(np.arange(run_1_tokens))
         run_1_slot_mapping = jnp.array(run_1_slot_mapping, dtype=jnp.int32)
 
         init_cache = jnp.zeros(cfgs.cache_shape(num_pages), dtype=jnp.uint8)
-        init_state_cache = jnp.zeros(cfgs.state_cache_shape(num_pages),
-                                     dtype=jnp.uint8)
+        init_state_cache = jnp.zeros(cfgs.state_cache_shape(num_pages), dtype=jnp.uint8)
 
         ref_wkv_proj_and_save_state_jit = jax.jit(
             proj_and_save_state_ref.ref_wkv_proj_and_save_state,
@@ -200,12 +202,10 @@ class CompressStoreTest(jtu.JaxTestCase):
 
         # 3. Setup Kernel 2 inputs
         if token_to_req_indices is None:
-            token_to_req_indices_filtered = np.zeros((num_boundary, ),
-                                                     dtype=np.int32)
+            token_to_req_indices_filtered = np.zeros((num_boundary,), dtype=np.int32)
         else:
             token_to_req_indices_np = np.array(token_to_req_indices)
-            token_to_req_indices_filtered = token_to_req_indices_np[
-                boundary_mask]
+            token_to_req_indices_filtered = token_to_req_indices_np[boundary_mask]
 
         if kv_slot_mapping is None:
             kv_slot_mapping_filtered = generate_kv_slot_mapping(
@@ -241,26 +241,24 @@ class CompressStoreTest(jtu.JaxTestCase):
         kv_slot_mapping = jnp.array(kv_slot_mapping_padded)
 
         if block_table is None:
-            block_table = jnp.array([[i for i in range(num_pages)]],
-                                    dtype=jnp.int32)
+            block_table = jnp.array([[i for i in range(num_pages)]], dtype=jnp.int32)
         else:
             block_table = jnp.array(block_table)
         block_table_stride = block_table.shape[1]
         block_table = block_table.reshape(-1)
 
-        rms_weight = jax.random.normal(k4, (head_dim, ))
+        rms_weight = jax.random.normal(k4, (head_dim,))
 
         max_pos = int(jnp.max(positions)) + 1 if len(positions) > 0 else 0
         cos_sin_cache_len = max(max_pos, num_tokens)
-        cos_sin_cache = jax.random.normal(k5,
-                                          (cos_sin_cache_len, rope_head_dim))
+        cos_sin_cache = jax.random.normal(k5, (cos_sin_cache_len, rope_head_dim))
 
         if cfgs.dims.has_rope_cache:
-            init_rope_cache = jnp.zeros(cfgs.rope_cache_shape(num_pages),
-                                        dtype=jnp.uint8)
+            init_rope_cache = jnp.zeros(
+                cfgs.rope_cache_shape(num_pages), dtype=jnp.uint8
+            )
         else:
-            init_rope_cache = jnp.zeros((num_pages, 1, 1, 128),
-                                        dtype=jnp.uint8)
+            init_rope_cache = jnp.zeros((num_pages, 1, 1, 128), dtype=jnp.uint8)
         slot_mapping = jnp.where(positions >= 0, state_slot(positions), -1)
 
         is_quantized = overlap
@@ -319,8 +317,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             rms_weight,
             block_table_stride=block_table_stride,
             state_block_size=state_block_size,
-            state_cache=(jnp.copy(populated_state_cache)
-                         if separate_state else None),
+            state_cache=(jnp.copy(populated_state_cache) if separate_state else None),
             rope_cache=jnp.copy(init_rope_cache),
             cos_sin_cache=cos_sin_cache,
             compress_ratio=cfgs.dims.compress_ratio,
@@ -332,17 +329,14 @@ class CompressStoreTest(jtu.JaxTestCase):
         pallas_cache_output, pallas_rope_output = pallas_out
 
         if is_quantized:
-            pallas_cache_normalized = normalize_fp8_zero_sign(
-                pallas_cache_output)
+            pallas_cache_normalized = normalize_fp8_zero_sign(pallas_cache_output)
             ref_cache_normalized = normalize_fp8_zero_sign(ref_cache_output)
         else:
-            pallas_cache_normalized = normalize_bf16_zero_sign(
-                pallas_cache_output)
+            pallas_cache_normalized = normalize_bf16_zero_sign(pallas_cache_output)
             ref_cache_normalized = normalize_bf16_zero_sign(ref_cache_output)
 
         if cfgs.dims.has_rope_cache:
-            pallas_rope_normalized = normalize_bf16_zero_sign(
-                pallas_rope_output)
+            pallas_rope_normalized = normalize_bf16_zero_sign(pallas_rope_output)
             ref_rope_normalized = normalize_bf16_zero_sign(ref_rope_output)
             self.assertArraysEqual(pallas_rope_normalized, ref_rope_normalized)
 
@@ -488,8 +482,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 overlap=False,
                 physical_page_size=16,
                 state_physical_page_size=256,
-                positions=np.array([127, 126, 255, 254, 383, 382],
-                                   dtype=np.int32),
+                positions=np.array([127, 126, 255, 254, 383, 382], dtype=np.int32),
                 prefill_len=384,
             ),
         ),
@@ -523,36 +516,34 @@ class CompressStoreTest(jtu.JaxTestCase):
     def test_compress_store(self, cfg):
         # csa_decode_batch_large failed on v6e but passed on v7x,
         # temperarily disable that test case for v6e.
-        if (self._testMethodName.endswith("csa_decode_batch_large")
-                and not jtu.is_device_tpu_at_least(version=7)):
+        if self._testMethodName.endswith(
+            "csa_decode_batch_large"
+        ) and not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("skip csa_decode_batch_large on TPUv6e")
         self.run_compress_store_correctness(**cfg)
 
     def test_derive_aliases(self):
         # HCA: has_rope=True, has_rope_cache=False, num_scalar_prefetch=5
         self.assertEqual(
-            compress_store.derive_aliases(has_rope=True,
-                                          has_rope_cache=False,
-                                          num_scalar_prefetch=5),
+            compress_store.derive_aliases(
+                has_rope=True, has_rope_cache=False, num_scalar_prefetch=5
+            ),
             {7: 0},
         )
 
         # CSA: has_rope=True, has_rope_cache=True, num_scalar_prefetch=5
         self.assertEqual(
-            compress_store.derive_aliases(has_rope=True,
-                                          has_rope_cache=True,
-                                          num_scalar_prefetch=5),
-            {
-                7: 0,
-                8: 1
-            },
+            compress_store.derive_aliases(
+                has_rope=True, has_rope_cache=True, num_scalar_prefetch=5
+            ),
+            {7: 0, 8: 1},
         )
 
         # CSA_INDEXER: has_rope=True, has_rope_cache=False, num_scalar_prefetch=5
         self.assertEqual(
-            compress_store.derive_aliases(has_rope=True,
-                                          has_rope_cache=False,
-                                          num_scalar_prefetch=5),
+            compress_store.derive_aliases(
+                has_rope=True, has_rope_cache=False, num_scalar_prefetch=5
+            ),
             {7: 0},
         )
 
