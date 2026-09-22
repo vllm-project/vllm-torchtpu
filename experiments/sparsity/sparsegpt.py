@@ -78,9 +78,11 @@ class SparseGPT:
         # Factorize dampened Hessian: H = L @ L^T
         L = torch.linalg.cholesky(H)
         # Fast multi-threaded inversion: solve L @ Linv = I, then H^-1 = Linv^T @ Linv
-        Linv = torch.linalg.solve_triangular(
-            L, torch.eye(self.columns, device=self.dev, dtype=L.dtype), upper=False
-        )
+        Linv = torch.linalg.solve_triangular(L,
+                                             torch.eye(self.columns,
+                                                       device=self.dev,
+                                                       dtype=L.dtype),
+                                             upper=False)
         Hinv = Linv.t().matmul(Linv)
         # Obtain upper Cholesky factor for OBS block updates
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
@@ -197,9 +199,11 @@ class SparseGPT:
         self.L = L
 
         # Fast multi-threaded inversion: solve L @ Linv = I, then H^-1 = Linv^T @ Linv
-        Linv = torch.linalg.solve_triangular(
-            L, torch.eye(self.columns, device=self.dev, dtype=L.dtype), upper=False
-        )
+        Linv = torch.linalg.solve_triangular(L,
+                                             torch.eye(self.columns,
+                                                       device=self.dev,
+                                                       dtype=L.dtype),
+                                             upper=False)
         Hinv = Linv.t().matmul(Linv)
         # Obtain upper Cholesky factor for OBS block updates
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
@@ -226,7 +230,8 @@ class SparseGPT:
 
                 if prunen == 0:
                     tmp = W1**2 / (torch.diag(Hinv1).reshape((1, -1)))**2
-                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() *
+                                                              sparsity)]
                     mask1 = tmp <= thresh
                 else:
                     mask1 = torch.zeros_like(W1) == 1
@@ -236,10 +241,11 @@ class SparseGPT:
                     d = Hinv1[i, i]
 
                     if prunen != 0 and i % prunem == 0:
-                        tmp = W1[:, i:(i + prunem)]**2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1)))**2
+                        tmp = W1[:, i:(i + prunem)]**2 / (torch.diag(Hinv1)[i:(
+                            i + prunem)].reshape((1, -1)))**2
                         mask1.scatter_(
-                            1,
-                            i + torch.topk(tmp, prunen, dim=1, largest=False)[1],
+                            1, i +
+                            torch.topk(tmp, prunen, dim=1, largest=False)[1],
                             True)
 
                     q = w.clone()
@@ -276,7 +282,10 @@ class SparseGPT:
                     Vh_k = eig_vecs[:, idx].t()
                     U = R_tilde.matmul(eig_vecs[:, idx])
                     # Solve triangular system: V @ L = Vh_k <=> V = Vh_k @ L^-1
-                    V = torch.linalg.solve_triangular(L, Vh_k, upper=False, left=False)
+                    V = torch.linalg.solve_triangular(L,
+                                                      Vh_k,
+                                                      upper=False,
+                                                      left=False)
                 else:
                     # Wide matrix: Gram matrix G = R_tilde @ R_tilde^T (rows x rows)
                     G = R_tilde.matmul(R_tilde.t())
@@ -284,11 +293,15 @@ class SparseGPT:
                     idx = torch.argsort(eig_vals, descending=True)[:k_eff]
                     Sigma_k = torch.sqrt(torch.clamp(eig_vals[idx], min=0.0))
                     U_k = eig_vecs[:, idx]
-                    inv_sigma = torch.where(Sigma_k > 1e-7, 1.0 / Sigma_k, torch.zeros_like(Sigma_k))
+                    inv_sigma = torch.where(Sigma_k > 1e-7, 1.0 / Sigma_k,
+                                            torch.zeros_like(Sigma_k))
                     Vh_k = inv_sigma.unsqueeze(1) * (U_k.t().matmul(R_tilde))
                     U = U_k * Sigma_k.unsqueeze(0)
                     # Solve triangular system: V @ L = Vh_k <=> V = Vh_k @ L^-1
-                    V = torch.linalg.solve_triangular(L, Vh_k, upper=False, left=False)
+                    V = torch.linalg.solve_triangular(L,
+                                                      Vh_k,
+                                                      upper=False,
+                                                      left=False)
 
                 R_lrc = (W_orig - S - U.matmul(V)).matmul(L)
                 error_lrc = torch.norm(R_lrc, p='fro').item()
@@ -299,7 +312,8 @@ class SparseGPT:
             torch.cuda.synchronize()
 
         print('time %.2f' % (time.time() - tick))
-        print('error SparseGPT: %.4f | LRC (T=%d, k=%d): %.4f' % (error_sparsegpt, T, k, error_lrc))
+        print('error SparseGPT: %.4f | LRC (T=%d, k=%d): %.4f' %
+              (error_sparsegpt, T, k, error_lrc))
 
         self.S = S
         self.U = U
@@ -312,8 +326,7 @@ class SparseGPT:
         if isinstance(self.layer, transformers.Conv1D):
             W_final = W_final.t()
         self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
-        )
+            self.layer.weight.data.dtype)
 
         return U, V
 

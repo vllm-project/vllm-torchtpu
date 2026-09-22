@@ -11,10 +11,16 @@ class NaiveMagnitudeResolver(BaseSparsityResolver):
     """
     METHOD_NAME: str = "magnitude"
 
-    def prune_in_memory(self, base_model: str, save_path: str, min_layer: int,
-                        max_layer: int, prunen: int, prunem: int,
-                        resolver_config: Dict[str, Any],
-                        sparse_layer_indices: Optional[Set[int]] = None) -> str:
+    def prune_in_memory(
+            self,
+            base_model: str,
+            save_path: str,
+            min_layer: int,
+            max_layer: int,
+            prunen: int,
+            prunem: int,
+            resolver_config: Dict[str, Any],
+            sparse_layer_indices: Optional[Set[int]] = None) -> str:
         prune_model_magnitude(base_model_dir=base_model,
                               output_dir=save_path,
                               prunen=prunen,

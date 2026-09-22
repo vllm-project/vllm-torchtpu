@@ -137,7 +137,9 @@ class TestGemma4Sparsity(unittest.TestCase):
         Arrange-Act-Assert: Exercises gemma4_sequential with use_lrc=True to verify
         the active gpts[name].lrc_prune alternating minimization path end-to-end.
         """
+
         class MockDecoderLayer(nn.Module):
+
             def __init__(self):
                 super().__init__()
                 self.self_attn_q = nn.Linear(32, 32, bias=False)
@@ -149,9 +151,12 @@ class TestGemma4Sparsity(unittest.TestCase):
                 return (self.mlp_down(self.self_attn_q(hidden_states)), )
 
         class MockLanguageModel(nn.Module):
+
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([MockDecoderLayer(), MockDecoderLayer()])
+                self.layers = nn.ModuleList(
+                    [MockDecoderLayer(),
+                     MockDecoderLayer()])
                 self.embed_tokens = nn.Embedding(100, 32)
                 self.embed_tokens.weight.data = torch.randn(100, 32)
                 self.unique_layer_types = ["full_attention"]
@@ -163,11 +168,13 @@ class TestGemma4Sparsity(unittest.TestCase):
                 return torch.zeros((1, 32, 32))
 
         class MockInnerModel(nn.Module):
+
             def __init__(self):
                 super().__init__()
                 self.language_model = MockLanguageModel()
 
         class MockGemmaModel(nn.Module):
+
             def __init__(self):
                 super().__init__()
                 self.model = MockInnerModel()
@@ -197,8 +204,16 @@ class TestGemma4Sparsity(unittest.TestCase):
             lrc_iters=2,
         )
 
-        with patch("transformers.models.gemma4.modeling_gemma4.create_causal_mask", return_value=None),              patch("transformers.models.gemma4.modeling_gemma4.create_sliding_window_causal_mask", return_value=None):
-            gemma4_sequential(model, dataloader, dev=torch.device("cpu"), args=args)
+        with patch(
+                "transformers.models.gemma4.modeling_gemma4.create_causal_mask",
+                return_value=None
+        ), patch(
+                "transformers.models.gemma4.modeling_gemma4.create_sliding_window_causal_mask",
+                return_value=None):
+            gemma4_sequential(model,
+                              dataloader,
+                              dev=torch.device("cpu"),
+                              args=args)
 
         for layer in model.model.language_model.layers:
             self.assertFalse(torch.isnan(layer.self_attn_q.weight.data).any())

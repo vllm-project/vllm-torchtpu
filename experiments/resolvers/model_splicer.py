@@ -166,7 +166,6 @@ class ModelSplicer:
         print(f">>> [SPLICER] Saved into {output_dir}\n")
         return output_dir
 
-
     @classmethod
     def save_substituted_checkpoint(
             cls,
@@ -214,14 +213,13 @@ class ModelSplicer:
                            device="cpu") as dense_handle:
                 for k in dense_handle.keys():
                     layer_idx = cls.extract_layer_idx(k)
-                    should_substitute = (
-                        k in replacement_state_dict and (
-                            target_layer_indices is None or
-                            (layer_idx is not None and layer_idx in target_layer_indices)
-                        )
-                    )
+                    should_substitute = (k in replacement_state_dict and
+                                         (target_layer_indices is None or
+                                          (layer_idx is not None and layer_idx
+                                           in target_layer_indices)))
                     if should_substitute:
-                        merged_shard[k] = replacement_state_dict[k].detach().cpu().contiguous()
+                        merged_shard[k] = replacement_state_dict[k].detach(
+                        ).cpu().contiguous()
                         replaced_count += 1
                     else:
                         merged_shard[k] = dense_handle.get_tensor(k)

@@ -217,7 +217,8 @@ class TestSparseGPT(unittest.TestCase):
         self.assertEqual(V.shape, (4, 16))
         self.assertIsNotNone(sparsegpt.error_sparsegpt)
         self.assertIsNotNone(sparsegpt.error_lrc)
-        self.assertLessEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt + 1e-5)
+        self.assertLessEqual(sparsegpt.error_lrc,
+                             sparsegpt.error_sparsegpt + 1e-5)
         self.assertFalse(torch.isnan(linear.weight.data).any())
         self.assertFalse(torch.isinf(linear.weight.data).any())
 
@@ -261,7 +262,8 @@ class TestSparseGPT(unittest.TestCase):
         self.assertEqual(V.shape, (4, 32))
         self.assertIsNotNone(sparsegpt.error_sparsegpt)
         self.assertIsNotNone(sparsegpt.error_lrc)
-        self.assertLessEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt + 1e-5)
+        self.assertLessEqual(sparsegpt.error_lrc,
+                             sparsegpt.error_sparsegpt + 1e-5)
         self.assertFalse(torch.isnan(linear.weight.data).any())
         self.assertFalse(torch.isinf(linear.weight.data).any())
 
@@ -298,7 +300,9 @@ class TestSparseGPT(unittest.TestCase):
         )
         self.assertEqual(U.shape, (16, 0))
         self.assertEqual(V.shape, (0, 16))
-        self.assertAlmostEqual(sparsegpt.error_lrc, sparsegpt.error_sparsegpt, places=5)
+        self.assertAlmostEqual(sparsegpt.error_lrc,
+                               sparsegpt.error_sparsegpt,
+                               places=5)
         sparsegpt.free()
 
 
