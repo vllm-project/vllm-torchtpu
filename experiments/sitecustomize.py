@@ -13,7 +13,7 @@ Patches:
 """
 
 import os
-import sys
+
 
 def apply_tpu_subgroup_patch():
     try:
@@ -42,6 +42,7 @@ def apply_tpu_subgroup_patch():
     except Exception:
         pass
 
+
 def apply_tpu_barrier_patch():
     try:
         import torch.distributed as dist
@@ -49,7 +50,7 @@ def apply_tpu_barrier_patch():
         if getattr(dist, "_tpu_barrier_patch_applied", False):
             return
 
-        orig_barrier = dist.barrier
+        _orig_barrier = dist.barrier
 
         def _safe_barrier(*args, **kwargs):
             try:
@@ -63,6 +64,7 @@ def apply_tpu_barrier_patch():
     except Exception:
         pass
 
+
 def apply_tpu_export_collective_patch():
     if os.environ.get('VLLM_MOCK_TPU', '0') != '1':
         return
@@ -70,7 +72,8 @@ def apply_tpu_export_collective_patch():
         import torch_tpu._internal.export.export as exp
         from torch_tpu._internal.compile.collective_ops import COLLECTIVE_OPS
 
-        if getattr(exp.EagerLikeFxInterpreter, "_tpu_coll_patch_applied", False):
+        if getattr(exp.EagerLikeFxInterpreter, "_tpu_coll_patch_applied",
+                   False):
             return
 
         orig_run_node = exp.EagerLikeFxInterpreter.run_node
@@ -80,7 +83,8 @@ def apply_tpu_export_collective_patch():
             is_coll = False
             if target in COLLECTIVE_OPS:
                 is_coll = True
-            elif hasattr(target, "overloadpacket") and target.overloadpacket in COLLECTIVE_OPS:
+            elif hasattr(target, "overloadpacket"
+                         ) and target.overloadpacket in COLLECTIVE_OPS:
                 is_coll = True
             elif str(target).startswith("_c10d_functional."):
                 is_coll = True
@@ -88,7 +92,8 @@ def apply_tpu_export_collective_patch():
             if is_coll:
                 args, kwargs = self.fetch_args_kwargs_from_env(node)
                 target_str = str(target)
-                if "all_gather" in target_str and len(args) >= 2 and isinstance(args[1], int):
+                if "all_gather" in target_str and len(
+                        args) >= 2 and isinstance(args[1], int):
                     group_size = args[1]
                     dim = kwargs.get("dim", 0)
                     repeats = [1] * args[0].dim()
@@ -103,6 +108,7 @@ def apply_tpu_export_collective_patch():
     except Exception:
         pass
 
+
 def apply_tpu_eager_collective_patch():
     if os.environ.get('VLLM_MOCK_TPU', '0') != '1':
         return
@@ -113,24 +119,31 @@ def apply_tpu_eager_collective_patch():
             return
 
         class DummyWork:
+
             def wait(self, timeout=None):
                 return True
+
             def is_completed(self):
                 return True
 
         orig_all_reduce = dist.all_reduce
+
         def safe_all_reduce(tensor, *args, **kwargs):
             if hasattr(tensor, "device") and tensor.device.type == "tpu":
                 if kwargs.get("async_op", False):
                     return DummyWork()
                 return None
             return orig_all_reduce(tensor, *args, **kwargs)
+
         dist.all_reduce = safe_all_reduce
 
         orig_all_gather_into = getattr(dist, "all_gather_into_tensor", None)
         if orig_all_gather_into:
-            def safe_all_gather_into_tensor(output_tensor, input_tensor, *args, **kwargs):
-                if hasattr(input_tensor, "device") and input_tensor.device.type == "tpu":
+
+            def safe_all_gather_into_tensor(output_tensor, input_tensor, *args,
+                                            **kwargs):
+                if hasattr(input_tensor,
+                           "device") and input_tensor.device.type == "tpu":
                     n = input_tensor.shape[0]
                     world_size = output_tensor.shape[0] // n if n > 0 else 1
                     for i in range(world_size):
@@ -138,11 +151,14 @@ def apply_tpu_eager_collective_patch():
                     if kwargs.get("async_op", False):
                         return DummyWork()
                     return None
-                return orig_all_gather_into(output_tensor, input_tensor, *args, **kwargs)
+                return orig_all_gather_into(output_tensor, input_tensor, *args,
+                                            **kwargs)
+
             dist.all_gather_into_tensor = safe_all_gather_into_tensor
 
         orig_all_gather = getattr(dist, "all_gather", None)
         if orig_all_gather:
+
             def safe_all_gather(tensor_list, tensor, *args, **kwargs):
                 if hasattr(tensor, "device") and tensor.device.type == "tpu":
                     for t in tensor_list:
@@ -151,22 +167,29 @@ def apply_tpu_eager_collective_patch():
                         return DummyWork()
                     return None
                 return orig_all_gather(tensor_list, tensor, *args, **kwargs)
+
             dist.all_gather = safe_all_gather
 
         orig_reduce_scatter_into = getattr(dist, "reduce_scatter_tensor", None)
         if orig_reduce_scatter_into:
-            def safe_reduce_scatter_tensor(output_tensor, input_tensor, *args, **kwargs):
-                if hasattr(input_tensor, "device") and input_tensor.device.type == "tpu":
+
+            def safe_reduce_scatter_tensor(output_tensor, input_tensor, *args,
+                                           **kwargs):
+                if hasattr(input_tensor,
+                           "device") and input_tensor.device.type == "tpu":
                     n = output_tensor.shape[0]
                     output_tensor.copy_(input_tensor[:n])
                     if kwargs.get("async_op", False):
                         return DummyWork()
                     return None
-                return orig_reduce_scatter_into(output_tensor, input_tensor, *args, **kwargs)
+                return orig_reduce_scatter_into(output_tensor, input_tensor,
+                                                *args, **kwargs)
+
             dist.reduce_scatter_tensor = safe_reduce_scatter_tensor
 
         orig_reduce_scatter = getattr(dist, "reduce_scatter", None)
         if orig_reduce_scatter:
+
             def safe_reduce_scatter(output, input_list, *args, **kwargs):
                 if hasattr(output, "device") and output.device.type == "tpu":
                     output.copy_(input_list[0])
@@ -174,21 +197,25 @@ def apply_tpu_eager_collective_patch():
                         return DummyWork()
                     return None
                 return orig_reduce_scatter(output, input_list, *args, **kwargs)
+
             dist.reduce_scatter = safe_reduce_scatter
 
         orig_broadcast = getattr(dist, "broadcast", None)
         if orig_broadcast:
+
             def safe_broadcast(tensor, *args, **kwargs):
                 if hasattr(tensor, "device") and tensor.device.type == "tpu":
                     if kwargs.get("async_op", False):
                         return DummyWork()
                     return None
                 return orig_broadcast(tensor, *args, **kwargs)
+
             dist.broadcast = safe_broadcast
 
         dist._tpu_eager_coll_patch_applied = True
     except Exception:
         pass
+
 
 apply_tpu_subgroup_patch()
 apply_tpu_barrier_patch()

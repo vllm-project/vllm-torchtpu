@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from unittest.mock import Mock
 
 import numpy as np
@@ -168,7 +168,8 @@ class TpuProfileRunner(BaseVllmRunner):
         if in_process is not None:
             self.in_process = in_process
         else:
-            self.in_process = os.environ.get("VLLM_PROFILE_IN_PROCESS", "0") == "1"
+            self.in_process = os.environ.get("VLLM_PROFILE_IN_PROCESS",
+                                             "0") == "1"
 
     def close(self) -> None:
         """Tears down the engine and reclaims TPU device resources."""
@@ -208,11 +209,9 @@ class TpuProfileRunner(BaseVllmRunner):
         delegates directly to InProcessProfileEngine.
         Otherwise, executes via an isolated subprocess worker with automatic clean teardown.
         """
-        is_mocked = (
-            isinstance(LLM, Mock)
-            or getattr(LLM, "_mock_return_value", None) is not None
-            or hasattr(LLM, "assert_called")
-        )
+        is_mocked = (isinstance(LLM, Mock)
+                     or getattr(LLM, "_mock_return_value", None) is not None
+                     or hasattr(LLM, "assert_called"))
 
         if self.in_process or is_mocked:
             if self._engine is None:
@@ -221,7 +220,8 @@ class TpuProfileRunner(BaseVllmRunner):
 
         return self._execute_in_subprocess(context)
 
-    def _execute_in_subprocess(self, context: ExecutionContext) -> BenchmarkResult:
+    def _execute_in_subprocess(self,
+                               context: ExecutionContext) -> BenchmarkResult:
         """Executes the trial in an isolated Python process to ensure clean PjRt client lifecycle."""
         context_payload = {
             "model_path": context.model_path,
@@ -240,11 +240,15 @@ class TpuProfileRunner(BaseVllmRunner):
         }
 
         # Write execution context to temporary payload file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".json",
+                                         delete=False) as f:
             json.dump(context_payload, f)
             payload_file = f.name
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".json",
+                                         delete=False) as f:
             result_file = f.name
 
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -270,22 +274,28 @@ class TpuProfileRunner(BaseVllmRunner):
         worker_env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         worker_env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         worker_env["USE_BATCHED_RPA_KERNEL"] = "1"
-        worker_env["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "false"
+        worker_env[
+            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "false"
         worker_env["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "0"
         worker_env["VLLM_NO_USAGE_STATS"] = "1"
         worker_env["VLLM_DO_NOT_TRACK"] = "1"
-        worker_env["HF_HOME"] = os.environ.get("HF_HOME", "/mnt/pd/huggingface_cache")
+        worker_env["HF_HOME"] = os.environ.get("HF_HOME",
+                                               "/mnt/pd/huggingface_cache")
         worker_env["PYTHONUNBUFFERED"] = "1"
         existing_init_args = worker_env.get("LIBTPU_INIT_ARGS", "")
         if "--deepsea_hal_test_skip_slicebuilder" in existing_init_args:
-            cleaned = [a for a in existing_init_args.split() if not a.startswith("--deepsea_hal_test_skip_slicebuilder")]
+            cleaned = [
+                a for a in existing_init_args.split()
+                if not a.startswith("--deepsea_hal_test_skip_slicebuilder")
+            ]
             worker_env["LIBTPU_INIT_ARGS"] = " ".join(cleaned)
         worker_env.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
         worker_env.pop("TORCH_TPU_XPROF_SESSION_ID", None)
 
         # Preserve TPU device assignment in container / multi-tenant environments
         if "TPU_VISIBLE_DEVICES" in os.environ:
-            worker_env["TPU_VISIBLE_DEVICES"] = os.environ["TPU_VISIBLE_DEVICES"]
+            worker_env["TPU_VISIBLE_DEVICES"] = os.environ[
+                "TPU_VISIBLE_DEVICES"]
         if "TPU_VISIBLE_CHIPS" in os.environ:
             worker_env["TPU_VISIBLE_CHIPS"] = os.environ["TPU_VISIBLE_CHIPS"]
         if "TORCH_TPU_TOPOLOGY" in os.environ:
@@ -296,13 +306,17 @@ class TpuProfileRunner(BaseVllmRunner):
         if "SPMM_KERNEL_PATH" in os.environ:
             worker_env["SPMM_KERNEL_PATH"] = os.environ["SPMM_KERNEL_PATH"]
         elif os.path.isfile("/workspace/internal_kernels/structured_spmm.py"):
-            worker_env["SPMM_KERNEL_PATH"] = "/workspace/internal_kernels/structured_spmm.py"
+            worker_env[
+                "SPMM_KERNEL_PATH"] = "/workspace/internal_kernels/structured_spmm.py"
         current_pythonpath = worker_env.get("PYTHONPATH", "")
-        worker_env["PYTHONPATH"] = f"{repo_root}:{current_pythonpath}" if current_pythonpath else repo_root
+        worker_env[
+            "PYTHONPATH"] = f"{repo_root}:{current_pythonpath}" if current_pythonpath else repo_root
 
         try:
-            print(f">>> [PROFILE RUNNER] Launching isolated worker process for {context.model_path} (BS={context.batch_size})...")
-            proc = subprocess.run(
+            print(
+                f">>> [PROFILE RUNNER] Launching isolated worker process for {context.model_path} (BS={context.batch_size})..."
+            )
+            subprocess.run(
                 cmd,
                 cwd=repo_root,
                 env=worker_env,
@@ -318,7 +332,9 @@ class TpuProfileRunner(BaseVllmRunner):
                 metrics=res_data["metrics"],
             )
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Profiling worker process failed with exit code {e.returncode}") from e
+            raise RuntimeError(
+                f"Profiling worker process failed with exit code {e.returncode}"
+            ) from e
         finally:
             try:
                 os.unlink(payload_file)
