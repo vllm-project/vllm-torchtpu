@@ -18,11 +18,14 @@ def isolated_caches(monkeypatch):
     monkeypatch.setattr(mesh_utils, "_MESH_CACHE", {})
 
 
-@pytest.mark.parametrize("group", [
-    None,
-    SimpleNamespace(world_size=1, rank_in_group=0),
-    SimpleNamespace(world_size=4, rank_in_group=2)
-])
+@pytest.mark.parametrize(
+    "group",
+    [
+        None,
+        SimpleNamespace(world_size=1, rank_in_group=0),
+        SimpleNamespace(world_size=4, rank_in_group=2),
+    ],
+)
 def test_native_group_accessors(monkeypatch, group):
     monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
     assert pcp.get_pcp_group() is group
@@ -44,8 +47,9 @@ def test_get_pcp_group_returns_none_when_native_symbol_is_missing(monkeypatch):
 
 
 def test_uninitialized_native_group(monkeypatch):
-    monkeypatch.setattr(parallel_state, "get_pcp_group",
-                        Mock(side_effect=AssertionError))
+    monkeypatch.setattr(
+        parallel_state, "get_pcp_group", Mock(side_effect=AssertionError)
+    )
     assert pcp.get_pcp_group() is None
 
 
@@ -57,15 +61,19 @@ def test_single_rank_collectives_preserve_tensor(monkeypatch, group):
     assert pcp.all_reduce_sum(tensor) is tensor
 
 
-@pytest.mark.parametrize("dim,as_list,contiguous", [
-    (0, False, False),
-    (1, False, False),
-    (1, False, True),
-    (1, True, False),
-    (1, True, True),
-])
+@pytest.mark.parametrize(
+    "dim,as_list,contiguous",
+    [
+        (0, False, False),
+        (1, False, False),
+        (1, False, True),
+        (1, True, False),
+        (1, True, True),
+    ],
+)
 def test_all_gather_equal_tokens_materializes_contiguous_input(
-        monkeypatch, dim, as_list, contiguous):
+    monkeypatch, dim, as_list, contiguous
+):
     tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
     if contiguous:
         tensor = tensor.contiguous()
@@ -79,8 +87,10 @@ def test_all_gather_equal_tokens_materializes_contiguous_input(
 
     group.all_gather.side_effect = gather
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
-    torch.testing.assert_close(pcp.all_gather_equal_tokens(tensor, dim=dim),
-                               torch.cat([tensor, tensor + 10], dim=dim))
+    torch.testing.assert_close(
+        pcp.all_gather_equal_tokens(tensor, dim=dim),
+        torch.cat([tensor, tensor + 10], dim=dim),
+    )
     group.all_gather.assert_called_once()
     assert group.all_gather.call_args.kwargs == {"dim": dim}
 
@@ -100,13 +110,13 @@ def test_reduce_materializes_input(monkeypatch, contiguous):
         assert value is tensor
 
 
-@pytest.mark.parametrize("available,initialized,expected", [(False, False, 0),
-                                                            (True, False, 0),
-                                                            (True, True, 7)])
+@pytest.mark.parametrize(
+    "available,initialized,expected",
+    [(False, False, 0), (True, False, 0), (True, True, 7)],
+)
 def test_global_rank_probe(monkeypatch, available, initialized, expected):
     monkeypatch.setattr(torch.distributed, "is_available", lambda: available)
-    monkeypatch.setattr(torch.distributed, "is_initialized",
-                        lambda: initialized)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
     get_rank = Mock(return_value=7)
     monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
     assert mesh_utils._get_current_global_rank() == expected
@@ -116,6 +126,7 @@ def test_global_rank_probe(monkeypatch, available, initialized, expected):
 @pytest.fixture
 def runtime():
     from torch_tpu._internal.distributed import tpu_distributed
+
     return tpu_distributed
 
 
@@ -124,19 +135,17 @@ def test_native_device_id(monkeypatch, runtime):
     assert mesh_utils._get_tpu_global_device_id() == 9
 
 
-@pytest.mark.parametrize("devices",
-                         [[], [SimpleNamespace(id=17)], [SimpleNamespace()]])
+@pytest.mark.parametrize("devices", [[], [SimpleNamespace(id=17)], [SimpleNamespace()]])
 def test_device_id_fallback(monkeypatch, runtime, devices):
-    monkeypatch.setattr(runtime, "global_device_id",
-                        Mock(side_effect=RuntimeError))
+    monkeypatch.setattr(runtime, "global_device_id", Mock(side_effect=RuntimeError))
     monkeypatch.setattr(jax, "local_devices", lambda: devices)
     assert mesh_utils._get_tpu_global_device_id() == (
-        17 if devices and hasattr(devices[0], "id") else 0)
+        17 if devices and hasattr(devices[0], "id") else 0
+    )
 
 
 def test_device_id_without_runtime(monkeypatch, runtime):
-    monkeypatch.setattr(runtime, "global_device_id",
-                        Mock(side_effect=RuntimeError))
+    monkeypatch.setattr(runtime, "global_device_id", Mock(side_effect=RuntimeError))
     monkeypatch.setattr(jax, "local_devices", Mock(side_effect=RuntimeError))
     assert mesh_utils._get_tpu_global_device_id() == 0
 
@@ -150,15 +159,18 @@ def test_single_rank_cache_rank(monkeypatch, group, runtime):
     device_id.assert_not_called()
 
 
-@pytest.mark.parametrize("device_id,ids,expected,error",
-                         [(6, [4, 7, 6, 5], 2, None),
-                          (6, [4, 6], None, "partition space"),
-                          (8, [4, 7, 6, 5], None, "not in torch_tpu")])
-def test_cache_rank_uses_physical_partition_order(monkeypatch, runtime,
-                                                  device_id, ids, expected,
-                                                  error):
-    monkeypatch.setattr(pcp, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=4))
+@pytest.mark.parametrize(
+    "device_id,ids,expected,error",
+    [
+        (6, [4, 7, 6, 5], 2, None),
+        (6, [4, 6], None, "partition space"),
+        (8, [4, 7, 6, 5], None, "not in torch_tpu"),
+    ],
+)
+def test_cache_rank_uses_physical_partition_order(
+    monkeypatch, runtime, device_id, ids, expected, error
+):
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(world_size=4))
     monkeypatch.setattr(runtime, "global_device_id", lambda: device_id)
     monkeypatch.setattr(runtime, "all_global_device_ids", lambda: ids)
     if error:
@@ -184,10 +196,7 @@ def test_rank_device_collective(monkeypatch, missing):
         with pytest.raises(RuntimeError, match="empty entry"):
             mesh_utils._collect_rank_to_device_id(group, 6, 20)
     else:
-        assert mesh_utils._collect_rank_to_device_id(group, 6, 20) == {
-            6: 20,
-            2: 40
-        }
+        assert mesh_utils._collect_rank_to_device_id(group, 6, 20) == {6: 20, 2: 40}
 
 
 def test_group_layout_orders_mapping_and_scopes_cache(monkeypatch):
@@ -199,8 +208,11 @@ def test_group_layout_orders_mapping_and_scopes_cache(monkeypatch):
     monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", gather)
     layout = pcp.get_pcp_group_layout()
     assert layout == pcp.PcpGroupLayout((2, 4, 6, 8), (40, 20, 10, 30), 2, 4)
-    assert (layout.device_id, layout.prev_rank_in_group,
-            layout.next_rank_in_group) == (10, 1, 3)
+    assert (layout.device_id, layout.prev_rank_in_group, layout.next_rank_in_group) == (
+        10,
+        1,
+        3,
+    )
     assert pcp.get_pcp_group_layout() is layout
     gather.assert_called_once_with(group, 6, 10)
     group.ranks = [8, 6, 4, 2]
@@ -221,7 +233,7 @@ def test_single_rank_layout(monkeypatch):
     monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 6)
     monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
     layout = pcp.get_pcp_group_layout()
-    assert layout == pcp.PcpGroupLayout((6, ), (10, ), 0, 1)
+    assert layout == pcp.PcpGroupLayout((6,), (10,), 0, 1)
     assert layout.prev_rank_in_group == layout.next_rank_in_group == 0
 
 
@@ -230,25 +242,23 @@ def test_layout_missing_rank_is_not_cached(monkeypatch):
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
     monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 2)
     monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
-    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id",
-                        lambda *args: {2: 10})
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", lambda *args: {2: 10})
     with pytest.raises(RuntimeError, match=r"missing=\[6\]"):
         pcp.get_pcp_group_layout()
     assert mesh_utils._LAYOUT_CACHE == {}
 
 
-def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(
-        monkeypatch):
+def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(monkeypatch):
     layout = pcp.PcpGroupLayout((2, 6), (30, 10), 0, 2)
-    monkeypatch.setattr(mesh_utils, "get_cp_group_layout",
-                        lambda group: layout)
-    monkeypatch.setattr(jax, "devices",
-                        lambda: [SimpleNamespace(id=i) for i in [10, 20, 30]])
+    monkeypatch.setattr(mesh_utils, "get_cp_group_layout", lambda group: layout)
+    monkeypatch.setattr(
+        jax, "devices", lambda: [SimpleNamespace(id=i) for i in [10, 20, 30]]
+    )
     mesh = Mock(side_effect=lambda *args, **kwargs: object())
     monkeypatch.setattr(jax.sharding, "Mesh", mesh)
     first = pcp.get_or_create_pcp_mesh()
     assert [device.id for device in mesh.call_args.args[0]] == [30, 10]
-    assert mesh.call_args.kwargs == {"axis_names": ("pcp", )}
+    assert mesh.call_args.kwargs == {"axis_names": ("pcp",)}
     assert pcp.get_or_create_pcp_mesh() is first
     assert pcp.get_or_create_pcp_mesh("ring") is not first
     layout = pcp.PcpGroupLayout((6, 2), (10, 30), 1, 2)
@@ -258,8 +268,10 @@ def test_mesh_preserves_group_order_and_caches_by_axis_and_devices(
 
 def test_mesh_missing_device_is_not_cached(monkeypatch):
     monkeypatch.setattr(
-        mesh_utils, "get_cp_group_layout", lambda group: pcp.PcpGroupLayout(
-            (2, 6), (30, 10), 0, 2))
+        mesh_utils,
+        "get_cp_group_layout",
+        lambda group: pcp.PcpGroupLayout((2, 6), (30, 10), 0, 2),
+    )
     monkeypatch.setattr(jax, "devices", lambda: [SimpleNamespace(id=30)])
     with pytest.raises(RuntimeError, match=r"missing=\[10\]"):
         pcp.get_or_create_pcp_mesh()

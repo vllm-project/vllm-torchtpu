@@ -4,6 +4,7 @@
 import dataclasses
 import functools
 import inspect
+import math
 from typing import Any, ClassVar
 
 import jax
@@ -156,6 +157,17 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     return min_page_size
 
 
+def _reshape_packed_kv_cache(kv_cache: jax.Array,
+                             shape: tuple[int, ...]) -> jax.Array:
+    if kv_cache.shape[-2:] == shape[-2:]:
+        return kv_cache.reshape(shape)
+    # Changing head width must preserve the packed sublane axis; a plain
+    # reshape interleaves packed bytes and can require a full-pool copy.
+    packed = kv_cache.transpose(3, 0, 1, 2, 4)
+    packed_shape = (shape[3], *shape[:3], shape[4])
+    return packed.reshape(packed_shape).transpose(1, 2, 3, 0, 4)
+
+
 def _pallas_rpa_kernel_impl(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -181,6 +193,33 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    pool_shape = kv_cache.shape
+    if kv_cache.ndim == 4:
+        if (kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                and query.shape[2] != 64):
+            native_shape = rpa_batched_wrapper.get_kv_cache_shape(
+                total_num_pages=1,
+                page_size=pool_shape[1],
+                actual_num_kv_heads=key.shape[1],
+                actual_head_dim=query.shape[2],
+                kv_dtype=kv_cache.dtype,
+                kv_layout=kv_layout,
+                chip_version=get_chip_version(),
+            )
+        else:
+            native_shape = PallasAttentionBackend.get_kv_cache_shape(
+                1, pool_shape[1], key.shape[1], query.shape[2],
+                pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype])
+        native_page_elements = math.prod(native_shape[1:])
+        # A padded pool page can span several of this layer's native pages.
+        page_stride = math.prod(pool_shape[1:]) // native_page_elements
+        packing = native_shape[3]
+        packed_pool_shape = (pool_shape[0], pool_shape[1], 1, packing,
+                             pool_shape[3])
+        kv_cache = _reshape_packed_kv_cache(
+            kv_cache.reshape(packed_pool_shape),
+            (pool_shape[0] * page_stride, *native_shape[1:]))
+        block_tables = block_tables * page_stride
     metadata = AttentionMetadata(
         input_positions=
         None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
@@ -210,6 +249,9 @@ def _pallas_rpa_kernel_impl(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
     )
+    if len(pool_shape) == 4:
+        new_kv_cache = _reshape_packed_kv_cache(
+            new_kv_cache, packed_pool_shape).reshape(pool_shape)
     return new_kv_cache, outputs
 
 
@@ -1200,8 +1242,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_cache: shape =
                 [num_blocks, block_size, num_kv_heads_x2 // kv_packing,
                  kv_packing, padded_head_size] (preferred)
-                or legacy 4D
-                [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
+                or a shared packed pool
+                [num_blocks, block_size, kv_packing, words_per_token]
                 or, under SEQ_ALONG_LANE,
                 [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
                  kv_packing, block_size]
@@ -1256,7 +1298,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
         # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if self._pool_is_seq_along_lane:
+        if kv_cache.ndim == 4:
+            pool_head_dim = self.head_size
+        elif self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
         else:
             pool_head_dim = kv_cache.shape[-1]

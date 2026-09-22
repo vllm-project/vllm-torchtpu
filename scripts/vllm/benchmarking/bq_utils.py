@@ -108,6 +108,15 @@ def build_insert_sql(
     """
     table = (bq_table or os.getenv("BQ_TABLE") or DEFAULT_BQ_TABLE).strip("`")
     repository = os.getenv("REPOSITORY") or "vllm-torchtpu"
+    # Which fleet produced the row, when the fleet says. Two lanes measure the
+    # same benchmarks on the same hardware and write this one table, so a
+    # reader needs to be able to hold one of them constant. In config rather
+    # than a column of its own because config is JSON for exactly this: a
+    # dimension one producer has and the others do not. A row without the key
+    # came from the bare-metal lane, which is unchanged and sets nothing.
+    runner = os.getenv("CI_RUNNER")
+    if runner:
+        config = {**config, "runner": runner}
     config_json = sql_escape(json.dumps(config))
     metrics_elems = ", ".join(
         f"STRUCT('{metrics_type}', "

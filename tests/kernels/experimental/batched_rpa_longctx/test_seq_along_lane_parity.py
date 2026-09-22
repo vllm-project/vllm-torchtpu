@@ -21,30 +21,33 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    wrapper)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
 
-_DECODE_BLOCKS = configs.BlockSizes(bq_sz=1,
-                                    bq_c_sz=1,
-                                    bkv_sz=256,
-                                    batch_size=8,
-                                    n_buffer=3)
-_PREFILL_BLOCKS = configs.BlockSizes(bq_sz=1792,
-                                     bq_c_sz=28,
-                                     bkv_sz=256,
-                                     batch_size=2,
-                                     n_buffer=3)
+_DECODE_BLOCKS = configs.BlockSizes(
+    bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
+)
+_PREFILL_BLOCKS = configs.BlockSizes(
+    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2, n_buffer=3
+)
 
 
-def _build_cache(kv_layout, target_k, target_v, kv_len, total_pages, page_size,
-                 num_q_heads, num_kv_heads, head_dim, dtype, page_indices,
-                 sm_scale):
-    cache_shape = wrapper.get_kv_cache_shape(total_pages,
-                                             page_size,
-                                             num_kv_heads,
-                                             head_dim,
-                                             dtype,
-                                             kv_layout=kv_layout)
+def _build_cache(
+    kv_layout,
+    target_k,
+    target_v,
+    kv_len,
+    total_pages,
+    page_size,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    page_indices,
+    sm_scale,
+):
+    cache_shape = wrapper.get_kv_cache_shape(
+        total_pages, page_size, num_kv_heads, head_dim, dtype, kv_layout=kv_layout
+    )
     _, cache = wrapper.ragged_paged_attention(
         jnp.zeros((kv_len, num_q_heads, head_dim), dtype),
         jnp.asarray(target_k, dtype),
@@ -70,8 +73,7 @@ def _build_cache(kv_layout, target_k, target_v, kv_len, total_pages, page_size,
         (4096, 1, (1, 1, 1)),
     ],
 )
-def test_seq_along_lane_matches_head_along_sublane(kv_len, q_len,
-                                                   distribution):
+def test_seq_along_lane_matches_head_along_sublane(kv_len, q_len, distribution):
     rng = np.random.default_rng(0)
     dtype = jnp.bfloat16
     head_dim = 128
@@ -84,20 +86,32 @@ def test_seq_along_lane_matches_head_along_sublane(kv_len, q_len,
     def r(*shape):
         return (rng.standard_normal(shape) * 0.5).astype(np.float32)
 
-    target_k, target_v = r(kv_len, num_kv_heads,
-                           head_dim), r(kv_len, num_kv_heads, head_dim)
+    target_k, target_v = (
+        r(kv_len, num_kv_heads, head_dim),
+        r(kv_len, num_kv_heads, head_dim),
+    )
     query = r(q_len, num_q_heads, head_dim)
-    new_k, new_v = target_k[kv_len - q_len:kv_len], target_v[kv_len -
-                                                             q_len:kv_len]
+    new_k, new_v = target_k[kv_len - q_len : kv_len], target_v[kv_len - q_len : kv_len]
 
     kv_lens = jnp.array([kv_len], jnp.int32)
     cu_q_lens = jnp.array([0, q_len], jnp.int32)
     distribution = jnp.asarray(distribution, jnp.int32)
 
     def run(kv_layout):
-        cache = _build_cache(kv_layout, target_k, target_v, kv_len,
-                             total_pages, page_size, num_q_heads, num_kv_heads,
-                             head_dim, dtype, page_indices, sm_scale)
+        cache = _build_cache(
+            kv_layout,
+            target_k,
+            target_v,
+            kv_len,
+            total_pages,
+            page_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            page_indices,
+            sm_scale,
+        )
         out, _ = wrapper.ragged_paged_attention(
             jnp.asarray(query, dtype),
             jnp.asarray(new_k, dtype),
@@ -141,40 +155,40 @@ def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
 
     query = random_array((num_tokens, num_q_heads, head_dim), jnp.bfloat16)
     key = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
-    value = random_array((num_tokens, num_kv_heads, head_dim),
-                         jnp.float8_e4m3fn)
+    value = random_array((num_tokens, num_kv_heads, head_dim), jnp.float8_e4m3fn)
     # Reserve two pages per request for the default 256-token KV block.
-    shape = wrapper.get_kv_cache_shape(6,
-                                       128,
-                                       num_kv_heads,
-                                       head_dim,
-                                       key.dtype,
-                                       kv_layout=kv_layout)
+    shape = wrapper.get_kv_cache_shape(
+        6, 128, num_kv_heads, head_dim, key.dtype, kv_layout=kv_layout
+    )
 
     def run(return_lse):
         # LONGCTX routes prefill through the MIXED segment, as in the
         # existing parity cases above; its standalone PREFILL pass is unused.
-        return wrapper.ragged_paged_attention(query,
-                                              key,
-                                              value,
-                                              jnp.zeros(shape, key.dtype),
-                                              jnp.asarray(q_lens, jnp.int32),
-                                              jnp.array([4, 0, 2, 5, 1, 3],
-                                                        jnp.int32),
-                                              jnp.asarray(starts),
-                                              jnp.array([1, 1, 3], jnp.int32),
-                                              sm_scale=head_dim**-0.5,
-                                              kv_layout=kv_layout,
-                                              return_lse=return_lse)
+        return wrapper.ragged_paged_attention(
+            query,
+            key,
+            value,
+            jnp.zeros(shape, key.dtype),
+            jnp.asarray(q_lens, jnp.int32),
+            jnp.array([4, 0, 2, 5, 1, 3], jnp.int32),
+            jnp.asarray(starts),
+            jnp.array([1, 1, 3], jnp.int32),
+            sm_scale=head_dim**-0.5,
+            kv_layout=kv_layout,
+            return_lse=return_lse,
+        )
 
     out_without_lse, cache_without_lse = run(False)
     output, cache, lse = run(True)
-    np.testing.assert_allclose(np.asarray(output, np.float32),
-                               np.asarray(out_without_lse, np.float32),
-                               atol=3e-3,
-                               rtol=1e-2)
-    np.testing.assert_array_equal(np.asarray(cache, np.float32),
-                                  np.asarray(cache_without_lse, np.float32))
+    np.testing.assert_allclose(
+        np.asarray(output, np.float32),
+        np.asarray(out_without_lse, np.float32),
+        atol=3e-3,
+        rtol=1e-2,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(cache, np.float32), np.asarray(cache_without_lse, np.float32)
+    )
 
     queries = np.asarray(query, np.float32)
     keys = np.repeat(np.asarray(key, np.float32), q_heads_per_kv, axis=1)
@@ -182,22 +196,22 @@ def test_return_lse_preserves_gqa_heads(kv_layout, q_heads_per_kv):
     expected_out, expected_lse = [], []
     for start, end in zip(starts[:-1], starts[1:]):
         for pos in range(start, end):
-            scores = np.einsum("hd,thd->ht", queries[pos],
-                               keys[start:pos + 1]) * head_dim**-0.5
+            scores = (
+                np.einsum("hd,thd->ht", queries[pos], keys[start : pos + 1])
+                * head_dim**-0.5
+            )
             maximum = scores.max(axis=-1, keepdims=True)
             weights = np.exp(scores - maximum)
             denominator = weights.sum(axis=-1, keepdims=True)
             expected_out.append(
-                np.einsum("ht,thd->hd", weights / denominator,
-                          values[start:pos + 1]))
+                np.einsum("ht,thd->hd", weights / denominator, values[start : pos + 1])
+            )
             expected_lse.append((maximum + np.log(denominator))[:, 0])
     assert output.shape == query.shape
     assert lse.shape == query.shape[:2]
-    np.testing.assert_allclose(np.asarray(output, np.float32),
-                               expected_out,
-                               atol=3e-3,
-                               rtol=1e-2)
-    np.testing.assert_allclose(np.asarray(lse, np.float32),
-                               expected_lse,
-                               atol=4e-2,
-                               rtol=1e-2)
+    np.testing.assert_allclose(
+        np.asarray(output, np.float32), expected_out, atol=3e-3, rtol=1e-2
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse, np.float32), expected_lse, atol=4e-2, rtol=1e-2
+    )

@@ -129,13 +129,18 @@ and `--profiler-config.max_iterations` limits are honored only by the
 
 [`scripts/vllm/benchmarking/run_benchmarks.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/run_benchmarks.sh)
 wires all of this up. Setting `CAPTURE_PROFILE=1` adds the profiler flags to the
-server and `--profile` to the bench client, writing traces to
-`<results-dir>/profile`:
+server and, after each cell's measured run, runs that cell once more with
+`--profile`, writing traces to `<results-dir>/profile`:
 
 ```bash
 CAPTURE_PROFILE=1 ./scripts/vllm/benchmarking/run_benchmarks.sh \
   --config qwen3.5-35b-fp8-tp4-ep
 ```
+
+Neither the warmup passes nor the measured run are profiled, so the numbers the
+harness reports stay comparable to a baseline. The extra run's
+`<cell>.profile.json` is ignored by the regression check and the results upload,
+and `PROFILE_NUM_PROMPTS` sizes it — one full concurrency wave by default.
 
 `CAPTURE_PROFILE=1` is *inferred* whenever `EXTRA_SERVE_ARGS` contains
 `--profiler-config.torch_profiler_dir`, which then also chooses the destination.
@@ -144,8 +149,7 @@ client would not send `--profile`, so nothing would call `/start_profile` and
 the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
 out.
 
-Warmup passes are never profiled. Prefer a single ISL/OSL case so the trace maps
-to one workload shape.
+Prefer a single ISL/OSL cell so the trace maps to one workload shape.
 
 ## Phased profiling
 
@@ -175,8 +179,8 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
 trace directory in `EXTRA_SERVE_ARGS`
 ([as above](#through-the-benchmark-harness)) and passes `--profile` to
-`vllm bench serve`, which POSTs to the two endpoints around the measured run.
-Warmup passes are excluded.
+`vllm bench serve` for the extra profile run, which POSTs to the two endpoints
+around it.
 
 ### Option 2: against your own `vllm serve`
 
@@ -252,7 +256,7 @@ Token accounting, from
 
 Each phase is captured **once per profiling session** — the window between
 `/start_profile` and `/stop_profile` — for `max_iterations` steps, and then not
-again within that session. A new session (for example, the next benchmark case
+again within that session. A new session (for example, the next benchmark cell
 run with `--profile`) starts with fresh phase tracking and captures each phase
 again. A phase that the workload never produces simply yields no subdirectory.
 

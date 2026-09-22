@@ -52,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "Unknown argument: $1"
             echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
+            # shellcheck disable=SC2016
+            echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
             ;;
     esac
@@ -97,7 +99,13 @@ if [ "$START_SERVER" = "1" ]; then
 fi
 
 if [ -z "$RESULTS_DIR" ]; then
-    RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
+    # Under ARTIFACTS_DIR when the caller set one, so results are picked up as
+    # artifacts without every step restating the path it already declared.
+    if [ -n "${ARTIFACTS_DIR:-}" ]; then
+        RESULTS_DIR="$ARTIFACTS_DIR/$CONFIG_NAME"
+    else
+        RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
+    fi
 fi
 mkdir -p "$RESULTS_DIR"
 
@@ -320,6 +328,11 @@ echo "=== Uploading results to Spanner and BigQuery ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
 if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
     UPLOAD_ARGS+=("--skip-db-upload")
+fi
+# Spanner only. A fleet that reports into the shared BigQuery table but keeps
+# no Spanner record of its own sets this; the guard above still wins.
+if [ "${SKIP_SPANNER_UPLOAD:-0}" = "1" ] || [ "${SKIP_SPANNER_UPLOAD:-}" = "true" ]; then
+    UPLOAD_ARGS+=("--skip-spanner")
 fi
 
 

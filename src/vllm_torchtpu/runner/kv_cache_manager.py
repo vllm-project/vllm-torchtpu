@@ -40,8 +40,9 @@ from vllm.v1.worker.utils import (AttentionGroup,
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.kv_cache_materializer import (
-    build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
-    materialize_kv_cache_tensors)
+    build_kernel_block_size_by_group_id, can_share_attention_cache,
+    format_kv_cache_layout_summary, materialize_kv_cache_tensors,
+    materialize_shared_attention_cache)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
@@ -320,9 +321,11 @@ class KVCacheManager:
         kv_cache_specs: dict[str, KVCacheSpec],
         backend_cls: type[AttentionBackend],
     ) -> dict[str, KVCacheSpec]:
-        # vLLM overlays groups in one byte allocation, but TPU attention
-        # kernels donate native typed arrays. Different geometries need
-        # separate arrays; identical geometries can share an array across
+        if can_share_attention_cache(list(kv_cache_specs.values()),
+                                     backend_cls):
+            return kv_cache_specs
+        # Layouts that cannot share a packed pool need separate native arrays;
+        # identical geometries can still share an array across
         # groups because each block ID belongs to only one group at a time.
         groups = get_kv_cache_groups(self.runner.vllm_config,
                                      kv_cache_specs.copy())
@@ -1281,6 +1284,36 @@ class KVCacheManager:
                 native_caches[key] = caches
             return caches
 
+        shared_attention_caches: dict[tuple[int, int], torch.Tensor] = {}
+        if share_attention_regions and not use_block_major and not _is_ds_v4:
+            region_specs: dict[tuple[int, int], list[tuple[str,
+                                                           KVCacheSpec]]] = {}
+            for tensor in kv_cache_config.kv_cache_tensors:
+                for index, name in enumerate(tensor.layers):
+                    region = (tensor.offset + index * tensor.layer_stride,
+                              tensor.block_stride)
+                    region_specs.setdefault(region, []).append(
+                        (name, _per_layer_spec(name)))
+            for region, layer_specs in region_specs.items():
+                attention_specs = [(name, spec) for name, spec in layer_specs
+                                   if isinstance(spec, AttentionSpec)
+                                   and not isinstance(spec, MLAAttentionSpec)]
+                if (len(attention_specs) <= 1
+                        or len(attention_specs) != len(layer_specs)
+                        or attention_specs[0][1].page_size_bytes != region[1]
+                        or not can_share_attention_cache(
+                            [spec
+                             for _, spec in attention_specs], backend_cls)):
+                    continue
+                shared_attention_caches[
+                    region] = materialize_shared_attention_cache(
+                        layer_specs=attention_specs,
+                        tensor_size=kv_cache_config.num_blocks * region[1],
+                        num_blocks=kv_cache_config.num_blocks,
+                        attn_backend=backend_cls,
+                        device=self.runner.device,
+                    )
+
         for kv_cache_tensor in ([] if _is_ds_v4 else
                                 kv_cache_config.kv_cache_tensors):
             # Each descriptor names layers within the whole backing allocation;
@@ -1353,7 +1386,9 @@ class KVCacheManager:
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    if use_block_major and layer_name in bundle_view_by_name:
+                    if region in shared_attention_caches:
+                        kv_caches[layer_name] = shared_attention_caches[region]
+                    elif use_block_major and layer_name in bundle_view_by_name:
                         # Bind the strided per-layer view sharing storage with self._kv_cache_bundle.
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:

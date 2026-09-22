@@ -26,12 +26,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane,
-                                                   situ_and_mul)
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    TileSizes,
+    apply_act_fn,
+    gmm_v2,
+    interleave_lane,
+    situ_and_mul,
+)
 
 _GroupConfig = collections.namedtuple(
-    "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"])
+    "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"]
+)
 
 
 def _require_tpu() -> None:
@@ -44,10 +49,9 @@ def _require_tpu() -> None:
 
 
 def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5) -> None:
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=atol,
-                               rtol=rtol)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=atol, rtol=rtol
+    )
 
 
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
@@ -55,11 +59,13 @@ def test_situ_and_mul(linear_beta):
     gate = jnp.asarray([-3.0, 0.5, 7.0])
     up = jnp.asarray([-30.0, 2.0, 40.0])
     expected_gate = 4.0 * jnp.tanh(gate / 4.0) * jax.nn.sigmoid(gate)
-    expected_up = (up if linear_beta is None else linear_beta *
-                   jnp.tanh(up / linear_beta))
+    expected_up = (
+        up if linear_beta is None else linear_beta * jnp.tanh(up / linear_beta)
+    )
 
-    _assert_allclose(situ_and_mul(gate, up, 4.0, linear_beta),
-                     expected_gate * expected_up)
+    _assert_allclose(
+        situ_and_mul(gate, up, 4.0, linear_beta), expected_gate * expected_up
+    )
 
 
 @pytest.mark.parametrize("linear_beta", ["none", "25.0"])
@@ -82,17 +88,17 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
-    distribution = jax.random.uniform(jax.random.key(0), (num_groups - 1, ),
-                                      dtype=jnp.float32)
+    distribution = jax.random.uniform(
+        jax.random.key(0), (num_groups - 1,), dtype=jnp.float32
+    )
     distribution = distribution / jnp.sum(distribution)
     group_sizes = jnp.floor(distribution * batch_size).astype(jnp.int32)
     return jnp.append(group_sizes, batch_size - jnp.sum(group_sizes))
 
 
-def quantize_tensor(x: jax.Array,
-                    dtype: jnp.dtype,
-                    axis: int = -1,
-                    block_size: int = 256):
+def quantize_tensor(
+    x: jax.Array, dtype: jnp.dtype, axis: int = -1, block_size: int = 256
+):
     if jnp.issubdtype(dtype, jnp.integer):
         dtype_info = jnp.iinfo(dtype)
         max_val = int(dtype_info.max)
@@ -103,13 +109,10 @@ def quantize_tensor(x: jax.Array,
         min_val = float(dtype_info.min)
 
     orig_shape = x.shape
-    blocked_shape = orig_shape[:axis] + (-1,
-                                         block_size) + orig_shape[axis + 1:]
+    blocked_shape = orig_shape[:axis] + (-1, block_size) + orig_shape[axis + 1 :]
     x_blocked = x.reshape(blocked_shape)
 
-    x_blocked_abs_max = jnp.max(jnp.abs(x_blocked),
-                                axis=axis + 1,
-                                keepdims=True)
+    x_blocked_abs_max = jnp.max(jnp.abs(x_blocked), axis=axis + 1, keepdims=True)
     scale = x_blocked_abs_max / max_val
     x_blocked_q = jnp.clip(x_blocked / scale, min_val, max_val).astype(dtype)
 
@@ -158,10 +161,8 @@ def reference_gmm(
             for block in range(num_blocks):
                 block_start = block * block_size
                 block_end = block_start + block_size
-                lhs_block = lhs_slice[:, block_start:block_end].astype(
-                    jnp.float32)
-                rhs_block = rhs_slice[block_start:block_end, :].astype(
-                    jnp.float32)
+                lhs_block = lhs_slice[:, block_start:block_end].astype(jnp.float32)
+                rhs_block = rhs_slice[block_start:block_end, :].astype(jnp.float32)
 
                 acc = jnp.einsum("bd,dh->bh", lhs_block, rhs_block)
                 if rhs_scale is not None:
@@ -191,21 +192,21 @@ def test_gmm_matches_reference(has_bias, group_offset):
     key = jax.random.key(0)
 
     lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
-    rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
-                            dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        key, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
     rhs_bias = None
     if has_bias:
-        rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size),
-                                     dtype=jnp.bfloat16)
+        rhs_bias = jax.random.normal(
+            key, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
+        )
 
     group_sizes = get_group_sizes(batch_size, num_groups)
     group_offset = jnp.array(group_offset, dtype=jnp.int32)
 
-    expected = reference_gmm(lhs,
-                             rhs,
-                             group_sizes,
-                             rhs_bias=rhs_bias,
-                             group_offset=group_offset)
+    expected = reference_gmm(
+        lhs, rhs, group_sizes, rhs_bias=rhs_bias, group_offset=group_offset
+    )
 
     actual = gmm_v2(
         lhs,
@@ -231,19 +232,17 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
     key = jax.random.key(0)
 
     lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
-    rhs = jax.random.uniform(key, (num_groups, in_size, out_size),
-                             jnp.bfloat16, -1, 1)
-    rhs_q, rhs_scale = quantize_tensor(rhs,
-                                       weight_dtype,
-                                       axis=1,
-                                       block_size=block_size)
+    rhs = jax.random.uniform(key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+    rhs_q, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=block_size)
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
-    expected = reference_gmm(lhs,
-                             rhs_q,
-                             get_group_sizes(batch_size, num_groups),
-                             rhs_scale=rhs_scale,
-                             group_offset=group_offset)
+    expected = reference_gmm(
+        lhs,
+        rhs_q,
+        get_group_sizes(batch_size, num_groups),
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
 
     actual = gmm_v2(
         lhs,
@@ -270,39 +269,36 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
     key = jax.random.key(0)
 
     lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
-    rhs = jax.random.uniform(key, (num_groups, in_size, out_size),
-                             jnp.bfloat16, -1, 1)
-    rhs_q, rhs_scale = quantize_tensor(rhs,
-                                       jnp.int8,
-                                       axis=1,
-                                       block_size=block_size)
+    rhs = jax.random.uniform(key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+    rhs_q, rhs_scale = quantize_tensor(rhs, jnp.int8, axis=1, block_size=block_size)
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-    rhs_bias = jax.random.normal(key, (num_groups, 1, out_size),
-                                 dtype=jnp.bfloat16)
+    rhs_bias = jax.random.normal(key, (num_groups, 1, out_size), dtype=jnp.bfloat16)
     group_sizes = get_group_sizes(batch_size, num_groups)
     group_offset = jnp.array([0], dtype=jnp.int32)
 
     lhs_block_size = min(512, in_size)
-    lhs_q, lhs_scale_factor = quantize_tensor(lhs,
-                                              jnp.int8,
-                                              axis=1,
-                                              block_size=lhs_block_size)
-    lhs_q_blocked = lhs_q.reshape(batch_size, -1,
-                                  lhs_block_size).astype(jnp.float32)
+    lhs_q, lhs_scale_factor = quantize_tensor(
+        lhs, jnp.int8, axis=1, block_size=lhs_block_size
+    )
+    lhs_q_blocked = lhs_q.reshape(batch_size, -1, lhs_block_size).astype(jnp.float32)
     lhs_scale_expanded = jnp.expand_dims(lhs_scale_factor, axis=2)
-    lhs_simulated = ((lhs_q_blocked * lhs_scale_expanded).reshape(
-        lhs.shape).astype(lhs.dtype))
+    lhs_simulated = (
+        (lhs_q_blocked * lhs_scale_expanded).reshape(lhs.shape).astype(lhs.dtype)
+    )
 
-    raw_expected = reference_gmm(lhs_simulated,
-                                 rhs_q,
-                                 group_sizes,
-                                 rhs_scale=rhs_scale,
-                                 rhs_bias=rhs_bias,
-                                 group_offset=group_offset)
+    raw_expected = reference_gmm(
+        lhs_simulated,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_offset=group_offset,
+    )
     raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
     raw_expected = interleave_lane(raw_gate, raw_up)
-    expected = apply_act_fn(raw_expected.astype(jnp.float32),
-                            fuse_act).astype(lhs.dtype)
+    expected = apply_act_fn(raw_expected.astype(jnp.float32), fuse_act).astype(
+        lhs.dtype
+    )
 
     actual = gmm_v2(
         lhs,
@@ -327,28 +323,21 @@ def test_gmm_weight_quantized_block_larger_than_tile_k():
     out_size = 512
     num_groups = 16
     block_size = 1024
-    tile_info = TileSizes(tile_m=128,
-                          bucket_base=128,
-                          tile_k=256,
-                          tile_n=out_size)
+    tile_info = TileSizes(tile_m=128, bucket_base=128, tile_k=256, tile_n=out_size)
     key = jax.random.key(0)
 
     lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
-    rhs = jax.random.uniform(key, (num_groups, in_size, out_size),
-                             jnp.bfloat16, -1, 1)
-    rhs_q, rhs_scale = quantize_tensor(rhs,
-                                       jnp.float8_e4m3fn,
-                                       axis=1,
-                                       block_size=block_size)
+    rhs = jax.random.uniform(key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     group_sizes = get_group_sizes(batch_size, num_groups)
     group_offset = jnp.array(0, dtype=jnp.int32)
 
-    expected = reference_gmm(lhs,
-                             rhs_q,
-                             group_sizes,
-                             rhs_scale=rhs_scale,
-                             group_offset=group_offset)
+    expected = reference_gmm(
+        lhs, rhs_q, group_sizes, rhs_scale=rhs_scale, group_offset=group_offset
+    )
 
     actual = gmm_v2(
         lhs,
@@ -380,18 +369,18 @@ def test_gmm_nonlocal_groups_produce_zeros(group_config):
     key = jax.random.key(0)
 
     lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
-    rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
-                            dtype=jnp.bfloat16)
-    rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size),
-                                 dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        key, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    rhs_bias = jax.random.normal(
+        key, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
+    )
     group_sizes = get_group_sizes(batch_size, num_groups)
     group_offset = jnp.array(group_offset, dtype=jnp.int32)
 
-    expected = reference_gmm(lhs,
-                             rhs,
-                             group_sizes,
-                             rhs_bias=rhs_bias,
-                             group_offset=group_offset)
+    expected = reference_gmm(
+        lhs, rhs, group_sizes, rhs_bias=rhs_bias, group_offset=group_offset
+    )
 
     actual = gmm_v2(
         lhs,

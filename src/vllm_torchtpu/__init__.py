@@ -1398,6 +1398,73 @@ def _patch_vllm_block_pool_lifo_free() -> None:
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_same_step_prefix_hits() -> None:
+    """Keep prefix-cache hits off blocks the current step has not written.
+
+    vLLM publishes a block's hash when the block is allocated, before the
+    forward that fills it runs, so a request admitted later in the same
+    `schedule()` can hit a block an earlier request fills in that very step.
+    GPU attention writes the whole batch's KV before any request reads it,
+    which makes that hit safe there. The TPU ragged paged attention kernel
+    writes each sequence's new KV as it walks the batch instead: a sequence
+    ordered before the one filling the block DMAs the block from HBM
+    unwritten and attends over stale KV. Identical prompts admitted together
+    (n > 1 sampling, a repeated prompt) then decode garbage.
+
+    Blocks hashed during the current `schedule()` therefore count as misses,
+    and a request that would have hit one recomputes that prefix itself.
+    From the next `schedule()` on they hit normally: the worker runs the
+    steps' forwards in order, so the step that fills a block has run before
+    any later step reads it, with or without async scheduling.
+    """
+    import functools
+
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch",
+               False):
+        return
+
+    original_insert_block_hash = BlockPool._insert_block_hash
+    original_get_cached_block = BlockPool.get_cached_block
+    original_schedule = Scheduler.schedule
+
+    def unwritten_block_ids(pool) -> set[int]:
+        return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
+
+    # Every path that makes a block hittable (full blocks, partial blocks,
+    # re-pointed hashes) goes through here.
+    @functools.wraps(original_insert_block_hash)
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+        original_insert_block_hash(self, block_hash_with_group_id, block,
+                                   num_tokens)
+        unwritten_block_ids(self).add(block.block_id)
+
+    @functools.wraps(original_get_cached_block)
+    def get_cached_block(self, block_hash, kv_cache_group_ids):
+        blocks = original_get_cached_block(self, block_hash,
+                                           kv_cache_group_ids)
+        unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
+        if blocks and unwritten and any(block.block_id in unwritten
+                                        for block in blocks):
+            return None
+        return blocks
+
+    @functools.wraps(original_schedule)
+    def schedule(self, *args, **kwargs):
+        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
+        return original_schedule(self, *args, **kwargs)
+
+    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+        wrapper._tpu_same_step_prefix_hit_patch = True
+    BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool.get_cached_block = get_cached_block
+    Scheduler.schedule = schedule
+    logger.info("Applied TPU patch: no prefix-cache hits on blocks the "
+                "current step has not written.")
+
+
 def _patch_vllm_vocab_parallel_embedding() -> None:
     """Register shard index bounds as module buffers in VocabParallelEmbedding.
 

@@ -18,9 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm_torchtpu.worker.runai_repull import (COMPLETE_SENTINEL,
-                                               PULLING_SENTINEL,
-                                               ensure_runai_aux_files)
+from vllm_torchtpu.worker.runai_repull import (
+    COMPLETE_SENTINEL,
+    PULLING_SENTINEL,
+    ensure_runai_aux_files,
+)
 
 MODEL_URI = "gs://bucket/models/kimi/k3"
 TOK_URI = "gs://bucket/models/kimi/tok"
@@ -75,10 +77,7 @@ def cache_root(tmp_path):
 def _v2_config(cache_root, **kw):
     """Ray V2 state: head's rewritten config (local dir + URI)."""
     local = os.path.join(str(cache_root), "k3")
-    return FakeModelConfig(cache_root,
-                           model=local,
-                           model_weights=MODEL_URI,
-                           **kw)
+    return FakeModelConfig(cache_root, model=local, model_weights=MODEL_URI, **kw)
 
 
 def test_noop_for_non_object_storage_model(cache_root):
@@ -149,10 +148,9 @@ def test_v1_pre_pull_state_pulls_and_rewrites(cache_root):
 
 
 def test_v1_separate_tokenizer_uri_passes_through(cache_root):
-    cfg = FakeModelConfig(cache_root,
-                          model=MODEL_URI,
-                          tokenizer=TOK_URI,
-                          model_weights=None)
+    cfg = FakeModelConfig(
+        cache_root, model=MODEL_URI, tokenizer=TOK_URI, model_weights=None
+    )
     ensure_runai_aux_files(cfg)
     assert cfg.pull_calls == [(MODEL_URI, TOK_URI)]
     assert cfg.tokenizer == cfg.dir_for(TOK_URI)
@@ -168,8 +166,9 @@ def test_v2_separate_tokenizer_dir_missing_is_reported(cache_root):
     assert cfg.pull_calls == [(MODEL_URI, missing_tok)]
     assert cfg.tokenizer == missing_tok
     messages = [str(c.args[0]) % c.args[1:] for c in log.error.call_args_list]
-    assert any("[runai-repull] tokenizer dir" in m and missing_tok in m
-               for m in messages), messages
+    assert any(
+        "[runai-repull] tokenizer dir" in m and missing_tok in m for m in messages
+    ), messages
 
 
 def test_noop_for_mock_model_config():

@@ -47,7 +47,9 @@ logger = init_logger(__name__)
 _STOCK_PLACEHOLDER_LINE = """      output_shapes = [
           torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
       ]"""
-_SHARDED_PLACEHOLDER_LINE = """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
+_SHARDED_PLACEHOLDER_LINE = (
+    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
+)
 
 
 def _sharded_output_placeholders(lowered, mesh):
@@ -59,7 +61,7 @@ def _sharded_output_placeholders(lowered, mesh):
     """
     shardings = getattr(lowered, "_out_named_shardings", None)
     if shardings is None or len(shardings) != len(lowered.out_avals):
-        shardings = (None, ) * len(lowered.out_avals)
+        shardings = (None,) * len(lowered.out_avals)
     return [
         _placeholder(aval, getattr(sharding, "spec", None), mesh)
         for aval, sharding in zip(lowered.out_avals, shardings)
@@ -79,16 +81,16 @@ def _placeholder(aval, spec, mesh):
         return pallas_impl.torch_placeholder(aval, mesh=mesh)
     torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
     if torch_dtype is None:
-        raise NotImplementedError(
-            f"Unsupported dtype for pallas kernels: {aval.dtype}")
+        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
     shape = tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec))
     if torch_dtype == torch.float4_e2m1fn_x2 and shape:
         if shape[-1] % 2:
             raise ValueError(
                 "expected the last dimension of the JAX local shape to be even "
                 f"to pack into {torch_dtype}, got {shape[-1]} (local={shape}, "
-                f"global={aval.shape}, spec={spec})")
-        shape = shape[:-1] + (shape[-1] // 2, )
+                f"global={aval.shape}, spec={spec})"
+            )
+        shape = shape[:-1] + (shape[-1] // 2,)
     return torch.empty(shape, dtype=torch_dtype, device="tpu")
 
 
@@ -105,10 +107,12 @@ def _build_sharded_callable_cls():
             "torch_tpu's JaxCallable.__call__ no longer builds its output "
             "placeholders the way this adapter expects; sharded outputs will "
             "be sized globally. Sharded multi-device ops will fail on a shape "
-            "mismatch until this is re-derived.")
+            "mismatch until this is re-derived."
+        )
         return pallas_impl.JaxCallable
-    patched = "class _Holder:\n" + src.replace(_STOCK_PLACEHOLDER_LINE,
-                                               _SHARDED_PLACEHOLDER_LINE, 1)
+    patched = "class _Holder:\n" + src.replace(
+        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
+    )
     namespace: dict = {}
     exec(  # noqa: S102 - deriving from the installed source is the point
         compile(patched, pallas_impl.__file__, "exec"),
@@ -118,8 +122,11 @@ def _build_sharded_callable_cls():
         },
         namespace,
     )
-    return type("_ShardedJaxCallable", (pallas_impl.JaxCallable, ),
-                {"__call__": namespace["_Holder"].__call__})
+    return type(
+        "_ShardedJaxCallable",
+        (pallas_impl.JaxCallable,),
+        {"__call__": namespace["_Holder"].__call__},
+    )
 
 
 _SHARDED_CALLABLE_CLS = None
@@ -152,8 +159,7 @@ def sharded_jax_op(
     if _SHARDED_CALLABLE_CLS is None:
         _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
     if "::" not in name or len(name.split("::")) != 2:
-        raise ValueError(
-            f"Op name {name} must be 'namespace::op', with one '::'.")
+        raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
     signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
     pallas_impl._verify_signature(signature)
@@ -162,23 +168,29 @@ def sharded_jax_op(
     out_shardings = jax.tree.map(
         lambda s: NamedSharding(mesh, s),
         output_partition_specs,
-        is_leaf=lambda s: isinstance(s, PartitionSpec))
+        is_leaf=lambda s: isinstance(s, PartitionSpec),
+    )
 
     # `out_shardings` is what puts the real shardings on the export's
     # `_out_named_shardings`, which is the only place they survive; the rest of
     # the jit config mirrors `pallas.custom_jax_kernel`, `keep_unused` included
     # so the jitted arity keeps matching the torch operands.
-    jit_fn = jax.jit(fn,
-                     static_argnums=static_argnums,
-                     donate_argnums=donate_argnums,
-                     out_shardings=out_shardings,
-                     keep_unused=True)
+    jit_fn = jax.jit(
+        fn,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+        out_shardings=out_shardings,
+        keep_unused=True,
+    )
     trace_key = pallas_impl._get_kernel_invocation_key(
-        f"{name}_{id(fn)}", [], {
+        f"{name}_{id(fn)}",
+        [],
+        {
             "static_argnums": static_argnums,
             "donate_argnums": donate_argnums,
             "output_partition_specs": str(output_partition_specs),
-        })
+        },
+    )
     wrapped_fn = _SHARDED_CALLABLE_CLS(
         name=name,
         jit_fn=jit_fn,
@@ -193,11 +205,11 @@ def sharded_jax_op(
 
     def fake_fn(*args, **kwargs):
         jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=input_partition_specs)
+            args, mesh=mesh, partition_specs=input_partition_specs
+        )
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        return lowered.out_tree.unflatten(
-            _sharded_output_placeholders(lowered, mesh))
+        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
 
     op.register_fake(fake_fn)
     return op

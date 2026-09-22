@@ -129,9 +129,9 @@ run_mp_multihost() {
     start_rank=$((worker_idx * DATA_PARALLELISM_LOCAL))
     worker_serve_cmd=$(printf '%q ' vllm serve "${WORKER_SERVE_ARGS_ARR[@]}" --headless --data-parallel-start-rank="${start_rank}")
     echo "--- Starting mp worker ${worker_idx} on ${worker_ip} (data-parallel-start-rank=${start_rank})"
-    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home"
-    base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64
-    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster_mp.sh" < /tmp/run_cluster_mp.b64
+    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home" || return 1
+    base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64 || return 1
+    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster_mp.sh" < /tmp/run_cluster_mp.b64 || return 1
     # shellcheck disable=SC2029
     (
       for _attempt in 1 2 3; do

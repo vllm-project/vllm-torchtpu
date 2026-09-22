@@ -80,8 +80,9 @@ def test_multiple_sampling_params(llm: LLM):
 
     # Exception raised, if the size of params does not match the size of prompts
     with pytest.raises(
-            VLLMValidationError,
-            match=r"lengths of prompts .* and params .* must be the same"):
+        VLLMValidationError,
+        match=r"lengths of prompts .* and params .* must be the same",
+    ):
         outputs = llm.generate(PROMPTS, sampling_params=sampling_params[:3])
 
     # Single SamplingParams should be applied to every prompt
@@ -102,42 +103,46 @@ def test_non_greedy_sampling(llm: LLM):
 
 def test_multiple_priority(llm: LLM):
     # Generate works when priority is None
-    outputs = llm.generate(PROMPTS,
-                           sampling_params=GREEDY_SAMPLING_PARAMS,
-                           priority=None)
+    outputs = llm.generate(
+        PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=None
+    )
     assert len(PROMPTS) == len(outputs)
 
     # Generate works when length of priority is same as the len(PROMPTS)
-    outputs = llm.generate(PROMPTS,
-                           sampling_params=GREEDY_SAMPLING_PARAMS,
-                           priority=[0] * len(PROMPTS))
+    outputs = llm.generate(
+        PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=[0] * len(PROMPTS)
+    )
     assert len(PROMPTS) == len(outputs)
 
     # Exception raised, if the length of priority does not match the length of prompts
     with pytest.raises(
-            VLLMValidationError,
-            match=r"lengths of prompts .* and priority .* must be the same"):
-        outputs = llm.generate(PROMPTS,
-                               sampling_params=GREEDY_SAMPLING_PARAMS,
-                               priority=[0] * (len(PROMPTS) - 1))
+        VLLMValidationError,
+        match=r"lengths of prompts .* and priority .* must be the same",
+    ):
+        outputs = llm.generate(
+            PROMPTS,
+            sampling_params=GREEDY_SAMPLING_PARAMS,
+            priority=[0] * (len(PROMPTS) - 1),
+        )
 
     # Exception raised, if the priority list is empty
     with pytest.raises(
-            VLLMValidationError,
-            match=r"lengths of prompts .* and priority .* must be the same"):
-        outputs = llm.generate(PROMPTS,
-                               sampling_params=GREEDY_SAMPLING_PARAMS,
-                               priority=[])
+        VLLMValidationError,
+        match=r"lengths of prompts .* and priority .* must be the same",
+    ):
+        outputs = llm.generate(
+            PROMPTS, sampling_params=GREEDY_SAMPLING_PARAMS, priority=[]
+        )
 
 
 def test_max_model_len(llm: LLM):
     max_model_len = llm.model_config.max_model_len
-    sampling_params = SamplingParams(temperature=0.0,
-                                     max_tokens=max_model_len + 10)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_model_len + 10)
     outputs = llm.generate(PROMPTS, sampling_params)
     for output in outputs:
         num_total_tokens = len(output.prompt_token_ids) + len(
-            output.outputs[0].token_ids)
+            output.outputs[0].token_ids
+        )
         # Total tokens must not exceed max_model_len.
         # It can be less if generation finishes due to other reasons (e.g., EOS)
         # before reaching the absolute model length limit.
