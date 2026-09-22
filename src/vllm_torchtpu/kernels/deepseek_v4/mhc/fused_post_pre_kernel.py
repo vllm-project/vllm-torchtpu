@@ -20,14 +20,30 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import \
-    DEFAULT_VMEM_LIMIT_BYTES
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
-def _fused_kernel(x_ref, res_ref, post_ref, comb_ref, fn_hi_ref, fn_mid_ref,
-                  fn_lo_ref, sc_ref, hb_ref, newres_ref, mixes_ref, sqrsum_ref,
-                  layer_ref, *, hc_mult, hidden_size, gemm_precision, rms_eps,
-                  hc_pre_eps):
+def _fused_kernel(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    fn_hi_ref,
+    fn_mid_ref,
+    fn_lo_ref,
+    sc_ref,
+    hb_ref,
+    newres_ref,
+    mixes_ref,
+    sqrsum_ref,
+    layer_ref,
+    *,
+    hc_mult,
+    hidden_size,
+    gemm_precision,
+    rms_eps,
+    hc_pre_eps,
+):
     """One token block: recombine, store once, 3-pass GEMM, collapse."""
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -38,33 +54,33 @@ def _fused_kernel(x_ref, res_ref, post_ref, comb_ref, fn_hi_ref, fn_mid_ref,
     # bf16 -> f32 casts are exact, so results are unchanged.
     x_bf = x_ref[...]  # (tb, hidden) bf16
     old_bf = [
-        res_ref[:, i * hidden_size:(i + 1) * hidden_size]
-        for i in range(hc_mult)
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
     ]
 
     streams_bf = []
     for j in range(hc_mult):
-        acc = post[:, j:j + 1] * x_bf.astype(jnp.float32)
+        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
         for i in range(hc_mult):
             k = i * hc_mult + j
-            acc = acc + comb[:, k:k + 1] * old_bf[i].astype(jnp.float32)
+            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
         # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
         # bf16 residual that post stored, and parity requires matching it.
         new_bf = acc.astype(jnp.bfloat16)
-        newres_ref[:, j * hidden_size:(j + 1) * hidden_size] = new_bf
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
         streams_bf.append(new_bf)
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    dn = (((1, ), (1, )), ((), ()))
-    acc = jax.lax.dot_general(g_bf,
-                              fn_hi_ref[...],
-                              dn,
-                              preferred_element_type=jnp.float32)
+    dn = (((1,), (1,)), ((), ()))
+    acc = jax.lax.dot_general(
+        g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
+    )
     if gemm_precision == "highest":
         acc = acc + jax.lax.dot_general(
-            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32)
+            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+        )
         acc = acc + jax.lax.dot_general(
-            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32)
+            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+        )
     mixes_ref[...] = acc
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
@@ -72,18 +88,23 @@ def _fused_kernel(x_ref, res_ref, post_ref, comb_ref, fn_hi_ref, fn_mid_ref,
 
     m, h = hc_mult, hidden_size
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
-    pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + \
-        hc_pre_eps
+    pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
     lay = pre_mix[:, 0:1] * gf[:, :h]
     for i in range(1, m):
-        lay = lay + pre_mix[:, i:i + 1] * gf[:, i * h:(i + 1) * h]
+        lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("rms_eps", "hc_pre_eps",
-                                    "token_block_size", "gemm_precision",
-                                    "vmem_limit_bytes"))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "rms_eps",
+        "hc_pre_eps",
+        "token_block_size",
+        "gemm_precision",
+        "vmem_limit_bytes",
+    ),
+)
 def fused_post_pre_mixes(
     x2d: jax.Array,
     res2d: jax.Array,
@@ -146,28 +167,29 @@ def fused_post_pre_mixes(
     # This kernel keeps a fixed block: its default (32) already fits the
     # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
-    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d,
-                                              post2d, comb2d)
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel", ),
+        dimension_semantics=("parallel",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
-        functools.partial(_fused_kernel,
-                          hc_mult=hc_mult,
-                          hidden_size=hidden_size,
-                          gemm_precision=gemm_precision,
-                          rms_eps=rms_eps,
-                          hc_pre_eps=hc_pre_eps),
-        grid=(padded_tokens // tb, ),
+        functools.partial(
+            _fused_kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            gemm_precision=gemm_precision,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+        ),
+        grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
@@ -243,10 +265,22 @@ def mhc_fused_post_pre(
         vmem_limit_bytes=vmem_limit_bytes,
     )
     _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
-        mixes, sqrsum, hc_mult, hidden_size, hc_scale, hc_base, rms_eps,
-        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
 
-    return (new_res2d.reshape(*outer_shape, hc_mult, hidden_size),
-            post_mix_cur.reshape(*outer_shape, hc_mult, 1),
-            comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
-            layer_input_cur.reshape(*outer_shape, hidden_size))
+    return (
+        new_res2d.reshape(*outer_shape, hc_mult, hidden_size),
+        post_mix_cur.reshape(*outer_shape, hc_mult, 1),
+        comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
+        layer_input_cur.reshape(*outer_shape, hidden_size),
+    )

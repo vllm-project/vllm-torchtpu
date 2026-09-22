@@ -31,8 +31,6 @@ repos:
       # kernels/experimental
       |src/vllm_torchtpu/kernels/experimental/
 
-      # kernels/deepseek_v4
-      |src/vllm_torchtpu/kernels/deepseek_v4/
 
       # kernels: fused_moe, gdn, kimi_k3
       |src/vllm_torchtpu/kernels/fused_moe/

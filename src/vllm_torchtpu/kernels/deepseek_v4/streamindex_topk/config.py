@@ -8,10 +8,10 @@ import threading
 class MlaCase(enum.Enum):
     """Represents the different cases for MLA.
 
-  - DECODE: Sequences are in decode-only mode (q_len = 1).
-  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
-  - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
-  """
+    - DECODE: Sequences are in decode-only mode (q_len = 1).
+    - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
+    - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
+    """
 
     DECODE = 0
     PREFILL = 1
@@ -29,25 +29,25 @@ class MlaCase(enum.Enum):
 class KVLayout(enum.Enum):
     """Memory layout of the packed FP8 index KV cache.
 
-  - HEAD_ALONG_SUBLANE: `[pages, page_size // packing, packing, width]`.
-    Tokens live on the sublane dimension and the `head_dim` features live on
-    the lane dimension. Because per-token quantization appends a UE8M0 scale
-    byte after the `head_dim` FP8 bytes, `width` must be padded up to a
-    multiple of the 128-lane register width. For `head_dim=128` that means 129
-    useful bytes are stored in 256, i.e. **half of the HBM traffic is padding**
-    and the kernel can never exceed ~0.5 of the HBM roofline.
+    - HEAD_ALONG_SUBLANE: `[pages, page_size // packing, packing, width]`.
+      Tokens live on the sublane dimension and the `head_dim` features live on
+      the lane dimension. Because per-token quantization appends a UE8M0 scale
+      byte after the `head_dim` FP8 bytes, `width` must be padded up to a
+      multiple of the 128-lane register width. For `head_dim=128` that means 129
+      useful bytes are stored in 256, i.e. **half of the HBM traffic is padding**
+      and the kernel can never exceed ~0.5 of the HBM roofline.
 
-  - SEQ_ALONG_LANE: `[pages, head_dim // packing + 1, packing, page_size]`.
-    The sequence is packed along the lane dimension and `head_dim` lives on the
-    sublane dimension, so the per-token scale only needs to grow the *sublane*
-    count. One extra packed sublane group (`packing` rows, of which the first
-    holds the UE8M0 scale) is enough, giving `head_dim + packing` bytes per
-    token (132 instead of 256 for `head_dim=128`).
+    - SEQ_ALONG_LANE: `[pages, head_dim // packing + 1, packing, page_size]`.
+      The sequence is packed along the lane dimension and `head_dim` lives on the
+      sublane dimension, so the per-token scale only needs to grow the *sublane*
+      count. One extra packed sublane group (`packing` rows, of which the first
+      holds the UE8M0 scale) is enough, giving `head_dim + packing` bytes per
+      token (132 instead of 256 for `head_dim=128`).
 
-    This also makes the QK product the MXU-native `[n, d] x [d, m]` form and
-    yields the per-token scales directly as a `[1, bkv_sz]` row vector, so the
-    lane broadcast of the dequantization scale becomes free.
-  """
+      This also makes the QK product the MXU-native `[n, d] x [d, m]` form and
+      yields the per-token scales directly as a `[1, bkv_sz]` row vector, so the
+      lane broadcast of the dequantization scale becomes free.
+    """
 
     HEAD_ALONG_SUBLANE = 0
     SEQ_ALONG_LANE = 1
@@ -89,14 +89,14 @@ _scheduling_group_ids_lock = threading.Lock()
 def reserve_scheduling_group_ids(count: int) -> int:
     """Reserves `count` scheduling group ids nobody else in this process gets.
 
-  Args:
-    count: Number of ids wanted; a pipeline over `n` chunks uses `n - 1` of them
-      (chunk 0's TensorCore compute and the last chunk's SparseCore compute are
-      not annotated).
+    Args:
+      count: Number of ids wanted; a pipeline over `n` chunks uses `n - 1` of them
+        (chunk 0's TensorCore compute and the last chunk's SparseCore compute are
+        not annotated).
 
-  Returns:
-    The first id; the caller owns `[first, first + count)`.
-  """
+    Returns:
+      The first id; the caller owns `[first, first + count)`.
+    """
     if count < 1:
         raise ValueError(f"count ({count}) must be positive.")
     with _scheduling_group_ids_lock:

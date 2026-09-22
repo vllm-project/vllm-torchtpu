@@ -58,7 +58,6 @@ class _BufferedRef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CosSinRef(_BufferedRef):
-
     def copy_in(self, src_ref, grid_indices):
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
@@ -76,8 +75,9 @@ class CosSinRef(_BufferedRef):
             position = positions_ref[global_idx]
             compressed_pos = (position // compress_ratio) * compress_ratio
 
-            src = cos_sin_cache_ref.at[compressed_pos,
-                                       pl.ds(0, self.window_ref.shape[-1])]
+            src = cos_sin_cache_ref.at[
+                compressed_pos, pl.ds(0, self.window_ref.shape[-1])
+            ]
             dest = dest_ref.at[i, :]
             pltpu.make_async_copy(src, dest, sem).start()
 
@@ -123,11 +123,9 @@ class PageBufferRef(_BufferedRef):
             position = positions_ref[idx_n]
             req_idx = token_to_req_indices_ref[idx_n]
 
-            block_idx = position // block_size - (pages_to_buffer_per_token -
-                                                  1) + p
+            block_idx = position // block_size - (pages_to_buffer_per_token - 1) + p
             safe_block_idx = jnp.maximum(block_idx, 0)
-            page = block_table_ref[req_idx * block_table_stride +
-                                   safe_block_idx]
+            page = block_table_ref[req_idx * block_table_stride + safe_block_idx]
 
             src = state_cache_ref.at[page, :, :, :]
             dest = page_buffer_ref.at[n, p, :, :, :]
@@ -170,8 +168,7 @@ class OutputRef(_BufferedRef):
             def _read_nope():
                 p = kv_slot // page_size
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot %
-                         page_size) // (self.cfgs.tokens_in_second_minor)
+                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
                 src = cache_ref.at[p, s_row, :, :]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -222,12 +219,14 @@ class OutputRef(_BufferedRef):
                 def _write_nope():
                     p = kv_slot // self.cfgs.kv_block_size
                     s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor)
+                        self.cfgs.tokens_in_second_minor
+                    )
                     src = src_ref.at[n, 0, :, :]
                     dest = cache_ref.at[p, s_row, :, :]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
             cache_ref, kv_slot_mapping_ref = dest_ref
+
             # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages, kv_block_size, 4, 128] uint8
             @pl.loop(0, tile_n)
@@ -283,7 +282,6 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _wait_nope():
-
                     @pl.loop(0, self.cfgs.record_rows, unroll=True)
                     def wait_loop(o):
                         pltpu.make_async_copy(
@@ -421,16 +419,14 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-        tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef
-              | None],
-        tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec
-              | None],
-        tuple[
-            tuple[Any, ...] | None,
-            tuple[Any, ...],
-            tuple[Any, ...],
-            tuple[Any, ...] | None,
-        ],
+    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
+    tuple[
+        tuple[Any, ...] | None,
+        tuple[Any, ...],
+        tuple[Any, ...],
+        tuple[Any, ...] | None,
+    ],
 ]:
     # cos_sin
     if cfgs.dims.has_rope:
@@ -459,8 +455,9 @@ def create_allocs_and_specs(
         index_map=lambda i: (i, 0, 0, 0),
     )
     is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
-    buffer_type = (pltpu.BufferType.INPUT_OUTPUT
-                   if is_indexer else pltpu.BufferType.OUTPUT)
+    buffer_type = (
+        pltpu.BufferType.INPUT_OUTPUT if is_indexer else pltpu.BufferType.OUTPUT
+    )
     output_alloc = OutputRef.create(
         spec=output_spec,
         dtype_or_type=jnp.uint8,
@@ -511,8 +508,7 @@ def create_allocs_and_specs(
             use_lookahead=False,
             cfgs=cfgs,
         )
-        rope_args = (rope_cache_ref, kv_slot_mapping_ref,
-                     is_first_mask_rope_ref)
+        rope_args = (rope_cache_ref, kv_slot_mapping_ref, is_first_mask_rope_ref)
     else:
         rope_alloc = rope_spec = rope_args = None
 
