@@ -67,7 +67,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def get_torch_device(cls, _local_rank: int | None = None) -> torch.device:
@@ -83,7 +83,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def empty_cache(cls) -> None:
