@@ -2992,7 +2992,8 @@ class TPUModelRunner(GPUModelRunner):
                     ModelInputSnapshot
                 model_kwargs = self.model_adapter.prepare_inputs(
                     ModelInputSnapshot(step_token_store, start_index, num_reqs,
-                                       num_tokens_padded, attn_metadata))
+                                       num_tokens_padded, attn_metadata,
+                                       input_ids))
 
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:

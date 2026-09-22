@@ -37,9 +37,13 @@ class Qwen4ExpAdapter:
         self.runner = runner
         self.cache = None
         self.token_store = None
+        self.host_ple = None
 
     def bind_model(self, model):
         self.cache = Qwen4ExpCache(self.runner, model)
+        ple = model.model.layers[1].ple
+        if ple.cpu_offload:
+            self.host_ple = ple
 
     def get_kv_cache_spec(self):
         return self.cache.get_specs()
@@ -77,15 +81,23 @@ class Qwen4ExpAdapter:
             table = snapshot.attention_metadata[name].block_tables.reshape(
                 rows, -1)
             tables.append(table)
-        return dict(query_start_loc=starts,
-                    ngram_context=history,
-                    state_slots=slots,
-                    context_lens=context,
-                    valid_tokens=torch.arange(snapshot.num_tokens,
-                                              device=runner.device)
-                    < starts[-1],
-                    main_block_table=tables[0],
-                    compressed_block_table=tables[1])
+        kwargs = dict(query_start_loc=starts,
+                      ngram_context=history,
+                      state_slots=slots,
+                      context_lens=context,
+                      valid_tokens=torch.arange(snapshot.num_tokens,
+                                                device=runner.device)
+                      < starts[-1],
+                      main_block_table=tables[0],
+                      compressed_block_table=tables[1])
+        self._prepare_host(snapshot.input_ids, kwargs)
+        return kwargs
+
+    def _prepare_host(self, input_ids, kwargs):
+        if self.host_ple is not None:
+            kwargs["ple_raw_embeddings"] = self.host_ple.prepare_host(
+                input_ids, kwargs["query_start_loc"], kwargs["ngram_context"],
+                kwargs["valid_tokens"])
 
     def dummy_run(self,
                   num_tokens,
@@ -222,6 +234,7 @@ class Qwen4ExpAdapter:
                        dp_lockstep=False):
         runner = self.runner
         per_layer = {name: metadata for name in self.cache.specs}
+        self._prepare_host(ids, kwargs)
         with set_forward_context(per_layer, runner.vllm_config, num_tokens=num_tokens,
                                  num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens)), \
                 set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=runner.vllm_config):

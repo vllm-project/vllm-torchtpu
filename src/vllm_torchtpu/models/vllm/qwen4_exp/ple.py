@@ -3,6 +3,7 @@
 import re
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 from torch import nn
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
@@ -10,6 +11,7 @@ from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm_torchtpu.kernels.qwen4_exp import ple as ple_kernels
 
 from .parallel import PLEParallel
+from .ple_host import SharedPLETable
 
 
 class ResidentPLEEmbedding(nn.Module):
@@ -114,27 +116,32 @@ class ResidentPLEEmbedding(nn.Module):
                                                 tp_end=self.vocab_start +
                                                 self.local_rows)
             if overlap is not None:
-                if self._staging is None:
-                    self._staging = torch.empty((self.local_rows, 160),
-                                                dtype=carrier,
-                                                device="cpu")
                 source = tensor.detach().narrow(
                     0, overlap.source_start, overlap.row_count).view(carrier)
-                self._staging.narrow(0, overlap.destination_start,
-                                     overlap.row_count).copy_(source)
+                self._copy_rows(source, overlap.destination_start, carrier)
             self._shards.add(index)
             loaded.add(name)
         return loaded
 
-    def finalize_weights(self):
-        if self._finalized:
-            return
+    def _copy_rows(self, source, start, carrier):
+        if self._staging is None:
+            self._staging = torch.empty((self.local_rows, 160),
+                                        dtype=carrier,
+                                        device="cpu")
+        self._staging.narrow(0, start, source.shape[0]).copy_(source)
+
+    def _validate_checkpoint(self):
         missing = set(range(self.checkpoint_shards)) - self._shards
         if missing:
             raise ValueError(
                 f"Missing PLE checkpoint shards: {sorted(missing)}")
         if self._weight_dtype == torch.float8_e4m3fn and self._scale is None:
             raise ValueError("Missing PLE global weight_scale")
+
+    def finalize_weights(self):
+        if self._finalized:
+            return
+        self._validate_checkpoint()
         assert self._staging is not None, "Complete checkpoint must cover this TP range"
         self.table = self._staging.reshape(-1,
                                            128).to(device=self.table.device)
@@ -163,18 +170,109 @@ class ResidentPLEEmbedding(nn.Module):
         return self._decode(raw_embeddings, self.weight_scale)
 
 
+class HostPLEEmbedding(ResidentPLEEmbedding):
+    """Reuse checkpoint validation while retaining row160 storage on the CPU.
+
+    Only the small scale buffer belongs to the device computation. Host lookup
+    returns integer bits; the adapter owns their explicit device transfer.
+    """
+
+    def __init__(self, *, shared=None, **kwargs):
+        super().__init__(**kwargs)
+        self._shared_config = shared
+        self._shared_table = None
+
+    def _copy_rows(self, source, start, carrier):
+        if self._shared_config is None:
+            return super()._copy_rows(source, start, carrier)
+        if self._shared_table is None:
+            options = self._shared_config
+            self._shared_table = SharedPLETable(
+                directory=options["directory"],
+                key=options["key"],
+                identity=dict(options["identity"],
+                              dtype=str(self._weight_dtype),
+                              rows=self.local_rows,
+                              start=self.vocab_start),
+                nbytes=self.local_rows * 160 * source.element_size(),
+                participants=options["participants"])
+        if self._shared_table.is_writer:
+            # The shard intersection is contiguous row160, with no table-sized
+            # staging copy and no floating-point conversion.
+            value = source.cpu().numpy().view(np.uint8).reshape(-1)
+            self._shared_table.write(start * 160 * source.element_size(),
+                                     value)
+
+    def finalize_weights(self):
+        if self._finalized:
+            return
+        self._validate_checkpoint()
+        if self._shared_config is None:
+            assert self._staging is not None, "Checkpoint must cover the host range"
+        else:
+            assert self._shared_table is not None, "Checkpoint must cover the shared range"
+            scale_bits = (None if self._scale is None else int(
+                self._scale.view(torch.int16)[0]))
+            self._shared_table.finish(metadata=dict(scale_bits=scale_bits))
+        if self._scale is None:
+            self.weight_scale.fill_(1)
+        else:
+            self.weight_scale.copy_(self._scale)
+        self._scale = None
+        self._decode = ple_kernels.build_decode_op()
+        self._finalized = True
+
+    def lookup_host(self, ids):
+        assert self._finalized, "Host PLE must be finalized before lookup"
+        indices = ids.numpy().reshape(-1)
+        owned = ((indices >= self.vocab_start)
+                 & (indices < self.vocab_start + self.local_rows))
+        dtype = np.int16 if self._weight_dtype == torch.bfloat16 else np.uint8
+        output = np.zeros((indices.size, 160), dtype=dtype)
+        rows = indices[owned] - self.vocab_start
+        if self._shared_table is None:
+            output[owned] = self._staging.numpy()[rows]
+        else:
+            with self._shared_table.buffer() as buffer:
+                output[owned] = np.frombuffer(buffer, dtype=dtype).reshape(
+                    self.local_rows, 160)[rows]
+        raw = torch.from_numpy(output)
+        if self._weight_dtype == torch.float8_e4m3fn:
+            raw = raw.view(torch.int8)
+        return raw.reshape(ids.shape[0], 2560)
+
+    def close(self):
+        self._staging = None
+        if self._shared_table is not None:
+            self._shared_table.close()
+            self._shared_table = None
+        self._finalized = False
+
+
 class _HashEmbedding(nn.Module):
 
-    def __init__(self, tp_rank, tp_size, device):
+    def __init__(self,
+                 tp_rank,
+                 tp_size,
+                 device,
+                 *,
+                 cpu_offload=False,
+                 shared=None):
         super().__init__()
         for name, size in (("layer_multipliers", 3), ("ngram_heads_offsets",
                                                       16),
                            ("ngram_heads_vocab_sizes", 16)):
             self.register_buffer(
                 name, torch.empty(size, dtype=torch.int64, device=device))
-        self.ngram_embedding = ResidentPLEEmbedding(tp_rank=tp_rank,
+        if cpu_offload:
+            self.ngram_embedding = HostPLEEmbedding(tp_rank=tp_rank,
                                                     tp_size=tp_size,
-                                                    device=device)
+                                                    device=device,
+                                                    shared=shared)
+        else:
+            self.ngram_embedding = ResidentPLEEmbedding(tp_rank=tp_rank,
+                                                        tp_size=tp_size,
+                                                        device=device)
 
     def forward(self, tokens, starts, context, eos_token_id, valid_tokens):
         ids = ple_kernels.compute_ngram_ids(tokens,
@@ -214,12 +312,18 @@ class Qwen4ExpPLE(nn.Module):
                  parallel: PLEParallel,
                  device=None,
                  prefix: str = "",
-                 eos_token_id: int = 248044):
+                 eos_token_id: int = 248044,
+                 cpu_offload: bool = False,
+                 shared=None):
         super().__init__()
         self.parallel = parallel
+        self.cpu_offload = cpu_offload
         self.prefix, self.eos_token_id = prefix, eos_token_id
-        self.ple_embedding = _HashEmbedding(parallel.rank, parallel.world_size,
-                                            device)
+        self.ple_embedding = _HashEmbedding(parallel.rank,
+                                            parallel.world_size,
+                                            device,
+                                            cpu_offload=cpu_offload,
+                                            shared=shared)
         self.key_proj = nn.Linear(2560,
                                   10240,
                                   bias=False,
@@ -244,6 +348,7 @@ class Qwen4ExpPLE(nn.Module):
         self._finalized = False
         self._values = None
         self._conv = None
+        self._host_ids = None
 
     def get_state_shape(self):
         return (9, 10240),
@@ -308,16 +413,49 @@ class Qwen4ExpPLE(nn.Module):
         ), ple_kernels.build_short_conv_op()
         self._finalized = True
 
-    def forward(self, hidden_states, input_ids, query_start_loc, ngram_context,
-                state_indices, has_initial_states, valid_tokens):
+        if self.cpu_offload:
+            self._host_ids = torch.compile(self._prepare_host_ids,
+                                           backend="tpu",
+                                           fullgraph=True,
+                                           dynamic=False)
+
+    def _prepare_host_ids(self, input_ids, starts, context, valid_tokens):
+        ids = self.ple_embedding(input_ids, starts, context, self.eos_token_id,
+                                 valid_tokens)
+        return self.parallel.gather_ids(ids)
+
+    def prepare_host(self, input_ids, starts, context, valid_tokens):
+        """Finish ID D2H, gather immutable CPU rows, transfer only this batch."""
+        ids = self._host_ids(input_ids, starts, context, valid_tokens).cpu()
+        raw = self.ple_embedding.ngram_embedding.lookup_host(ids)
+        # vLLM specializes every free shape symbol to the local token bucket.
+        # Keep DP static and expose only T, never an independent D*T symbol.
+        return raw.reshape(-1, input_ids.shape[0], 2560).to(input_ids.device)
+
+    def forward(self,
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                state_indices,
+                has_initial_states,
+                valid_tokens,
+                ple_raw_embeddings=None):
         assert self._finalized, "PLE finalize_weights must run before inference"
         assert len(
             self.kv_cache) == 1, "PLE history must be bound before inference"
-        ids = self.ple_embedding(input_ids, query_start_loc, ngram_context,
-                                 self.eos_token_id, valid_tokens)
-        ids = self.parallel.gather_ids(ids)
         embedding = self.ple_embedding.ngram_embedding
-        raw = embedding.lookup_raw(ids)
+        if self.cpu_offload:
+            assert ple_raw_embeddings is not None, "Host PLE requires prepared raw rows"
+            # Collectives mutate dtype views. Own their buffer inside the
+            # compiled graph: mutating an external INT16 argument through an
+            # INT32 view corrupts the mixed TP/DP graph's input update.
+            raw = ple_raw_embeddings.reshape(-1, 2560).clone()
+        else:
+            ids = self.ple_embedding(input_ids, query_start_loc, ngram_context,
+                                     self.eos_token_id, valid_tokens)
+            ids = self.parallel.gather_ids(ids)
+            raw = embedding.lookup_raw(ids)
         raw = self.parallel.combine(raw, input_ids.shape[0])
         embeddings = embedding.decode(raw)
         gated, normalized = self._values(embeddings, hidden_states,

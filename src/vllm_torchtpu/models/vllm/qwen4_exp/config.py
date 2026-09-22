@@ -8,6 +8,8 @@ from vllm.model_executor.models.config import (Qwen4ExpForCausalLMConfig,
 
 from vllm_torchtpu import envs
 
+from .ple_host import host_available_memory
+
 
 def native_cache_capacity(context: int,
                           seqs: int,
@@ -37,6 +39,17 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
         # mrope even though this class truthfully does not support vision.
         Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
         validate_config(vllm_config)
+        qwen = vllm_config.additional_config.get("qwen4_exp", {})
+        if qwen.get("engram_config", {}).get("dp_shared_memory", False):
+            # This hook runs before engine copies / TPU worker DP collapse.
+            # Runtime-only ModelConfig attributes survive deepcopy/pickling
+            # but are outside its dataclass hash factors. A launch identity
+            # in additional_config would invalidate compilation caches.
+            vllm_config.model_config._qwen4_exp_ple_host_launch = dict(
+                instance=vllm_config.instance_id,
+                participants=vllm_config.parallel_config.data_parallel_size,
+                checkpoint=vllm_config.model_config.model,
+                revision=vllm_config.model_config.revision)
         vllm_config.cache_config.kv_cache_layout = "BLHNC"
         pages = native_cache_capacity(
             vllm_config.model_config.max_model_len,
@@ -148,8 +161,28 @@ def validate_config(cfg):
     for flag in ("cpu_offload", "embedding_across_dp", "dp_shared_memory"):
         if type(engram.get(flag, False)) is not bool:
             raise ValueError(f"Qwen4Exp engram_config.{flag} must be bool")
-    if engram.get("cpu_offload", False) or engram.get("dp_shared_memory",
-                                                      False):
+    offload = engram.get("cpu_offload", False)
+    shared = engram.get("dp_shared_memory", False)
+    across = engram.get("embedding_across_dp", False)
+    if shared and not offload:
+        raise ValueError("Qwen4Exp dp_shared_memory requires cpu_offload")
+    if shared and (across or p.data_parallel_size <= 1 or p.nnodes != 1
+                   or p.data_parallel_size_local != p.data_parallel_size):
         raise ValueError(
-            "Qwen4Exp TPU requires resident PLE; host offload/shared memory is unsupported"
+            "Qwen4Exp shared PLE requires local DP>1, one host, and embedding_across_dp=false"
         )
+    if offload:
+        if p.nnodes != 1 or p.data_parallel_size_local != p.data_parallel_size:
+            raise ValueError("Qwen4Exp host PLE requires local DP on one host")
+        # BF16 upper bound, including all DP replicas for private TP tables.
+        # The 8-worker loader has measured ~135GiB of aggregate peak RSS
+        # beyond PLE staging; reserve160GiB as a conservative launch allowance.
+        copies = 1 if shared or across else p.data_parallel_size
+        required = 320001536 * 160 * 2 * copies + 160 * 1024**3
+        available = host_available_memory()
+        if required > available:
+            raise ValueError(
+                f"Qwen4Exp host PLE capacity estimate needs {required} bytes "
+                f"including loader allowance; only {available} bytes available. "
+                "Use dp_shared_memory or embedding_across_dp to avoid DP replicas."
+            )

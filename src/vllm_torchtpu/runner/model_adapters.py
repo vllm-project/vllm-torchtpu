@@ -18,6 +18,7 @@ class ModelInputSnapshot:
     num_requests: int
     num_tokens: int
     attention_metadata: dict[str, Any]
+    input_ids: torch.Tensor
 
 
 class ModelAdapter(Protocol):

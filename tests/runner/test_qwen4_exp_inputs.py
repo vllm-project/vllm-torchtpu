@@ -12,7 +12,8 @@ from vllm_torchtpu.runner.model_adapters import (ModelInputSnapshot,
                                                  select_model_adapter)
 
 
-def test_reordered_history_slots_and_group_tables_are_independent():
+@pytest.mark.parametrize('offload', [False, True])
+def test_reordered_history_slots_and_group_tables_are_independent(offload):
     store = torch.tensor(
         [[90, 91, 92, 93], [20, 21, 22, 23], [30, 31, 32, 33]],
         dtype=torch.int32)
@@ -21,6 +22,11 @@ def test_reordered_history_slots_and_group_tables_are_independent():
              mamba_state_indices=torch.tensor([7, 2, 0], dtype=torch.int32))
     runner = NS(device='cpu', _attn_metadata_builder_ctx=ctx)
     adapter = Qwen4ExpAdapter(runner)
+    device_ids = torch.tensor([999, 21, 22, 23, 0, 0, 0, 0], dtype=torch.int32)
+    raw = torch.zeros((8, 2560), dtype=torch.int16)
+    if offload:
+        adapter.host_ple = Mock()
+        adapter.host_ple.prepare_host.return_value = raw
     metadata = {
         'model.layers.3.self_attn':
         NS(block_tables=torch.tensor([11, 12, 21, 22, 0, 0])),
@@ -28,7 +34,7 @@ def test_reordered_history_slots_and_group_tables_are_independent():
         NS(block_tables=torch.tensor([31, 32, 41, 42, 0, 0]))
     }
     actual = adapter.prepare_inputs(
-        ModelInputSnapshot(store, 0, 2, 8, metadata))
+        ModelInputSnapshot(store, 0, 2, 8, metadata, device_ids))
     assert actual['ngram_context'].tolist() == [[91, 92], [248044, 20],
                                                 [248044, 248044]]
     assert actual['state_slots'].tolist() == [7, 2, -1]
@@ -36,6 +42,15 @@ def test_reordered_history_slots_and_group_tables_are_independent():
     assert actual['compressed_block_table'].tolist()[0] == [31, 32]
     assert actual['valid_tokens'].tolist() == [True] * 4 + [False] * 4
     assert actual['query_start_loc'] is ctx.query_start_loc
+    if offload:
+        # Async sampling may leave the CPU current-token slot stale. PLE
+        # consumes the substituted device IDs, plus the committed prefix.
+        assert actual['ple_raw_embeddings'] is raw
+        args = adapter.host_ple.prepare_host.call_args.args
+        assert args[0] is device_ids
+        assert args[2].tolist() == [[91, 92], [248044, 20], [248044, 248044]]
+    else:
+        assert 'ple_raw_embeddings' not in actual
 
 
 @pytest.mark.parametrize('tokens,rows,limit', [(128, 8, 1), (128, 8, 8),
@@ -64,8 +79,9 @@ def test_old_model_has_no_adapter():
 
 
 @pytest.mark.parametrize('tp', [1, 2])
+@pytest.mark.parametrize('offload', [False, True])
 def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
-        monkeypatch, tp):
+        monkeypatch, tp, offload):
     from contextlib import nullcontext
 
     from vllm_torchtpu.models.vllm.qwen4_exp import inputs
@@ -100,6 +116,8 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
                 forward_model=forward,
                 compute_selected_logits=logits)
     adapter = Qwen4ExpAdapter(runner)
+    if offload:
+        adapter.host_ple = Mock()
     allocations = []
     adapter.cache = NS(allocate=lambda: allocations.append(True),
                        pages=44,
@@ -122,6 +140,12 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     assert kwargs['main_block_table'].max().item() == 1
     assert adapter.token_store.shape == (8, 4096)
     assert kwargs['ngram_context'].tolist() == [[248044, 248044]] * 8
+    if offload:
+        assert kwargs[
+            'ple_raw_embeddings'] is adapter.host_ple.prepare_host.return_value
+        args = adapter.host_ple.prepare_host.call_args.args
+        assert args[0] is captured['input_ids']
+        assert args[3].all()
     logits.assert_not_called()
     runner.input_batch.num_reqs = 1
     with pytest.raises(AssertionError, match='no live requests'):
@@ -151,6 +175,10 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(
     assert not kwargs['valid_tokens'].any()
     assert kwargs['state_slots'].tolist() == [-1] * 8
     assert kwargs['ngram_context'].tolist() == [[248044, 248044]] * 8
+    if offload:
+        assert adapter.host_ple.prepare_host.call_count == 2
+        args = adapter.host_ple.prepare_host.call_args.args
+        assert not args[0].any() and not args[3].any()
     for value in (kwargs['query_start_loc'], kwargs['context_lens'],
                   kwargs['main_block_table'], kwargs['compressed_block_table'],
                   md.seq_lens, md.request_distribution,

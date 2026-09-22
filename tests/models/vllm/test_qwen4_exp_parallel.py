@@ -63,6 +63,8 @@ def config(tp=1, dp=8):
                               max_model_len=8192),
               parallel_config=NS(tensor_parallel_size=tp,
                                  data_parallel_size=dp,
+                                 data_parallel_size_local=dp,
+                                 nnodes=1,
                                  enable_expert_parallel=True,
                                  pipeline_parallel_size=1,
                                  prefill_context_parallel_size=1,
@@ -160,11 +162,87 @@ def test_model_admission_precedes_tpu_sequence_parallel_normalization(tp, dp):
     validate_config(cfg)
 
 
-@pytest.mark.parametrize('flag', ['cpu_offload', 'dp_shared_memory'])
-def test_host_flags_are_not_resident_sharding_switches(flag):
+def test_shared_host_requires_explicit_offload():
     cfg = config()
-    cfg.additional_config = {'qwen4_exp': {'engram_config': {flag: True}}}
-    with pytest.raises(ValueError, match='host offload/shared memory'):
+    cfg.additional_config = {
+        'qwen4_exp': {
+            'engram_config': {
+                'dp_shared_memory': True
+            }
+        }
+    }
+    with pytest.raises(ValueError,
+                       match='dp_shared_memory requires cpu_offload'):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize('shared,across', [(False, False), (False, True),
+                                           (True, False)])
+def test_host_configuration_keeps_ownership_modes_explicit(
+        monkeypatch, shared, across):
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as admission
+    monkeypatch.setattr(admission, 'host_available_memory',
+                        lambda: 2 * 1024**4)
+    cfg = config()
+    cfg.additional_config = {
+        'qwen4_exp': {
+            'engram_config':
+            dict(cpu_offload=True,
+                 dp_shared_memory=shared,
+                 embedding_across_dp=across)
+        }
+    }
+    validate_config(cfg)
+
+
+@pytest.mark.parametrize('invalid', ['across', 'remote', 'singleton'])
+def test_shared_host_rejects_ambiguous_or_nonlocal_participants(invalid):
+    cfg = config(8, 1) if invalid == 'singleton' else config()
+    cfg.additional_config = {
+        'qwen4_exp': {
+            'engram_config':
+            dict(cpu_offload=True,
+                 dp_shared_memory=True,
+                 embedding_across_dp=invalid == 'across')
+        }
+    }
+    if invalid == 'remote':
+        cfg.parallel_config.data_parallel_size_local = 4
+    with pytest.raises(ValueError, match='shared PLE requires'):
+        validate_config(cfg)
+
+
+def test_private_host_replicas_are_checked_against_host_capacity(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as admission
+    monkeypatch.setattr(admission, 'host_available_memory',
+                        lambda: 850 * 1024**3)
+    cfg = config()
+    cfg.additional_config = {
+        'qwen4_exp': {
+            'engram_config': {
+                'cpu_offload': True
+            }
+        }
+    }
+    with pytest.raises(ValueError, match='host PLE capacity'):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize('across', [False, True])
+def test_private_host_offload_rejects_unvalidated_multihost(
+        monkeypatch, across):
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as admission
+    monkeypatch.setattr(admission, 'host_available_memory',
+                        lambda: 2 * 1024**4)
+    cfg = config()
+    cfg.parallel_config.nnodes = 2
+    cfg.parallel_config.data_parallel_size_local = 4
+    cfg.additional_config = {
+        'qwen4_exp': {
+            'engram_config': dict(cpu_offload=True, embedding_across_dp=across)
+        }
+    }
+    with pytest.raises(ValueError, match='host PLE requires.*one host'):
         validate_config(cfg)
 
 

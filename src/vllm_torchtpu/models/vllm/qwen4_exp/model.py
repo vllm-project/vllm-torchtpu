@@ -19,6 +19,7 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .moe import Qwen4ExpSparseMoeBlock
 from .parallel import PLEParallel
 from .ple import Qwen4ExpPLE
+from .ple_host import shared_ple_options
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
 
@@ -39,13 +40,18 @@ class Qwen4ExpDecoderLayer(nn.Module):
         tp, ep = get_tp_group(), get_ep_group()
         engram = cfg.additional_config.get("qwen4_exp",
                                            {}).get("engram_config", {})
-        self.ple = (Qwen4ExpPLE(
-            parallel=PLEParallel(tp,
-                                 get_dp_group(),
-                                 embedding_across_dp=engram.get(
-                                     "embedding_across_dp", False)),
-            prefix=prefix + ".ple",
-            eos_token_id=t.eos_token_id) if index == 1 else None)
+        shared = (shared_ple_options(cfg.model_config, prefix +
+                                     ".ple", tp.rank_in_group, tp.world_size)
+                  if index == 1 and engram.get("dp_shared_memory", False) else
+                  None)
+        self.ple = (Qwen4ExpPLE(parallel=PLEParallel(
+            tp,
+            get_dp_group(),
+            embedding_across_dp=engram.get("embedding_across_dp", False)),
+                                prefix=prefix + ".ple",
+                                eos_token_id=t.eos_token_id,
+                                cpu_offload=engram.get("cpu_offload", False),
+                                shared=shared) if index == 1 else None)
         self.layer_type = t.layer_types[index]
         if self.layer_type == "linear_attention":
             dense_cfg = copy.copy(cfg)
@@ -73,13 +79,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(hc_config(t))
         self.mlp_hyper_connection = GatedResidual(hc_config(t))
 
-    def forward(self, hidden, positions, input_ids, query_start_loc,
-                ngram_context, state_slots, context_lens, valid_tokens,
-                main_block_table, compressed_block_table):
+    def forward(self,
+                hidden,
+                positions,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                state_slots,
+                context_lens,
+                valid_tokens,
+                main_block_table,
+                compressed_block_table,
+                ple_raw_embeddings=None):
         if self.ple is not None:
             hidden = hidden + self.ple(hidden, input_ids, query_start_loc,
                                        ngram_context, state_slots, context_lens
-                                       > 0, valid_tokens)
+                                       > 0, valid_tokens, ple_raw_embeddings)
         block, residual = self.attn_hyper_connection.mix(hidden)
         if self.layer_type == "linear_attention":
             block = self.linear_attn(block)
@@ -94,12 +109,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
                                                  residual)
 
 
-@support_torch_compile(dynamic_arg_dims={
-    "input_ids": 0,
-    "positions": 0,
-    "inputs_embeds": 0,
-    "valid_tokens": 0
-})
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+        "ple_raw_embeddings": 1
+    })
 class Qwen4ExpBackbone(nn.Module):
 
     def __init__(self, cfg):
@@ -125,7 +142,8 @@ class Qwen4ExpBackbone(nn.Module):
                 context_lens,
                 valid_tokens,
                 main_block_table,
-                compressed_block_table):
+                compressed_block_table,
+                ple_raw_embeddings=None):
         hidden = self.embed_tokens(
             input_ids) if inputs_embeds is None else inputs_embeds
         hidden = hidden.repeat(1, 4)
@@ -134,7 +152,7 @@ class Qwen4ExpBackbone(nn.Module):
                            input_ids.to(torch.int64), query_start_loc,
                            ngram_context, state_slots, context_lens,
                            valid_tokens, main_block_table,
-                           compressed_block_table)
+                           compressed_block_table, ple_raw_embeddings)
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
