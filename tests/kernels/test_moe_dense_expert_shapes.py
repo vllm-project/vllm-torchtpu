@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.megablox import moe_dense_expert as kernel
+from vllm_torchtpu.kernels.experimental import moe_dense_expert as kernel
 
 
 @pytest.mark.parametrize('capacity_mib, expected', [(128, 3), (64, 3), (48, 2),
