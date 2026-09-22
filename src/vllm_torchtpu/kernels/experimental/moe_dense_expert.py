@@ -159,7 +159,7 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
         for initial in range(num_buffers - 1):
 
             @pl.when(count > initial)
-            def prime():
+            def prime(*, initial=initial):
                 for copy in transfers(jnp.int32(initial)):
                     copy.start()
 
