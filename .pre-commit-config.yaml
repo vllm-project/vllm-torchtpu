@@ -58,8 +58,6 @@ repos:
       # layers/adapter (src)
       |src/vllm_torchtpu/layers/adapter/
 
-      # tests/layers
-      |tests/layers/
 
       # layers/core
       |src/vllm_torchtpu/layers/core/

@@ -11,6 +11,7 @@ hd64 kernel (`head_size == 64`), which folds K and V along head_dim — which is
 why bf16 can be padded too. The second round-up is dtype-independent: any
 head_size neither 64 nor a multiple of 128 leaves lanes empty.
 """
+
 import contextlib
 import logging
 
@@ -55,14 +56,14 @@ PADDING_CASES = [
 ]
 
 # fp8 must halve the page against bf16 wherever the head count fills a word.
-FP8_HALVES = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64),
-              (8, 64)]
+FP8_HALVES = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64), (8, 64)]
 FP8_SHOULD_HALVE = [(1, 128), (1, 256), (1, 64), (2, 64)]
 
 
 def page_bytes(num_kv_heads, head_size, dtype):
     return PallasAttentionBackend.get_kv_cache_page_size_bytes(
-        BLOCK_SIZE, num_kv_heads, head_size, dtype)
+        BLOCK_SIZE, num_kv_heads, head_size, dtype
+    )
 
 
 def unpadded_bytes(num_kv_heads, head_size, dtype):
@@ -83,8 +84,9 @@ def test_padding_matches_expectation(num_kv_heads, head_size, dtype, padded):
 @pytest.mark.parametrize("num_kv_heads,head_size", FP8_HALVES)
 def test_fp8_halves_the_page(num_kv_heads, head_size):
     """A layout change must keep every one of these at 2x."""
-    assert page_bytes(num_kv_heads, head_size,
-                      BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
+    assert page_bytes(num_kv_heads, head_size, BF16) == 2 * page_bytes(
+        num_kv_heads, head_size, FP8
+    )
 
 
 @pytest.mark.xfail(
@@ -96,8 +98,9 @@ def test_fp8_halves_the_page(num_kv_heads, head_size):
 @pytest.mark.parametrize("num_kv_heads,head_size", FP8_SHOULD_HALVE)
 def test_fp8_should_halve_the_page(num_kv_heads, head_size):
     """These xfail today; the xfail turning green is the signal it is fixed."""
-    assert page_bytes(num_kv_heads, head_size,
-                      BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
+    assert page_bytes(num_kv_heads, head_size, BF16) == 2 * page_bytes(
+        num_kv_heads, head_size, FP8
+    )
 
 
 @contextlib.contextmanager
@@ -134,8 +137,9 @@ WARNING_PHRASE = "larger than"
 def test_warns_exactly_when_padded(num_kv_heads, head_size, dtype, padded):
     """Including the bf16 cases: what matters is whether HBM is wasted."""
     with captured_warnings() as messages:
-        _warn_if_kv_cache_is_padded(PallasAttentionBackend, BLOCK_SIZE,
-                                    num_kv_heads, head_size, dtype)
+        _warn_if_kv_cache_is_padded(
+            PallasAttentionBackend, BLOCK_SIZE, num_kv_heads, head_size, dtype
+        )
     assert any(WARNING_PHRASE in m for m in messages) is padded
 
 

@@ -42,11 +42,11 @@ import pytest
 import torch
 from vllm.config import get_current_vllm_config
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    wrapper)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
 from vllm_torchtpu.layers.adapter import attention, cp_attention
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    set_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 
 _TP_SIZE = 8
 _HEAD_DIM = 256
@@ -87,14 +87,15 @@ def _write_slot(cache, layout, page, offset, key, value):
 
 def _reference(query, keys, values):
     if len(keys) == 0:
-        return (np.zeros_like(query),
-                np.full(query.shape[0], -np.inf, np.float32))
+        return (np.zeros_like(query), np.full(query.shape[0], -np.inf, np.float32))
     scores = query @ (keys * _K_SCALE).T * _HEAD_DIM**-0.5
     maximum = scores.max(axis=-1, keepdims=True)
     weights = np.exp(scores - maximum)
     denominator = weights.sum(axis=-1, keepdims=True)
-    return (weights @ (values * _V_SCALE) / denominator,
-            (maximum + np.log(denominator))[:, 0])
+    return (
+        weights @ (values * _V_SCALE) / denominator,
+        (maximum + np.log(denominator))[:, 0],
+    )
 
 
 def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
@@ -104,32 +105,36 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
     # Exercise both sides of every ownership boundary, including wraparound
     # into rank 0's second local page. Keeping only 127/128/129/255/256/257
     # would never test a live cache or a new-token write on ranks 3 through 7.
-    kv_lens = tuple(page * _PAGE_SIZE + delta
-                    for page in range(1, dcp_size + 1) for delta in (-1, 0, 1))
+    kv_lens = tuple(
+        page * _PAGE_SIZE + delta
+        for page in range(1, dcp_size + 1)
+        for delta in (-1, 0, 1)
+    )
     num_seqs = len(kv_lens)
 
     def random_tensor(shape, dtype):
         data = rng.normal(0, 0.5, shape).astype(np.float32)
         return torch.from_numpy(data).to(dtype)
 
-    queries = random_tensor((num_seqs, dcp_size * own_q_heads, _HEAD_DIM),
-                            torch.bfloat16)
+    queries = random_tensor(
+        (num_seqs, dcp_size * own_q_heads, _HEAD_DIM), torch.bfloat16
+    )
     keys = random_tensor((num_seqs, max(kv_lens), _HEAD_DIM), _FP8).float()
     values = random_tensor((num_seqs, max(kv_lens), _HEAD_DIM), _FP8).float()
     keys, values = keys.numpy(), values.numpy()
     if scope == configs.AttentionScope.NEW_TOKENS_ONLY:
-        queries = queries[:, rank * own_q_heads:(rank + 1) * own_q_heads]
+        queries = queries[:, rank * own_q_heads : (rank + 1) * own_q_heads]
     queries = queries.contiguous()
 
     num_pages = num_seqs * _PAGES_PER_SEQ + 4  # Also check unused pages.
-    page_table = rng.permutation(num_pages)[:num_seqs * _PAGES_PER_SEQ]
+    page_table = rng.permutation(num_pages)[: num_seqs * _PAGES_PER_SEQ]
     page_table = page_table.reshape(num_seqs, _PAGES_PER_SEQ).astype(np.int32)
     shape = attention.PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
-        num_pages, _PAGE_SIZE, 1, _HEAD_DIM, _FP8)
+        num_pages, _PAGE_SIZE, 1, _HEAD_DIM, _FP8
+    )
     cache = np.zeros(shape, dtype=np.float32)
     # A physical HND page uses exactly half the bytes for a single FP8 KV head.
-    assert np.prod(shape[1:]) // _PAGE_SIZE == (512
-                                                if layout == "HND" else 1024)
+    assert np.prod(shape[1:]) // _PAGE_SIZE == (512 if layout == "HND" else 1024)
     expected_out, expected_lse = [], []
     new_keys, new_values = [], []
     for seq, kv_len in enumerate(kv_lens):
@@ -137,12 +142,17 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
         owned = history[(history // _PAGE_SIZE) % dcp_size == rank]
         for pos in owned:
             page = page_table[seq, pos // (_PAGE_SIZE * dcp_size)]
-            _write_slot(cache, layout, page, pos % _PAGE_SIZE, keys[seq, pos],
-                        values[seq, pos])
-        positions = (owned if scope == configs.AttentionScope.CACHE_ONLY else
-                     np.array([kv_len - 1]))
-        out, lse = _reference(queries[seq].float().numpy(),
-                              keys[seq, positions], values[seq, positions])
+            _write_slot(
+                cache, layout, page, pos % _PAGE_SIZE, keys[seq, pos], values[seq, pos]
+            )
+        positions = (
+            owned
+            if scope == configs.AttentionScope.CACHE_ONLY
+            else np.array([kv_len - 1])
+        )
+        out, lse = _reference(
+            queries[seq].float().numpy(), keys[seq, positions], values[seq, positions]
+        )
         expected_out.append(out)
         expected_lse.append(lse)
         new_keys.append(keys[seq, kv_len - 1])
@@ -154,8 +164,14 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
             pos = kv_len - 1
             if (pos // _PAGE_SIZE) % dcp_size == rank:
                 page = page_table[seq, pos // (_PAGE_SIZE * dcp_size)]
-                _write_slot(expected_cache, layout, page, pos % _PAGE_SIZE,
-                            new_keys[seq], new_values[seq])
+                _write_slot(
+                    expected_cache,
+                    layout,
+                    page,
+                    pos % _PAGE_SIZE,
+                    new_keys[seq],
+                    new_values[seq],
+                )
 
     args = (
         torch.from_numpy(cache).to(_FP8),
@@ -165,7 +181,7 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
         torch.tensor(kv_lens, dtype=torch.int32),
         torch.from_numpy(page_table.reshape(-1)),
         torch.arange(num_seqs + 1, dtype=torch.int32),
-        torch.full((3, ), num_seqs, dtype=torch.int32),
+        torch.full((3,), num_seqs, dtype=torch.int32),
     )
     return args, np.stack(expected_out), np.stack(expected_lse), expected_cache
 
@@ -174,8 +190,10 @@ def _run_adapter(args, rank, scope, monkeypatch, *, dcp_size, own_q_heads):
     # Only supply process-group metadata; initialization and both custom ops
     # remain the production implementation. No collective is needed for a pass.
     monkeypatch.setattr(
-        attention, "_get_dcp_group",
-        lambda: SimpleNamespace(world_size=dcp_size, rank_in_group=rank))
+        attention,
+        "_get_dcp_group",
+        lambda: SimpleNamespace(world_size=dcp_size, rank_in_group=rank),
+    )
     monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
     impl = attention.PallasBatchedRPAAttentionBackendImpl(
         num_heads=own_q_heads,
@@ -187,19 +205,27 @@ def _run_adapter(args, rank, scope, monkeypatch, *, dcp_size, own_q_heads):
         kv_cache_dtype="fp8",
     )
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=_TP_SIZE,
-                                        prefill_context_parallel_size=1,
-                                        decode_context_parallel_size=dcp_size))
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=_TP_SIZE,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=dcp_size,
+        )
+    )
     layer = SimpleNamespace(_k_scale_float=_K_SCALE, _v_scale_float=_V_SCALE)
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=config):
         impl.initialize_kernel(layer)
-    kernel = (impl.rpa_dcp_cache_kernel
-              if scope == configs.AttentionScope.CACHE_ONLY else
-              impl.rpa_dcp_new_kernel)
+    kernel = (
+        impl.rpa_dcp_cache_kernel
+        if scope == configs.AttentionScope.CACHE_ONLY
+        else impl.rpa_dcp_new_kernel
+    )
     device_args = tuple(tensor.to("tpu") for tensor in args)
     output, lse = kernel(*device_args, None, _K_SCALE, _V_SCALE)
-    return (output.cpu().float().numpy(), lse.cpu().float().numpy(),
-            device_args[0].cpu().float().numpy())
+    return (
+        output.cpu().float().numpy(),
+        lse.cpu().float().numpy(),
+        device_args[0].cpu().float().numpy(),
+    )
 
 
 def _run_longctx(args, layout, rank, scope, *, dcp_size):
@@ -209,9 +235,10 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
         torch.bfloat16: jnp.bfloat16,
         torch.int32: jnp.int32,
     }
-    cache, query, key, value, *metadata = (jnp.asarray(
-        tensor.float().numpy(), dtype=dtype_map[tensor.dtype])
-                                           for tensor in args)
+    cache, query, key, value, *metadata = (
+        jnp.asarray(tensor.float().numpy(), dtype=dtype_map[tensor.dtype])
+        for tensor in args
+    )
     output, updated_cache, lse = wrapper.ragged_paged_attention(
         query,
         key,
@@ -225,12 +252,16 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
         cp_rank=jnp.array([rank], jnp.int32),
         attention_scope=scope,
         return_lse=True,
-        kv_layout=(configs.KVLayout.SEQ_ALONG_LANE if layout == "HND" else
-                   configs.KVLayout.HEAD_ALONG_SUBLANE),
+        kv_layout=(
+            configs.KVLayout.SEQ_ALONG_LANE
+            if layout == "HND"
+            else configs.KVLayout.HEAD_ALONG_SUBLANE
+        ),
     )
     return tuple(
         np.asarray(tensor.astype(jnp.float32))
-        for tensor in (output, lse, updated_cache))
+        for tensor in (output, lse, updated_cache)
+    )
 
 
 @pytest.mark.parametrize("entry", ["adapter", "longctx"])
@@ -243,49 +274,55 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
             kv_heads,
             dcp_size,
             rank,
-            id=f"tp8-q{q_heads}-kv{kv_heads}-dcp{dcp_size}-rank{rank}")
+            id=f"tp8-q{q_heads}-kv{kv_heads}-dcp{dcp_size}-rank{rank}",
+        )
         for q_heads, kv_heads, dcp_size in _PARALLEL_CASES
         for rank in range(dcp_size)
     ],
 )
-@pytest.mark.parametrize("scope", [
-    configs.AttentionScope.CACHE_ONLY,
-    configs.AttentionScope.NEW_TOKENS_ONLY,
-],
-                         ids=lambda scope: scope.name)
-def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
-                                        global_kv_heads, dcp_size, rank, scope,
-                                        monkeypatch, vllm_config_context):
+@pytest.mark.parametrize(
+    "scope",
+    [
+        configs.AttentionScope.CACHE_ONLY,
+        configs.AttentionScope.NEW_TOKENS_ONLY,
+    ],
+    ids=lambda scope: scope.name,
+)
+def test_dcp_fp8_pass_matches_reference(
+    entry,
+    layout,
+    global_q_heads,
+    global_kv_heads,
+    dcp_size,
+    rank,
+    scope,
+    monkeypatch,
+    vllm_config_context,
+):
     assert global_q_heads % _TP_SIZE == 0
     assert global_kv_heads * dcp_size == _TP_SIZE
     own_q_heads = global_q_heads // _TP_SIZE
     get_current_vllm_config().cache_config.kv_cache_layout = (
-        "LBHNC" if layout == "HND" else "LBNHC")
+        "LBHNC" if layout == "HND" else "LBNHC"
+    )
     args, expected_out, expected_lse, expected_cache = _make_case(
-        layout, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
+        layout, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads
+    )
     if entry == "adapter":
-        output, lse, cache = _run_adapter(args,
-                                          rank,
-                                          scope,
-                                          monkeypatch,
-                                          dcp_size=dcp_size,
-                                          own_q_heads=own_q_heads)
+        output, lse, cache = _run_adapter(
+            args, rank, scope, monkeypatch, dcp_size=dcp_size, own_q_heads=own_q_heads
+        )
     else:
-        output, lse, cache = _run_longctx(args,
-                                          layout,
-                                          rank,
-                                          scope,
-                                          dcp_size=dcp_size)
+        output, lse, cache = _run_longctx(args, layout, rank, scope, dcp_size=dcp_size)
 
     # BF16 output and LSE; the FP8 input rounding is already in the reference.
     # An empty shard has LSE=-inf and zero merge weight. Its output buffer is
     # unspecified (the kernel may leave the input Q there), so only compare
     # output rows with a nonempty history; still check every LSE below.
     nonempty = np.isfinite(expected_lse)
-    np.testing.assert_allclose(output[nonempty],
-                               expected_out[nonempty],
-                               atol=3e-3,
-                               rtol=1e-2)
+    np.testing.assert_allclose(
+        output[nonempty], expected_out[nonempty], atol=3e-3, rtol=1e-2
+    )
     np.testing.assert_allclose(lse, expected_lse, atol=4e-2, rtol=1e-2)
     # Exact because writes only copy already-quantized values. Comparing the
     # entire pool also catches changes to old tokens, other owners and padding.

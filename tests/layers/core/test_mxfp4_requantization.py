@@ -39,8 +39,13 @@ import torch
 
 # Import functions under test from production code
 from vllm_torchtpu.layers.core.quantization import (  # isort: skip
-    dequantize_mxfp4_packed, e8m0_to_fp32, fp4_indices_to_float,
-    pack_fp4_indices, quantize_tensor_to_fp4, unpack_uint8_to_fp4)
+    dequantize_mxfp4_packed,
+    e8m0_to_fp32,
+    fp4_indices_to_float,
+    pack_fp4_indices,
+    quantize_tensor_to_fp4,
+    unpack_uint8_to_fp4,
+)
 
 # ============================================================================
 # JAX REFERENCE IMPLEMENTATION (from legacy vllm_torchtpu)
@@ -61,7 +66,7 @@ def jax_u8_unpack_e2m1(u8_packed_e2m1: jax.Array) -> jax.Array:
     """Unpack e2m1 tensor that was packed into u8."""
     assert u8_packed_e2m1.dtype == jnp.uint8
     e2m1 = jax.lax.bitcast_convert_type(u8_packed_e2m1, jnp.float4_e2m1fn)
-    return jnp.reshape(e2m1, e2m1.shape[:-2] + (-1, ))
+    return jnp.reshape(e2m1, e2m1.shape[:-2] + (-1,))
 
 
 def jax_dequantize_tensor(
@@ -235,45 +240,44 @@ class TestFP4Unpacking:
 class TestMXFP4Dequantization:
     """Tests for full MXFP4 dequantization."""
 
-    @pytest.mark.parametrize("shape", [
-        (4, 64, 128),
-        (2, 32, 64),
-        (8, 16, 256),
-    ])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 64, 128),
+            (2, 32, 64),
+            (8, 16, 256),
+        ],
+    )
     def test_dequantize_matches_jax(self, device, shape):
         """Full dequantization should match JAX reference."""
         E, out_dim, in_dim = shape
         block_size = 32
 
         np.random.seed(42)
-        weight_packed_np = np.random.randint(0,
-                                             256,
-                                             size=(E, out_dim, in_dim // 2),
-                                             dtype=np.uint8)
-        scale_u8_np = np.random.randint(100,
-                                        160,
-                                        size=(E, out_dim,
-                                              in_dim // block_size),
-                                        dtype=np.uint8)
+        weight_packed_np = np.random.randint(
+            0, 256, size=(E, out_dim, in_dim // 2), dtype=np.uint8
+        )
+        scale_u8_np = np.random.randint(
+            100, 160, size=(E, out_dim, in_dim // block_size), dtype=np.uint8
+        )
 
         # JAX reference
         weight_packed_jax = jnp.array(weight_packed_np)
         scale_u8_jax = jnp.array(scale_u8_np)
         jax_result = np.array(
-            jax_dequantize_mxfp4_packed(weight_packed_jax,
-                                        scale_u8_jax,
-                                        axis=2))
+            jax_dequantize_mxfp4_packed(weight_packed_jax, scale_u8_jax, axis=2)
+        )
 
         # PyTorch (from production code) - runs on device
-        weight_packed_torch = torch.tensor(weight_packed_np,
-                                           dtype=torch.uint8,
-                                           device=device)
-        scale_u8_torch = torch.tensor(scale_u8_np,
-                                      dtype=torch.uint8,
-                                      device=device)
-        torch_result = dequantize_mxfp4_packed(weight_packed_torch,
-                                               scale_u8_torch,
-                                               axis=2).cpu().numpy()
+        weight_packed_torch = torch.tensor(
+            weight_packed_np, dtype=torch.uint8, device=device
+        )
+        scale_u8_torch = torch.tensor(scale_u8_np, dtype=torch.uint8, device=device)
+        torch_result = (
+            dequantize_mxfp4_packed(weight_packed_torch, scale_u8_torch, axis=2)
+            .cpu()
+            .numpy()
+        )
 
         np.testing.assert_allclose(torch_result, jax_result, atol=1e-5)
 
@@ -287,24 +291,20 @@ class TestFP4Quantization:
         E, out_dim, in_dim = 4, 64, 1024
 
         np.random.seed(42)
-        tensor_np = np.random.randn(E, out_dim, in_dim).astype(
-            np.float32) * 3.0
+        tensor_np = np.random.randn(E, out_dim, in_dim).astype(np.float32) * 3.0
 
         # JAX reference
         tensor_jax = jnp.array(tensor_np)
-        _, jax_scale = jax_quantize_tensor(jnp.float4_e2m1fn,
-                                           tensor_jax,
-                                           axis=2,
-                                           block_size=block_size)
+        _, jax_scale = jax_quantize_tensor(
+            jnp.float4_e2m1fn, tensor_jax, axis=2, block_size=block_size
+        )
         jax_scale_np = np.array(jax_scale)
 
         # PyTorch (from production code) - runs on device
-        tensor_torch = torch.tensor(tensor_np,
-                                    dtype=torch.float32,
-                                    device=device)
-        _, torch_scale = quantize_tensor_to_fp4(tensor_torch,
-                                                axis=2,
-                                                block_size=block_size)
+        tensor_torch = torch.tensor(tensor_np, dtype=torch.float32, device=device)
+        _, torch_scale = quantize_tensor_to_fp4(
+            tensor_torch, axis=2, block_size=block_size
+        )
         torch_scale_np = torch_scale.cpu().numpy()
 
         np.testing.assert_allclose(torch_scale_np, jax_scale_np, atol=1e-5)
@@ -315,30 +315,24 @@ class TestFP4Quantization:
         block_size = 512
 
         np.random.seed(42)
-        tensor_np = np.random.randn(E, out_dim, in_dim).astype(
-            np.float32) * 3.0
+        tensor_np = np.random.randn(E, out_dim, in_dim).astype(np.float32) * 3.0
 
         # JAX reference
         tensor_jax = jnp.array(tensor_np)
-        jax_quantized, _ = jax_quantize_tensor(jnp.float4_e2m1fn,
-                                               tensor_jax,
-                                               axis=2,
-                                               block_size=block_size)
+        jax_quantized, _ = jax_quantize_tensor(
+            jnp.float4_e2m1fn, tensor_jax, axis=2, block_size=block_size
+        )
         jax_quantized_np = np.array(jax_quantized.astype(jnp.float32))
 
         # PyTorch (from production code) - runs on device
-        tensor_torch = torch.tensor(tensor_np,
-                                    dtype=torch.float32,
-                                    device=device)
-        torch_indices, _ = quantize_tensor_to_fp4(tensor_torch,
-                                                  axis=2,
-                                                  block_size=block_size)
+        tensor_torch = torch.tensor(tensor_np, dtype=torch.float32, device=device)
+        torch_indices, _ = quantize_tensor_to_fp4(
+            tensor_torch, axis=2, block_size=block_size
+        )
         torch_quantized = fp4_indices_to_float(torch_indices)
         torch_quantized_np = torch_quantized.cpu().numpy()
 
-        np.testing.assert_allclose(torch_quantized_np,
-                                   jax_quantized_np,
-                                   atol=1e-5)
+        np.testing.assert_allclose(torch_quantized_np, jax_quantized_np, atol=1e-5)
 
 
 class TestFP4Packing:
@@ -360,16 +354,13 @@ class TestFP4Packing:
         # Convert original indices to floats for comparison
         original_floats = fp4_indices_to_float(indices)
 
-        np.testing.assert_allclose(unpacked_floats.cpu().numpy(),
-                                   original_floats.cpu().numpy(),
-                                   atol=1e-6)
+        np.testing.assert_allclose(
+            unpacked_floats.cpu().numpy(), original_floats.cpu().numpy(), atol=1e-6
+        )
 
     def test_pack_shape(self, device):
         """Packed output should have half the last dimension."""
-        indices = torch.randint(0,
-                                16, (4, 64, 1024),
-                                dtype=torch.int8,
-                                device=device)
+        indices = torch.randint(0, 16, (4, 64, 1024), dtype=torch.int8, device=device)
         packed = pack_fp4_indices(indices)
 
         assert packed.shape == (4, 64, 512)
@@ -383,12 +374,11 @@ class TestFP4Packing:
             (1, 0),  # 0x01
             (0, 1),  # 0x10
             (5, 10),  # 0xA5
-        ])
+        ],
+    )
     def test_pack_specific_values(self, device, low_idx, high_idx):
         """Test specific index pairs pack correctly."""
-        indices = torch.tensor([[low_idx, high_idx]],
-                               dtype=torch.int8,
-                               device=device)
+        indices = torch.tensor([[low_idx, high_idx]], dtype=torch.int8, device=device)
         packed = pack_fp4_indices(indices)
 
         expected = low_idx | (high_idx << 4)
@@ -404,35 +394,32 @@ class TestFullDequantRequantCycle:
         original_block_size = 32
 
         np.random.seed(42)
-        weight_packed_np = np.random.randint(0,
-                                             256,
-                                             size=(E, out_dim, in_dim // 2),
-                                             dtype=np.uint8)
-        scale_u8_np = np.random.randint(110,
-                                        150,
-                                        size=(E, out_dim,
-                                              in_dim // original_block_size),
-                                        dtype=np.uint8)
+        weight_packed_np = np.random.randint(
+            0, 256, size=(E, out_dim, in_dim // 2), dtype=np.uint8
+        )
+        scale_u8_np = np.random.randint(
+            110, 150, size=(E, out_dim, in_dim // original_block_size), dtype=np.uint8
+        )
 
         # JAX
         weight_packed_jax = jnp.array(weight_packed_np)
         scale_u8_jax = jnp.array(scale_u8_np)
         jax_dequant = np.array(
-            jax_dequantize_mxfp4_packed(weight_packed_jax,
-                                        scale_u8_jax,
-                                        axis=2,
-                                        out_dtype=jnp.float32))
+            jax_dequantize_mxfp4_packed(
+                weight_packed_jax, scale_u8_jax, axis=2, out_dtype=jnp.float32
+            )
+        )
 
         # PyTorch (from production code) - runs on device
-        weight_packed_torch = torch.tensor(weight_packed_np,
-                                           dtype=torch.uint8,
-                                           device=device)
-        scale_u8_torch = torch.tensor(scale_u8_np,
-                                      dtype=torch.uint8,
-                                      device=device)
-        torch_dequant = dequantize_mxfp4_packed(weight_packed_torch,
-                                                scale_u8_torch,
-                                                axis=2).cpu().numpy()
+        weight_packed_torch = torch.tensor(
+            weight_packed_np, dtype=torch.uint8, device=device
+        )
+        scale_u8_torch = torch.tensor(scale_u8_np, dtype=torch.uint8, device=device)
+        torch_dequant = (
+            dequantize_mxfp4_packed(weight_packed_torch, scale_u8_torch, axis=2)
+            .cpu()
+            .numpy()
+        )
 
         np.testing.assert_allclose(torch_dequant, jax_dequant, atol=1e-5)
 
@@ -448,42 +435,35 @@ class TestFullDequantRequantCycle:
         target_block_size = 512
 
         np.random.seed(42)
-        weight_packed_np = np.random.randint(0,
-                                             256,
-                                             size=(E, out_dim, in_dim // 2),
-                                             dtype=np.uint8)
-        scale_u8_np = np.random.randint(110,
-                                        150,
-                                        size=(E, out_dim,
-                                              in_dim // original_block_size),
-                                        dtype=np.uint8)
+        weight_packed_np = np.random.randint(
+            0, 256, size=(E, out_dim, in_dim // 2), dtype=np.uint8
+        )
+        scale_u8_np = np.random.randint(
+            110, 150, size=(E, out_dim, in_dim // original_block_size), dtype=np.uint8
+        )
 
         # JAX pipeline
         weight_packed_jax = jnp.array(weight_packed_np)
         scale_u8_jax = jnp.array(scale_u8_np)
-        jax_dequant = jax_dequantize_mxfp4_packed(weight_packed_jax,
-                                                  scale_u8_jax,
-                                                  axis=2,
-                                                  out_dtype=jnp.float32)
+        jax_dequant = jax_dequantize_mxfp4_packed(
+            weight_packed_jax, scale_u8_jax, axis=2, out_dtype=jnp.float32
+        )
         jax_requant, jax_scale = jax_quantize_tensor(
-            jnp.float4_e2m1fn,
-            jax_dequant,
-            axis=2,
-            block_size=target_block_size)
+            jnp.float4_e2m1fn, jax_dequant, axis=2, block_size=target_block_size
+        )
         jax_requant_np = np.array(jax_requant.astype(jnp.float32))
 
         # PyTorch pipeline (from production code) - runs on device
-        weight_packed_torch = torch.tensor(weight_packed_np,
-                                           dtype=torch.uint8,
-                                           device=device)
-        scale_u8_torch = torch.tensor(scale_u8_np,
-                                      dtype=torch.uint8,
-                                      device=device)
-        torch_dequant = dequantize_mxfp4_packed(weight_packed_torch,
-                                                scale_u8_torch,
-                                                axis=2)
+        weight_packed_torch = torch.tensor(
+            weight_packed_np, dtype=torch.uint8, device=device
+        )
+        scale_u8_torch = torch.tensor(scale_u8_np, dtype=torch.uint8, device=device)
+        torch_dequant = dequantize_mxfp4_packed(
+            weight_packed_torch, scale_u8_torch, axis=2
+        )
         torch_indices, torch_scale = quantize_tensor_to_fp4(
-            torch_dequant, axis=2, block_size=target_block_size)
+            torch_dequant, axis=2, block_size=target_block_size
+        )
         torch_requant = fp4_indices_to_float(torch_indices)
         torch_requant_np = torch_requant.cpu().numpy()
 
@@ -491,7 +471,9 @@ class TestFullDequantRequantCycle:
         matching = np.isclose(jax_requant_np, torch_requant_np, atol=1e-6)
         match_rate = matching.mean() * 100
 
-        assert match_rate >= 99.0, f"Match rate {match_rate:.2f}% is below 99% threshold"
+        assert match_rate >= 99.0, (
+            f"Match rate {match_rate:.2f}% is below 99% threshold"
+        )
 
 
 if __name__ == "__main__":

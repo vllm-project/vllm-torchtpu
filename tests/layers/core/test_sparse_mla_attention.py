@@ -36,9 +36,11 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
-                                                      KVCacheType,
-                                                      SparseMLAKVCacheSpec)
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout,
+    KVCacheType,
+    SparseMLAKVCacheSpec,
+)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.core import attention_interface
 
@@ -53,21 +55,39 @@ TOKEN_PAD = 16  # attention kernel batch size; token count must be a multiple
 # Layouts pinned explicitly rather than read from the environment: these
 # tests check the exact geometry dsa_gather is written against.
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
-NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
-                                        PAGE_SIZE, LKV_DIM, KV_PACKING)
-ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
-                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
-                                        PAGE_SIZE, ROPE_DIM, KV_PACKING)
+NOPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE,
+    KVCacheLayout.TENSORCORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    LKV_DIM,
+    KV_PACKING,
+)
+ROPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE,
+    KVCacheLayout.TENSORCORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    ROPE_DIM,
+    KV_PACKING,
+)
 
-NOPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                           KVCacheLayout.SPARSECORE,
-                                           TOTAL_PAGES, PAGE_SIZE, LKV_DIM,
-                                           KV_PACKING)
-ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
-                                           KVCacheLayout.SPARSECORE,
-                                           TOTAL_PAGES, PAGE_SIZE, ROPE_DIM,
-                                           KV_PACKING)
+NOPE_SC_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE,
+    KVCacheLayout.SPARSECORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    LKV_DIM,
+    KV_PACKING,
+)
+ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE,
+    KVCacheLayout.SPARSECORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    ROPE_DIM,
+    KV_PACKING,
+)
 
 _LIMIT_NAMES = ("MASKED_DENSE_ANALYTIC_LIMIT", "MASKED_DENSE_LIMIT")
 
@@ -102,8 +122,10 @@ def _noop():
 
 def _empty_pair(nope_spec=NOPE_SPEC, rope_spec=ROPE_SPEC):
     """Zeroed (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
-            jnp.zeros(rope_spec.shape, rope_spec.jax_dtype))
+    return (
+        jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
+        jnp.zeros(rope_spec.shape, rope_spec.jax_dtype),
+    )
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -119,12 +141,11 @@ def _causal_topk(positions: list[int], topk: int) -> np.ndarray:
     rows = np.full((len(positions), topk), -1, np.int32)
     for i, pos in enumerate(positions):
         assert pos + 1 <= topk
-        rows[i, :pos + 1] = np.arange(pos + 1)
+        rows[i, : pos + 1] = np.arange(pos + 1)
     return rows
 
 
 class SparseMlaAttentionTest(parameterized.TestCase):
-
     def setUp(self):
         super().setUp()
         self.rng = np.random.default_rng(1234)
@@ -136,7 +157,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
 
     def _make_mesh(self):
-        return jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+        return jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
 
     def _random_latents(self, n):
         kv_c = self.rng.standard_normal((n, LKV_DIM)).astype(np.float32)
@@ -144,71 +165,83 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         return kv_c, k_pe
 
     def _random_queries(self, num_tokens):
-        ql_nope = jnp.asarray(self.rng.standard_normal(
-            (num_tokens, NUM_HEADS, LKV_DIM)).astype(np.float32),
-                              dtype=jnp.bfloat16)
-        q_pe = jnp.asarray(self.rng.standard_normal(
-            (num_tokens, NUM_HEADS, ROPE_DIM)).astype(np.float32),
-                           dtype=jnp.bfloat16)
+        ql_nope = jnp.asarray(
+            self.rng.standard_normal((num_tokens, NUM_HEADS, LKV_DIM)).astype(
+                np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            self.rng.standard_normal((num_tokens, NUM_HEADS, ROPE_DIM)).astype(
+                np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
         return ql_nope, q_pe
 
     def _block_tables(self, num_seqs):
         """Distinct physical pages per sequence, permuted."""
-        perm = self.rng.permutation(TOTAL_PAGES)[:num_seqs * PAGES_PER_SEQ]
-        return jnp.asarray(perm.reshape(num_seqs, PAGES_PER_SEQ).reshape(-1),
-                           dtype=jnp.int32)
+        perm = self.rng.permutation(TOTAL_PAGES)[: num_seqs * PAGES_PER_SEQ]
+        return jnp.asarray(
+            perm.reshape(num_seqs, PAGES_PER_SEQ).reshape(-1), dtype=jnp.int32
+        )
 
     def _empty_cache(self):
         return _empty_pair()
 
-    def _call(self,
-              kv_cache,
-              ql_nope,
-              q_pe,
-              kv_c_fp8,
-              k_pe_fp8,
-              topk_rows,
-              seq_lens,
-              query_start_loc,
-              distribution,
-              block_tables,
-              mesh,
-              force_sparse=False,
-              *,
-              nope_spec=NOPE_SPEC,
-              rope_spec=ROPE_SPEC):
-        with (_masked_dense_limits(*GATHER_ONLY) if force_sparse else _noop()):
-            return self._call_inner(kv_cache,
-                                    ql_nope,
-                                    q_pe,
-                                    kv_c_fp8,
-                                    k_pe_fp8,
-                                    topk_rows,
-                                    seq_lens,
-                                    query_start_loc,
-                                    distribution,
-                                    block_tables,
-                                    mesh,
-                                    nope_spec=nope_spec,
-                                    rope_spec=rope_spec)
+    def _call(
+        self,
+        kv_cache,
+        ql_nope,
+        q_pe,
+        kv_c_fp8,
+        k_pe_fp8,
+        topk_rows,
+        seq_lens,
+        query_start_loc,
+        distribution,
+        block_tables,
+        mesh,
+        force_sparse=False,
+        *,
+        nope_spec=NOPE_SPEC,
+        rope_spec=ROPE_SPEC,
+    ):
+        with _masked_dense_limits(*GATHER_ONLY) if force_sparse else _noop():
+            return self._call_inner(
+                kv_cache,
+                ql_nope,
+                q_pe,
+                kv_c_fp8,
+                k_pe_fp8,
+                topk_rows,
+                seq_lens,
+                query_start_loc,
+                distribution,
+                block_tables,
+                mesh,
+                nope_spec=nope_spec,
+                rope_spec=rope_spec,
+            )
 
-    def _call_inner(self,
-                    kv_cache,
-                    ql_nope,
-                    q_pe,
-                    kv_c_fp8,
-                    k_pe_fp8,
-                    topk_rows,
-                    seq_lens,
-                    query_start_loc,
-                    distribution,
-                    block_tables,
-                    mesh,
-                    *,
-                    nope_spec=NOPE_SPEC,
-                    rope_spec=ROPE_SPEC):
-        nope_cache, rope_cache, output = \
-            attention_interface.sparse_mla_attention(
+    def _call_inner(
+        self,
+        kv_cache,
+        ql_nope,
+        q_pe,
+        kv_c_fp8,
+        k_pe_fp8,
+        topk_rows,
+        seq_lens,
+        query_start_loc,
+        distribution,
+        block_tables,
+        mesh,
+        *,
+        nope_spec=NOPE_SPEC,
+        rope_spec=ROPE_SPEC,
+    ):
+        nope_cache, rope_cache, output = attention_interface.sparse_mla_attention(
             ql_nope,
             q_pe,
             kv_c_fp8,
@@ -267,26 +300,31 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         )
         self._check(output, expected, valid)
 
-    def _reference(self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc,
-                   kv_c_deq, k_pe_deq):
+    def _reference(
+        self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc, kv_c_deq, k_pe_deq
+    ):
         """f32 MLA attention over exactly the selected (dequantized) KVs.
 
         kv_c_deq/k_pe_deq: per-sequence arrays [seq_len, dim] of the values
         the cache actually holds after fp8 rounding.
         """
         num_tokens = ql_nope.shape[0]
-        q = np.concatenate([
-            np.asarray(ql_nope.astype(jnp.float32)),
-            np.asarray(q_pe.astype(jnp.float32))
-        ], -1)  # [T, N, 576]
+        q = np.concatenate(
+            [
+                np.asarray(ql_nope.astype(jnp.float32)),
+                np.asarray(q_pe.astype(jnp.float32)),
+            ],
+            -1,
+        )  # [T, N, 576]
         out = np.zeros((num_tokens, NUM_HEADS, LKV_DIM), np.float32)
         mask = np.zeros(num_tokens, bool)
         for s in range(len(q_lens)):
             for local in range(q_lens[s]):
                 t = query_start_loc[s] + local
                 sel = topk_rows[t][topk_rows[t] >= 0]
-                keys = np.concatenate([kv_c_deq[s][sel], k_pe_deq[s][sel]],
-                                      -1)  # [n, 576]
+                keys = np.concatenate(
+                    [kv_c_deq[s][sel], k_pe_deq[s][sel]], -1
+                )  # [n, 576]
                 scores = q[t] @ keys.T * self.sm_scale  # [N, n]
                 scores -= scores.max(-1, keepdims=True)
                 probs = np.exp(scores)
@@ -297,32 +335,32 @@ class SparseMlaAttentionTest(parameterized.TestCase):
 
     def _check(self, output, expected, valid_mask):
         got = np.asarray(output.astype(jnp.float32))[valid_mask]
-        np.testing.assert_allclose(got,
-                                   expected[valid_mask],
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(got, expected[valid_mask], rtol=2e-2, atol=2e-2)
 
     @parameterized.named_parameters(
         dict(testcase_name="single_prefill", q_lens=[48], topk=64),
         dict(testcase_name="mixed_prefill", q_lens=[40, 24], topk=64),
         dict(testcase_name="padded_tokens", q_lens=[20, 16], topk=64),
-        dict(testcase_name="single_prefill_sparse",
-             q_lens=[48],
-             topk=64,
-             force_sparse=True),
-        dict(testcase_name="mixed_prefill_sparse",
-             q_lens=[40, 24],
-             topk=64,
-             force_sparse=True),
-        dict(testcase_name="padded_tokens_sparse",
-             q_lens=[20, 16],
-             topk=64,
-             force_sparse=True),
+        dict(
+            testcase_name="single_prefill_sparse",
+            q_lens=[48],
+            topk=64,
+            force_sparse=True,
+        ),
+        dict(
+            testcase_name="mixed_prefill_sparse",
+            q_lens=[40, 24],
+            topk=64,
+            force_sparse=True,
+        ),
+        dict(
+            testcase_name="padded_tokens_sparse",
+            q_lens=[20, 16],
+            topk=64,
+            force_sparse=True,
+        ),
     )
-    def test_causal_matches_dense_reference(self,
-                                            q_lens,
-                                            topk,
-                                            force_sparse=False):
+    def test_causal_matches_dense_reference(self, q_lens, topk, force_sparse=False):
         """Causal-arange topk == dense MLA; validates the full path.
 
         These sequences are far below the masked-dense limit, so the default
@@ -349,30 +387,36 @@ class SparseMlaAttentionTest(parameterized.TestCase):
 
         pad = num_tokens - total
         kv_c_fp8 = jnp.concatenate(
-            kv_c_rows + [jnp.zeros((pad, LKV_DIM), jnp.float8_e4m3fn)])
+            kv_c_rows + [jnp.zeros((pad, LKV_DIM), jnp.float8_e4m3fn)]
+        )
         k_pe_fp8 = jnp.concatenate(
-            k_pe_rows + [jnp.zeros((pad, ROPE_DIM), jnp.float8_e4m3fn)])
+            k_pe_rows + [jnp.zeros((pad, ROPE_DIM), jnp.float8_e4m3fn)]
+        )
         # Padding tokens still need >= 1 valid topk entry (kernel contract).
         topk_rows = np.concatenate(
-            [_causal_topk(positions, topk),
-             _causal_topk([0] * pad, topk)])
+            [_causal_topk(positions, topk), _causal_topk([0] * pad, topk)]
+        )
 
         ql_nope, q_pe = self._random_queries(num_tokens)
         mesh = self._make_mesh()
-        _, output = self._call(self._empty_cache(),
-                               ql_nope,
-                               q_pe,
-                               kv_c_fp8,
-                               k_pe_fp8,
-                               topk_rows,
-                               q_lens,
-                               query_start_loc, [0, num_seqs, num_seqs],
-                               self._block_tables(num_seqs),
-                               mesh,
-                               force_sparse=force_sparse)
+        _, output = self._call(
+            self._empty_cache(),
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            topk_rows,
+            q_lens,
+            query_start_loc,
+            [0, num_seqs, num_seqs],
+            self._block_tables(num_seqs),
+            mesh,
+            force_sparse=force_sparse,
+        )
 
-        expected, valid = self._reference(ql_nope, q_pe, topk_rows, q_lens,
-                                          query_start_loc, kv_c_deq, k_pe_deq)
+        expected, valid = self._reference(
+            ql_nope, q_pe, topk_rows, q_lens, query_start_loc, kv_c_deq, k_pe_deq
+        )
         self._check(output, expected, valid)
 
     def test_sparse_subset_selection(self):
@@ -390,21 +434,38 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             # emits distinct positions, and the two DSA kernels do not agree
             # on repeats -- a gathered row is attended twice, a mask bit set
             # twice is still one column.
-            others = self.rng.choice(pos, size=n_sel -
-                                     1, replace=False) if pos else np.empty(
-                                         0, np.int64)
+            others = (
+                self.rng.choice(pos, size=n_sel - 1, replace=False)
+                if pos
+                else np.empty(0, np.int64)
+            )
             topk_rows[pos, :n_sel] = np.sort(np.append(others, pos))
 
         ql_nope, q_pe = self._random_queries(q_len)
         mesh = self._make_mesh()
-        _, output = self._call(self._empty_cache(), ql_nope, q_pe, kv_c_fp8,
-                               k_pe_fp8, topk_rows, [q_len], [0, q_len],
-                               [0, 1, 1], self._block_tables(1), mesh)
+        _, output = self._call(
+            self._empty_cache(),
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [0, 1, 1],
+            self._block_tables(1),
+            mesh,
+        )
 
         expected, valid = self._reference(
-            ql_nope, q_pe, topk_rows, [q_len], [0, q_len],
+            ql_nope,
+            q_pe,
+            topk_rows,
+            [q_len],
+            [0, q_len],
             [_dequantize(kv_c_fp8, self.k_scale)],
-            [_dequantize(k_pe_fp8, self.k_scale)])
+            [_dequantize(k_pe_fp8, self.k_scale)],
+        )
         self._check(output, expected, valid)
 
     def test_prefill_then_decode(self):
@@ -428,12 +489,19 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         total = sum(prior_lens)
         query_start_loc = np.concatenate([[0], np.cumsum(prior_lens)])
         ql_nope, q_pe = self._random_queries(total)
-        kv_cache, _ = self._call(kv_cache, ql_nope, q_pe,
-                                 jnp.concatenate(kv_c_rows),
-                                 jnp.concatenate(k_pe_rows),
-                                 _causal_topk(positions, topk), prior_lens,
-                                 query_start_loc, [0, num_seqs, num_seqs],
-                                 block_tables, mesh)
+        kv_cache, _ = self._call(
+            kv_cache,
+            ql_nope,
+            q_pe,
+            jnp.concatenate(kv_c_rows),
+            jnp.concatenate(k_pe_rows),
+            _causal_topk(positions, topk),
+            prior_lens,
+            query_start_loc,
+            [0, num_seqs, num_seqs],
+            block_tables,
+            mesh,
+        )
         for s in range(num_seqs):
             kv_c_deq.append(_dequantize(kv_c_rows[s], self.k_scale))
             k_pe_deq.append(_dequantize(k_pe_rows[s], self.k_scale))
@@ -445,35 +513,44 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         kv_c_fp8 = _quantize_fp8(kv_c_new, self.k_scale)
         k_pe_fp8 = _quantize_fp8(k_pe_new, self.k_scale)
         pad = num_tokens - num_seqs
-        topk_rows = np.concatenate([
-            _causal_topk(prior_lens, topk),  # decode pos == prior_len
-            _causal_topk([0] * pad, topk),
-        ])
+        topk_rows = np.concatenate(
+            [
+                _causal_topk(prior_lens, topk),  # decode pos == prior_len
+                _causal_topk([0] * pad, topk),
+            ]
+        )
         ql_nope, q_pe = self._random_queries(num_tokens)
         seq_lens = [n + 1 for n in prior_lens]
         _, output = self._call(
-            kv_cache, ql_nope, q_pe,
-            jnp.concatenate(
-                [kv_c_fp8,
-                 jnp.zeros((pad, LKV_DIM), jnp.float8_e4m3fn)]),
-            jnp.concatenate(
-                [k_pe_fp8,
-                 jnp.zeros((pad, ROPE_DIM),
-                           jnp.float8_e4m3fn)]), topk_rows, seq_lens,
-            list(range(num_seqs + 1)), [num_seqs, num_seqs, num_seqs],
-            block_tables, mesh)
+            kv_cache,
+            ql_nope,
+            q_pe,
+            jnp.concatenate([kv_c_fp8, jnp.zeros((pad, LKV_DIM), jnp.float8_e4m3fn)]),
+            jnp.concatenate([k_pe_fp8, jnp.zeros((pad, ROPE_DIM), jnp.float8_e4m3fn)]),
+            topk_rows,
+            seq_lens,
+            list(range(num_seqs + 1)),
+            [num_seqs, num_seqs, num_seqs],
+            block_tables,
+            mesh,
+        )
 
         for s in range(num_seqs):
             kv_c_deq[s] = np.concatenate(
-                [kv_c_deq[s],
-                 _dequantize(kv_c_fp8[s:s + 1], self.k_scale)])
+                [kv_c_deq[s], _dequantize(kv_c_fp8[s : s + 1], self.k_scale)]
+            )
             k_pe_deq[s] = np.concatenate(
-                [k_pe_deq[s],
-                 _dequantize(k_pe_fp8[s:s + 1], self.k_scale)])
-        expected, valid = self._reference(ql_nope, q_pe, topk_rows,
-                                          [1] * num_seqs,
-                                          list(range(num_seqs + 1)), kv_c_deq,
-                                          k_pe_deq)
+                [k_pe_deq[s], _dequantize(k_pe_fp8[s : s + 1], self.k_scale)]
+            )
+        expected, valid = self._reference(
+            ql_nope,
+            q_pe,
+            topk_rows,
+            [1] * num_seqs,
+            list(range(num_seqs + 1)),
+            kv_c_deq,
+            k_pe_deq,
+        )
         self._check(output, expected, valid)
 
 
@@ -494,73 +571,79 @@ class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
         devices = jax.local_devices()
         if len(devices) < size:
             self.skipTest(f"needs {size} local devices, got {len(devices)}")
-        return jax.sharding.Mesh(np.array(devices[:size]), (axis_name, ))
+        return jax.sharding.Mesh(np.array(devices[:size]), (axis_name,))
 
     def test_dcp_size_must_exceed_one(self):
         """`dcp_size=1` means no sharding, which is what the plain
         `sparse_mla_attention` is for. The DCP variant refuses it, and does
         so before reading `mesh`, so `mesh=None` is fine here."""
         with self.assertRaisesRegex(ValueError, "dcp_size > 1"):
-            attention_interface.sparse_mla_attention_dcp(None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         mesh=None,
-                                                         nope_spec=None,
-                                                         rope_spec=None,
-                                                         dcp_size=1,
-                                                         interleave_size=1)
+            attention_interface.sparse_mla_attention_dcp(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                mesh=None,
+                nope_spec=None,
+                rope_spec=None,
+                dcp_size=1,
+                interleave_size=1,
+            )
 
     def test_mesh_missing_dcp_axis_raises(self):
         """The mesh must have an axis with the DCP axis name. A mesh whose
         only axis is called something else is rejected."""
         mesh = self._mesh("x", 1)
         with self.assertRaisesRegex(ValueError, "requires a mesh with"):
-            attention_interface.sparse_mla_attention_dcp(None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         mesh=mesh,
-                                                         nope_spec=None,
-                                                         rope_spec=None,
-                                                         dcp_size=2,
-                                                         interleave_size=1)
+            attention_interface.sparse_mla_attention_dcp(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                mesh=mesh,
+                nope_spec=None,
+                rope_spec=None,
+                dcp_size=2,
+                interleave_size=1,
+            )
 
     def test_mesh_axis_size_mismatch_raises(self):
         """The DCP axis must have exactly `dcp_size` devices on it. Here the
         axis has the right name but only one device while `dcp_size=2`."""
         mesh = self._mesh(streamindex_topk.DCP_AXIS_NAME, 1)
         with self.assertRaisesRegex(ValueError, "does not match mesh axis"):
-            attention_interface.sparse_mla_attention_dcp(None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         mesh=mesh,
-                                                         nope_spec=None,
-                                                         rope_spec=None,
-                                                         dcp_size=2,
-                                                         interleave_size=1)
+            attention_interface.sparse_mla_attention_dcp(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                mesh=mesh,
+                nope_spec=None,
+                rope_spec=None,
+                dcp_size=2,
+                interleave_size=1,
+            )
 
     def test_local_topk_indices_row_count_mismatch_raises(self):
         """`local_topk_indices` holds one row per (chip, token), so it must
@@ -573,22 +656,24 @@ class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
         bad_topk = jnp.zeros((2 * num_tokens - 1, 8), jnp.int32)
 
         with self.assertRaisesRegex(ValueError, "one row per"):
-            attention_interface.sparse_mla_attention_dcp(ql_nope,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         bad_topk,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         None,
-                                                         mesh=mesh,
-                                                         nope_spec=None,
-                                                         rope_spec=None,
-                                                         dcp_size=2,
-                                                         interleave_size=1)
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                None,
+                None,
+                None,
+                None,
+                None,
+                bad_topk,
+                None,
+                None,
+                None,
+                None,
+                mesh=mesh,
+                nope_spec=None,
+                rope_spec=None,
+                dcp_size=2,
+                interleave_size=1,
+            )
 
 
 class MaskedDensePrefillTierTest(parameterized.TestCase):
@@ -602,13 +687,16 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
 
     def _tier(self, seq_lens, q_lens, distribution, limits=None):
         starts = np.zeros(len(seq_lens) + 1, np.int32)
-        starts[1:len(q_lens) + 1] = np.cumsum(q_lens)
-        starts[len(q_lens) + 1:] = sum(q_lens)
+        starts[1 : len(q_lens) + 1] = np.cumsum(q_lens)
+        starts[len(q_lens) + 1 :] = sum(q_lens)
         return int(
             mla_dispatch.masked_dense_prefill_mla_tier(
                 jnp.asarray(seq_lens, jnp.int32),
                 jnp.asarray(distribution, jnp.int32),
-                jnp.asarray(starts, jnp.int32), limits or self.LIMITS))
+                jnp.asarray(starts, jnp.int32),
+                limits or self.LIMITS,
+            )
+        )
 
     def test_measured_prefill_crossovers(self):
         self.assertEqual(self._tier([1024], [1024], [0, 0, 1]), 0)
@@ -619,8 +707,7 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
 
     @parameterized.parameters(([1], [1, 1, 1]), ([1, 1024], [1, 1, 2]))
     def test_any_decode_forces_sparse(self, q_lens, distribution):
-        self.assertEqual(
-            self._tier([1024] * len(q_lens), q_lens, distribution), 2)
+        self.assertEqual(self._tier([1024] * len(q_lens), q_lens, distribution), 2)
 
     def test_cost_sums_multiple_prefill_requests(self):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
@@ -675,40 +762,62 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         num_seqs = len(q_lens)
         pad_seqs = len(seq_lens)
         rng = np.random.default_rng(99)
-        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
         block_tables = jnp.asarray(
-            rng.permutation(TOTAL_PAGES)[:pad_seqs * PAGES_PER_SEQ].astype(
-                np.int32))
+            rng.permutation(TOTAL_PAGES)[: pad_seqs * PAGES_PER_SEQ].astype(np.int32)
+        )
         caches = _empty_pair()
 
         prior = [seq_lens[s] - q_lens[s] for s in range(num_seqs)]
         if any(prior):
-            caches, _ = self._step(caches, prior, prior, 0, GATHER_ONLY, rng,
-                                   block_tables, mesh, pad_seqs, num_seqs)
-        _, out = self._step(caches, q_lens, seq_lens[:num_seqs], num_decode,
-                            limits, rng, block_tables, mesh, pad_seqs,
-                            num_seqs, seq_lens)
+            caches, _ = self._step(
+                caches,
+                prior,
+                prior,
+                0,
+                GATHER_ONLY,
+                rng,
+                block_tables,
+                mesh,
+                pad_seqs,
+                num_seqs,
+            )
+        _, out = self._step(
+            caches,
+            q_lens,
+            seq_lens[:num_seqs],
+            num_decode,
+            limits,
+            rng,
+            block_tables,
+            mesh,
+            pad_seqs,
+            num_seqs,
+            seq_lens,
+        )
         assert np.any(out), "degenerate case: both kernels would return zeros"
         return out
 
-    def _step(self,
-              caches,
-              q_lens,
-              kv_lens,
-              num_decode,
-              limits,
-              rng,
-              block_tables,
-              mesh,
-              pad_seqs,
-              num_seqs,
-              seq_lens=None):
+    def _step(
+        self,
+        caches,
+        q_lens,
+        kv_lens,
+        num_decode,
+        limits,
+        rng,
+        block_tables,
+        mesh,
+        pad_seqs,
+        num_seqs,
+        seq_lens=None,
+    ):
         """One `sparse_mla_attention` call; returns (caches, output)."""
         total = sum(q_lens)
         num_tokens = max(TOKEN_PAD, math.ceil(total / TOKEN_PAD) * TOKEN_PAD)
         starts = np.zeros(pad_seqs + 1, np.int32)
-        starts[1:num_seqs + 1] = np.cumsum(q_lens)
-        starts[num_seqs + 1:] = total
+        starts[1 : num_seqs + 1] = np.cumsum(q_lens)
+        starts[num_seqs + 1 :] = total
         if seq_lens is None:
             seq_lens = list(kv_lens) + [1] * (pad_seqs - len(kv_lens))
 
@@ -725,20 +834,23 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         positions.extend([0] * (num_tokens - total))
         topk_rows = _causal_topk(positions, self.TOPK)
 
-        ql_nope = jnp.asarray(rng.standard_normal(
-            (num_tokens, NUM_HEADS, LKV_DIM)).astype(np.float32),
-                              dtype=jnp.bfloat16)
-        q_pe = jnp.asarray(rng.standard_normal(
-            (num_tokens, NUM_HEADS, ROPE_DIM)).astype(np.float32),
-                           dtype=jnp.bfloat16)
+        ql_nope = jnp.asarray(
+            rng.standard_normal((num_tokens, NUM_HEADS, LKV_DIM)).astype(np.float32),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            rng.standard_normal((num_tokens, NUM_HEADS, ROPE_DIM)).astype(np.float32),
+            dtype=jnp.bfloat16,
+        )
 
-        with (_masked_dense_limits(*limits),
-              mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-              mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_TOKEN_BUCKET",
-                                0),
-              mock.patch.object(mla_dispatch,
-                                "matches_glm52_tpu7x_profile",
-                                return_value=True)):
+        with (
+            _masked_dense_limits(*limits),
+            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+            mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_TOKEN_BUCKET", 0),
+            mock.patch.object(
+                mla_dispatch, "matches_glm52_tpu7x_profile", return_value=True
+            ),
+        ):
             nope, rope, output = attention_interface.sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -761,64 +873,80 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
         # Analytic tier. Prefill/mixed step: distribution[0] != [2].
-        dict(testcase_name="prefill_analytic",
-             q_lens=[40, 24],
-             seq_lens=[40, 24],
-             num_decode=0,
-             limits=(128, 4096)),
+        dict(
+            testcase_name="prefill_analytic",
+            q_lens=[40, 24],
+            seq_lens=[40, 24],
+            num_decode=0,
+            limits=(128, 4096),
+        ),
         # Bitmap tier: over the analytic limit, under the bitmap one.
-        dict(testcase_name="prefill_bitmap",
-             q_lens=[40, 24],
-             seq_lens=[40, 24],
-             num_decode=0,
-             limits=(0, 4096)),
+        dict(
+            testcase_name="prefill_bitmap",
+            q_lens=[40, 24],
+            seq_lens=[40, 24],
+            num_decode=0,
+            limits=(0, 4096),
+        ),
         # All three tiers live, so the switch has three branches.
-        dict(testcase_name="prefill_three_branches",
-             q_lens=[40, 24],
-             seq_lens=[40, 24],
-             num_decode=0,
-             limits=(64, 4096)),
+        dict(
+            testcase_name="prefill_three_branches",
+            q_lens=[40, 24],
+            seq_lens=[40, 24],
+            num_decode=0,
+            limits=(64, 4096),
+        ),
         # `seq_lens` carries stale padding past num_seqs=1.
-        dict(testcase_name="padded_seq_lens",
-             q_lens=[40],
-             seq_lens=[40, 100000],
-             num_decode=0,
-             limits=(128, 4096)),
+        dict(
+            testcase_name="padded_seq_lens",
+            q_lens=[40],
+            seq_lens=[40, 100000],
+            num_decode=0,
+            limits=(128, 4096),
+        ),
     )
-    def test_masked_dense_agrees_with_gather(self, q_lens, seq_lens,
-                                             num_decode, limits):
-        np.testing.assert_allclose(self._run(q_lens, seq_lens, num_decode,
-                                             limits),
-                                   self._run(q_lens, seq_lens, num_decode,
-                                             GATHER_ONLY),
-                                   rtol=2e-2,
-                                   atol=2e-2)
+    def test_masked_dense_agrees_with_gather(
+        self, q_lens, seq_lens, num_decode, limits
+    ):
+        np.testing.assert_allclose(
+            self._run(q_lens, seq_lens, num_decode, limits),
+            self._run(q_lens, seq_lens, num_decode, GATHER_ONLY),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     @parameterized.named_parameters(
         # One over-limit sequence pushes the whole step to the gather kernel,
         # short neighbour included -- the dispatch is per step.
-        dict(testcase_name="one_long_sequence",
-             q_lens=[40, 24],
-             seq_lens=[40, 100],
-             num_decode=0,
-             limits=(32, 64)),
+        dict(
+            testcase_name="one_long_sequence",
+            q_lens=[40, 24],
+            seq_lens=[40, 100],
+            num_decode=0,
+            limits=(32, 64),
+        ),
         # A one-token decode prefix keeps PR1 on the original sparse path.
-        dict(testcase_name="decode_always_sparse",
-             q_lens=[1, 1],
-             seq_lens=[80, 96],
-             num_decode=2,
-             limits=(4096, 4096)),
-        dict(testcase_name="mixed_always_sparse",
-             q_lens=[1, 40],
-             seq_lens=[80, 40],
-             num_decode=1,
-             limits=(4096, 4096)),
+        dict(
+            testcase_name="decode_always_sparse",
+            q_lens=[1, 1],
+            seq_lens=[80, 96],
+            num_decode=2,
+            limits=(4096, 4096),
+        ),
+        dict(
+            testcase_name="mixed_always_sparse",
+            q_lens=[1, 40],
+            seq_lens=[80, 40],
+            num_decode=1,
+            limits=(4096, 4096),
+        ),
     )
     def test_routes_to_gather(self, q_lens, seq_lens, num_decode, limits):
         """Routed to the gather kernel, so bit-identical to the pinned run."""
         np.testing.assert_array_equal(
             self._run(q_lens, seq_lens, num_decode, limits),
-            self._run(q_lens, seq_lens, num_decode, GATHER_ONLY))
+            self._run(q_lens, seq_lens, num_decode, GATHER_ONLY),
+        )
 
 
 class MaskedDenseDispatchSetupTest(parameterized.TestCase):
@@ -832,18 +960,30 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
                     attention_interface,
                     "update_sparse_mla_kv_cache",
                     autospec=True,
-                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax))
+                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax,
+                )
+            )
         case = MaskedDenseDispatchTest()
         case.k_scale = 1.5
         case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
-        with mock.patch.object(mla_dispatch,
-                               "ragged_paged_attention",
-                               side_effect=lambda q, *args, **kwargs: q):
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+        with mock.patch.object(
+            mla_dispatch,
+            "ragged_paged_attention",
+            side_effect=lambda q, *args, **kwargs: q,
+        ):
             caches, output = case._step(
-                _empty_pair(), [8], [8], 0, GATHER_ONLY,
+                _empty_pair(),
+                [8],
+                [8],
+                0,
+                GATHER_ONLY,
                 np.random.default_rng(99),
-                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32), mesh, 1, 1)
+                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32),
+                mesh,
+                1,
+                1,
+            )
 
         self.assertEqual(output.shape, (8, NUM_HEADS, LKV_DIM))
         self.assertTrue(np.any(output))
@@ -867,8 +1007,7 @@ class MaskedDenseLimitResolutionTest(parameterized.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TPU_MLA_MASKED_DENSE_ENABLED", None)
             self.assertFalse(getter())
-        with mock.patch.dict(os.environ,
-                             {"TPU_MLA_MASKED_DENSE_ENABLED": "1"}):
+        with mock.patch.dict(os.environ, {"TPU_MLA_MASKED_DENSE_ENABLED": "1"}):
             self.assertTrue(getter())
 
     def test_unset_uses_default(self):
@@ -894,7 +1033,6 @@ class MaskedDenseLimitResolutionTest(parameterized.TestCase):
 
 
 class MaskedDenseProfileTest(parameterized.TestCase):
-
     @staticmethod
     def _operands(*, tokens=512, heads=64, topk=2048, page_size=1024):
         shape = jax.ShapeDtypeStruct
@@ -906,33 +1044,39 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         )
 
     def test_exact_glm52_profile_is_enabled(self):
-        self.assertTrue(
-            mla_dispatch.matches_glm52_tpu7x_profile(*self._operands()))
+        self.assertTrue(mla_dispatch.matches_glm52_tpu7x_profile(*self._operands()))
 
-    @parameterized.parameters(dict(heads=16), dict(topk=1024),
-                              dict(page_size=512))
+    @parameterized.parameters(dict(heads=16), dict(topk=1024), dict(page_size=512))
     def test_other_sparse_mla_profiles_fall_back(self, **overrides):
         self.assertFalse(
-            mla_dispatch.matches_glm52_tpu7x_profile(*self._operands(
-                **overrides)))
+            mla_dispatch.matches_glm52_tpu7x_profile(*self._operands(**overrides))
+        )
 
     @parameterized.parameters(16, 32, 64, 128, 256)
     def test_decode_sized_bucket_bypasses_dispatch(self, tokens):
         q, nope, rope, topk = self._operands(tokens=tokens)
         sentinel = object()
-        with (mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-              mock.patch.object(mla_dispatch,
-                                "sparse_ragged_paged_attention",
-                                return_value=sentinel) as sparse,
-              mock.patch.object(mla_dispatch,
-                                "_masked_dense_prefill_cost_tier",
-                                side_effect=AssertionError(
-                                    "small buckets must not build dispatch"))):
+        with (
+            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+            mock.patch.object(
+                mla_dispatch, "sparse_ragged_paged_attention", return_value=sentinel
+            ) as sparse,
+            mock.patch.object(
+                mla_dispatch,
+                "_masked_dense_prefill_cost_tier",
+                side_effect=AssertionError("small buckets must not build dispatch"),
+            ),
+        ):
             result = mla_dispatch.ragged_paged_attention(
-                q, nope, rope, topk, jax.ShapeDtypeStruct((64, ), jnp.int32),
-                jax.ShapeDtypeStruct((64 * 9, ), jnp.int32),
-                jax.ShapeDtypeStruct((65, ), jnp.int32),
-                jax.ShapeDtypeStruct((3, ), jnp.int32))
+                q,
+                nope,
+                rope,
+                topk,
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 9,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            )
         self.assertIs(result, sentinel)
         sparse.assert_called_once()
 
@@ -941,25 +1085,28 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         nope = jax.ShapeDtypeStruct((8, 1024, 128), jnp.uint32)
         rope = jax.ShapeDtypeStruct((8, 256, 128), jnp.uint32)
         sentinel = object()
-        with (mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
-              mock.patch.object(mla_dispatch,
-                                "sparse_ragged_paged_attention",
-                                return_value=sentinel) as sparse,
-              mock.patch.object(
-                  mla_dispatch,
-                  "_masked_dense_prefill_cost_tier",
-                  side_effect=AssertionError(
-                      "native caches require sparse attention"))):
+        with (
+            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+            mock.patch.object(
+                mla_dispatch, "sparse_ragged_paged_attention", return_value=sentinel
+            ) as sparse,
+            mock.patch.object(
+                mla_dispatch,
+                "_masked_dense_prefill_cost_tier",
+                side_effect=AssertionError("native caches require sparse attention"),
+            ),
+        ):
             result = mla_dispatch.ragged_paged_attention(
                 q,
                 nope,
                 rope,
                 topk,
-                jax.ShapeDtypeStruct((64, ), jnp.int32),
-                jax.ShapeDtypeStruct((64 * 9, ), jnp.int32),
-                jax.ShapeDtypeStruct((65, ), jnp.int32),
-                jax.ShapeDtypeStruct((3, ), jnp.int32),
-                cache_layout="sparsecore")
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 9,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+                cache_layout="sparsecore",
+            )
         self.assertIs(result, sentinel)
         sparse.assert_called_once()
         self.assertEqual(sparse.call_args.kwargs["cache_layout"], "sparsecore")

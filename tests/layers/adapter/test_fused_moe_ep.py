@@ -47,14 +47,8 @@ _WEIGHT_FORMAT_ARG = 6
 def _layer(experts=4, hidden=8, inter=16, **overrides):
     """A layer whose weights and routing the kernel would accept."""
     layer = SimpleNamespace(
-        w13_weight=torch.zeros(experts,
-                               hidden,
-                               2 * inter,
-                               dtype=torch.float8_e4m3fn),
-        w2_weight=torch.zeros(experts,
-                              inter,
-                              hidden,
-                              dtype=torch.float8_e4m3fn),
+        w13_weight=torch.zeros(experts, hidden, 2 * inter, dtype=torch.float8_e4m3fn),
+        w2_weight=torch.zeros(experts, inter, hidden, dtype=torch.float8_e4m3fn),
         w13_weight_scale_inv=torch.ones(experts, 1, 1, 2 * inter),
         w2_weight_scale_inv=torch.ones(experts, 1, 1, hidden),
         global_num_experts=experts * _STUB_EP,
@@ -67,9 +61,9 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
-            moe_parallel_config=SimpleNamespace(use_ep=True,
-                                                pcp_size=1,
-                                                is_sequence_parallel=False),
+            moe_parallel_config=SimpleNamespace(
+                use_ep=True, pcp_size=1, is_sequence_parallel=False
+            ),
         ),
     )
     for name, value in overrides.items():
@@ -77,15 +71,17 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
     return layer
 
 
-def _prebuild(layer,
-              *,
-              has_mesh=True,
-              node_tokens=4096,
-              smem_bytes=1024 * 1024,
-              ep_order=None,
-              replica_groups=((0, ), (1, )),
-              build_op=None,
-              **kwargs):
+def _prebuild(
+    layer,
+    *,
+    has_mesh=True,
+    node_tokens=4096,
+    smem_bytes=1024 * 1024,
+    ep_order=None,
+    replica_groups=((0,), (1,)),
+    build_op=None,
+    **kwargs,
+):
     """Call prebuild with the distributed lookups stubbed out.
 
     `build_ep_mesh` does an `all_gather_object` over the EP group, so it is
@@ -93,18 +89,17 @@ def _prebuild(layer,
     op would be built, and `_build_op` is stubbed so the one accepting case
     does not need a device.
     """
-    mesh = (SimpleNamespace(
-        shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None)
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None
     build_op = build_op or (lambda *_args, **_kwargs: "op")
-    with patch.object(bridge, "build_ep_mesh", return_value=mesh), \
-            patch.object(bridge, "ep_mesh_index", return_value=0), \
-            patch.object(bridge, "ep_rank_order", return_value=ep_order), \
-            patch.object(bridge, "ep_token_replica_groups",
-                         return_value=replica_groups), \
-            patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
-            patch.object(bridge, "_smem_capacity_bytes",
-                         return_value=smem_bytes), \
-            patch.object(bridge, "_build_op", side_effect=build_op):
+    with (
+        patch.object(bridge, "build_ep_mesh", return_value=mesh),
+        patch.object(bridge, "ep_mesh_index", return_value=0),
+        patch.object(bridge, "ep_rank_order", return_value=ep_order),
+        patch.object(bridge, "ep_token_replica_groups", return_value=replica_groups),
+        patch.object(bridge, "_max_node_tokens", return_value=node_tokens),
+        patch.object(bridge, "_smem_capacity_bytes", return_value=smem_bytes),
+        patch.object(bridge, "_build_op", side_effect=build_op),
+    ):
         defaults = dict(topk=2, renormalize=True, activation="silu")
         defaults.update(kwargs)
         return bridge.prebuild_fused_moe_ep(layer, **defaults)
@@ -113,10 +108,12 @@ def _prebuild(layer,
 @pytest.fixture(autouse=True)
 def _armed():
     """Every test here runs as if the operator asked for the kernel."""
-    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True), \
-            patch.object(envs, "MOE_FUSED_EP_ENABLE_W4A8", True), \
-            patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024), \
-            patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", False):
+    with (
+        patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True),
+        patch.object(envs, "MOE_FUSED_EP_ENABLE_W4A8", True),
+        patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024),
+        patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", False),
+    ):
         yield
 
 
@@ -125,23 +122,31 @@ def test_arms_on_a_supported_layer():
 
 
 def test_native_replica_groups_reach_prebuilt_op():
-    groups = ((0, 1), )
+    groups = ((0, 1),)
     seen = []
-    assert _prebuild(
-        _layer(),
-        replica_groups=groups,
-        build_op=lambda *args, **kw: seen.append(kw) or "op") == "op"
+    assert (
+        _prebuild(
+            _layer(),
+            replica_groups=groups,
+            build_op=lambda *args, **kw: seen.append(kw) or "op",
+        )
+        == "op"
+    )
     assert seen[0]["token_replica_groups"] == groups
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True])
-@pytest.mark.parametrize("scoring_fn,has_bias,scale", [
-    ("softmax", False, 1.0),
-    ("sigmoid", True, 2.5),
-    ("sqrtsoftplus", True, 0.75),
-])
+@pytest.mark.parametrize(
+    "scoring_fn,has_bias,scale",
+    [
+        ("softmax", False, 1.0),
+        ("sigmoid", True, 2.5),
+        ("sqrtsoftplus", True, 0.75),
+    ],
+)
 def test_replica_groups_are_part_of_op_cache_and_kernel_call(
-        monkeypatch, sharded_plan, scoring_fn, has_bias, scale):
+    monkeypatch, sharded_plan, scoring_fn, has_bias, scale
+):
     from unittest.mock import Mock
 
     from vllm_torchtpu.kernels.fused_moe import v2
@@ -156,30 +161,38 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     monkeypatch.setattr(bridge, "sharded_jax_op", build)
     kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
     monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
-    groups = ((0, 1), )
+    groups = ((0, 1),)
     args = (None, 2, True, "silu", None, sharded_plan)
-    options = dict(scoring_fn=scoring_fn,
-                   has_score_bias=has_bias,
-                   routed_scaling_factor=scale,
-                   token_replica_groups=groups)
+    options = dict(
+        scoring_fn=scoring_fn,
+        has_score_bias=has_bias,
+        routed_scaling_factor=scale,
+        token_replica_groups=groups,
+    )
     replicated = bridge._build_op(*args, **options)
     assert bridge._build_op(*args, **options) is replicated
     # Every independent routing setting and the TP membership separate caches.
     for changed in (
-            dict(token_replica_groups=((0, ), (1, ))),
-            dict(scoring_fn="sigmoid" if scoring_fn ==
-                 "softmax" else "softmax"),
-            dict(has_score_bias=not has_bias),
-            dict(routed_scaling_factor=scale + 1.0),
+        dict(token_replica_groups=((0,), (1,))),
+        dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
+        dict(has_score_bias=not has_bias),
+        dict(routed_scaling_factor=scale + 1.0),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
     assert len(closures) == 5
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
-    operands = (x, None, None, None, None, jnp.zeros(
-        (8, 4)), jnp.zeros((1, 1), dtype=jnp.int32))
+    operands = (
+        x,
+        None,
+        None,
+        None,
+        None,
+        jnp.zeros((8, 4)),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+    )
     if has_bias:
-        operands += (bias, )
+        operands += (bias,)
     assert closures[0](*operands) is x
     forwarded = kernel.call_args.kwargs
     assert forwarded["token_replica_groups"] == groups
@@ -196,19 +209,26 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
-        assert _prebuild(
-            _layer(),
-            build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+        assert (
+            _prebuild(
+                _layer(), build_op=lambda *args, **kwargs: seen.append(args) or "op"
+            )
+            == "op"
+        )
     assert seen and seen[0][_SHARDED_PLAN_ARG] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
     order = (1, 0)
     seen = []
-    assert _prebuild(
-        _layer(),
-        ep_order=order,
-        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+    assert (
+        _prebuild(
+            _layer(),
+            ep_order=order,
+            build_op=lambda *args, **kwargs: seen.append(args) or "op",
+        )
+        == "op"
+    )
     assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
@@ -236,8 +256,7 @@ def test_arms_under_prefill_context_parallelism():
 
 def test_pcp_threshold_counts_one_logical_scheduler_batch():
     """PCP partitions one batch; DP contributes independent batches."""
-    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(
-        max_num_batched_tokens=4096))
+    cfg = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=4096))
     with patch("vllm.config.get_current_vllm_config", return_value=cfg):
         assert bridge._max_node_tokens(ep=8, pcp=8) == 4096
         assert bridge._max_node_tokens(ep=8, pcp=1) == 32768
@@ -266,13 +285,18 @@ def test_fixed_smem_working_set_is_still_checked():
     assert _prebuild(_layer(), smem_bytes=needed - 1) is None
 
 
-@pytest.mark.parametrize("weights", [
-    dict(w13_weight=torch.zeros(4, 8, 32, dtype=torch.bfloat16),
-         w2_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16)),
-    dict(w2_weight=torch.zeros(4, 999, 8, dtype=torch.float8_e4m3fn)),
-    dict(w13_weight_scale_inv=torch.ones(4, 3, 1, 32)),
-    dict(w2_weight_scale_inv=torch.ones(4, 3, 1, 8)),
-])
+@pytest.mark.parametrize(
+    "weights",
+    [
+        dict(
+            w13_weight=torch.zeros(4, 8, 32, dtype=torch.bfloat16),
+            w2_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16),
+        ),
+        dict(w2_weight=torch.zeros(4, 999, 8, dtype=torch.float8_e4m3fn)),
+        dict(w13_weight_scale_inv=torch.ones(4, 3, 1, 32)),
+        dict(w2_weight_scale_inv=torch.ones(4, 3, 1, 8)),
+    ],
+)
 def test_refused_on_an_unservable_weight_layout(weights):
     assert _prebuild(_layer(**weights)) is None
 
@@ -296,11 +320,14 @@ def test_refused_when_the_layer_carries_expert_biases():
     assert _prebuild(_layer(w2_bias=torch.zeros(4, 8))) is None
 
 
-@pytest.mark.parametrize("routing", [
-    dict(custom_routing_function=lambda **_: None),
-    dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
-    dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-])
+@pytest.mark.parametrize(
+    "routing",
+    [
+        dict(custom_routing_function=lambda **_: None),
+        dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
+        dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
+    ],
+)
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
     """The fused path never calls `moe_routing.route`: the kernel selects
     top-k itself. Anything it cannot reproduce routes tokens to a different
@@ -310,6 +337,7 @@ def test_refused_on_routing_the_kernel_does_not_implement(routing):
 
 def test_refused_while_the_routing_simulator_is_on():
     from vllm_torchtpu.layers.adapter import moe_routing
+
     with patch.object(moe_routing, "_SIMULATION_STRATEGY", object()):
         assert _prebuild(_layer()) is None
 
@@ -319,8 +347,11 @@ def test_arming_is_per_layer_not_per_process():
     armed = SimpleNamespace()
     refused = SimpleNamespace()
     setattr(armed, bridge.FUSED_MOE_EP_OP_ATTR, _prebuild(_layer()))
-    setattr(refused, bridge.FUSED_MOE_EP_OP_ATTR,
-            _prebuild(_layer(w2_bias=torch.zeros(4, 8))))
+    setattr(
+        refused,
+        bridge.FUSED_MOE_EP_OP_ATTR,
+        _prebuild(_layer(w2_bias=torch.zeros(4, 8))),
+    )
 
     assert bridge.fused_moe_ep_supported(armed)
     assert not bridge.fused_moe_ep_supported(refused)
@@ -343,21 +374,29 @@ def test_squeeze_channel_scale_terminates_on_a_non_singleton_axis():
 
 def test_selected_expert_ids_move_each_rank_block_to_its_mesh_index():
     """Relabel only selected IDs, not the full router-logit tensor."""
-    from vllm_torchtpu.kernels.fused_moe.v2.layer import \
-        _relabel_expert_ids_to_mesh_order
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import (
+        _relabel_expert_ids_to_mesh_order,
+    )
 
     ep, per_shard = 4, 2
     order = (0, 2, 3, 1)
     selected = jnp.arange(ep * per_shard, dtype=jnp.int32).reshape(2, 4)
     got = np.asarray(
-        _relabel_expert_ids_to_mesh_order(selected,
-                                          g_local=per_shard,
-                                          mesh_ep_ranks=order))
+        _relabel_expert_ids_to_mesh_order(
+            selected, g_local=per_shard, mesh_ep_ranks=order
+        )
+    )
     mesh_index_of_rank = {ep_rank: i for i, ep_rank in enumerate(order)}
-    want = np.asarray([[
-        mesh_index_of_rank[int(e) // per_shard] * per_shard +
-        int(e) % per_shard for e in row
-    ] for row in np.asarray(selected)], np.int32)
+    want = np.asarray(
+        [
+            [
+                mesh_index_of_rank[int(e) // per_shard] * per_shard + int(e) % per_shard
+                for e in row
+            ]
+            for row in np.asarray(selected)
+        ],
+        np.int32,
+    )
     np.testing.assert_array_equal(got, want)
 
 
@@ -375,15 +414,20 @@ def test_forward_passes_router_logits_without_a_full_expert_gather():
     weights = torch.empty(0)
     scales = torch.ones(1, 1)
     logits = torch.zeros(1, 8)
-    assert bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales,
-                               logits) is hidden
+    assert (
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+        is hidden
+    )
     assert seen[0][5] is logits
 
 
-@pytest.mark.parametrize("order,expected", [
-    ((0, 1, 2, 3), None),
-    ((0, 2, 3, 1), (0, 2, 3, 1)),
-])
+@pytest.mark.parametrize(
+    "order,expected",
+    [
+        ((0, 1, 2, 3), None),
+        ((0, 2, 3, 1), (0, 2, 3, 1)),
+    ],
+)
 def test_mesh_expert_order(order, expected):
     with patch.object(bridge, "ep_rank_order", return_value=order):
         assert bridge._mesh_expert_order(len(order)) == expected
@@ -398,12 +442,13 @@ def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
     # up at the position of its device id.
     device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
-    with patch.object(ep_mesh, "get_ep_group", return_value=group), \
-            patch.object(ep_mesh, "ep_device_ids", return_value=device_ids):
+    with (
+        patch.object(ep_mesh, "get_ep_group", return_value=group),
+        patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
+    ):
         order = ep_mesh.ep_rank_order()
 
-    assert order == tuple(rank
-                          for _, rank in sorted(zip(device_ids, range(8))))
+    assert order == tuple(rank for _, rank in sorted(zip(device_ids, range(8))))
     assert order == (0, 1, 6, 7, 2, 3, 4, 5)
 
 
@@ -428,37 +473,41 @@ def test_supports_internal_mk_tracks_both_owners():
     chunk pipelining or the fused kernel -- has to claim it alone, and the
     fused half must follow what prebuild ARMED, not what the operator asked
     for: on a refusal vLLM's collectives have to stay."""
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-        VllmFp8MoEMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
     armed = SimpleNamespace()
     setattr(armed, bridge.FUSED_MOE_EP_OP_ATTR, "op")
 
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.fp8."
-            "enable_pipelined_collective_and_compute",
-            return_value=False):
+        "vllm_torchtpu.layers.adapter.quantization.fp8."
+        "enable_pipelined_collective_and_compute",
+        return_value=False,
+    ):
         assert prop.fget(SimpleNamespace()) is False
         assert prop.fget(armed) is True
 
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.fp8."
-            "enable_pipelined_collective_and_compute",
-            return_value=True):
+        "vllm_torchtpu.layers.adapter.quantization.fp8."
+        "enable_pipelined_collective_and_compute",
+        return_value=True,
+    ):
         assert prop.fget(SimpleNamespace()) is True
 
 
 def test_env_flag_alone_does_not_claim_the_collectives():
     """The refusals only hold if the request does not claim ownership."""
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-        VllmFp8MoEMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
-    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True), \
-            patch("vllm_torchtpu.layers.adapter.quantization.fp8."
-                  "enable_pipelined_collective_and_compute",
-                  return_value=False):
+    with (
+        patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True),
+        patch(
+            "vllm_torchtpu.layers.adapter.quantization.fp8."
+            "enable_pipelined_collective_and_compute",
+            return_value=False,
+        ),
+    ):
         assert prop.fget(SimpleNamespace()) is False
 
 
@@ -474,8 +523,8 @@ class TestFusedOutputIsReducedPatch:
     @staticmethod
     def _fresh_runner_cls():
         """A MoERunner with the patch un-applied, restored after the test."""
-        from vllm.model_executor.layers.fused_moe.runner import \
-            moe_runner as mr
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
         return mr.MoERunner
 
     @pytest.fixture(autouse=True)
@@ -495,6 +544,7 @@ class TestFusedOutputIsReducedPatch:
 
     def _apply(self):
         import vllm_torchtpu
+
         vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
 
     def _runner(self, cls, *, armed, skip_final_all_reduce=False):
@@ -507,8 +557,7 @@ class TestFusedOutputIsReducedPatch:
             setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, "op")
         runner = SimpleNamespace(
             _quant_method=quant_method,
-            moe_config=SimpleNamespace(
-                skip_final_all_reduce=skip_final_all_reduce),
+            moe_config=SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce),
         )
         return cls._fused_output_is_reduced.fget(runner)
 
@@ -533,8 +582,7 @@ class TestFusedOutputIsReducedPatch:
         cls = _restore
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
             self._apply()
-        assert self._runner(cls, armed=True,
-                            skip_final_all_reduce=True) is False
+        assert self._runner(cls, armed=True, skip_final_all_reduce=True) is False
 
     def test_is_idempotent(self, _restore):
         cls = _restore
@@ -547,18 +595,15 @@ class TestFusedOutputIsReducedPatch:
 
 def _fp4_layer(block=512, hidden=512, inter=512):
     layer = _layer(experts=1, hidden=hidden, inter=inter)
-    layer.w13_weight = torch.empty((1, hidden, inter),
-                                   dtype=torch.float4_e2m1fn_x2)
-    layer.w2_weight = torch.empty((1, inter, hidden // 2),
-                                  dtype=torch.float4_e2m1fn_x2)
+    layer.w13_weight = torch.empty((1, hidden, inter), dtype=torch.float4_e2m1fn_x2)
+    layer.w2_weight = torch.empty((1, inter, hidden // 2), dtype=torch.float4_e2m1fn_x2)
     layer.w13_weight_scale = torch.ones(1, hidden // block, 1, 2 * inter)
     layer.w2_weight_scale = torch.ones(1, inter // block, 1, hidden)
     del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     return layer
 
 
-@pytest.mark.parametrize("setting,enabled", [(None, False), ("0", False),
-                                             ("1", True)])
+@pytest.mark.parametrize("setting,enabled", [(None, False), ("0", False), ("1", True)])
 def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
     name = "MOE_FUSED_EP_ENABLE_W4A8"
     if setting is None:
@@ -568,8 +613,9 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
     value = envs.environment_variables[name]()
     assert value is enabled
     monkeypatch.setattr(envs, name, value)
-    assert _prebuild(_fp4_layer(), weight_format="fp4",
-                     rhs_qb=512) == ("op" if enabled else None)
+    assert _prebuild(_fp4_layer(), weight_format="fp4", rhs_qb=512) == (
+        "op" if enabled else None
+    )
     # The new opt-in applies only to FP4; FP8 fused EP retains its behavior.
     assert _prebuild(_layer()) == "op"
 
@@ -577,12 +623,16 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
 @pytest.mark.parametrize("block", [64, 128, 256, 512, 1024])
 def test_nvfp4_aligned_block_arms_and_passes_format(block):
     seen = []
-    assert _prebuild(
-        _fp4_layer(block, hidden=1024, inter=1024),
-        weight_format="fp4",
-        rhs_qb=block,
-        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
-    assert seen[0][_WEIGHT_FORMAT_ARG:_WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
+    assert (
+        _prebuild(
+            _fp4_layer(block, hidden=1024, inter=1024),
+            weight_format="fp4",
+            rhs_qb=block,
+            build_op=lambda *args, **kwargs: seen.append(args) or "op",
+        )
+        == "op"
+    )
+    assert seen[0][_WEIGHT_FORMAT_ARG : _WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
 
 
 @pytest.mark.parametrize("block", [None, 0, -64, 16, 32, 96, 192, 1024])
@@ -592,9 +642,12 @@ def test_nvfp4_refuses_invalid_blocks(block):
 
 @pytest.mark.parametrize("hidden,inter", [(768, 1024), (1024, 768)])
 def test_nvfp4_block_must_divide_both_contractions(hidden, inter):
-    assert _prebuild(_fp4_layer(hidden=hidden, inter=inter),
-                     weight_format="fp4",
-                     rhs_qb=512) is None
+    assert (
+        _prebuild(
+            _fp4_layer(hidden=hidden, inter=inter), weight_format="fp4", rhs_qb=512
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("block", [64, 256, 512])
@@ -616,26 +669,33 @@ def test_nvfp4_forward_preserves_single_block_scale_axis():
     layer = _fp4_layer()
     seen = []
     owner = SimpleNamespace()
-    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR,
-            lambda *args: seen.append(args) or args[0])
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
     s1 = layer.w13_weight_scale.squeeze(2)
     s2 = layer.w2_weight_scale.squeeze(2)
     x = torch.ones(2, 512)
-    assert bridge.fused_moe_ep(owner, x, layer.w13_weight, layer.w2_weight, s1,
-                               s2, torch.ones(2, 2)) is x
+    assert (
+        bridge.fused_moe_ep(
+            owner, x, layer.w13_weight, layer.w2_weight, s1, s2, torch.ones(2, 2)
+        )
+        is x
+    )
     assert seen[0][3] is s1 and seen[0][4] is s2
     assert seen[0][3].shape == (1, 1, 1024)
 
 
-@pytest.mark.parametrize("armed,pipelined", [(False, False), (True, False),
-                                             (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "armed,pipelined", [(False, False), (True, False), (False, True), (True, True)]
+)
 def test_nvfp4_communication_ownership(armed, pipelined):
     from vllm_torchtpu.layers.adapter.quantization import nvfp4
+
     method = object.__new__(nvfp4.VllmNvfp4MoEMethod)
     setattr(method, bridge.FUSED_MOE_EP_OP_ATTR, "op" if armed else None)
-    with patch.object(nvfp4,
-                      "enable_pipelined_collective_and_compute",
-                      return_value=pipelined):
+    with patch.object(
+        nvfp4, "enable_pipelined_collective_and_compute", return_value=pipelined
+    ):
         assert method.supports_internal_mk == (armed or pipelined)
 
 
@@ -644,18 +704,17 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     for name, shape, dtype in (
         ("w13_weight", (1, 2 * inter, hidden // 2), torch.uint8),
         ("w2_weight", (1, hidden, inter // 2), torch.uint8),
-        ("w13_weight_scale", (1, 2 * inter, hidden // 16),
-         torch.float8_e4m3fn),
+        ("w13_weight_scale", (1, 2 * inter, hidden // 16), torch.float8_e4m3fn),
         ("w2_weight_scale", (1, hidden, inter // 16), torch.float8_e4m3fn),
         ("w13_weight_scale_2", (1, 2), torch.float32),
-        ("w2_weight_scale_2", (1, ), torch.float32),
+        ("w2_weight_scale_2", (1,), torch.float32),
     ):
         layer.register_parameter(
             name,
-            torch.nn.Parameter(torch.ones(shape, dtype=dtype),
-                               requires_grad=False))
-    layer.w13_weight_scale_2.data.copy_(torch.tensor([[2., 3.]]))
-    layer.w2_weight_scale_2.data.fill_(4.)
+            torch.nn.Parameter(torch.ones(shape, dtype=dtype), requires_grad=False),
+        )
+    layer.w13_weight_scale_2.data.copy_(torch.tensor([[2.0, 3.0]]))
+    layer.w2_weight_scale_2.data.fill_(4.0)
     layer.activation = "silu"
     layer.renormalize = True
     # RoutedExperts.__init__ always sets these, and the test stubs it out.
@@ -667,19 +726,22 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     layer.topk_group = None
     layer.routed_scaling_factor = 1.0
     layer.global_num_experts = _STUB_EP
-    layer.moe_config = SimpleNamespace(experts_per_token=2,
-                                       moe_parallel_config=SimpleNamespace(
-                                           use_ep=use_ep,
-                                           pcp_size=1,
-                                           is_sequence_parallel=False))
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=2,
+        moe_parallel_config=SimpleNamespace(
+            use_ep=use_ep, pcp_size=1, is_sequence_parallel=False
+        ),
+    )
     return layer
 
 
 @pytest.mark.parametrize("block", [None, 64, 128, 256, 512])
 @pytest.mark.parametrize("execution", ["fused", "gmm", "pipelined"])
 def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
-        monkeypatch, execution, block):
+    monkeypatch, execution, block
+):
     from vllm_torchtpu.layers.adapter.quantization import nvfp4
+
     admitted = execution == "fused"
     effective_block = 64 if block is None else block
     layer = _nvfp4_checkpoint_layer()
@@ -692,9 +754,10 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     def requant(w, scales, block):
         seen.append((scales.clone(), block))
         e, n, half_k = w.shape
-        return (torch.empty((e, half_k * 2, n // 2),
-                            dtype=torch.float4_e2m1fn_x2),
-                torch.ones(e, half_k * 2 // block, 1, n))
+        return (
+            torch.empty((e, half_k * 2, n // 2), dtype=torch.float4_e2m1fn_x2),
+            torch.ones(e, half_k * 2 // block, 1, n),
+        )
 
     def op(*args):
         seen.append(args)
@@ -703,15 +766,21 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
     monkeypatch.setattr(
-        nvfp4, "load_kmajor_fp4", lambda w: torch.empty(
-            (w.shape[0], w.shape[2] * 2, w.shape[1] // 2),
-            dtype=torch.float4_e2m1fn_x2))
-    monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel",
-                        lambda **kw: gmm_options.append(kw))
-    monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
-                        lambda *a, **kw: None)
-    monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
-                        lambda *a: None)
+        nvfp4,
+        "load_kmajor_fp4",
+        lambda w: torch.empty(
+            (w.shape[0], w.shape[2] * 2, w.shape[1] // 2), dtype=torch.float4_e2m1fn_x2
+        ),
+    )
+    monkeypatch.setattr(
+        nvfp4, "prebuild_fused_moe_kernel", lambda **kw: gmm_options.append(kw)
+    )
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "validate_linear_ep_placement", lambda *a: None
+    )
 
     def prebuild(candidate, **kwargs):
         assert candidate.w13_weight.dtype == torch.uint8
@@ -730,11 +799,9 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
     assert not gmm_options[0].get("quantize_fp4_lhs", False)
     if admitted or block is not None:
         assert seen[0][1] == seen[1][1] == effective_block
-        torch.testing.assert_close(seen[0][0][:, :512],
-                                   torch.full((1, 512, 32), 2.))
-        torch.testing.assert_close(seen[0][0][:, 512:],
-                                   torch.full((1, 512, 32), 3.))
-        torch.testing.assert_close(seen[1][0], torch.full((1, 512, 32), 4.))
+        torch.testing.assert_close(seen[0][0][:, :512], torch.full((1, 512, 32), 2.0))
+        torch.testing.assert_close(seen[0][0][:, 512:], torch.full((1, 512, 32), 3.0))
+        torch.testing.assert_close(seen[1][0], torch.full((1, 512, 32), 4.0))
     else:
         assert seen == []
         assert layer.w13_weight_scale.shape == (1, 32, 1, 1024)
@@ -755,16 +822,23 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
             fallback_calls.append((path, kwargs))
             return kwargs["hidden_states"]
 
-        monkeypatch.setattr(nvfp4, "fused_moe_gmm",
-                            lambda **kw: fallback("gmm", **kw))
-        monkeypatch.setattr(nvfp4, "pipelined_fused_moe_gmm",
-                            lambda **kw: fallback("pipelined", **kw))
-        monkeypatch.setattr(nvfp4, "enable_pipelined_collective_and_compute",
-                            lambda: execution == "pipelined")
+        monkeypatch.setattr(nvfp4, "fused_moe_gmm", lambda **kw: fallback("gmm", **kw))
         monkeypatch.setattr(
-            nvfp4.moe_routing, "route", lambda *args:
-            (torch.ones(2, 2, dtype=torch.bfloat16),
-             torch.zeros(2, 2, dtype=torch.int32)))
+            nvfp4, "pipelined_fused_moe_gmm", lambda **kw: fallback("pipelined", **kw)
+        )
+        monkeypatch.setattr(
+            nvfp4,
+            "enable_pipelined_collective_and_compute",
+            lambda: execution == "pipelined",
+        )
+        monkeypatch.setattr(
+            nvfp4.moe_routing,
+            "route",
+            lambda *args: (
+                torch.ones(2, 2, dtype=torch.bfloat16),
+                torch.zeros(2, 2, dtype=torch.int32),
+            ),
+        )
         x = torch.ones(2, 512, dtype=torch.bfloat16)
         assert method.apply_monolithic(layer, x, torch.ones(2, 2)) is x
         assert len(fallback_calls) == 1
@@ -789,13 +863,21 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
         (True, True, 16, 512, 512, 16, False),
         (True, True, 128, 512, 512, 128, True),
         (False, True, 128, 512, 512, 128, False),
-    ])
-def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
-                                                   use_ep, configured_block,
-                                                   hidden, inter,
-                                                   expected_block, armed,
-                                                   w4a8_enabled):
+    ],
+)
+def test_nvfp4_default_block_and_explicit_override(
+    monkeypatch,
+    fused_enabled,
+    use_ep,
+    configured_block,
+    hidden,
+    inter,
+    expected_block,
+    armed,
+    w4a8_enabled,
+):
     from vllm_torchtpu.layers.adapter.quantization import nvfp4
+
     if not w4a8_enabled:
         expected_block = configured_block or 16
         armed = False
@@ -808,8 +890,7 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
 
     def load(w):
         e, n, half_k = w.shape
-        return torch.empty((e, half_k * 2, n // 2),
-                           dtype=torch.float4_e2m1fn_x2)
+        return torch.empty((e, half_k * 2, n // 2), dtype=torch.float4_e2m1fn_x2)
 
     def requant(w, scales, block):
         requant_blocks.append(block)
@@ -833,23 +914,31 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
     monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
     monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
-    monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
-                        lambda *a, **kw: None)
-    monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
-                        lambda *a: None)
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "validate_linear_ep_placement", lambda *a: None
+    )
     monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
     method.process_weights_after_loading(layer)
 
-    padded_inter = ((inter + expected_block - 1) // expected_block *
-                    expected_block)
-    assert layer.w13_weight_scale.shape == (1, hidden // expected_block, 1,
-                                            2 * padded_inter)
-    assert layer.w2_weight_scale.shape == (1, padded_inter // expected_block,
-                                           1, hidden)
+    padded_inter = (inter + expected_block - 1) // expected_block * expected_block
+    assert layer.w13_weight_scale.shape == (
+        1,
+        hidden // expected_block,
+        1,
+        2 * padded_inter,
+    )
+    assert layer.w2_weight_scale.shape == (1, padded_inter // expected_block, 1, hidden)
     assert bridge.fused_moe_ep_supported(method) == armed
-    if (w4a8_enabled and fused_enabled and use_ep
-            and (configured_block is None or configured_block > 0)
-            and hidden % (configured_block or 64) == 0):
+    if (
+        w4a8_enabled
+        and fused_enabled
+        and use_ep
+        and (configured_block is None or configured_block > 0)
+        and hidden % (configured_block or 64) == 0
+    ):
         assert prebuild_calls == [configured_block or 64]
     else:
         assert prebuild_calls == []
@@ -861,12 +950,22 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
 
 
 @pytest.mark.parametrize("configured_block", [None, 128])
-@pytest.mark.parametrize("refusal", [
-    "mesh", "tokens", "smem", "routing", "experts", "activation", "simulation",
-    "prepared_scales"
-])
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "mesh",
+        "tokens",
+        "smem",
+        "routing",
+        "experts",
+        "activation",
+        "simulation",
+        "prepared_scales",
+    ],
+)
 def test_nvfp4_admission_and_prepared_weight_validation(
-        monkeypatch, refusal, configured_block):
+    monkeypatch, refusal, configured_block
+):
     from vllm_torchtpu.layers.adapter.quantization import nvfp4
 
     layer = _nvfp4_checkpoint_layer()
@@ -889,8 +988,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     elif refusal == "activation":
         layer.activation = "gelu"
     elif refusal == "simulation":
-        monkeypatch.setattr(nvfp4.moe_routing, "_SIMULATION_STRATEGY",
-                            object())
+        monkeypatch.setattr(nvfp4.moe_routing, "_SIMULATION_STRATEGY", object())
 
     loads = []
     requants = []
@@ -899,8 +997,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     def load(w):
         loads.append(w.clone())
         e, n, half_k = w.shape
-        return torch.empty((e, 2 * half_k, n // 2),
-                           dtype=torch.float4_e2m1fn_x2)
+        return torch.empty((e, 2 * half_k, n // 2), dtype=torch.float4_e2m1fn_x2)
 
     def requant(w, scales, block):
         events.append("requant")
@@ -909,8 +1006,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
         assert layer.w13_weight is originals[0]
         assert layer.w2_weight is originals[1]
         e, n, half_k = w.shape
-        weight = torch.empty((e, 2 * half_k, n // 2),
-                             dtype=torch.float4_e2m1fn_x2)
+        weight = torch.empty((e, 2 * half_k, n // 2), dtype=torch.float4_e2m1fn_x2)
         scale = torch.ones(e, 2 * half_k // block, 1, n)
         if refusal == "prepared_scales":
             scale = scale[..., :-1]  # Force final validation to refuse.
@@ -931,15 +1027,18 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
     monkeypatch.setattr(nvfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
-    monkeypatch.setattr(nvfp4.moe_routing, "register_experts_start_buffer",
-                        lambda *a, **kw: None)
-    monkeypatch.setattr(nvfp4.moe_routing, "validate_linear_ep_placement",
-                        lambda *a: None)
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        nvfp4.moe_routing, "validate_linear_ep_placement", lambda *a: None
+    )
     monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
     if refusal == "prepared_scales":
-        with pytest.raises(AssertionError,
-                           match="prepared weights violate the admitted "
-                           "layout: w1_scale"):
+        with pytest.raises(
+            AssertionError,
+            match="prepared weights violate the admitted layout: w1_scale",
+        ):
             method.process_weights_after_loading(layer)
         assert events == ["admission", "requant", "requant"]
         assert requants == [configured_block or 64] * 2
@@ -966,18 +1065,27 @@ def test_nvfp4_admission_and_prepared_weight_validation(
         assert len(loads) == 2
         for loaded, original in zip(loads, original_values):
             torch.testing.assert_close(loaded, original)
-        torch.testing.assert_close(layer.w13_weight_scale[..., :512],
-                                   torch.full((1, 32, 1, 512), 2.))
-        torch.testing.assert_close(layer.w13_weight_scale[..., 512:],
-                                   torch.full((1, 32, 1, 512), 3.))
-        torch.testing.assert_close(layer.w2_weight_scale,
-                                   torch.full((1, 32, 1, 512), 4.))
+        torch.testing.assert_close(
+            layer.w13_weight_scale[..., :512], torch.full((1, 32, 1, 512), 2.0)
+        )
+        torch.testing.assert_close(
+            layer.w13_weight_scale[..., 512:], torch.full((1, 32, 1, 512), 3.0)
+        )
+        torch.testing.assert_close(
+            layer.w2_weight_scale, torch.full((1, 32, 1, 512), 4.0)
+        )
 
 
-@pytest.mark.parametrize("field", [
-    "custom_routing_function", "scoring_func", "e_score_correction_bias",
-    "use_grouped_topk", "routed_scaling_factor"
-])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "custom_routing_function",
+        "scoring_func",
+        "e_score_correction_bias",
+        "use_grouped_topk",
+        "routed_scaling_factor",
+    ],
+)
 def test_missing_routing_field_cannot_arm_fused_ep(field):
     layer = _layer()
     delattr(layer, field)

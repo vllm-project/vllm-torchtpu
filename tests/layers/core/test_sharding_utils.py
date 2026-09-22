@@ -17,8 +17,10 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.layers.core.utils import (
-    inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding,
-    slice_sharded_tensor_for_concatenation)
+    inverse_reorder_for_sharding,
+    reorder_concatenated_tensor_for_sharding,
+    slice_sharded_tensor_for_concatenation,
+)
 
 
 def test_reorder_concatenated_tensor_1d():
@@ -29,18 +31,17 @@ def test_reorder_concatenated_tensor_1d():
     gets a fair slice of Q, K, and V, concatenated together locally.
     """
     # 12 As, 8 Bs, 4 Cs
-    a = jnp.full((12, ), 1)
-    b = jnp.full((8, ), 2)
-    c = jnp.full((4, ), 3)
+    a = jnp.full((12,), 1)
+    b = jnp.full((8,), 2)
+    c = jnp.full((4,), 3)
     concatenated = jnp.concatenate([a, b, c], axis=0)
 
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=0
+    )
 
     # Each shard should have 3 As (12/4), 2 Bs (8/4), and 1 C (4/4)
     expected_shard = [1, 1, 1, 2, 2, 3]
@@ -64,17 +65,14 @@ def test_reorder_concatenated_tensor_2d_dim0():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=0
+    )
 
     # For each shard: 3x2 As, 2x2 Bs, 1x2 Cs -> total 6x2 per shard
     expected_shard = jnp.concatenate(
-        [jnp.full((3, 2), 1),
-         jnp.full((2, 2), 2),
-         jnp.full((1, 2), 3)],
-        axis=0)
+        [jnp.full((3, 2), 1), jnp.full((2, 2), 2), jnp.full((1, 2), 3)], axis=0
+    )
 
     # 4 shards stacked together along dim 0
     expected_full = jnp.concatenate([expected_shard] * n_shards, axis=0)
@@ -96,16 +94,13 @@ def test_reorder_concatenated_tensor_2d_dim1():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=-1)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=-1
+    )
 
     expected_shard = jnp.concatenate(
-        [jnp.full((5, 3), 1),
-         jnp.full((5, 2), 2),
-         jnp.full((5, 1), 3)],
-        axis=-1)
+        [jnp.full((5, 3), 1), jnp.full((5, 2), 2), jnp.full((5, 1), 3)], axis=-1
+    )
 
     expected_full = jnp.concatenate([expected_shard] * n_shards, axis=-1)
 
@@ -118,23 +113,19 @@ def test_inverse_reorder_1d():
     This guarantees that `inverse_reorder_for_sharding` reverses exactly what
     `reorder_concatenated_tensor_for_sharding` did, recovering the original tensor.
     """
-    a = jnp.full((12, ), 1)
-    b = jnp.full((8, ), 2)
-    c = jnp.full((4, ), 3)
+    a = jnp.full((12,), 1)
+    b = jnp.full((8,), 2)
+    c = jnp.full((4,), 3)
     original = jnp.concatenate([a, b, c], axis=0)
 
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(original,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        original, split_sizes, n_shards, dim=0
+    )
 
-    recovered = inverse_reorder_for_sharding(reordered,
-                                             split_sizes,
-                                             n_shards,
-                                             dim=0)
+    recovered = inverse_reorder_for_sharding(reordered, split_sizes, n_shards, dim=0)
 
     np.testing.assert_array_equal(recovered, original)
 
@@ -153,15 +144,11 @@ def test_inverse_reorder_2d_dim1():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(original,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=-1)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        original, split_sizes, n_shards, dim=-1
+    )
 
-    recovered = inverse_reorder_for_sharding(reordered,
-                                             split_sizes,
-                                             n_shards,
-                                             dim=-1)
+    recovered = inverse_reorder_for_sharding(reordered, split_sizes, n_shards, dim=-1)
 
     np.testing.assert_array_equal(recovered, original)
 
@@ -181,15 +168,16 @@ def test_slice_sharded_tensor_for_concatenation():
     n_shards = 4
 
     sliced_tensors = slice_sharded_tensor_for_concatenation(
-        sharded_tensor, split_sizes, n_shards)
+        sharded_tensor, split_sizes, n_shards
+    )
 
     assert len(sliced_tensors) == 3
 
     # The first tensor should contain all '1's from all 4 shards (4 shards * 3 As = 12 As)
     # and its shape should represent the "global" tensor before physical sharding.
-    expected_a = jnp.full((12, ), 1)
-    expected_b = jnp.full((8, ), 2)
-    expected_c = jnp.full((4, ), 3)
+    expected_a = jnp.full((12,), 1)
+    expected_b = jnp.full((8,), 2)
+    expected_c = jnp.full((4,), 3)
 
     np.testing.assert_array_equal(sliced_tensors[0], expected_a)
     np.testing.assert_array_equal(sliced_tensors[1], expected_b)
@@ -219,7 +207,8 @@ def test_slice_sharded_tensor_for_concatenation_2d():
     split_sizes = [12, 8, 4]
 
     sliced_tensors = slice_sharded_tensor_for_concatenation(
-        sharded_tensor, split_sizes, n_shards)
+        sharded_tensor, split_sizes, n_shards
+    )
 
     assert len(sliced_tensors) == 3
 
@@ -238,18 +227,17 @@ def test_reorder_concatenated_tensor_1d_8_shards():
     Reordering a 1D tensor across 8 shards.
     """
     # 24 As, 16 Bs, 8 Cs
-    a = jnp.full((24, ), 1)
-    b = jnp.full((16, ), 2)
-    c = jnp.full((8, ), 3)
+    a = jnp.full((24,), 1)
+    b = jnp.full((16,), 2)
+    c = jnp.full((8,), 3)
     concatenated = jnp.concatenate([a, b, c], axis=0)
 
     split_sizes = [24, 16, 8]
     n_shards = 8
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=0
+    )
 
     # Each shard should have 3 As (24/8), 2 Bs (16/8), and 1 C (8/8)
     expected_shard = [1, 1, 1, 2, 2, 3]
@@ -270,17 +258,14 @@ def test_reorder_concatenated_tensor_2d_dim0_2_shards():
     split_sizes = [12, 8, 4]
     n_shards = 2
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=0
+    )
 
     # For each shard: 6x2 As, 4x2 Bs, 2x2 Cs -> total 12x2 per shard
     expected_shard = jnp.concatenate(
-        [jnp.full((6, 2), 1),
-         jnp.full((4, 2), 2),
-         jnp.full((2, 2), 3)],
-        axis=0)
+        [jnp.full((6, 2), 1), jnp.full((4, 2), 2), jnp.full((2, 2), 3)], axis=0
+    )
 
     # 2 shards stacked together along dim 0
     expected_full = jnp.concatenate([expected_shard] * n_shards, axis=0)
@@ -293,18 +278,17 @@ def test_reorder_concatenated_tensor_1d_64_shards():
     Reordering a 1D tensor across 64 shards (Simulating a large TPU pod).
     """
     # 192 As, 128 Bs, 64 Cs
-    a = jnp.full((192, ), 1)
-    b = jnp.full((128, ), 2)
-    c = jnp.full((64, ), 3)
+    a = jnp.full((192,), 1)
+    b = jnp.full((128,), 2)
+    c = jnp.full((64,), 3)
     concatenated = jnp.concatenate([a, b, c], axis=0)
 
     split_sizes = [192, 128, 64]
     n_shards = 64
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=0
+    )
 
     # Each shard should have 3 As (192/64), 2 Bs (128/64), and 1 C (64/64)
     expected_shard = [1, 1, 1, 2, 2, 3]
@@ -327,18 +311,14 @@ def test_reorder_concatenated_tensor_3d_dim1():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(concatenated,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=1)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        concatenated, split_sizes, n_shards, dim=1
+    )
 
     # For each shard: 3 As, 2 Bs, 1 Cs along dim 1
-    expected_shard = jnp.concatenate([
-        jnp.full((2, 3, 4), 1),
-        jnp.full((2, 2, 4), 2),
-        jnp.full((2, 1, 4), 3)
-    ],
-                                     axis=1)
+    expected_shard = jnp.concatenate(
+        [jnp.full((2, 3, 4), 1), jnp.full((2, 2, 4), 2), jnp.full((2, 1, 4), 3)], axis=1
+    )
 
     # 4 shards stacked together along dim 1
     expected_full = jnp.concatenate([expected_shard] * n_shards, axis=1)
@@ -358,15 +338,11 @@ def test_inverse_reorder_3d_dim1():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(original,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=1)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        original, split_sizes, n_shards, dim=1
+    )
 
-    recovered = inverse_reorder_for_sharding(reordered,
-                                             split_sizes,
-                                             n_shards,
-                                             dim=1)
+    recovered = inverse_reorder_for_sharding(reordered, split_sizes, n_shards, dim=1)
 
     np.testing.assert_array_equal(recovered, original)
 
@@ -383,15 +359,11 @@ def test_inverse_reorder_2d_dim0():
     split_sizes = [12, 8, 4]
     n_shards = 4
 
-    reordered = reorder_concatenated_tensor_for_sharding(original,
-                                                         split_sizes,
-                                                         n_shards,
-                                                         dim=0)
+    reordered = reorder_concatenated_tensor_for_sharding(
+        original, split_sizes, n_shards, dim=0
+    )
 
-    recovered = inverse_reorder_for_sharding(reordered,
-                                             split_sizes,
-                                             n_shards,
-                                             dim=0)
+    recovered = inverse_reorder_for_sharding(reordered, split_sizes, n_shards, dim=0)
 
     np.testing.assert_array_equal(recovered, original)
 
@@ -406,18 +378,14 @@ def test_sharding_utils_indivisible_errors():
     # For inverse reorder
     dummy_reordered = jnp.zeros((25, 2))
     with pytest.raises(AssertionError):
-        inverse_reorder_for_sharding(dummy_reordered,
-                                     split_sizes,
-                                     n_shards,
-                                     dim=0)
+        inverse_reorder_for_sharding(dummy_reordered, split_sizes, n_shards, dim=0)
 
     # For slice sharded tensor
     # The last dimension must be a multiple of n_shards (4) so the initial reshape succeeds,
     # allowing the function to reach the assert split_size % n_shards == 0 check.
     dummy_sharded = jnp.zeros((25, 4))
     with pytest.raises(AssertionError):
-        slice_sharded_tensor_for_concatenation(dummy_sharded, split_sizes,
-                                               n_shards)
+        slice_sharded_tensor_for_concatenation(dummy_sharded, split_sizes, n_shards)
 
     # For reorder (JAX raises a reshape error, usually TypeError or ValueError because size mismatches)
     a = jnp.full((13, 2), 1)
@@ -425,7 +393,6 @@ def test_sharding_utils_indivisible_errors():
     c = jnp.full((4, 2), 3)
     concatenated = jnp.concatenate([a, b, c], axis=0)
     with pytest.raises((TypeError, ValueError)):
-        reorder_concatenated_tensor_for_sharding(concatenated,
-                                                 split_sizes,
-                                                 n_shards,
-                                                 dim=0)
+        reorder_concatenated_tensor_for_sharding(
+            concatenated, split_sizes, n_shards, dim=0
+        )
