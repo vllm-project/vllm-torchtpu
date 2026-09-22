@@ -34,14 +34,24 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
-                                           pooled_gdn_conv_state_bytes,
-                                           pooled_gdn_ssm_state_bytes,
-                                           pooled_gdn_state_dtypes,
-                                           pooled_gdn_state_itemsize)
+from vllm_torchtpu.gdn_pool_layout import (
+    derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_state_bytes,
+    pooled_gdn_ssm_state_bytes,
+    pooled_gdn_state_dtypes,
+    pooled_gdn_state_itemsize,
+)
 
-from .tags import (TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM,
-                   TAG_MLA_NOPE, TAG_MLA_ROPE, class_tag, layer_tag)
+from .tags import (
+    TAG_DSA_IDX,
+    TAG_FA,
+    TAG_GDN_CONV,
+    TAG_GDN_SSM,
+    TAG_MLA_NOPE,
+    TAG_MLA_ROPE,
+    class_tag,
+    layer_tag,
+)
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -76,8 +86,11 @@ class RegionSpec:
         """Exclusive end of the last live byte relative to the pool base."""
         if self.num_units <= 0:
             return self.offset_bytes
-        return (self.offset_bytes + (self.num_units - 1) * self.stride_bytes +
-                self.unit_bytes * self.units_per_stride)
+        return (
+            self.offset_bytes
+            + (self.num_units - 1) * self.stride_bytes
+            + self.unit_bytes * self.units_per_stride
+        )
 
     def to_dict(self) -> dict[str, int | str]:
         return dataclasses.asdict(self)
@@ -140,7 +153,8 @@ class PoolManifest:
             elif existing != geometry:
                 raise ManifestError(
                     f"pool geometry diverges within tag {tag}: "
-                    f"{existing} vs {geometry} ({pool.layer_name})")
+                    f"{existing} vs {geometry} ({pool.layer_name})"
+                )
         return result
 
     def pools_of_class(self, tag: str) -> list[PoolEntry]:
@@ -226,8 +240,7 @@ def _raw_index_for(tensor: Any, raw_tensors: Sequence[Any]) -> int | None:
         if raw is tensor:
             return idx
         raw_ptr = _storage_ptr(raw)
-        if (tensor_ptr is not None and raw_ptr is not None
-                and tensor_ptr == raw_ptr):
+        if tensor_ptr is not None and raw_ptr is not None and tensor_ptr == raw_ptr:
             return idx
     return None
 
@@ -263,31 +276,42 @@ class GdnHeadGeometry:
 
     @property
     def conv_dim(self) -> int:
-        return (2 * self.local_key_heads * self.key_head_dim +
-                self.local_value_heads * self.value_head_dim)
+        return (
+            2 * self.local_key_heads * self.key_head_dim
+            + self.local_value_heads * self.value_head_dim
+        )
 
 
-def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
-                num_kv_heads: int, head_size: int,
-                itemsize: int) -> tuple[RegionSpec, ...]:
+def _fa_regions(
+    *,
+    block_size_tokens: int,
+    token_stride_bytes: int,
+    num_kv_heads: int,
+    head_size: int,
+    itemsize: int,
+) -> tuple[RegionSpec, ...]:
     unit_bytes = 2 * head_size * itemsize  # one K+V head pair per token
     live_per_token = unit_bytes * num_kv_heads
     if live_per_token > token_stride_bytes:
         raise ManifestError(
             "full-attention live bytes per token exceed the physical token "
-            f"stride: live={live_per_token} stride={token_stride_bytes}")
-    return (RegionSpec(
-        name="fa_payload",
-        offset_bytes=0,
-        stride_bytes=token_stride_bytes,
-        unit_bytes=unit_bytes,
-        num_units=block_size_tokens,
-        units_per_stride=num_kv_heads,
-    ), )
+            f"stride: live={live_per_token} stride={token_stride_bytes}"
+        )
+    return (
+        RegionSpec(
+            name="fa_payload",
+            offset_bytes=0,
+            stride_bytes=token_stride_bytes,
+            unit_bytes=unit_bytes,
+            num_units=block_size_tokens,
+            units_per_stride=num_kv_heads,
+        ),
+    )
 
 
-def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
-                      geometry: GdnHeadGeometry) -> tuple[RegionSpec, ...]:
+def _gdn_conv_regions(
+    *, conv_shape: Sequence[int], itemsize: int, geometry: GdnHeadGeometry
+) -> tuple[RegionSpec, ...]:
     # Since the mamba state relayout removal the conv cache is declared
     # (blocks, taps, 1, dim); the singleton is layout-neutral, so normalize
     # it away rather than duplicating the derivation below.
@@ -296,15 +320,18 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
     elif len(conv_shape) == 4 and conv_shape[1] == 1:
         conv_shape = (conv_shape[0], conv_shape[2], conv_shape[3])
     if len(conv_shape) != 3:
-        raise ManifestError("GDN conv state must be (blocks, taps, dim) or "
-                            f"(blocks, taps, 1, dim): got {conv_shape}")
+        raise ManifestError(
+            "GDN conv state must be (blocks, taps, dim) or "
+            f"(blocks, taps, 1, dim): got {conv_shape}"
+        )
     taps = int(conv_shape[1])
     local_dim = int(conv_shape[2])
     expected_dim = geometry.conv_dim
     if local_dim != expected_dim:
         raise ManifestError(
             "GDN conv state dim does not match the local head geometry: "
-            f"tensor dim={local_dim} derived={expected_dim} ({geometry})")
+            f"tensor dim={local_dim} derived={expected_dim} ({geometry})"
+        )
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
@@ -317,59 +344,73 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
         # blocks in rank order, which the pooled kernel's rows_perm maps
         # back to the logical [Q | K | V] row order.
         return (
-            RegionSpec(name="gdn_conv_qk",
-                       offset_bytes=0,
-                       stride_bytes=row_stride,
-                       unit_bytes=qk_bytes,
-                       num_units=taps,
-                       units_per_stride=1),
-            RegionSpec(name="gdn_conv_v",
-                       offset_bytes=qk_bytes,
-                       stride_bytes=row_stride,
-                       unit_bytes=value_bytes,
-                       num_units=taps,
-                       units_per_stride=geometry.local_value_heads),
+            RegionSpec(
+                name="gdn_conv_qk",
+                offset_bytes=0,
+                stride_bytes=row_stride,
+                unit_bytes=qk_bytes,
+                num_units=taps,
+                units_per_stride=1,
+            ),
+            RegionSpec(
+                name="gdn_conv_v",
+                offset_bytes=qk_bytes,
+                stride_bytes=row_stride,
+                unit_bytes=value_bytes,
+                num_units=taps,
+                units_per_stride=geometry.local_value_heads,
+            ),
         )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
     v_offset = 2 * geometry.local_key_heads * key_bytes
     return (
-        RegionSpec(name="gdn_conv_q",
-                   offset_bytes=q_offset,
-                   stride_bytes=row_stride,
-                   unit_bytes=key_bytes,
-                   num_units=taps,
-                   units_per_stride=geometry.local_key_heads),
-        RegionSpec(name="gdn_conv_k",
-                   offset_bytes=k_offset,
-                   stride_bytes=row_stride,
-                   unit_bytes=key_bytes,
-                   num_units=taps,
-                   units_per_stride=geometry.local_key_heads),
-        RegionSpec(name="gdn_conv_v",
-                   offset_bytes=v_offset,
-                   stride_bytes=row_stride,
-                   unit_bytes=value_bytes,
-                   num_units=taps,
-                   units_per_stride=geometry.local_value_heads),
+        RegionSpec(
+            name="gdn_conv_q",
+            offset_bytes=q_offset,
+            stride_bytes=row_stride,
+            unit_bytes=key_bytes,
+            num_units=taps,
+            units_per_stride=geometry.local_key_heads,
+        ),
+        RegionSpec(
+            name="gdn_conv_k",
+            offset_bytes=k_offset,
+            stride_bytes=row_stride,
+            unit_bytes=key_bytes,
+            num_units=taps,
+            units_per_stride=geometry.local_key_heads,
+        ),
+        RegionSpec(
+            name="gdn_conv_v",
+            offset_bytes=v_offset,
+            stride_bytes=row_stride,
+            unit_bytes=value_bytes,
+            num_units=taps,
+            units_per_stride=geometry.local_value_heads,
+        ),
     )
 
 
-def _gdn_ssm_regions(*, ssm_shape: Sequence[int],
-                     itemsize: int) -> tuple[RegionSpec, ...]:
+def _gdn_ssm_regions(
+    *, ssm_shape: Sequence[int], itemsize: int
+) -> tuple[RegionSpec, ...]:
     if len(ssm_shape) != 4:
         raise ManifestError(
-            f"GDN ssm state must be (blocks, heads, d, d): got {ssm_shape}")
+            f"GDN ssm state must be (blocks, heads, d, d): got {ssm_shape}"
+        )
     heads = int(ssm_shape[1])
     head_bytes = int(ssm_shape[2]) * int(ssm_shape[3]) * itemsize
-    return (RegionSpec(
-        name="gdn_ssm",
-        offset_bytes=0,
-        stride_bytes=head_bytes,
-        unit_bytes=head_bytes,
-        num_units=heads,
-        units_per_stride=1,
-    ), )
+    return (
+        RegionSpec(
+            name="gdn_ssm",
+            offset_bytes=0,
+            stride_bytes=head_bytes,
+            unit_bytes=head_bytes,
+            num_units=heads,
+            units_per_stride=1,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -377,17 +418,21 @@ def _gdn_ssm_regions(*, ssm_shape: Sequence[int],
 # ---------------------------------------------------------------------------
 
 
-def _group_spec_for_layer(kv_cache_groups: Sequence[Any],
-                          layer_name: str) -> Any:
+def _group_spec_for_layer(kv_cache_groups: Sequence[Any], layer_name: str) -> Any:
     for group in kv_cache_groups:
         if layer_name in group.layer_names:
             return group.kv_cache_spec
     raise ManifestError(f"layer {layer_name} is in no kv cache group")
 
 
-def _pooled_gdn_state_views(*, pool: Any, spec: Any,
-                            raw_tensors: Sequence[Any], layer_name: str,
-                            gdn_geometry: GdnHeadGeometry) -> tuple[Any, Any]:
+def _pooled_gdn_state_views(
+    *,
+    pool: Any,
+    spec: Any,
+    raw_tensors: Sequence[Any],
+    layer_name: str,
+    gdn_geometry: GdnHeadGeometry,
+) -> tuple[Any, Any]:
     """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
 
     The state geometry is tied to the pooled GDN kernel's byte model
@@ -403,27 +448,30 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
         raise ManifestError(
-            f"pooled GDN cache {layer_name} must share raw pool storage")
+            f"pooled GDN cache {layer_name} must share raw pool storage"
+        )
     raw = raw_tensors[raw_index]
     pool_nbytes = _nbytes(pool)
     raw_nbytes = _nbytes(raw)
     pool_offset_bytes = _storage_offset_bytes(pool)
-    if (pool_nbytes != raw_nbytes
-            or pool_offset_bytes != _storage_offset_bytes(raw)):
+    if pool_nbytes != raw_nbytes or pool_offset_bytes != _storage_offset_bytes(raw):
         raise ManifestError(
-            f"pooled GDN cache {layer_name} must cover the complete raw pool")
+            f"pooled GDN cache {layer_name} must cover the complete raw pool"
+        )
 
     shapes = tuple(getattr(spec, "shapes", ()))
     dtypes = tuple(getattr(spec, "dtypes", ()))
     if len(shapes) != 2 or len(dtypes) != 2:
         raise ManifestError(
-            f"pooled GDN cache {layer_name} requires conv and SSM specs")
+            f"pooled GDN cache {layer_name} requires conv and SSM specs"
+        )
 
     taps = gdn_geometry.conv_kernel_size - 1
     if taps <= 0:
         raise ManifestError(
             f"pooled GDN cache {layer_name} has no conv taps: "
-            f"conv_kernel_size={gdn_geometry.conv_kernel_size}")
+            f"conv_kernel_size={gdn_geometry.conv_kernel_size}"
+        )
     conv_shape = (taps, gdn_geometry.conv_dim)
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
     try:
@@ -432,50 +480,52 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
     conv_bytes = pooled_gdn_conv_state_bytes(
-        kernel_size=gdn_geometry.conv_kernel_size,
-        conv_dim=gdn_geometry.conv_dim)
-    ssm_shape = (gdn_geometry.local_value_heads, gdn_geometry.value_head_dim,
-                 gdn_geometry.key_head_dim)
+        kernel_size=gdn_geometry.conv_kernel_size, conv_dim=gdn_geometry.conv_dim
+    )
+    ssm_shape = (
+        gdn_geometry.local_value_heads,
+        gdn_geometry.value_head_dim,
+        gdn_geometry.key_head_dim,
+    )
     ssm_bytes = pooled_gdn_ssm_state_bytes(
         num_v_heads=gdn_geometry.local_value_heads,
         head_k_dim=gdn_geometry.key_head_dim,
         head_v_dim=gdn_geometry.value_head_dim,
-        dtype=ssm_dtype)
+        dtype=ssm_dtype,
+    )
 
     try:
         manager_page_bytes = int(spec.page_size_bytes)
     except (AttributeError, TypeError, ValueError) as exc:
         raise ManifestError(
-            f"pooled GDN cache {layer_name} has no manager page size") from exc
+            f"pooled GDN cache {layer_name} has no manager page size"
+        ) from exc
     if manager_page_bytes <= 0 or raw_nbytes % manager_page_bytes != 0:
         raise ManifestError(
             f"raw pool bytes {raw_nbytes} for {layer_name} must be divisible "
-            f"by manager page bytes {manager_page_bytes}")
+            f"by manager page bytes {manager_page_bytes}"
+        )
     if conv_bytes + ssm_bytes > manager_page_bytes:
         raise ManifestError(
             f"GDN states for {layer_name} exceed one manager page: "
-            f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}")
+            f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}"
+        )
     num_blocks = raw_nbytes // manager_page_bytes
 
     states: list[_PooledStateView] = []
     # The PR #106 pooled ABI places SSM first and conv immediately after it,
     # while the public/canonical manifest order remains conv then SSM.
-    for shape, dtype, itemsize, state_bytes, offset_bytes in ((conv_shape,
-                                                               conv_dtype,
-                                                               conv_itemsize,
-                                                               conv_bytes,
-                                                               ssm_bytes),
-                                                              (ssm_shape,
-                                                               ssm_dtype,
-                                                               ssm_itemsize,
-                                                               ssm_bytes, 0)):
+    for shape, dtype, itemsize, state_bytes, offset_bytes in (
+        (conv_shape, conv_dtype, conv_itemsize, conv_bytes, ssm_bytes),
+        (ssm_shape, ssm_dtype, ssm_itemsize, ssm_bytes, 0),
+    ):
         absolute_offset_bytes = pool_offset_bytes + offset_bytes
-        if (manager_page_bytes % itemsize != 0
-                or absolute_offset_bytes % itemsize != 0):
+        if manager_page_bytes % itemsize != 0 or absolute_offset_bytes % itemsize != 0:
             raise ManifestError(
                 f"pooled GDN state for {layer_name} is not aligned to "
                 f"dtype {dtype}: page={manager_page_bytes} "
-                f"offset={absolute_offset_bytes}")
+                f"offset={absolute_offset_bytes}"
+            )
         states.append(
             _PooledStateView(
                 pool=pool,
@@ -484,7 +534,8 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
                 itemsize=itemsize,
                 storage_offset_elems=absolute_offset_bytes // itemsize,
                 nbytes=num_blocks * state_bytes,
-            ))
+            )
+        )
     return states[0], states[1]
 
 
@@ -510,8 +561,7 @@ def _pooled_kda_regions(
         raise ManifestError("pooled KDA cache requires conv and SSM specs")
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
     try:
-        conv_bytes = math.prod(
-            shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
+        conv_bytes = math.prod(shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
         ssm_bytes = math.prod(shapes[1]) * pooled_gdn_state_itemsize(ssm_dtype)
         layout = derive_pooled_gdn_state_layout(
             ssm_bytes=ssm_bytes,
@@ -521,20 +571,25 @@ def _pooled_kda_regions(
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
     if layout.required_bytes > page_bytes:
-        raise ManifestError("KDA state exceeds its pooled page: "
-                            f"state={layout.required_bytes}, "
-                            f"page={page_bytes}")
+        raise ManifestError(
+            "KDA state exceeds its pooled page: "
+            f"state={layout.required_bytes}, "
+            f"page={page_bytes}"
+        )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
         raise ManifestError("KDA transfer requires f32 SSM and bf16 pool rows")
     return {
         TAG_GDN_SSM: (
             0,
-            (RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1), ),
+            (RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1),),
         ),
         TAG_GDN_CONV: (
             layout.ssm_tokens * row_bytes,
-            (RegionSpec("kda_conv_rank_blocks", 0, row_bytes, row_bytes,
-                        layout.conv_tokens), ),
+            (
+                RegionSpec(
+                    "kda_conv_rank_blocks", 0, row_bytes, row_bytes, layout.conv_tokens
+                ),
+            ),
         ),
     }
 
@@ -558,8 +613,9 @@ class _StorageTable:
         return index
 
 
-def _binding_for(typed_tensors: Sequence[tuple[str, Any]],
-                 raw_tensors: Sequence[Any]) -> tuple[str, dict[int, int]]:
+def _binding_for(
+    typed_tensors: Sequence[tuple[str, Any]], raw_tensors: Sequence[Any]
+) -> tuple[str, dict[int, int]]:
     """Returns (binding, {typed position -> raw index}) after consistency
     checks."""
     raw_index_by_pos: dict[int, int] = {}
@@ -573,12 +629,14 @@ def _binding_for(typed_tensors: Sequence[tuple[str, Any]],
         return BINDING_ALIASED_RAW, raw_index_by_pos
     aliased = [typed_tensors[pos][0] for pos in sorted(raw_index_by_pos)]
     private = [
-        name for pos, (name, _) in enumerate(typed_tensors)
+        name
+        for pos, (name, _) in enumerate(typed_tensors)
         if pos not in raw_index_by_pos
     ]
     raise ManifestError(
         "mixed KV cache binding: some typed caches alias raw storage "
-        f"({aliased[:3]}…) while others are private ({private[:3]}…)")
+        f"({aliased[:3]}…) while others are private ({private[:3]}…)"
+    )
 
 
 def build_qwen35_pool_manifest(
@@ -616,20 +674,22 @@ def build_qwen35_pool_manifest(
         if isinstance(cache, (list, tuple)):
             if len(cache) == 1:
                 spec = _group_spec_for_layer(kv_cache_groups, layer_name)
-                states = _pooled_gdn_state_views(pool=cache[0],
-                                                 spec=spec,
-                                                 raw_tensors=raw_tensors,
-                                                 layer_name=layer_name,
-                                                 gdn_geometry=gdn_geometry)
+                states = _pooled_gdn_state_views(
+                    pool=cache[0],
+                    spec=spec,
+                    raw_tensors=raw_tensors,
+                    layer_name=layer_name,
+                    gdn_geometry=gdn_geometry,
+                )
             elif len(cache) == 2:
                 states = cache
             else:
                 raise ManifestError(
                     f"GDN layer {layer_name} must have a unified pool or "
                     f"(conv, ssm) states: "
-                    f"got {len(cache)}")
-            suffix = _state_tag_suffix(layer_name,
-                                       mamba_group_ordinal_by_layer)
+                    f"got {len(cache)}"
+                )
+            suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:
@@ -640,7 +700,8 @@ def build_qwen35_pool_manifest(
             layer_index = layer_index_from_name(layer_name)
             if layer_index is None:
                 raise ManifestError(
-                    f"per-layer pool tags need a layer index in {layer_name}")
+                    f"per-layer pool tags need a layer index in {layer_name}"
+                )
             tagged.append((layer_tag(tag, layer_index), layer_name, tensor))
         flat = tagged
 
@@ -658,25 +719,30 @@ def build_qwen35_pool_manifest(
             if len(shape) < 2:
                 raise ManifestError(
                     f"full-attention cache {layer_name} needs a paged shape: "
-                    f"got {shape}")
+                    f"got {shape}"
+                )
             total_tokens = shape[0] * shape[1]
             if total_tokens % block_size != 0:
                 raise ManifestError(
                     f"full-attention cache {layer_name} token capacity "
                     f"{total_tokens} is not divisible by the logical block "
-                    f"size {block_size}")
+                    f"size {block_size}"
+                )
             num_blocks = total_tokens // block_size
             if nbytes % total_tokens != 0:
                 raise ManifestError(
                     f"full-attention cache {layer_name} nbytes {nbytes} is "
-                    f"not divisible by token capacity {total_tokens}")
+                    f"not divisible by token capacity {total_tokens}"
+                )
             token_stride = nbytes // total_tokens
             live_stride = nbytes // num_blocks
-            regions = _fa_regions(block_size_tokens=block_size,
-                                  token_stride_bytes=token_stride,
-                                  num_kv_heads=num_kv_heads,
-                                  head_size=head_size,
-                                  itemsize=itemsize)
+            regions = _fa_regions(
+                block_size_tokens=block_size,
+                token_stride_bytes=token_stride,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                itemsize=itemsize,
+            )
         else:
             if not shape:
                 raise ManifestError(f"GDN state {layer_name} has no shape")
@@ -684,24 +750,31 @@ def build_qwen35_pool_manifest(
             if num_blocks <= 0 or nbytes % num_blocks != 0:
                 raise ManifestError(
                     f"GDN state {layer_name} nbytes {nbytes} is not "
-                    f"divisible by num_blocks {num_blocks}")
+                    f"divisible by num_blocks {num_blocks}"
+                )
             live_stride = nbytes // num_blocks
             if class_tag(tag).startswith(TAG_GDN_CONV):
-                regions = _gdn_conv_regions(conv_shape=shape,
-                                            itemsize=itemsize,
-                                            geometry=gdn_geometry)
+                regions = _gdn_conv_regions(
+                    conv_shape=shape, itemsize=itemsize, geometry=gdn_geometry
+                )
             else:
                 regions = _gdn_ssm_regions(ssm_shape=shape, itemsize=itemsize)
 
-        entries.append((tensor,
-                        PoolEntry(tag=tag,
-                                  layer_name=layer_name,
-                                  storage_index=-1,
-                                  base_offset_bytes=0,
-                                  block_stride_bytes=live_stride,
-                                  num_blocks=num_blocks,
-                                  regions=regions,
-                                  dtype_tag=dtype_tag)))
+        entries.append(
+            (
+                tensor,
+                PoolEntry(
+                    tag=tag,
+                    layer_name=layer_name,
+                    storage_index=-1,
+                    base_offset_bytes=0,
+                    block_stride_bytes=live_stride,
+                    num_blocks=num_blocks,
+                    regions=regions,
+                    dtype_tag=dtype_tag,
+                ),
+            )
+        )
     return _bind_pool_manifest(entries, raw_tensors)
 
 
@@ -724,83 +797,97 @@ def build_kimi_k3_pool_manifest(
         if is_state and len(cache) != 1:
             raise ManifestError(
                 f"Kimi state layer {layer_name} must expose one unified pool, "
-                f"got {len(cache)} tensors")
+                f"got {len(cache)} tensors"
+            )
         tensor = cache[0] if is_state else cache
         shape = tuple(int(dim) for dim in tensor.shape)
         spec = _group_spec_for_layer(kv_cache_groups, layer_name)
         page_bytes = int(spec.page_size_bytes)
         if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
-            raise ManifestError(f"Kimi cache {layer_name} must be bf16 "
-                                f"[blocks, rows, packing, width], got {shape}")
+            raise ManifestError(
+                f"Kimi cache {layer_name} must be bf16 "
+                f"[blocks, rows, packing, width], got {shape}"
+            )
         num_blocks, rows, packing, width = shape
         if min(shape) <= 0 or packing != 2:
             raise ManifestError(
-                f"Kimi cache {layer_name} has invalid packed-row geometry")
+                f"Kimi cache {layer_name} has invalid packed-row geometry"
+            )
         declared_block_size = getattr(spec, "block_size", None)
-        if (declared_block_size is not None
-                and int(declared_block_size) != rows * packing):
+        if (
+            declared_block_size is not None
+            and int(declared_block_size) != rows * packing
+        ):
             raise ManifestError(
-                f"Kimi cache {layer_name} block size does not match its rows")
+                f"Kimi cache {layer_name} block size does not match its rows"
+            )
         row_bytes = packing * width * _element_size(tensor)
-        if page_bytes != rows * row_bytes or _nbytes(
-                tensor) != num_blocks * page_bytes:
+        if page_bytes != rows * row_bytes or _nbytes(tensor) != num_blocks * page_bytes:
             raise ManifestError(
                 f"Kimi cache {layer_name} page bytes {page_bytes} do not "
-                "match its packed-row stride")
+                "match its packed-row stride"
+            )
         if is_state:
-            layouts = _pooled_kda_regions(spec=spec,
-                                          row_bytes=row_bytes,
-                                          page_bytes=page_bytes)
-            suffix = _state_tag_suffix(layer_name,
-                                       mamba_group_ordinal_by_layer)
+            layouts = _pooled_kda_regions(
+                spec=spec, row_bytes=row_bytes, page_bytes=page_bytes
+            )
+            suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             tags = (TAG_GDN_CONV, TAG_GDN_SSM)
         else:
             layouts = {
-                TAG_FA: (0, (RegionSpec("fa_rows", 0, row_bytes, row_bytes,
-                                        rows), ))
+                TAG_FA: (0, (RegionSpec("fa_rows", 0, row_bytes, row_bytes, rows),))
             }
             suffix = ""
-            tags = (TAG_FA, )
+            tags = (TAG_FA,)
         for tag in tags:
             offset, regions = layouts[tag]
-            entries.append((tensor,
-                            PoolEntry(tag=tag + suffix,
-                                      layer_name=layer_name,
-                                      storage_index=-1,
-                                      base_offset_bytes=offset,
-                                      block_stride_bytes=page_bytes,
-                                      num_blocks=num_blocks,
-                                      regions=regions,
-                                      dtype_tag=_dtype_tag(tensor))))
+            entries.append(
+                (
+                    tensor,
+                    PoolEntry(
+                        tag=tag + suffix,
+                        layer_name=layer_name,
+                        storage_index=-1,
+                        base_offset_bytes=offset,
+                        block_stride_bytes=page_bytes,
+                        num_blocks=num_blocks,
+                        regions=regions,
+                        dtype_tag=_dtype_tag(tensor),
+                    ),
+                )
+            )
     return _bind_pool_manifest(entries, raw_tensors)
 
 
 def _ordered_layers(named_kv_caches: Mapping[str, Any]) -> list[str]:
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
-    return sorted(named_kv_caches,
-                  key=lambda name:
-                  (layer_index_from_name(name) is None,
-                   layer_index_from_name(name) or 0, str(name)))
+    return sorted(
+        named_kv_caches,
+        key=lambda name: (
+            layer_index_from_name(name) is None,
+            layer_index_from_name(name) or 0,
+            str(name),
+        ),
+    )
 
 
-def _state_tag_suffix(layer_name: str,
-                      group_ordinals: Mapping[str, int] | None) -> str:
+def _state_tag_suffix(layer_name: str, group_ordinals: Mapping[str, int] | None) -> str:
     if group_ordinals is None:
         return ""
     ordinal = group_ordinals.get(layer_name)
     if ordinal is None:
-        raise ManifestError(
-            f"GDN layer {layer_name} has no mamba group ordinal")
+        raise ManifestError(f"GDN layer {layer_name} has no mamba group ordinal")
     return f".g{int(ordinal)}"
 
 
-def _bind_pool_manifest(entries: Sequence[tuple[Any, PoolEntry]],
-                        raw_tensors: Sequence[Any]) -> PoolManifest:
+def _bind_pool_manifest(
+    entries: Sequence[tuple[Any, PoolEntry]], raw_tensors: Sequence[Any]
+) -> PoolManifest:
     """Resolve logical pool layouts to live storages and validate page bounds."""
-    binding, raw_index_by_pos = _binding_for([(entry.layer_name, tensor)
-                                              for tensor, entry in entries],
-                                             raw_tensors)
+    binding, raw_index_by_pos = _binding_for(
+        [(entry.layer_name, tensor) for tensor, entry in entries], raw_tensors
+    )
     storages = _StorageTable()
     pools = []
     for pos, (tensor, entry) in enumerate(entries):
@@ -817,40 +904,43 @@ def _bind_pool_manifest(entries: Sequence[tuple[Any, PoolEntry]],
             if raw_nbytes % num_blocks != 0:
                 raise ManifestError(
                     f"raw storage bytes {raw_nbytes} are not divisible by "
-                    f"num_blocks {num_blocks} for {layer_name}")
+                    f"num_blocks {num_blocks} for {layer_name}"
+                )
             stride = raw_nbytes // num_blocks
-            base_offset = (_storage_offset_bytes(tensor) -
-                           _storage_offset_bytes(raw))
+            base_offset = _storage_offset_bytes(tensor) - _storage_offset_bytes(raw)
             if base_offset < 0 or base_offset >= stride:
                 raise ManifestError(
                     f"typed cache {layer_name} offset {base_offset} is "
-                    f"outside one raw page of {stride} bytes")
+                    f"outside one raw page of {stride} bytes"
+                )
 
         base_offset += entry.base_offset_bytes
 
-        last_live_byte = base_offset + max(region.extent_end_bytes
-                                           for region in entry.regions)
+        last_live_byte = base_offset + max(
+            region.extent_end_bytes for region in entry.regions
+        )
         if last_live_byte > stride:
             raise ManifestError(
                 f"logical cache {layer_name} extends through byte "
                 f"{last_live_byte}, beyond its physical page of {stride} "
-                "bytes")
+                "bytes"
+            )
 
         pools.append(
-            dataclasses.replace(entry,
-                                storage_index=storage_index,
-                                base_offset_bytes=base_offset,
-                                block_stride_bytes=stride))
+            dataclasses.replace(
+                entry,
+                storage_index=storage_index,
+                base_offset_bytes=base_offset,
+                block_stride_bytes=stride,
+            )
+        )
 
-    manifest = PoolManifest(binding=binding,
-                            storages=storages.storages,
-                            pools=pools)
+    manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
     # All pools must agree on the block count: the vLLM BlockPool hands out
     # one global block-id space across groups.
     block_counts = {pool.num_blocks for pool in manifest.pools}
     if len(block_counts) != 1:
-        raise ManifestError(
-            f"pools disagree on num_blocks: {sorted(block_counts)}")
+        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
     manifest.geometry_by_tag()
     return manifest
 
@@ -894,15 +984,13 @@ def verify_storage_binding(
     """
     typed_ptrs: set[int] = set()
     for cache in named_kv_caches.values():
-        tensors = cache if isinstance(cache, (list, tuple)) else (cache, )
+        tensors = cache if isinstance(cache, (list, tuple)) else (cache,)
         for tensor in tensors:
             ptr = _storage_ptr(tensor)
             if ptr is not None:
                 typed_ptrs.add(ptr)
     raw_ptrs = {
-        ptr
-        for ptr in (_storage_ptr(raw) for raw in raw_tensors)
-        if ptr is not None
+        ptr for ptr in (_storage_ptr(raw) for raw in raw_tensors) if ptr is not None
     }
     storage_ptrs = {
         ptr
@@ -916,22 +1004,26 @@ def verify_storage_binding(
             raise DeadStorageError(
                 "pool storages reference raw unified pages while the typed "
                 "KV caches are private tensors — the kernels never touch "
-                f"those bytes ({len(dead)} storages).")
+                f"those bytes ({len(dead)} storages)."
+            )
         if storage_ptrs != typed_ptrs:
             missing = len(typed_ptrs - storage_ptrs)
             extra = len(storage_ptrs - typed_ptrs)
             raise DeadStorageError(
                 "pool storages do not match the typed KV cache storages: "
                 f"{missing} typed storages unreferenced, {extra} pool "
-                "storages unknown")
+                "storages unknown"
+            )
     else:
         if not storage_ptrs <= raw_ptrs:
             raise DeadStorageError(
-                "aliased_raw pool storages must be raw unified tensors")
+                "aliased_raw pool storages must be raw unified tensors"
+            )
         if not typed_ptrs <= raw_ptrs:
             raise DeadStorageError(
                 "aliased_raw binding requires every typed KV cache to share "
-                "raw unified storage")
+                "raw unified storage"
+            )
     return len(manifest.storages)
 
 
@@ -942,17 +1034,20 @@ _GLM_REGION_NAMES = {
 }
 
 
-def _glm_row_region(tag: str, *, row_bytes: int,
-                    num_rows: int) -> tuple[RegionSpec, ...]:
+def _glm_row_region(
+    tag: str, *, row_bytes: int, num_rows: int
+) -> tuple[RegionSpec, ...]:
     """One dense region of whole packed rows covering the full page."""
-    return (RegionSpec(
-        name=_GLM_REGION_NAMES[tag],
-        offset_bytes=0,
-        stride_bytes=row_bytes,
-        unit_bytes=row_bytes,
-        num_units=num_rows,
-        units_per_stride=1,
-    ), )
+    return (
+        RegionSpec(
+            name=_GLM_REGION_NAMES[tag],
+            offset_bytes=0,
+            stride_bytes=row_bytes,
+            unit_bytes=row_bytes,
+            num_units=num_rows,
+            units_per_stride=1,
+        ),
+    )
 
 
 def build_glm_mla_pool_manifest(
@@ -978,7 +1073,8 @@ def build_glm_mla_pool_manifest(
             if len(cache) != 2:
                 raise ManifestError(
                     f"GLM MLA admission expects (nope, rope) cache pairs; "
-                    f"layer {layer_name} has a {len(cache)}-tuple")
+                    f"layer {layer_name} has a {len(cache)}-tuple"
+                )
             nope, rope = cache
             flat.append((TAG_MLA_NOPE, layer_name, _dtype_tag(nope), nope))
             flat.append((TAG_MLA_ROPE, layer_name, _dtype_tag(rope), rope))
@@ -986,16 +1082,16 @@ def build_glm_mla_pool_manifest(
         dtype_tag = _dtype_tag(cache)
         flat.append((TAG_DSA_IDX, layer_name, dtype_tag, cache))
     if not any(tag == TAG_MLA_NOPE for tag, _, _, _ in flat):
-        raise ManifestError(
-            "GLM MLA admission found no latent (mla.nope) caches")
+        raise ManifestError("GLM MLA admission found no latent (mla.nope) caches")
 
-    binding, _ = _binding_for([(layer_name, tensor)
-                               for _, layer_name, _, tensor in flat],
-                              raw_tensors)
+    binding, _ = _binding_for(
+        [(layer_name, tensor) for _, layer_name, _, tensor in flat], raw_tensors
+    )
     if binding != BINDING_PRIVATE_TYPED:
         raise ManifestError(
             "GLM MLA admission requires private typed cache tensors; got "
-            f"binding {binding!r}")
+            f"binding {binding!r}"
+        )
 
     storages = _StorageTable()
     pools: list[PoolEntry] = []
@@ -1005,38 +1101,43 @@ def build_glm_mla_pool_manifest(
         if len(shape) != 4:
             raise ManifestError(
                 f"cache {layer_name} must be [blocks, rows, packing, width]: "
-                f"got shape {shape}")
+                f"got shape {shape}"
+            )
         num_blocks, rows, packing, width = shape
         itemsize = _element_size(tensor)
         if num_blocks <= 0 or nbytes % num_blocks != 0:
             raise ManifestError(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
-                f"num_blocks {num_blocks}")
+                f"num_blocks {num_blocks}"
+            )
         live_stride = nbytes // num_blocks
         if tag == TAG_MLA_NOPE:
             # One packed row per token in the nope layout.
             if rows != block_size_tokens:
                 raise ManifestError(
                     f"cache {layer_name} nope rows {rows} do not match the "
-                    f"KV block size {block_size_tokens}")
+                    f"KV block size {block_size_tokens}"
+                )
         elif rows * packing != block_size_tokens:
             raise ManifestError(
                 f"cache {layer_name} rows*packing {rows}*{packing} does not "
-                f"match the KV block size {block_size_tokens}")
+                f"match the KV block size {block_size_tokens}"
+            )
         # The packing axis must fill one 32-bit word (see the layout
         # fingerprint's tile assertion).
         if packing * itemsize != 4:
             raise ManifestError(
                 f"cache {layer_name} packing {packing} does not fill one "
-                f"32-bit word at itemsize {itemsize}")
+                f"32-bit word at itemsize {itemsize}"
+            )
         if width % 128:
-            raise ManifestError(
-                f"cache {layer_name} width {width} is not lane-aligned")
+            raise ManifestError(f"cache {layer_name} width {width} is not lane-aligned")
         row_bytes = packing * width * itemsize
         if live_stride != rows * row_bytes:
             raise ManifestError(
                 f"cache {layer_name} block stride {live_stride} does not "
-                f"match {rows} rows of {row_bytes} bytes")
+                f"match {rows} rows of {row_bytes} bytes"
+            )
         pools.append(
             PoolEntry(
                 tag=tag,
@@ -1045,18 +1146,14 @@ def build_glm_mla_pool_manifest(
                 base_offset_bytes=0,
                 block_stride_bytes=live_stride,
                 num_blocks=num_blocks,
-                regions=_glm_row_region(tag,
-                                        row_bytes=row_bytes,
-                                        num_rows=rows),
+                regions=_glm_row_region(tag, row_bytes=row_bytes, num_rows=rows),
                 dtype_tag=dtype_tag,
-            ))
+            )
+        )
 
-    manifest = PoolManifest(binding=binding,
-                            storages=storages.storages,
-                            pools=pools)
+    manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
     block_counts = {pool.num_blocks for pool in manifest.pools}
     if len(block_counts) != 1:
-        raise ManifestError(
-            f"pools disagree on num_blocks: {sorted(block_counts)}")
+        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
     manifest.geometry_by_tag()  # raises on per-tag geometry divergence
     return manifest

@@ -17,8 +17,7 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import (TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE,
-                            PoolManifest)
+from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
 from .tags import class_tag
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
@@ -38,10 +37,9 @@ def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
         return result
     if not isinstance(value, Mapping):
         raise TypeError("layout fingerprint must be a string or mapping")
-    encoded = json.dumps(dict(value),
-                         sort_keys=True,
-                         separators=(",", ":"),
-                         ensure_ascii=True).encode("ascii")
+    encoded = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -55,7 +53,8 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
             continue
         if len(pool.regions) != 1:
             raise ValueError(
-                "FA page geometry requires exactly one live region per pool")
+                "FA page geometry requires exactly one live region per pool"
+            )
         region = pool.regions[0]
         tokens = int(region.num_units)
         if tokens <= 0:
@@ -65,7 +64,8 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
         raise ValueError("FA page geometry requires an admitted FA pool")
     if len(page_tokens) != 1:
         raise ValueError(
-            f"FA page geometry differs across pools: {sorted(page_tokens)}")
+            f"FA page geometry differs across pools: {sorted(page_tokens)}"
+        )
     return next(iter(page_tokens))
 
 
@@ -88,60 +88,57 @@ def measured_fa_layout_fingerprint(
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    fa_pools = [
-        pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA
-    ]
+    fa_pools = [pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA]
     if not fa_pools:
         raise ValueError("layout fingerprint requires an admitted FA pool")
     fa_pool = fa_pools[0]
     try:
         tensor = manifest.storages[fa_pool.storage_index]
     except IndexError as exc:
-        raise ValueError(
-            "FA pool storage index is outside the manifest") from exc
+        raise ValueError("FA pool storage index is outside the manifest") from exc
 
     getter = layout_getter or _default_layout_getter
     layout = getter(tensor)
     if layout is None:
-        raise RuntimeError(
-            "admitted FA storage has no materialized TPU layout")
+        raise RuntimeError("admitted FA storage has no materialized TPU layout")
     raw_minor_to_major, raw_tiles, raw_element_bits = layout
     minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
     tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
     element_bits = int(raw_element_bits or 8)
     if minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR:
-        raise RuntimeError("FA layout failed E0' minor-to-major gate: "
-                           f"measured={minor_to_major} "
-                           f"expected={EXPECTED_FA_MINOR_TO_MAJOR}")
+        raise RuntimeError(
+            "FA layout failed E0' minor-to-major gate: "
+            f"measured={minor_to_major} "
+            f"expected={EXPECTED_FA_MINOR_TO_MAJOR}"
+        )
     if tiles != EXPECTED_FA_TILES:
-        raise RuntimeError("FA layout failed E0' tile gate: "
-                           f"measured={tiles} expected={EXPECTED_FA_TILES}")
+        raise RuntimeError(
+            "FA layout failed E0' tile gate: "
+            f"measured={tiles} expected={EXPECTED_FA_TILES}"
+        )
     if element_bits != 8:
-        raise RuntimeError("FA layout failed E0' element-size gate: "
-                           f"measured={element_bits} expected=8")
+        raise RuntimeError(
+            "FA layout failed E0' element-size gate: "
+            f"measured={element_bits} expected=8"
+        )
 
     version = package_version or importlib.metadata.version
     payload = {
-        "schema":
-        FA_LAYOUT_FINGERPRINT_SCHEMA,
-        "torch_tpu":
-        version("torch_tpu"),
-        "libtpu":
-        version("libtpu"),
-        "minor_to_major":
-        list(minor_to_major),
+        "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
+        "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
-        "element_size_in_bits":
-        element_bits,
+        "element_size_in_bits": element_bits,
         # GDN conv state layout version.  Both sides of a disagg pair must
         # agree: the byte-span convention (pair-blocked whole-token QK
         # spans vs the legacy split Q/K) is baked into the transfer plan,
         # and the geometries are size-identical, so a mixed pair would not
         # otherwise fail closed.  The controller compares fingerprints
         # before emitting a plan.
-        "gdn_conv_layout":
-        ("qk-pair-v1"
-         if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"),
+        "gdn_conv_layout": (
+            "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
+        ),
     }
     return canonical_layout_fingerprint(payload), payload
 
@@ -178,31 +175,33 @@ def measured_kimi_k3_layout_fingerprint(
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
     payload = {
-        "schema":
-        KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
-        "torch_tpu":
-        version("torch_tpu"),
-        "libtpu":
-        version("libtpu"),
+        "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
         # The planner splits at destination page boundaries, so Kimi compares
         # physical rows independent of the role's page size.
-        "layouts":
-        _measure_packed_row_layouts(manifest,
-                                    page_tokens=page_tokens,
-                                    layout_getter=layout_getter,
-                                    include_page_shape=False),
+        "layouts": _measure_packed_row_layouts(
+            manifest,
+            page_tokens=page_tokens,
+            layout_getter=layout_getter,
+            include_page_shape=False,
+        ),
     }
 
     state_layouts: dict[str, int] = {}
     for pool in manifest.pools:
-        state_tag = next((tag for tag in (TAG_GDN_CONV, TAG_GDN_SSM)
-                          if pool.tag.startswith(tag)), None)
+        state_tag = next(
+            (tag for tag in (TAG_GDN_CONV, TAG_GDN_SSM) if pool.tag.startswith(tag)),
+            None,
+        )
         if state_tag is None:
             continue
         live_bytes = pool.live_bytes_per_block
         if live_bytes % state_fragments:
-            raise ValueError("Kimi live state must divide into source-sized "
-                             f"fragments: tag={pool.tag}")
+            raise ValueError(
+                "Kimi live state must divide into source-sized "
+                f"fragments: tag={pool.tag}"
+            )
         fragment_bytes = live_bytes // state_fragments
         known = state_layouts.setdefault(state_tag, fragment_bytes)
         if known != fragment_bytes:
@@ -227,10 +226,12 @@ def measured_glm_layout_fingerprint(
     Hash per-page geometry only: both peers must agree on it, but they size
     their pools independently.
     """
-    layouts = _measure_packed_row_layouts(manifest,
-                                          page_tokens=page_tokens,
-                                          layout_getter=layout_getter,
-                                          include_page_shape=True)
+    layouts = _measure_packed_row_layouts(
+        manifest,
+        page_tokens=page_tokens,
+        layout_getter=layout_getter,
+        include_page_shape=True,
+    )
     version = package_version or importlib.metadata.version
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
@@ -273,16 +274,18 @@ def _measure_packed_row_layouts(
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
         if len(shape) != 4:
             raise RuntimeError(
-                f"admitted {pool.tag} storage must be rank-4: shape={shape}")
+                f"admitted {pool.tag} storage must be rank-4: shape={shape}"
+            )
         known = shape_by_tag.setdefault(tag, shape)
         if known != shape:
             raise RuntimeError(
-                f"admitted {pool.tag} storages disagree on shape: "
-                f"{known} vs {shape}")
+                f"admitted {pool.tag} storages disagree on shape: {known} vs {shape}"
+            )
         layout = getter(tensor)
         if layout is None:
             raise RuntimeError(
-                f"admitted {pool.tag} storage has no materialized TPU layout")
+                f"admitted {pool.tag} storage has no materialized TPU layout"
+            )
         raw_minor_to_major, raw_tiles, _ = layout
         minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
         tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
@@ -294,24 +297,29 @@ def _measure_packed_row_layouts(
         if page_rows_tokens != page_tokens:
             raise RuntimeError(
                 f"{pool.tag} page geometry {rows}x{packing} does not match "
-                f"page_tokens {page_tokens}")
+                f"page_tokens {page_tokens}"
+            )
         if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "
-                f"minor_to_major={minor_to_major}")
+                f"minor_to_major={minor_to_major}"
+            )
         if tiles != ((packing, 128), (packing, 1)):
             raise RuntimeError(
                 "Packed-row transfers require the packed tile shape "
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "
-                f"layer={pool.layer_name}, tiles={tiles}")
+                f"layer={pool.layer_name}, tiles={tiles}"
+            )
         measured = per_tag.setdefault(
-            tag, {
+            tag,
+            {
                 "row_bytes": packing * width * element_bits // 8,
                 "minor_to_major": list(minor_to_major),
                 "tiles": [list(tile) for tile in tiles],
                 "element_size_in_bits": element_bits,
-            })
+            },
+        )
         if include_page_shape:
             measured["page_shape"] = [rows, packing, width]
     return per_tag

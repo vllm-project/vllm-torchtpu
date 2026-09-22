@@ -67,10 +67,6 @@ repos:
       |src/vllm_torchtpu/layers/core/
       |src/vllm_torchtpu/layers/__init__\.py$
 
-      # distributed
-      |src/vllm_torchtpu/distributed/
-      |tests/distributed/
-      |tests/disagg/
 
       # runner
       |src/vllm_torchtpu/runner/

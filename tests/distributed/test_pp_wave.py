@@ -7,6 +7,7 @@ launch number, and it hands stage r-1's payload of that launch to stage r. A
 schedule whose launches do not pair therefore deadlocks and fails the join
 timeout instead of passing by accident.
 """
+
 import random
 import threading
 from types import SimpleNamespace
@@ -24,7 +25,6 @@ SIDE_WIDTH = 4
 
 
 class _Ring:
-
     def __init__(self, size):
         self.size = size
         self.count = [0] * size
@@ -37,12 +37,12 @@ class _Ring:
             self.slots[(rank, pos)] = tuple(x.clone() for x in carried)
             self.count[rank] += 1
             self.cv.notify_all()
-            if not self.cv.wait_for(lambda: all(c > pos for c in self.count),
-                                    timeout=20):
+            if not self.cv.wait_for(
+                lambda: all(c > pos for c in self.count), timeout=20
+            ):
                 raise TimeoutError(f"rank {rank} launch {pos} never paired")
             # closed cycle: the first stage receives the last stage's block
-            return tuple(x.clone()
-                         for x in self.slots[((rank - 1) % self.size, pos)])
+            return tuple(x.clone() for x in self.slots[((rank - 1) % self.size, pos)])
 
 
 def _build_stages(monkeypatch, template, size=8):
@@ -53,15 +53,18 @@ def _build_stages(monkeypatch, template, size=8):
     monkeypatch.setattr(
         pp_wave,
         "pp_permute_op",
-        lambda mesh, num_tensors=1:
-        (lambda *xs, rank=current["rank"]: ring.launch(rank, xs)))
-    monkeypatch.setattr(pp_wave, "_launch_now",
-                        lambda op, carried: op(*carried))
+        lambda mesh, num_tensors=1: (
+            lambda *xs, rank=current["rank"]: ring.launch(rank, xs)
+        ),
+    )
+    monkeypatch.setattr(pp_wave, "_launch_now", lambda op, carried: op(*carried))
     from vllm.distributed import parallel_state
+
     monkeypatch.setattr(
         parallel_state,
-        "get_pp_group", lambda: SimpleNamespace(rank_in_group=current["rank"],
-                                                world_size=size))
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=current["rank"], world_size=size),
+    )
     waves = []
     for rank in range(size):
         current["rank"] = rank
@@ -71,11 +74,11 @@ def _build_stages(monkeypatch, template, size=8):
 
 def _template(side: bool):
     template = {
-        "hidden_states": ((HIDDEN, ), torch.float32),
-        "residual": ((HIDDEN, ), torch.float32),
+        "hidden_states": ((HIDDEN,), torch.float32),
+        "residual": ((HIDDEN,), torch.float32),
     }
     if side:
-        template[SIDE] = ((SIDE_WIDTH, ), torch.int32)
+        template[SIDE] = ((SIDE_WIDTH,), torch.int32)
     return template
 
 
@@ -114,8 +117,7 @@ def _run_stage(wave, events, results, errors):
                 r = torch.full((rows, HIDDEN), 0.5)
                 extra = torch.full((rows, SIDE_WIDTH), g, dtype=torch.int32)
             else:
-                assert torch.equal(received["residual"],
-                                   torch.zeros(rows, HIDDEN))
+                assert torch.equal(received["residual"], torch.zeros(rows, HIDDEN))
                 h = received["hidden_states"] + 1
                 r = received["residual"]
                 extra = received[SIDE] if side else None
@@ -157,9 +159,10 @@ def _events(rng, forwards, stages, bursts=3):
 def _run(waves, events, timeout=60):
     results, errors = [], []
     threads = [
-        threading.Thread(target=_run_stage,
-                         args=(w, events, results, errors),
-                         daemon=True) for w in waves
+        threading.Thread(
+            target=_run_stage, args=(w, events, results, errors), daemon=True
+        )
+        for w in waves
     ]
     for t in threads:
         t.start()
@@ -187,7 +190,8 @@ def test_random_forwards_and_pushes_deliver_every_forward(stages):
             # relayed across every stage, unchanged and still paired with
             # its own forward
             assert torch.equal(
-                extra, torch.full((rows, SIDE_WIDTH), g, dtype=torch.int32))
+                extra, torch.full((rows, SIDE_WIDTH), g, dtype=torch.int32)
+            )
     # Every burst costs its forwards and pushes plus stages - 1 launches;
     # the warmup adds one.
     moves = len(events) - events.count(SETTLE)
@@ -223,31 +227,42 @@ def test_a_launch_count_off_by_one_is_caught(stages):
 
 def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
     from vllm.distributed import parallel_state
+
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
-    monkeypatch.setattr(pp_wave,
-                        "pp_permute_op",
-                        lambda mesh, num_tensors=1: None)
-    monkeypatch.setattr(parallel_state, "get_pp_group",
-                        lambda: SimpleNamespace(rank_in_group=0, world_size=2))
+    monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh, num_tensors=1: None)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2),
+    )
     with pytest.raises(ValueError, match="hidden_states and residual"):
         pp_wave.PPWave(
-            torch.device("cpu"), MAX_ROWS, {
-                "hidden_states": ((HIDDEN, ), torch.float32),
-                "other": ((HIDDEN, ), torch.float32),
-            })
+            torch.device("cpu"),
+            MAX_ROWS,
+            {
+                "hidden_states": ((HIDDEN,), torch.float32),
+                "other": ((HIDDEN,), torch.float32),
+            },
+        )
     with pytest.raises(ValueError, match="one dtype"):
         pp_wave.PPWave(
-            torch.device("cpu"), MAX_ROWS, {
-                "hidden_states": ((HIDDEN, ), torch.float32),
-                "residual": ((HIDDEN, ), torch.bfloat16),
-            })
+            torch.device("cpu"),
+            MAX_ROWS,
+            {
+                "hidden_states": ((HIDDEN,), torch.float32),
+                "residual": ((HIDDEN,), torch.bfloat16),
+            },
+        )
     with pytest.raises(ValueError, match="side tensors"):
         pp_wave.PPWave(
-            torch.device("cpu"), MAX_ROWS, {
-                "hidden_states": ((HIDDEN, ), torch.float32),
-                "residual": ((HIDDEN, ), torch.float32),
+            torch.device("cpu"),
+            MAX_ROWS,
+            {
+                "hidden_states": ((HIDDEN,), torch.float32),
+                "residual": ((HIDDEN,), torch.float32),
                 SIDE: ((2, SIDE_WIDTH), torch.int32),
-            })
+            },
+        )
 
 
 def test_a_side_tensor_is_self_tested_on_every_stage(monkeypatch):
@@ -267,11 +282,12 @@ def test_a_forward_that_drops_a_side_tensor_is_refused(monkeypatch):
             {
                 "hidden_states": torch.zeros(8, HIDDEN),
                 "residual": torch.zeros(8, HIDDEN),
-            }, 8)
+            },
+            8,
+        )
 
 
-def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_input_once(
-):
+def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_input_once():
     """The next stage's first norm adds hidden states and residual in
     float32, normalizes the sum and keeps it rounded as the residual. The
     hand-off sends the sum rounded to the model dtype with a zero residual,
@@ -280,10 +296,8 @@ def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_inpu
     # a local generator: the global seed would initialize every accelerator
     # backend in this process, and a process that opened the TPU keeps it
     generator = torch.Generator().manual_seed(0)
-    hidden = (torch.randn(256, 512, generator=generator) * 4).to(
-        torch.bfloat16)
-    residual = (torch.randn(256, 512, generator=generator) * 4).to(
-        torch.bfloat16)
+    hidden = (torch.randn(256, 512, generator=generator) * 4).to(torch.bfloat16)
+    residual = (torch.randn(256, 512, generator=generator) * 4).to(torch.bfloat16)
 
     # the norm's input and new residual in a single-stage model
     norm_input = hidden.float() + residual.float()
