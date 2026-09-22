@@ -25,9 +25,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.utils import (
-    align_to, get_dtype_packing)
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper import \
-    ragged_paged_attention
+    align_to,
+    get_dtype_packing,
+)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper import (
+    ragged_paged_attention,
+)
 
 jax.config.parse_flags_with_absl()
 
@@ -61,8 +64,9 @@ def unpack_kv_cache_uint8_to_fp4(kv_cache):
     # Bitcast to float4
     kv_cache = jax.lax.bitcast_convert_type(kv_cache, jnp.float4_e2m1fn)
     # Reshape (..., 4, 2) to (..., 8)
-    kv_cache = kv_cache.reshape(*kv_cache.shape[:-2],
-                                kv_cache.shape[-2] * kv_cache.shape[-1])
+    kv_cache = kv_cache.reshape(
+        *kv_cache.shape[:-2], kv_cache.shape[-2] * kv_cache.shape[-1]
+    )
     # Transpose back
     kv_cache = kv_cache.transpose(0, 1, 2, 4, 3)
     return kv_cache
@@ -100,16 +104,16 @@ def quantize_kv_per_token(k, v, scale_dtype=jnp.bfloat16):
     max_k = jnp.max(jnp.abs(k), axis=-1, keepdims=True)
     scale_k = max_k / 6.0
     scale_k = jnp.where(scale_k == 0, 1.0, scale_k)
-    k_quant = fp4_vals_jax[jnp.argmin(jnp.abs((k / scale_k)[..., None] -
-                                              fp4_vals_jax_4d),
-                                      axis=-1)]
+    k_quant = fp4_vals_jax[
+        jnp.argmin(jnp.abs((k / scale_k)[..., None] - fp4_vals_jax_4d), axis=-1)
+    ]
 
     max_v = jnp.max(jnp.abs(v), axis=-1, keepdims=True)
     scale_v = max_v / 6.0
     scale_v = jnp.where(scale_v == 0, 1.0, scale_v)
-    v_quant = fp4_vals_jax[jnp.argmin(jnp.abs((v / scale_v)[..., None] -
-                                              fp4_vals_jax_4d),
-                                      axis=-1)]
+    v_quant = fp4_vals_jax[
+        jnp.argmin(jnp.abs((v / scale_v)[..., None] - fp4_vals_jax_4d), axis=-1)
+    ]
 
     return (
         k_quant.astype(k.dtype),
@@ -125,14 +129,16 @@ def quantize_kv_fp8_per_token(k, v, scale_dtype=jnp.bfloat16):
     max_k = jnp.max(jnp.abs(k), axis=-1, keepdims=True)
     scale_k = max_k / fp8_max
     scale_k_safe = jnp.where(scale_k == 0, 1.0, scale_k)
-    k_quant = jnp.clip(jnp.round(k / scale_k_safe), -fp8_max,
-                       fp8_max).astype(jnp.float8_e4m3fn)
+    k_quant = jnp.clip(jnp.round(k / scale_k_safe), -fp8_max, fp8_max).astype(
+        jnp.float8_e4m3fn
+    )
 
     max_v = jnp.max(jnp.abs(v), axis=-1, keepdims=True)
     scale_v = max_v / fp8_max
     scale_v_safe = jnp.where(scale_v == 0, 1.0, scale_v)
-    v_quant = jnp.clip(jnp.round(v / scale_v_safe), -fp8_max,
-                       fp8_max).astype(jnp.float8_e4m3fn)
+    v_quant = jnp.clip(jnp.round(v / scale_v_safe), -fp8_max, fp8_max).astype(
+        jnp.float8_e4m3fn
+    )
 
     return (
         k_quant,
@@ -148,20 +154,20 @@ def quantize_kv_per_tensor_with_scale(k, v, scale_k, scale_v):
     fp4_vals_jax_4d = fp4_vals_jax.reshape(1, 1, 1, -1)
 
     scale_k_safe = jnp.where(scale_k == 0, 1.0, scale_k)
-    k_quant = fp4_vals_jax[jnp.argmin(jnp.abs((k / scale_k_safe)[..., None] -
-                                              fp4_vals_jax_4d),
-                                      axis=-1)]
+    k_quant = fp4_vals_jax[
+        jnp.argmin(jnp.abs((k / scale_k_safe)[..., None] - fp4_vals_jax_4d), axis=-1)
+    ]
 
     scale_v_safe = jnp.where(scale_v == 0, 1.0, scale_v)
-    v_quant = fp4_vals_jax[jnp.argmin(jnp.abs((v / scale_v_safe)[..., None] -
-                                              fp4_vals_jax_4d),
-                                      axis=-1)]
+    v_quant = fp4_vals_jax[
+        jnp.argmin(jnp.abs((v / scale_v_safe)[..., None] - fp4_vals_jax_4d), axis=-1)
+    ]
     return k_quant.astype(k.dtype), v_quant.astype(v.dtype)
 
 
 def quantize_kv_per_tensor(k, v):
     """Fake quantizes K and V to FP4 E2M1 with single per-tensor scalar
-  scaling."""
+    scaling."""
     max_k = jnp.max(jnp.abs(k))
     scale_k = max_k / 6.0
     scale_k = jnp.where(scale_k == 0, 1.0, scale_k)
@@ -170,16 +176,13 @@ def quantize_kv_per_tensor(k, v):
     scale_v = max_v / 6.0
     scale_v = jnp.where(scale_v == 0, 1.0, scale_v)
 
-    k_quant, v_quant = quantize_kv_per_tensor_with_scale(
-        k, v, scale_k, scale_v)
+    k_quant, v_quant = quantize_kv_per_tensor_with_scale(k, v, scale_k, scale_v)
     return k_quant, v_quant, float(scale_k), float(scale_v)
 
 
 def merge_kv(
-        k: jax.
-    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
-        v: jax.
-    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
+    v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
 ):
     assert k.shape == v.shape
     assert k.dtype == v.dtype
@@ -196,9 +199,9 @@ def merge_kv(
         head_dim = align_to(actual_head_dim, num_sublanes * kv_packing)
 
     kv = jnp.pad(
-        jnp.concat([k, v],
-                   axis=-1).reshape(max_num_tokens, actual_num_kv_heads_x2,
-                                    actual_head_dim),
+        jnp.concat([k, v], axis=-1).reshape(
+            max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
+        ),
         (
             (0, 0),
             (0, num_kv_heads_x2 - actual_num_kv_heads_x2),
@@ -215,11 +218,9 @@ def merge_kv(
 
 
 def ref_ragged_paged_attention(
-    queries: jax.
-    Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    values: jax.
-    Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     kv_cache: jax.Array,  # [total_num_pages, page_size,
     # num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
@@ -261,8 +262,7 @@ def ref_ragged_paged_attention(
     actual_num_kv_heads = keys.shape[1]
     merged_kv = merge_kv(keys, values)
 
-    _, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = (
-        kv_cache.shape)
+    _, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = kv_cache.shape
     num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
     assert num_kv_heads_x2 % 2 == 0
     assert actual_num_q_heads % actual_num_kv_heads == 0
@@ -295,44 +295,51 @@ def ref_ragged_paged_attention(
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape
         gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
-        gathered_kv = gathered_kv.at[kv_len - q_len:kv_len].set(
-            merged_kv[q_start:q_end])
-        kv_cache = kv_cache.at[indices].set(
-            gathered_kv.reshape(gathered_shape))
+        gathered_kv = gathered_kv.at[kv_len - q_len : kv_len].set(
+            merged_kv[q_start:q_end]
+        )
+        kv_cache = kv_cache.at[indices].set(gathered_kv.reshape(gathered_shape))
 
-        kv = gathered_kv.reshape(
-            -1, num_kv_heads_x2,
-            head_dim)[:, :actual_num_kv_heads * 2, :].reshape(
-                -1, actual_num_kv_heads, head_dim * 2)
+        kv = gathered_kv.reshape(-1, num_kv_heads_x2, head_dim)[
+            :, : actual_num_kv_heads * 2, :
+        ].reshape(-1, actual_num_kv_heads, head_dim * 2)
         k = kv[:kv_len, :, :head_dim][:, :, :actual_head_dim]
         v = kv[:kv_len, :, head_dim:][:, :, :actual_head_dim]
 
         # Update the scale cache and dequantize K and V if using per-token scale
         if use_per_token_scale:
             gathered_scale = kv_cache_scale[indices]
-            gathered_scale_2d = (gathered_scale.swapaxes(0, 1).reshape(
-                num_kv_heads_x2, -1).swapaxes(0, 1))
+            gathered_scale_2d = (
+                gathered_scale.swapaxes(0, 1)
+                .reshape(num_kv_heads_x2, -1)
+                .swapaxes(0, 1)
+            )
 
             new_k_scale = k_scale[q_start:q_end]
             new_v_scale = v_scale[q_start:q_end]
-            new_scales = jnp.stack([new_k_scale, new_v_scale],
-                                   axis=-1).reshape(-1, num_kv_heads_x2)
+            new_scales = jnp.stack([new_k_scale, new_v_scale], axis=-1).reshape(
+                -1, num_kv_heads_x2
+            )
 
-            gathered_scale_2d = gathered_scale_2d.at[kv_len -
-                                                     q_len:kv_len].set(
-                                                         new_scales)
+            gathered_scale_2d = gathered_scale_2d.at[kv_len - q_len : kv_len].set(
+                new_scales
+            )
             kv_cache_scale = kv_cache_scale.at[indices].set(
-                gathered_scale_2d.swapaxes(0, 1).reshape(
-                    num_kv_heads_x2, -1, page_size).swapaxes(0, 1))
+                gathered_scale_2d.swapaxes(0, 1)
+                .reshape(num_kv_heads_x2, -1, page_size)
+                .swapaxes(0, 1)
+            )
 
             # Dequantize K and V using scales from cache
             seq_scales = gathered_scale_2d[:kv_len]
             seq_k_scale = seq_scales[:, 0::2, jnp.newaxis]  # [kv_len, H, 1]
             seq_v_scale = seq_scales[:, 1::2, jnp.newaxis]  # [kv_len, H, 1]
-            k = (k.astype(jnp.float32) *
-                 seq_k_scale.astype(jnp.float32)).astype(queries.dtype)
-            v = (v.astype(jnp.float32) *
-                 seq_v_scale.astype(jnp.float32)).astype(queries.dtype)
+            k = (k.astype(jnp.float32) * seq_k_scale.astype(jnp.float32)).astype(
+                queries.dtype
+            )
+            v = (v.astype(jnp.float32) * seq_v_scale.astype(jnp.float32)).astype(
+                queries.dtype
+            )
 
         k = jnp.repeat(k, actual_num_q_heads_per_kv_head, axis=1)
         v = jnp.repeat(v, actual_num_q_heads_per_kv_head, axis=1)
@@ -346,10 +353,9 @@ def ref_ragged_paged_attention(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(k.dtype)
 
-        attn = jnp.einsum("qhd,khd->hqk",
-                          q,
-                          k,
-                          preferred_element_type=jnp.float32).astype(out_dtype)
+        attn = jnp.einsum(
+            "qhd,khd->hqk", q, k, preferred_element_type=jnp.float32
+        ).astype(out_dtype)
         attn *= sm_scale
 
         if not use_per_token_scale:
@@ -363,7 +369,8 @@ def ref_ragged_paged_attention(
 
         if use_causal_mask:
             q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
-                jnp.int32, attn.shape, 1)
+                jnp.int32, attn.shape, 1
+            )
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span >= kv_span
             if sliding_window is not None:
@@ -371,10 +378,7 @@ def ref_ragged_paged_attention(
             attn = jnp.where(mask, attn, mask_value)
 
         attn = jax.nn.softmax(attn, axis=-1).astype(out_dtype)
-        out = jnp.einsum("hqk,khd->qhd",
-                         attn,
-                         v,
-                         preferred_element_type=jnp.float32)
+        out = jnp.einsum("hqk,khd->qhd", attn, v, preferred_element_type=jnp.float32)
 
         if not use_per_token_scale and v_scale is not None:
             out *= v_scale
@@ -391,17 +395,17 @@ def ref_ragged_paged_attention(
 class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
     """Correctness tests for quantized batched ragged paged attention.
 
-  This suite has been pruned to the minimum set of tests required to validate:
-  1. Numerical error bounds of fake FP4 quantization (vs BF16 reference).
-  2. Robustness to outliers (per-token vs per-tensor quantization).
-  3. Scale channel packing layouts (1, 2, and 4 channels):
-     - 1 channel: BF16 KV + BF16 scale (quantized_basic)
-     - 2 channels: BF16 KV + FP32 scale (quantized_fp32_scale_basic)
-                   or FP8 KV + BF16 scale (fp8_basic)
-     - 4 channels: FP8 KV + FP32 scale (fp8_fp32_scale_basic)
-  4. Mixed prefill/decode scheduling with quantization (quantized_mixed).
-  5. Layout/padding edge cases with scale channels (quantized_complex).
-  """
+    This suite has been pruned to the minimum set of tests required to validate:
+    1. Numerical error bounds of fake FP4 quantization (vs BF16 reference).
+    2. Robustness to outliers (per-token vs per-tensor quantization).
+    3. Scale channel packing layouts (1, 2, and 4 channels):
+       - 1 channel: BF16 KV + BF16 scale (quantized_basic)
+       - 2 channels: BF16 KV + FP32 scale (quantized_fp32_scale_basic)
+                     or FP8 KV + BF16 scale (fp8_basic)
+       - 4 channels: FP8 KV + FP32 scale (fp8_fp32_scale_basic)
+    4. Mixed prefill/decode scheduling with quantization (quantized_mixed).
+    5. Layout/padding edge cases with scale channels (quantized_complex).
+    """
 
     def _test_ragged_paged_attention(
         self,
@@ -436,8 +440,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         rng = np.random.default_rng(1234)
 
         def gen_random(shape, dtype):
-            return jnp.array(rng.random(size=shape,
-                                        dtype=np.float32)).astype(dtype)
+            return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
 
         if use_per_token_scale:
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
@@ -460,12 +463,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         pages_per_seq = cdiv(max_kv_len, page_size)
         num_q_heads, num_kv_heads = num_heads
 
-        q = gen_random((max_num_batched_tokens, num_q_heads, head_dim),
-                       q_dtype)
-        k = gen_random((max_num_batched_tokens, num_kv_heads, head_dim),
-                       kv_dtype)
-        v = gen_random((max_num_batched_tokens, num_kv_heads, head_dim),
-                       kv_dtype)
+        q = gen_random((max_num_batched_tokens, num_q_heads, head_dim), q_dtype)
+        k = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), kv_dtype)
+        v = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), kv_dtype)
 
         if inject_outliers:
             k = k.at[::64, :, :4].set(50.0)
@@ -474,7 +474,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         if use_per_token_scale:
             assert k_scale is None and v_scale is None
             k_quant, v_quant, k_scale, v_scale = quantize_fn(
-                k, v, scale_dtype=per_token_scale_dtype)
+                k, v, scale_dtype=per_token_scale_dtype
+            )
             k = k_quant
             v = v_quant
         elif use_per_tensor_scale:
@@ -500,25 +501,30 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
             if use_per_token_scale:
                 k_cache_quant, v_cache_quant, scale_k_cache, scale_v_cache = (
-                    quantize_fn(k_cache_i,
-                                v_cache_i,
-                                scale_dtype=per_token_scale_dtype))
+                    quantize_fn(k_cache_i, v_cache_i, scale_dtype=per_token_scale_dtype)
+                )
                 # Prepare reference scale pages for ref_ragged_paged_attention
-                scales = (jnp.stack([scale_k_cache, scale_v_cache],
-                                    axis=-1).reshape(kv_len, num_kv_heads *
-                                                     2).swapaxes(0, 1))
-                scales_padded = jnp.pad(
-                    scales,
-                    (
-                        (0, 0),
-                        (0, cdiv(kv_len, page_size) * page_size - kv_len),
-                    ),
-                    constant_values=1.0,
-                ).reshape(
-                    num_kv_heads * 2,
-                    -1,
-                    page_size,
-                ).swapaxes(0, 1)
+                scales = (
+                    jnp.stack([scale_k_cache, scale_v_cache], axis=-1)
+                    .reshape(kv_len, num_kv_heads * 2)
+                    .swapaxes(0, 1)
+                )
+                scales_padded = (
+                    jnp.pad(
+                        scales,
+                        (
+                            (0, 0),
+                            (0, cdiv(kv_len, page_size) * page_size - kv_len),
+                        ),
+                        constant_values=1.0,
+                    )
+                    .reshape(
+                        num_kv_heads * 2,
+                        -1,
+                        page_size,
+                    )
+                    .swapaxes(0, 1)
+                )
                 kv_scale_pages_list.append(scales_padded)
 
                 # 1. Reference token cache (no scale channels)
@@ -529,24 +535,21 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 num_scale_channels = max(1, scale_bits // kv_bits)
                 if kv_bits < scale_bits:
                     scale_k_split = jax.lax.bitcast_convert_type(
-                        scale_k_cache,
-                        k_cache_quant.dtype).reshape(*scale_k_cache.shape,
-                                                     num_scale_channels)
+                        scale_k_cache, k_cache_quant.dtype
+                    ).reshape(*scale_k_cache.shape, num_scale_channels)
                     scale_v_split = jax.lax.bitcast_convert_type(
-                        scale_v_cache,
-                        v_cache_quant.dtype).reshape(*scale_v_cache.shape,
-                                                     num_scale_channels)
+                        scale_v_cache, v_cache_quant.dtype
+                    ).reshape(*scale_v_cache.shape, num_scale_channels)
                 else:
                     scale_k_split = scale_k_cache[..., None]
                     scale_v_split = scale_v_cache[..., None]
-                k_with_sc = jnp.concatenate([k_cache_quant, scale_k_split],
-                                            axis=-1)
-                v_with_sc = jnp.concatenate([v_cache_quant, scale_v_split],
-                                            axis=-1)
+                k_with_sc = jnp.concatenate([k_cache_quant, scale_k_split], axis=-1)
+                v_with_sc = jnp.concatenate([v_cache_quant, scale_v_split], axis=-1)
                 kv_rpa = merge_kv(k_with_sc, v_with_sc)
             elif use_per_tensor_scale:
                 k_cache_quant, v_cache_quant = quantize_kv_per_tensor_with_scale(
-                    k_cache_i, v_cache_i, k_scale, v_scale)
+                    k_cache_i, v_cache_i, k_scale, v_scale
+                )
                 kv_ref = merge_kv(k_cache_quant, v_cache_quant)
                 kv_rpa = kv_ref
             else:
@@ -588,11 +591,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 kv_rpa.shape[-1],
             )
 
-            indices = page_cnt + jnp.arange(kv_padded_ref.shape[0],
-                                            dtype=jnp.int32)
+            indices = page_cnt + jnp.arange(kv_padded_ref.shape[0], dtype=jnp.int32)
             indices = jnp.pad(
                 indices,
-                ((0, pages_per_seq - indices.shape[0]), ),
+                ((0, pages_per_seq - indices.shape[0]),),
                 constant_values=jnp.nan,
             )
             page_indices_list.append(indices)
@@ -603,16 +605,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         kv_cache_ref = jnp.concatenate(kv_pages_list, axis=0)
         kv_cache_ref = jnp.pad(
             kv_cache_ref,
-            ((0, num_pages - kv_cache_ref.shape[0]), (0, 0), (0, 0), (0, 0),
-             (0, 0)),
+            ((0, num_pages - kv_cache_ref.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
             constant_values=jnp.nan,
         )
 
         rpa_kv_cache = jnp.concatenate(kv_pages_rpa_list, axis=0)
         rpa_kv_cache = jnp.pad(
             rpa_kv_cache,
-            ((0, num_pages - rpa_kv_cache.shape[0]), (0, 0), (0, 0), (0, 0),
-             (0, 0)),
+            ((0, num_pages - rpa_kv_cache.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
             constant_values=jnp.nan,
         )
 
@@ -634,8 +634,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         page_indices = page_indices.reshape(-1)
 
         cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
-        cu_q_lens = jnp.pad(cu_q_lens,
-                            (0, max_num_seq + 1 - cu_q_lens.shape[0]))
+        cu_q_lens = jnp.pad(cu_q_lens, (0, max_num_seq + 1 - cu_q_lens.shape[0]))
         kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
         kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
         distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
@@ -683,7 +682,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         aligned_head_dim_rpa = align_to(
             base_dim,
             num_sublanes * kv_packing
-            if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 128,
+            if kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            else 128,
         )
 
         if aligned_head_dim_rpa != rpa_kv_cache.shape[-1]:
@@ -696,7 +696,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 num_kv_heads_x2,
                 aligned_head_dim_rpa // kv_packing,
                 kv_packing,
-            ).transpose(0, 2, 3, 4, 1)[:, :num_kv_heads * 2]
+            ).transpose(0, 2, 3, 4, 1)[:, : num_kv_heads * 2]
 
         if pack_inputs_to_uint8:
             k = pack_fp4_to_uint8(k)
@@ -749,7 +749,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
         if pack_cache_to_uint8:
             updated_kv_cache = unpack_kv_cache_uint8_to_fp4(updated_kv_cache)
-        output = output[:cu_q_lens[distribution[-1]]]
+        output = output[: cu_q_lens[distribution[-1]]]
 
         dtype_bits = dtypes.itemsize_bits(jnp.dtype(kv_dtype))
         tols = {
@@ -767,8 +767,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             if num_kv_heads * 2 != num_kv_heads_x2:
                 tmp = jnp.pad(
                     tmp,
-                    ((0, 0), (0, 0), (0, num_kv_heads_x2 - num_kv_heads * 2),
-                     (0, 0), (0, 0)),
+                    (
+                        (0, 0),
+                        (0, 0),
+                        (0, num_kv_heads_x2 - num_kv_heads * 2),
+                        (0, 0),
+                        (0, 0),
+                    ),
                     constant_values=jnp.nan,
                 )
             updated_kv_cache = tmp.reshape(
@@ -785,63 +790,83 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 kv_bits = jax.dtypes.itemsize_bits(jnp.dtype(kv_dtype))
                 scale_bits = jax.dtypes.itemsize_bits(per_token_scale_dtype)
                 num_scale_channels = max(1, scale_bits // kv_bits)
-                unpadded_cache = updated_kv_cache[:, :, :num_kv_heads * 2]
+                unpadded_cache = updated_kv_cache[:, :, : num_kv_heads * 2]
                 if kv_bits < scale_bits:
-                    scale_slice = unpadded_cache[..., head_dim:head_dim +
-                                                 num_scale_channels]
+                    scale_slice = unpadded_cache[
+                        ..., head_dim : head_dim + num_scale_channels
+                    ]
                     if kv_bits == 4 and scale_bits == 16:
                         scale_slice_reshaped = scale_slice.reshape(
-                            *scale_slice.shape[:-1], 2, 2)
+                            *scale_slice.shape[:-1], 2, 2
+                        )
                         packed_uint8 = jax.lax.bitcast_convert_type(
-                            scale_slice_reshaped, jnp.uint8)
+                            scale_slice_reshaped, jnp.uint8
+                        )
                         lo = packed_uint8[..., 0].astype(jnp.uint16)
                         hi = packed_uint8[..., 1].astype(jnp.uint16)
                         updated_kv_scale = jax.lax.bitcast_convert_type(
-                            lo | (hi << 8), per_token_scale_dtype)
+                            lo | (hi << 8), per_token_scale_dtype
+                        )
                     elif kv_bits == 4 and scale_bits == 32:
                         scale_slice_reshaped = scale_slice.reshape(
-                            *scale_slice.shape[:-1], 4, 2)
+                            *scale_slice.shape[:-1], 4, 2
+                        )
                         packed_uint8 = jax.lax.bitcast_convert_type(
-                            scale_slice_reshaped, jnp.uint8)
+                            scale_slice_reshaped, jnp.uint8
+                        )
                         b0 = packed_uint8[..., 0].astype(jnp.uint32)
                         b1 = packed_uint8[..., 1].astype(jnp.uint32)
                         b2 = packed_uint8[..., 2].astype(jnp.uint32)
                         b3 = packed_uint8[..., 3].astype(jnp.uint32)
                         updated_kv_scale = jax.lax.bitcast_convert_type(
                             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24),
-                            per_token_scale_dtype)
+                            per_token_scale_dtype,
+                        )
                     elif kv_bits == 8 and scale_bits == 16:
                         lo = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 0], jnp.uint8).astype(jnp.uint16)
+                            scale_slice[..., 0], jnp.uint8
+                        ).astype(jnp.uint16)
                         hi = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 1], jnp.uint8).astype(jnp.uint16)
+                            scale_slice[..., 1], jnp.uint8
+                        ).astype(jnp.uint16)
                         updated_kv_scale = jax.lax.bitcast_convert_type(
-                            lo | (hi << 8), per_token_scale_dtype)
+                            lo | (hi << 8), per_token_scale_dtype
+                        )
                     elif kv_bits == 8 and scale_bits == 32:
                         b0 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 0], jnp.uint8).astype(jnp.uint32)
+                            scale_slice[..., 0], jnp.uint8
+                        ).astype(jnp.uint32)
                         b1 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 1], jnp.uint8).astype(jnp.uint32)
+                            scale_slice[..., 1], jnp.uint8
+                        ).astype(jnp.uint32)
                         b2 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 2], jnp.uint8).astype(jnp.uint32)
+                            scale_slice[..., 2], jnp.uint8
+                        ).astype(jnp.uint32)
                         b3 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 3], jnp.uint8).astype(jnp.uint32)
+                            scale_slice[..., 3], jnp.uint8
+                        ).astype(jnp.uint32)
                         updated_kv_scale = jax.lax.bitcast_convert_type(
                             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24),
-                            per_token_scale_dtype)
+                            per_token_scale_dtype,
+                        )
                     elif kv_bits == 16 and scale_bits == 32:
                         w0 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 0], jnp.uint16).astype(jnp.uint32)
+                            scale_slice[..., 0], jnp.uint16
+                        ).astype(jnp.uint32)
                         w1 = jax.lax.bitcast_convert_type(
-                            scale_slice[..., 1], jnp.uint16).astype(jnp.uint32)
+                            scale_slice[..., 1], jnp.uint16
+                        ).astype(jnp.uint32)
                         updated_kv_scale = jax.lax.bitcast_convert_type(
-                            w0 | (w1 << 16), per_token_scale_dtype)
+                            w0 | (w1 << 16), per_token_scale_dtype
+                        )
                     else:
                         updated_kv_scale = jax.lax.bitcast_convert_type(
-                            scale_slice, per_token_scale_dtype)
+                            scale_slice, per_token_scale_dtype
+                        )
                 else:
                     updated_kv_scale = unpadded_cache[..., head_dim].astype(
-                        per_token_scale_dtype)
+                        per_token_scale_dtype
+                    )
             updated_kv_cache = updated_kv_cache[..., :head_dim]
             expected_kv_cache = expected_kv_cache[..., :head_dim]
 
@@ -859,15 +884,16 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                         else:
                             cache_mask[page_num, :] = True
             mask = jnp.array(cache_mask)
-            self.assertArraysEqual(updated_kv_cache[mask],
-                                   expected_kv_cache[mask])
+            self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         else:
             self.assertTrue(
                 jnp.all(
                     jnp.logical_or(
                         jnp.isnan(expected_kv_cache),
                         updated_kv_cache == expected_kv_cache,
-                    )).item())
+                    )
+                ).item()
+            )
 
         if use_per_token_scale and updated_kv_scale is not None:
             if kv_bits == 4:
@@ -884,9 +910,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertEqual(output.shape[-1], head_dim)
         return output
 
-    @parameterized.product(block_sizes=[
-        (64, 256, 32, 128),
-    ], )
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),
+        ],
+    )
     def test_ragged_paged_attention_quantized_vs_no_quant(self, block_sizes):
         dtype = jnp.bfloat16
         seq_lens = [(192, 328), (128, 180), (64, 255)]
@@ -958,8 +986,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             flat_ref = ref.reshape(-1)
             flat_tgt = target.reshape(-1)
             cos_sim = jnp.dot(flat_ref, flat_tgt) / (
-                jnp.linalg.norm(flat_ref) * jnp.linalg.norm(flat_tgt) +
-                epsilon)
+                jnp.linalg.norm(flat_ref) * jnp.linalg.norm(flat_tgt) + epsilon
+            )
             return (
                 float(mae),
                 float(max_ae),
@@ -970,9 +998,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             )
 
         mae_pt, max_pt, mre_pt, max_re_pt, mse_pt, cos_pt = calc_metrics(
-            out_no_quant, out_quant_pt)
+            out_no_quant, out_quant_pt
+        )
         mae_std, max_std, mre_std, max_re_std, mse_std, cos_std = calc_metrics(
-            out_no_quant, out_quant_std)
+            out_no_quant, out_quant_std
+        )
 
         print("\n============================================================")
         print("--- Quantization Error Comparison (Fake FP4 vs BF16 Ref) ---")
@@ -982,9 +1012,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         print(f"Mean Absolute Error (MAE) | {mae_pt:14.6f} | {mae_std:14.6f}")
         print(f"Max Absolute Error        | {max_pt:14.6f} | {max_std:14.6f}")
         print(f"Mean Relative Error       | {mre_pt:14.6f} | {mre_std:14.6f}")
-        print(
-            f"Max Relative Error        | {max_re_pt:14.6f} | {max_re_std:14.6f}"
-        )
+        print(f"Max Relative Error        | {max_re_pt:14.6f} | {max_re_std:14.6f}")
         print(f"Mean Squared Error (MSE)  | {mse_pt:14.6f} | {mse_std:14.6f}")
         print(f"Cosine Similarity         | {cos_pt:14.6f} | {cos_std:14.6f}")
         print("============================================================\n")
@@ -999,9 +1027,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertAllClose(out_no_quant, out_quant_pt, atol=0.8, rtol=0.8)
         self.assertAllClose(out_no_quant, out_quant_std, atol=0.8, rtol=0.8)
 
-    @parameterized.product(block_sizes=[
-        (64, 256, 32, 128),
-    ], )
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),
+        ],
+    )
     def test_ragged_paged_attention_quantized_outliers(self, block_sizes):
         dtype = jnp.bfloat16
         seq_lens = [(192, 328), (128, 180), (64, 255)]
@@ -1073,13 +1103,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             mre = jnp.mean(rel_diff)
             max_re = jnp.max(rel_diff)
             mse = jnp.mean(jnp.square(ref - target))
-            return float(mae), float(max_ae), float(mre), float(max_re), float(
-                mse)
+            return float(mae), float(max_ae), float(mre), float(max_re), float(mse)
 
         mae_pt, max_pt, mre_pt, max_re_pt, mse_pt = calc_metrics(
-            out_no_quant, out_quant_pt)
+            out_no_quant, out_quant_pt
+        )
         mae_std, max_std, mre_std, max_re_std, mse_std = calc_metrics(
-            out_no_quant, out_quant_std)
+            out_no_quant, out_quant_std
+        )
 
         print("\n============================================================")
         print("--- Quantization Error with LLM Outliers (+50.0 Spikes) ----")
@@ -1089,9 +1120,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         print(f"Mean Absolute Error (MAE) | {mae_pt:14.6f} | {mae_std:14.6f}")
         print(f"Max Absolute Error        | {max_pt:14.6f} | {max_std:14.6f}")
         print(f"Mean Relative Error       | {mre_pt:14.6f} | {mre_std:14.6f}")
-        print(
-            f"Max Relative Error        | {max_re_pt:14.6f} | {max_re_std:14.6f}"
-        )
+        print(f"Max Relative Error        | {max_re_pt:14.6f} | {max_re_std:14.6f}")
         print("============================================================\n")
 
     @parameterized.product(
@@ -1103,9 +1132,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
     )
-    def test_ragged_paged_attention_quantized_basic(self,
-                                                    block_sizes_and_page_size,
-                                                    kv_layout):
+    def test_ragged_paged_attention_quantized_basic(
+        self, block_sizes_and_page_size, kv_layout
+    ):
         dtype = jnp.bfloat16
         seq_lens = [(192, 328), (128, 180), (64, 255)]
         num_heads = (32, 8)
@@ -1140,8 +1169,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
     )
-    def test_ragged_paged_attention_fp8_basic(self, block_sizes_and_page_size,
-                                              kv_layout):
+    def test_ragged_paged_attention_fp8_basic(
+        self, block_sizes_and_page_size, kv_layout
+    ):
         q_dtype = jnp.bfloat16
         kv_dtype = jnp.float8_e4m3fn
         seq_lens = [(192, 328), (128, 180), (64, 255)]
@@ -1246,7 +1276,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         ],
     )
     def test_ragged_paged_attention_quantized_fp32_scale_basic(
-            self, block_sizes_and_page_size, kv_layout):
+        self, block_sizes_and_page_size, kv_layout
+    ):
         dtype = jnp.bfloat16
         seq_lens = [(192, 328), (128, 180), (64, 255)]
         num_heads = (32, 8)
@@ -1283,7 +1314,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         ],
     )
     def test_ragged_paged_attention_fp8_fp32_scale_basic(
-            self, block_sizes_and_page_size, kv_layout):
+        self, block_sizes_and_page_size, kv_layout
+    ):
         q_dtype = jnp.bfloat16
         kv_dtype = jnp.float8_e4m3fn
         seq_lens = [(192, 328), (128, 180), (64, 255)]
