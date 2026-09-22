@@ -1,0 +1,27 @@
+# Goal: Benchmark Performance & Throughput as an increasing number of layers are 2:4 sparsified
+mode: "profile"
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 4096
+
+engine_args:
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+model_resolver:
+  module: "resolvers.gemma_sparsity_resolver"
+  function: "resolve_model"
+  config:
+    strategy: "last_to_first"
+    base_model: "/mnt/pd/huggingface_cache/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475"
+    checkpoint_base_dir: "/mnt/pd/sparse_checkpoints"
+    prunen: 2
+    prunem: 4
+    nsamples: 64
+
+sweep_matrix:
+  num_sparse_layers: [0, 5, 10, 20, 30, 40, 50, 60]
+  batch_size: [1, 16]
+  input_len: [128, 2048]
+  output_len: [64]
