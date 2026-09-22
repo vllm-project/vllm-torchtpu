@@ -188,8 +188,6 @@ ignore = [
 # .pre-commit-config.yaml. All three move together, otherwise two tools format
 # the same file. Use `dir/**` or a full path: in a `*` pattern the star also
 # matches `/`, so `dir/*.py` silently covers the whole subtree.
-# kernels/experimental
-"src/vllm_torchtpu/kernels/experimental/**" = ["I"]
 
 # kernels/deepseek_v4
 "src/vllm_torchtpu/kernels/deepseek_v4/**" = ["I"]
@@ -292,8 +290,6 @@ docstring-code-format = true
 
 # Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
 exclude = [
-    # kernels/experimental
-    "src/vllm_torchtpu/kernels/experimental/**",
 
     # kernels/deepseek_v4
     "src/vllm_torchtpu/kernels/deepseek_v4/**",

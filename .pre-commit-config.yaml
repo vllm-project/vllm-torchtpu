@@ -28,8 +28,6 @@ repos:
       # (?!) never matches, so every path below can carry a leading `|` and a
       # migration deletes whole lines only.
       (?!)
-      # kernels/experimental
-      |src/vllm_torchtpu/kernels/experimental/
 
       # kernels/deepseek_v4
       |src/vllm_torchtpu/kernels/deepseek_v4/

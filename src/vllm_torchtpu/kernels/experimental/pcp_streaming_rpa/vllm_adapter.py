@@ -15,12 +15,16 @@ from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
-from vllm_torchtpu.kernels.experimental.batched_rpa import \
-    configs as batched_rpa_configs
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
-    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
-    PCP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
+    PCP_AXIS_NAME,
+    sharded_pcp_ragged_paged_attention,
+)
 
 _PCP_STREAMING_RPA_TENSOR_ARG_COUNT = 9
 
@@ -41,21 +45,23 @@ PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS = (
 
 
 def _torch_placeholder_with_sharding(
-        aval: jax.core.ShapedArray | None,
-        sharding: jax.sharding.NamedSharding | None,
-        mesh: jax.sharding.Mesh | None) -> torch.Tensor | None:
+    aval: jax.core.ShapedArray | None,
+    sharding: jax.sharding.NamedSharding | None,
+    mesh: jax.sharding.Mesh | None,
+) -> torch.Tensor | None:
     if not isinstance(aval, jax.core.ShapedArray):
         return aval
     torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
     if torch_dtype is None:
-        raise NotImplementedError(
-            f"Unsupported dtype for pallas kernels: {aval.dtype}")
+        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
     spec = getattr(sharding, "spec", None)
     if spec is None:
         spec = getattr(getattr(aval, "sharding", None), "spec", None)
-    return torch.empty(pallas_impl.get_local_shape(aval.shape, mesh, spec),
-                       dtype=torch_dtype,
-                       device="tpu")
+    return torch.empty(
+        pallas_impl.get_local_shape(aval.shape, mesh, spec),
+        dtype=torch_dtype,
+        device="tpu",
+    )
 
 
 class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
@@ -74,13 +80,16 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
         self._validate_args(*args)
 
         kernel_key = pallas_impl._get_kernel_invocation_key(
-            self.trace_key, args, kwargs, self.static_argnums)
-        output_shapes, out_tree = self.output_shapes.get(
-            kernel_key, (None, None))
+            self.trace_key, args, kwargs, self.static_argnums
+        )
+        output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
         mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
-        kernel_exists = (mlir_fingerprint is not None
-                         and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-                             self.name, mlir_fingerprint))
+        kernel_exists = (
+            mlir_fingerprint is not None
+            and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
+                self.name, mlir_fingerprint
+            )
+        )
         if not output_shapes or not kernel_exists:
             jax_args = pallas_impl.jax_placeholders(
                 args,
@@ -93,10 +102,10 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
             # differing caller stack frames produce the same deterministic fingerprint
             # and reuse the compiled executable cache.
             with jax.interpreters.mlir.make_ir_context():
-                ir_module = jax.interpreters.mlir.ir.Module.parse(
-                    lowered.mlir_module())
+                ir_module = jax.interpreters.mlir.ir.Module.parse(lowered.mlir_module())
                 normalized_mlir = str(
-                    ir_module.operation.get_asm(enable_debug_info=False))
+                    ir_module.operation.get_asm(enable_debug_info=False)
+                )
             # BLAKE2 is significantly faster than SHA-256, and 128 bits (16 bytes)
             # provides enough collision resistance before being fingerprinted down to
             # 64 bits in lower layers.
@@ -112,8 +121,7 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
                 serialized_mlir_module=lowered.mlir_module_serialized,
             )
             out_shardings = getattr(lowered, "_out_named_shardings", None)
-            if (out_shardings is None
-                    or len(out_shardings) != len(lowered.out_avals)):
+            if out_shardings is None or len(out_shardings) != len(lowered.out_avals):
                 out_shardings = [None] * len(lowered.out_avals)
             output_shapes = [
                 _torch_placeholder_with_sharding(aval, sharding, self.mesh)
@@ -123,7 +131,8 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
             self.output_shapes[kernel_key] = (output_shapes, out_tree)
 
         tensor_args = [
-            arg for i, arg in enumerate(args)
+            arg
+            for i, arg in enumerate(args)
             if arg is not None and i not in self.static_argnums
         ]
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
@@ -140,10 +149,8 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
         return out_tree.unflatten(results)
 
 
-def _named_shardings(mesh: jax.sharding.Mesh,
-                     partition_specs: Sequence[PartitionSpec]):
-    return tuple(
-        jax.sharding.NamedSharding(mesh, spec) for spec in partition_specs)
+def _named_shardings(mesh: jax.sharding.Mesh, partition_specs: Sequence[PartitionSpec]):
+    return tuple(jax.sharding.NamedSharding(mesh, spec) for spec in partition_specs)
 
 
 def build_pcp_streaming_callable(
@@ -166,22 +173,22 @@ def build_pcp_streaming_callable(
     static_argnums = pallas_impl._infer_static_argnums(signature)
     donate_argnums_tuple = tuple(donate_argnums or ())
     output_partition_specs_tuple = tuple(
-        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
     output_shardings = _named_shardings(mesh, output_partition_specs_tuple)
-    jit_fn = jax.jit(fn,
-                     static_argnums=static_argnums,
-                     donate_argnums=donate_argnums_tuple,
-                     out_shardings=output_shardings)
+    jit_fn = jax.jit(
+        fn,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums_tuple,
+        out_shardings=output_shardings,
+    )
     trace_key = pallas_impl._get_kernel_invocation_key(
         f"{name}_{id(fn)}",
         [],
         {
-            "static_argnums":
-            static_argnums,
-            "donate_argnums":
-            donate_argnums_tuple,
-            "output_partition_specs":
-            tuple(map(str, output_partition_specs_tuple)),
+            "static_argnums": static_argnums,
+            "donate_argnums": donate_argnums_tuple,
+            "output_partition_specs": tuple(map(str, output_partition_specs_tuple)),
         },
     )
     return _PcpStreamingJaxCallable(
@@ -224,6 +231,7 @@ def pcp_streaming_jax_op(
     # so hot-reload can swap the callable without re-registering the op.
     if envs.TPU_KERNEL_ITER_MODE:
         from vllm_torchtpu.compilation import kernel_reload
+
         kernel_reload.set_live(name, wrapped_fn)
         op_target = kernel_reload.make_dispatcher(name, wrapped_fn)
     else:
@@ -240,12 +248,12 @@ def pcp_streaming_jax_op(
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
         out_shardings = getattr(lowered, "_out_named_shardings", None)
-        if out_shardings is None or len(out_shardings) != len(
-                lowered.out_avals):
+        if out_shardings is None or len(out_shardings) != len(lowered.out_avals):
             out_shardings = [None] * len(lowered.out_avals)
         return lowered.out_tree.unflatten(
             _torch_placeholder_with_sharding(aval, sharding, mesh)
-            for aval, sharding in zip(lowered.out_avals, out_shardings))
+            for aval, sharding in zip(lowered.out_avals, out_shardings)
+        )
 
     result.register_fake(fake_fn)
     return result
@@ -269,15 +277,14 @@ def make_pcp_streaming_rpa_kernel(
     q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     q_compute_size: int | None = None,
     kv_layout: batched_rpa_configs.KVLayout = (
-        batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE),
+        batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
     """Build a PCP streaming RPA entry with only tensor args in its signature."""
     if soft_cap is not None:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support logits soft cap.")
+        raise NotImplementedError("PCP streaming RPA does not support logits soft cap.")
     if skip_kv_update:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support skip_kv_update.")
+        raise NotImplementedError("PCP streaming RPA does not support skip_kv_update.")
 
     def _pcp_streaming_rpa_kernel(
         kv_cache: jax.Array,
@@ -321,15 +328,16 @@ def invoke_pcp_streaming_op(rpa_kernel_op, kv_cache, args, kwargs):
     if kwargs:
         raise ValueError(
             "PCP streaming RPA kernel does not accept keyword tensor args: "
-            f"{tuple(kwargs)}.")
+            f"{tuple(kwargs)}."
+        )
     if len(args) != _PCP_STREAMING_RPA_TENSOR_ARG_COUNT - 1:
         raise ValueError(
             "PCP streaming RPA kernel expects "
             f"{_PCP_STREAMING_RPA_TENSOR_ARG_COUNT - 1} tensor args "
-            f"after kv_cache, got {len(args)}.")
+            f"after kv_cache, got {len(args)}."
+        )
     if args[7] is not None:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support attention sinks.")
+        raise NotImplementedError("PCP streaming RPA does not support attention sinks.")
     pcp_streaming_args = (
         args[0],  # query
         args[1],  # key
