@@ -24,8 +24,8 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    _fp8_all_gather_applies, calculate_moe_chunks, enable_fp8_all_gather,
-    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
+    calculate_moe_chunks, enable_pipelined_collective_and_compute,
+    pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
@@ -36,8 +36,8 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import \
     VllmUnquantizedFusedMoEMethod
 from vllm_torchtpu.layers.core.quantization import (FP8_ACT_BLOCK_SIZE,
-                                                    dequantize_block_fp8,
-                                                    dynamic_block_quantize_fp8)
+                                                    dequantize_tensor,
+                                                    quantize_tensor)
 
 
 def _make_mock_moe_config():
@@ -283,36 +283,10 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
     assert dp_group.call_log == []
 
 
-def test_enable_fp8_all_gather_env_gating():
-    """Verify enable_fp8_all_gather reflects TPU_MOE_FP8_ALL_GATHER."""
+def test_fp8_all_gather_is_off_by_default():
+    """The flag is opt-in: nothing quantizes the gather unless it is set."""
     with patch.dict(os.environ, {}, clear=True):
         assert envs.TPU_MOE_FP8_ALL_GATHER is False
-
-    with patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", False):
-        assert enable_fp8_all_gather() is False
-
-    with patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True):
-        assert enable_fp8_all_gather() is True
-
-
-@pytest.mark.parametrize(
-    ("enabled", "act_dtype", "expected"),
-    [
-        (True, torch.bfloat16, True),
-        (True, torch.float16, True),
-        # f32 activations are not on the list: quantizing them to fp8 would be
-        # a two step rounding, and they are not what the models we serve run in.
-        (True, torch.float32, False),
-        (False, torch.bfloat16, False),
-    ],
-)
-def test_fp8_all_gather_applies(enabled, act_dtype, expected):
-    with patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", enabled):
-        assert _fp8_all_gather_applies(act_dtype) is expected
-    # The explicit form ignores the env, which is how the forward passes on
-    # the `fp8_all_gather` argument it was called with.
-    with patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", not enabled):
-        assert _fp8_all_gather_applies(act_dtype, enabled) is expected
 
 
 def test_fp8_all_gather_alone_claims_the_collectives():
@@ -358,6 +332,7 @@ def _run_with_fp8_all_gather(hidden_states,
         return kwargs["hidden_states"]
 
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", chunk_size), \
+         patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", fp8_all_gather), \
          patch("vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group", return_value=None), \
          patch("vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group", return_value=group), \
          patch("vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
@@ -375,7 +350,6 @@ def _run_with_fp8_all_gather(hidden_states,
             experts_start=None,
             topk=topk,
             activation="silu",
-            fp8_all_gather=fp8_all_gather,
         )
     assert out.shape == (seq_len, hidden_dim)
     return out, calls
@@ -420,44 +394,41 @@ def test_fp8_all_gather_hands_the_kernel_its_own_quantization_grid():
     The gmm re-quantizes its LHS in blocks of the same width, and a block's
     amax survives its own quantization, so what the kernel is handed here
     re-encodes to exactly the codes it would have produced from activations
-    that never crossed the wire quantized. `test_block_quantize_is_idempotent_
-    at_the_kernel_s_own_block_width` proves that end of it; this one checks the
-    gather actually delivers rows already sitting on that grid.
+    that never crossed the wire quantized. Re-running the quantizer over the
+    delivered rows stands in for the kernel's own pass: if the gather put them
+    on the grid, the second pass is a no-op.
     """
     group = _MockCollectiveGroup(world_size=2, rank=0)
-    hidden_states = torch.randn(8, 2 * FP8_ACT_BLOCK_SIZE, dtype=torch.bfloat16)
+    hidden_states = torch.randn(8,
+                                2 * FP8_ACT_BLOCK_SIZE,
+                                dtype=torch.bfloat16)
 
     _, calls = _run_with_fp8_all_gather(hidden_states, group=group)
 
     delivered = calls[0]["hidden_states"]
-    requantized, scale = dynamic_block_quantize_fp8(
-        delivered, block_size=FP8_ACT_BLOCK_SIZE)
+    requantized, scale = quantize_tensor(delivered,
+                                         quant_dtype=torch.float8_e4m3fn,
+                                         block_size=FP8_ACT_BLOCK_SIZE)
     assert torch.equal(
-        dequantize_block_fp8(requantized, scale, torch.bfloat16), delivered)
+        dequantize_tensor(requantized, scale, out_dtype=torch.bfloat16),
+        delivered)
 
 
-def test_fp8_all_gather_zero_pads_a_partial_block():
-    """A hidden size short of a whole block is padded, and the pad is dropped.
+def test_fp8_all_gather_requires_a_whole_number_of_blocks():
+    """A hidden size short of a whole block is refused, not padded.
 
-    The pad is real traffic -- the gather carries 512 columns for 640 bits of
-    activation -- so this pins both halves of the bargain: the wire widens to
-    the block boundary, and nothing downstream ever sees the padding.
+    `quantize_tensor` takes the divisibility as a precondition rather than
+    zero-padding up to it, which is what keeps the round trip down to a
+    reshape and a broadcast multiply with no pad to carry on the wire and none
+    to slice off on arrival. The cost is that a model whose hidden size is not
+    a multiple of `FP8_ACT_BLOCK_SIZE` cannot use the flag at all, and finds
+    out here rather than at the gate.
     """
     group = _MockCollectiveGroup(world_size=2, rank=0)
     hidden_states = torch.randn(8, 640, dtype=torch.bfloat16)
 
-    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
-
-    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
-    # 640 rounds up to two blocks, hence 1024 columns and two scales.
-    assert gathers[0] == ((8, 2 * FP8_ACT_BLOCK_SIZE), torch.int8)
-    assert gathers[1] == ((8, 2), torch.float32)
-
-    assert calls[0]["hidden_states"].shape == (8 * 2, 640)
-    torch.testing.assert_close(out,
-                               hidden_states,
-                               rtol=1.0 / 32,
-                               atol=float(hidden_states.abs().max()) / 32)
+    with pytest.raises(ValueError, match="divisible by block_size"):
+        _run_with_fp8_all_gather(hidden_states, group=group)
 
 
 def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
@@ -468,7 +439,7 @@ def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
     leave the concatenated output nowhere near the input.
     """
     group = _MockCollectiveGroup(world_size=4, rank=0)
-    hidden_states = torch.randn(64, 128, dtype=torch.bfloat16)
+    hidden_states = torch.randn(64, FP8_ACT_BLOCK_SIZE, dtype=torch.bfloat16)
     # 64 local tokens * 4 ranks / 128 = 2 chunks.
     out, calls = _run_with_fp8_all_gather(hidden_states,
                                           group=group,
@@ -476,7 +447,7 @@ def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
 
     assert len(calls) == 2
     for kwargs in calls:
-        assert kwargs["hidden_states"].shape == (32 * 4, 128)
+        assert kwargs["hidden_states"].shape == (32 * 4, FP8_ACT_BLOCK_SIZE)
         assert kwargs["hidden_states"].dtype is torch.bfloat16
 
     torch.testing.assert_close(out,
@@ -485,20 +456,10 @@ def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
                                atol=float(hidden_states.abs().max()) / 32)
 
 
-@pytest.mark.parametrize(
-    ("world_size", "dtype"),
-    [
-        # Nothing crosses the wire on one rank, so there is nothing to shrink
-        # and no reason to round the activations.
-        pytest.param(1, torch.bfloat16, id="single_rank"),
-        # f32 activations are not on the list: halving them would be a two
-        # step rounding, and they are not what the models we serve run in.
-        pytest.param(4, torch.float32, id="float32_activations"),
-    ],
-)
-def test_fp8_all_gather_declines_where_it_does_not_pay(world_size, dtype):
-    group = _MockCollectiveGroup(world_size=world_size, rank=0)
-    hidden_states = torch.randn(64, 128, dtype=dtype)
+def test_fp8_all_gather_declines_on_a_single_rank():
+    """Nothing crosses the wire on one rank, so rounding would buy nothing."""
+    group = _MockCollectiveGroup(world_size=1, rank=0)
+    hidden_states = torch.randn(64, FP8_ACT_BLOCK_SIZE, dtype=torch.bfloat16)
 
     out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
 
@@ -506,7 +467,7 @@ def test_fp8_all_gather_declines_where_it_does_not_pay(world_size, dtype):
         c
         for c in group.call_log if c[0] == "all_gather" and c[2] is torch.int8
     ]
-    assert calls[0]["hidden_states"].dtype is dtype
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
     # Declining means no rounding at all, so this is exact, not approximate.
     assert torch.equal(out, hidden_states)
 
@@ -533,13 +494,12 @@ class TestMoEForwardPrecisionBranches:
 
         Every quantization method builds one kwargs dict and hands it to
         whichever of the two the mode selects, so the shared parameters have to
-        keep the same names in the same order. Only the pipelined path issues
-        the collectives, so only it takes ``fp8_all_gather``; that exception is
-        named here rather than papered over with a subset check, so a parameter
-        that diverges for any other reason still fails.
+        keep the same names in the same order. Both lists are empty today; they
+        stay here so that a parameter added to one side has to be named as a
+        deliberate exception rather than papered over with a subset check.
         """
         fused_only = set()
-        pipelined_only = {"fp8_all_gather"}
+        pipelined_only = set()
 
         params_fused = inspect.signature(fused_moe_gmm).parameters
         params_pipelined = inspect.signature(

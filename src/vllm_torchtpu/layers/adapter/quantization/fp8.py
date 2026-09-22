@@ -71,8 +71,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
                                                         WEIGHT_FLIPPED_ATTR,
                                                         quantized_matmul)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_fp8_all_gather, enable_pipelined_collective_and_compute,
-    pipelined_fused_moe_gmm)
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
@@ -728,7 +727,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import \
             fused_moe_ep_supported
         return (enable_pipelined_collective_and_compute()
-                or enable_fp8_all_gather() or fused_moe_ep_supported(self))
+                or envs.TPU_MOE_FP8_ALL_GATHER or fused_moe_ep_supported(self))
 
     def maybe_roundup_sizes(
         self,
@@ -944,7 +943,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # tensors local here, still holding this rank's own tokens. (The third
         # reason, the fused EP kernel, returned above.)
         owns_collectives = (enable_pipelined_collective_and_compute()
-                            or enable_fp8_all_gather())
+                            or envs.TPU_MOE_FP8_ALL_GATHER)
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
@@ -967,8 +966,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "activation": activation_str,
         }
         if owns_collectives:
-            return pipelined_fused_moe_gmm(
-                **kwargs, fp8_all_gather=enable_fp8_all_gather())
+            return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
 

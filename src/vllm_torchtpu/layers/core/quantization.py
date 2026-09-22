@@ -58,9 +58,6 @@ FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 # the way it would have scaled them.
 FP8_ACT_BLOCK_SIZE = 512
 
-# Below this, 1/scale is no longer an f32 number. See `dynamic_block_quantize_fp8`.
-_MIN_FP8_SCALE = 1.0 / torch.finfo(torch.float32).max
-
 
 def dtype_max(dtype: jnp.dtype) -> float:
     info = (jnp.iinfo(dtype)
@@ -92,102 +89,6 @@ def static_per_tensor_quantize_tensor(
     quantized = torch.clamp(
         tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max)
     return quantized.to(quant_dtype)
-
-
-def dynamic_block_quantize_fp8(
-    tensor: torch.Tensor,
-    block_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize activations to fp8 e4m3, one f32 scale per block of the last axis.
-
-    The last axis is cut into ``block_size``-wide blocks and zero-padded up to
-    a whole number of them; ``block_size=None`` keeps the axis in a single
-    block, which is the per-row form. Returns the quantized values -- *padded*,
-    so the last axis comes back as ``ceil(size / block_size) * block_size`` --
-    and their scales ``[..., blocks]``, so that
-    ``q.unflatten(-1, (blocks, block_size)) * scale[..., None]`` recovers the
-    padded input. `dequantize_block_fp8` does exactly that and drops the pad.
-
-    Padding is what keeps the block reduction and the rescale to plain
-    reshapes over static shapes, but it is not free: an axis that is not
-    already a multiple of ``block_size`` carries the pad into whatever the
-    caller does with the result, a collective included.
-
-    Mirrors the fused EP kernel's ``rowquant_fp8`` in how it answers a block it
-    cannot scale: a block of all zeros, or one holding an infinity, has no
-    usable scale, and rather than send a zero or infinite scale on to whoever
-    multiplies it back, the block is zeroed whole and its scale left at zero.
-    An empty block is obviously empty; a block quietly rescaled by zero or NaN
-    is not.
-    """
-    size = tensor.shape[-1]
-    if block_size is None:
-        block_size = size
-    elif block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}.")
-
-    pad = -size % block_size
-    if pad:
-        tensor = torch.nn.functional.pad(tensor, (0, pad))
-    blocked = tensor.reshape(*tensor.shape[:-1], -1, block_size)
-
-    amax = blocked.abs().amax(dim=-1).to(torch.float32)
-    scale = amax / FP8_E4M3_MAX
-    # A block is only scalable if the reciprocal below stays finite, which puts
-    # the floor a long way above zero: 1/scale overflows f32 once the block's
-    # values fall under ~1e-36. Such a block is zero for every purpose the
-    # model has, and taking it as zero here is what keeps it from coming out as
-    # the NaN that `0 * inf` would otherwise write into every one of its
-    # elements.
-    usable = torch.isfinite(scale) & (scale >= _MIN_FP8_SCALE)
-    ones = torch.ones_like(scale)
-    zeros = torch.zeros_like(scale)
-    scale = torch.where(usable, scale, zeros)
-    scale_inv = torch.where(usable, 1.0 / torch.where(usable, scale, ones),
-                            zeros)
-    # Only the select below is elementwise over the activations; the three
-    # above run on the per-block scales, which are `block_size` times smaller.
-    #
-    # The rescale runs in f32, not in the input's own dtype. `scale_inv` is
-    # routinely far outside that range -- an f16 block peaking at 1e-3 needs a
-    # multiplier of 4.5e5, which is already an infinity in f16 -- so narrowing
-    # it first would destroy the very values it is meant to preserve.
-    quantized = torch.where(usable.unsqueeze(-1),
-                            blocked.to(torch.float32) * scale_inv.unsqueeze(-1),
-                            zeros.unsqueeze(-1))
-    return quantized.flatten(-2).to(torch.float8_e4m3fn), scale
-
-
-def dequantize_block_fp8(
-    quantized: torch.Tensor,
-    scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    size: int | None = None,
-) -> torch.Tensor:
-    """Undo `dynamic_block_quantize_fp8`, dropping the zero padding.
-
-    ``size`` is the unpadded length of the last axis; left out, whatever
-    padding the quantizer added is kept. Deliberately no more than a reshape,
-    one broadcast multiply and a slice, so XLA can fold the whole thing into
-    the single convert-and-multiply fusion that follows a collective. Expanding
-    the scales to the width of the data instead would have to materialize a
-    second tensor the size of the activations before the multiply could start.
-    """
-    blocked = quantized.reshape(*quantized.shape[:-1], scale.shape[-1], -1)
-    restored = (blocked.to(torch.float32) * scale.unsqueeze(-1)).flatten(-2)
-    if size is not None and size != restored.shape[-1]:
-        restored = restored[..., :size]
-    return restored.to(out_dtype)
-
-
-def dynamic_row_quantize_fp8(
-        tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Row-quantize activations to fp8 e4m3, one f32 scale per row.
-
-    The whole-row case of `dynamic_block_quantize_fp8`: scales come back as
-    ``[..., 1]`` and nothing is ever padded.
-    """
-    return dynamic_block_quantize_fp8(tensor, block_size=None)
 
 
 def quantize_kv(
