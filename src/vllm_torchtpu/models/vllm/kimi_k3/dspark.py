@@ -10,13 +10,18 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               ReplicatedLinear)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
-from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
-                                              get_draft_quant_config,
-                                              maybe_prefix)
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    get_draft_quant_config,
+    maybe_prefix,
+)
 
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 
@@ -32,7 +37,8 @@ def _duplicate_context_kv_weights(
     for name, weight in weights:
         yield name, weight
         layer_prefix, marker, param_name = name.partition(
-            ".self_attn.kv_a_proj_with_mqa.")
+            ".self_attn.kv_a_proj_with_mqa."
+        )
         if not marker:
             continue
         layer_idx_text = layer_prefix.rsplit(".", 1)[-1]
@@ -47,7 +53,6 @@ def _duplicate_context_kv_weights(
 
 
 class K3DSparkDecoderLayer(nn.Module):
-
     def __init__(
         self,
         *,
@@ -58,8 +63,7 @@ class K3DSparkDecoderLayer(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        layer_prefix = maybe_prefix(prefix,
-                                    f"layers.{start_layer_id + layer_idx}")
+        layer_prefix = maybe_prefix(prefix, f"layers.{start_layer_id + layer_idx}")
         self.self_attn = MultiHeadLatentAttention(
             config,
             vllm_config,
@@ -76,8 +80,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=f"{layer_prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -94,7 +97,6 @@ class K3DSparkDecoderLayer(nn.Module):
 
 
 class K3DSparkModel(nn.Module):
-
     def __init__(
         self,
         *,
@@ -116,17 +118,19 @@ class K3DSparkModel(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "context_proj"),
         )
-        self.context_norm = RMSNorm(self.config.hidden_size,
-                                    self.config.rms_norm_eps)
-        self.layers = nn.ModuleList([
-            K3DSparkDecoderLayer(
-                config=self.config,
-                vllm_config=vllm_config,
-                layer_idx=layer_idx,
-                start_layer_id=start_layer_id,
-                prefix=prefix,
-            ) for layer_idx in range(self.config.num_hidden_layers)
-        ])
+        self.context_norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            [
+                K3DSparkDecoderLayer(
+                    config=self.config,
+                    vllm_config=vllm_config,
+                    layer_idx=layer_idx,
+                    start_layer_id=start_layer_id,
+                    prefix=prefix,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
         self.context_kv_proj = MergedColumnParallelLinear(
@@ -137,8 +141,7 @@ class K3DSparkModel(nn.Module):
             prefix=maybe_prefix(prefix, "context_kv_proj"),
             disable_tp=True,
         )
-        self.final_norm = RMSNorm(self.config.hidden_size,
-                                  self.config.rms_norm_eps)
+        self.final_norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(
             self.config.vocab_size,
             self.config.draft_vocab_size,
@@ -150,8 +153,7 @@ class K3DSparkModel(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
-    def combine_hidden_states(self,
-                              hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.context_proj(hidden_states)
         return self.context_norm(hidden_states)
 
@@ -196,14 +198,8 @@ class K3DSparkModel(nn.Module):
             cache_dtype = getattr(core, "kv_cache_quantized_dtype", None)
             if cache_dtype is not None:
                 k_scale = getattr(core, "_k_scale_float", None) or 1.0
-                kv_c, _ = quantize_kv(cache_dtype,
-                                      kv_c,
-                                      value=None,
-                                      k_scale=k_scale)
-                k_pe, _ = quantize_kv(cache_dtype,
-                                      k_pe,
-                                      value=None,
-                                      k_scale=k_scale)
+                kv_c, _ = quantize_kv(cache_dtype, kv_c, value=None, k_scale=k_scale)
+                k_pe, _ = quantize_kv(cache_dtype, k_pe, value=None, k_scale=k_scale)
             else:
                 kv_c = kv_c.to(dtype=core.kv_cache.dtype)
                 k_pe = k_pe.to(dtype=core.kv_cache.dtype)
@@ -231,8 +227,9 @@ class K3DSparkModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = (self.embed_input_ids(input_ids)
-                         if inputs_embeds is None else inputs_embeds)
+        hidden_states = (
+            self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
+        )
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states)
         return self.final_norm(hidden_states)
@@ -259,7 +256,8 @@ class K3DSparkForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         target_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config)
+            vllm_config.parallel_config
+        )
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
             start_layer_id=target_layers,
@@ -274,8 +272,7 @@ class K3DSparkForCausalLM(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def combine_hidden_states(self,
-                              hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
 
     def get_draft_attn_causal(self) -> list[bool]:
@@ -283,8 +280,7 @@ class K3DSparkForCausalLM(nn.Module):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [
-            layer.self_attn.mla_attn.mla_attn.layer_name
-            for layer in self.model.layers
+            layer.self_attn.mla_attn.mla_attn.layer_name for layer in self.model.layers
         ]
 
     def tpu_precompute_and_store_context_kv(
@@ -294,7 +290,8 @@ class K3DSparkForCausalLM(nn.Module):
         metadata: tuple,
     ) -> torch.Tensor:
         return self.model.precompute_and_store_context_kv(
-            hidden_states, positions, metadata)
+            hidden_states, positions, metadata
+        )
 
     def forward(
         self,
@@ -304,8 +301,7 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
-    def compute_draft_logits(self,
-                             hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None
         return self.logits_processor(self.lm_head, hidden_states)
 
@@ -325,15 +321,17 @@ class K3DSparkForCausalLM(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-
         def filtered_weights():
             for name, weight in weights:
-                if any(part in name for part in ("confidence_head",
-                                                 "embed_tokens", "lm_head")):
+                if any(
+                    part in name
+                    for part in ("confidence_head", "embed_tokens", "lm_head")
+                ):
                     continue
                 yield name, weight
 
-        duplicated = _duplicate_context_kv_weights(filtered_weights(),
-                                                   len(self.model.layers))
+        duplicated = _duplicate_context_kv_weights(
+            filtered_weights(), len(self.model.layers)
+        )
         mapped = self.hf_to_vllm_mapper.apply(duplicated)
         return AutoWeightsLoader(self).load_weights(mapped)

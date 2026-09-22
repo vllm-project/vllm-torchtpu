@@ -230,13 +230,6 @@ ignore = [
 "src/vllm_torchtpu/runner/**" = ["I"]
 "tests/runner/**" = ["I"]
 
-# models, spec_decode, offload
-"src/vllm_torchtpu/models/**" = ["I"]
-"src/vllm_torchtpu/offload/**" = ["I"]
-"src/vllm_torchtpu/spec_decode/**" = ["I"]
-"tests/models/**" = ["I"]
-"tests/offload/**" = ["I"]
-"tests/spec_decode/**" = ["I"]
 
 
 # core, tracing, omni, tools, loose modules
@@ -334,13 +327,6 @@ exclude = [
     "src/vllm_torchtpu/runner/**",
     "tests/runner/**",
 
-    # models, spec_decode, offload
-    "src/vllm_torchtpu/models/**",
-    "src/vllm_torchtpu/offload/**",
-    "src/vllm_torchtpu/spec_decode/**",
-    "tests/models/**",
-    "tests/offload/**",
-    "tests/spec_decode/**",
 
 
     # core, tracing, omni, tools, loose modules

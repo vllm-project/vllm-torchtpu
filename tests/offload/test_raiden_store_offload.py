@@ -30,6 +30,7 @@ physical TPU hardware or native C++ wheels:
      directory entry once the bytes land.
    - Compatibility namespace: Generates deterministic 16-byte hashes to isolate entries.
 """
+
 import enum
 import os
 import sys
@@ -58,20 +59,22 @@ class FakeBlockStatus(enum.Enum):
 
 
 class FakeRaidenBlockId:
-
-    def __init__(self,
-                 raiden_id=None,
-                 host_block_id=-1,
-                 status=FakeBlockStatus.INIT,
-                 device_block_id=-1):
+    def __init__(
+        self,
+        raiden_id=None,
+        host_block_id=-1,
+        status=FakeBlockStatus.INIT,
+        device_block_id=-1,
+    ):
         self.raiden_id = raiden_id
         self.host_block_id = host_block_id
         self.device_block_id = device_block_id
         self.status = status
 
 
-FAKE_STORE_TYPES = SimpleNamespace(BlockStatus=FakeBlockStatus,
-                                   RaidenBlockId=FakeRaidenBlockId)
+FAKE_STORE_TYPES = SimpleNamespace(
+    BlockStatus=FakeBlockStatus, RaidenBlockId=FakeRaidenBlockId
+)
 
 
 @dataclass
@@ -128,7 +131,8 @@ class FakeKVCacheStore:
         # peer's block and are never pinned. Candidates are peeked, never
         # pinned, so a lookup cannot resurrect one.
         self.calls.append(
-            _Call("lookup", (list(block_hashes), enable_global, pin_found)))
+            _Call("lookup", (list(block_hashes), enable_global, pin_found))
+        )
         out = []
         for h in block_hashes:
             entry = self.entries.get(h)
@@ -144,24 +148,27 @@ class FakeKVCacheStore:
                 break
             if pin_found:
                 entry.pin_count += 1
-            out.append((
-                h,
-                SimpleNamespace(status=entry.status,
-                                device_block_id=entry.device_block_id,
-                                host_block_id=-1),
-            ))
+            out.append(
+                (
+                    h,
+                    SimpleNamespace(
+                        status=entry.status,
+                        device_block_id=entry.device_block_id,
+                        host_block_id=-1,
+                    ),
+                )
+            )
         return out
 
     def release(self, block_hashes) -> None:
-        self.calls.append(_Call("release", (list(block_hashes), )))
+        self.calls.append(_Call("release", (list(block_hashes),)))
         for h in block_hashes:
             entry = self.entries.get(h)
             if entry is not None and entry.pin_count > 0:
                 entry.pin_count -= 1
 
     def insert(self, block_hashes, slices, on_host) -> bool:
-        self.calls.append(
-            _Call("insert", (list(block_hashes), list(slices), on_host)))
+        self.calls.append(_Call("insert", (list(block_hashes), list(slices), on_host)))
         if self.fail_insert:
             return False
         for h, s in zip(block_hashes, slices):
@@ -173,9 +180,9 @@ class FakeKVCacheStore:
                 del self.entries[h]
                 entry = None
             if entry is None:
-                self.entries[h] = _Entry(status=s.status,
-                                         device_block_id=s.device_block_id,
-                                         pin_count=1)
+                self.entries[h] = _Entry(
+                    status=s.status, device_block_id=s.device_block_id, pin_count=1
+                )
             else:
                 entry.pin_count += 1
         return True
@@ -187,15 +194,18 @@ class FakeKVCacheStore:
         # Mirror Raiden C++ preconditions: hashes must exist in HBM status and be pinned.
         for h in block_hashes:
             entry = self.entries.get(h)
-            if (entry is None or entry.status != FakeBlockStatus.HBM
-                    or entry.pin_count <= 0 or h in self._saving):
+            if (
+                entry is None
+                or entry.status != FakeBlockStatus.HBM
+                or entry.pin_count <= 0
+                or h in self._saving
+            ):
                 return False
         self._saving.extend(block_hashes)
         return True
 
     def load(self, block_hashes, device_block_ids, slices=None) -> bool:
-        self.calls.append(
-            _Call("load", (list(block_hashes), list(device_block_ids))))
+        self.calls.append(_Call("load", (list(block_hashes), list(device_block_ids))))
         if self.fail_load:
             return False
         # Mirror Raiden C++ preconditions for a local source: the entry must be
@@ -209,15 +219,19 @@ class FakeKVCacheStore:
 
     def read_remote(self, block_hashes, slices, device_block_ids):
         self.calls.append(
-            _Call("read_remote",
-                  (list(block_hashes), list(slices), list(device_block_ids))))
+            _Call(
+                "read_remote",
+                (list(block_hashes), list(slices), list(device_block_ids)),
+            )
+        )
         if self.fail_read_remote:
             return False
         # Mirror Raiden: a peer read consults nothing locally and needs no pin.
         # It only needs a REMOTE slice naming the owner, and one destination
         # device block per hash.
         if len(slices) != len(block_hashes) or len(device_block_ids) != len(
-                block_hashes):
+            block_hashes
+        ):
             return False
         for h, sl in zip(block_hashes, slices):
             if sl is None or sl.status != FakeBlockStatus.REMOTE:
@@ -287,13 +301,11 @@ class FakeKVCacheStore:
         return {h: e.pin_count for h, e in self.entries.items() if e.pin_count}
 
 
-def make_manager(store,
-                 *,
-                 device_block_size_factor=4,
-                 num_blocks=8,
-                 world_size=2,
-                 **kwargs):
+def make_manager(
+    store, *, device_block_size_factor=4, num_blocks=8, world_size=2, **kwargs
+):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
+
     return RaidenOffloadingManager(
         kernel_physical_blocks_capacity=num_blocks * device_block_size_factor,
         offload_logical_blocks_capacity=num_blocks,
@@ -311,33 +323,32 @@ def make_global_manager(store, **kwargs):
     """Manager with the global registry enabled."""
     # Set PYTHONHASHSEED to satisfy registry requirement for cross-replica hash parity.
     with patch.dict(os.environ, {"PYTHONHASHSEED": "0"}):
-        return make_manager(store,
-                            global_registry_address="registry:50051",
-                            store_server_ip="10.0.0.1",
-                            **kwargs)
+        return make_manager(
+            store,
+            global_registry_address="registry:50051",
+            store_server_ip="10.0.0.1",
+            **kwargs,
+        )
 
 
-def sub_hashes(key: bytes,
-               device_block_size_factor: int = 4,
-               key_namespace: bytes = b"",
-               ns: bytes = b"") -> list[bytes]:
+def sub_hashes(
+    key: bytes,
+    device_block_size_factor: int = 4,
+    key_namespace: bytes = b"",
+    ns: bytes = b"",
+) -> list[bytes]:
     prefix = key_namespace or ns
     return [
-        prefix + key + i.to_bytes(4, "big")
-        for i in range(device_block_size_factor)
+        prefix + key + i.to_bytes(4, "big") for i in range(device_block_size_factor)
     ]
 
 
-def seed_host_entries(store,
-                      key: bytes,
-                      device_block_size_factor: int = 4) -> None:
+def seed_host_entries(store, key: bytes, device_block_size_factor: int = 4) -> None:
     for sub_hash in sub_hashes(key, device_block_size_factor):
         store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
 
 
-def displace_entries(store,
-                     key: bytes,
-                     device_block_size_factor: int = 4) -> None:
+def displace_entries(store, key: bytes, device_block_size_factor: int = 4) -> None:
     """Move `key`'s entries to the eviction-candidate list: invisible to
     lookup but still physically present (holding their host blocks), exactly
     as a store admission's displacement leaves them until the GC or a
@@ -346,31 +357,30 @@ def displace_entries(store,
         store.entries[sub_hash].is_candidate = True
 
 
-def seed_global_entries(store,
-                        key: bytes,
-                        device_block_size_factor: int = 4,
-                        key_namespace: bytes = b"",
-                        ns: bytes = b"") -> None:
+def seed_global_entries(
+    store,
+    key: bytes,
+    device_block_size_factor: int = 4,
+    key_namespace: bytes = b"",
+    ns: bytes = b"",
+) -> None:
     """Publish a peer's REMOTE slices for `key` in the fake registry."""
     prefix = key_namespace or ns
-    for i, sub_hash in enumerate(
-            sub_hashes(key, device_block_size_factor, prefix)):
+    for i, sub_hash in enumerate(sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockId(
-            raiden_id=object(),
-            host_block_id=100 + i,
-            status=FakeBlockStatus.REMOTE)
+            raiden_id=object(), host_block_id=100 + i, status=FakeBlockStatus.REMOTE
+        )
 
 
 class TestConstructionGuards(unittest.TestCase):
-
     def test_spec_rejects_kv_cache_events(self):
         # The manager emits no offloading events (displaced keys are
         # rediscovered by directory probes), so a configuration that expects
         # KV cache events must be refused at startup, before any config
         # derivation, rather than silently dropping BlockRemoved
         # notifications.
-        from vllm_torchtpu.offload.raiden_store import \
-            TPURaidenStoreOffloadingSpec
+        from vllm_torchtpu.offload.raiden_store import TPURaidenStoreOffloadingSpec
+
         vllm_config = MagicMock()
         vllm_config.kv_events_config.enable_kv_cache_events = True
         with self.assertRaisesRegex(ValueError, "enable_kv_cache_events"):
@@ -381,33 +391,31 @@ class TestConstructionGuards(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(ValueError):
-                make_manager(FakeKVCacheStore(),
-                             global_registry_address="registry:50051",
-                             store_server_ip="10.0.0.1")
+                make_manager(
+                    FakeKVCacheStore(),
+                    global_registry_address="registry:50051",
+                    store_server_ip="10.0.0.1",
+                )
 
 
 class TestLookup(unittest.TestCase):
-
     def setUp(self):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
 
     def test_hit_requires_every_sub_hash(self):
         seed_host_entries(self.store, _key(0))
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
         # Partial sub-block availability results in a lookup MISS.
         del self.store.entries[sub_hashes(_key(0))[2]]
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
 
     def test_hbm_status_with_live_job_is_hit_pending(self):
         # A save really is in flight for these sub-hashes: come back later.
         for h in sub_hashes(_key(0)):
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
             self.manager._hash_to_admission[h] = object()
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT_PENDING)
 
     def test_hbm_status_without_live_job_is_miss(self):
         # Same HBM status, but no job owns these sub-hashes: this is the
@@ -419,18 +427,15 @@ class TestLookup(unittest.TestCase):
         for h in sub_hashes(_key(0)):
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
         self.assertFalse(self.manager._hash_to_admission)
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
 
     def test_remote_status_is_miss_without_registry(self):
         for h in sub_hashes(_key(0)):
             self.store.entries[h] = _Entry(status=FakeBlockStatus.REMOTE)
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
 
 
 class TestStoreJobLifecycle(unittest.TestCase):
-
     def setUp(self):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
@@ -443,14 +448,15 @@ class TestStoreJobLifecycle(unittest.TestCase):
     def test_submit_expands_sub_hashes_and_device_blocks(self):
         self._admit([_key(0), _key(1)], [5, 9])
 
-        (call, ) = self.store.calls_named("insert")
+        (call,) = self.store.calls_named("insert")
         hashes, slices, on_host = call.args
         self.assertEqual(hashes, sub_hashes(_key(0)) + sub_hashes(_key(1)))
         self.assertFalse(on_host)
-        self.assertEqual([s.device_block_id for s in slices],
-                         [20, 21, 22, 23, 36, 37, 38, 39])
+        self.assertEqual(
+            [s.device_block_id for s in slices], [20, 21, 22, 23, 36, 37, 38, 39]
+        )
         self.assertTrue(all(s.status == FakeBlockStatus.HBM for s in slices))
-        (save_call, ) = self.store.calls_named("save")
+        (save_call,) = self.store.calls_named("save")
         self.assertEqual(save_call.args[0], hashes)
 
     def test_success_spends_every_pin_and_marks_stored(self):
@@ -460,18 +466,16 @@ class TestStoreJobLifecycle(unittest.TestCase):
 
         releases_before = len(self.store.calls_named("release"))
         self.store.complete_save(sub_hashes(_key(0)))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(finished_job.job_id, 7)
         # Every sub-hash was saved, and each save spent the pin its admission
         # took, so the job ends owing nothing back.
-        self.assertEqual(len(self.store.calls_named("release")),
-                         releases_before)
+        self.assertEqual(len(self.store.calls_named("release")), releases_before)
         self.assertEqual(self.store.pinned_hashes(), {})
         self.assertFalse(self.manager.has_pending_work())
         # Promoted to HIT and excluded from subsequent prepare_store calls.
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
         out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(1)])
 
@@ -487,7 +491,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
         self.assertEqual(retry.args[0], batch[:1])
         # Terminal failure upon retry exhaustion triggers exact-batch rollback.
         self.store.complete_save(batch[:1], success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         # The saves that landed already spent their pins; the terminal cleanup
         # gives back exactly the one the sub-hash that never saved still holds.
@@ -501,10 +505,8 @@ class TestStoreJobLifecycle(unittest.TestCase):
         # park the request on a save that will never complete and the
         # scheduler would defer it forever (design notes 5.6). Key 1 is fully
         # host-resident (HIT, skipped by the directory probe).
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.MISS)
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()), LookupResult.HIT)
         out = self.manager.prepare_store([_key(0), _key(1)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(0)])
 
@@ -516,10 +518,9 @@ class TestStoreJobLifecycle(unittest.TestCase):
         retry = self.store.calls_named("save")[-1]
         self.assertEqual(retry.args[0], batch)
         self.store.complete_save(batch, success=True)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
 
     def test_mixed_terminal_hashes_in_one_poll_finalize_once(self):
         self._admit([_key(0)], [5])
@@ -533,8 +534,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         self.assertFalse(finished[0].success)
         # Only the sub-hash whose save never landed still owes its pin back.
-        self.assertEqual(
-            self.store.calls_named("release")[-1].args[0], batch[:1])
+        self.assertEqual(self.store.calls_named("release")[-1].args[0], batch[:1])
         self.assertEqual(self.store.pinned_hashes(), {})
         self.assertFalse(self.manager.has_pending_work())
 
@@ -544,7 +544,7 @@ class TestStoreJobLifecycle(unittest.TestCase):
         self.assertEqual(self.store.calls_named("save"), [])
         # A rejected insert pins nothing, so there is nothing to give back.
         self.assertEqual(self.store.calls_named("release"), [])
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertFalse(self.manager.has_pending_work())
 
@@ -555,13 +555,12 @@ class TestStoreJobLifecycle(unittest.TestCase):
         release_call = self.store.calls_named("release")[-1]
         self.assertEqual(release_call.args[0], sub_hashes(_key(0)))
         self.assertEqual(self.store.pinned_hashes(), {})
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
 
     def test_inflight_keys_report_hit_pending_and_skip_restore(self):
         self._admit([_key(0)], [5])
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT_PENDING)
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [])
 
@@ -574,7 +573,6 @@ class TestStoreJobLifecycle(unittest.TestCase):
 
 
 class TestLoadJobLifecycle(unittest.TestCase):
-
     def setUp(self):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
@@ -588,7 +586,7 @@ class TestLoadJobLifecycle(unittest.TestCase):
             self.assertEqual(self.store.entries[h].pin_count, 1)
 
         self.manager.submit_load_job(3, [_key(0), _key(1)], [10, 11], "r1")
-        (load, ) = self.store.calls_named("load")
+        (load,) = self.store.calls_named("load")
         self.assertEqual(load.args[0], batch)
         self.assertEqual(load.args[1], [40, 41, 42, 43, 44, 45, 46, 47])
 
@@ -597,7 +595,7 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertEqual(self.store.entries[batch[0]].pin_count, 1)
 
         self.store.complete_load(batch)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(finished_job.req_id, "r1")
         self.assertEqual(finished_job.failed_device_block_ids, [])
@@ -608,21 +606,20 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.manager.prepare_load([_key(0)], _ctx("r1"))
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
         self.store.complete_load(sub_hashes(_key(0)), success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.req_id, "r1")
         self.assertEqual(finished_job.failed_device_block_ids, [10])
         # Pre-existing HOST entries remain intact and unpinned upon failure.
         for h in sub_hashes(_key(0)):
-            self.assertEqual(self.store.entries[h].status,
-                             FakeBlockStatus.HOST)
+            self.assertEqual(self.store.entries[h].status, FakeBlockStatus.HOST)
             self.assertEqual(self.store.entries[h].pin_count, 0)
 
     def test_failed_load_launch_is_immediate_terminal(self):
         self.store.fail_load = True
         self.manager.prepare_load([_key(0)], _ctx("r1"))
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
         for h in sub_hashes(_key(0)):
@@ -632,18 +629,15 @@ class TestLoadJobLifecycle(unittest.TestCase):
         # Losing the lookup-to-pin race against eviction fails the job cleanly without raising.
         spec = self.manager.prepare_load([_key(9)], _ctx("r1"))
         self.assertFalse(spec.pinned)
-        self.manager.submit_load_job(3, [_key(9)], [10],
-                                     "r1",
-                                     pinned=spec.pinned)
+        self.manager.submit_load_job(3, [_key(9)], [10], "r1", pinned=spec.pinned)
         self.assertEqual(self.store.calls_named("load"), [])
         self.assertEqual(self.store.calls_named("release"), [])
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
 
 
 class TestTouchAndMisc(unittest.TestCase):
-
     def setUp(self):
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
@@ -657,10 +651,9 @@ class TestTouchAndMisc(unittest.TestCase):
         # The connector-level override must return False (not raise) so the
         # scheduler's reset_connector_cache surfaces {"success": false}
         # through /reset_prefix_cache instead of an opaque 500.
-        from vllm_torchtpu.offload.raiden_connector import \
-            TPURaidenOffloadingConnector
-        self.assertIs(TPURaidenOffloadingConnector.reset_cache(MagicMock()),
-                      False)
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        self.assertIs(TPURaidenOffloadingConnector.reset_cache(MagicMock()), False)
 
     def test_touch_refreshes_resident_keys_only(self):
         seed_host_entries(self.store, _key(0))
@@ -668,7 +661,7 @@ class TestTouchAndMisc(unittest.TestCase):
         # release hands it straight back, which is the touch. An absent key
         # matches nothing, so nothing is pinned or released for it.
         self.manager.touch([_key(0), _key(1)], _ctx())
-        (release, ) = self.store.calls_named("release")
+        (release,) = self.store.calls_named("release")
         self.assertEqual(release.args[0], sub_hashes(_key(0)))
         self.assertEqual(self.store.pinned_hashes(), {})
         self.store.calls.clear()
@@ -681,7 +674,7 @@ class TestTouchAndMisc(unittest.TestCase):
         self.store.calls.clear()
 
         self.manager.touch([_key(2), _key(1)], _ctx())
-        (release, ) = self.store.calls_named("release")
+        (release,) = self.store.calls_named("release")
         self.assertEqual(release.args[0], sub_hashes(_key(2)))
         self.assertEqual(self.store.pinned_hashes(), {})
 
@@ -697,14 +690,15 @@ class TestTouchAndMisc(unittest.TestCase):
         self.manager.prepare_store([_key(0)], _ctx())
         for call in self.store.calls_named("lookup"):
             pin_found = call.args[2]
-            self.assertFalse(pin_found,
-                             "a probe must not take a pin: %r" % (call.args, ))
+            self.assertFalse(
+                pin_found, "a probe must not take a pin: %r" % (call.args,)
+            )
         self.assertEqual(self.store.pinned_hashes(), {})
 
         # touch, by contrast, deliberately does take one and give it back.
         self.store.calls.clear()
         self.manager.touch([_key(0)], _ctx())
-        (probe, ) = self.store.calls_named("lookup")
+        (probe,) = self.store.calls_named("lookup")
         self.assertTrue(probe.args[2])
         self.assertEqual(len(self.store.calls_named("release")), 1)
         self.assertEqual(self.store.pinned_hashes(), {})
@@ -715,8 +709,7 @@ class TestTouchAndMisc(unittest.TestCase):
         # pull one back into the active set past capacity — on any call,
         # because nothing caches the key as "stored".
         seed_host_entries(self.store, _key(0))
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
         displace_entries(self.store, _key(0))
         self.store.calls.clear()
 
@@ -749,8 +742,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
     base-class methods patched out."""
 
     def _make_scheduler(self, manager, num_workers=2):
-        from vllm_torchtpu.offload.raiden_connector import \
-            TPURaidenOffloadingScheduler
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
         sched = object.__new__(TPURaidenOffloadingScheduler)
         sched.config = SimpleNamespace(num_workers=num_workers)
         sched._raiden_manager = manager
@@ -758,8 +751,10 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         return sched
 
     def _stock_meta(self, store_jobs=None, load_jobs=None, jobs_to_flush=None):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import \
-            OffloadingConnectorMetadata
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            OffloadingConnectorMetadata,
+        )
+
         return OffloadingConnectorMetadata(
             load_jobs=load_jobs or {},
             store_jobs=store_jobs or {},
@@ -767,51 +762,62 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         )
 
     def _store_job(self, keys, device_block_ids, req_id="r1"):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import \
-            TransferJob
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            TransferJob,
+        )
 
         from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
+
         return TransferJob(
             req_id=req_id,
-            src_spec=GPULoadStoreSpec(device_block_ids,
-                                      group_sizes=[len(device_block_ids)],
-                                      block_indices=[0]),
+            src_spec=GPULoadStoreSpec(
+                device_block_ids, group_sizes=[len(device_block_ids)], block_indices=[0]
+            ),
             dst_spec=RaidenLoadStoreSpec(keys),
         )
 
     def _load_job(self, keys, device_block_ids, req_id="r1"):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import \
-            TransferJob
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            TransferJob,
+        )
 
         from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
+
         return TransferJob(
             req_id=req_id,
             src_spec=RaidenLoadStoreSpec(keys),
-            dst_spec=GPULoadStoreSpec(device_block_ids,
-                                      group_sizes=[len(device_block_ids)],
-                                      block_indices=[0]),
+            dst_spec=GPULoadStoreSpec(
+                device_block_ids, group_sizes=[len(device_block_ids)], block_indices=[0]
+            ),
         )
 
     def _build_meta(self, sched, stock_meta):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            OffloadingConnectorScheduler
-        with patch.object(OffloadingConnectorScheduler,
-                          "build_connector_meta",
-                          return_value=stock_meta):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+
+        with patch.object(
+            OffloadingConnectorScheduler,
+            "build_connector_meta",
+            return_value=stock_meta,
+        ):
             return sched.build_connector_meta(MagicMock())
 
     def _ack(self, sched, job_ids, count=1):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            OffloadingConnectorScheduler
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
 
-        from vllm_torchtpu.offload.raiden_connector import \
-            RaidenOffloadingWorkerMetadata
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingWorkerMetadata,
+        )
+
         output = SimpleNamespace(
             kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
-                fenced_jobs={jid: count
-                             for jid in job_ids}))
-        with patch.object(OffloadingConnectorScheduler,
-                          "update_connector_output"):
+                fenced_jobs={jid: count for jid in job_ids}
+            )
+        )
+        with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
             sched.update_connector_output(output)
 
     def test_store_jobs_parked_until_all_ranks_fence(self):
@@ -821,8 +827,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched = self._make_scheduler(manager)
 
         meta = self._build_meta(
-            sched,
-            self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])}))
+            sched, self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])})
+        )
 
         # Shipped metadata: parked jobs, fence requests, and no echoes yet.
         self.assertEqual(meta.store_jobs, {})
@@ -848,10 +854,10 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched = self._make_scheduler(manager)
 
         meta = self._build_meta(
-            sched,
-            self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])}))
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
         self.assertEqual(meta.load_jobs, {})
-        (load, ) = store.calls_named("load")
+        (load,) = store.calls_named("load")
         self.assertEqual(load.args[1], [40, 41, 42, 43])
 
         # Job completion is echoed in the subsequent step's metadata.
@@ -866,8 +872,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
         self._build_meta(
-            sched,
-            self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])}))
+            sched, self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])})
+        )
 
         # Cancel parked store before rank acknowledgements when source blocks are reclaimed.
         meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
@@ -887,8 +893,10 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         # Created and flushed in same step: cancelled immediately without shipping redundant fence requests.
         meta = self._build_meta(
             sched,
-            self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])},
-                             jobs_to_flush={7}))
+            self._stock_meta(
+                store_jobs={7: self._store_job([_key(0)], [5])}, jobs_to_flush={7}
+            ),
+        )
         self.assertEqual(meta.fence_job_ids, set())
         self.assertIn(7, meta.finished_store_job_ids)
         self.assertNotIn(7, sched._fence_pending)
@@ -899,8 +907,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
         self._build_meta(
-            sched,
-            self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])}))
+            sched, self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])})
+        )
         self._ack(sched, [7], count=2)
         self.assertTrue(manager.is_job_launched(7))
 
@@ -943,24 +951,30 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
 
     def _make_sched(self, manager):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
-            GroupOffloadConfig, SchedulerOffloadConfig)
+            GroupOffloadConfig,
+            SchedulerOffloadConfig,
+        )
 
-        from vllm_torchtpu.offload.raiden_connector import \
-            TPURaidenOffloadingScheduler
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
         sched = object.__new__(TPURaidenOffloadingScheduler)
         sched.config = SchedulerOffloadConfig(
-            kv_group_configs=(GroupOffloadConfig(
-                group_idx=0,
-                tokens_per_block=self.TPC,
-                tokens_per_chunk=self.TPC,
-                hashes_per_chunk=1,
-                kv_event_group_spec=MagicMock(),
-                sliding_window_size_in_chunks=None), ),
+            kv_group_configs=(
+                GroupOffloadConfig(
+                    group_idx=0,
+                    tokens_per_block=self.TPC,
+                    tokens_per_chunk=self.TPC,
+                    hashes_per_chunk=1,
+                    kv_event_group_spec=MagicMock(),
+                    sliding_window_size_in_chunks=None,
+                ),
+            ),
             blocks_per_chunk=1,
             tokens_per_hash=self.TPC,
             num_workers=2,
             offload_prompt_only=False,
-            supports_partial_tail=False)
+            supports_partial_tail=False,
+        )
         sched.manager = manager
         sched._raiden_manager = manager
         sched._fence_pending = {}
@@ -975,45 +989,45 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         return sched
 
     def _track(self, sched, req, keys, block_ids):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            RequestOffloadState  # noqa: E501
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            RequestOffloadState,  # noqa: E501
+        )
         from vllm.v1.kv_offload.base import RequestOffloadingContext
+
         req_status = RequestOffloadState(
             config=sched.config,
             req=req,
             req_context=_ctx(req.request_id),
-            offloading_context=RequestOffloadingContext())
+            offloading_context=RequestOffloadingContext(),
+        )
         req_status.group_states[0].offload_keys.extend(keys)
         req_status.group_states[0].block_ids.extend(block_ids)
         sched._req_status[req.request_id] = req_status
         return req_status
 
     def _add_pending_store_job(self, sched, req_status, job_id=99):
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-            TransferJobStatus  # noqa: E501
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            TransferJobStatus,  # noqa: E501
+        )
+
         req_status.transfer_jobs.add(job_id)
         sched._jobs[job_id] = TransferJobStatus(
-            req_id=req_status.req.request_id,
-            pending_count=2,
-            keys=set(),
-            is_store=True)
+            req_id=req_status.req.request_id, pending_count=2, keys=set(), is_store=True
+        )
 
     def _sched_output(self, req_id):
-        return SimpleNamespace(num_scheduled_tokens={},
-                               finished_req_ids={req_id})
+        return SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={req_id})
 
-    def _aborted_setup(self,
-                       num_tokens=32,
-                       num_computed_tokens=12,
-                       num_blocks=3):
+    def _aborted_setup(self, num_tokens=32, num_computed_tokens=12, num_blocks=3):
         from vllm.v1.request import RequestStatus
+
         store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
-        req = _FakeFinishedRequest("r1", num_tokens, num_computed_tokens,
-                                   RequestStatus.FINISHED_ABORTED)
+        req = _FakeFinishedRequest(
+            "r1", num_tokens, num_computed_tokens, RequestStatus.FINISHED_ABORTED
+        )
         keys = [_key(i) for i in range(num_tokens // self.TPC)]
-        req_status = self._track(sched, req, keys,
-                                 list(range(1, num_blocks + 1)))
+        req_status = self._track(sched, req, keys, list(range(1, num_blocks + 1)))
         self._add_pending_store_job(sched, req_status)
         return sched, keys
 
@@ -1021,7 +1035,7 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         # 8 chunks of hashes, 3 blocks allocated, 12 tokens computed: store chunks 0-2.
         sched, keys = self._aborted_setup()
         jobs = sched._build_store_jobs(self._sched_output("r1"))
-        (job, ) = jobs.values()
+        (job,) = jobs.values()
         self.assertEqual(job.dst_spec.keys, keys[:3])
         self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2, 3])
 
@@ -1029,13 +1043,14 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         # 3 blocks allocated but only 10 tokens computed: unwritten third block is omitted.
         sched, keys = self._aborted_setup(num_computed_tokens=10)
         jobs = sched._build_store_jobs(self._sched_output("r1"))
-        (job, ) = jobs.values()
+        (job,) = jobs.values()
         self.assertEqual(job.dst_spec.keys, keys[:2])
         self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2])
 
     def test_waiting_abort_with_no_blocks_builds_no_job(self):
         # Request aborted from waiting queue before block allocation: no store issued.
         from vllm.v1.request import RequestStatus
+
         store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
         req = _FakeFinishedRequest("r1", 32, 0, RequestStatus.FINISHED_ABORTED)
@@ -1050,22 +1065,22 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
     def test_normally_finished_request_keys_untouched(self):
         # Normal completion: computed = num_tokens - 1, both chunks backed by blocks.
         from vllm.v1.request import RequestStatus
+
         store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
         req = _FakeFinishedRequest("r1", 8, 7, RequestStatus.FINISHED_STOPPED)
         keys = [_key(0), _key(1)]
         self._track(sched, req, keys, [1, 2])
         jobs = sched._build_store_jobs(self._sched_output("r1"))
-        (job, ) = jobs.values()
+        (job,) = jobs.values()
         self.assertEqual(job.dst_spec.keys, keys)
         self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2])
 
 
 class TestWorkerSideConnector(unittest.TestCase):
-
     def _make_worker_connector(self):
-        from vllm_torchtpu.offload.raiden_connector import \
-            TPURaidenOffloadingConnector
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
         conn = object.__new__(TPURaidenOffloadingConnector)
         conn.connector_worker = MagicMock()
         conn._fenced_jobs = {}
@@ -1076,11 +1091,11 @@ class TestWorkerSideConnector(unittest.TestCase):
         return conn
 
     def _meta(self, **kwargs):
-        from vllm_torchtpu.offload.raiden_connector import \
-            RaidenOffloadingConnectorMetadata
-        return RaidenOffloadingConnectorMetadata(load_jobs={},
-                                                 store_jobs={},
-                                                 **kwargs)
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingConnectorMetadata,
+        )
+
+        return RaidenOffloadingConnectorMetadata(load_jobs={}, store_jobs={}, **kwargs)
 
     def test_fence_acks_only_after_event_retires(self):
         conn = self._make_worker_connector()
@@ -1092,14 +1107,20 @@ class TestWorkerSideConnector(unittest.TestCase):
         # While the event is in flight, retain the fence as pending without
         # acknowledging store jobs. Verify that pool writes are enqueued before
         # recording the event to guarantee ordering in the stream.
-        with patch("vllm_torchtpu.offload.raiden_connector."
-                   "_enqueue_pool_writes",
-                   side_effect=lambda pools: order.append("enqueue")) as enq, \
-             patch("vllm_torchtpu.offload.raiden_connector."
-                   "_record_fence_event",
-                   side_effect=lambda: order.append("record") or event) as rec, \
-             patch("vllm_torchtpu.offload.raiden_connector."
-                   "_event_is_retired", return_value=False):
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._enqueue_pool_writes",
+                side_effect=lambda pools: order.append("enqueue"),
+            ) as enq,
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._record_fence_event",
+                side_effect=lambda: order.append("record") or event,
+            ) as rec,
+            patch(
+                "vllm_torchtpu.offload.raiden_connector._event_is_retired",
+                return_value=False,
+            ),
+        ):
             sending, recving = conn.get_finished(set())
         enq.assert_called_once_with(conn._pool_sync_tensors)
         rec.assert_called_once_with()
@@ -1112,15 +1133,16 @@ class TestWorkerSideConnector(unittest.TestCase):
         # clear the pending fence state.
         conn._connector_metadata = self._meta()
         with patch(
-                "vllm_torchtpu.offload.raiden_connector."
-                "_event_is_retired",
-                return_value=True):
+            "vllm_torchtpu.offload.raiden_connector._event_is_retired",
+            return_value=True,
+        ):
             conn.get_finished(set())
         self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
         self.assertEqual(conn._pending_fences, [])
 
     def test_event_retirement_propagates_execution_errors(self):
         from vllm_torchtpu.offload.raiden_connector import _event_is_retired
+
         event = MagicMock()
 
         # In-flight execution: return False without issuing a blocking synchronization.
@@ -1155,6 +1177,7 @@ class TestWorkerSideConnector(unittest.TestCase):
         # Pool writes must be synchronized with wait=False to avoid host-side
         # thread stalls that drain the scheduler's dispatch pipeline.
         from vllm_torchtpu.offload.raiden_connector import _enqueue_pool_writes
+
         fake_sync = MagicMock()
         modules = {
             "torch_tpu": MagicMock(),
@@ -1191,15 +1214,14 @@ class TestWorkerSideConnector(unittest.TestCase):
         self.assertIsNone(conn.build_connector_worker_meta())
 
     def test_worker_metadata_aggregation_sums_both_channels(self):
-        from vllm_torchtpu.offload.raiden_connector import \
-            RaidenOffloadingWorkerMetadata
-        a = RaidenOffloadingWorkerMetadata(completed_jobs={3: 1},
-                                           fenced_jobs={7: 1})
-        b = RaidenOffloadingWorkerMetadata(completed_jobs={
-            3: 1,
-            4: 1
-        },
-                                           fenced_jobs={7: 1})
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingWorkerMetadata,
+        )
+
+        a = RaidenOffloadingWorkerMetadata(completed_jobs={3: 1}, fenced_jobs={7: 1})
+        b = RaidenOffloadingWorkerMetadata(
+            completed_jobs={3: 1, 4: 1}, fenced_jobs={7: 1}
+        )
         merged = a.aggregate(b)
         self.assertEqual(merged.completed_jobs, {3: 2, 4: 1})
         self.assertEqual(merged.fenced_jobs, {7: 2})
@@ -1218,22 +1240,21 @@ class TestFailureHardening(unittest.TestCase):
         # Drain disables retries to prevent re-reading reclaimed source blocks.
         self.store.complete_save(sub_hashes(_key(0)), success=False)
         drained = self.manager.drain_jobs({4})
-        self.assertEqual([(fj.job_id, fj.success) for fj in drained],
-                         [(4, False)])
+        self.assertEqual([(fj.job_id, fj.success) for fj in drained], [(4, False)])
         self.assertEqual(len(self.store.calls_named("save")), 1)
         # The save never landed, so the job gives its whole admitted batch back.
         self.assertEqual(
-            self.store.calls_named("release")[-1].args[0], sub_hashes(_key(0)))
+            self.store.calls_named("release")[-1].args[0], sub_hashes(_key(0))
+        )
         self.assertEqual(self.store.pinned_hashes(), {})
 
     def test_failed_load_reports_failure(self):
         seed_host_entries(self.store, _key(0))
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
         self.manager.prepare_load([_key(0)], _ctx("r1"))
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
         self.store.complete_load(sub_hashes(_key(0)), success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
 
@@ -1241,23 +1262,23 @@ class TestFailureHardening(unittest.TestCase):
         self.store.fail_save = True
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.manager.submit_store_job(4, out.keys_to_store, [5])
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.job_id, 4)
 
     def test_failed_load_launch_reports_failure(self):
         seed_host_entries(self.store, _key(0))
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
         self.store.fail_load = True
         self.manager.prepare_load([_key(0)], _ctx("r1"))
         self.manager.submit_load_job(3, [_key(0)], [10], "r1")
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
 
     def test_drain_timeout_poisons_inflight_job(self):
         import vllm_torchtpu.offload.raiden_store as rs
+
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.manager.submit_store_job(4, out.keys_to_store, [5])
         # Timed-out drain poisons in-flight jobs to prevent committing corrupted bytes.
@@ -1270,13 +1291,12 @@ class TestFailureHardening(unittest.TestCase):
         # Poisoned jobs finalize as terminal failures even if hardware reports success.
         releases_before = len(self.store.calls_named("release"))
         self.store.complete_save(sub_hashes(_key(0)))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.job_id, 4)
         # The hardware save landed and spent every pin, so a poisoned job that
         # reports failure still has nothing to give back.
-        self.assertEqual(len(self.store.calls_named("release")),
-                         releases_before)
+        self.assertEqual(len(self.store.calls_named("release")), releases_before)
         self.assertEqual(self.store.pinned_hashes(), {})
         # Verify poisoned job finalizes exactly once.
         self.assertEqual(self.manager.poll_finished_jobs(), [])
@@ -1301,18 +1321,16 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         out = self.manager.prepare_store([_key(0)], _ctx())
         self.assertEqual(out.keys_to_store, [_key(0)])
         self.manager.submit_store_job(7, [_key(0)], [5])
-        (save, ) = self.store.calls_named("save")
+        (save,) = self.store.calls_named("save")
         self.assertEqual(save.args[0], batch[2:])
         self.store.complete_save(batch[2:])
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         # The saved sub-hashes spent their pins; cleanup gives back exactly
         # the pre-existing HOST entries the admission pinned in place.
-        self.assertEqual(
-            self.store.calls_named("release")[-1].args[0], batch[:2])
+        self.assertEqual(self.store.calls_named("release")[-1].args[0], batch[:2])
         self.assertEqual(self.store.pinned_hashes(), {})
-        self.assertEqual(self.manager.lookup(_key(0), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.HIT)
 
     def test_all_host_batch_finishes_without_save(self):
         out = self.manager.prepare_store([_key(0)], _ctx())
@@ -1325,8 +1343,9 @@ class TestMixedBatchesAndRecovery(unittest.TestCase):
         self.manager.submit_store_job(7, out.keys_to_store, [5])
         self.assertEqual(self.store.calls_named("save"), [])
         self.assertEqual(
-            self.store.calls_named("release")[-1].args[0], sub_hashes(_key(0)))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+            self.store.calls_named("release")[-1].args[0], sub_hashes(_key(0))
+        )
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(self.store.pinned_hashes(), {})
         self.assertFalse(self.manager.has_pending_work())
@@ -1347,21 +1366,20 @@ class TestPostAdmissionClassification(unittest.TestCase):
 
     def _store_key(self, key, device_block, job_id):
         out = self.manager.prepare_store([key], _ctx())
-        self.manager.submit_store_job(job_id, out.keys_to_store,
-                                      [device_block])
+        self.manager.submit_store_job(job_id, out.keys_to_store, [device_block])
 
     def test_lookup_classification_saves_only_new_sub_hashes(self):
         batch = sub_hashes(_key(0))
         for h in batch[:2]:
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
         self._store_key(_key(0), 5, 7)
-        (call, ) = self.store.calls_named("insert")
+        (call,) = self.store.calls_named("insert")
         self.assertEqual(call.args[0], batch)
-        (save, ) = self.store.calls_named("save")
+        (save,) = self.store.calls_named("save")
         self.assertEqual(save.args[0], batch[2:])
 
         self.store.complete_save(batch[2:])
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
 
     def test_remote_sub_hashes_are_resident_and_not_saved(self):
@@ -1369,7 +1387,7 @@ class TestPostAdmissionClassification(unittest.TestCase):
         for h in batch[:2]:
             self.store.entries[h] = _Entry(status=FakeBlockStatus.REMOTE)
         self._store_key(_key(0), 5, 7)
-        (save, ) = self.store.calls_named("save")
+        (save,) = self.store.calls_named("save")
         self.assertEqual(save.args[0], batch[2:])
 
     def test_fully_remote_key_is_not_offered(self):
@@ -1382,20 +1400,22 @@ class TestPostAdmissionClassification(unittest.TestCase):
         batch = sub_hashes(_key(0))
         # An HBM entry bound to a device block this job did not supply breaks
         # the connector's invariants; the job must fail, not guess.
-        self.store.entries[batch[0]] = _Entry(status=FakeBlockStatus.HBM,
-                                              device_block_id=99)
+        self.store.entries[batch[0]] = _Entry(
+            status=FakeBlockStatus.HBM, device_block_id=99
+        )
         self._store_key(_key(0), 5, 7)
         self.assertEqual(self.store.calls_named("save"), [])
         self.assertEqual(self.store.calls_named("release")[-1].args[0], batch)
         self.assertEqual(self.store.pinned_hashes(), {})
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertFalse(self.manager.has_pending_work())
 
     def test_displaced_key_rediscovered_by_directory_probe(self):
         seed_host_entries(self.store, _key(1))
         self.assertEqual(
-            self.manager.prepare_store([_key(1)], _ctx()).keys_to_store, [])
+            self.manager.prepare_store([_key(1)], _ctx()).keys_to_store, []
+        )
         # Displacement moves the entries to the candidate list, invisible to
         # lookup. No event is emitted; the next prepare_store probe simply
         # re-offers the key.
@@ -1423,14 +1443,13 @@ class TestPostAdmissionClassification(unittest.TestCase):
             self.assertFalse(entry.is_candidate)
             self.assertEqual(entry.status, FakeBlockStatus.HBM)
             self.assertEqual(entry.device_block_id, 20 + i)
-        (save, ) = self.store.calls_named("save")
+        (save,) = self.store.calls_named("save")
         self.assertEqual(save.args[0], batch)
 
         self.store.complete_save(batch)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()), LookupResult.HIT)
 
 
 class TestRemoteReadFlow(unittest.TestCase):
@@ -1443,10 +1462,8 @@ class TestRemoteReadFlow(unittest.TestCase):
     def test_remote_hit_requires_global_enabled(self):
         seed_global_entries(self.store, _key(1))
         local_manager = make_manager(self.store)
-        self.assertEqual(local_manager.lookup(_key(1), _ctx()),
-                         LookupResult.MISS)
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(local_manager.lookup(_key(1), _ctx()), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()), LookupResult.HIT)
 
     def test_on_schedule_end_drops_unconsumed_remote_slices(self):
         # A remote HIT whose request never reaches prepare_load (aborted, or
@@ -1454,13 +1471,15 @@ class TestRemoteReadFlow(unittest.TestCase):
         # past the step: they would accumulate forever and a stale slice
         # could later be handed to read_remote.
         from vllm.v1.kv_offload.base import ScheduleEndContext
+
         key = _key(1)
         seed_global_entries(self.store, key)
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
         self.assertTrue(self.manager._remote_slices)
 
         self.manager.on_schedule_end(
-            ScheduleEndContext(new_req_ids=(), preempted_req_ids=()))
+            ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
+        )
         self.assertEqual(self.manager._remote_slices, {})
 
         # A retried request re-runs lookup and repopulates the stash.
@@ -1471,10 +1490,8 @@ class TestRemoteReadFlow(unittest.TestCase):
         seed_global_entries(self.store, _key(1))
         seed_host_entries(self.store, _key(2))
         self.store.registry_down = True
-        self.assertEqual(self.manager.lookup(_key(1), _ctx()),
-                         LookupResult.MISS)
-        self.assertEqual(self.manager.lookup(_key(2), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx()), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(2), _ctx()), LookupResult.HIT)
 
     def test_receiver_flow_end_to_end(self):
         key = _key(1)
@@ -1492,20 +1509,18 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.manager.submit_load_job(7, [key], [5], "req")
         # Pure remote prefix dispatches read_remote directly without local load.
         self.assertEqual(self.store.calls_named("load"), [])
-        (rr, ) = self.store.calls_named("read_remote")
+        (rr,) = self.store.calls_named("read_remote")
         self.assertEqual(rr.args[0], sub_hashes(key))
         self.assertEqual(rr.args[2], [20, 21, 22, 23])
-        self.assertTrue(
-            all(sl.status == FakeBlockStatus.REMOTE for sl in rr.args[1]))
+        self.assertTrue(all(sl.status == FakeBlockStatus.REMOTE for sl in rr.args[1]))
         self.assertTrue(self.manager.has_pending_work())
         self.assertEqual(self.manager.poll_finished_jobs(), [])
 
         # Concurrent lookup for in-flight fetch returns HIT_PENDING without duplicate read.
-        self.assertEqual(self.manager.lookup(key, _ctx()),
-                         LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
 
         self.store.complete_remote_read(sub_hashes(key))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(finished_job.req_id, "req")
         # The bytes landed in the destination device blocks and nowhere else:
@@ -1521,17 +1536,15 @@ class TestRemoteReadFlow(unittest.TestCase):
         local_key, remote_key = _key(1), _key(2)
         seed_host_entries(self.store, local_key)
         seed_global_entries(self.store, remote_key)
-        self.assertEqual(self.manager.lookup(local_key, _ctx()),
-                         LookupResult.HIT)
-        self.assertEqual(self.manager.lookup(remote_key, _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(local_key, _ctx()), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(remote_key, _ctx()), LookupResult.HIT)
         spec = self.manager.prepare_load([local_key, remote_key], _ctx())
         self.assertTrue(spec.pinned)
 
         self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
-        (ld, ) = self.store.calls_named("load")
+        (ld,) = self.store.calls_named("load")
         self.assertEqual(ld.args, (sub_hashes(local_key), [20, 21, 22, 23]))
-        (rr, ) = self.store.calls_named("read_remote")
+        (rr,) = self.store.calls_named("read_remote")
         self.assertEqual(rr.args[0], sub_hashes(remote_key))
         self.assertEqual(rr.args[2], [24, 25, 26, 27])
 
@@ -1539,7 +1552,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.store.complete_load(sub_hashes(local_key))
         self.assertEqual(self.manager.poll_finished_jobs(), [])
         self.store.complete_remote_read(sub_hashes(remote_key))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
 
     def test_remote_failure_leaves_nothing_behind(self):
@@ -1550,7 +1563,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.manager.submit_load_job(7, [key], [5], "req")
 
         self.store.complete_remote_read(sub_hashes(key), success=False)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [5])
         # A peer read records nothing locally either way, and the registry
@@ -1573,10 +1586,10 @@ class TestRemoteReadFlow(unittest.TestCase):
         spec = self.manager.prepare_load([local_key, remote_key], _ctx())
         self.assertFalse(spec.pinned)
         self.assertEqual(self.store.pinned_hashes(), {})
-        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6],
-                                     "req",
-                                     pinned=spec.pinned)
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        self.manager.submit_load_job(
+            7, [local_key, remote_key], [5, 6], "req", pinned=spec.pinned
+        )
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
         self.assertEqual(self.store.calls_named("read_remote"), [])
@@ -1594,7 +1607,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertTrue(self.manager.has_pending_work())
         self.assertEqual(self.manager.poll_finished_jobs(), [])
         self.store.complete_load(sub_hashes(local_key))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
         # The peer read left nothing local to clean up, and the HOST entries
@@ -1602,11 +1615,9 @@ class TestRemoteReadFlow(unittest.TestCase):
         for h in sub_hashes(remote_key):
             self.assertNotIn(h, self.store.entries)
         for h in sub_hashes(local_key):
-            self.assertEqual(self.store.entries[h].status,
-                             FakeBlockStatus.HOST)
+            self.assertEqual(self.store.entries[h].status, FakeBlockStatus.HOST)
             self.assertEqual(self.store.entries[h].pin_count, 0)
-        self.assertEqual(self.manager.lookup(local_key, _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(local_key, _ctx()), LookupResult.HIT)
 
     def test_read_remote_launch_failure_cleans_up(self):
         key = _key(1)
@@ -1616,7 +1627,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.store.fail_read_remote = True
         self.manager.submit_load_job(7, [key], [5], "req")
         # Immediate terminal failure; a peer read left nothing local behind.
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [5])
         for h in sub_hashes(key):
@@ -1635,7 +1646,7 @@ class TestRemoteReadFlow(unittest.TestCase):
         spec = self.manager.prepare_load([key], _ctx())
         self.assertTrue(spec.pinned)
         self.manager.submit_load_job(7, [key], [5], "req")
-        (ld, ) = self.store.calls_named("load")
+        (ld,) = self.store.calls_named("load")
         self.assertEqual(ld.args, (sub_hashes(key), [20, 21, 22, 23]))
         self.assertEqual(self.store.calls_named("read_remote"), [])
 
@@ -1648,8 +1659,7 @@ class TestRemoteLanding(unittest.TestCase):
         self.store = FakeKVCacheStore()
         self.manager = make_global_manager(self.store)
         seed_global_entries(self.store, _key(2))
-        self.assertEqual(self.manager.lookup(_key(2), _ctx()),
-                         LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(_key(2), _ctx()), LookupResult.HIT)
 
     def test_peer_read_admits_nothing_locally(self):
         seed_host_entries(self.store, _key(3))
@@ -1660,7 +1670,7 @@ class TestRemoteLanding(unittest.TestCase):
         self.manager.submit_load_job(7, [_key(2)], [5], "r1")
         self.assertEqual(list(self.manager.take_events()), [])
         self.store.complete_remote_read(sub_hashes(_key(2)))
-        (finished_job, ) = self.manager.poll_finished_jobs()
+        (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         # Nothing admitted, nothing displaced, nothing pinned.
         self.assertEqual(set(self.store.entries), set(resident_before))
@@ -1681,9 +1691,9 @@ class TestNamespace(unittest.TestCase):
         key = _key(1)
         self.manager.prepare_store([key], _ctx())
         self.manager.submit_store_job(1, [key], [3])
-        (ial, ) = self.store.calls_named("insert")
+        (ial,) = self.store.calls_named("insert")
         self.assertEqual(ial.args[0], sub_hashes(key, ns=self.NS))
-        (sv, ) = self.store.calls_named("save")
+        (sv,) = self.store.calls_named("save")
         self.assertEqual(sv.args[0], sub_hashes(key, ns=self.NS))
 
     def test_namespaced_remote_flow(self):
@@ -1692,7 +1702,7 @@ class TestNamespace(unittest.TestCase):
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
         self.manager.prepare_load([key], _ctx())
         self.manager.submit_load_job(7, [key], [5], "req")
-        (rr, ) = self.store.calls_named("read_remote")
+        (rr,) = self.store.calls_named("read_remote")
         self.assertEqual(rr.args[0], sub_hashes(key, ns=self.NS))
         self.assertEqual(rr.args[2], [20, 21, 22, 23])
 
@@ -1707,37 +1717,34 @@ class TestNamespace(unittest.TestCase):
             c.cache_config.prefix_caching_hash_algo = algo
             return c
 
-        kwargs = dict(kernel_block_size=256,
-                      per_block_shape=(256, 8, 2, 128),
-                      kv_dtype="bfloat16",
-                      device_block_size=1280,
-                      world_size=4,
-                      num_kv_cache_groups=1,
-                      num_kv_cache_tensors=64)
+        kwargs = dict(
+            kernel_block_size=256,
+            per_block_shape=(256, 8, 2, 128),
+            kv_dtype="bfloat16",
+            device_block_size=1280,
+            world_size=4,
+            num_kv_cache_groups=1,
+            num_kv_cache_tensors=64,
+        )
         ns = derive_offload_namespace(cfg(), **kwargs)
         self.assertEqual(len(ns), 16)
         self.assertEqual(ns, derive_offload_namespace(cfg(), **kwargs))
         # Compatibility namespace prevents cache collisions across incompatible engine configurations.
-        self.assertNotEqual(ns,
-                            derive_offload_namespace(cfg(model="o"), **kwargs))
+        self.assertNotEqual(ns, derive_offload_namespace(cfg(model="o"), **kwargs))
+        self.assertNotEqual(ns, derive_offload_namespace(cfg(quant="fp8"), **kwargs))
         self.assertNotEqual(
-            ns, derive_offload_namespace(cfg(quant="fp8"), **kwargs))
+            ns, derive_offload_namespace(cfg(algo="sha256_cbor"), **kwargs)
+        )
         self.assertNotEqual(
-            ns, derive_offload_namespace(cfg(algo="sha256_cbor"), **kwargs))
-        self.assertNotEqual(
-            ns, derive_offload_namespace(cfg(), **{
-                **kwargs, "world_size": 8
-            }))
+            ns, derive_offload_namespace(cfg(), **{**kwargs, "world_size": 8})
+        )
         # Context parallelism geometry is included in namespace only when CP is active.
-        self.assertEqual(
-            ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=()))
-        pcp_ns = derive_offload_namespace(cfg(),
-                                          **kwargs,
-                                          cp_geometry=(8, 1, 1))
+        self.assertEqual(ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=()))
+        pcp_ns = derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 1))
         self.assertNotEqual(ns, pcp_ns)
         self.assertNotEqual(
-            pcp_ns,
-            derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16)))
+            pcp_ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16))
+        )
 
 
 class TestHybridGeometry(unittest.TestCase):
@@ -1745,21 +1752,31 @@ class TestHybridGeometry(unittest.TestCase):
 
     def _resolve(self, groups, unified=True):
         from vllm_torchtpu.offload import raiden_store as rs
+
         kv_cache_config = SimpleNamespace(
-            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups])
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups]
+        )
         backend = MagicMock()
         backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
         backend.is_ssm.return_value = False
-        with patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
-                   "_find_non_ssm_backend", return_value=backend), \
-             patch("vllm.v1.worker.utils.select_common_block_size",
-                   return_value=256), \
-             patch("vllm_torchtpu.platforms.tpu_block_size_utils."
-                   "unified_kv_layout_enabled", return_value=unified):
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=backend,
+            ),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+            patch(
+                "vllm_torchtpu.platforms.tpu_block_size_utils."
+                "unified_kv_layout_enabled",
+                return_value=unified,
+            ),
+        ):
             return rs.resolve_kernel_geometry(MagicMock(), kv_cache_config)
 
     def _attn_spec(self, page=1310720):
         from vllm.v1.kv_cache_interface import FullAttentionSpec
+
         spec = MagicMock(spec=FullAttentionSpec)
         spec.block_size = 1280
         spec.num_kv_heads = 8
@@ -1770,6 +1787,7 @@ class TestHybridGeometry(unittest.TestCase):
 
     def _mamba_spec(self, page=1310720):
         from vllm.v1.kv_cache_interface import MambaSpec
+
         spec = MagicMock(spec=MambaSpec)
         spec.page_size_bytes = page
         return spec
@@ -1777,15 +1795,15 @@ class TestHybridGeometry(unittest.TestCase):
     def test_hybrid_uses_attention_geometry_with_mamba_group_first(self):
         # In hybrid models, group 0 may be Mamba; verify attention spec resolution.
         kernel, shape, dtype, device_block = self._resolve(
-            [self._mamba_spec(), self._attn_spec()])
+            [self._mamba_spec(), self._attn_spec()]
+        )
         self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         self.assertEqual(dtype, "bfloat16")
 
     def test_hybrid_requires_unified_pool(self):
         with self.assertRaises(AssertionError):
-            self._resolve(
-                [self._mamba_spec(), self._attn_spec()], unified=False)
+            self._resolve([self._mamba_spec(), self._attn_spec()], unified=False)
 
     def test_hybrid_rejects_mismatched_page_sizes(self):
         with self.assertRaises(AssertionError):
@@ -1800,31 +1818,37 @@ class TestHybridGeometry(unittest.TestCase):
         from contextlib import nullcontext
 
         from vllm_torchtpu.offload import raiden_store as rs
+
         kv_cache_config = SimpleNamespace(
-            kv_cache_groups=[SimpleNamespace(kv_cache_spec=self._attn_spec())])
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=self._attn_spec())]
+        )
         backend = MagicMock()
         backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
         backend.is_ssm.return_value = False
-        with patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
-                   "_find_non_ssm_backend", return_value=None), \
-             patch("vllm.v1.attention.selector.get_attn_backend",
-                   return_value=backend) as selector, \
-             patch("vllm.config.set_current_vllm_config",
-                   return_value=nullcontext()), \
-             patch("vllm.v1.worker.utils.select_common_block_size",
-                   return_value=256):
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=None,
+            ),
+            patch(
+                "vllm.v1.attention.selector.get_attn_backend", return_value=backend
+            ) as selector,
+            patch("vllm.config.set_current_vllm_config", return_value=nullcontext()),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+        ):
             kernel, shape, dtype, device_block = rs.resolve_kernel_geometry(
-                MagicMock(), kv_cache_config)
+                MagicMock(), kv_cache_config
+            )
         self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         selector.assert_called_once()
 
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):
-
     def test_submit_paths_fail_loudly(self):
-        from vllm_torchtpu.offload.raiden_store import \
-            RaidenStoreOffloadingWorker
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
         worker = object.__new__(RaidenStoreOffloadingWorker)
         with self.assertRaises(AssertionError):
             worker.submit_store(1, MagicMock(), MagicMock())
