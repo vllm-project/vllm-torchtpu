@@ -1,0 +1,1444 @@
+{
+  "date": "2026-09-22",
+  "kernel_revision": "bed64114bd428ac99b9ed608f1df7bb6d272507c",
+  "scope": "TPU:0 mean TensorCore XLA Ops duration over captured forwards",
+  "input_source": "deterministic synthetic, not model activation replay",
+  "profile_steps_per_pool_per_rank": 20,
+  "runner_sha256": "7726b24b65a0bc65724b535ed8e1dc6ea3c63f8a679ab3a99129c2d443c14d1e",
+  "kernel_sources_sha256": {
+    "src/vllm_torchtpu/layers/core/fused_moe_gmm.py": "1c73d10d8d06e4a87e611b2f74a663bda24bfeabcaa514ca281ea96af71c9cfc",
+    "src/vllm_torchtpu/kernels/megablox/moe_dense_expert.py": "f837e5da5af54441b068b50805c5de0ee022eab1fe657198564cf3de04966638"
+  },
+  "versions": {
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "libtpu": "0.0.47",
+    "torch": "2.13.0+cpu",
+    "torch-tpu": "0.1.1.dev20260912075415"
+  },
+  "configuration": {
+    "global_tokens": 256,
+    "dp": 4,
+    "tp": 2,
+    "ep": 8,
+    "hidden": 4096,
+    "intermediate": 1024,
+    "experts": 512,
+    "topk": 10,
+    "weight": "FP8",
+    "activation": "BF16",
+    "seed": 20260921,
+    "shared_expert": true,
+    "input_source": "deterministic synthetic, not captured model activations"
+  },
+  "raw_run_directory_in_benchmark_workspace": "runs/moe-inrepo-ut-20260922T013216Z",
+  "cases": {
+    "pool16": {
+      "inputs_and_routes_equal": true,
+      "relative_l2": 0.0026796329766511917,
+      "worst_token_relative_l2": 0.004837557673454285,
+      "standard_op_us": 238.15672215,
+      "candidate_op_us": 189.65053845,
+      "latency_ratio": 0.7963266236531044,
+      "latency_change_percent": -20.367337634689562,
+      "standard_module_us": 288.640456,
+      "candidate_module_us": 232.80066025,
+      "standard_sort_count": 4,
+      "candidate_sort_count": 0,
+      "standard_details": {
+        "total_us": 288.640456,
+        "gmm1_us": 55.719147750000005,
+        "gmm2_us": 30.756542500000002,
+        "gmm_us": 86.47569025,
+        "routed_kernel_us": 86.47569025,
+        "other_us": 202.16476575,
+        "op_sum_us": 238.15672215,
+        "op_other_us": 151.6810319,
+        "module_gap_us": 50.48373384999999
+      },
+      "candidate_details": {
+        "total_us": 232.80066025,
+        "dense_expert_us": 84.1039016,
+        "routed_kernel_us": 84.1039016,
+        "other_us": 148.69675865,
+        "op_sum_us": 189.65053845,
+        "op_other_us": 105.54663685,
+        "module_gap_us": 43.1501218
+      },
+      "standard": {
+        "checks": {
+          "relative_l2": 0.015702562406659126,
+          "worst_token_relative_l2": 0.02987612783908844,
+          "routing_relative_l2": 0.0,
+          "routing_worst_token_relative_l2": 0.0,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16
+          ],
+          "routed_rows_per_rank": [
+            329,
+            312,
+            313,
+            310,
+            301,
+            339,
+            317,
+            339
+          ],
+          "output_sha256": "55d421fa3f74320e5cdeeea7084448c7da6398df4327cdeb788245f16cdc58ab"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 608.4205,
+          "min_us": 566.099,
+          "p90_us": 629.3343
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 287.108043,
+            "gmm1_us": 55.6866745,
+            "gmm2_us": 30.719687999999998,
+            "gmm_us": 86.451981,
+            "routed_kernel_us": 86.451981,
+            "other_us": 200.39135650000003,
+            "op_sum_us": 237.962785,
+            "op_other_us": 151.45498300000003,
+            "module_gap_us": 49.01260450000001,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 288.640456,
+              "gmm1_us": 55.719147750000005,
+              "gmm2_us": 30.756542500000002,
+              "gmm_us": 86.47569025,
+              "routed_kernel_us": 86.47569025,
+              "other_us": 202.16476575,
+              "op_sum_us": 238.15672215,
+              "op_other_us": 151.6810319,
+              "module_gap_us": 50.48373384999999
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 281.17767100000003,
+            "gmm1_us": 55.693276999999995,
+            "gmm2_us": 30.337335,
+            "gmm_us": 85.91056449999999,
+            "routed_kernel_us": 85.91056449999999,
+            "other_us": 195.5222085,
+            "op_sum_us": 237.062423,
+            "op_other_us": 151.3517395,
+            "module_gap_us": 43.31692600000001,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 282.03145255,
+              "gmm1_us": 55.67208875,
+              "gmm2_us": 30.3183073,
+              "gmm_us": 85.99039605,
+              "routed_kernel_us": 85.99039605,
+              "other_us": 196.0410565,
+              "op_sum_us": 237.354141,
+              "op_other_us": 151.36374495,
+              "module_gap_us": 44.67731155
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 290.17106850000005,
+            "gmm1_us": 55.6266505,
+            "gmm2_us": 30.365546000000002,
+            "gmm_us": 85.964586,
+            "routed_kernel_us": 85.964586,
+            "other_us": 204.11224500000003,
+            "op_sum_us": 236.079232,
+            "op_other_us": 150.190875,
+            "module_gap_us": 54.32292950000003,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 290.0558224,
+              "gmm1_us": 55.6660864,
+              "gmm2_us": 30.36428565,
+              "gmm_us": 86.03037205,
+              "routed_kernel_us": 86.03037205,
+              "other_us": 204.02545035,
+              "op_sum_us": 236.3075624,
+              "op_other_us": 150.27719035,
+              "module_gap_us": 53.74826
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 283.643457,
+            "gmm1_us": 55.747899000000004,
+            "gmm2_us": 30.462784999999997,
+            "gmm_us": 86.3409365,
+            "routed_kernel_us": 86.3409365,
+            "other_us": 197.65246050000002,
+            "op_sum_us": 236.22028699999998,
+            "op_other_us": 150.1692655,
+            "module_gap_us": 47.10924600000001,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 282.222569,
+              "gmm1_us": 55.739195699999996,
+              "gmm2_us": 30.650780349999998,
+              "gmm_us": 86.38997605,
+              "routed_kernel_us": 86.38997605,
+              "other_us": 195.83259295,
+              "op_sum_us": 236.4762293,
+              "op_other_us": 150.08625325,
+              "module_gap_us": 45.7463397
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 265.2815125,
+            "gmm1_us": 55.406963000000005,
+            "gmm2_us": 30.3817525,
+            "gmm_us": 85.804322,
+            "routed_kernel_us": 85.804322,
+            "other_us": 178.9543815,
+            "op_sum_us": 236.3145235,
+            "op_other_us": 150.515007,
+            "module_gap_us": 28.926771000000016,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 270.3498799,
+              "gmm1_us": 55.3967587,
+              "gmm2_us": 30.41020405,
+              "gmm_us": 85.80696275,
+              "routed_kernel_us": 85.80696275,
+              "other_us": 184.54291715,
+              "op_sum_us": 236.38145155,
+              "op_other_us": 150.5744888,
+              "module_gap_us": 33.968428349999996
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 279.586435,
+            "gmm1_us": 56.630252,
+            "gmm2_us": 30.406963,
+            "gmm_us": 87.136855,
+            "routed_kernel_us": 87.136855,
+            "other_us": 192.44958,
+            "op_sum_us": 236.508403,
+            "op_other_us": 149.51320500000003,
+            "module_gap_us": 42.936374999999984,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 280.2414766,
+              "gmm1_us": 56.6767107,
+              "gmm2_us": 30.4105042,
+              "gmm_us": 87.0872149,
+              "routed_kernel_us": 87.0872149,
+              "other_us": 193.1542617,
+              "op_sum_us": 236.59777775,
+              "op_other_us": 149.51056284999999,
+              "module_gap_us": 43.64369885
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 270.33733500000005,
+            "gmm1_us": 55.4513805,
+            "gmm2_us": 30.501801,
+            "gmm_us": 85.9855945,
+            "routed_kernel_us": 85.9855945,
+            "other_us": 184.50300150000004,
+            "op_sum_us": 235.1584635,
+            "op_other_us": 149.25570199999999,
+            "module_gap_us": 35.106844000000024,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 277.42388945,
+              "gmm1_us": 55.535114,
+              "gmm2_us": 30.56110445,
+              "gmm_us": 86.09621845,
+              "routed_kernel_us": 86.09621845,
+              "other_us": 191.327671,
+              "op_sum_us": 235.38049155,
+              "op_other_us": 149.2842731,
+              "module_gap_us": 42.043397899999995
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 290.86314500000003,
+            "gmm1_us": 55.9063625,
+            "gmm2_us": 30.405162,
+            "gmm_us": 86.21428549999999,
+            "routed_kernel_us": 86.21428549999999,
+            "other_us": 205.05702250000002,
+            "op_sum_us": 235.325328,
+            "op_other_us": 149.31932950000004,
+            "module_gap_us": 54.8985605,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 287.3931572,
+              "gmm1_us": 55.76392555,
+              "gmm2_us": 30.4575631,
+              "gmm_us": 86.22148865,
+              "routed_kernel_us": 86.22148865,
+              "other_us": 201.17166855,
+              "op_sum_us": 235.5684262,
+              "op_other_us": 149.34693755,
+              "module_gap_us": 51.82473099999999
+            }
+          }
+        },
+        "median_max_rank_module_us": 308.830732
+      },
+      "dense_expert": {
+        "checks": {
+          "relative_l2": 0.0157259963452816,
+          "worst_token_relative_l2": 0.02999340370297432,
+          "routing_relative_l2": 0.0026796329766511917,
+          "routing_worst_token_relative_l2": 0.004837557673454285,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16
+          ],
+          "routed_rows_per_rank": [
+            329,
+            312,
+            313,
+            310,
+            301,
+            339,
+            317,
+            339
+          ],
+          "output_sha256": "4c92c6beb89f460dcd5d6f499726dd5d2172a1565b6dee58905400b930f9dce1"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 536.0930000000001,
+          "min_us": 504.198,
+          "p90_us": 558.2796000000001
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 234.939976,
+            "dense_expert_us": 84.12124850000001,
+            "routed_kernel_us": 84.12124850000001,
+            "other_us": 150.734694,
+            "op_sum_us": 189.2893145,
+            "op_other_us": 105.1656625,
+            "module_gap_us": 45.655464499999994,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 232.80066025,
+              "dense_expert_us": 84.1039016,
+              "routed_kernel_us": 84.1039016,
+              "other_us": 148.69675865,
+              "op_sum_us": 189.65053845,
+              "op_other_us": 105.54663685,
+              "module_gap_us": 43.1501218
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 233.59243700000002,
+            "dense_expert_us": 84.022809,
+            "routed_kernel_us": 84.022809,
+            "other_us": 150.06422600000002,
+            "op_sum_us": 188.5120025,
+            "op_other_us": 104.47718850000001,
+            "module_gap_us": 44.786918,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 231.74471785,
+              "dense_expert_us": 83.98445375,
+              "routed_kernel_us": 83.98445375,
+              "other_us": 147.7602641,
+              "op_sum_us": 188.80984285,
+              "op_other_us": 104.8253891,
+              "module_gap_us": 42.934875
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 237.92557,
+            "dense_expert_us": 83.977791,
+            "routed_kernel_us": 83.977791,
+            "other_us": 154.1818725,
+            "op_sum_us": 187.1482575,
+            "op_other_us": 102.91956649999999,
+            "module_gap_us": 50.259306499999994,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 239.434814,
+              "dense_expert_us": 83.96272515,
+              "routed_kernel_us": 83.96272515,
+              "other_us": 155.47208885,
+              "op_sum_us": 187.22412775,
+              "op_other_us": 103.2614026,
+              "module_gap_us": 52.21068625
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 221.785114,
+            "dense_expert_us": 84.1644655,
+            "routed_kernel_us": 84.1644655,
+            "other_us": 137.3835535,
+            "op_sum_us": 187.27490899999998,
+            "op_other_us": 102.8913575,
+            "module_gap_us": 34.024011499999986,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 225.4536014,
+              "dense_expert_us": 84.23211285,
+              "routed_kernel_us": 84.23211285,
+              "other_us": 141.22148855,
+              "op_sum_us": 187.42610865,
+              "op_other_us": 103.19399580000001,
+              "module_gap_us": 38.02749274999999
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 230.7815125,
+            "dense_expert_us": 84.039616,
+            "routed_kernel_us": 84.039616,
+            "other_us": 146.822329,
+            "op_sum_us": 187.03241,
+            "op_other_us": 102.80672100000001,
+            "module_gap_us": 44.19327949999999,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 230.7247299,
+              "dense_expert_us": 84.0664466,
+              "routed_kernel_us": 84.0664466,
+              "other_us": 146.6582833,
+              "op_sum_us": 187.2639237,
+              "op_other_us": 103.1974771,
+              "module_gap_us": 43.4608062
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 224.08763499999998,
+            "dense_expert_us": 84.7040815,
+            "routed_kernel_us": 84.7040815,
+            "other_us": 139.29891949999998,
+            "op_sum_us": 187.3103205,
+            "op_other_us": 102.501801,
+            "module_gap_us": 37.29051799999999,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 228.55084035,
+              "dense_expert_us": 84.75282105,
+              "routed_kernel_us": 84.75282105,
+              "other_us": 143.7980193,
+              "op_sum_us": 187.47430775,
+              "op_other_us": 102.7214867,
+              "module_gap_us": 41.0765326
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 223.94958,
+            "dense_expert_us": 83.90576250000001,
+            "routed_kernel_us": 83.90576250000001,
+            "other_us": 140.388356,
+            "op_sum_us": 186.0126035,
+            "op_other_us": 102.11524599999998,
+            "module_gap_us": 38.32773250000001,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 224.71164475,
+              "dense_expert_us": 83.98025215,
+              "routed_kernel_us": 83.98025215,
+              "other_us": 140.7313926,
+              "op_sum_us": 186.60564015,
+              "op_other_us": 102.625388,
+              "module_gap_us": 38.106004600000006
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 221.08223299999997,
+            "dense_expert_us": 84.0888355,
+            "routed_kernel_us": 84.0888355,
+            "other_us": 136.72809149999998,
+            "op_sum_us": 186.348137,
+            "op_other_us": 102.4915955,
+            "module_gap_us": 34.622450999999984,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 233.0589436,
+              "dense_expert_us": 84.0253901,
+              "routed_kernel_us": 84.0253901,
+              "other_us": 149.03355349999998,
+              "op_sum_us": 186.80011795000001,
+              "op_other_us": 102.77472785,
+              "module_gap_us": 46.25882564999999
+            }
+          }
+        },
+        "median_max_rank_module_us": 254.09483799999998
+      }
+    },
+    "pool32": {
+      "inputs_and_routes_equal": true,
+      "relative_l2": 0.0026711488608270884,
+      "worst_token_relative_l2": 0.004714127629995346,
+      "standard_op_us": 305.84297715,
+      "candidate_op_us": 263.6914154,
+      "latency_ratio": 0.862179075868311,
+      "latency_change_percent": -13.7820924131689,
+      "standard_module_us": 355.6294117,
+      "candidate_module_us": 312.74123635,
+      "standard_sort_count": 4,
+      "candidate_sort_count": 0,
+      "standard_details": {
+        "total_us": 355.6294117,
+        "gmm1_us": 96.6648259,
+        "gmm2_us": 56.40330135,
+        "gmm_us": 153.06812725,
+        "routed_kernel_us": 153.06812725,
+        "other_us": 202.56128445,
+        "op_sum_us": 305.84297715,
+        "op_other_us": 152.7748499,
+        "module_gap_us": 49.786434549999996
+      },
+      "candidate_details": {
+        "total_us": 312.74123635,
+        "dense_expert_us": 158.60492205,
+        "routed_kernel_us": 158.60492205,
+        "other_us": 154.1363143,
+        "op_sum_us": 263.6914154,
+        "op_other_us": 105.08649335,
+        "module_gap_us": 49.04982095000001
+      },
+      "standard": {
+        "checks": {
+          "relative_l2": 0.015659676864743233,
+          "worst_token_relative_l2": 0.030814994126558304,
+          "routing_relative_l2": 0.0,
+          "routing_worst_token_relative_l2": 0.0,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32
+          ],
+          "routed_rows_per_rank": [
+            304,
+            297,
+            301,
+            327,
+            330,
+            321,
+            344,
+            336
+          ],
+          "output_sha256": "0a2ca17bd46a4db5af41caf8584ac026081b71fc3660c348977d1f9e7b839543"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 660.0409999999999,
+          "min_us": 630.883,
+          "p90_us": 679.9789999999999
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 358.91656650000004,
+            "gmm1_us": 96.598439,
+            "gmm2_us": 56.387155,
+            "gmm_us": 152.957983,
+            "routed_kernel_us": 152.957983,
+            "other_us": 205.3289315,
+            "op_sum_us": 305.611046,
+            "op_other_us": 152.35234150000002,
+            "module_gap_us": 53.434574000000026,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 355.6294117,
+              "gmm1_us": 96.6648259,
+              "gmm2_us": 56.40330135,
+              "gmm_us": 153.06812725,
+              "routed_kernel_us": 153.06812725,
+              "other_us": 202.56128445,
+              "op_sum_us": 305.84297715,
+              "op_other_us": 152.7748499,
+              "module_gap_us": 49.786434549999996
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 343.317527,
+            "gmm1_us": 96.5582235,
+            "gmm2_us": 55.804322,
+            "gmm_us": 152.3355345,
+            "routed_kernel_us": 152.3355345,
+            "other_us": 190.9681865,
+            "op_sum_us": 304.8991615,
+            "op_other_us": 152.590037,
+            "module_gap_us": 38.41056499999999,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 349.1665066,
+              "gmm1_us": 96.67605045,
+              "gmm2_us": 55.8154262,
+              "gmm_us": 152.49147665,
+              "routed_kernel_us": 152.49147665,
+              "other_us": 196.67502994999998,
+              "op_sum_us": 305.13097145,
+              "op_other_us": 152.6394948,
+              "module_gap_us": 44.03553515
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 342.84994,
+            "gmm1_us": 96.804922,
+            "gmm2_us": 55.9903965,
+            "gmm_us": 152.655462,
+            "routed_kernel_us": 152.655462,
+            "other_us": 190.286915,
+            "op_sum_us": 303.7376945,
+            "op_other_us": 151.02581149999997,
+            "module_gap_us": 38.2130875,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 345.51044415,
+              "gmm1_us": 96.76350545,
+              "gmm2_us": 55.95468185,
+              "gmm_us": 152.7181873,
+              "routed_kernel_us": 152.7181873,
+              "other_us": 192.79225685,
+              "op_sum_us": 303.9988586,
+              "op_other_us": 151.2806713,
+              "module_gap_us": 41.51158555
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 351.162065,
+            "gmm1_us": 96.82112799999999,
+            "gmm2_us": 56.480791999999994,
+            "gmm_us": 153.3925565,
+            "routed_kernel_us": 153.3925565,
+            "other_us": 197.6728695,
+            "op_sum_us": 304.097838,
+            "op_other_us": 150.854741,
+            "module_gap_us": 45.87334899999999,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 350.7243698,
+              "gmm1_us": 96.8161464,
+              "gmm2_us": 56.4970587,
+              "gmm_us": 153.3132051,
+              "routed_kernel_us": 153.3132051,
+              "other_us": 197.4111647,
+              "op_sum_us": 304.2378737,
+              "op_other_us": 150.9246686,
+              "module_gap_us": 46.4864961
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 341.959784,
+            "gmm1_us": 97.0804325,
+            "gmm2_us": 55.997599,
+            "gmm_us": 152.8979595,
+            "routed_kernel_us": 152.8979595,
+            "other_us": 188.836134,
+            "op_sum_us": 303.840935,
+            "op_other_us": 150.88955450000003,
+            "module_gap_us": 38.37155099999998,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 347.30672265,
+              "gmm1_us": 97.05420185,
+              "gmm2_us": 56.02509,
+              "gmm_us": 153.07929185,
+              "routed_kernel_us": 153.07929185,
+              "other_us": 194.2274308,
+              "op_sum_us": 303.9996392,
+              "op_other_us": 150.92034735000001,
+              "module_gap_us": 43.30708345
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 339.312725,
+            "gmm1_us": 98.471789,
+            "gmm2_us": 56.214886,
+            "gmm_us": 154.784514,
+            "routed_kernel_us": 154.784514,
+            "other_us": 184.49879950000002,
+            "op_sum_us": 304.0666255,
+            "op_other_us": 149.30852149999998,
+            "module_gap_us": 35.37755000000004,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 340.8946579,
+              "gmm1_us": 98.4758704,
+              "gmm2_us": 56.2777312,
+              "gmm_us": 154.7536016,
+              "routed_kernel_us": 154.7536016,
+              "other_us": 186.1410563,
+              "op_sum_us": 304.23613365,
+              "op_other_us": 149.48253205,
+              "module_gap_us": 36.658524250000006
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 327.307323,
+            "gmm1_us": 96.8055225,
+            "gmm2_us": 56.342737,
+            "gmm_us": 153.2358945,
+            "routed_kernel_us": 153.2358945,
+            "other_us": 174.1314525,
+            "op_sum_us": 302.5240095,
+            "op_other_us": 149.53301,
+            "module_gap_us": 24.424971999999997,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 337.15750305,
+              "gmm1_us": 96.78715485000001,
+              "gmm2_us": 56.2995799,
+              "gmm_us": 153.08673475,
+              "routed_kernel_us": 153.08673475,
+              "other_us": 184.0707683,
+              "op_sum_us": 302.80432079999997,
+              "op_other_us": 149.71758605,
+              "module_gap_us": 34.35318225
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 355.07202900000004,
+            "gmm1_us": 97.1296515,
+            "gmm2_us": 55.910564,
+            "gmm_us": 153.003602,
+            "routed_kernel_us": 153.003602,
+            "other_us": 201.91836800000002,
+            "op_sum_us": 302.75029800000004,
+            "op_other_us": 149.91056550000002,
+            "module_gap_us": 52.077432500000015,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 350.70132055,
+              "gmm1_us": 97.16908755,
+              "gmm2_us": 55.989556,
+              "gmm_us": 153.15864355,
+              "routed_kernel_us": 153.15864355,
+              "other_us": 197.542677,
+              "op_sum_us": 303.1138048,
+              "op_other_us": 149.95516125,
+              "module_gap_us": 47.587515749999994
+            }
+          }
+        },
+        "median_max_rank_module_us": 370.13925600000005
+      },
+      "dense_expert": {
+        "checks": {
+          "relative_l2": 0.015688037499785423,
+          "worst_token_relative_l2": 0.03058658540248871,
+          "routing_relative_l2": 0.0026711488608270884,
+          "routing_worst_token_relative_l2": 0.004714127629995346,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32
+          ],
+          "routed_rows_per_rank": [
+            304,
+            297,
+            301,
+            327,
+            330,
+            321,
+            344,
+            336
+          ],
+          "output_sha256": "40cbca47f0d669ec188b521a7717ceab176796d80efb91b8a831cbfba7e646d9"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 606.346,
+          "min_us": 575.992,
+          "p90_us": 623.5712
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 314.9771905,
+            "dense_expert_us": 158.56842749999998,
+            "routed_kernel_us": 158.56842749999998,
+            "other_us": 155.99219649999998,
+            "op_sum_us": 263.7322915,
+            "op_other_us": 105.20527899999999,
+            "module_gap_us": 50.92857299999997,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 312.74123635,
+              "dense_expert_us": 158.60492205,
+              "routed_kernel_us": 158.60492205,
+              "other_us": 154.1363143,
+              "op_sum_us": 263.6914154,
+              "op_other_us": 105.08649335,
+              "module_gap_us": 49.04982095000001
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 305.67947200000003,
+            "dense_expert_us": 158.429772,
+            "routed_kernel_us": 158.429772,
+            "other_us": 147.409964,
+            "op_sum_us": 262.9057605,
+            "op_other_us": 104.45498099999998,
+            "module_gap_us": 42.792317500000024,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 306.5184274,
+              "dense_expert_us": 158.42040825,
+              "routed_kernel_us": 158.42040825,
+              "other_us": 148.09801915,
+              "op_sum_us": 262.8994581,
+              "op_other_us": 104.47904985,
+              "module_gap_us": 43.6189693
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 309.0630255,
+            "dense_expert_us": 158.0714285,
+            "routed_kernel_us": 158.0714285,
+            "other_us": 150.92377000000002,
+            "op_sum_us": 261.44057599999996,
+            "op_other_us": 103.26170450000001,
+            "module_gap_us": 47.75810550000003,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 309.26626650000003,
+              "dense_expert_us": 158.1605042,
+              "routed_kernel_us": 158.1605042,
+              "other_us": 151.1057623,
+              "op_sum_us": 261.3762282,
+              "op_other_us": 103.21572400000001,
+              "module_gap_us": 47.8900383
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 301.7539015,
+            "dense_expert_us": 158.285114,
+            "routed_kernel_us": 158.285114,
+            "other_us": 142.89975949999996,
+            "op_sum_us": 261.387753,
+            "op_other_us": 103.153058,
+            "module_gap_us": 40.03481649999998,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 301.29921965,
+              "dense_expert_us": 158.31092435,
+              "routed_kernel_us": 158.31092435,
+              "other_us": 142.9882953,
+              "op_sum_us": 261.5424946,
+              "op_other_us": 103.23157025,
+              "module_gap_us": 39.75672505
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 299.9891955,
+            "dense_expert_us": 158.1662665,
+            "routed_kernel_us": 158.1662665,
+            "other_us": 142.105642,
+            "op_sum_us": 260.998197,
+            "op_other_us": 102.7881115,
+            "module_gap_us": 39.15426450000001,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 301.72154869999997,
+              "dense_expert_us": 158.2460384,
+              "routed_kernel_us": 158.2460384,
+              "other_us": 143.4755103,
+              "op_sum_us": 261.18817335,
+              "op_other_us": 102.94213495,
+              "module_gap_us": 40.53337535
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 293.69507799999997,
+            "dense_expert_us": 159.0216085,
+            "routed_kernel_us": 159.0216085,
+            "other_us": 134.756903,
+            "op_sum_us": 261.13685150000003,
+            "op_other_us": 102.1506555,
+            "module_gap_us": 33.33733599999999,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 300.8280912,
+              "dense_expert_us": 158.94687865,
+              "routed_kernel_us": 158.94687865,
+              "other_us": 141.88121255,
+              "op_sum_us": 261.395075,
+              "op_other_us": 102.44819635,
+              "module_gap_us": 39.43301619999999
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 299.60924350000005,
+            "dense_expert_us": 158.397359,
+            "routed_kernel_us": 158.397359,
+            "other_us": 141.259904,
+            "op_sum_us": 260.9519805,
+            "op_other_us": 102.49399299999999,
+            "module_gap_us": 38.72569100000001,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 305.482473,
+              "dense_expert_us": 158.3782713,
+              "routed_kernel_us": 158.3782713,
+              "other_us": 147.1042017,
+              "op_sum_us": 260.8511387,
+              "op_other_us": 102.4728674,
+              "module_gap_us": 44.631334300000006
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 297.137455,
+            "dense_expert_us": 158.337935,
+            "routed_kernel_us": 158.337935,
+            "other_us": 139.0138055,
+            "op_sum_us": 261.1746675,
+            "op_other_us": 102.8871515,
+            "module_gap_us": 35.448379999999986,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 304.63457385,
+              "dense_expert_us": 158.38349335,
+              "routed_kernel_us": 158.38349335,
+              "other_us": 146.2510805,
+              "op_sum_us": 261.0591216,
+              "op_other_us": 102.67562825,
+              "module_gap_us": 43.57545225
+            }
+          }
+        },
+        "median_max_rank_module_us": 330.539616
+      }
+    },
+    "pool64": {
+      "inputs_and_routes_equal": true,
+      "relative_l2": 0.002622774336487055,
+      "worst_token_relative_l2": 0.0046870349906384945,
+      "standard_op_us": 438.01962685,
+      "candidate_op_us": 412.28709355,
+      "latency_ratio": 0.9412525564549369,
+      "latency_change_percent": -5.874744354506312,
+      "standard_module_us": 481.8685474,
+      "candidate_module_us": 464.74189685,
+      "standard_sort_count": 4,
+      "candidate_sort_count": 0,
+      "standard_details": {
+        "total_us": 481.8685474,
+        "gmm1_us": 178.41416555,
+        "gmm2_us": 107.9459784,
+        "gmm_us": 286.36014395,
+        "routed_kernel_us": 286.36014395,
+        "other_us": 195.50840345,
+        "op_sum_us": 438.01962685,
+        "op_other_us": 151.6594829,
+        "module_gap_us": 43.848920549999995
+      },
+      "candidate_details": {
+        "total_us": 464.74189685,
+        "dense_expert_us": 306.4955582,
+        "routed_kernel_us": 306.4955582,
+        "other_us": 158.24633864999998,
+        "op_sum_us": 412.28709355,
+        "op_other_us": 105.79153535,
+        "module_gap_us": 52.454803299999995
+      },
+      "standard": {
+        "checks": {
+          "relative_l2": 0.0154344467446208,
+          "worst_token_relative_l2": 0.030658360570669174,
+          "routing_relative_l2": 0.0,
+          "routing_worst_token_relative_l2": 0.0,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            64,
+            64,
+            64,
+            63,
+            64,
+            64,
+            63,
+            64
+          ],
+          "routed_rows_per_rank": [
+            326,
+            289,
+            276,
+            341,
+            323,
+            329,
+            342,
+            334
+          ],
+          "output_sha256": "d92c44cbdfd9257081c223d803bd3bd1826e2c95fe5f82e23db7f378008bba91"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 794.9495,
+          "min_us": 751.037,
+          "p90_us": 818.8113999999999
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 487.0036015,
+            "gmm1_us": 178.391957,
+            "gmm2_us": 107.9309725,
+            "gmm_us": 286.2965185,
+            "routed_kernel_us": 286.2965185,
+            "other_us": 200.639856,
+            "op_sum_us": 437.8043195,
+            "op_other_us": 151.2388935,
+            "module_gap_us": 49.38235350000002,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 481.8685474,
+              "gmm1_us": 178.41416555,
+              "gmm2_us": 107.9459784,
+              "gmm_us": 286.36014395,
+              "routed_kernel_us": 286.36014395,
+              "other_us": 195.50840345,
+              "op_sum_us": 438.01962685,
+              "op_other_us": 151.6594829,
+              "module_gap_us": 43.848920549999995
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 480.64465800000005,
+            "gmm1_us": 177.617047,
+            "gmm2_us": 106.3367345,
+            "gmm_us": 284.140456,
+            "routed_kernel_us": 284.140456,
+            "other_us": 195.177671,
+            "op_sum_us": 437.15666,
+            "op_other_us": 153.02160749999996,
+            "module_gap_us": 42.89616200000003,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 481.2553421,
+              "gmm1_us": 177.6608645,
+              "gmm2_us": 106.4722088,
+              "gmm_us": 284.1330733,
+              "routed_kernel_us": 284.1330733,
+              "other_us": 197.1222688,
+              "op_sum_us": 437.32040635,
+              "op_other_us": 153.18733305,
+              "module_gap_us": 43.93493575
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 483.0,
+            "gmm1_us": 177.4579835,
+            "gmm2_us": 106.93937600000001,
+            "gmm_us": 284.51740700000005,
+            "routed_kernel_us": 284.51740700000005,
+            "other_us": 197.797719,
+            "op_sum_us": 435.7316905,
+            "op_other_us": 151.6704655,
+            "module_gap_us": 46.79411999999999,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 482.2432173,
+              "gmm1_us": 177.6052221,
+              "gmm2_us": 106.9137454,
+              "gmm_us": 284.5189675,
+              "routed_kernel_us": 284.5189675,
+              "other_us": 197.7242498,
+              "op_sum_us": 435.8874535,
+              "op_other_us": 151.36848600000002,
+              "module_gap_us": 46.3557638
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 479.702881,
+            "gmm1_us": 175.7683075,
+            "gmm2_us": 106.6830735,
+            "gmm_us": 282.2551025,
+            "routed_kernel_us": 282.2551025,
+            "other_us": 196.72509,
+            "op_sum_us": 436.068427,
+            "op_other_us": 153.90816400000003,
+            "module_gap_us": 43.409362499999986,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 477.25546215,
+              "gmm1_us": 175.879772,
+              "gmm2_us": 106.642497,
+              "gmm_us": 282.522269,
+              "routed_kernel_us": 282.522269,
+              "other_us": 194.73319315,
+              "op_sum_us": 436.18721425,
+              "op_other_us": 153.66494525000002,
+              "module_gap_us": 41.0682479
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 470.7539015,
+            "gmm1_us": 177.907563,
+            "gmm2_us": 107.87875149999999,
+            "gmm_us": 285.65846350000004,
+            "routed_kernel_us": 285.65846350000004,
+            "other_us": 185.15066000000002,
+            "op_sum_us": 435.7436975,
+            "op_other_us": 150.00359949999998,
+            "module_gap_us": 34.841538499999984,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 472.5092437,
+              "gmm1_us": 177.83001205,
+              "gmm2_us": 107.79117655,
+              "gmm_us": 285.6211886,
+              "routed_kernel_us": 285.6211886,
+              "other_us": 186.8880551,
+              "op_sum_us": 435.89333655,
+              "op_other_us": 150.27214795,
+              "module_gap_us": 36.61590715
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 474.2989195,
+            "gmm1_us": 179.4981995,
+            "gmm2_us": 106.9465785,
+            "gmm_us": 286.65006,
+            "routed_kernel_us": 286.65006,
+            "other_us": 186.2557025,
+            "op_sum_us": 435.9879935,
+            "op_other_us": 149.588234,
+            "module_gap_us": 37.00240400000001,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 478.14945965,
+              "gmm1_us": 179.7507803,
+              "gmm2_us": 106.8920167,
+              "gmm_us": 286.642797,
+              "routed_kernel_us": 286.642797,
+              "other_us": 191.50666265,
+              "op_sum_us": 436.1683665,
+              "op_other_us": 149.5255695,
+              "module_gap_us": 41.98109315000001
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 461.9225695,
+            "gmm1_us": 175.429772,
+            "gmm2_us": 106.193277,
+            "gmm_us": 281.553421,
+            "routed_kernel_us": 281.553421,
+            "other_us": 181.13805600000003,
+            "op_sum_us": 434.867346,
+            "op_other_us": 153.15485950000001,
+            "module_gap_us": 27.108045000000033,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 472.25660265,
+              "gmm1_us": 175.42508995,
+              "gmm2_us": 106.22761095,
+              "gmm_us": 281.6527009,
+              "routed_kernel_us": 281.6527009,
+              "other_us": 190.60390175,
+              "op_sum_us": 434.9903351,
+              "op_other_us": 153.3376342,
+              "module_gap_us": 37.26626755
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 498.61164499999995,
+            "gmm1_us": 178.160864,
+            "gmm2_us": 107.57383,
+            "gmm_us": 285.673469,
+            "routed_kernel_us": 285.673469,
+            "other_us": 212.606843,
+            "op_sum_us": 435.1272495,
+            "op_other_us": 149.4537825,
+            "module_gap_us": 62.84754149999998,
+            "steps": 20,
+            "sort_count_per_step": 4,
+            "mean": {
+              "total_us": 486.4315126,
+              "gmm1_us": 178.1974189,
+              "gmm2_us": 107.4771909,
+              "gmm_us": 285.6746098,
+              "routed_kernel_us": 285.6746098,
+              "other_us": 200.7569028,
+              "op_sum_us": 435.280131,
+              "op_other_us": 149.6055212,
+              "module_gap_us": 51.15138159999999
+            }
+          }
+        },
+        "median_max_rank_module_us": 502.2388955
+      },
+      "dense_expert": {
+        "checks": {
+          "relative_l2": 0.015462533570826054,
+          "worst_token_relative_l2": 0.03075152076780796,
+          "routing_relative_l2": 0.002622774336487055,
+          "routing_worst_token_relative_l2": 0.0046870349906384945,
+          "tp_replicas_bitwise_equal": true,
+          "route_count": 2560,
+          "active_experts_per_rank": [
+            64,
+            64,
+            64,
+            63,
+            64,
+            64,
+            63,
+            64
+          ],
+          "routed_rows_per_rank": [
+            326,
+            289,
+            276,
+            341,
+            323,
+            329,
+            342,
+            334
+          ],
+          "output_sha256": "37b6e1e1a8dc290bb2265561d9ff9bbdcf1d273ad1358b502059b518e7d9063a"
+        },
+        "host_timing": {
+          "scope": "synchronized host dispatch plus one complete device MoE",
+          "iterations": 200,
+          "warmup": 20,
+          "median_us": 758.3199999999999,
+          "min_us": 725.87,
+          "p90_us": 778.6425
+        },
+        "all_ranks": {
+          "/device:TPU:0": {
+            "total_us": 464.966987,
+            "dense_expert_us": 306.579832,
+            "routed_kernel_us": 306.579832,
+            "other_us": 158.5510205,
+            "op_sum_us": 412.0132045,
+            "op_other_us": 105.38475299999999,
+            "module_gap_us": 53.25390250000001,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 464.74189685,
+              "dense_expert_us": 306.4955582,
+              "routed_kernel_us": 306.4955582,
+              "other_us": 158.24633864999998,
+              "op_sum_us": 412.28709355,
+              "op_other_us": 105.79153535,
+              "module_gap_us": 52.454803299999995
+            }
+          },
+          "/device:TPU:1": {
+            "total_us": 449.10864349999997,
+            "dense_expert_us": 305.9333735,
+            "routed_kernel_us": 305.9333735,
+            "other_us": 143.54801949999998,
+            "op_sum_us": 411.26410250000004,
+            "op_other_us": 105.18006749999998,
+            "module_gap_us": 37.953783999999985,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 450.6280912,
+              "dense_expert_us": 306.15708285,
+              "routed_kernel_us": 306.15708285,
+              "other_us": 144.47100835,
+              "op_sum_us": 411.49027375000003,
+              "op_other_us": 105.3331909,
+              "module_gap_us": 39.13781744999999
+            }
+          },
+          "/device:TPU:2": {
+            "total_us": 464.935774,
+            "dense_expert_us": 306.02400950000003,
+            "routed_kernel_us": 306.02400950000003,
+            "other_us": 159.11224449999997,
+            "op_sum_us": 409.56182250000006,
+            "op_other_us": 103.34633500000001,
+            "module_gap_us": 54.6866775,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 465.07953165,
+              "dense_expert_us": 306.0238296,
+              "routed_kernel_us": 306.0238296,
+              "other_us": 159.05570205,
+              "op_sum_us": 409.993035,
+              "op_other_us": 103.9692054,
+              "module_gap_us": 55.086496649999994
+            }
+          },
+          "/device:TPU:3": {
+            "total_us": 448.777911,
+            "dense_expert_us": 301.208283,
+            "routed_kernel_us": 301.208283,
+            "other_us": 147.6050425,
+            "op_sum_us": 409.9957975,
+            "op_other_us": 108.3325285,
+            "module_gap_us": 39.437578,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 447.32274905,
+              "dense_expert_us": 301.4857743,
+              "routed_kernel_us": 301.4857743,
+              "other_us": 145.83697475,
+              "op_sum_us": 410.14987755,
+              "op_other_us": 108.66410325,
+              "module_gap_us": 37.17287150000001
+            }
+          },
+          "/device:TPU:4": {
+            "total_us": 454.855342,
+            "dense_expert_us": 305.89315750000003,
+            "routed_kernel_us": 305.89315750000003,
+            "other_us": 149.145258,
+            "op_sum_us": 409.63385300000004,
+            "op_other_us": 103.648856,
+            "module_gap_us": 45.21788849999999,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 455.76302515,
+              "dense_expert_us": 305.84585835,
+              "routed_kernel_us": 305.84585835,
+              "other_us": 149.9171668,
+              "op_sum_us": 409.8873331,
+              "op_other_us": 104.04147474999999,
+              "module_gap_us": 45.875692050000005
+            }
+          },
+          "/device:TPU:5": {
+            "total_us": 437.2743095,
+            "dense_expert_us": 306.8241295,
+            "routed_kernel_us": 306.8241295,
+            "other_us": 130.3625445,
+            "op_sum_us": 409.89075149999996,
+            "op_other_us": 103.17526950000001,
+            "module_gap_us": 27.56302549999998,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 453.12214885,
+              "dense_expert_us": 306.81632655,
+              "routed_kernel_us": 306.81632655,
+              "other_us": 146.3058223,
+              "op_sum_us": 410.1286287,
+              "op_other_us": 103.31230215000001,
+              "module_gap_us": 42.993520149999995
+            }
+          },
+          "/device:TPU:6": {
+            "total_us": 449.3397355,
+            "dense_expert_us": 301.5606245,
+            "routed_kernel_us": 301.5606245,
+            "other_us": 147.27611000000002,
+            "op_sum_us": 408.810322,
+            "op_other_us": 107.507801,
+            "module_gap_us": 39.367950000000036,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 449.929952,
+              "dense_expert_us": 301.5327732,
+              "routed_kernel_us": 301.5327732,
+              "other_us": 148.3971788,
+              "op_sum_us": 409.34543545,
+              "op_other_us": 107.81266225,
+              "module_gap_us": 40.584516550000004
+            }
+          },
+          "/device:TPU:7": {
+            "total_us": 446.63685499999997,
+            "dense_expert_us": 305.7316925,
+            "routed_kernel_us": 305.7316925,
+            "other_us": 139.9183675,
+            "op_sum_us": 409.21188299999994,
+            "op_other_us": 103.30491899999998,
+            "module_gap_us": 37.719689999999986,
+            "steps": 20,
+            "sort_count_per_step": 0,
+            "mean": {
+              "total_us": 457.0490397,
+              "dense_expert_us": 305.8580432,
+              "routed_kernel_us": 305.8580432,
+              "other_us": 151.1909965,
+              "op_sum_us": 409.50143855,
+              "op_other_us": 103.64339534999999,
+              "module_gap_us": 47.547601150000006
+            }
+          }
+        },
+        "median_max_rank_module_us": 483.3709485
+      }
+    }
+  }
+}

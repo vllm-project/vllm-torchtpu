@@ -120,8 +120,9 @@ export TPU_MOE_DECODE_IMPL=dense_expert
 
 ## 正确性验证
 
-下列 TPU 测试及端到端结果来自放宽形状限制前的提交 `3477a1f`，
-不代表扩大支持范围后所有形状都已经在硬件上验证。
+下列 203 项 TPU 测试及端到端结果来自放宽形状限制前的提交 `3477a1f`。
+最新 kernel 的 M=256 性能 UT 硬件复测见下方 2026-09-22 小节；
+扩大支持范围后所有形状尚未逐一在硬件上验证。
 
 - 集成后 203 项 TPU 测试通过，含 13 项新 kernel 测试和 190 项原 MoE core 回归。
 - 覆盖同入口切换、EP 屏蔽、单专家、空 rank、零权重、重复专家和长 prefill 回退。
@@ -201,18 +202,88 @@ TPOT 来自客户端接收时间，不是设备 kernel 时间。
 因此以满 256 路区间平均吞吐的 **+6.38%** 作为稳定 decode 对照结论。
 单层 UT 的 13.6% 改善不能直接等同于完整模型收益。
 
+## 2026-09-22：仓库内性能 UT 复测
+
+`bench_moe_decode_ut.py`、trace 分析和配对比较工具已迁入本仓库。
+本次使用最新 kernel 提交 `bed6411`，包含放宽尺寸限制及移除固定 VMEM 预算的修改。
+三组均为 M=256、DP4/TP2/EP8、seed=20260921；两种实现顺序执行。
+每组 20 次预热、200 次同步 host 计时、20 个设备 profiling forward，覆盖 8 个 rank。
+
+下表为 TPU:0 的 TensorCore XLA Ops 耗时之和的均值，单位 μs：
+
+| 本地专家候选池 | 原 GMM | dense expert | 整层耗时变化 |
+| --- | ---: | ---: | ---: |
+| pool16 | 238.16 | 189.65 | -20.4% |
+| pool32 | 305.84 | 263.69 | -13.8% |
+| pool64 | 438.02 | 412.29 | -5.9% |
+
+pool32 的原 GMM1/GMM2 分别为 96.66/56.40 μs，合计
+153.07 μs；新融合 kernel 为 158.60 μs。
+其余 XLA Ops 为 152.77 → 105.09 μs。
+新融合 kernel 包含 activation、mask 与加权累加，不能将其时间直接当作同范围的两次 GMM。
+完整 device module 跨度均值为 355.63 → 312.74 μs，
+包含算子间隙，另行记录，不与 XLA Ops 之和混用。
+
+三组新旧 hidden、router、top-k IDs/weights、expert counts 完全一致，runner 和
+kernel 源码哈希相同。原实现与同算术路由参考逐位一致；新实现相对原实现的整体 L2
+为 0.262%–0.268%，最坏 token 为 0.469%–0.484%，低于既有 0.8% / 1.5% 门限。
+全部 TP 副本逐位一致；8 个 rank 的 trace 均核验为每 forward 原路径 4 个 sort、
+新路径 0 个 sort 且无独立 one-hot unpermute。pool64 实际命中 63–64 个专家。
+
+[机器可读结果](data/dense_expert_moe_ut_20260922.json) 包含精确数值、所有 rank、
+数值校验、host timing 汇总、版本与源码哈希。完整 trace 和 fixture 保存在本机
+benchmark workspace 的 `runs/moe-inrepo-ut-20260922T013216Z/`。
+这是最新 kernel 在原 M=256 几何下的硬件复测；新增的大 M/H/I/E 组合仍只有此前的
+CPU 解释模式验证。端到端吞吐数据仍来自前一轮，没有重新压测服务。
+
 ## 代码、复测与原始记录
 
 - [Kernel 实现](../../src/vllm_torchtpu/kernels/megablox/moe_dense_expert.py)
 - [原入口与分支选择](../../src/vllm_torchtpu/layers/core/fused_moe_gmm.py)
 - [Kernel 测试](../../tests/kernels/test_moe_dense_expert.py)
-- [配套 UT、分析工具与服务启动脚本][benchmark]
+- [单层 MoE 性能 UT](../../scripts/bench_moe_decode_ut.py)
+- [XPlane 设备时间分析](../../scripts/analyze_moe_ut_trace.py)
+- [相同输入/路由下的新旧实现比较](../../scripts/compare_moe_ut.py)
+- [配套服务端到端压测与启动脚本][benchmark]
 
 [benchmark]: https://github.com/aios-tpu-infra/tpu_benchmark_daily/tree/handsomehow/dense_expert_moe
 
-配套项目的 `MOE_DECODE_DENSE_EXPERT.md` 和 `MOE_DECODE_UT.md` 包含 UT 命令及环境。
-硬件测试需要独占 TPU，应在停止服务后执行。已有验证使用 JAX/JAXLIB 0.10.2、
-libtpu 0.0.47、torch 2.13.0+cpu、torch-tpu 0.1.1.dev20260912075415。
+单层性能 UT 及分析工具已包含在本仓库，不需要外层 benchmark 项目或模型权重。
+硬件测试需要独占 8 个 TPU chiplet，应先停止占用设备的服务，顺序运行两种实现。
+使用项目的 JAX/TorchTPU 环境，离线 trace 分析额外需要 `xprof`（本次为 2.23.2）。
+已有验证使用 JAX/JAXLIB 0.10.2、libtpu 0.0.47、torch 2.13.0+cpu、
+torch-tpu 0.1.1.dev20260912075415。
+
+从仓库根目录、已激活的项目环境运行：
+
+```bash
+PYTHONPATH=src python scripts/bench_moe_decode_ut.py \
+  --output benchmark_runs/moe-ut/standard --moe-impl standard \
+  --pools 16 32 64 --seed 20260921 --iterations 200 --profile-steps 20
+
+PYTHONPATH=src python scripts/bench_moe_decode_ut.py \
+  --output benchmark_runs/moe-ut/dense_expert --moe-impl dense_expert \
+  --pools 16 32 64 --seed 20260921 --iterations 200 --profile-steps 20
+
+python scripts/analyze_moe_ut_trace.py benchmark_runs/moe-ut/standard
+python scripts/analyze_moe_ut_trace.py benchmark_runs/moe-ut/dense_expert
+python scripts/compare_moe_ut.py \
+  benchmark_runs/moe-ut/standard benchmark_runs/moe-ut/dense_expert \
+  --output benchmark_runs/moe-ut/comparison.json
+```
+
+`--pools 32` 可只跑最接近此前服务 profiling 耗时的那组。
+`--profile-steps 0` 仅保留数值校验和同步 host timing，不可再运行设备 trace 分析。
+分析器默认读取 runner 记录的 profile steps，不需要重复传入步数。
+输出目录必须为空或不存在，避免混入旧 trace。
+
+每组保存独立参考数值校验、输入/路由 fixture、host timing、StableHLO 和 XPlane。
+分析器输出 8 个 rank 的逐 forward 时间，以及 TensorCore XLA Ops 之和、
+GMM/融合 kernel、其余算子和完整 module 跨度。
+比较器先核验配置、输入、路由及数值误差，再输出 TPU:0 的设备时间对照。
+Host timing 包含 Python dispatch，不能与设备算子时间混用。
+JAX profiler 与本机 libtpu 的 ABI 不匹配，runner 使用实际 TorchTPU allocation
+初始化配套 profiler 后采集；编译、预热和参考校验均在采集区间之外。
 
 原始 E2E 数据保存在 benchmark 项目的本机
 `runs/moe-e2e-20260921T065541Z/`，含配置、源码哈希、问答、逐请求时间线、
