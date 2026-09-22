@@ -49,14 +49,27 @@ enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 def _quantized_all_gather(collective_group,
                           hidden_states: torch.Tensor) -> torch.Tensor:
     """All-gather activations in fp8, restored on arrival."""
+    # quantize_tensor blocks along the hidden dim and rejects a hidden size the
+    # block does not divide, so pad the tail out with zeros and slice it back
+    # off once the gathered values are dequantized. Zeros never win the
+    # per-block abs-max, so the padded block keeps the scale it would have had.
+    out_dtype = hidden_states.dtype
+    hidden_size = hidden_states.shape[-1]
+    pad = -hidden_size % FP8_ACT_BLOCK_SIZE
+    if pad:
+        hidden_states = torch.nn.functional.pad(hidden_states, (0, pad))
+
     quantized, scale = quantize_tensor(hidden_states,
                                        quant_dtype=torch.float8_e4m3fn,
                                        block_size=FP8_ACT_BLOCK_SIZE)
     ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
     ag_scale = collective_group.all_gather(scale, dim=0)
-    return dequantize_tensor(ag_rows.view(torch.float8_e4m3fn),
-                             ag_scale,
-                             out_dtype=hidden_states.dtype)
+    ag_hidden_states = dequantize_tensor(ag_rows.view(torch.float8_e4m3fn),
+                                         ag_scale,
+                                         out_dtype=out_dtype)
+    if pad:
+        ag_hidden_states = ag_hidden_states[..., :hidden_size]
+    return ag_hidden_states
 
 
 def calculate_moe_chunks(seq_len: int, parallel_size: int,

@@ -414,21 +414,103 @@ def test_fp8_all_gather_hands_the_kernel_its_own_quantization_grid():
         delivered)
 
 
-def test_fp8_all_gather_requires_a_whole_number_of_blocks():
-    """A hidden size short of a whole block is refused, not padded.
+def test_fp8_all_gather_pads_a_partial_block_out_and_slices_it_back():
+    """A hidden size short of a whole block is padded, not refused.
 
-    `quantize_tensor` takes the divisibility as a precondition rather than
-    zero-padding up to it, which is what keeps the round trip down to a
-    reshape and a broadcast multiply with no pad to carry on the wire and none
-    to slice off on arrival. The cost is that a model whose hidden size is not
-    a multiple of `FP8_ACT_BLOCK_SIZE` cannot use the flag at all, and finds
-    out here rather than at the gate.
+    `quantize_tensor` takes the divisibility as a precondition, so a model
+    whose hidden size is not a multiple of `FP8_ACT_BLOCK_SIZE` would
+    otherwise be locked out of the flag. The pad is what buys it in, and it
+    has to be invisible on both ends: the wire carries whole blocks, and the
+    kernel is handed back the width it would have had with the flag off.
     """
     group = _MockCollectiveGroup(world_size=2, rank=0)
-    hidden_states = torch.randn(8, 640, dtype=torch.bfloat16)
+    # One whole block plus a quarter of one, so the tail block is partly pad.
+    hidden_states = torch.randn(8,
+                                FP8_ACT_BLOCK_SIZE + 128,
+                                dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        _run_with_fp8_all_gather(hidden_states, group=group)
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    # The pad is carried, not stripped before the gather: two whole blocks of
+    # rows and one scale per block.
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == ((8, 2 * FP8_ACT_BLOCK_SIZE), torch.int8)
+    assert gathers[1] == ((8, 2), torch.float32)
+
+    # ...and sliced back off on arrival, so nothing downstream sees the pad.
+    assert calls[0]["hidden_states"].shape == (16, FP8_ACT_BLOCK_SIZE + 128)
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
+
+    torch.testing.assert_close(out,
+                               hidden_states,
+                               rtol=1.0 / 32,
+                               atol=float(hidden_states.abs().max()) / 32)
+
+
+def test_fp8_all_gather_pad_does_not_move_the_tail_blocks_scale():
+    """The zeros the pad adds cost the tail block no precision.
+
+    A block's scale is its abs-max, and zeros never win an abs-max, so the
+    padded block has to round exactly the way a block holding only the real
+    columns would. Quantizing those columns on their own is that block: if the
+    pad had shifted the scale, the delivered tail would differ from it.
+    """
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8,
+                                FP8_ACT_BLOCK_SIZE + 128,
+                                dtype=torch.bfloat16)
+
+    _, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    tail = hidden_states[:, FP8_ACT_BLOCK_SIZE:]
+    quantized, scale = quantize_tensor(tail,
+                                       quant_dtype=torch.float8_e4m3fn,
+                                       block_size=tail.shape[-1])
+    unpadded_tail = dequantize_tensor(quantized,
+                                      scale,
+                                      out_dtype=torch.bfloat16)
+    delivered_tail = calls[0]["hidden_states"][:8, FP8_ACT_BLOCK_SIZE:]
+    assert torch.equal(delivered_tail, unpadded_tail)
+
+
+def test_fp8_all_gather_pads_a_tail_block_that_holds_only_zeros():
+    """An all-zero tail block keeps its zeros instead of turning into NaN.
+
+    Every real column of the tail being zero makes the whole padded block
+    zero, and its scale with it. The restore multiplies by that scale, so the
+    guard against dividing by it lives in `quantize_tensor`; this pins the
+    behaviour the gather depends on rather than re-testing it there.
+    """
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8,
+                                FP8_ACT_BLOCK_SIZE + 128,
+                                dtype=torch.bfloat16)
+    hidden_states[:, FP8_ACT_BLOCK_SIZE:] = 0.0
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    delivered = calls[0]["hidden_states"]
+    assert torch.isfinite(delivered).all()
+    assert torch.equal(delivered[:, FP8_ACT_BLOCK_SIZE:],
+                       torch.zeros_like(delivered[:, FP8_ACT_BLOCK_SIZE:]))
+    torch.testing.assert_close(out,
+                               hidden_states,
+                               rtol=1.0 / 32,
+                               atol=float(hidden_states.abs().max()) / 32)
+
+
+def test_fp8_all_gather_pads_nothing_when_the_blocks_come_out_whole():
+    """A hidden size the block divides pays no pad, on the wire or in scales."""
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8,
+                                2 * FP8_ACT_BLOCK_SIZE,
+                                dtype=torch.bfloat16)
+
+    _run_with_fp8_all_gather(hidden_states, group=group)
+
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == (hidden_states.shape, torch.int8)
+    assert gathers[1] == ((8, 2), torch.float32)
 
 
 def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
