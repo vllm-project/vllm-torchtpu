@@ -33,8 +33,7 @@ def prune_tensor_magnitude_nm(w: torch.Tensor,
     # Double argsort yields rank positions (0 is smallest, prunem-1 is largest)
     assert w.shape[-1] % prunem == 0, (
         f"Contracting dimension size ({w.shape[-1]}) must be divisible by {prunem} "
-        f"to avoid grouping across row boundaries."
-    )
+        f"to avoid grouping across row boundaries.")
     # Double argsort yields rank positions (0 is smallest, prunem-1 is largest).
     # stable=True makes tie-breaks deterministic and portable across backends.
     ranks = torch.argsort(torch.argsort(w_abs, dim=-1, stable=True), dim=-1)
@@ -141,11 +140,14 @@ def prune_model_magnitude(base_model_dir: str,
     if total_pruned_tensors == 0:
         raise RuntimeError(
             f"No tensors matched the pruning filter in {base_model_dir}. "
-            "Check the parameter-name prefix and --minlayer/--maxlayer."
-        )
+            "Check the parameter-name prefix and --minlayer/--maxlayer.")
 
-    print(f">>> Total Pruned Linear Projections:   {total_pruned_tensors} ({total_pruned_params / 1e9:.2f}B params)")
-    print(f">>> Total Unpruned Tensors (Dense):     {total_unpruned_tensors} ({total_unpruned_params / 1e9:.2f}B params)")
+    print(
+        f">>> Total Pruned Linear Projections:   {total_pruned_tensors} ({total_pruned_params / 1e9:.2f}B params)"
+    )
+    print(
+        f">>> Total Unpruned Tensors (Dense):     {total_unpruned_tensors} ({total_unpruned_params / 1e9:.2f}B params)"
+    )
     print(f">>> Saved Checkpoint:                   {output_dir}")
     print("=======================================================\n")
 
