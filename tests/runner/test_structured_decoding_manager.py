@@ -6,24 +6,27 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.runner.structured_decoding_manager import \
-    StructuredDecodingManager
+from vllm_torchtpu.runner.structured_decoding_manager import StructuredDecodingManager
 
 VOCAB_SIZE = 64  # 2 packed int32 words per bitmask row.
 ALLOW_ALL = -1  # All 32 bits set.
 BLOCK_ALL = 0
 
 
-def make_manager(vocab_size: int = VOCAB_SIZE,
-                 max_num_reqs: int = 8,
-                 req_id_to_index: dict[str, int] | None = None,
-                 num_spec_tokens: int | None = None,
-                 num_tokens_paddings: list[int] | None = None,
-                 pcp_mtp_k1: bool = False,
-                 device: torch.device | str = "cpu"):
-    speculative_config = (SimpleNamespace(
-        num_speculative_tokens=num_spec_tokens)
-                          if num_spec_tokens is not None else None)
+def make_manager(
+    vocab_size: int = VOCAB_SIZE,
+    max_num_reqs: int = 8,
+    req_id_to_index: dict[str, int] | None = None,
+    num_spec_tokens: int | None = None,
+    num_tokens_paddings: list[int] | None = None,
+    pcp_mtp_k1: bool = False,
+    device: torch.device | str = "cpu",
+):
+    speculative_config = (
+        SimpleNamespace(num_speculative_tokens=num_spec_tokens)
+        if num_spec_tokens is not None
+        else None
+    )
     runner = SimpleNamespace(
         vocab_size=vocab_size,
         max_num_reqs=max_num_reqs,
@@ -43,8 +46,9 @@ def make_grammar_output(req_ids: list[str], rows: list[list[int]]):
     )
 
 
-def reference_apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor,
-                            vocab_size: int) -> torch.Tensor:
+def reference_apply_bitmask(
+    logits: torch.Tensor, bitmask: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
     """Per-bit reference for the vectorized unpack."""
     out = logits.clone()
     for row in range(logits.shape[0]):
@@ -56,14 +60,9 @@ def reference_apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor,
 
 
 class TestPrepareStructuredDecodingInput:
-
     def test_scatter_mixed_batch(self):
         # 3 requests; req0 and req2 are structured, req1 is not.
-        manager = make_manager(req_id_to_index={
-            "req0": 0,
-            "req1": 1,
-            "req2": 2
-        })
+        manager = make_manager(req_id_to_index={"req0": 0, "req1": 1, "req2": 2})
         grammar_output = make_grammar_output(
             ["req0", "req2"],
             [[ALLOW_ALL, BLOCK_ALL], [BLOCK_ALL, ALLOW_ALL]],
@@ -71,7 +70,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(4, VOCAB_SIZE)  # Padded to 4 rows.
 
         require, bitmask, arange = manager.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx=0, cur_end_idx=3)
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=3
+        )
 
         assert require.shape == (4, 1)
         assert bitmask.shape == (4, 2)
@@ -85,12 +85,9 @@ class TestPrepareStructuredDecodingInput:
         # Chunk 2 covers batch rows [2, 4): its structured request (global
         # row 3) must land on local row 1, and chunk 1's rows must not
         # leak in.
-        manager = make_manager(req_id_to_index={
-            "req0": 0,
-            "req1": 1,
-            "req2": 2,
-            "req3": 3
-        })
+        manager = make_manager(
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2, "req3": 3}
+        )
         grammar_output = make_grammar_output(
             ["req0", "req3"],
             [[ALLOW_ALL, BLOCK_ALL], [BLOCK_ALL, ALLOW_ALL]],
@@ -98,7 +95,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(2, VOCAB_SIZE)
 
         require, bitmask, _ = manager.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx=2, cur_end_idx=4)
+            logits, grammar_output, cur_start_idx=2, cur_end_idx=4
+        )
 
         assert require[:, 0].tolist() == [False, True]
         assert bitmask[0].tolist() == [0, 0]
@@ -115,7 +113,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(1, VOCAB_SIZE)
 
         require, bitmask, _ = manager.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx=0, cur_end_idx=1)
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=1
+        )
 
         assert require[0, 0].item() is True
         assert bitmask[0].tolist() == [BLOCK_ALL, ALLOW_ALL]
@@ -123,14 +122,14 @@ class TestPrepareStructuredDecodingInput:
     def test_stale_rows_are_reset(self):
         # A later call must not see rows written by an earlier one.
         manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
-        first = make_grammar_output(["req0", "req1"],
-                                    [[ALLOW_ALL, ALLOW_ALL]] * 2)
+        first = make_grammar_output(["req0", "req1"], [[ALLOW_ALL, ALLOW_ALL]] * 2)
         logits = torch.zeros(2, VOCAB_SIZE)
         manager.prepare_structured_decoding_input(logits, first, 0, 2)
 
         second = make_grammar_output(["req1"], [[BLOCK_ALL, BLOCK_ALL]])
         require, bitmask, _ = manager.prepare_structured_decoding_input(
-            logits, second, 0, 2)
+            logits, second, 0, 2
+        )
 
         assert require[:, 0].tolist() == [False, True]
         assert bitmask[0].tolist() == [0, 0]
@@ -142,10 +141,10 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(2, VOCAB_SIZE)
 
         require, bitmask, arange = manager.prepare_structured_decoding_input(
-            logits, grammar_output, 0, 2)
-
-        assert require.data_ptr() == manager.device_all_false_require.data_ptr(
+            logits, grammar_output, 0, 2
         )
+
+        assert require.data_ptr() == manager.device_all_false_require.data_ptr()
         assert require[:, 0].tolist() == [False, False]
         assert bitmask.data_ptr() == manager.device_dummy_bitmask.data_ptr()
         assert bitmask.shape == (2, 2)
@@ -160,7 +159,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(2, VOCAB_SIZE)
 
         require, bitmask, arange = manager.prepare_structured_decoding_input(
-            logits, grammar_output, 0, 2)
+            logits, grammar_output, 0, 2
+        )
 
         assert require[:, 0].tolist() == [True, True]
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
@@ -177,7 +177,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(2, VOCAB_SIZE)
 
         require, bitmask, arange = manager.prepare_structured_decoding_input(
-            logits, grammar_output, 0, 1)
+            logits, grammar_output, 0, 1
+        )
 
         assert require[:, 0].tolist() == [True, False]
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
@@ -196,12 +197,14 @@ class TestPrepareStructuredDecodingInput:
         # block-copy shortcut keys on -- yet rows 1 and 2 belong to the
         # requests sitting at batch rows 2 and 1. Each row must still land on
         # its own request's logits.
-        manager = make_manager(req_id_to_index={
-            "reqA": 0,
-            "reqB": 2,
-            "reqC": 1,
-            "reqD": 3,
-        })
+        manager = make_manager(
+            req_id_to_index={
+                "reqA": 0,
+                "reqB": 2,
+                "reqC": 1,
+                "reqD": 3,
+            }
+        )
         grammar_output = make_grammar_output(
             ["reqA", "reqB", "reqC", "reqD"],
             [row(10), row(20), row(30), row(40)],
@@ -209,7 +212,8 @@ class TestPrepareStructuredDecodingInput:
         logits = torch.zeros(4, VOCAB_SIZE)
 
         require, bitmask, _ = manager.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx=0, cur_end_idx=4)
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=4
+        )
 
         assert require[:, 0].tolist() == [True, True, True, True]
         assert bitmask[0].tolist() == row(10)
@@ -222,22 +226,24 @@ class TestPrepareStructuredDecodingInput:
         # not start at row 0: `req0` belongs to an earlier chunk and owns
         # bitmask row 0, and the four rows that follow cover batch rows 4..7
         # in a different order than the scheduler listed them.
-        manager = make_manager(req_id_to_index={
-            "req0": 0,
-            "reqA": 4,
-            "reqB": 6,
-            "reqC": 5,
-            "reqD": 7,
-        })
+        manager = make_manager(
+            req_id_to_index={
+                "req0": 0,
+                "reqA": 4,
+                "reqB": 6,
+                "reqC": 5,
+                "reqD": 7,
+            }
+        )
         grammar_output = make_grammar_output(
             ["req0", "reqA", "reqB", "reqC", "reqD"],
-            [row(1), row(10), row(20),
-             row(30), row(40)],
+            [row(1), row(10), row(20), row(30), row(40)],
         )
         logits = torch.zeros(4, VOCAB_SIZE)
 
         require, bitmask, _ = manager.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx=4, cur_end_idx=8)
+            logits, grammar_output, cur_start_idx=4, cur_end_idx=8
+        )
 
         assert require[:, 0].tolist() == [True, True, True, True]
         assert bitmask[0].tolist() == row(10)  # reqA sits at batch row 4.
@@ -247,7 +253,6 @@ class TestPrepareStructuredDecodingInput:
 
 
 class TestStructuredDecode:
-
     @pytest.mark.parametrize("vocab_size", [64, 50])
     def test_matches_per_bit_reference(self, vocab_size):
         # vocab_size=50 also checks tail truncation when the vocab is not
@@ -257,10 +262,12 @@ class TestStructuredDecode:
         num_words = -(-vocab_size // 32)
         manager = make_manager(vocab_size=vocab_size)
         logits = torch.randn(num_reqs, vocab_size)
-        bitmask = torch.randint(torch.iinfo(torch.int32).min,
-                                torch.iinfo(torch.int32).max,
-                                (num_reqs, num_words),
-                                dtype=torch.int32)
+        bitmask = torch.randint(
+            torch.iinfo(torch.int32).min,
+            torch.iinfo(torch.int32).max,
+            (num_reqs, num_words),
+            dtype=torch.int32,
+        )
         arange = torch.arange(32)
 
         out = manager.apply_grammar_bitmask(logits, bitmask, arange)
@@ -273,8 +280,9 @@ class TestStructuredDecode:
         manager = make_manager()
         logits = torch.randn(3, VOCAB_SIZE)
         # Row 0 structured (blocks the upper half), rows 1-2 not.
-        bitmask = torch.tensor([[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]],
-                               dtype=torch.int32)
+        bitmask = torch.tensor(
+            [[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]], dtype=torch.int32
+        )
         require = torch.tensor([[True], [False], [False]])
         arange = torch.arange(32)
 
@@ -287,8 +295,7 @@ class TestStructuredDecode:
     @pytest.mark.parametrize(
         ("vocab_size", "padded_vocab_dim"),
         [
-            (50,
-             128),  # Tail truncation + padding (bitmask unpacks 64 cols < 128)
+            (50, 128),  # Tail truncation + padding (bitmask unpacks 64 cols < 128)
             (64, 128),  # Exact multiple of 32 + padding
             (100, 128),  # 4 packed words (128 cols), target_dim=128
             (128, 256),  # Padded to 256 lanes
@@ -301,18 +308,21 @@ class TestStructuredDecode:
         num_words = -(-vocab_size // 32)
         manager = make_manager(vocab_size=vocab_size)
         logits = torch.randn(num_reqs, padded_vocab_dim)
-        bitmask = torch.randint(torch.iinfo(torch.int32).min,
-                                torch.iinfo(torch.int32).max,
-                                (num_reqs, num_words),
-                                dtype=torch.int32)
+        bitmask = torch.randint(
+            torch.iinfo(torch.int32).min,
+            torch.iinfo(torch.int32).max,
+            (num_reqs, num_words),
+            dtype=torch.int32,
+        )
         arange = torch.arange(32)
 
         out = manager.apply_grammar_bitmask(logits, bitmask, arange)
 
         assert out.shape == (num_reqs, padded_vocab_dim)
         # Active vocab tokens match reference bitmask behavior.
-        expected_active = reference_apply_bitmask(logits[:, :vocab_size],
-                                                  bitmask, vocab_size)
+        expected_active = reference_apply_bitmask(
+            logits[:, :vocab_size], bitmask, vocab_size
+        )
         assert torch.equal(out[:, :vocab_size], expected_active)
         # Padded slots beyond vocab_size must be masked to -inf.
         assert torch.isneginf(out[:, vocab_size:]).all()
@@ -327,10 +337,9 @@ class TestStructuredDecode:
         arange = torch.arange(32)
 
         with pytest.raises(
-                ValueError,
-                match=
-                r"TPU logits vocab dimension must be at least vocab_size \(64\) "
-                r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
+            ValueError,
+            match=r"TPU logits vocab dimension must be at least vocab_size \(64\) "
+            r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
         ):
             manager.apply_grammar_bitmask(logits, bitmask, arange)
 
@@ -342,8 +351,9 @@ class TestStructuredDecode:
         manager = make_manager(vocab_size=vocab_size)
         logits = torch.randn(3, padded_vocab_dim)
         # Row 0 structured (blocks tokens 32..49), rows 1-2 unstructured.
-        bitmask = torch.tensor([[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]],
-                               dtype=torch.int32)
+        bitmask = torch.tensor(
+            [[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]], dtype=torch.int32
+        )
         require = torch.tensor([[True], [False], [False]])
         arange = torch.arange(32)
 
@@ -371,9 +381,9 @@ class TestPrepareSpecStructuredDecodingInput:
         manager = make_manager()
         assert not hasattr(manager, "target_grammar_bitmask_cpu")
 
-        spec_manager = make_manager(num_spec_tokens=3,
-                                    max_num_reqs=8,
-                                    num_tokens_paddings=[16, 32, 64])
+        spec_manager = make_manager(
+            num_spec_tokens=3, max_num_reqs=8, num_tokens_paddings=[16, 32, 64]
+        )
         # 8 reqs * (1 + 3) = 32 rows -> the 32 bucket covers it exactly.
         assert spec_manager.target_grammar_bitmask_cpu.shape == (32, 2)
         assert spec_manager.require_structured_out_target_cpu.shape == (32, 1)
@@ -387,12 +397,9 @@ class TestPrepareSpecStructuredDecodingInput:
     def test_variable_draft_counts_single_chunk(self):
         # req0 structured, 2 drafts; req1 unstructured, 1 draft;
         # req2 structured, 0 drafts.
-        manager = make_manager(num_spec_tokens=2,
-                               req_id_to_index={
-                                   "req0": 0,
-                                   "req1": 1,
-                                   "req2": 2
-                               })
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1, "req2": 2}
+        )
         grammar_output = make_grammar_output(
             ["req0", "req2"],
             # req0: draft rows 10, 11, bonus 12; req2: bonus row 20.
@@ -403,10 +410,17 @@ class TestPrepareSpecStructuredDecodingInput:
         target_logits = torch.zeros(8, VOCAB_SIZE)
         bonus_logits = torch.zeros(4, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         arange) = manager.prepare_spec_structured_decoding_input(
-             target_logits, bonus_logits, grammar_output, scheduled,
-             draft_lengths, 0, 3)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, arange) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                0,
+                3,
+            )
+        )
 
         # Target row j aligns with target_logits row j (the target
         # model's logits at draft position j). Rows 0-1 belong to req0's
@@ -414,7 +428,14 @@ class TestPrepareSpecStructuredDecodingInput:
         # rest padding.
         assert require_target.shape == (8, 1)
         assert require_target[:, 0].tolist() == [
-            True, True, False, False, False, False, False, False
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
         ]
         assert target_bitmask[0].tolist() == row(10)
         assert target_bitmask[1].tolist() == row(11)
@@ -429,18 +450,14 @@ class TestPrepareSpecStructuredDecodingInput:
     def test_second_chunk_uses_local_rows(self):
         # Chunk 2 covers batch rows [2, 4). req0 (chunk 1) has 1 draft;
         # req2/req3 (chunk 2) have 1 and 2 drafts, req3 structured.
-        manager = make_manager(num_spec_tokens=2,
-                               req_id_to_index={
-                                   "req0": 0,
-                                   "req1": 1,
-                                   "req2": 2,
-                                   "req3": 3
-                               })
+        manager = make_manager(
+            num_spec_tokens=2,
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2, "req3": 3},
+        )
         grammar_output = make_grammar_output(
             ["req0", "req3"],
             # req0: draft row 10, bonus 11; req3: draft rows 30, 31, bonus 32.
-            [row(10), row(11), row(30),
-             row(31), row(32)],
+            [row(10), row(11), row(30), row(31), row(32)],
         )
         scheduled = {"req0": [1], "req2": [2], "req3": [3, 4]}
         # Chunk-local draft lengths for [req2, req3].
@@ -448,10 +465,17 @@ class TestPrepareSpecStructuredDecodingInput:
         target_logits = torch.zeros(4, VOCAB_SIZE)
         bonus_logits = torch.zeros(2, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
-             target_logits, bonus_logits, grammar_output, scheduled,
-             draft_lengths, 2, 4)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                2,
+                4,
+            )
+        )
 
         # Target rows by draft position:
         # [req2 draft0, req3 draft0, req3 draft1, pad].
@@ -468,11 +492,9 @@ class TestPrepareSpecStructuredDecodingInput:
         # md is None for this chunk (its requests carry no drafts), but a
         # structured request in another chunk owns 1 + 2 rows; the cursor
         # must stride over them to find this chunk's bonus row.
-        manager = make_manager(num_spec_tokens=2,
-                               req_id_to_index={
-                                   "req0": 0,
-                                   "req1": 1
-                               })
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
+        )
         grammar_output = make_grammar_output(
             ["req0", "req1"],
             # req0 (other chunk): drafts 10, 11, bonus 12; req1: bonus 20.
@@ -481,9 +503,11 @@ class TestPrepareSpecStructuredDecodingInput:
         scheduled = {"req0": [5, 6]}
         logits = torch.zeros(2, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
-             None, logits, grammar_output, scheduled, None, 1, 2)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                None, logits, grammar_output, scheduled, None, 1, 2
+            )
+        )
 
         assert require_target is None
         assert target_bitmask is None
@@ -499,18 +523,24 @@ class TestPrepareSpecStructuredDecodingInput:
             ["req0", "req1"],
             # req0 (gone, had 2 drafts): rows 10, 11, 12; req1: draft 20,
             # bonus 21.
-            [row(10), row(11), row(12),
-             row(20), row(21)],
+            [row(10), row(11), row(12), row(20), row(21)],
         )
         scheduled = {"req0": [1, 2], "req1": [3]}
         draft_lengths = np.array([1], dtype=np.int32)
         target_logits = torch.zeros(2, VOCAB_SIZE)
         bonus_logits = torch.zeros(1, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
-             target_logits, bonus_logits, grammar_output, scheduled,
-             draft_lengths, 0, 1)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                0,
+                1,
+            )
+        )
 
         assert require_target[:, 0].tolist() == [True, False]
         assert target_bitmask[0].tolist() == row(20)
@@ -518,11 +548,9 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == row(21)
 
     def test_stale_rows_are_reset(self):
-        manager = make_manager(num_spec_tokens=1,
-                               req_id_to_index={
-                                   "req0": 0,
-                                   "req1": 1
-                               })
+        manager = make_manager(
+            num_spec_tokens=1, req_id_to_index={"req0": 0, "req1": 1}
+        )
         first = make_grammar_output(
             ["req0", "req1"],
             [row(10), row(11), row(20), row(21)],
@@ -531,19 +559,19 @@ class TestPrepareSpecStructuredDecodingInput:
         draft_lengths = np.array([1, 1], dtype=np.int32)
         target_logits = torch.zeros(4, VOCAB_SIZE)
         bonus_logits = torch.zeros(2, VOCAB_SIZE)
-        manager.prepare_spec_structured_decoding_input(target_logits,
-                                                       bonus_logits, first,
-                                                       scheduled,
-                                                       draft_lengths, 0, 2)
+        manager.prepare_spec_structured_decoding_input(
+            target_logits, bonus_logits, first, scheduled, draft_lengths, 0, 2
+        )
 
         # Second step: only req1 is structured.
         second = make_grammar_output(["req1"], [row(30), row(31)])
         scheduled = {"req1": [3]}
         draft_lengths = np.array([0, 1], dtype=np.int32)
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
-             target_logits, bonus_logits, second, scheduled, draft_lengths, 0,
-             2)
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits, bonus_logits, second, scheduled, draft_lengths, 0, 2
+            )
+        )
 
         # req0's rows from the first call must be gone.
         assert require_target[:, 0].tolist() == [True, False, False, False]
@@ -557,12 +585,12 @@ class TestPrepareSpecStructuredDecodingInput:
 def capture_trace():
     """Captures PyTorch CPU profiler events during test execution."""
     with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
         yield prof
 
 
 class TestMaskLogitsWithTrace:
-
     def test_mask_logits(self, monkeypatch):
         manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
         grammar_output = make_grammar_output(
@@ -570,14 +598,12 @@ class TestMaskLogitsWithTrace:
             [[ALLOW_ALL, BLOCK_ALL]],
         )
         logits = torch.zeros(4, VOCAB_SIZE)  # Padded to 4 rows for 2 requests
-        monkeypatch.setattr(manager, "structured_decode",
-                            manager._structured_decode)
+        monkeypatch.setattr(manager, "structured_decode", manager._structured_decode)
 
         with capture_trace() as prof:
-            out = manager.mask_logits(logits,
-                                      grammar_output,
-                                      cur_start_idx=0,
-                                      cur_end_idx=2)
+            out = manager.mask_logits(
+                logits, grammar_output, cur_start_idx=0, cur_end_idx=2
+            )
 
         # 1. Output correctness: row 0 masked on second half, row 1 untouched.
         assert torch.equal(out[0, :32], logits[0, :32])
@@ -589,10 +615,13 @@ class TestMaskLogitsWithTrace:
         assert any(
             "SD:PrepareInput#num_reqs=2,padded_num_reqs=4,cur_start_idx=0,cur_end_idx=2#"
             in name
-            for name in events), f"SD:PrepareInput not found in {events}"
+            for name in events
+        ), f"SD:PrepareInput not found in {events}"
         assert any(
             "SD:MaskLogits#num_reqs=2,padded_num_reqs=4,cur_start_idx=0,cur_end_idx=2#"
-            in name for name in events), f"SD:MaskLogits not found in {events}"
+            in name
+            for name in events
+        ), f"SD:MaskLogits not found in {events}"
 
     def test_mask_spec_logits(self, monkeypatch):
         manager = make_manager(num_spec_tokens=1, req_id_to_index={"req0": 0})
@@ -604,13 +633,18 @@ class TestMaskLogitsWithTrace:
         bonus_logits = torch.zeros(1, VOCAB_SIZE)
         scheduled = {"req0": [1]}
         draft_lengths = np.array([1], dtype=np.int32)
-        monkeypatch.setattr(manager, "structured_decode",
-                            manager._structured_decode)
+        monkeypatch.setattr(manager, "structured_decode", manager._structured_decode)
 
         with capture_trace() as prof:
             out_target, out_bonus = manager.mask_spec_logits(
-                target_logits, bonus_logits, grammar_output, scheduled,
-                draft_lengths, 0, 1)
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                0,
+                1,
+            )
 
         # 1. Output correctness: target masked top half, bonus masked bottom half.
         assert torch.isinf(out_target[0, 32:]).all()
@@ -621,20 +655,23 @@ class TestMaskLogitsWithTrace:
         assert any(
             "SD:PrepareSpecInput#num_reqs=1,num_target_rows=1,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
             in name
-            for name in events), f"SD:PrepareSpecInput not found in {events}"
+            for name in events
+        ), f"SD:PrepareSpecInput not found in {events}"
         assert any(
             "SD:MaskSpecLogits#num_reqs=1,num_target_rows=1,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
             in name
-            for name in events), f"SD:MaskSpecLogits not found in {events}"
+            for name in events
+        ), f"SD:MaskSpecLogits not found in {events}"
 
         # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
-        grammar_output_none = make_grammar_output(["req0"],
-                                                  [[ALLOW_ALL, BLOCK_ALL]])
+        grammar_output_none = make_grammar_output(["req0"], [[ALLOW_ALL, BLOCK_ALL]])
         with capture_trace() as prof_none:
-            manager.mask_spec_logits(None, bonus_logits, grammar_output_none,
-                                     {}, None, 0, 1)
+            manager.mask_spec_logits(
+                None, bonus_logits, grammar_output_none, {}, None, 0, 1
+            )
         events_none = [evt.name for evt in prof_none.events()]
         assert any(
             "SD:PrepareSpecInput#num_reqs=1,num_target_rows=0,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
-            in name for name in events_none
+            in name
+            for name in events_none
         ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"

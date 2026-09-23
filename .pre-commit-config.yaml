@@ -37,9 +37,6 @@ repos:
 
 
 
-      # runner
-      |src/vllm_torchtpu/runner/
-      |tests/runner/
 
       # models, spec_decode, offload
       |src/vllm_torchtpu/models/

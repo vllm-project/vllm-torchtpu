@@ -1,12 +1,12 @@
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, MambaSpec,
-                                        MLAAttentionSpec)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
-from vllm_torchtpu.kv_cache_spec_normalizer import \
-    normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
-                                                    PallasMLAttentionBackend)
+from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend,
+    PallasMLAttentionBackend,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -59,13 +59,12 @@ def test_mla_attention_spec_with_bf16_normalizes_to_fp8_without_inflation():
         attention_backend=PallasAttentionBackend,
     )
     spec = normalized["mla_layer"]
-    pallas_mla_page_size = (
-        PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            16,
-            1,
-            576,
-            torch.float8_e4m3fn,
-        ))
+    pallas_mla_page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+        16,
+        1,
+        576,
+        torch.float8_e4m3fn,
+    )
     assert spec.dtype == torch.float8_e4m3fn
     assert spec.page_size_padded == pallas_mla_page_size
     assert spec.page_size_padded < mla_bf16_spec.real_page_size_bytes
@@ -140,8 +139,7 @@ def test_hybrid_specs_keep_separate_page_size_by_default():
         attention_backend=PallasAttentionBackend,
     )
 
-    assert normalized["attn"].page_size_bytes != normalized[
-        "mamba"].page_size_bytes
+    assert normalized["attn"].page_size_bytes != normalized["mamba"].page_size_bytes
     assert normalized["mamba"].page_size_padded is None
 
 
@@ -170,14 +168,11 @@ def test_hybrid_specs_use_uniform_page_size_when_unified_enabled():
         enable_unified_kv_layout=True,
     )
 
-    assert normalized["attn"].page_size_bytes == normalized[
-        "mamba"].page_size_bytes
-    assert normalized["mamba"].page_size_padded == normalized[
-        "attn"].page_size_bytes
+    assert normalized["attn"].page_size_bytes == normalized["mamba"].page_size_bytes
+    assert normalized["mamba"].page_size_padded == normalized["attn"].page_size_bytes
 
 
-def test_hybrid_specs_with_smaller_mamba_padded_size_normalizes_safely(
-) -> None:
+def test_hybrid_specs_with_smaller_mamba_padded_size_normalizes_safely() -> None:
     attention_spec = FullAttentionSpec(
         block_size=1536,
         num_kv_heads=4,
@@ -204,10 +199,8 @@ def test_hybrid_specs_with_smaller_mamba_padded_size_normalizes_safely(
         attention_backend=PallasAttentionBackend,
     )
 
-    assert normalized["attn"].page_size_bytes == normalized[
-        "mamba"].page_size_bytes
-    assert normalized["mamba"].page_size_padded == normalized[
-        "attn"].page_size_bytes
+    assert normalized["attn"].page_size_bytes == normalized["mamba"].page_size_bytes
+    assert normalized["mamba"].page_size_padded == normalized["attn"].page_size_bytes
     assert normalized["mamba"].page_size_bytes == 1572864
 
 
@@ -224,7 +217,7 @@ def test_hybrid_specs_preserve_attention_pallas_padding_workload_a() -> None:
     )
     mamba_spec = MambaSpec(
         block_size=1536,
-        shapes=[(274432, )],
+        shapes=[(274432,)],
         dtypes=[torch.bfloat16],
         page_size_padded=None,
     )
@@ -263,7 +256,7 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
     )
     mamba_spec = MambaSpec(
         block_size=1536,
-        shapes=[(500000, )],
+        shapes=[(500000,)],
         dtypes=[torch.bfloat16],
         page_size_padded=None,
     )
@@ -299,7 +292,8 @@ def test_hybrid_specs_mamba_page_uses_pooled_physical_dtypes() -> None:
         head_size=576,
         dtype=torch.bfloat16,
         page_size_padded=PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            162, 1, 576, torch.bfloat16),
+            162, 1, 576, torch.bfloat16
+        ),
     )
     assert attention_spec.page_size_bytes == 207360
     mamba_spec = MambaSpec(
@@ -320,8 +314,7 @@ def test_hybrid_specs_mamba_page_uses_pooled_physical_dtypes() -> None:
     )
 
     assert normalized["mamba"].page_size_bytes == 207360
-    assert normalized["mamba"].page_size_bytes == normalized[
-        "attn"].page_size_bytes
+    assert normalized["mamba"].page_size_bytes == normalized["attn"].page_size_bytes
     # The retyped spec describes the pool's physical layout: bf16 conv, fp32
     # ssm.
     assert tuple(normalized["mamba"].dtypes) == (torch.bfloat16, torch.float32)
@@ -373,13 +366,11 @@ def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:
     assert normalized["ds_v4"] is ds_v4_spec
     assert normalized["ds_v4"].dtype == torch.bfloat16
     assert normalized["ds_v4"].page_size_padded == 100
-    assert normalized["attn"].page_size_bytes == normalized[
-        "mamba"].page_size_bytes
+    assert normalized["attn"].page_size_bytes == normalized["mamba"].page_size_bytes
     assert normalized["attn"].dtype == torch.float8_e4m3fn
 
 
-def test_exempt_attention_does_not_trigger_hybrid_unification_with_mamba(
-) -> None:
+def test_exempt_attention_does_not_trigger_hybrid_unification_with_mamba() -> None:
     ds_v4_spec = MLAAttentionSpec(
         block_size=16,
         num_kv_heads=1,

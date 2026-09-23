@@ -192,9 +192,6 @@ ignore = [
 
 
 
-# runner
-"src/vllm_torchtpu/runner/**" = ["I"]
-"tests/runner/**" = ["I"]
 
 # models, spec_decode, offload
 "src/vllm_torchtpu/models/**" = ["I"]
@@ -267,9 +264,6 @@ exclude = [
 
 
 
-    # runner
-    "src/vllm_torchtpu/runner/**",
-    "tests/runner/**",
 
     # models, spec_decode, offload
     "src/vllm_torchtpu/models/**",
