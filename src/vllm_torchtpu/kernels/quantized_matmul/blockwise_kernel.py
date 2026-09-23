@@ -8,20 +8,27 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.quantized_matmul import util
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
-    TunedValue, get_device_vmem_limit, get_tuned_block_sizes)
-from vllm_torchtpu.kernels.quantized_matmul.util import (get_kernel_name,
-                                                         next_multiple,
-                                                         unfold_args)
+    TunedValue,
+    get_device_vmem_limit,
+    get_tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    get_kernel_name,
+    next_multiple,
+    unfold_args,
+)
 
 quantize_tensor = util.quantize_tensor
 MXU_SIZE = 256
 
 
-@jax.jit(static_argnames=[
-    "block_size",
-    "x_q_dtype",
-    "tuned_value",
-])
+@jax.jit(
+    static_argnames=[
+        "block_size",
+        "x_q_dtype",
+        "tuned_value",
+    ]
+)
 def quantized_matmul_kernel(
     x: jax.Array,  # [bs, n_in]
     w_q: jax.Array,  # [n_out, n_in]
@@ -70,14 +77,16 @@ def quantized_matmul_kernel(
         raise ValueError(f"w_scale.shape[1] must be 1, got {w_scale.shape=}")
     if w_scale.shape[2] != orig_n_out:
         raise ValueError(
-            f"w_scale output dim {w_scale.shape[2]} must match {orig_n_out=}.")
+            f"w_scale output dim {w_scale.shape[2]} must match {orig_n_out=}."
+        )
     if orig_n_in % block_size != 0:
         raise ValueError(f"{orig_n_in=} must be divisible by {block_size=}.")
     expected_scale_blocks = orig_n_in // block_size
     if w_scale.shape[0] != expected_scale_blocks:
         raise ValueError(
             f"w_scale block dim {w_scale.shape[0]} must match "
-            f"{expected_scale_blocks=} for {orig_n_in=} and {block_size=}.")
+            f"{expected_scale_blocks=} for {orig_n_in=} and {block_size=}."
+        )
 
     if tuned_value is None:
         tuned_value = get_tuned_block_sizes(
@@ -96,11 +105,11 @@ def quantized_matmul_kernel(
     if channelwise_weight_scale and in_block_size != orig_n_in:
         raise ValueError(
             "Channelwise weight scales require tuned in_block_size to match "
-            f"{orig_n_in=}, got {in_block_size=}.")
+            f"{orig_n_in=}, got {in_block_size=}."
+        )
     block_size = tuned_value.in_block_size if block_size == orig_n_in else block_size
     if in_block_size % block_size != 0:
-        raise ValueError(
-            f"{in_block_size=} must be divisible by {block_size=}.")
+        raise ValueError(f"{in_block_size=} must be divisible by {block_size=}.")
 
     # Pad the inputs to be multiple of block size.
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
@@ -110,13 +119,13 @@ def quantized_matmul_kernel(
     padded_n_out = next_multiple(orig_n_out, out_block_size)
     if orig_n_out < padded_n_out:
         w_q = jnp.pad(w_q, ((0, padded_n_out - orig_n_out), (0, 0)))
-        w_scale = jnp.pad(w_scale,
-                          ((0, 0), (0, 0), (0, padded_n_out - orig_n_out)))
+        w_scale = jnp.pad(w_scale, ((0, 0), (0, 0), (0, padded_n_out - orig_n_out)))
     padded_n_in = next_multiple(orig_n_in, in_block_size)
     if orig_n_in < padded_n_in:
         raise ValueError(
             f"{orig_n_in=} must be a multiple of {in_block_size=} for the "
-            "blockwise quantized matmul kernel.")
+            "blockwise quantized matmul kernel."
+        )
 
     if w_scale.dtype != jnp.float32:
         w_scale = w_scale.astype(jnp.float32)
@@ -133,9 +142,12 @@ def quantized_matmul_kernel(
 
     # TODO(amandaliang): Make this configurable.
     acc_dtype = jnp.bfloat16
-    if (quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer)
-            # Mixed precision matmuls like int4xfp8 accumulate as float.
-            and jnp.issubdtype(x_q_dtype, jnp.integer)):
+    if (
+        quantize_activation
+        and jnp.issubdtype(w_q.dtype, jnp.integer)
+        # Mixed precision matmuls like int4xfp8 accumulate as float.
+        and jnp.issubdtype(x_q_dtype, jnp.integer)
+    ):
         acc_dtype = jnp.int32
 
     vmem_limit_bytes = util.get_vmem_limit(
@@ -162,8 +174,7 @@ def quantized_matmul_kernel(
     # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
     compute_tile_n = MXU_SIZE * n_lane_multiplier
     if out_block_size % compute_tile_n != 0:
-        raise ValueError(
-            f"{out_block_size=} must be divisible by {compute_tile_n=}.")
+        raise ValueError(f"{out_block_size=} must be divisible by {compute_tile_n=}.")
     steps_n = out_block_size // compute_tile_n
 
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
@@ -184,8 +195,7 @@ def quantized_matmul_kernel(
                 rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
 
                 for j in range(steps_n):
-                    n_start, n_end = j * compute_tile_n, (j +
-                                                          1) * compute_tile_n
+                    n_start, n_end = j * compute_tile_n, (j + 1) * compute_tile_n
 
                     rhs_q_slice = rhs_q_full[n_start:n_end, :]
                     rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
@@ -196,7 +206,7 @@ def quantized_matmul_kernel(
                     dot_res = jax.lax.dot_general(
                         lhs_q,
                         rhs_q_slice,
-                        (((1, ), (1, )), ((), ())),
+                        (((1,), (1,)), ((), ())),
                         preferred_element_type=preferred_element_type,
                     )
                     res = dot_res.astype(acc_dtype)
@@ -240,15 +250,15 @@ def quantized_matmul_kernel(
                     memory_space=pltpu.VMEM,
                 ),
             ],  # w_scale
-            out_specs=pl.BlockSpec((batch_block_size, out_block_size),
-                                   lambda b, o, i: (b, o)),
+            out_specs=pl.BlockSpec(
+                (batch_block_size, out_block_size), lambda b, o, i: (b, o)
+            ),
             scratch_shapes=[
                 pltpu.VMEM((batch_block_size, out_block_size), jnp.bfloat16)
             ],
             grid=(n_batch, n_out, n_in),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out),
-                                       x.dtype),
+        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=vmem_limit_bytes,

@@ -186,20 +186,6 @@ ignore = [
 
 
 
-# kernels: attention and the rest
-"src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
-"src/vllm_torchtpu/kernels/collectives/**" = ["I"]
-"src/vllm_torchtpu/kernels/flash_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/megablox/**" = ["I"]
-"src/vllm_torchtpu/kernels/mla/**" = ["I"]
-"src/vllm_torchtpu/kernels/quantized_matmul/**" = ["I"]
-"src/vllm_torchtpu/kernels/ragged_paged_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/sparse_core/**" = ["I"]
-"src/vllm_torchtpu/kernels/__init__.py" = ["I"]
-"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["I"]
-"src/vllm_torchtpu/kernels/pool_adapters.py" = ["I"]
-"src/vllm_torchtpu/kernels/router_topk.py" = ["I"]
-"src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
 
 
 # layers/adapter (src)
@@ -282,20 +268,6 @@ exclude = [
 
 
 
-    # kernels: attention and the rest
-    "src/vllm_torchtpu/kernels/causal_conv1d/**",
-    "src/vllm_torchtpu/kernels/collectives/**",
-    "src/vllm_torchtpu/kernels/flash_attention/**",
-    "src/vllm_torchtpu/kernels/megablox/**",
-    "src/vllm_torchtpu/kernels/mla/**",
-    "src/vllm_torchtpu/kernels/quantized_matmul/**",
-    "src/vllm_torchtpu/kernels/ragged_paged_attention/**",
-    "src/vllm_torchtpu/kernels/sparse_core/**",
-    "src/vllm_torchtpu/kernels/__init__.py",
-    "src/vllm_torchtpu/kernels/partial_kv_update.py",
-    "src/vllm_torchtpu/kernels/pool_adapters.py",
-    "src/vllm_torchtpu/kernels/router_topk.py",
-    "src/vllm_torchtpu/kernels/typed_ldst.py",
 
 
     # layers/adapter (src)

@@ -50,8 +50,7 @@ class Plan(NamedTuple):
     @property
     def total_tokens(self) -> int:
         """Tokens the grid covers; the inputs must be padded to this."""
-        return (self.steps_per_core * self.blocks_per_round *
-                self.lanes_per_block)
+        return self.steps_per_core * self.blocks_per_round * self.lanes_per_block
 
 
 def split_plan(num_tokens: int, num_lanes: int, num_cores: int) -> Plan:
@@ -107,8 +106,7 @@ def _scatter_kernel(
             dst = dst_rows[i]
             write = jnp.logical_and(dst >= 0, dst < num_rows)
             if plan.cores_per_block > 1:
-                write = jnp.logical_and(write,
-                                        lane_group == i // plan.lanes_per_core)
+                write = jnp.logical_and(write, lane_group == i // plan.lanes_per_core)
             row = jnp.clip(dst, 0, num_rows - 1)
             copy = pltpu.make_async_copy(
                 src_buf.at[pl.ds(i, 1)],
@@ -129,12 +127,12 @@ def _scatter_kernel(
 
     pltpu.emit_pipeline(
         body,
-        grid=(plan.steps_per_core, ),
+        grid=(plan.steps_per_core,),
         tiling=pltpu.Tiling.SPARSE_CORE,
         in_specs=(
             pl.BlockSpec(
-                (plan.lanes_per_block, ),
-                lambda r: (block_index(r), ),
+                (plan.lanes_per_block,),
+                lambda r: (block_index(r),),
             ),
             pl.BlockSpec(
                 (plan.lanes_per_block, src_words.shape[-1]),
@@ -167,15 +165,17 @@ def scatter_rows(
       The updated cache, same shape and dtype as `cache`.
     """
     assert src.dtype == cache.dtype, (
-        f"src {src.dtype} does not match cache {cache.dtype}")
+        f"src {src.dtype} does not match cache {cache.dtype}"
+    )
     tc_tiled = cache.dtype == jnp.uint8
     assert tc_tiled or cache.dtype == jnp.uint32, (
-        "cache must be uint8 (TensorCore) or uint32 (SparseCore), got"
-        f" {cache.dtype}")
+        f"cache must be uint8 (TensorCore) or uint32 (SparseCore), got {cache.dtype}"
+    )
     tc_row_bytes = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert not tc_tiled or src.shape[-1] == tc_row_bytes, (
         f"TensorCore tiling folds exactly {kv_cache_utils.WORD_BYTES} rows, so a"
-        f" token must be {tc_row_bytes}B (got {src.shape[-1]}B)")
+        f" token must be {tc_row_bytes}B (got {src.shape[-1]}B)"
+    )
 
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
@@ -184,8 +184,9 @@ def scatter_rows(
 
     pad_tokens = plan.total_tokens - src.shape[0]
     if pad_tokens > 0:
-        dst_rows = jnp.pad(dst_rows, (0, pad_tokens),
-                           constant_values=kv_cache_utils.SKIP_ROW)
+        dst_rows = jnp.pad(
+            dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW
+        )
         src = jnp.pad(src, ((0, pad_tokens), (0, 0)))
 
     # A TC-tiled token is WORD_BYTES uint8 rows the kernel folds back into one.
@@ -207,7 +208,7 @@ def scatter_rows(
             tc_tiled=tc_tiled,
         ),
         out_type=(),
-        scratch_types=(pltpu.SemaphoreType.DMA((plan.lanes_per_block, )), ),
+        scratch_types=(pltpu.SemaphoreType.DMA((plan.lanes_per_block,)),),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=tc_tiled,
             needs_layout_passes=True,

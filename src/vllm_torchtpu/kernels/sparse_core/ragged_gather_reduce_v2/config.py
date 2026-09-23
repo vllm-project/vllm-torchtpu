@@ -57,8 +57,7 @@ class Config:
         return max(1, min(4, input_size_block))
 
     def get_row_chunk_size(self, num_row_partitions: int) -> int:
-        return (self.sc_info.num_lanes *
-                self.get_num_row_subchunks(num_row_partitions))
+        return self.sc_info.num_lanes * self.get_num_row_subchunks(num_row_partitions)
 
     @property
     def num_row_subchunks(self) -> int:
@@ -105,9 +104,9 @@ class Config:
     def max_window(self) -> int:
         """Largest window of row-blocks whose resident sort permutation fits SPMEM.
 
-    Streaming a fixed window instead of the whole partition makes SPMEM use
-    independent of input_size; the clamp keeps small inputs single-window.
-    """
+        Streaming a fixed window instead of the whole partition makes SPMEM use
+        independent of input_size; the clamp keeps small inputs single-window.
+        """
         # Per-subcore tile_spmem budget in 32-bit words, kept 10% under to leave
         # headroom for TC-tiling padding.
         words_per_subcore = self.sc_info.vmem_capacity_bytes // 4
@@ -116,8 +115,12 @@ class Config:
         # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
         # the num_rows + next-window-first-row vectors (2*lanes), and 6 row
         # index/dma buffers + the row gather pipeline double-buffers (10*row_chunk).
-        fixed = (self.col_size + 3 * num_simd_lanes * self.col_chunk_size +
-                 2 * num_simd_lanes + 10 * self.row_chunk_size)
+        fixed = (
+            self.col_size
+            + 3 * num_simd_lanes * self.col_chunk_size
+            + 2 * num_simd_lanes
+            + 10 * self.row_chunk_size
+        )
         window = (int(words_per_subcore * 0.9) - fixed) // self.row_chunk_size
         return max(1, min(window, max(1, self.max_blocks_per_partition)))
 
@@ -139,9 +142,9 @@ class Config:
     def row_shift(self) -> int:
         """log2 of how many source rows pack into one uint32 gather element.
 
-    The SparseCore indirect DMA requires 32-bit elements: bfloat16 packs two
-    source rows per uint32 (shift 1), float32 is 1:1 (shift 0).
-    """
+        The SparseCore indirect DMA requires 32-bit elements: bfloat16 packs two
+        source rows per uint32 (shift 1), float32 is 1:1 (shift 0).
+        """
         input_packing = 32 // jax.dtypes.itemsize_bits(self.in_dtype)
         return input_packing.bit_length() - 1
 
@@ -150,8 +153,9 @@ class Config:
         """Calculates the number of row partitions."""
         num_simd_lanes = self.sc_info.num_lanes
         num_row_partitions = self.num_tot_cores // self.num_column_partitions
-        assert (num_row_partitions <= num_simd_lanes
-                ), f"{num_row_partitions=} must be <= {num_simd_lanes=}"
+        assert num_row_partitions <= num_simd_lanes, (
+            f"{num_row_partitions=} must be <= {num_simd_lanes=}"
+        )
         return num_row_partitions
 
     @property
@@ -166,18 +170,18 @@ class Config:
         num_simd_lanes = self.sc_info.num_lanes
         preferred_num_stages = 4
         num_column_partitions = 1
-        while (self.num_tot_cores % (num_column_partitions * 2) == 0
-               and self.hidden_size %
-               (num_lanes * num_column_partitions * 2) == 0
-               and self.hidden_size // (num_column_partitions * 2 * num_lanes)
-               >= preferred_num_stages):
+        while (
+            self.num_tot_cores % (num_column_partitions * 2) == 0
+            and self.hidden_size % (num_lanes * num_column_partitions * 2) == 0
+            and self.hidden_size // (num_column_partitions * 2 * num_lanes)
+            >= preferred_num_stages
+        ):
             next_candidate = num_column_partitions * 2
             next_row_partitions = self.num_tot_cores // next_candidate
 
             # Calculate exactly how many pipeline invocations (outer loop).
             row_chunk_size = self.get_row_chunk_size(next_row_partitions)
-            num_iterations = self.input_size // (row_chunk_size *
-                                                 next_row_partitions)
+            num_iterations = self.input_size // (row_chunk_size * next_row_partitions)
 
             # Too many row partitions for the SIMD lanes: split the columns
             # further before weighing the iteration count.
@@ -197,8 +201,7 @@ class Config:
     def aligned_hidden_size(self) -> int:
         """Calculates the aligned hidden size."""
         num_lanes = self.tpu_info.num_lanes
-        return _align_to(self.hidden_size,
-                         num_lanes * self.num_column_partitions)
+        return _align_to(self.hidden_size, num_lanes * self.num_column_partitions)
 
     @property
     def col_size(self) -> int:
@@ -209,9 +212,9 @@ class Config:
     def col_chunk_size(self) -> int:
         """Picks the column chunk size the inner pipeline gathers at a time.
 
-    The chunk is the largest divisor of ``col_size`` whose gather double-buffer
-    still fits comfortably in SparseCore VMEM.
-    """
+        The chunk is the largest divisor of ``col_size`` whose gather double-buffer
+        still fits comfortably in SparseCore VMEM.
+        """
         match self.tpu_info.generation:
             case 6:
                 target_bytes = int(256 * 1024 * 0.95)
@@ -227,8 +230,7 @@ class Config:
         max_safe_col = (target_bytes // bytes_per_col // num_lanes) * num_lanes
 
         # Larger chunk sizes cause larger pipeline bubbles, so cap it.
-        max_safe_col = min(max_safe_col,
-                           _CostModelConstants.MAX_COL_CHUNK_SIZE)
+        max_safe_col = min(max_safe_col, _CostModelConstants.MAX_COL_CHUNK_SIZE)
 
         start_col = (min(self.col_size, max_safe_col) // num_lanes) * num_lanes
         for chunk in range(start_col, num_lanes - 1, -num_lanes):
