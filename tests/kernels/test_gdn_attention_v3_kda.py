@@ -343,18 +343,12 @@ def _cases():
             case["testcase_name"] = f"{case.pop('name')}_{gate_name}"
             case["gate_lower_bound"] = lower_bound
             yield case
-            if shape["distribution"][0] == 0:
-                yield dict(
-                    case,
-                    testcase_name=case["testcase_name"] + "_prefill_only",
-                    prefill_only=True,
-                )
 
 
 class KdaAttentionV3Test(parameterized.TestCase):
     @parameterized.named_parameters(*_cases())
     def test_kda_matches_the_recurrence(
-        self, max_reqs, q_loc, distribution, gate_lower_bound, n_v=4, prefill_only=False
+        self, max_reqs, q_loc, distribution, gate_lower_bound, n_v=4
     ):
         # K3 and Kimi-Linear both run KDA without GQA, so n_kq == n_v.
         n_kq = n_v
@@ -425,10 +419,9 @@ class KdaAttentionV3Test(parameterized.TestCase):
                 "kernel_size",
                 "attention_mode",
                 "gate_lower_bound",
-                "prefill_only",
             ],
         )
-        (_, out_state), out = kda_jitted(**common_kwargs, prefill_only=prefill_only)
+        (_, out_state), out = kda_jitted(**common_kwargs)
 
         # Tighter than the GDN v3 suite's 2e-2/2e-2 on purpose. KDA feeds the
         # output through an L2 norm and a d_k**-0.5 scale, so |out| peaks
@@ -545,7 +538,6 @@ class KdaAttentionV3Test(parameterized.TestCase):
             **common_kwargs,
             read_offsets=read_offsets_arr,
             num_spec_tokens=num_spec_tokens,
-            batched_only=True,
             attention_mode=config.AttentionMode.KDA,
         )
 

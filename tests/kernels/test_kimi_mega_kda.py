@@ -13,40 +13,16 @@ from vllm_torchtpu.kernels.kimi_k3.mega_kda import (
     kda_forward_inference,
 )
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op
-from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
-    _guard_kda_verify_window,
-)
 
 
-@pytest.mark.parametrize(
-    "spec_tokens,window_end,total_tokens,expected_calls",
-    [
-        (5, 0, 8, ["prefill"]),
-        (5, 1, 6, ["verify"]),
-        (5, 1, 8, ["verify", "prefill"]),
-        (0, 1, 8, ["combined"]),
-    ],
-)
-def test_fused_kda_segment_dispatch(
-    monkeypatch, spec_tokens, window_end, total_tokens, expected_calls
-):
+@pytest.mark.parametrize("spec_tokens", [0, 5])
+def test_fused_kda_passes_window_distribution(monkeypatch, spec_tokens):
+    """The adapter forwards one distribution; kernel owns segment dispatch."""
     calls = []
 
     def fake_kernel(**kwargs):
-        mode = (
-            "verify"
-            if kwargs["batched_only"]
-            else "prefill"
-            if kwargs["prefill_only"]
-            else "combined"
-        )
-        calls.append(mode)
-        increment = 1 if mode == "verify" else 10
-        states = (
-            kwargs["conv_state"] + increment,
-            kwargs["recurrent_state"] + increment,
-        )
-        return states, jnp.full((8, 2), increment, jnp.float32)
+        calls.append(kwargs)
+        return (kwargs["conv_state"], kwargs["recurrent_state"]), jnp.zeros((8, 2))
 
     monkeypatch.setattr(kda_attention_op.gdn_wrapper, "fused_conv1d_gdn", fake_kernel)
     monkeypatch.setattr(kda_attention_op, "_check_kda_abi", lambda *args: (8, 2, 1, 2))
@@ -55,7 +31,7 @@ def test_fused_kda_segment_dispatch(
     )
     core = kda_attention_op._build_fused_core(-5.0, 1e-6, spec_tokens)
     with jax.disable_jit():
-        out, conv, recurrent = core(
+        core(
             jnp.zeros((8, 6)),
             jnp.zeros((8, 2)),
             jnp.zeros((8, 1)),
@@ -66,31 +42,16 @@ def test_fused_kda_segment_dispatch(
             jnp.zeros((1,)),
             jnp.zeros((2,)),
             jnp.ones((2,)),
-            jnp.asarray([0, 6, total_tokens]),
+            jnp.asarray([0, 6, 8]),
             jnp.asarray([1, 2]),
-            jnp.asarray([6, total_tokens - 6]),
+            jnp.asarray([6, 2]),
             jnp.asarray([0, 2, 2]),
-            jnp.asarray([window_end, 2, 2]),
+            jnp.asarray([1, 2, 2]),
             jnp.zeros((4,), jnp.int32),
         )
-    assert calls == expected_calls
-    expected_state = sum(1 if mode == "verify" else 10 for mode in calls)
-    assert bool(jnp.all(conv == expected_state))
-    assert bool(jnp.all(recurrent == expected_state))
-    assert bool(jnp.all(out[:6] == (1 if "verify" in calls else 10)))
-    if total_tokens == 8:
-        assert bool(jnp.all(out[6:] == 10))
-
-
-@pytest.mark.parametrize(("num_window_reqs", "expected"), [(0, 2), (1, 1)])
-def test_kda_verify_window_guard(num_window_reqs: int, expected: int) -> None:
-    guarded = jax.jit(
-        lambda count: _guard_kda_verify_window(
-            count, lambda: jnp.asarray(1), lambda: jnp.asarray(2)
-        )
-    )
-
-    assert int(guarded(jnp.asarray(num_window_reqs))) == expected
+    assert len(calls) == 1
+    assert calls[0]["distribution"].tolist() == [1, 2, 2]
+    assert calls[0]["num_spec_tokens"] == spec_tokens
 
 
 @pytest.mark.parametrize(

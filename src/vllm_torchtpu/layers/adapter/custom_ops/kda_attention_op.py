@@ -8,8 +8,6 @@
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
 import math
-from collections.abc import Callable
-from typing import TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -29,17 +27,6 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-_VerifyWindowResult = TypeVar("_VerifyWindowResult")
-
-
-def _guard_kda_verify_window(
-    num_window_reqs: jax.Array,
-    run_verify_window: Callable[[], _VerifyWindowResult],
-    skip_verify_window: Callable[[], _VerifyWindowResult],
-) -> _VerifyWindowResult:
-    """Skip KDA verification when the device-side window is empty."""
-    return jax.lax.cond(num_window_reqs > 0, run_verify_window, skip_verify_window)
 
 
 def _token_sequence_ids(
@@ -373,7 +360,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 raise ValueError("slot_read_offsets are required for KDA verify")
             read_offsets = slot_read_offsets[state_indices]
 
-        def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
+        def run_kernel(conv_in, rec_in):
             return gdn_wrapper.fused_conv1d_gdn(
                 qkv=mixed_qkv,
                 # Raw: the kernel applies sigmoid to `b` and the gate activation
@@ -404,32 +391,10 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 attention_mode=gdn_config.AttentionMode.KDA,
                 gate_lower_bound=lower_bound,
                 num_spec_tokens=num_spec_tokens,
-                batched_only=batched_only,
-                prefill_only=prefill_only,
             )
 
-        if num_spec_tokens > 0:
-            window_end = window_distribution[0]
-            empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
-            (verify_states, verify_out) = _guard_kda_verify_window(
-                window_end,
-                lambda: run_kernel(conv_state, recurrent_state, batched_only=True),
-                lambda: ((conv_state, recurrent_state), empty_out),
-            )
-            first_prefill_token = query_start_loc[window_end]
-            total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-            ((new_conv_state, new_pool), prefill_out) = jax.lax.cond(
-                first_prefill_token < total_tokens,
-                lambda: run_kernel(*verify_states, prefill_only=True),
-                lambda: (verify_states, empty_out),
-            )
-            out = jnp.where(
-                (jnp.arange(num_tokens) < first_prefill_token)[:, None],
-                verify_out,
-                prefill_out,
-            )
-        else:
-            (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
+        (new_conv_state, new_pool), out = run_kernel(conv_state,
+                                                     recurrent_state)
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(

@@ -339,8 +339,6 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
-        "batched_only",
-        "prefill_only",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -375,8 +373,6 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
-    batched_only: bool = False,
-    prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -444,9 +440,6 @@ def fused_conv1d_gdn(
             Must be set iff `state_source` is set.
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
-        batched_only: Run only the leading decode/verify segment.
-        prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
-            untouched. Mutually exclusive with batched_only.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -725,30 +718,42 @@ def fused_conv1d_gdn(
             weights,
         )
 
-    if batched_only and prefill_only:
-        raise ValueError("batched_only and prefill_only are mutually exclusive")
-
     if pooled:
-        out_act, out_source = None, state_source
-        if not prefill_only:
-            out_act, out_source, _ = call_kernel(
-                state_source, None, None, config.GDNMode.BATCHED
-            )
-        if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
-        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-        return out_source, out_act
+        out_act, out_source, _ = call_kernel(
+            state_source, None, None, config.GDNMode.BATCHED
+        )
+        out_act, out_source, _ = call_kernel(
+            out_source, None, out_act, config.GDNMode.PER_SEQ
+        )
+        return out_source, out_act.reshape(padded_batch_size, -1)[:batch_size]
 
-    # The first segment holds verify windows of up to `num_spec_tokens + 1`
-    # tokens, or plain 1-token decodes without speculative decoding.
-    out_act, out_conv_state, out_recurrent_state = None, conv_state, recurrent_state
-    if not prefill_only:
+    if is_kda and num_spec_tokens > 0:
+        # KDA verification and prefill own disjoint token/state segments.
+        # Keep the empty-segment guards next to their kernel launches instead
+        # of exposing execution switches to model adapters. In particular an
+        # empty verification pass must not touch checkpoint slots.
+        out_act = jnp.zeros((padded_batch_size, n_v, d_v), act_out_dtype)
+        out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
+            distribution[0] > 0,
+            lambda: call_kernel(
+                conv_state, recurrent_state, None, config.GDNMode.BATCHED
+            ),
+            lambda: (out_act, conv_state, recurrent_state),
+        )
+        first_prefill_token = query_start_loc[distribution[0]]
+        total_tokens = jnp.minimum(query_start_loc[-1], batch_size)
+        out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
+            first_prefill_token < total_tokens,
+            lambda: call_kernel(
+                out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+            ),
+            lambda: (out_act, out_conv_state, out_recurrent_state),
+        )
+    else:
+        # Preserve the existing non-speculative and ordinary GDN launch path.
         out_act, out_conv_state, out_recurrent_state = call_kernel(
             conv_state, recurrent_state, None, config.GDNMode.BATCHED
         )
-    if not batched_only:
         out_act, out_conv_state, out_recurrent_state = call_kernel(
             out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
         )
