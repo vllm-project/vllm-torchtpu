@@ -20,19 +20,6 @@ BUILDKITE_DIR=".buildkite"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
-MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-auto}"
-
-# Validate inputs that will later be interpolated into uploaded pipeline YAML.
-# Reject anything that isn't on the allowlist / numeric to prevent injection of
-# extra YAML keys (e.g. via embedded newlines or quotes) through env vars.
-case "${MODEL_IMPL_TYPE}" in
-  auto|flax_nnx|vllm) ;;
-  *)
-    echo "ERROR: MODEL_IMPL_TYPE must be one of auto|flax_nnx|vllm, got: '${MODEL_IMPL_TYPE}'"
-    exit 1
-    ;;
-esac
-
 if [[ ! "${JOB_PRIORITY:-1}" =~ ^-?[0-9]+$ ]]; then
   echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY:-}'"
   exit 1
@@ -64,18 +51,8 @@ add_kernel_microbenchmarks() {
   fi
 }
 
-case "${MODEL_IMPL_TYPE}" in
-  "auto")
-    TARGET_FOLDERS=("parallelism" "models" "features" "rl")
-    add_kernel_microbenchmarks
-    ;;
-  "flax_nnx")
-    TARGET_FOLDERS=("quantization" "parallelism" "features")
-    ;;
-  "vllm")
-    TARGET_FOLDERS=("quantization" "parallelism" "models" "features")
-    ;;
-esac
+TARGET_FOLDERS=("parallelism" "models" "features" "rl")
+add_kernel_microbenchmarks
 
 # Arrays to store YAML content fragments (without 'steps:' header)
 pipeline_v6e_fragments=()
@@ -161,7 +138,7 @@ if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
   {
     echo "priority: ${JOB_PRIORITY:-1}"
     echo "steps:"
-    echo "  - group: \"TPU v6e nightly Tests (${MODEL_IMPL_TYPE:-auto})\""
+    echo "  - group: \"TPU v6e nightly Tests\""
     echo "    key: \"v6e-group\""
     echo "    depends_on: \"build_docker\""
     echo "    steps:"
@@ -184,7 +161,7 @@ if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
   {
     echo "priority: ${JOB_PRIORITY:-1}"
     echo "steps:"
-    echo "  - group: \"TPU v7x nightly Tests (${MODEL_IMPL_TYPE:-auto})\""
+    echo "  - group: \"TPU v7x nightly Tests\""
     echo "    key: \"v7x-group\""
     echo "    depends_on: \"build_docker\""
     echo "    steps:"

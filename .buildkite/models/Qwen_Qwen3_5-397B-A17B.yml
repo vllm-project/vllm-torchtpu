@@ -17,18 +17,16 @@ steps:
     key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_UnitTest"
     agents:
       queue: "${TPU_QUEUE_MULTI:-tpu_v6e_8_queue}"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     soft_fail: true
     commands:
       - |
-        if [ "${TPU_VERSION:-tpu6e}" = "tpu6e" ]; then
-          buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_UnitTest" "not enough HBM"
-        else
-          .buildkite/scripts/run_in_docker.sh \
-            bash -c 'SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0 MODEL_IMPL_TYPE=vllm python examples/offline_inference.py --model Qwen/Qwen3.5-397B-A17B-FP8 --tensor-parallel-size 8 --enable-expert-parallel  --max-num-batched-tokens 256 --max-num-seqs 256  --limit-mm-per-prompt "{\"image\": 0, \"video\": 0}" --chat-template-kwargs="{\"enable_thinking\": false}"'
-        fi
+        .buildkite/scripts/run_in_docker.sh \
+          bash -c 'SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0 python examples/offline_inference.py --model Qwen/Qwen3.5-397B-A17B-FP8 --tensor-parallel-size 8 --enable-expert-parallel  --max-num-batched-tokens 256 --max-num-seqs 256  --limit-mm-per-prompt "{\"image\": 0, \"video\": 0}" --chat-template-kwargs="{\"enable_thinking\": false}"'
 
   - label: "${TPU_VERSION:-tpu6e} Record unit test result for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_UnitTest"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_UnitTest"
     env:
       CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
@@ -43,20 +41,18 @@ steps:
 
   - label: "${TPU_VERSION:-tpu6e} Accuracy for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Accuracy"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_UnitTest"
     agents:
       queue: "${TPU_QUEUE_MULTI:-tpu_v6e_8_queue}"
     soft_fail: true
     commands:
       - |
-        if [ "${TPU_VERSION:-tpu6e}" = "tpu6e" ]; then
-          buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Accuracy" "not enough HBM"
-        else
-          .buildkite/scripts/run_in_docker.sh bash tests/e2e/check_lm_eval.sh  --model_name "Qwen/Qwen3.5-397B-A17B-FP8" --tensor_parallel_size 8 --max_model_len 4096 --max_num_batched_tokens 4096 --max_gen_toks 2048 --enable_expert_parallel 1 --flex_threshold 0.63 --strict_threshold 0.63 --limit_mm_per_prompt '{"image": 0, "video": 0}' --block_size 256 --limit 100 --enable_thinking false
-        fi
+        .buildkite/scripts/run_in_docker.sh bash tests/e2e/check_lm_eval.sh  --model_name "Qwen/Qwen3.5-397B-A17B-FP8" --tensor_parallel_size 8 --max_model_len 4096 --max_num_batched_tokens 4096 --max_gen_toks 2048 --enable_expert_parallel 1 --flex_threshold 0.63 --strict_threshold 0.63 --limit_mm_per_prompt '{"image": 0, "video": 0}' --block_size 256 --limit 100 --enable_thinking false
 
   - label: "${TPU_VERSION:-tpu6e} Record integration test result for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_Accuracy"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Accuracy"
     env:
       CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
@@ -71,6 +67,7 @@ steps:
 
   - label: "${TPU_VERSION:-tpu6e} Performance benchmarks for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Benchmark"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_Accuracy"
     agents:
       queue: "${TPU_QUEUE_MULTI:-tpu_v6e_8_queue}"
@@ -79,14 +76,11 @@ steps:
     # I increased the timeout to 52 minutes -- this should be fine since this test is only run nightly though
     commands:
       - |
-        if [ "${TPU_VERSION:-tpu6e}" = "tpu6e" ]; then
-          buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Benchmark" "not enough HBM"
-        else
-              .buildkite/scripts/run_in_docker.sh bash tests/e2e/benchmarking/bm_qwen3_coder.sh --model Qwen/Qwen3.5-397B-A17B-FP8 --tp 8 --req_tput_limit 0.04  --output_token_tput_limit 300 --total_token_tput_limit 345 --input_len 1024 --output_len 8192 --limit_mm_per_prompt '{"image": 0, "video": 0}' --block_size 256 --num_prompts 64 --timeout 52 --gpu-memory-utilization 0.88
-        fi
+        .buildkite/scripts/run_in_docker.sh bash tests/e2e/benchmarking/bm_qwen3_coder.sh --model Qwen/Qwen3.5-397B-A17B-FP8 --tp 8 --req_tput_limit 0.04  --output_token_tput_limit 300 --total_token_tput_limit 345 --input_len 1024 --output_len 8192 --limit_mm_per_prompt '{"image": 0, "video": 0}' --block_size 256 --num_prompts 64 --timeout 52 --gpu-memory-utilization 0.88
 
   - label: "${TPU_VERSION:-tpu6e} Record performance benchmark result for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_Benchmark"
+    if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
     depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-397B-A17B_Benchmark"
     env:
       CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"

@@ -23,17 +23,7 @@ TARGET_BRANCH="${BUILDKITE_BRANCH:-main}"
 if [ "${NIGHTLY}" = "1" ]; then
   # Set path and commit message for nightly builds.
   BASE_PATH="support_matrices/nightly"
-  IMPL_TYPE_SUBDIR="default" # Default implementation subdir
-
-  # Check for specific model implementation type to enable directory isolation.
-  # If MODEL_IMPL_TYPE is 'vllm' or 'flax_nnx', use a implementation-specific subfolder.
-  if [ "${MODEL_IMPL_TYPE:-auto}" = "vllm" ] || [ "${MODEL_IMPL_TYPE:-auto}" = "flax_nnx" ]; then
-    IMPL_TYPE_SUBDIR="${MODEL_IMPL_TYPE}"
-    COMMIT_MESSAGE="[skip ci] Update nightly support matrices for ${MODEL_IMPL_TYPE} (v6e/v7x)"
-  else
-    # Default case: support_matrices/nightly/default
-    COMMIT_MESSAGE="[skip ci] Update nightly support matrices (v6e/v7x)"
-  fi
+  COMMIT_MESSAGE="[skip ci] Update nightly support matrices (v6e/v7x)"
 else
   # Set path and commit message for release tag builds.
   COMMIT_TAG="${BUILDKITE_TAG:-unknown-tag}"
@@ -67,8 +57,8 @@ TARGET_DIRS=""
 for ver in v6e v7x; do
   if [ -d "$ver" ]; then
     if [ "${NIGHTLY}" = "1" ]; then
-      # Nightly layout: support_matrices/nightly/{ver}/{impl_type}
-      TARGET_DIR="${BASE_PATH}/${ver}/${IMPL_TYPE_SUBDIR}"
+      # Nightly layout: support_matrices/nightly/{ver}
+      TARGET_DIR="${BASE_PATH}/${ver}"
     else
       # Release layout: support_matrices/{ver}
       TARGET_DIR="${ARTIFACT_DOWNLOAD_PATH}/${ver}"

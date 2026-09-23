@@ -21,23 +21,10 @@ steps:
     commands:
       - |
         buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest" "unverified"
-  - label: "${TPU_VERSION:-tpu6e} Record unit test result for Qwen/Qwen3.5-9B"
-    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B_UnitTest"
-    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest"
-    env:
-      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
-      CI_TARGET: "Qwen/Qwen3.5-9B"
-      CI_STAGE: "UnitTest"
-      CI_CATEGORY: "multimodal"
-    agents:
-      queue: cpu
-    commands:
-      - |
-        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest
 
   - label: "${TPU_VERSION:-tpu6e} Accuracy for Qwen/Qwen3.5-9B"
     key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy"
-    depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B_UnitTest"
+    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest"
     soft_fail: true
     agents:
       queue: cpu  # TODO: replace with execution environment
@@ -48,23 +35,10 @@ steps:
     commands:
       - |
         buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy" "unverified"
-  - label: "${TPU_VERSION:-tpu6e} Record accuracy result for Qwen/Qwen3.5-9B"
-    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B_Accuracy"
-    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy"
-    env:
-      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
-      CI_TARGET: "Qwen/Qwen3.5-9B"
-      CI_STAGE: "Accuracy/Correctness"
-      CI_CATEGORY: "multimodal"
-    agents:
-      queue: cpu
-    commands:
-      - |
-        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy
 
   - label: "${TPU_VERSION:-tpu6e} Performance benchmarks for Qwen/Qwen3.5-9B"
     key: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark"
-    depends_on: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B_Accuracy"
+    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy"
     soft_fail: true
     agents:
       queue: cpu  # TODO: replace with execution environment
@@ -75,16 +49,20 @@ steps:
     commands:
       - |
         buildkite-agent meta-data set "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark" "unverified"
-  - label: "${TPU_VERSION:-tpu6e} Record performance benchmark result for Qwen/Qwen3.5-9B"
-    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B_Benchmark"
-    depends_on: "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark"
-    env:
-      CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
-      CI_TARGET: "Qwen/Qwen3.5-9B"
-      CI_STAGE: "Benchmark"
-      CI_CATEGORY: "multimodal"
+
+  - label: "${TPU_VERSION:-tpu6e} Record test results for Qwen/Qwen3.5-9B"
+    key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-9B"
+    depends_on:
+      - "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest"
+      - "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy"
+      - "${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark"
     agents:
       queue: cpu
     commands:
       - |
-        .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark
+        CI_TPU_VERSION="${TPU_VERSION:-tpu6e}" CI_TARGET="Qwen/Qwen3.5-9B" CI_CATEGORY="multimodal" CI_STAGE="UnitTest" \
+          .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_UnitTest
+        CI_TPU_VERSION="${TPU_VERSION:-tpu6e}" CI_TARGET="Qwen/Qwen3.5-9B" CI_CATEGORY="multimodal" CI_STAGE="Accuracy/Correctness" \
+          .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Accuracy
+        CI_TPU_VERSION="${TPU_VERSION:-tpu6e}" CI_TARGET="Qwen/Qwen3.5-9B" CI_CATEGORY="multimodal" CI_STAGE="Benchmark" \
+          .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_Qwen_Qwen3_5-9B_Benchmark
