@@ -527,6 +527,13 @@ def fused_conv1d_gdn(
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if is_kda and num_spec_tokens > 0:
+        # Both cond branches are traced even for pure verification. The KDA
+        # prefill solve requires whole triangular blocks (2, 8 or 16 tokens),
+        # including when the caller supplies a small, unpadded verify batch.
+        # Pad internally; sequence metadata still bounds all real writes.
+        mixed_tile_size = pl.cdiv(mixed_tile_size, 16) * 16
+        padded_batch_size = max(padded_batch_size, mixed_tile_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
