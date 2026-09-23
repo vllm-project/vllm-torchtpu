@@ -62,22 +62,20 @@ def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
     logical = logical_ref[...]  # i32[block_tokens, topk]
     out = jnp.zeros_like(logical)
     for c in range(num_chunks):
-        window_chunk = windows_ref[:, c * _GATHER_PAGE_CHUNK:(
-            c + 1) * _GATHER_PAGE_CHUNK]  # i32[block_tokens, 128]
+        window_chunk = windows_ref[
+            :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
+        ]  # i32[block_tokens, 128]
         local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(window_chunk,
-                                       jnp.clip(local, 0,
-                                                _GATHER_PAGE_CHUNK - 1),
-                                       axis=1)
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered,
-                        out)
+        gathered = jnp.take_along_axis(
+            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+        )
+        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
     out_ref[...] = out
 
 
 def gather_page_ids(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    seq_page_ids: jax.
-    Array,  # i32[num_tokens, topk]  (logical page within seq)
+    seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
     seq_ids_segment: jax.Array,  # i32[num_tokens]  (token -> seq id)
     max_num_seqs: int,
     *,
@@ -91,8 +89,7 @@ def gather_page_ids(
 
     page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
     if padded_pps != pages_per_seq:
-        page_table = jnp.pad(page_table,
-                             ((0, 0), (0, padded_pps - pages_per_seq)))
+        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
     # Per-token page-table window. This is a whole-row gather.
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
@@ -112,11 +109,11 @@ def gather_page_ids(
                 pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
             ],
             out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens, ),
+            grid=(padded_tokens // block_tokens,),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary", ),
+            dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
         ),
         name="gather_page_ids",
@@ -172,8 +169,11 @@ def _attention_kernel(
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = (cache_kv_nope_hbm_ref.shape[1] if sparsecore_layout else
-              cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES)
+    bkv_sz = (
+        cache_kv_nope_hbm_ref.shape[1]
+        if sparsecore_layout
+        else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
+    )
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -190,9 +190,9 @@ def _attention_kernel(
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
 
     def attention_step1_qk_softmax(
-            q,  # [num_q_heads, head_dim]
-            kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
-            kv_len,  # i32[] number of valid (non "-1") top-k rows in kv
+        q,  # [num_q_heads, head_dim]
+        kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
+        kv_len,  # i32[] number of valid (non "-1") top-k rows in kv
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -237,8 +237,11 @@ def _attention_kernel(
         if k_scale != 1.0:
             pv *= k_scale
 
-        out = (lax.div(pv, l_sum) if q_dtype == jnp.float32 else
-               (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype))
+        out = (
+            lax.div(pv, l_sum)
+            if q_dtype == jnp.float32
+            else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+        )
         return out
 
     def _async_copy(src, dst, sem, wait):
@@ -375,7 +378,6 @@ def _attention_kernel(
         return bkv
 
     def process():
-
         def get_next_seq_ids(seq_idx, bi_sem_idx):
             next_seq_idx = seq_idx + batch_size
             next_bi_sem_idx = lax.select(bi_sem_idx == 0, 1, 0)
@@ -383,7 +385,8 @@ def _attention_kernel(
 
         bi_sem_idx = sem_ids_ref[0]
         next_seq_idx, next_bi_sem_idx = get_next_seq_ids(
-            batch_start_seq_idx, bi_sem_idx)
+            batch_start_seq_idx, bi_sem_idx
+        )
 
         # Prefetch next seq
         @pl.when(next_seq_idx < end_seq_idx)
@@ -482,7 +485,7 @@ def _attention_kernel(
 
 
 def prepare_q_inputs(
-        q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
@@ -554,70 +557,90 @@ def sparse_ragged_paged_attention(
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
-  Args:
-    q: concatenated all sequences' queries.
-    cache_kv_nope: the current kv cache for nope.
-    cache_kv_rope: the current kv cache for rope.
-    topk_indices: for each query token, the indices of the top k key tokens to
-      attend to.
-    page_indices: flattened page indices look-up table by (seq_id, page_id).
-    cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-      kv_lens, only the first num_seqs+1 values are valid.
-    distribution: (i, j, k) represents that sequences[0:i] are decode-only,
-      sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-      k is also the total number of sequences.
-    sm_scale: the softmax scale which will be applied to the Q@K^T.
-    k_scale: per-tensor dequantization scale for the fp8 nope cache.
-    vmem_limit_bytes: the vmem limit for the pallas kernel.
-    return_lse: also return the per-(token, head) log-sum-exp of the attention
-      scores. Needed only when `topk_indices` holds a slice of a token's
-      global top-k and the partial outputs of several ranks must be merged.
-    cache_layout: Physical cache layout: ``"tensorcore"`` for tiled uint8
-      caches or ``"sparsecore"`` for native uint32 caches. Both modes perform
-      the same sparse attention computation.
-    sparsecore_atoms_per_batch: Native SparseCore gather pipeline atoms per
-      owner batch.
-    sparsecore_gather_wait_mode: Whether native SparseCore NOPE output DMA
-      overlaps ROPE work.
-    sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
-      serving.
+    Args:
+      q: concatenated all sequences' queries.
+      cache_kv_nope: the current kv cache for nope.
+      cache_kv_rope: the current kv cache for rope.
+      topk_indices: for each query token, the indices of the top k key tokens to
+        attend to.
+      page_indices: flattened page indices look-up table by (seq_id, page_id).
+      cu_q_lens: the cumulative sum of the effective query lengths. Similar to
+        kv_lens, only the first num_seqs+1 values are valid.
+      distribution: (i, j, k) represents that sequences[0:i] are decode-only,
+        sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
+        k is also the total number of sequences.
+      sm_scale: the softmax scale which will be applied to the Q@K^T.
+      k_scale: per-tensor dequantization scale for the fp8 nope cache.
+      vmem_limit_bytes: the vmem limit for the pallas kernel.
+      return_lse: also return the per-(token, head) log-sum-exp of the attention
+        scores. Needed only when `topk_indices` holds a slice of a token's
+        global top-k and the partial outputs of several ranks must be merged.
+      cache_layout: Physical cache layout: ``"tensorcore"`` for tiled uint8
+        caches or ``"sparsecore"`` for native uint32 caches. Both modes perform
+        the same sparse attention computation.
+      sparsecore_atoms_per_batch: Native SparseCore gather pipeline atoms per
+        owner batch.
+      sparsecore_gather_wait_mode: Whether native SparseCore NOPE output DMA
+        overlaps ROPE work.
+      sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
+        serving.
 
-  Returns:
-    The output of attention, or `(output, lse)` when `return_lse` is set.
-    `lse` is f32[max_num_tokens, actual_num_q_heads].
-  """
+    Returns:
+      The output of attention, or `(output, lse)` when `return_lse` is set.
+      `lse` is f32[max_num_tokens, actual_num_q_heads].
+    """
     if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
         raise ValueError(
             f"cache_layout must be {TENSORCORE_CACHE_LAYOUT!r} or "
-            f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}")
+            f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
+        )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if sparsecore_layout:
-        if (cache_kv_nope.dtype != jnp.uint32 or cache_kv_nope.ndim != 3
-                or cache_kv_nope.shape[-1] != 128):
+        if (
+            cache_kv_nope.dtype != jnp.uint32
+            or cache_kv_nope.ndim != 3
+            or cache_kv_nope.shape[-1] != 128
+        ):
             raise ValueError(
-                "sparsecore NOPE cache must be uint32[pages,page_size,128]")
-        if (cache_kv_rope.dtype != jnp.uint32 or cache_kv_rope.ndim != 3
-                or cache_kv_rope.shape[-1] != 128):
-            raise ValueError("sparsecore ROPE cache must be "
-                             "uint32[pages,page_size/4,128]")
+                "sparsecore NOPE cache must be uint32[pages,page_size,128]"
+            )
+        if (
+            cache_kv_rope.dtype != jnp.uint32
+            or cache_kv_rope.ndim != 3
+            or cache_kv_rope.shape[-1] != 128
+        ):
+            raise ValueError(
+                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+            )
     else:
-        if (cache_kv_nope.dtype != jnp.uint8 or cache_kv_nope.ndim != 4
-                or cache_kv_nope.shape[-2:] != (4, 128)):
-            raise ValueError("tensorcore NOPE cache must be "
-                             "uint8[pages,page_size,4,128]")
-        if (cache_kv_rope.dtype != jnp.uint8 or cache_kv_rope.ndim != 4
-                or cache_kv_rope.shape[-2:] != (4, 128)):
-            raise ValueError("tensorcore ROPE cache must be "
-                             "uint8[pages,page_size/4,4,128]")
+        if (
+            cache_kv_nope.dtype != jnp.uint8
+            or cache_kv_nope.ndim != 4
+            or cache_kv_nope.shape[-2:] != (4, 128)
+        ):
+            raise ValueError(
+                "tensorcore NOPE cache must be uint8[pages,page_size,4,128]"
+            )
+        if (
+            cache_kv_rope.dtype != jnp.uint8
+            or cache_kv_rope.ndim != 4
+            or cache_kv_rope.shape[-2:] != (4, 128)
+        ):
+            raise ValueError(
+                "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
+            )
     if cache_kv_nope.size != 4 * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})")
-    if (cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-            or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]):
+            f"4 * ROPE cache size ({cache_kv_rope.size})"
+        )
+    if (
+        cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
+        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+    ):
         raise ValueError(
-            "NOPE and ROPE caches must have matching page counts and page "
-            "geometry")
+            "NOPE and ROPE caches must have matching page counts and page geometry"
+        )
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
@@ -630,21 +653,19 @@ def sparse_ragged_paged_attention(
     max_num_seqs = cu_q_lens.shape[0] - 1
 
     def run_mla_kernel(
-            q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-            # [num_tokens, topk * WORD_BYTES, TILE_LANE_BYTES] (gathered raw tiles)
+        q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
+        # [num_tokens, topk * WORD_BYTES, TILE_LANE_BYTES] (gathered raw tiles)
         cache_kv_nope: jax.Array,
-            cache_kv_rope: jax.
-        Array,  # [num_tokens, topk, rope_dim] (gathered)
-            kv_lens: jax.Array,  # i32[max_num_tokens]
-            start_seq_idx: jax.Array,  # i32
-            end_seq_idx: jax.Array,  # i32
-            kernel_batch_size: int,
-            lse: jax.Array
-        | None = None,  # f32[max_num_tokens, num_q_heads, 1]
+        cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
+        kv_lens: jax.Array,  # i32[max_num_tokens]
+        start_seq_idx: jax.Array,  # i32
+        end_seq_idx: jax.Array,  # i32
+        kernel_batch_size: int,
+        lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
     ):
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
-        grid = (cdiv(end_seq_idx - start_seq_idx, batch_size), )
+        grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
@@ -684,21 +705,23 @@ def sparse_ragged_paged_attention(
         ]
         if return_lse:
             scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32))
+                pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32)
+            )
         # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
         # (+ blse when the log-sum-exp is exported).
-        scratch_shapes.append(
-            pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
+        scratch_shapes.append(pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
 
         scalar_prefetches = (
             kv_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
-            jnp.zeros((2, ), jnp.int32),
+            jnp.zeros((2,), jnp.int32),
         )
 
-        scope_name = (f"MLA-{cache_layout}-p_{cache_kv_rope.shape[1]}-"
-                      f"bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}")
+        scope_name = (
+            f"MLA-{cache_layout}-p_{cache_kv_rope.shape[1]}-"
+            f"bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
+        )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -717,25 +740,33 @@ def sparse_ragged_paged_attention(
                     scratch_shapes=scratch_shapes,
                 ),
                 compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("arbitrary", ),
+                    dimension_semantics=("arbitrary",),
                     vmem_limit_bytes=vmem_limit_bytes,
                     disable_bounds_checks=True,
                 ),
-                out_shape=([
-                    jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                    jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
-                ] if return_lse else jax.ShapeDtypeStruct(shape=q.shape,
-                                                          dtype=q.dtype)),
-                input_output_aliases=({
-                    3: 0,
-                    6: 1,
-                } if return_lse else {
-                    # 3 = q; operand indices count the scalar prefetches
-                    # (DSV4's "4" also counted attention_sinks).
-                    3: 0,  # Alias output activation with q
-                }),
+                out_shape=(
+                    [
+                        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                        jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
+                    ]
+                    if return_lse
+                    else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+                ),
+                input_output_aliases=(
+                    {
+                        3: 0,
+                        6: 1,
+                    }
+                    if return_lse
+                    else {
+                        # 3 = q; operand indices count the scalar prefetches
+                        # (DSV4's "4" also counted attention_sinks).
+                        3: 0,  # Alias output activation with q
+                    }
+                ),
                 name=scope_name,
-            ))
+            )
+        )
         operands = [q, cache_kv_nope, cache_kv_rope]
         if return_lse:
             operands.append(lse)
@@ -746,46 +777,49 @@ def sparse_ragged_paged_attention(
     if q.shape[0] != topk_indices.shape[0]:
         raise ValueError(
             f"q tokens ({q.shape[0]}) must match topk_indices tokens "
-            f"({topk_indices.shape[0]})")
+            f"({topk_indices.shape[0]})"
+        )
     topk = topk_indices.shape[-1]
     if sparsecore_layout and topk % native_sc_gather.ROPE_PACKING != 0:
         raise ValueError(
             f"topk ({topk}) must be a multiple of "
-            f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing")
+            f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing"
+        )
 
     # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
     is_padding = topk_indices == -1
-    flat_element_index = jnp.arange(q.shape[0] * topk,
-                                    dtype=jnp.int32).reshape(q.shape[0], topk)
+    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
+        q.shape[0], topk
+    )
     if page_indices is not None:
         num_page_indices = page_indices.shape[0]
         if num_page_indices % max_num_seqs != 0:
             raise ValueError(
                 f"page_indices size ({num_page_indices}) must be divisible by "
-                f"the sequence count ({max_num_seqs})")
+                f"the sequence count ({max_num_seqs})"
+            )
         tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-        seq_ids_segment = jnp.repeat(jnp.arange(max_num_seqs),
-                                     tokens_per_seq,
-                                     total_repeat_length=q.shape[0])
+        seq_ids_segment = jnp.repeat(
+            jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
+        )
         seq_page_ids = topk_indices // page_size
         token_offset = topk_indices % page_size
-        page_ids = gather_page_ids(page_indices, seq_page_ids, seq_ids_segment,
-                                   max_num_seqs)
+        page_ids = gather_page_ids(
+            page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+        )
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
         total_num_pages = cache_kv_nope.shape[0]
         scattered_page_ids = (flat_element_index * 104729) % total_num_pages
         scattered_token_offset = (flat_element_index * 15485863) % page_size
         page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-        token_offset = jnp.where(is_padding, scattered_token_offset,
-                                 token_offset)
+        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
         physical_indices = page_ids * page_size + token_offset
     else:
         total_tokens = cache_kv_nope.shape[0] * page_size
         scattered_physical = (flat_element_index * 15485863) % total_tokens
-        physical_indices = jnp.where(is_padding, scattered_physical,
-                                     topk_indices)
+        physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
@@ -793,9 +827,13 @@ def sparse_ragged_paged_attention(
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
-    lse = (jnp.full((q.shape[0], num_q_heads, 1),
-                    jnp.finfo(jnp.float32).min,
-                    dtype=jnp.float32) if return_lse else None)
+    lse = (
+        jnp.full(
+            (q.shape[0], num_q_heads, 1), jnp.finfo(jnp.float32).min, dtype=jnp.float32
+        )
+        if return_lse
+        else None
+    )
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -804,22 +842,25 @@ def sparse_ragged_paged_attention(
         indices = physical_indices[start_pos:end_pos]
 
         # Batching
-        kernel_batch_size = _largest_divisor(chunk_size,
-                                             attention_kernel_batch_size)
+        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
         assert chunk_size % kernel_batch_size == 0
         # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
         # steps, so `batch_end - start_pos` MUST be a multiple of
         # `kernel_batch_size`.
-        batch_end = start_pos + (cdiv(
-            jnp.maximum(
-                0,
-                jnp.minimum(
-                    cu_q_lens[distribution[2]],
-                    end_pos,
-                ) - start_pos,
-            ),
-            kernel_batch_size,
-        ) * kernel_batch_size)
+        batch_end = start_pos + (
+            cdiv(
+                jnp.maximum(
+                    0,
+                    jnp.minimum(
+                        cu_q_lens[distribution[2]],
+                        end_pos,
+                    )
+                    - start_pos,
+                ),
+                kernel_batch_size,
+            )
+            * kernel_batch_size
+        )
         num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
         # For prefilling of short sequences (or early in the sequence), there are
@@ -841,11 +882,12 @@ def sparse_ragged_paged_attention(
                     atoms_per_batch=sparsecore_atoms_per_batch,
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
-                ))
-            gathered_nope_buffer = gathered_nope_buffer.reshape(
-                chunk_size, topk, 128)
+                )
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
             gathered_rope_buffer = gathered_rope_buffer.reshape(
-                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128)
+                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+            )
         else:
             gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
                 cache_kv_nope,
@@ -858,8 +900,7 @@ def sparse_ragged_paged_attention(
                 topk * kv_cache_utils.WORD_BYTES,
                 kv_cache_utils.TILE_LANE_BYTES,
             )
-            gathered_rope_buffer = gathered_rope_buffer.reshape(
-                chunk_size, topk, -1)
+            gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk, -1)
         # We treat each query token as a one independent sequence, attend to their
         # respective gathered kv tokens in the `gathered_kv_buffer`.
         # -1 in topk_indices is padded elements at the end of each row.

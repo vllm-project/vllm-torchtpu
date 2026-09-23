@@ -315,6 +315,12 @@ class StructuredDecodingManager:
                               grammar_bitmask: torch.Tensor,
                               arange: torch.Tensor) -> torch.Tensor:
         assert logits.shape[0] == grammar_bitmask.shape[0]
+        target_dim = logits.shape[-1]
+        if target_dim < self.vocab_size:
+            raise ValueError(
+                f"TPU logits vocab dimension must be at least vocab_size ({self.vocab_size}) "
+                f"(padded to hardware alignment boundary), but got logits.shape[-1]={target_dim}"
+            )
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
         # arange: (32,)
@@ -326,4 +332,10 @@ class StructuredDecodingManager:
         # (B, N * 32) -> (B, vocab_size)
         unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0],
                                                     -1)[:, :self.vocab_size]
+        if target_dim > self.vocab_size:
+            unpacked_bitmask = torch.nn.functional.pad(
+                unpacked_bitmask,
+                (0, target_dim - self.vocab_size),
+                value=True,
+            )
         return torch.where(unpacked_bitmask, float("-inf"), logits)

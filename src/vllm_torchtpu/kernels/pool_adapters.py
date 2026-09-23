@@ -30,6 +30,7 @@ unaligned ranges decompose into aligned gcd-sized chunks. Scatters alias
 the pool in place (`input_output_aliases`); the unwritten complement is
 preserved via the HBM alias, with no read-modify-write.
 """
+
 import math
 
 import jax
@@ -70,7 +71,7 @@ def _bitcast_payload(payload: tuple[int, ...], pool_dtype, out_dtype):
         return payload
     last = payload[-1] * elem_in
     assert last % elem_out == 0, (payload, pool_dtype, out_dtype)
-    return payload[:-1] + (last // elem_out, )
+    return payload[:-1] + (last // elem_out,)
 
 
 def _rescale_rows(rows: int, pool_dtype, out_dtype) -> int:
@@ -88,14 +89,16 @@ def _out_rows(payload: tuple[int, ...], ntok: int) -> int:
     return rows
 
 
-def gather_region(pool,
-                  state_indices,
-                  *,
-                  tok0: int,
-                  ntok: int,
-                  out_dtype,
-                  out_lanes: int | None = None,
-                  split: int = 1):
+def gather_region(
+    pool,
+    state_indices,
+    *,
+    tok0: int,
+    ntok: int,
+    out_dtype,
+    out_lanes: int | None = None,
+    split: int = 1,
+):
     """Per-request typed read of a pool token-range.
 
     ``split`` > 1 addresses a MANAGER-block token range on a pool born at
@@ -119,24 +122,29 @@ def gather_region(pool,
     if split > 1:
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
-            return _gather_window(pool,
-                                  state_indices,
-                                  split=split,
-                                  kb0=tok0 // kernel_bs,
-                                  nblocks=ntok // kernel_bs,
-                                  out_dtype=out_dtype,
-                                  out_lanes=out_lanes)
+            return _gather_window(
+                pool,
+                state_indices,
+                split=split,
+                kb0=tok0 // kernel_bs,
+                nblocks=ntok // kernel_bs,
+                out_dtype=out_dtype,
+                out_lanes=out_lanes,
+            )
         kb, local0 = divmod(tok0, kernel_bs)
         if local0 + ntok > kernel_bs:
             raise NotImplementedError(
                 "region partially straddles kernel blocks: "
-                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
-        return gather_region(pool,
-                             state_indices * split + kb,
-                             tok0=local0,
-                             ntok=ntok,
-                             out_dtype=out_dtype,
-                             out_lanes=out_lanes)
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}"
+            )
+        return gather_region(
+            pool,
+            state_indices * split + kb,
+            tok0=local0,
+            ntok=ntok,
+            out_dtype=out_dtype,
+            out_lanes=out_lanes,
+        )
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
@@ -150,8 +158,9 @@ def gather_region(pool,
     g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
     chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
-    out_payload = (payload if same_dtype else _bitcast_payload(
-        payload, pool.dtype, out_dtype))
+    out_payload = (
+        payload if same_dtype else _bitcast_payload(payload, pool.dtype, out_dtype)
+    )
     out_rows = _out_rows(out_payload, g)
     if not payload and not same_dtype:
         # 3-D pool: the block ref is 2-D and the bitcast rescales the
@@ -163,39 +172,40 @@ def gather_region(pool,
         lane_split = lanes // out_lanes
         out_rows *= lane_split
     o_lanes = lanes // lane_split
-    pad = (0, ) * (len(payload) + 1)
+    pad = (0,) * (len(payload) + 1)
 
     def _kernel(sidx_ref, pool_ref, o_ref):
-        o_ref[...] = typed_ldst.load_typed(pool_ref.at[0],
-                                           view_dtype=out_dtype,
-                                           lane_split=lane_split)[None]
+        o_ref[...] = typed_ldst.load_typed(
+            pool_ref.at[0], view_dtype=out_dtype, lane_split=lane_split
+        )[None]
 
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na * chunks, ),
+            grid=(na * chunks,),
             in_specs=[
-                pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
-                             (s[p // chunks], (tok0 +
-                                               (p % chunks) * g) // g) + pad)
+                pl.BlockSpec(
+                    (1, g) + payload + (lanes,),
+                    lambda p, s: (s[p // chunks], (tok0 + (p % chunks) * g) // g) + pad,
+                )
             ],
-            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s:
-                                   (p, 0, 0)),
+            out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s: (p, 0, 0)),
         ),
-        out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes),
-                                       out_dtype),
+        out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes), out_dtype),
     )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
 
 
-def _gather_window(pool,
-                   mgr_indices,
-                   *,
-                   split: int,
-                   kb0: int,
-                   nblocks: int,
-                   out_dtype,
-                   out_lanes: int | None = None):
+def _gather_window(
+    pool,
+    mgr_indices,
+    *,
+    split: int,
+    kb0: int,
+    nblocks: int,
+    out_dtype,
+    out_lanes: int | None = None,
+):
     """Typed read of `nblocks` whole kernel blocks inside each request's
     manager block, one grid step and ONE DMA window per request.
 
@@ -210,8 +220,9 @@ def _gather_window(pool,
     na = mgr_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(out_dtype)
-    out_payload = (payload if same_dtype else _bitcast_payload(
-        payload, pool.dtype, out_dtype))
+    out_payload = (
+        payload if same_dtype else _bitcast_payload(payload, pool.dtype, out_dtype)
+    )
     rows_pb = _out_rows(out_payload, block_size)
     if not payload and not same_dtype:
         rows_pb = _rescale_rows(block_size, pool.dtype, out_dtype)
@@ -221,34 +232,34 @@ def _gather_window(pool,
         lane_split = lanes // out_lanes
         rows_pb *= lane_split
     o_lanes = lanes // lane_split
-    pad = (0, ) * (len(payload) + 1)
+    pad = (0,) * (len(payload) + 1)
 
     def _kernel(sidx_ref, pool_ref, o_ref):
         for j in range(nblocks):
-            o_ref[0, j * rows_pb:(j + 1) *
-                  rows_pb, :] = (typed_ldst.load_typed(pool_ref.at[kb0 + j],
-                                                       view_dtype=out_dtype,
-                                                       lane_split=lane_split))
+            o_ref[0, j * rows_pb : (j + 1) * rows_pb, :] = typed_ldst.load_typed(
+                pool_ref.at[kb0 + j], view_dtype=out_dtype, lane_split=lane_split
+            )
 
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na,),
             in_specs=[
-                pl.BlockSpec((split, block_size) + payload + (lanes, ),
-                             lambda i, s: (s[i], 0) + pad)
+                pl.BlockSpec(
+                    (split, block_size) + payload + (lanes,),
+                    lambda i, s: (s[i], 0) + pad,
+                )
             ],
-            out_specs=pl.BlockSpec((1, nblocks * rows_pb, o_lanes),
-                                   lambda i, s: (i, 0, 0)),
+            out_specs=pl.BlockSpec(
+                (1, nblocks * rows_pb, o_lanes), lambda i, s: (i, 0, 0)
+            ),
         ),
-        out_shape=jax.ShapeDtypeStruct((na, nblocks * rows_pb, o_lanes),
-                                       out_dtype),
+        out_shape=jax.ShapeDtypeStruct((na, nblocks * rows_pb, o_lanes), out_dtype),
     )(mgr_indices, pool)
 
 
-def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
-                    nblocks: int):
+def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: int):
     """Typed write of `nblocks` whole kernel blocks inside each request's
     manager block (in place), one grid step per request; vals is the
     gather shape. The aliased output window covers the whole
@@ -259,8 +270,9 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
     na = mgr_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
-    val_payload = (payload if same_dtype else _bitcast_payload(
-        payload, pool.dtype, vals.dtype))
+    val_payload = (
+        payload if same_dtype else _bitcast_payload(payload, pool.dtype, vals.dtype)
+    )
     rows_pb = _out_rows(val_payload, block_size)
     if not payload and not same_dtype:
         rows_pb = _rescale_rows(block_size, pool.dtype, vals.dtype)
@@ -270,18 +282,22 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
         assert lanes % v_lanes == 0, (lanes, v_lanes)
         lane_split = lanes // v_lanes
     v_rows_pb = rows_pb * lane_split
-    assert vals.shape == (na, nblocks * v_rows_pb,
-                          v_lanes), (vals.shape, nblocks, v_rows_pb, v_lanes)
-    pad = (0, ) * (len(payload) + 1)
+    assert vals.shape == (na, nblocks * v_rows_pb, v_lanes), (
+        vals.shape,
+        nblocks,
+        v_rows_pb,
+        v_lanes,
+    )
+    pad = (0,) * (len(payload) + 1)
 
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
         for j in range(split):
             if kb0 <= j < kb0 + nblocks:
                 typed_ldst.store_typed(
                     pool_out_ref.at[j],
-                    val_ref[0, (j - kb0) * v_rows_pb:(j - kb0 + 1) *
-                            v_rows_pb, :],
-                    lane_split=lane_split)
+                    val_ref[0, (j - kb0) * v_rows_pb : (j - kb0 + 1) * v_rows_pb, :],
+                    lane_split=lane_split,
+                )
             else:
                 # full-write rule: pass the untouched kernel blocks through
                 pool_out_ref.at[j][...] = pool_in_ref.at[j][...]
@@ -290,28 +306,24 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int,
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na,),
             in_specs=[
-                pl.BlockSpec((1, nblocks * v_rows_pb, v_lanes), lambda i, s:
-                             (i, 0, 0)),
-                pl.BlockSpec((split, block_size) + payload + (lanes, ),
-                             lambda i, s: (s[i], 0) + pad),
+                pl.BlockSpec((1, nblocks * v_rows_pb, v_lanes), lambda i, s: (i, 0, 0)),
+                pl.BlockSpec(
+                    (split, block_size) + payload + (lanes,),
+                    lambda i, s: (s[i], 0) + pad,
+                ),
             ],
-            out_specs=pl.BlockSpec((split, block_size) + payload + (lanes, ),
-                                   lambda i, s: (s[i], 0) + pad),
+            out_specs=pl.BlockSpec(
+                (split, block_size) + payload + (lanes,), lambda i, s: (s[i], 0) + pad
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(mgr_indices, vals, pool)
 
 
-def scatter_region(pool,
-                   vals,
-                   state_indices,
-                   *,
-                   tok0: int,
-                   ntok: int,
-                   split: int = 1):
+def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: int = 1):
     """Per-request typed write of a pool token-range (in place); mirrors
     ``gather_region`` including the ``split`` manager-range routing.
 
@@ -323,22 +335,23 @@ def scatter_region(pool,
     if split > 1:
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
-            return _scatter_window(pool,
-                                   vals,
-                                   state_indices,
-                                   split=split,
-                                   kb0=tok0 // kernel_bs,
-                                   nblocks=ntok // kernel_bs)
+            return _scatter_window(
+                pool,
+                vals,
+                state_indices,
+                split=split,
+                kb0=tok0 // kernel_bs,
+                nblocks=ntok // kernel_bs,
+            )
         kb, local0 = divmod(tok0, kernel_bs)
         if local0 + ntok > kernel_bs:
             raise NotImplementedError(
                 "region partially straddles kernel blocks: "
-                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}")
-        return scatter_region(pool,
-                              vals,
-                              state_indices * split + kb,
-                              tok0=local0,
-                              ntok=ntok)
+                f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}"
+            )
+        return scatter_region(
+            pool, vals, state_indices * split + kb, tok0=local0, ntok=ntok
+        )
 
     na = state_indices.shape[0]
     block_size, payload, lanes = _pool_geometry(pool)
@@ -348,8 +361,9 @@ def scatter_region(pool,
     g = ntok if tok0 % ntok == 0 else math.gcd(tok0, ntok)
     chunks = ntok // g
     same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
-    val_payload = (payload if same_dtype else _bitcast_payload(
-        payload, pool.dtype, vals.dtype))
+    val_payload = (
+        payload if same_dtype else _bitcast_payload(payload, pool.dtype, vals.dtype)
+    )
     out_rows = _out_rows(val_payload, g)
     if not payload and not same_dtype:
         out_rows = _rescale_rows(g, pool.dtype, vals.dtype)
@@ -361,30 +375,32 @@ def scatter_region(pool,
         assert lanes % v_lanes == 0, (lanes, v_lanes)
         lane_split = lanes // v_lanes
     v_rows = out_rows * lane_split
-    assert vals.shape == (na, chunks * v_rows,
-                          v_lanes), (vals.shape, chunks * v_rows, v_lanes)
-    pad = (0, ) * (len(payload) + 1)
+    assert vals.shape == (na, chunks * v_rows, v_lanes), (
+        vals.shape,
+        chunks * v_rows,
+        v_lanes,
+    )
+    pad = (0,) * (len(payload) + 1)
 
     def _kernel(sidx_ref, val_ref, pool_in_ref, pool_out_ref):
         # The output block covers exactly the region chunk and is fully
         # written; the complement is preserved via the HBM alias.
-        typed_ldst.store_typed(pool_out_ref.at[0],
-                               val_ref[0],
-                               lane_split=lane_split)
+        typed_ldst.store_typed(pool_out_ref.at[0], val_ref[0], lane_split=lane_split)
 
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na * chunks, ),
+            grid=(na * chunks,),
             in_specs=[
                 pl.BlockSpec((1, v_rows, v_lanes), lambda p, s: (p, 0, 0)),
                 # Aliased with the output; never read, so leave it in HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec((1, g) + payload + (lanes, ), lambda p, s:
-                                   (s[p // chunks],
-                                    (tok0 + (p % chunks) * g) // g) + pad),
+            out_specs=pl.BlockSpec(
+                (1, g) + payload + (lanes,),
+                lambda p, s: (s[p // chunks], (tok0 + (p % chunks) * g) // g) + pad,
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
@@ -400,8 +416,8 @@ def copy_blocks(pool, src_indices, dst_indices):
     no-ops used as padding.
     """
     na = src_indices.shape[0]
-    block_shape = (1, ) + pool.shape[1:]
-    pad = (0, ) * (pool.ndim - 1)
+    block_shape = (1,) + pool.shape[1:]
+    pad = (0,) * (pool.ndim - 1)
 
     def _copy_kernel(src_ref, dst_ref, pool_in_ref, pool_out_ref):
         pool_out_ref[...] = pool_in_ref[...]
@@ -410,20 +426,18 @@ def copy_blocks(pool, src_indices, dst_indices):
         _copy_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(na, ),
-            in_specs=[
-                pl.BlockSpec(block_shape, lambda i, s, d: (s[i], ) + pad)
-            ],
-            out_specs=pl.BlockSpec(block_shape, lambda i, s, d:
-                                   (d[i], ) + pad),
+            grid=(na,),
+            in_specs=[pl.BlockSpec(block_shape, lambda i, s, d: (s[i],) + pad)],
+            out_specs=pl.BlockSpec(block_shape, lambda i, s, d: (d[i],) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(src_indices, dst_indices, pool)
 
 
-def _conv_qk_pair_rows_perm(taps: int, conv_dim: int, n_v: int, d_v: int,
-                            lanes: int) -> tuple[int, ...] | None:
+def _conv_qk_pair_rows_perm(
+    taps: int, conv_dim: int, n_v: int, d_v: int, lanes: int
+) -> tuple[int, ...] | None:
     """Typed-row permutation for the QK pair-blocked pooled conv layout.
 
     Stored order per tap interleaves Q and K row-pairs —
@@ -441,11 +455,12 @@ def _conv_qk_pair_rows_perm(taps: int, conv_dim: int, n_v: int, d_v: int,
         raise NotImplementedError(
             "QK pair-blocked conv layout requires lane-aligned equal Q/K "
             f"segments: conv_dim={conv_dim}, n_v*d_v={v_elems}, "
-            f"lanes={lanes}")
+            f"lanes={lanes}"
+        )
     if v_elems % lanes:
         raise NotImplementedError(
-            f"QK pair-blocked conv layout requires lane-aligned V: "
-            f"{v_elems} % {lanes}")
+            f"QK pair-blocked conv layout requires lane-aligned V: {v_elems} % {lanes}"
+        )
     q_rows = q_elems // lanes
     v_rows = v_elems // lanes
     rows_per_tap = conv_dim // lanes
@@ -461,19 +476,20 @@ def _conv_qk_pair_rows_perm(taps: int, conv_dim: int, n_v: int, d_v: int,
 
 
 def v3_state_source(
-        pool,
-        *,
-        split: int,
-        ssm_ntok: int,
-        conv_tok0: int,
-        conv_ntok: int,
-        conv_dim: int,
-        n_v: int,
-        d_k: int,
-        d_v: int,
-        kernel_size: int,
-        recurrent_state_dtype: jnp.dtype = jnp.float32,
-        qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
+    pool,
+    *,
+    split: int,
+    ssm_ntok: int,
+    conv_tok0: int,
+    conv_ntok: int,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
+    qk_pair_layout: bool = False,
+) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -507,10 +523,14 @@ def v3_state_source(
     # The SSM region may extend past the typed state bytes when the state does
     # not divide the pool token row; the kernel truncates loads to rows_used
     # and zero-fills the padding rows on store.
-    assert ssm_ntok * tok_bytes >= (
-        ssm_elements * recurrent_state_dtype.itemsize), (ssm_ntok, tok_bytes,
-                                                         n_v, d_k, d_v,
-                                                         recurrent_state_dtype)
+    assert ssm_ntok * tok_bytes >= (ssm_elements * recurrent_state_dtype.itemsize), (
+        ssm_ntok,
+        tok_bytes,
+        n_v,
+        d_k,
+        d_v,
+        recurrent_state_dtype,
+    )
     if ssm_ntok % block_size == 0:
         ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
     else:
@@ -550,22 +570,29 @@ def v3_state_source(
     if row0 + conv_ntok > block_size:
         raise NotImplementedError(
             "conv region partially straddles kernel blocks: "
-            f"tok0={conv_tok0} ntok={conv_ntok} kernel_block={block_size}")
-    assert conv_tok0 + conv_ntok <= split * block_size, (conv_tok0, conv_ntok,
-                                                         split, block_size)
-    assert (kernel_size - 1) * conv_dim % lanes == 0, (kernel_size, conv_dim,
-                                                       lanes)
+            f"tok0={conv_tok0} ntok={conv_ntok} kernel_block={block_size}"
+        )
+    assert conv_tok0 + conv_ntok <= split * block_size, (
+        conv_tok0,
+        conv_ntok,
+        split,
+        block_size,
+    )
+    assert (kernel_size - 1) * conv_dim % lanes == 0, (kernel_size, conv_dim, lanes)
     # The kernel regroups conv rows into (kernel_size - 1, conv_dim) via
     # 128-aligned lane concat, which needs whole rows per conv row.
     assert conv_dim % lanes == 0, (conv_dim, lanes)
     conv_rows = (kernel_size - 1) * conv_dim // lanes
-    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (conv_rows,
-                                                            conv_ntok,
-                                                            tok_bytes)
+    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
+        conv_rows,
+        conv_ntok,
+        tok_bytes,
+    )
     conv_rows_perm = None
     if qk_pair_layout:
-        conv_rows_perm = _conv_qk_pair_rows_perm(kernel_size - 1, conv_dim,
-                                                 n_v, d_v, lanes)
+        conv_rows_perm = _conv_qk_pair_rows_perm(
+            kernel_size - 1, conv_dim, n_v, d_v, lanes
+        )
     conv = gdn_v3_config.StateRegion(
         kb0=kb0,
         nblocks=1,

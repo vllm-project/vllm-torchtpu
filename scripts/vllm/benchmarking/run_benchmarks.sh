@@ -245,6 +245,15 @@ start_vllm_server() {
     # block_size=16 and benchmarks regress ~12% (see PR #191 / 9467829).
     local attn_backend="${ATTENTION_BACKEND:-CUSTOM}"
     extra_args="$extra_args --attention-backend $attn_backend"
+    # One API frontend, not one per DP rank: vLLM's default for DP starts a
+    # frontend per rank, and they race resolving the model into the loader
+    # cache - a losing frontend dies without binding (DSv4-Flash, and GLM-5.2
+    # in dev build 164). Topology rather than model, so it lives here rather
+    # than in each config. Ahead of EXTRA_SERVE_ARGS so a config can still
+    # override it.
+    if [ "${DATA_PARALLELISM:-1}" -gt 1 ]; then
+        extra_args="$extra_args --api-server-count=1"
+    fi
     if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
         extra_args="$extra_args $EXTRA_SERVE_ARGS"
     fi

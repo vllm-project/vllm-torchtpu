@@ -45,11 +45,14 @@ def scatter(
     """
     assert cache.shape == spec.shape and cache.dtype == spec.jax_dtype, (
         f"cache {cache.shape} {cache.dtype} does not match spec"
-        f" {spec.shape} {spec.jax_dtype}")
+        f" {spec.shape} {spec.jax_dtype}"
+    )
     if dst_rows is None:
-        assert (seq_lens is not None and block_tables is not None
-                and query_start_loc
-                is not None), "pass dst_rows or the addressing arrays"
+        assert (
+            seq_lens is not None
+            and block_tables is not None
+            and query_start_loc is not None
+        ), "pass dst_rows or the addressing arrays"
         dst_rows = kv_cache_utils.get_dst_rows(
             num_tokens=values.shape[0],
             seq_lens=seq_lens,

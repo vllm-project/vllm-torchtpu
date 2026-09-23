@@ -54,10 +54,9 @@ export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="NEW_MODEL_DESIGN,MODEL_IMPL_TYPE,MOE_REQ
 export TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE=1
 SERVER_READY_WAIT_MIN=240
 
-# api-server-count=1: DP frontends race resolving a gs:// model.
 # memory_limit: unbounded streamer buffers got weight load OOM-killed at
 # 897.8 GiB of 945.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --model-loader-extra-config={\"memory_limit\":4294967296,\"concurrency\":8} --enable-ep-weight-filter --safetensors-load-strategy=prefetch --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Pro-0813\"}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--model-loader-extra-config={\"memory_limit\":4294967296,\"concurrency\":8} --enable-ep-weight-filter --safetensors-load-strategy=prefetch --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Pro-0813\"}"
 
 export CAPTURE_PROFILE="${CAPTURE_PROFILE:-1}"
 export USE_PHASED_PROFILER="$CAPTURE_PROFILE"

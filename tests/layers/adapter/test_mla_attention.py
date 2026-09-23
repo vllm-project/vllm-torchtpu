@@ -21,12 +21,15 @@ from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import (
-    PallasMLAttentionBackend, PallasMLAttentionBackendImpl)
+    PallasMLAttentionBackend,
+    PallasMLAttentionBackendImpl,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
-    VllmMLAAttention, VllmMultiHeadLatentAttentionWrapper)
+    VllmMLAAttention,
+    VllmMultiHeadLatentAttentionWrapper,
+)
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-    VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
@@ -56,25 +59,26 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     k_rope = jnp.ones((num_tokens, r_dim), dtype=jnp.bfloat16)
     cache = jnp.zeros(
         (num_blocks, page_size_per_packing, kv_packing, lkv_dim + 128),
-        dtype=jnp.float8_e4m3fn)
+        dtype=jnp.float8_e4m3fn,
+    )
 
     md = SimpleNamespace(
         seq_lens=jnp.array([5, 5], dtype=jnp.int32),
-        block_tables=jnp.zeros((18, ), dtype=jnp.int32),
+        block_tables=jnp.zeros((18,), dtype=jnp.int32),
         query_start_loc=jnp.array([0, 5, 10], dtype=jnp.int32),
         request_distribution=jnp.array([0, 0, 2], dtype=jnp.int32),
     )
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model", ))
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
 
-    expected_kernel_out = jnp.full((num_heads, num_tokens, lkv_dim),
-                                   0.5,
-                                   dtype=jnp.bfloat16)
+    expected_kernel_out = jnp.full(
+        (num_heads, num_tokens, lkv_dim), 0.5, dtype=jnp.bfloat16
+    )
     expected_new_cache = cache
 
-    mock_mla_kernel = MagicMock(return_value=(expected_kernel_out,
-                                              expected_new_cache))
-    monkeypatch.setattr(attention_interface, "mla_ragged_paged_attention",
-                        mock_mla_kernel)
+    mock_mla_kernel = MagicMock(return_value=(expected_kernel_out, expected_new_cache))
+    monkeypatch.setattr(
+        attention_interface, "mla_ragged_paged_attention", mock_mla_kernel
+    )
 
     # 1. Unset env vars (None): falls back to mixed_tuned from get_tuned_params
     monkeypatch.setattr(envs, "MIXED_Q_SPLIT", None)
@@ -128,8 +132,7 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
 def test_pallas_mla_attention_backend():
     assert PallasMLAttentionBackend.get_name() == "FLASH_ATTN_MLA"
     assert PallasMLAttentionBackend.is_mla() is True
-    assert PallasMLAttentionBackend.get_impl_cls(
-    ) == PallasMLAttentionBackendImpl
+    assert PallasMLAttentionBackend.get_impl_cls() == PallasMLAttentionBackendImpl
 
     # Test get_kv_cache_shape with auto
     shape_auto = PallasMLAttentionBackend.get_kv_cache_shape(
@@ -153,7 +156,8 @@ def test_pallas_mla_attention_backend():
 
     # Test page size bytes
     page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-        block_size=16, num_kv_heads=1, head_size=576, cache_dtype_str="fp8")
+        block_size=16, num_kv_heads=1, head_size=576, cache_dtype_str="fp8"
+    )
     assert page_size == 10240
 
 
@@ -197,8 +201,8 @@ def test_tpu_platform_mla_backend():
     attn_selector_config = MagicMock()
     attn_selector_config.use_mla = True
     cls_name = TpuPlatform.get_attn_backend_cls(
-        selected_backend=MagicMock(),
-        attn_selector_config=attn_selector_config)
+        selected_backend=MagicMock(), attn_selector_config=attn_selector_config
+    )
     assert cls_name == "vllm_torchtpu.layers.adapter.attention.PallasMLAttentionBackend"
 
 
@@ -210,16 +214,18 @@ def test_vllm_fp8_linear_method_tpu():
 
     layer = MagicMock()
     layer.weight = torch.ones(128, 128)
-    with patch(
-            "vllm_torchtpu.layers.adapter.quantization.fp8.replace_parameter"
-    ), patch(
-            "vllm_torchtpu.layers.adapter.quantization.fp8.synchronize_tensors"
-    ), patch(
+    with (
+        patch("vllm_torchtpu.layers.adapter.quantization.fp8.replace_parameter"),
+        patch("vllm_torchtpu.layers.adapter.quantization.fp8.synchronize_tensors"),
+        patch(
             "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
-            return_value=0
-    ), patch(
+            return_value=0,
+        ),
+        patch(
             "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
-            return_value=1):
+            return_value=1,
+        ),
+    ):
         method.create_weights(
             layer,
             input_size=128,
@@ -240,8 +246,8 @@ def test_vllm_mla_attention_init():
         self.layer_name = "model.layers.0.attn"
 
     with patch(
-            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
-            mock_mla_init,
+        "vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
+        mock_mla_init,
     ):
         attn = VllmMLAAttention(
             num_heads=16,
@@ -274,8 +280,8 @@ def test_vllm_multi_head_latent_attention_wrapper():
     mla_modules.is_sparse = False
 
     with patch(
-            "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmMLAAttention.__init__",
-            return_value=None,
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmMLAAttention.__init__",
+        return_value=None,
     ) as mock_mla_init:
         wrapper = VllmMultiHeadLatentAttentionWrapper(
             hidden_size=1024,
@@ -292,13 +298,13 @@ def test_vllm_multi_head_latent_attention_wrapper():
         )
         assert wrapper.hidden_size == 1024
         assert wrapper.num_heads == 16
-        assert mock_mla_init.call_args.kwargs[
-            "non_causal_multi_token_decode"] is True
+        assert mock_mla_init.call_args.kwargs["non_causal_multi_token_decode"] is True
 
 
 def test_mla_wrapper_rope_preserves_activation_dtype():
     wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
-        VllmMultiHeadLatentAttentionWrapper)
+        VllmMultiHeadLatentAttentionWrapper
+    )
     torch.nn.Module.__init__(wrapper)
     wrapper.kimi_preprocess = None
     wrapper.q_lora_rank = None
@@ -317,13 +323,11 @@ def test_mla_wrapper_rope_preserves_activation_dtype():
         None,
     )
     wrapper.kv_a_layernorm = lambda value: value
-    wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(),
-                                                         k_pe.float())
+    wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(), k_pe.float())
     wrapper.is_sparse = False
     wrapper.g_proj = None
     wrapper.gate_is_fused = False
-    wrapper.mla_attn = MagicMock(
-        return_value=torch.ones((3, 4), dtype=torch.bfloat16))
+    wrapper.mla_attn = MagicMock(return_value=torch.ones((3, 4), dtype=torch.bfloat16))
     wrapper.o_proj = lambda value: (value, None)
 
     hidden_states = torch.ones((3, 8), dtype=torch.bfloat16)
@@ -381,7 +385,7 @@ def test_pallas_mla_backend_impl():
     layer.v_head_dim = 128
     q_nope = torch.ones((4, 16 * 128))
     q_pe = torch.ones((4, 16 * 64))
-    empty_kv_cache = torch.empty((0, ))
+    empty_kv_cache = torch.empty((0,))
     out = impl.forward(
         layer=layer,
         q=(q_nope, q_pe),
@@ -456,15 +460,26 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     inputs["kv_cache"] = tuple(
         torch.zeros(spec.shape, dtype=spec.torch_dtype)
         for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
-            2, 8, 576, torch.float8_e4m3fn))
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
 
     out = impl.forward(layer=layer, **inputs, topk_indices=topk_indices)
 
     layer.sparse_mla_op.assert_called_once()
     layer.mla_op.assert_not_called()
-    (kv_cache, ql_nope, q_pe, kv_c, k_pe, topk, seq_lens, block_tables,
-     query_start_loc,
-     request_distribution) = layer.sparse_mla_op.call_args.args
+    (
+        kv_cache,
+        ql_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        topk,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ) = layer.sparse_mla_op.call_args.args
 
     assert kv_cache is inputs["kv_cache"]
     assert topk is topk_indices
@@ -475,8 +490,7 @@ def test_mla_forward_sparse_dispatch_and_quantization():
 
     # Absorbed query: ql_nope = q_nope @ W_UK_T (per head), q_pe untouched.
     q_nope_in, q_pe_in = inputs["q"]
-    expected_ql = torch.bmm(q_nope_in.transpose(0, 1),
-                            layer.W_UK_T).transpose(0, 1)
+    expected_ql = torch.bmm(q_nope_in.transpose(0, 1), layer.W_UK_T).transpose(0, 1)
     torch.testing.assert_close(ql_nope, expected_ql)
     torch.testing.assert_close(q_pe, q_pe_in)
 
@@ -484,18 +498,17 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     # the originals up to fp8 rounding).
     assert kv_c.dtype == torch.float8_e4m3fn
     assert k_pe.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(kv_c.float() * k_scale,
-                               inputs["kv_c_normed"],
-                               rtol=0.1,
-                               atol=0.05)
-    torch.testing.assert_close(k_pe.float() * k_scale,
-                               inputs["k_pe"],
-                               rtol=0.1,
-                               atol=0.05)
+    torch.testing.assert_close(
+        kv_c.float() * k_scale, inputs["kv_c_normed"], rtol=0.1, atol=0.05
+    )
+    torch.testing.assert_close(
+        k_pe.float() * k_scale, inputs["k_pe"], rtol=0.1, atol=0.05
+    )
 
     # Output = op result through W_UV, flattened to (T, heads * v_head_dim).
-    expected_out = torch.bmm(op_out.transpose(0, 1),
-                             layer.W_UV).transpose(0, 1).reshape(4, -1)
+    expected_out = (
+        torch.bmm(op_out.transpose(0, 1), layer.W_UV).transpose(0, 1).reshape(4, -1)
+    )
     torch.testing.assert_close(out, expected_out)
 
 
@@ -508,24 +521,32 @@ def test_mla_forward_dense_dispatch_without_topk():
 
     layer.mla_op.assert_called_once()
     layer.sparse_mla_op.assert_not_called()
-    (kv_cache, ql_nope, q_pe, kv_c, k_pe, seq_lens, block_tables,
-     query_start_loc, request_distribution) = layer.mla_op.call_args.args
+    (
+        kv_cache,
+        ql_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ) = layer.mla_op.call_args.args
 
     assert kv_cache is inputs["kv_cache"]
     assert seq_lens is inputs["attn_metadata"].seq_lens
     assert kv_c.dtype == torch.float8_e4m3fn
     assert k_pe.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(kv_c.float() * k_scale,
-                               inputs["kv_c_normed"],
-                               rtol=0.1,
-                               atol=0.05)
-    expected_out = torch.bmm(op_out.transpose(0, 1),
-                             layer.W_UV).transpose(0, 1).reshape(4, -1)
+    torch.testing.assert_close(
+        kv_c.float() * k_scale, inputs["kv_c_normed"], rtol=0.1, atol=0.05
+    )
+    expected_out = (
+        torch.bmm(op_out.transpose(0, 1), layer.W_UV).transpose(0, 1).reshape(4, -1)
+    )
     torch.testing.assert_close(out, expected_out)
 
 
 class _ConstantProjection(torch.nn.Module):
-
     def __init__(self, values):
         super().__init__()
         self.values = torch.tensor(values, dtype=torch.float32)
@@ -535,7 +556,6 @@ class _ConstantProjection(torch.nn.Module):
 
 
 class _IdentityProjection(torch.nn.Module):
-
     def forward(self, inputs):
         return inputs, None
 
@@ -548,7 +568,8 @@ def _gate_modules(gate_mode, q_lora_rank):
         rotary_emb=None,
         o_proj=_IdentityProjection(),
         fused_qkv_a_proj=_ConstantProjection(
-            [1.0] * 5 + (gate if gate_mode == "fused" else [])),
+            [1.0] * 5 + (gate if gate_mode == "fused" else [])
+        ),
         kv_a_proj_with_mqa=_ConstantProjection([1.0] * 3),
         q_a_layernorm=torch.nn.Identity(),
         q_b_proj=_ConstantProjection([1.0] * 3),
@@ -564,15 +585,14 @@ def _gate_modules(gate_mode, q_lora_rank):
 
 
 def _gate_wrapper(modules, q_lora_rank, **kwargs):
-
     class Attention(torch.nn.Module):
-
         def forward(self, q, kv_c_normed, k_pe, **kwargs):
             return torch.ones(kv_c_normed.shape[0], 2)
 
     with patch(
-            "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmTPUMLAAttention",
-            return_value=Attention()):
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmTPUMLAAttention",
+        return_value=Attention(),
+    ):
         return VllmMultiHeadLatentAttentionWrapper(
             hidden_size=4,
             num_heads=1,
@@ -587,24 +607,30 @@ def _gate_wrapper(modules, q_lora_rank, **kwargs):
         )
 
 
-@pytest.mark.parametrize("gate_mode,q_lora_rank", [("none", None), ("none", 2),
-                                                   ("separate", None),
-                                                   ("separate", 2),
-                                                   ("fused", 2)])
+@pytest.mark.parametrize(
+    "gate_mode,q_lora_rank",
+    [("none", None), ("none", 2), ("separate", None), ("separate", 2), ("fused", 2)],
+)
 def test_mla_output_gate_numerics(gate_mode, q_lora_rank):
-    wrapper = _gate_wrapper(_gate_modules(gate_mode, q_lora_rank),
-                            q_lora_rank,
-                            gate_is_fused=gate_mode == "fused")
+    wrapper = _gate_wrapper(
+        _gate_modules(gate_mode, q_lora_rank),
+        q_lora_rank,
+        gate_is_fused=gate_mode == "fused",
+    )
     result = wrapper(torch.arange(3), torch.ones(3, 4))
-    expected = (torch.ones(2)
-                if gate_mode == "none" else torch.tensor([0.0, 2.0]).sigmoid())
+    expected = (
+        torch.ones(2) if gate_mode == "none" else torch.tensor([0.0, 2.0]).sigmoid()
+    )
     torch.testing.assert_close(result, expected.expand(3, -1))
 
 
-@pytest.mark.parametrize("field,value,message", [
-    ("fused_qkv_a_proj", None, "requires fused_qkv_a_proj"),
-    ("g_proj", torch.nn.Identity(), "cannot also use g_proj"),
-])
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("fused_qkv_a_proj", None, "requires fused_qkv_a_proj"),
+        ("g_proj", torch.nn.Identity(), "cannot also use g_proj"),
+    ],
+)
 def test_mla_rejects_invalid_fused_gate_modules(field, value, message):
     modules = _gate_modules("fused", 2)
     setattr(modules, field, value)
@@ -631,8 +657,9 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     attention.kv_b_proj = torch.nn.Module()
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     parameter_name = "weight_packed" if layout == "packed" else "weight"
-    attention.kv_b_proj.register_parameter(parameter_name,
-                                           torch.nn.Parameter(weight.clone()))
+    attention.kv_b_proj.register_parameter(
+        parameter_name, torch.nn.Parameter(weight.clone())
+    )
     if layout == "flipped":
         setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
 
@@ -642,13 +669,15 @@ def test_mla_weight_layout_is_restored_on_error(layout):
         torch.testing.assert_close(observed, expected)
         raise RuntimeError("upstream weight processing failed")
 
-    with patch(
+    with (
+        patch(
             "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
-            side_effect=upstream_process), pytest.raises(
-                RuntimeError, match="upstream weight processing failed"):
+            side_effect=upstream_process,
+        ),
+        pytest.raises(RuntimeError, match="upstream weight processing failed"),
+    ):
         attention.process_weights_after_loading(torch.float32)
-    torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name),
-                               weight)
+    torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
 
 
 def test_mla_flipped_projection_requires_weight():
@@ -660,17 +689,19 @@ def test_mla_flipped_projection_requires_weight():
         attention.process_weights_after_loading(torch.float32)
 
 
-@pytest.mark.parametrize("selected,expected", [("FLASH_ATTN", "FLASH_ATTN"),
-                                               ("FLASHINFER", "FLASH_ATTN")])
-def test_tpu_platform_keeps_the_selected_backend_without_mla(
-        selected, expected):
+@pytest.mark.parametrize(
+    "selected,expected", [("FLASH_ATTN", "FLASH_ATTN"), ("FLASHINFER", "FLASH_ATTN")]
+)
+def test_tpu_platform_keeps_the_selected_backend_without_mla(selected, expected):
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
     TpuPlatform.pre_register_and_update()
     attn_selector_config = MagicMock()
     attn_selector_config.use_mla = False
     cls_name = TpuPlatform.get_attn_backend_cls(
         selected_backend=AttentionBackendEnum[selected],
-        attn_selector_config=attn_selector_config)
+        attn_selector_config=attn_selector_config,
+    )
     assert cls_name == AttentionBackendEnum[expected].get_path()
     assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
 
@@ -682,11 +713,16 @@ def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention.impl = MagicMock()
     attention.impl.forward.return_value = "out"
     q, kv_c_normed, k_pe = torch.zeros(1), torch.zeros(2), torch.zeros(3)
-    with patch.object(torch.ops.vllm, "maybe_calc_kv_scales",
-                      create=True) as calc_scales, patch(
-                          "vllm_torchtpu.layers.adapter.custom_ops."
-                          "mla_attention_op.get_attention_context",
-                          return_value=("meta", None, "cache", None)):
+    with (
+        patch.object(
+            torch.ops.vllm, "maybe_calc_kv_scales", create=True
+        ) as calc_scales,
+        patch(
+            "vllm_torchtpu.layers.adapter.custom_ops."
+            "mla_attention_op.get_attention_context",
+            return_value=("meta", None, "cache", None),
+        ),
+    ):
         assert attention(q, kv_c_normed, k_pe) == "out"
     calc_scales.assert_not_called()
     attention.impl.forward.assert_called_once()

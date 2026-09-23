@@ -10,22 +10,31 @@ import numpy as np
 import torch
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.pcp import \
-    all_gather_equal_tokens as _pcp_all_gather_equal_tokens
+from vllm_torchtpu.distributed.pcp import (
+    all_gather_equal_tokens as _pcp_all_gather_equal_tokens,
+)
 from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 from vllm_torchtpu.distributed.pcp import get_pcp_rank as _get_native_pcp_rank
-from vllm_torchtpu.distributed.pcp import \
-    get_pcp_world_size as _get_native_pcp_world_size
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    build_pcp_logits_indices as _build_pcp_logits_indices
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    pcp_local_token_counts
+from vllm_torchtpu.distributed.pcp import (
+    get_pcp_world_size as _get_native_pcp_world_size,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    build_pcp_logits_indices as _build_pcp_logits_indices,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    pcp_local_token_counts,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, AllSequenceLayoutPlanner,
-    SequenceLayoutDescriptor, SequenceLayoutKind, SequenceLayoutPlan,
-    _first_ge)
+    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+    AllSequenceLayoutPlanner,
+    SequenceLayoutDescriptor,
+    SequenceLayoutKind,
+    SequenceLayoutPlan,
+    _first_ge,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -38,8 +47,9 @@ PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor(
 
 
 def _get_pcp_streaming_q_block_size() -> int:
-    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import \
-        PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+        PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    )
 
     return PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
 
@@ -58,10 +68,11 @@ class PcpRequestSpan:
 
     @property
     def crosses_prompt_boundary(self) -> bool:
-        return (self.scheduled_tokens > 0
-                and self.computed_tokens < self.prompt_tokens
-                and self.computed_tokens + self.scheduled_tokens
-                > self.prompt_tokens)
+        return (
+            self.scheduled_tokens > 0
+            and self.computed_tokens < self.prompt_tokens
+            and self.computed_tokens + self.scheduled_tokens > self.prompt_tokens
+        )
 
 
 @dataclass(frozen=True)
@@ -84,10 +95,10 @@ class PcpSequenceLayoutDecision:
 
 
 class PcpSequenceLayoutEligibility:
-
     _BOUNDARY_MESSAGE = (
         "PCP partial sequence layout does not support prompt/decode "
-        "boundary-crossing schedules yet.")
+        "boundary-crossing schedules yet."
+    )
 
     def __init__(
         self,
@@ -107,8 +118,7 @@ class PcpSequenceLayoutEligibility:
         self.is_kv_producer = is_kv_producer
 
     @classmethod
-    def from_vllm_config(cls,
-                         vllm_config: Any) -> "PcpSequenceLayoutEligibility":
+    def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutEligibility":
         if vllm_config is None:
             return cls()
 
@@ -152,12 +162,10 @@ class PcpSequenceLayoutEligibility:
             start_index=start_index,
             num_reqs=num_reqs,
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-            absolute_query_start_offsets_per_req=(
-                absolute_query_start_offsets_per_req),
+            absolute_query_start_offsets_per_req=(absolute_query_start_offsets_per_req),
         )
 
-        if not self.enabled or not any(span.scheduled_tokens > 0
-                                       for span in spans):
+        if not self.enabled or not any(span.scheduled_tokens > 0 for span in spans):
             return PcpSequenceLayoutDecision(
                 mode=PcpSequenceLayoutMode.DISABLED,
                 spans=spans,
@@ -184,7 +192,8 @@ class PcpSequenceLayoutEligibility:
         if decision.mode is not expected:
             raise NotImplementedError(
                 f"PCP sequence layout mode {decision.mode.value} cannot be "
-                f"used where {expected.value} is required.")
+                f"used where {expected.value} is required."
+            )
 
     def _build_request_spans(
         self,
@@ -198,64 +207,67 @@ class PcpSequenceLayoutEligibility:
     ) -> tuple[PcpRequestSpan, ...]:
         scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
         if scheduled.ndim != 1:
-            raise ValueError(
-                "num_scheduled_tokens_per_req must be a 1D array.")
+            raise ValueError("num_scheduled_tokens_per_req must be a 1D array.")
         if scheduled.size < num_reqs:
             raise ValueError(
-                "num_scheduled_tokens_per_req must cover every request in "
-                "the chunk.")
+                "num_scheduled_tokens_per_req must cover every request in the chunk."
+            )
 
         absolute_query_starts = None
         if absolute_query_start_offsets_per_req is not None:
             absolute_query_starts = np.asarray(
-                absolute_query_start_offsets_per_req, dtype=np.int64)
-            if (absolute_query_starts.ndim != 1
-                    or absolute_query_starts.size < num_reqs):
+                absolute_query_start_offsets_per_req, dtype=np.int64
+            )
+            if absolute_query_starts.ndim != 1 or absolute_query_starts.size < num_reqs:
                 raise ValueError(
                     "absolute_query_start_offsets_per_req must cover every "
-                    "request in the chunk.")
+                    "request in the chunk."
+                )
 
         spans: list[PcpRequestSpan] = []
-        req_ids = input_batch.req_ids[start_index:start_index + num_reqs]
+        req_ids = input_batch.req_ids[start_index : start_index + num_reqs]
         for chunk_offset, req_id in enumerate(req_ids):
             if req_id is None:
                 continue
             req_index = input_batch.req_id_to_index[req_id]
             scheduled_tokens = int(scheduled[chunk_offset])
-            scheduler_tokens = scheduler_output.num_scheduled_tokens.get(
-                req_id)
+            scheduler_tokens = scheduler_output.num_scheduled_tokens.get(req_id)
             if scheduler_tokens is not None:
                 scheduled_tokens = int(scheduler_tokens)
-            computed_tokens = int(
-                input_batch.num_computed_tokens_cpu[req_index])
-            absolute_query_start = (int(absolute_query_starts[chunk_offset])
-                                    if absolute_query_starts is not None else
-                                    computed_tokens)
+            computed_tokens = int(input_batch.num_computed_tokens_cpu[req_index])
+            absolute_query_start = (
+                int(absolute_query_starts[chunk_offset])
+                if absolute_query_starts is not None
+                else computed_tokens
+            )
             spans.append(
                 PcpRequestSpan(
                     computed_tokens=computed_tokens,
                     scheduled_tokens=scheduled_tokens,
-                    prompt_tokens=int(
-                        input_batch.num_prompt_tokens[req_index]),
+                    prompt_tokens=int(input_batch.num_prompt_tokens[req_index]),
                     absolute_query_start=absolute_query_start,
-                ))
+                )
+            )
         return tuple(spans)
 
     def _validate_execution_support(self) -> None:
         if self.is_kv_producer is False:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support KV "
-                "consumer/decode workers yet. Disable PCP on decode workers.")
+                "consumer/decode workers yet. Disable PCP on decode workers."
+            )
         if self.dcp_size > 1:
             raise NotImplementedError(
-                "PCP partial sequence layout does not support DCP yet.")
+                "PCP partial sequence layout does not support DCP yet."
+            )
         if self.pipeline_parallel_size > 1:
             raise NotImplementedError(
-                "PCP partial sequence layout does not support pipeline "
-                "parallelism yet.")
+                "PCP partial sequence layout does not support pipeline parallelism yet."
+            )
         if self.interleave_size <= 0:
-            raise ValueError("PCP partial sequence layout requires "
-                             "cp_kv_cache_interleave_size > 0.")
+            raise ValueError(
+                "PCP partial sequence layout requires cp_kv_cache_interleave_size > 0."
+            )
 
     def _evaluate_streaming_query(
         self,
@@ -268,7 +280,8 @@ class PcpSequenceLayoutEligibility:
         if any(span.scheduled_tokens <= 0 for span in spans):
             raise NotImplementedError(
                 "PCP streaming requires scheduled query tokens for every "
-                "request in the chunk.")
+                "request in the chunk."
+            )
 
         q_block_size = _get_pcp_streaming_q_block_size()
         if q_block_size % self.interleave_size != 0:
@@ -276,12 +289,13 @@ class PcpSequenceLayoutEligibility:
                 "PCP streaming requires q_block_size to be a "
                 "multiple of cp_kv_cache_interleave_size, got "
                 f"{q_block_size=} "
-                f"cp_kv_cache_interleave_size={self.interleave_size}.")
+                f"cp_kv_cache_interleave_size={self.interleave_size}."
+            )
 
-        q_lens = np.asarray([span.scheduled_tokens for span in spans],
-                            dtype=np.int32)
+        q_lens = np.asarray([span.scheduled_tokens for span in spans], dtype=np.int32)
         absolute_query_starts = np.asarray(
-            [span.absolute_query_start for span in spans], dtype=np.int64)
+            [span.absolute_query_start for span in spans], dtype=np.int64
+        )
         # Assign the current batch's request-major query rows as one flat token
         # stream. This is exactly query_start_loc[:-1]: ownership is local to
         # this runner chunk, while attention positions and KV-cache slots keep
@@ -302,15 +316,14 @@ class PcpSequenceLayoutEligibility:
         if num_tokens_paddings is not None:
             paddings = sorted(int(padding) for padding in num_tokens_paddings)
             local_padded_tokens = _first_ge(paddings, local_required_tokens)
-            if (dp_target_bucket is not None
-                    and dp_target_bucket > local_padded_tokens):
+            if dp_target_bucket is not None and dp_target_bucket > local_padded_tokens:
                 local_padded_tokens = int(dp_target_bucket)
-            if (max_num_tokens is not None
-                    and local_padded_tokens > int(max_num_tokens)):
+            if max_num_tokens is not None and local_padded_tokens > int(max_num_tokens):
                 raise ValueError(
                     "PCP local padded token length exceeds runner max token "
                     f"buffer: {local_padded_tokens=} "
-                    f"max_num_tokens={int(max_num_tokens)}.")
+                    f"max_num_tokens={int(max_num_tokens)}."
+                )
             global_padded_tokens = local_padded_tokens * self.pcp_size
 
         return PcpSequenceLayoutDecision(
@@ -342,7 +355,6 @@ class PcpPreparedBatch:
 
 
 class PcpSequenceLayoutPlanner:
-
     def __init__(self, eligibility: PcpSequenceLayoutEligibility):
         self.eligibility = eligibility
         self._all_planner = AllSequenceLayoutPlanner()
@@ -367,8 +379,9 @@ class PcpSequenceLayoutPlanner:
     def uses_selected_logits_hidden_states(self) -> bool:
         return self.enabled
 
-    def reserve_host_token_capacity(self, runner: Any,
-                                    required_num_tokens: int) -> None:
+    def reserve_host_token_capacity(
+        self, runner: Any, required_num_tokens: int
+    ) -> None:
         if self.enabled:
             _ensure_host_token_buffer_capacity(runner, required_num_tokens)
 
@@ -423,19 +436,19 @@ class PcpSequenceLayoutPlanner:
             descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
             token_slice=prepared.local_token_slice,
             global_num_tokens=int(total_num_scheduled_tokens),
-            global_padded_num_tokens=(
-                prepared.padded_total_num_scheduled_tokens),
+            global_padded_num_tokens=(prepared.padded_total_num_scheduled_tokens),
             local_num_tokens=prepared.local_total_num_scheduled_tokens,
-            local_padded_num_tokens=(
-                prepared.local_padded_total_num_scheduled_tokens),
+            local_padded_num_tokens=(prepared.local_padded_total_num_scheduled_tokens),
             logits_indices_cpu=prepared.logits_indices_cpu,
             logits_local_indices_cpu=prepared.logits_local_indices_cpu,
             logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
             requires_hidden_state_gather=True,
             _packed_to_request_major_token_indices=(
-                prepared.packed_to_request_major_token_indices),
+                prepared.packed_to_request_major_token_indices
+            ),
             _request_major_to_packed_token_indices=(
-                prepared.request_major_to_packed_token_indices),
+                prepared.request_major_to_packed_token_indices
+            ),
         )
 
     def prepare_dummy(
@@ -481,22 +494,23 @@ class PcpSequenceLayoutPlanner:
         del logits_indices
         if plan is None:
             return None
-        if (plan.logits_local_indices_cpu is None
-                or plan.logits_owner_mask_cpu is None):
+        if plan.logits_local_indices_cpu is None or plan.logits_owner_mask_cpu is None:
             return None
 
-        local_indices = plan.logits_local_indices_cpu.to(hidden_states.device,
-                                                         non_blocking=True)
-        owner_mask = plan.logits_owner_mask_cpu.to(hidden_states.device,
-                                                   non_blocking=True)
+        local_indices = plan.logits_local_indices_cpu.to(
+            hidden_states.device, non_blocking=True
+        )
+        owner_mask = plan.logits_owner_mask_cpu.to(
+            hidden_states.device, non_blocking=True
+        )
         selected = torch.index_select(hidden_states, 0, local_indices)
-        selected = torch.where(owner_mask.unsqueeze(1), selected,
-                               torch.zeros_like(selected))
+        selected = torch.where(
+            owner_mask.unsqueeze(1), selected, torch.zeros_like(selected)
+        )
         return _pcp_all_reduce_sum(selected)
 
 
-def _ensure_host_token_buffer_capacity(runner: Any,
-                                       required_num_tokens: int) -> None:
+def _ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) -> None:
     """Grow CPU-only token staging buffers for partial sequence layouts."""
     required_num_tokens = int(required_num_tokens)
     if required_num_tokens <= 0:
@@ -510,36 +524,42 @@ def _ensure_host_token_buffer_capacity(runner: Any,
         return
 
     old_input_ids_cpu = runner.input_ids_cpu
-    runner.input_ids_cpu = torch.zeros(required_num_tokens,
-                                       dtype=old_input_ids_cpu.dtype,
-                                       device=old_input_ids_cpu.device)
+    runner.input_ids_cpu = torch.zeros(
+        required_num_tokens,
+        dtype=old_input_ids_cpu.dtype,
+        device=old_input_ids_cpu.device,
+    )
     runner.input_ids_cpu[:current_num_tokens] = old_input_ids_cpu
 
     old_positions_cpu = runner.positions_cpu
-    runner.positions_cpu = torch.zeros(required_num_tokens,
-                                       dtype=old_positions_cpu.dtype,
-                                       device=old_positions_cpu.device)
+    runner.positions_cpu = torch.zeros(
+        required_num_tokens,
+        dtype=old_positions_cpu.dtype,
+        device=old_positions_cpu.device,
+    )
     runner.positions_cpu[:current_num_tokens] = old_positions_cpu
     runner.positions_np = runner.positions_cpu.numpy()
 
     if runner.supports_mm_inputs and hasattr(runner, "is_mm_embed_cpu"):
         old_is_mm_embed_cpu = runner.is_mm_embed_cpu
-        runner.is_mm_embed_cpu = torch.zeros(required_num_tokens,
-                                             dtype=old_is_mm_embed_cpu.dtype,
-                                             device=old_is_mm_embed_cpu.device)
+        runner.is_mm_embed_cpu = torch.zeros(
+            required_num_tokens,
+            dtype=old_is_mm_embed_cpu.dtype,
+            device=old_is_mm_embed_cpu.device,
+        )
         runner.is_mm_embed_cpu[:current_num_tokens] = old_is_mm_embed_cpu
 
     if runner.uses_mrope:
         old_mrope_positions = runner.mrope_positions
-        new_mrope_positions = runner._make_buffer(3,
-                                                  required_num_tokens + 1,
-                                                  dtype=torch.int32)
-        copy_len = min(current_num_tokens + 1,
-                       int(old_mrope_positions.cpu.shape[1]),
-                       required_num_tokens + 1)
-        new_mrope_positions.cpu[:, :
-                                copy_len] = old_mrope_positions.cpu[:, :
-                                                                    copy_len]
+        new_mrope_positions = runner._make_buffer(
+            3, required_num_tokens + 1, dtype=torch.int32
+        )
+        copy_len = min(
+            current_num_tokens + 1,
+            int(old_mrope_positions.cpu.shape[1]),
+            required_num_tokens + 1,
+        )
+        new_mrope_positions.cpu[:, :copy_len] = old_mrope_positions.cpu[:, :copy_len]
         runner.mrope_positions = new_mrope_positions
 
 
@@ -562,16 +582,14 @@ def _debug_pcp_layout_window(
             local_offset = index - rank_start
             start = max(0, local_offset - 8)
             end = min(local_padded_tokens, local_offset + 9)
-            selected_windows.append({
-                "global_index":
-                index,
-                "local_offset":
-                local_offset,
-                "ids":
-                local_ids[start:end].tolist(),
-                "positions":
-                local_positions[start:end].tolist(),
-            })
+            selected_windows.append(
+                {
+                    "global_index": index,
+                    "local_offset": local_offset,
+                    "ids": local_ids[start:end].tolist(),
+                    "positions": local_positions[start:end].tolist(),
+                }
+            )
     head = min(40, local_padded_tokens)
     return {
         "head_ids": local_ids[:head].tolist(),
@@ -598,24 +616,23 @@ def prepare_pcp_sequence_layout(
     del total_num_scheduled_tokens, use_max_model_len, target_num_reqs
     if decision is None:
         decision = PcpSequenceLayoutEligibility.from_vllm_config(
-            runner.vllm_config).evaluate_runner_chunk(
-                input_batch=runner.input_batch,
-                scheduler_output=scheduler_output,
-                start_index=start_index,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-                num_tokens_paddings=runner.num_tokens_paddings,
-                max_num_tokens=runner.max_num_tokens,
-                dp_target_bucket=runner._dp_target_bucket,
-            )
-    PcpSequenceLayoutEligibility.require_mode(decision,
-                                              PcpSequenceLayoutMode.STREAMING)
+            runner.vllm_config
+        ).evaluate_runner_chunk(
+            input_batch=runner.input_batch,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            num_tokens_paddings=runner.num_tokens_paddings,
+            max_num_tokens=runner.max_num_tokens,
+            dp_target_bucket=runner._dp_target_bucket,
+        )
+    PcpSequenceLayoutEligibility.require_mode(decision, PcpSequenceLayoutMode.STREAMING)
 
     pcp_size = decision.pcp_size
     interleave_size = decision.interleave_size
     if pcp_size <= 1:
-        raise ValueError(
-            "PCP streaming requires prefill_context_parallel_size > 1.")
+        raise ValueError("PCP streaming requires prefill_context_parallel_size > 1.")
 
     if get_native_pcp_rank is None:
         get_native_pcp_rank = _get_native_pcp_rank
@@ -624,18 +641,17 @@ def prepare_pcp_sequence_layout(
 
     native_pcp_world_size = get_native_pcp_world_size()
     if native_pcp_world_size != pcp_size:
-        raise RuntimeError("Native PCP group size does not match "
-                           "prefill_context_parallel_size: "
-                           f"{native_pcp_world_size=} {pcp_size=}.")
+        raise RuntimeError(
+            "Native PCP group size does not match "
+            "prefill_context_parallel_size: "
+            f"{native_pcp_world_size=} {pcp_size=}."
+        )
     pcp_rank = get_native_pcp_rank()
     if not 0 <= pcp_rank < pcp_size:
-        raise RuntimeError("Native PCP rank is out of range: "
-                           f"{pcp_rank=} {pcp_size=}.")
+        raise RuntimeError(f"Native PCP rank is out of range: {pcp_rank=} {pcp_size=}.")
 
-    absolute_query_start_offsets_per_req = (
-        decision.absolute_query_start_offsets_per_req)
-    token_owner_start_offsets_per_req = (
-        decision.token_owner_start_offsets_per_req)
+    absolute_query_start_offsets_per_req = decision.absolute_query_start_offsets_per_req
+    token_owner_start_offsets_per_req = decision.token_owner_start_offsets_per_req
     local_counts = decision.local_token_counts
     local_padded_tokens = decision.local_padded_tokens
     padded_total_num_scheduled_tokens = decision.global_padded_tokens
@@ -645,13 +661,13 @@ def prepare_pcp_sequence_layout(
     assert local_padded_tokens is not None
     assert padded_total_num_scheduled_tokens is not None
 
-    _ensure_host_token_buffer_capacity(runner,
-                                       padded_total_num_scheduled_tokens)
+    _ensure_host_token_buffer_capacity(runner, padded_total_num_scheduled_tokens)
 
     mrope_slice = None
     if runner.uses_mrope:
-        mrope_slice = runner.mrope_positions.cpu[:, :(
-            padded_total_num_scheduled_tokens)].numpy()
+        mrope_slice = runner.mrope_positions.cpu[
+            :, :(padded_total_num_scheduled_tokens)
+        ].numpy()
     request_major_to_packed_token_indices = _apply_pcp_rank_major_token_order(
         runner.input_ids_cpu[:padded_total_num_scheduled_tokens].numpy(),
         runner.positions_np[:padded_total_num_scheduled_tokens],
@@ -663,13 +679,15 @@ def prepare_pcp_sequence_layout(
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     )
     packed_to_request_major_token_indices = np.full(
-        padded_total_num_scheduled_tokens, -1, dtype=np.int64)
-    packed_to_request_major_token_indices[
-        request_major_to_packed_token_indices] = np.arange(
-            request_major_to_packed_token_indices.size, dtype=np.int64)
+        padded_total_num_scheduled_tokens, -1, dtype=np.int64
+    )
+    packed_to_request_major_token_indices[request_major_to_packed_token_indices] = (
+        np.arange(request_major_to_packed_token_indices.size, dtype=np.int64)
+    )
 
     local_padded_total_num_scheduled_tokens = (
-        padded_total_num_scheduled_tokens // pcp_size)
+        padded_total_num_scheduled_tokens // pcp_size
+    )
     local_total_num_scheduled_tokens = int(local_counts[pcp_rank])
     local_start = pcp_rank * local_padded_total_num_scheduled_tokens
     local_end = local_start + local_padded_total_num_scheduled_tokens
@@ -682,24 +700,24 @@ def prepare_pcp_sequence_layout(
         padded_total_num_scheduled_tokens,
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     ).astype(np.int32)
-    logits_indices_cpu = torch.full((padded_num_reqs, ),
-                                    -1,
-                                    dtype=torch.int32,
-                                    device="cpu")
+    logits_indices_cpu = torch.full(
+        (padded_num_reqs,), -1, dtype=torch.int32, device="cpu"
+    )
     logits_indices_cpu[:num_reqs] = torch.from_numpy(pcp_logits_indices)
-    logits_owner_mask_np = ((pcp_logits_indices >= local_start) &
-                            (pcp_logits_indices < local_end))
+    logits_owner_mask_np = (pcp_logits_indices >= local_start) & (
+        pcp_logits_indices < local_end
+    )
     logits_local_indices_np = np.zeros(num_reqs, dtype=np.int32)
     logits_local_indices_np[logits_owner_mask_np] = (
-        pcp_logits_indices[logits_owner_mask_np] - local_start)
-    logits_local_indices_cpu = torch.zeros((padded_num_reqs, ),
-                                           dtype=torch.int32,
-                                           device="cpu")
-    logits_local_indices_cpu[:num_reqs] = torch.from_numpy(
-        logits_local_indices_np)
-    logits_owner_mask_cpu = torch.zeros((padded_num_reqs, ),
-                                        dtype=torch.bool,
-                                        device="cpu")
+        pcp_logits_indices[logits_owner_mask_np] - local_start
+    )
+    logits_local_indices_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.int32, device="cpu"
+    )
+    logits_local_indices_cpu[:num_reqs] = torch.from_numpy(logits_local_indices_np)
+    logits_owner_mask_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.bool, device="cpu"
+    )
     logits_owner_mask_cpu[:num_reqs] = torch.from_numpy(logits_owner_mask_np)
 
     if envs.VLLM_TPU_DEBUG_PCP_LAYOUT:
@@ -724,9 +742,10 @@ def prepare_pcp_sequence_layout(
             padded_total_num_scheduled_tokens,
             pcp_logits_indices.tolist(),
             np.cumsum(
-                np.concatenate([
-                    np.array([0], dtype=np.int32), num_scheduled_tokens_per_req
-                ])).tolist(),
+                np.concatenate(
+                    [np.array([0], dtype=np.int32), num_scheduled_tokens_per_req]
+                )
+            ).tolist(),
             runner.seq_lens_np[:num_reqs].copy().tolist(),
             layout_debug,
         )
@@ -736,12 +755,11 @@ def prepare_pcp_sequence_layout(
         padded_total_num_scheduled_tokens=padded_total_num_scheduled_tokens,
         local_total_num_scheduled_tokens=local_total_num_scheduled_tokens,
         local_padded_total_num_scheduled_tokens=(
-            local_padded_total_num_scheduled_tokens),
+            local_padded_total_num_scheduled_tokens
+        ),
         logits_indices_cpu=logits_indices_cpu,
         logits_local_indices_cpu=logits_local_indices_cpu,
         logits_owner_mask_cpu=logits_owner_mask_cpu,
-        packed_to_request_major_token_indices=(
-            packed_to_request_major_token_indices),
-        request_major_to_packed_token_indices=(
-            request_major_to_packed_token_indices),
+        packed_to_request_major_token_indices=(packed_to_request_major_token_indices),
+        request_major_to_packed_token_indices=(request_major_to_packed_token_indices),
     )

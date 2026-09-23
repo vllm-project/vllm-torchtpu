@@ -20,8 +20,7 @@ from jax.experimental.pallas import tpu as pltpu
 # be avoided as it can trigger unintended relayout.
 
 
-def load_large_to_compact(vmem_ref,
-                          dst_dtype: jnp.dtype | None = None) -> jax.Array:
+def load_large_to_compact(vmem_ref, dst_dtype: jnp.dtype | None = None) -> jax.Array:
     assert vmem_ref.ndim == 2
 
     row_size = vmem_ref.shape[0]
@@ -35,7 +34,7 @@ def load_large_to_compact(vmem_ref,
         if should_unpack:
             packed_row = row_start // packing
             u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
-            packed = u32_vmem_ref[packed_row:packed_row + 1]
+            packed = u32_vmem_ref[packed_row : packed_row + 1]
 
             for p in range(packing):
                 unpacked = pltpu.unpack_elementwise(

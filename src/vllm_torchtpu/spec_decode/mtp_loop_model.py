@@ -14,6 +14,7 @@ This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read. The dims are spelled out below
 anyway, so nothing here depends on annotation style.
 """
+
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
@@ -36,11 +37,9 @@ MTP_DYNAMIC_ARG_DIMS = {
 class MtpLoopStepModel(nn.Module):
     """Runs an MTP draft's own ``forward`` as a separately compiled program."""
 
-    def __init__(self,
-                 *,
-                 vllm_config: VllmConfig,
-                 prefix: str = "",
-                 mtp: nn.Module) -> None:
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", mtp: nn.Module
+    ) -> None:
         # vllm_config is unused here: the compile decorator reads it and sets
         # self.vllm_config. Declaring it lets type checkers see the keyword the
         # decorator's wrapper accepts.
@@ -63,6 +62,12 @@ class MtpLoopStepModel(nn.Module):
         # The draft class's forward, called unbound: this program runs exactly
         # what the step-0 program runs, and Dynamo traces it inline instead of
         # going through the draft's own compiled wrapper.
-        return type(self.mtp).forward(self.mtp, input_ids, positions,
-                                      hidden_states, intermediate_tensors,
-                                      inputs_embeds, spec_step_idx)
+        return type(self.mtp).forward(
+            self.mtp,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+        )

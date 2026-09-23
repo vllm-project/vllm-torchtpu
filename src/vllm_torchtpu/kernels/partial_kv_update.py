@@ -63,21 +63,21 @@ def _blockspec_kernel(_sidx_ref, vals_ref, _pool_in_ref, pool_out_ref):
 def _scatter_slots_nd(pool, indices, vals):
     """Rank >= 3: native block spec, no manual DMA, no scratch."""
     na = indices.shape[0]
-    pad = (0, ) * (pool.ndim - 1)
-    block = (1, ) + pool.shape[1:]
-    assert vals.shape == (na, ) + pool.shape[1:], (vals.shape, pool.shape)
+    pad = (0,) * (pool.ndim - 1)
+    block = (1,) + pool.shape[1:]
+    assert vals.shape == (na,) + pool.shape[1:], (vals.shape, pool.shape)
 
     return pl.pallas_call(
         _blockspec_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na,),
             in_specs=[
-                pl.BlockSpec(block, lambda i, s: (i, ) + pad),
+                pl.BlockSpec(block, lambda i, s: (i,) + pad),
                 # Aliased with the output; never read, so leave it in HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec(block, lambda i, s: (s[i], ) + pad),
+            out_specs=pl.BlockSpec(block, lambda i, s: (s[i],) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
@@ -134,12 +134,13 @@ def _scatter_slots_2d(pool, indices, vals):
         raise ValueError(
             f"2D num_slots {num_slots} must be a multiple of {sublanes}: the "
             "block covers whole groups of sublanes, and a partial trailing "
-            "block would write past the end of the aliased output")
+            "block would write past the end of the aliased output"
+        )
     return pl.pallas_call(
         _make_sublane_block_kernel(width, sublanes, na),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(na, ),
+            grid=(na,),
             in_specs=[
                 # The whole update array, resident: the kernel needs any row
                 # of it, not just this step's. Block dims equal the array
@@ -148,19 +149,20 @@ def _scatter_slots_2d(pool, indices, vals):
                 pl.BlockSpec((na, width), lambda i, s: (0, 0)),
                 # Read, unlike the rank >= 3 path: the block holds the slot's
                 # neighbours and they have to survive the write-back.
-                pl.BlockSpec((sublanes, width), lambda i, s:
-                             (s[i] // sublanes, 0)),
+                pl.BlockSpec((sublanes, width), lambda i, s: (s[i] // sublanes, 0)),
             ],
-            out_specs=pl.BlockSpec((sublanes, width), lambda i, s:
-                                   (s[i] // sublanes, 0)),
+            out_specs=pl.BlockSpec(
+                (sublanes, width), lambda i, s: (s[i] // sublanes, 0)
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(indices, vals, pool)
 
 
-def pallas_scatter_slots(pool: jax.Array, indices: jax.Array,
-                         vals: jax.Array) -> jax.Array:
+def pallas_scatter_slots(
+    pool: jax.Array, indices: jax.Array, vals: jax.Array
+) -> jax.Array:
     """``pool[indices[i]] = vals[i]``, in place, cost O(len(indices)).
 
     pool:    (num_slots, ...) -- aliased with the output, never reshaped here.
@@ -170,7 +172,8 @@ def pallas_scatter_slots(pool: jax.Array, indices: jax.Array,
     if pool.dtype != vals.dtype:
         raise ValueError(
             f"pool dtype {pool.dtype} != vals dtype {vals.dtype}; a cross-dtype "
-            "view must be taken on the ref inside the kernel, never in XLA")
+            "view must be taken on the ref inside the kernel, never in XLA"
+        )
     indices = indices.astype(jnp.int32)
     if pool.ndim >= 3:
         return _scatter_slots_nd(pool, indices, vals)
@@ -182,28 +185,32 @@ def pallas_scatter_slots(pool: jax.Array, indices: jax.Array,
 # --- PyTorch bridge -------------------------------------------------------
 
 
-def _jax_scatter_op(pool: jax.Array, indices: jax.Array,
-                    vals: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _jax_scatter_op(
+    pool: jax.Array, indices: jax.Array, vals: jax.Array
+) -> tuple[jax.Array, jax.Array]:
     return pallas_scatter_slots(pool, indices, vals), indices[0]
 
 
 _pallas_scatter_torch_op = torch_pallas.jax_op(
-    "pallas::kv_pool_partial_update", _jax_scatter_op, donate_argnums=(0, ))
+    "pallas::kv_pool_partial_update", _jax_scatter_op, donate_argnums=(0,)
+)
 
 
-def _fake_scatter_op(pool: torch.Tensor, indices: torch.Tensor,
-                     vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(pool), torch.empty((),
-                                               dtype=indices.dtype,
-                                               device=indices.device)
+def _fake_scatter_op(
+    pool: torch.Tensor, indices: torch.Tensor, vals: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(pool), torch.empty(
+        (), dtype=indices.dtype, device=indices.device
+    )
 
 
 _pallas_scatter_torch_op.register_fake(_fake_scatter_op)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def pallas_index_copy_(cache: torch.Tensor, indices: torch.Tensor,
-                       updates: torch.Tensor) -> torch.Tensor:
+def pallas_index_copy_(
+    cache: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor
+) -> torch.Tensor:
     """Drop-in for ``cache.index_copy_(0, indices, updates)`` on TPU.
 
     ``torch.compile`` is load-bearing, not a speed-up. In strict eager the op
@@ -212,7 +219,6 @@ def pallas_index_copy_(cache: torch.Tensor, indices: torch.Tensor,
     graph XLA folds it into the donation and it becomes a pointer alias --
     the same pattern as ``mamba_state_copy_op.copy_mamba_state_blocks``.
     """
-    new_cache, _ = _pallas_scatter_torch_op(cache, indices.to(torch.int32),
-                                            updates)
+    new_cache, _ = _pallas_scatter_torch_op(cache, indices.to(torch.int32), updates)
     cache.copy_(new_cache)
     return cache

@@ -186,42 +186,16 @@ ignore = [
 
 
 
-# kernels: attention and the rest
-"src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
-"src/vllm_torchtpu/kernels/collectives/**" = ["I"]
-"src/vllm_torchtpu/kernels/flash_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/megablox/**" = ["I"]
-"src/vllm_torchtpu/kernels/mla/**" = ["I"]
-"src/vllm_torchtpu/kernels/quantized_matmul/**" = ["I"]
-"src/vllm_torchtpu/kernels/ragged_paged_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/sparse_core/**" = ["I"]
-"src/vllm_torchtpu/kernels/__init__.py" = ["I"]
-"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["I"]
-"src/vllm_torchtpu/kernels/pool_adapters.py" = ["I"]
-"src/vllm_torchtpu/kernels/router_topk.py" = ["I"]
-"src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
 
 
 
-# tests/layers
-"tests/layers/**" = ["I"]
 
-# layers/core
-"src/vllm_torchtpu/layers/core/**" = ["I"]
-"src/vllm_torchtpu/layers/__init__.py" = ["I"]
 
 
 # runner
 "src/vllm_torchtpu/runner/**" = ["I"]
 "tests/runner/**" = ["I"]
 
-# models, spec_decode, offload
-"src/vllm_torchtpu/models/**" = ["I"]
-"src/vllm_torchtpu/offload/**" = ["I"]
-"src/vllm_torchtpu/spec_decode/**" = ["I"]
-"tests/models/**" = ["I"]
-"tests/offload/**" = ["I"]
-"tests/spec_decode/**" = ["I"]
 
 
 # core, tracing, omni, tools, loose modules
@@ -280,42 +254,16 @@ exclude = [
 
 
 
-    # kernels: attention and the rest
-    "src/vllm_torchtpu/kernels/causal_conv1d/**",
-    "src/vllm_torchtpu/kernels/collectives/**",
-    "src/vllm_torchtpu/kernels/flash_attention/**",
-    "src/vllm_torchtpu/kernels/megablox/**",
-    "src/vllm_torchtpu/kernels/mla/**",
-    "src/vllm_torchtpu/kernels/quantized_matmul/**",
-    "src/vllm_torchtpu/kernels/ragged_paged_attention/**",
-    "src/vllm_torchtpu/kernels/sparse_core/**",
-    "src/vllm_torchtpu/kernels/__init__.py",
-    "src/vllm_torchtpu/kernels/partial_kv_update.py",
-    "src/vllm_torchtpu/kernels/pool_adapters.py",
-    "src/vllm_torchtpu/kernels/router_topk.py",
-    "src/vllm_torchtpu/kernels/typed_ldst.py",
 
 
 
-    # tests/layers
-    "tests/layers/**",
 
-    # layers/core
-    "src/vllm_torchtpu/layers/core/**",
-    "src/vllm_torchtpu/layers/__init__.py",
 
 
     # runner
     "src/vllm_torchtpu/runner/**",
     "tests/runner/**",
 
-    # models, spec_decode, offload
-    "src/vllm_torchtpu/models/**",
-    "src/vllm_torchtpu/offload/**",
-    "src/vllm_torchtpu/spec_decode/**",
-    "tests/models/**",
-    "tests/offload/**",
-    "tests/spec_decode/**",
 
 
     # core, tracing, omni, tools, loose modules

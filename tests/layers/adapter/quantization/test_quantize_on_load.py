@@ -20,11 +20,14 @@ import torch
 from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu.layers.adapter.quantization.configs import (
-    VllmQuantConfig, should_quantize_on_load)
-from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-    VllmFp8LinearMethodTPU
+    VllmQuantConfig,
+    should_quantize_on_load,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-    VllmUnquantizedConfig, VllmUnquantizedLinearMethod)
+    VllmUnquantizedConfig,
+    VllmUnquantizedLinearMethod,
+)
 
 
 @pytest.fixture
@@ -44,7 +47,6 @@ def mock_vllm_config(monkeypatch):
 
 
 class TestShouldQuantizeOnLoad:
-
     def test_empty_env_returns_false(self, monkeypatch):
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "")
         assert not should_quantize_on_load("model.layers.0.self_attn.q_proj")
@@ -63,38 +65,39 @@ class TestShouldQuantizeOnLoad:
         assert should_quantize_on_load("model.layers.0.self_attn.attn")
 
     def test_multiple_prefixes(self, monkeypatch):
-        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES",
-                           "self_attn,shared_experts,layers.0.mlp")
+        monkeypatch.setenv(
+            "QUANTIZE_ON_LOAD_PREFIXES", "self_attn,shared_experts,layers.0.mlp"
+        )
         assert should_quantize_on_load("model.layers.2.self_attn.o_proj")
-        assert should_quantize_on_load(
-            "model.layers.5.shared_experts.down_proj")
+        assert should_quantize_on_load("model.layers.5.shared_experts.down_proj")
         assert should_quantize_on_load("model.layers.0.mlp.gate_up_proj")
         assert not should_quantize_on_load("model.layers.1.mlp.gate_up_proj")
 
 
 class TestUnquantizedConfigQuantizeOnLoadDispatch:
-
-    def test_matching_linear_layer_uses_fp8_method(self, monkeypatch,
-                                                   linear_layer):
+    def test_matching_linear_layer_uses_fp8_method(self, monkeypatch, linear_layer):
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
         cfg = VllmUnquantizedConfig()
-        method = cfg.get_quant_method(linear_layer,
-                                      prefix="model.layers.0.self_attn.q_proj")
+        method = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.0.self_attn.q_proj"
+        )
         assert isinstance(method, VllmFp8LinearMethodTPU)
 
-    def test_kv_b_proj_is_skipped_for_linear_method(self, monkeypatch,
-                                                    linear_layer):
+    def test_kv_b_proj_is_skipped_for_linear_method(self, monkeypatch, linear_layer):
         """kv_b_proj must remain unquantized here because MLAAttention slices W_UK_T/W_UV and quantizes them separately."""
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
         cfg = VllmUnquantizedConfig()
         method = cfg.get_quant_method(
-            linear_layer, prefix="model.layers.0.self_attn.kv_b_proj")
+            linear_layer, prefix="model.layers.0.self_attn.kv_b_proj"
+        )
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_non_matching_linear_layer_uses_unquantized_method(
-            self, monkeypatch, linear_layer):
+        self, monkeypatch, linear_layer
+    ):
         monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
         cfg = VllmUnquantizedConfig()
-        method = cfg.get_quant_method(linear_layer,
-                                      prefix="model.layers.0.mlp.down_proj")
+        method = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.0.mlp.down_proj"
+        )
         assert isinstance(method, VllmUnquantizedLinearMethod)

@@ -4,8 +4,7 @@
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .dspark import K3DSparkForCausalLM, K3DSparkModel
-from .model import (KimiK3ForConditionalGeneration, KimiLinearForCausalLM,
-                    KimiModel)
+from .model import KimiK3ForConditionalGeneration, KimiLinearForCausalLM, KimiModel
 from .moe import KimiMoE
 
 __all__ = [

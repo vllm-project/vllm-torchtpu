@@ -58,8 +58,14 @@ RAY_PORT=6379
 # Is something listening on the head's Ray port? A worker asks this both before
 # it has joined anything and after the head has gone, so `ray status` cannot
 # answer it.
+#
+# Bounded, because the probe has to be able to fail and /dev/tcp has no deadline
+# of its own. A completed pod stays a ready endpoint of the headless service, so
+# this keeps resolving after the head exits - to an address that no longer
+# answers and drops rather than refuses. An unbounded connect hangs there, the
+# miss is never counted, and the worker waits out the deadline holding chips.
 head_listening() {
-  (exec 3<>"/dev/tcp/${HEAD_HOST}/${RAY_PORT}") 2>/dev/null && exec 3>&-
+  timeout 5 bash -c "exec 3<>/dev/tcp/${HEAD_HOST}/${RAY_PORT}" 2>/dev/null
 }
 
 # How many Ray nodes the head can see, or 0 if it could not ask.

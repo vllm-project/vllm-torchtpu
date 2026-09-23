@@ -284,6 +284,79 @@ class TestStructuredDecode:
         assert torch.isinf(out[0, 32:]).all()
         assert torch.equal(out[1:], logits[1:])
 
+    @pytest.mark.parametrize(
+        ("vocab_size", "padded_vocab_dim"),
+        [
+            (50,
+             128),  # Tail truncation + padding (bitmask unpacks 64 cols < 128)
+            (64, 128),  # Exact multiple of 32 + padding
+            (100, 128),  # 4 packed words (128 cols), target_dim=128
+            (128, 256),  # Padded to 256 lanes
+        ],
+    )
+    def test_padded_vocab_dimension(self, vocab_size, padded_vocab_dim):
+        """Hardware-padded logits slots (target_dim > vocab_size) must be masked to -inf."""
+        torch.manual_seed(0)
+        num_reqs = 4
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(num_reqs, padded_vocab_dim)
+        bitmask = torch.randint(torch.iinfo(torch.int32).min,
+                                torch.iinfo(torch.int32).max,
+                                (num_reqs, num_words),
+                                dtype=torch.int32)
+        arange = torch.arange(32)
+
+        out = manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+        assert out.shape == (num_reqs, padded_vocab_dim)
+        # Active vocab tokens match reference bitmask behavior.
+        expected_active = reference_apply_bitmask(logits[:, :vocab_size],
+                                                  bitmask, vocab_size)
+        assert torch.equal(out[:, :vocab_size], expected_active)
+        # Padded slots beyond vocab_size must be masked to -inf.
+        assert torch.isneginf(out[:, vocab_size:]).all()
+
+    def test_smaller_vocab_dimension_raises_value_error(self):
+        """Logits dimension smaller than vocab_size must raise ValueError."""
+        vocab_size = 64
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(2, 32)  # 32 < 64
+        bitmask = torch.zeros((2, num_words), dtype=torch.int32)
+        arange = torch.arange(32)
+
+        with pytest.raises(
+                ValueError,
+                match=
+                r"TPU logits vocab dimension must be at least vocab_size \(64\) "
+                r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
+        ):
+            manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+    def test_structured_decode_with_padded_vocab(self):
+        """End-to-end _structured_decode with mixed batch and hardware-padded logits."""
+        torch.manual_seed(0)
+        vocab_size = 50
+        padded_vocab_dim = 128
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(3, padded_vocab_dim)
+        # Row 0 structured (blocks tokens 32..49), rows 1-2 unstructured.
+        bitmask = torch.tensor([[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]],
+                               dtype=torch.int32)
+        require = torch.tensor([[True], [False], [False]])
+        arange = torch.arange(32)
+
+        out = manager._structured_decode(require, bitmask, logits, arange)
+
+        assert out.shape == (3, padded_vocab_dim)
+        # Row 0 (structured): tokens 0..31 allowed, 32..49 blocked (-inf), 50..127 padded (-inf)
+        assert torch.equal(out[0, :32], logits[0, :32])
+        assert torch.isneginf(out[0, 32:vocab_size]).all()
+        assert torch.isneginf(out[0, vocab_size:]).all()
+        # Rows 1-2 (unstructured): untouched, pass through all logits intact
+        assert torch.equal(out[1:], logits[1:])
+
 
 def row(value: int) -> list[int]:
     """A distinguishable bitmask row: both packed words carry `value`."""

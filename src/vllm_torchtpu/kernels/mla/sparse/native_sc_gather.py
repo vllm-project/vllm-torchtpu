@@ -64,23 +64,21 @@ def _kernel(
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
-        occurrence_base = (logical_batch * atoms_per_batch *
-                           OCCURRENCES_PER_ATOM)
+        occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
 
         def values(atom, stream):
             return indices_ref[0, atom, stream, :]
 
         def destinations(atom, stream):
             return pl.ds(
-                occurrence_base + atom * OCCURRENCES_PER_ATOM +
-                stream * NUM_LANES,
+                occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES,
                 NUM_LANES,
             )
 
         def body(*refs):
             atom = pl.program_id(0)
             nope_inputs = refs[:ROPE_PACKING]
-            rope_inputs = refs[ROPE_PACKING:2 * ROPE_PACKING]
+            rope_inputs = refs[ROPE_PACKING : 2 * ROPE_PACKING]
             rope_output = refs[-1]
 
             nope_copies = []
@@ -102,20 +100,18 @@ def _kernel(
                     logical_rank = row * ROPE_PACKING + token_slot
                     input_stream = logical_rank // NUM_LANES
                     input_lane = logical_rank % NUM_LANES
-                    data.append(rope_inputs[input_stream][pl.ds(input_lane, 1),
-                                                          pl.ds(0, 32)])
+                    data.append(
+                        rope_inputs[input_stream][pl.ds(input_lane, 1), pl.ds(0, 32)]
+                    )
 
                 low_16 = jnp.uint32(0x0000FFFF)
                 low_byte_each_half = jnp.uint32(0x00FF00FF)
                 data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
                 data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
-                data[0], data[1] = _delta_swap(data[0], data[1], 8,
-                                               low_byte_each_half)
-                data[2], data[3] = _delta_swap(data[2], data[3], 8,
-                                               low_byte_each_half)
+                data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
+                data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
                 for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1),
-                                pl.ds(band * 32, 32)] = data[band]
+                    rope_output[pl.ds(row, 1), pl.ds(band * 32, 32)] = data[band]
 
             if wait_mode == "overlap_rope":
                 for copy in nope_copies:
@@ -125,21 +121,25 @@ def _kernel(
             pl.BlockSpec(
                 (pl.Indirect(NUM_LANES), 128),
                 lambda atom, stream=stream: (values(atom, stream), 0),
-            ) for stream in range(ROPE_PACKING))
+            )
+            for stream in range(ROPE_PACKING)
+        )
         rope_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(NUM_LANES), 32),
                 lambda atom, stream=stream: (values(atom, stream), 0),
-            ) for stream in range(ROPE_PACKING))
+            )
+            for stream in range(ROPE_PACKING)
+        )
         rope_out_spec = pl.BlockSpec(
             (QUADS_PER_ATOM, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
         pltpu.emit_pipeline(
             body,
-            grid=(atoms_per_batch, ),
+            grid=(atoms_per_batch,),
             in_specs=nope_specs + rope_specs,
-            out_specs=(rope_out_spec, ),
+            out_specs=(rope_out_spec,),
             no_pipelining=not serve_pipelined,
         )(
             *([nope_hbm_ref] * ROPE_PACKING),
@@ -153,8 +153,8 @@ def _kernel(
     )
     pltpu.emit_pipeline(
         serve_batch,
-        grid=(batches_per_owner, ),
-        in_specs=(indices_spec, ),
+        grid=(batches_per_owner,),
+        in_specs=(indices_spec,),
     )(indices_hbm_ref)
 
 
@@ -189,34 +189,34 @@ def dsa_gather_native_sc(
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
-        raise ValueError(
-            "native-SC ROPE must be quarter-major uint32[...,128]")
+        raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
     if indices.size != out_size:
-        raise ValueError(
-            f"indices has {indices.size} values, expected {out_size}")
+        raise ValueError(f"indices has {indices.size} values, expected {out_size}")
 
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
     num_cores = sc_info.num_cores if sc_info is not None else NUM_CORES
-    num_subcores = (sc_info.num_subcores
-                    if sc_info is not None else NUM_SUBCORES)
+    num_subcores = sc_info.num_subcores if sc_info is not None else NUM_SUBCORES
     num_owners = num_cores * num_subcores
 
     max_possible_atoms = out_size // (num_owners * OCCURRENCES_PER_ATOM)
     if atoms_per_batch > max_possible_atoms > 0:
         atoms_per_batch = max_possible_atoms
     if atoms_per_batch <= 0:
-        raise ValueError(f"atoms_per_batch ({atoms_per_batch}) must be > 0 "
-                         f"(out_size={out_size}, num_owners={num_owners})")
+        raise ValueError(
+            f"atoms_per_batch ({atoms_per_batch}) must be > 0 "
+            f"(out_size={out_size}, num_owners={num_owners})"
+        )
 
     occurrences_per_batch = atoms_per_batch * OCCURRENCES_PER_ATOM
     owner_batch_size = num_owners * occurrences_per_batch
     if out_size % owner_batch_size != 0:
         raise ValueError(
             f"out_size ({out_size}) must be divisible by num_owners * "
-            f"occurrences_per_batch ({owner_batch_size})")
+            f"occurrences_per_batch ({owner_batch_size})"
+        )
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
     mesh = plsc.VectorSubcoreMesh(
@@ -245,10 +245,12 @@ def dsa_gather_native_sc(
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
-        scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING, ))},
+        scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))},
         mesh=mesh,
-        name=(f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
-              f"{'pipe' if serve_pipelined else 'nopipe'}"),
+        name=(
+            f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
+            f"{'pipe' if serve_pipelined else 'nopipe'}"
+        ),
     )(
         nope_cache.reshape(-1, 128),
         rope_cache.reshape(-1, 32),

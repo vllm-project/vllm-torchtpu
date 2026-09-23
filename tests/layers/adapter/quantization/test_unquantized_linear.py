@@ -25,8 +25,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedLinearMethod
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
 
 SHAPES = [(7, 64, 32), (128, 256, 512), (1, 128, 64)]
 

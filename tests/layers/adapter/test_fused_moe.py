@@ -57,7 +57,6 @@ def test_get_fused_moe_activation_requires_situ_beta():
 
 
 def test_get_fused_moe_activation_compiles():
-
     @torch.compile(fullgraph=True)
     def compiled_fn(x, activation):
         act_str = get_fused_moe_activation(activation, None)

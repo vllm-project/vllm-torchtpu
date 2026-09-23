@@ -17,7 +17,6 @@ import torch
 
 
 class _FakeDevice:
-
     def __init__(self, device_id: int, coords: tuple[int, int, int]) -> None:
         self.id = device_id
         self.coords = coords
@@ -66,8 +65,9 @@ def test_column_shards_gathered_in_rank_order_reconstruct_the_full_matmul():
 
     shard = out_features // cores
     partials = [
-        torch.nn.functional.linear(x, weight.narrow(
-            0, rank * shard, shard))  # what rank `rank` loads
+        torch.nn.functional.linear(
+            x, weight.narrow(0, rank * shard, shard)
+        )  # what rank `rank` loads
         for rank in range(cores)
     ]
     gathered = torch.cat(partials, dim=-1)  # what all_gather(dim=-1) builds
@@ -84,8 +84,7 @@ def test_swapped_gather_order_is_not_caught_by_shape():
     reference = torch.nn.functional.linear(x, weight)
 
     partials = [
-        torch.nn.functional.linear(x, weight.narrow(0, r * 4, 4))
-        for r in range(2)
+        torch.nn.functional.linear(x, weight.narrow(0, r * 4, 4)) for r in range(2)
     ]
     swapped = torch.cat(list(reversed(partials)), dim=-1)
 
@@ -108,18 +107,17 @@ def test_column_parallel_is_exact_where_row_parallel_would_resplit_the_sum():
     reference = torch.nn.functional.linear(x, weight)
 
     column = torch.cat(
-        [
-            torch.nn.functional.linear(x, weight.narrow(0, r * 32, 32))
-            for r in range(2)
-        ],
+        [torch.nn.functional.linear(x, weight.narrow(0, r * 32, 32)) for r in range(2)],
         dim=-1,
     )
     assert torch.equal(column, reference), "column-parallel must be bit-exact"
 
     row = sum(
-        torch.nn.functional.linear(x.narrow(1, r * 64, 64),
-                                   weight.narrow(1, r * 64, 64))
-        for r in range(2))
+        torch.nn.functional.linear(
+            x.narrow(1, r * 64, 64), weight.narrow(1, r * 64, 64)
+        )
+        for r in range(2)
+    )
     # Not an error, just not bit-exact -- which is the point.
     assert row.shape == reference.shape
 
@@ -205,7 +203,6 @@ def test_grouping_declines_an_unreadable_topology(monkeypatch):
 
 
 class _FakeGroup:
-
     def __init__(self, world_size: int, rank_in_group: int = 0) -> None:
         self.world_size = world_size
         self.rank_in_group = rank_in_group

@@ -20,13 +20,21 @@ import torch
 
 import vllm_torchtpu.layers.core.sequence_layout as sequence_layout
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
-    build_pcp_logits_indices, build_pcp_rank_major_token_order)
+    build_pcp_logits_indices,
+    build_pcp_rank_major_token_order,
+)
 from vllm_torchtpu.layers.core.pcp_sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR, PcpSequenceLayoutEligibility,
-    PcpSequenceLayoutMode, PcpSequenceLayoutPlanner)
+    PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+    PcpSequenceLayoutEligibility,
+    PcpSequenceLayoutMode,
+    PcpSequenceLayoutPlanner,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
-    AllSequenceLayoutPlanner, SequenceLayoutDescriptor, SequenceLayoutKind,
-    SequenceLayoutPlan)
+    AllSequenceLayoutPlanner,
+    SequenceLayoutDescriptor,
+    SequenceLayoutKind,
+    SequenceLayoutPlan,
+)
 
 
 def _eligibility(
@@ -52,30 +60,28 @@ def _input_batch(*, computed, prompt):
     req_ids = [f"req{i}" for i in range(len(computed))]
     return SimpleNamespace(
         req_ids=req_ids,
-        req_id_to_index={
-            req_id: idx
-            for idx, req_id in enumerate(req_ids)
-        },
+        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
         num_computed_tokens_cpu=np.asarray(computed, dtype=np.int32),
         num_prompt_tokens=np.asarray(prompt, dtype=np.int32),
     )
 
 
 def _scheduler_output(scheduled):
-    return SimpleNamespace(num_scheduled_tokens={
-        f"req{i}": int(tokens)
-        for i, tokens in enumerate(scheduled)
-    })
+    return SimpleNamespace(
+        num_scheduled_tokens={
+            f"req{i}": int(tokens) for i, tokens in enumerate(scheduled)
+        }
+    )
 
 
 def _evaluate(
-        *,
-        eligibility=None,
-        computed,
-        prompt,
-        scheduled,
-        num_tokens_paddings=(16, 32, 64),
-        max_num_tokens=64,
+    *,
+    eligibility=None,
+    computed,
+    prompt,
+    scheduled,
+    num_tokens_paddings=(16, 32, 64),
+    max_num_tokens=64,
 ):
     eligibility = eligibility or _eligibility()
     scheduled_np = np.asarray(scheduled, dtype=np.int32)
@@ -121,12 +127,15 @@ def test_evaluate_runner_chunk_classifies_streaming_prefill():
     assert decision.local_required_tokens == 16
     assert decision.local_padded_tokens == 16
     assert decision.global_padded_tokens == 64
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([16, 16, 16, 16]))
     np.testing.assert_array_equal(
-        decision.absolute_query_start_offsets_per_req, np.asarray([0]))
-    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0]))
+        decision.local_token_counts, np.asarray([16, 16, 16, 16])
+    )
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0])
+    )
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req, np.asarray([0])
+    )
 
 
 def test_evaluate_runner_chunk_accepts_decode_only_query_spans():
@@ -142,12 +151,13 @@ def test_evaluate_runner_chunk_accepts_decode_only_query_spans():
     assert decision.local_required_tokens == 2
     assert decision.local_padded_tokens == 2
     assert decision.global_padded_tokens == 8
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([2, 0, 0, 0]))
+    np.testing.assert_array_equal(decision.local_token_counts, np.asarray([2, 0, 0, 0]))
     np.testing.assert_array_equal(
-        decision.absolute_query_start_offsets_per_req, np.asarray([64, 64]))
-    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0, 1]))
+        decision.absolute_query_start_offsets_per_req, np.asarray([64, 64])
+    )
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req, np.asarray([0, 1])
+    )
 
 
 def test_evaluate_runner_chunk_disabled_when_pcp_is_off():
@@ -172,12 +182,15 @@ def test_evaluate_runner_chunk_accepts_mixed_prefill_decode_batch():
     assert decision.local_required_tokens == 17
     assert decision.local_padded_tokens == 32
     assert decision.global_padded_tokens == 128
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([17, 16, 16, 16]))
     np.testing.assert_array_equal(
-        decision.absolute_query_start_offsets_per_req, np.asarray([0, 64]))
-    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0, 64]))
+        decision.local_token_counts, np.asarray([17, 16, 16, 16])
+    )
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0, 64])
+    )
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req, np.asarray([0, 64])
+    )
 
 
 def test_evaluate_runner_chunk_rejects_boundary_crossing_chunk():
@@ -200,8 +213,9 @@ def test_evaluate_runner_chunk_accepts_unaligned_q_len():
     assert decision.local_required_tokens == 16
     assert decision.local_padded_tokens == 16
     assert decision.global_padded_tokens == 64
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([16, 16, 0, 0]))
+    np.testing.assert_array_equal(
+        decision.local_token_counts, np.asarray([16, 16, 0, 0])
+    )
 
 
 def test_evaluate_runner_chunk_accepts_unaligned_q_start():
@@ -213,8 +227,9 @@ def test_evaluate_runner_chunk_accepts_unaligned_q_start():
 
     assert decision.mode is PcpSequenceLayoutMode.STREAMING
     assert decision.local_required_tokens == 16
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([16, 16, 16, 16]))
+    np.testing.assert_array_equal(
+        decision.local_token_counts, np.asarray([16, 16, 16, 16])
+    )
 
 
 def test_batch_flat_owner_is_independent_from_request_absolute_position():
@@ -223,27 +238,28 @@ def test_batch_flat_owner_is_independent_from_request_absolute_position():
         computed=[16],
         prompt=[32],
         scheduled=[16],
-        num_tokens_paddings=(16, ),
+        num_tokens_paddings=(16,),
         max_num_tokens=16,
     )
 
     assert decision.spans[0].absolute_query_start == 16
     np.testing.assert_array_equal(
-        decision.absolute_query_start_offsets_per_req, np.asarray([16]))
-    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0]))
+        decision.absolute_query_start_offsets_per_req, np.asarray([16])
+    )
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req, np.asarray([0])
+    )
     assert decision.absolute_query_start_offsets_per_req is not (
-        decision.token_owner_start_offsets_per_req)
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([16, 0]))
+        decision.token_owner_start_offsets_per_req
+    )
+    np.testing.assert_array_equal(decision.local_token_counts, np.asarray([16, 0]))
 
     token_order, inverse_order = build_pcp_rank_major_token_order(
         [16],
         pcp_size=2,
         interleave_size=16,
         padded_num_tokens=32,
-        token_owner_start_offsets_per_req=(
-            decision.token_owner_start_offsets_per_req),
+        token_owner_start_offsets_per_req=(decision.token_owner_start_offsets_per_req),
     )
     np.testing.assert_array_equal(token_order[:16], np.arange(16))
     np.testing.assert_array_equal(token_order[16:], np.full(16, -1))
@@ -255,15 +271,15 @@ def test_batch_flat_owner_is_independent_from_request_absolute_position():
             interleave_size=16,
             padded_num_tokens=32,
             token_owner_start_offsets_per_req=(
-                decision.token_owner_start_offsets_per_req),
+                decision.token_owner_start_offsets_per_req
+            ),
         ),
         np.asarray([15]),
     )
 
 
 @pytest.mark.parametrize(
-    ("q_lens", "pcp_size", "interleave_size", "padded_num_tokens",
-     "owner_starts"),
+    ("q_lens", "pcp_size", "interleave_size", "padded_num_tokens", "owner_starts"),
     [
         ([2, 3], 2, 1, 6, [0, 2]),
         ([3, 3], 2, 2, 8, [0, 3]),
@@ -272,7 +288,8 @@ def test_batch_flat_owner_is_independent_from_request_absolute_position():
     ],
 )
 def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
-        q_lens, pcp_size, interleave_size, padded_num_tokens, owner_starts):
+    q_lens, pcp_size, interleave_size, padded_num_tokens, owner_starts
+):
     packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
         q_lens,
         pcp_size=pcp_size,
@@ -297,30 +314,32 @@ def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
         local_start = rank * local_padded_num_tokens
         plan = SequenceLayoutPlan(
             descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
-            token_slice=slice(local_start,
-                              local_start + local_padded_num_tokens),
+            token_slice=slice(local_start, local_start + local_padded_num_tokens),
             global_num_tokens=total_num_tokens,
             global_padded_num_tokens=padded_num_tokens,
             local_num_tokens=int(
                 np.count_nonzero(
-                    packed_to_request[local_start:local_start +
-                                      local_padded_num_tokens] >= 0)),
+                    packed_to_request[
+                        local_start : local_start + local_padded_num_tokens
+                    ]
+                    >= 0
+                )
+            ),
             local_padded_num_tokens=local_padded_num_tokens,
             _packed_to_request_major_token_indices=packed_to_request,
             _request_major_to_packed_token_indices=request_to_packed,
         )
 
-        local_tokens, local_gathers = (
-            plan.localize_token_tensor_and_gather_indices(
-                request_tokens,
-                request_gathers,
-                num_valid_gathers=len(q_lens),
-            ))
+        local_tokens, local_gathers = plan.localize_token_tensor_and_gather_indices(
+            request_tokens,
+            request_gathers,
+            num_valid_gathers=len(q_lens),
+        )
         if plan.local_num_tokens == 0:
-            torch.testing.assert_close(local_tokens,
-                                       torch.zeros_like(local_tokens))
-            torch.testing.assert_close(local_gathers,
-                                       torch.full_like(local_gathers, -1))
+            torch.testing.assert_close(local_tokens, torch.zeros_like(local_tokens))
+            torch.testing.assert_close(
+                local_gathers, torch.full_like(local_gathers, -1)
+            )
         owner_counts += local_gathers.ge(0)
 
     torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
@@ -354,10 +373,9 @@ def test_partial_plan_ignores_padded_request_aligned_gathers():
             _request_major_to_packed_token_indices=request_to_packed,
         )
 
-        local_tokens, local_gathers = (
-            plan.localize_token_tensor_and_gather_indices(request_tokens,
-                                                          request_gathers,
-                                                          num_valid_gathers=2))
+        local_tokens, local_gathers = plan.localize_token_tensor_and_gather_indices(
+            request_tokens, request_gathers, num_valid_gathers=2
+        )
 
         torch.testing.assert_close(local_tokens, expected_tokens)
         torch.testing.assert_close(local_gathers, expected_gathers)
@@ -406,15 +424,13 @@ def test_pcp_plan_masks_non_owner_before_request_aligned_reduce(monkeypatch):
         remote_owner[0, 0] = 10
         return masked_tensor + remote_owner
 
-    monkeypatch.setattr(sequence_layout,
-                        "_pcp_all_reduce_sum",
-                        fake_reduce,
-                        raising=False)
+    monkeypatch.setattr(
+        sequence_layout, "_pcp_all_reduce_sum", fake_reduce, raising=False
+    )
 
     result = plan.aggregate_request_aligned_tensor(local_tensor, owner_mask)
 
-    torch.testing.assert_close(reduced_inputs[0],
-                               torch.tensor([[0.0], [20.0], [0.0]]))
+    torch.testing.assert_close(reduced_inputs[0], torch.tensor([[0.0], [20.0], [0.0]]))
     torch.testing.assert_close(result, torch.tensor([[10.0], [20.0], [0.0]]))
 
 
@@ -432,12 +448,15 @@ def test_evaluate_runner_chunk_classifies_multi_active_streaming_prefill():
     assert decision.local_required_tokens == 512
     assert decision.local_padded_tokens == 512
     assert decision.global_padded_tokens == 2048
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([512, 512, 512, 512]))
     np.testing.assert_array_equal(
-        decision.absolute_query_start_offsets_per_req, np.asarray([0, 0]))
-    np.testing.assert_array_equal(decision.token_owner_start_offsets_per_req,
-                                  np.asarray([0, 1024]))
+        decision.local_token_counts, np.asarray([512, 512, 512, 512])
+    )
+    np.testing.assert_array_equal(
+        decision.absolute_query_start_offsets_per_req, np.asarray([0, 0])
+    )
+    np.testing.assert_array_equal(
+        decision.token_owner_start_offsets_per_req, np.asarray([0, 1024])
+    )
 
 
 def test_batch_flat_owner_balances_32_by_256_across_pcp8():
@@ -448,7 +467,7 @@ def test_batch_flat_owner_balances_32_by_256_across_pcp8():
         computed=[0] * num_reqs,
         prompt=[q_len] * num_reqs,
         scheduled=[q_len] * num_reqs,
-        num_tokens_paddings=(1024, ),
+        num_tokens_paddings=(1024,),
         max_num_tokens=1024,
     )
 
@@ -456,8 +475,9 @@ def test_batch_flat_owner_balances_32_by_256_across_pcp8():
         decision.token_owner_start_offsets_per_req,
         np.arange(num_reqs, dtype=np.int64) * q_len,
     )
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.full(8, 1024, dtype=np.int32))
+    np.testing.assert_array_equal(
+        decision.local_token_counts, np.full(8, 1024, dtype=np.int32)
+    )
     assert decision.local_required_tokens == 1024
     assert decision.local_padded_tokens == 1024
     assert decision.global_padded_tokens == 8192
@@ -471,7 +491,7 @@ def test_batch_flat_owner_balances_four_by_8192_across_pcp8():
         computed=[0] * num_reqs,
         prompt=[q_len] * num_reqs,
         scheduled=[q_len] * num_reqs,
-        num_tokens_paddings=(4096, ),
+        num_tokens_paddings=(4096,),
         max_num_tokens=4096,
     )
 
@@ -479,8 +499,9 @@ def test_batch_flat_owner_balances_four_by_8192_across_pcp8():
         decision.token_owner_start_offsets_per_req,
         np.arange(num_reqs, dtype=np.int64) * q_len,
     )
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.full(8, 4096, dtype=np.int32))
+    np.testing.assert_array_equal(
+        decision.local_token_counts, np.full(8, 4096, dtype=np.int32)
+    )
     assert decision.local_required_tokens == 4096
     assert decision.local_padded_tokens == 4096
     assert decision.global_padded_tokens == 4 * q_len
@@ -499,8 +520,9 @@ def test_evaluate_runner_chunk_accepts_unaligned_multi_active_q_len():
     assert decision.local_required_tokens == 384
     assert decision.local_padded_tokens == 512
     assert decision.global_padded_tokens == 2048
-    np.testing.assert_array_equal(decision.local_token_counts,
-                                  np.asarray([384, 384, 384, 384]))
+    np.testing.assert_array_equal(
+        decision.local_token_counts, np.asarray([384, 384, 384, 384])
+    )
 
 
 def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
@@ -509,7 +531,7 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
             computed=[0],
             prompt=[1024],
             scheduled=[1024],
-            num_tokens_paddings=(128, ),
+            num_tokens_paddings=(128,),
             max_num_tokens=128,
         )
 
@@ -518,20 +540,20 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
     ("eligibility", "error_type", "message"),
     [
         (_eligibility(dcp_size=2), NotImplementedError, "DCP"),
-        (_eligibility(pipeline_parallel_size=2), NotImplementedError,
-         "pipeline parallelism"),
-        (_eligibility(is_kv_producer=False), NotImplementedError,
-         "KV consumer"),
+        (
+            _eligibility(pipeline_parallel_size=2),
+            NotImplementedError,
+            "pipeline parallelism",
+        ),
+        (_eligibility(is_kv_producer=False), NotImplementedError, "KV consumer"),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
     ],
 )
 def test_evaluate_runner_chunk_rejects_unsupported_runtime_config(
-        eligibility, error_type, message):
+    eligibility, error_type, message
+):
     with pytest.raises(error_type, match=message):
-        _evaluate(eligibility=eligibility,
-                  computed=[0],
-                  prompt=[64],
-                  scheduled=[64])
+        _evaluate(eligibility=eligibility, computed=[0], prompt=[64], scheduled=[64])
 
 
 def test_evaluate_runner_chunk_accepts_async_non_speculative_runtime_config():
@@ -564,10 +586,7 @@ def _planner_runner_stub(*, scheduled, computed, prompt, token_paddings):
     req_ids = [f"req{i}" for i in range(len(scheduled))]
     runner.input_batch = SimpleNamespace(
         req_ids=req_ids,
-        req_id_to_index={
-            req_id: idx
-            for idx, req_id in enumerate(req_ids)
-        },
+        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
         num_computed_tokens_cpu=np.asarray(computed, dtype=np.int32),
         num_prompt_tokens=np.asarray(prompt, dtype=np.int32),
     )
@@ -584,11 +603,12 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
     planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=2))
 
     monkeypatch.setattr(
-        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank",
-        lambda: 1)
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank", lambda: 1
+    )
     monkeypatch.setattr(
-        "vllm_torchtpu.layers.core.pcp_sequence_layout."
-        "_get_native_pcp_world_size", lambda: 2)
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size",
+        lambda: 2,
+    )
 
     plan = planner.prepare_real(
         runner=runner,
@@ -623,16 +643,15 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
         plan._request_major_to_packed_token_indices,
         np.concatenate((np.arange(16), np.arange(256, 265))),
     )
-    local_tokens, local_gathers = (
-        plan.localize_token_tensor_and_gather_indices(
-            torch.arange(25, dtype=torch.int32),
-            torch.tensor([24]),
-            num_valid_gathers=1,
-        ))
-    torch.testing.assert_close(local_tokens[:9],
-                               torch.arange(16, 25, dtype=torch.int32))
-    torch.testing.assert_close(local_tokens[9:],
-                               torch.zeros(247, dtype=torch.int32))
+    local_tokens, local_gathers = plan.localize_token_tensor_and_gather_indices(
+        torch.arange(25, dtype=torch.int32),
+        torch.tensor([24]),
+        num_valid_gathers=1,
+    )
+    torch.testing.assert_close(
+        local_tokens[:9], torch.arange(16, 25, dtype=torch.int32)
+    )
+    torch.testing.assert_close(local_tokens[9:], torch.zeros(247, dtype=torch.int32))
     torch.testing.assert_close(local_gathers, torch.tensor([8]))
     torch.testing.assert_close(
         plan.logits_indices_cpu,
@@ -648,8 +667,9 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "vllm_torchtpu.layers.core.pcp_sequence_layout."
-        "_pcp_all_reduce_sum", lambda tensor: tensor)
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._pcp_all_reduce_sum",
+        lambda tensor: tensor,
+    )
     hidden_states = torch.arange(256 * 2, dtype=torch.float32).reshape(256, 2)
     selected = planner.maybe_select_logits_hidden_states(
         hidden_states,
@@ -690,8 +710,7 @@ def test_pcp_sequence_layout_planner_returns_all_when_disabled():
 
 
 def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
-    planner = PcpSequenceLayoutPlanner(
-        _eligibility(pcp_size=8, interleave_size=256))
+    planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=8, interleave_size=256))
 
     assert planner.requires_backend_preinit is True
     assert planner.backend_preinit_world_size == 8
