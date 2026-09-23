@@ -21,7 +21,11 @@ DATA_PARALLELISM=4
 ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
-CONCURRENCY_OPTIONS="512"
+CONCURRENCY_OPTIONS="2048"
+# One prompt per concurrency slot: 2048 = 4 DP replicas x --max-num-seqs=512,
+# so the run actually reaches the concurrency it asks for. Without this the
+# default (320) leaves the cap unreached at ~80 requests per replica.
+NUM_PROMPTS=2048
 RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.90
 EVAL_TOLERANCE="0.03"
