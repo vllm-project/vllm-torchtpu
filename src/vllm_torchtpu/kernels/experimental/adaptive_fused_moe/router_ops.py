@@ -23,6 +23,7 @@ than relying on the sentinels to sum to something the renormalization turns
 into zero -- that outcome was a property of the accumulation dtype and the
 association order rather than of the design.
 """
+
 import functools
 
 import jax
@@ -53,12 +54,12 @@ def pallas_select(scores, topk=10, block_rows=256):
     """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk]."""
     R, N = scores.shape
     assert R % block_rows == 0, (R, block_rows)
-    grid = (R // block_rows, )
+    grid = (R // block_rows,)
     out_shapes = (
         jax.ShapeDtypeStruct((R, topk), jnp.float32),
         jax.ShapeDtypeStruct((R, topk), jnp.int32),
     )
-    bs = (pl.BlockSpec((block_rows, N), lambda i: (i, 0)), )
+    bs = (pl.BlockSpec((block_rows, N), lambda i: (i, 0)),)
     os = (
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),

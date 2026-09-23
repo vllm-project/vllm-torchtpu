@@ -9,8 +9,7 @@ import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import \
-    vllm_adapter as bridge
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter as bridge
 
 pytestmark = pytest.mark.cpu_test
 
@@ -19,12 +18,8 @@ def layer(fp4=False):
     e, h, i = 4, 512, 256
     dtype = torch.float4_e2m1fn_x2 if fp4 else torch.float8_e4m3fn
     result = SimpleNamespace(
-        w13_weight=torch.empty((e, h, i if fp4 else 2 * i),
-                               dtype=dtype,
-                               device="meta"),
-        w2_weight=torch.empty((e, i, h // 2 if fp4 else h),
-                              dtype=dtype,
-                              device="meta"),
+        w13_weight=torch.empty((e, h, i if fp4 else 2 * i), dtype=dtype, device="meta"),
+        w2_weight=torch.empty((e, i, h // 2 if fp4 else h), dtype=dtype, device="meta"),
         global_num_experts=8,
         custom_routing_function=None,
         scoring_func="softmax",
@@ -33,16 +28,17 @@ def layer(fp4=False):
         num_expert_group=None,
         topk_group=None,
         routed_scaling_factor=1.0,
-        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(
-            use_ep=True, pcp_size=1, is_sequence_parallel=False)),
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_ep=True, pcp_size=1, is_sequence_parallel=False
+            )
+        ),
     )
     if fp4:
-        result.w13_weight_scale = torch.empty((e, h // 64, 1, 2 * i),
-                                              device="meta")
+        result.w13_weight_scale = torch.empty((e, h // 64, 1, 2 * i), device="meta")
         result.w2_weight_scale = torch.empty((e, i // 64, 1, h), device="meta")
     else:
-        result.w13_weight_scale_inv = torch.empty((e, 1, 1, 2 * i),
-                                                  device="meta")
+        result.w13_weight_scale_inv = torch.empty((e, 1, 1, 2 * i), device="meta")
         result.w2_weight_scale_inv = torch.empty((e, 1, 1, h), device="meta")
     return result
 
@@ -51,12 +47,11 @@ def layer(fp4=False):
 def context(monkeypatch):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(
-        bridge, "build_ep_mesh",
-        lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: 2}))
+        bridge, "build_ep_mesh", lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: 2})
+    )
     monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
     monkeypatch.setattr(bridge, "ep_rank_order", lambda: None)
-    monkeypatch.setattr(bridge, "ep_token_replica_groups", lambda **kw:
-                        ((0, 1), ))
+    monkeypatch.setattr(bridge, "ep_token_replica_groups", lambda **kw: ((0, 1),))
     monkeypatch.setattr(bridge, "_max_node_tokens", lambda *_: 4096)
     monkeypatch.setattr(bridge, "_device_info", lambda: info)
     monkeypatch.setattr(bridge.envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024)
@@ -66,17 +61,16 @@ def context(monkeypatch):
 
 
 def prebuild(value, **kwargs):
-    return bridge.prebuild_adaptive_fused_moe(value,
-                                              topk=2,
-                                              renormalize=True,
-                                              activation="silu",
-                                              **kwargs)
+    return bridge.prebuild_adaptive_fused_moe(
+        value, topk=2, renormalize=True, activation="silu", **kwargs
+    )
 
 
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("old_flags", ["0", "1"])
-def test_dtype_selects_format_without_legacy_gates(context, monkeypatch, fp4,
-                                                   old_flags):
+def test_dtype_selects_format_without_legacy_gates(
+    context, monkeypatch, fp4, old_flags
+):
     for name in ("MOE_FUSED_EP_ENABLE_W4A8", "MOE_FUSED_EP_V2_SHARDED_PLAN"):
         monkeypatch.setenv(name, old_flags)
     _, op = context
@@ -117,16 +111,17 @@ def test_former_fallbacks_raise(context, monkeypatch, case, match):
         monkeypatch.setattr(bridge, "_max_node_tokens", lambda *_: 512)
     elif case in ("smem", "vmem"):
         field = case + "_capacity_bytes"
-        monkeypatch.setattr(bridge, "_device_info",
-                            lambda: dataclasses.replace(info, **{field: 1}))
+        monkeypatch.setattr(
+            bridge, "_device_info", lambda: dataclasses.replace(info, **{field: 1})
+        )
     elif case == "uneven":
         value.global_num_experts = 9
     elif case == "dtype":
         value.w13_weight = torch.empty(value.w13_weight.shape, device="meta")
     elif case == "shape":
-        value.w2_weight = torch.empty((4, 256, 256),
-                                      dtype=torch.float8_e4m3fn,
-                                      device="meta")
+        value.w2_weight = torch.empty(
+            (4, 256, 256), dtype=torch.float8_e4m3fn, device="meta"
+        )
     elif case == "scales":
         value.w13_weight_scale_inv = torch.empty((4, 2, 1, 512), device="meta")
     elif case == "custom":
@@ -168,18 +163,19 @@ def test_fp4_forward_preserves_single_contraction_block():
     owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
     s1 = torch.empty((4, 1, 1, 512), device="meta")
     s2 = torch.empty((4, 1, 1, 512), device="meta")
-    bridge.run_adaptive_fused_moe(owner, None, value.w13_weight,
-                                  value.w2_weight, s1, s2, None)
+    bridge.run_adaptive_fused_moe(
+        owner, None, value.w13_weight, value.w2_weight, s1, s2, None
+    )
     assert op.call_args.args[3].shape == (4, 1, 512)
     assert op.call_args.args[4].shape == (4, 1, 512)
 
 
-def test_built_bridge_calls_experimental_kernel_and_separates_formats(
-        monkeypatch):
+def test_built_bridge_calls_experimental_kernel_and_separates_formats(monkeypatch):
     import importlib
 
     package = importlib.import_module(
-        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe")
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
     kernel = Mock(return_value="result")
     monkeypatch.setattr(package, "adaptive_fused_moe", kernel)
     monkeypatch.setattr(bridge, "_OPS", {})
@@ -205,11 +201,10 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(
 
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_prebuild_passes_native_token_groups(context, monkeypatch,
-                                             sequence_parallel):
+def test_prebuild_passes_native_token_groups(context, monkeypatch, sequence_parallel):
     value = layer()
     value.moe_config.moe_parallel_config.is_sequence_parallel = sequence_parallel
-    groups = ((0, ), (1, )) if sequence_parallel else ((1, 0), )
+    groups = ((0,), (1,)) if sequence_parallel else ((1, 0),)
     discover = Mock(return_value=groups)
     monkeypatch.setattr(bridge, "ep_token_replica_groups", discover)
     prebuild(value)
@@ -217,11 +212,12 @@ def test_prebuild_passes_native_token_groups(context, monkeypatch,
     assert context[1].call_args.kwargs["token_replica_groups"] == groups
 
 
-def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(
-        monkeypatch):
+def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch):
     import importlib
+
     package = importlib.import_module(
-        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe")
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
     kernel = Mock(return_value="output")
     monkeypatch.setattr(package, "adaptive_fused_moe", kernel)
     monkeypatch.setattr(bridge, "_OPS", {})
@@ -233,21 +229,13 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(
 
     monkeypatch.setattr(bridge, "sharded_jax_op", create)
     mesh = object()
-    groups = ((1, 0), )
+    groups = ((1, 0),)
     original = bridge._build_op(mesh, 2, True, "silu", None)
-    tp = bridge._build_op(mesh,
-                          2,
-                          True,
-                          "silu",
-                          None,
-                          token_replica_groups=groups)
+    tp = bridge._build_op(mesh, 2, True, "silu", None, token_replica_groups=groups)
     assert original is not tp
-    assert tp is bridge._build_op(mesh,
-                                  2,
-                                  True,
-                                  "silu",
-                                  None,
-                                  token_replica_groups=groups)
+    assert tp is bridge._build_op(
+        mesh, 2, True, "silu", None, token_replica_groups=groups
+    )
     gate = SimpleNamespace(astype=lambda _: "gate")
     functions[-1](1, 2, 3, 4, 5, gate, 6)
     assert kernel.call_args.kwargs["token_replica_groups"] == groups

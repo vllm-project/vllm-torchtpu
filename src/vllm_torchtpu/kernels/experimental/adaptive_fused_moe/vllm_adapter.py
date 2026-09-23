@@ -31,15 +31,20 @@ from jax.sharding import Mesh, PartitionSpec
 from vllm.config import get_current_vllm_config
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order,
-                                               ep_token_replica_groups)
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    ep_rank_order,
+    ep_token_replica_groups,
+)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.experimental import \
-    adaptive_fused_moe as adaptive_kernel
+from vllm_torchtpu.kernels.experimental import adaptive_fused_moe as adaptive_kernel
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
-    PACK4, U32_SUBLANE_TILE)
+    PACK4,
+    U32_SUBLANE_TILE,
+)
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.logger import init_logger
 
@@ -66,7 +71,8 @@ def _max_node_tokens(ep: int, pcp: int) -> int:
     cap = config.scheduler_config.max_num_batched_tokens
     if not isinstance(cap, int) or cap <= 0 or pcp <= 0 or ep % pcp:
         raise ValueError(
-            "adaptive fused MoE requires a valid scheduler cap and PCP size")
+            "adaptive fused MoE requires a valid scheduler cap and PCP size"
+        )
     return cap * (ep // pcp)
 
 
@@ -96,39 +102,36 @@ def prebuild_adaptive_fused_moe(
     node_tokens = _max_node_tokens(ep, pcp)
     if node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         raise ValueError(
-            "maximum node token count is below MOE_FUSED_EP_KERNEL_MIN_TOKENS")
+            "maximum node token count is below MOE_FUSED_EP_KERNEL_MIN_TOKENS"
+        )
     if weights is None:
         w1, w2 = layer.w13_weight, layer.w2_weight
         if w1.dtype == torch.float4_e2m1fn_x2:
             weights = (w1, w2, layer.w13_weight_scale, layer.w2_weight_scale)
         else:
-            weights = (w1, w2, layer.w13_weight_scale_inv,
-                       layer.w2_weight_scale_inv)
+            weights = (w1, w2, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
     w1, w2, s1, s2 = weights
     if w1.dtype == torch.float4_e2m1fn_x2:
         weight_format = "fp4"
         if rhs_qb is None:
             if s1.ndim != 4 or s1.shape[1] <= 0 or w1.shape[1] % s1.shape[1]:
                 raise ValueError(
-                    "cannot infer FP4 block size from prepared scale layout")
+                    "cannot infer FP4 block size from prepared scale layout"
+                )
             rhs_qb = w1.shape[1] // s1.shape[1]
     elif w1.dtype == torch.float8_e4m3fn:
         weight_format = "fp8"
     else:
-        raise ValueError(
-            f"unsupported adaptive fused MoE weight dtype {w1.dtype}")
-    reason = fused_moe_ep_unsupported_reason(layer,
-                                             weights,
-                                             activation,
-                                             weight_format=weight_format,
-                                             rhs_qb=rhs_qb)
+        raise ValueError(f"unsupported adaptive fused MoE weight dtype {w1.dtype}")
+    reason = fused_moe_ep_unsupported_reason(
+        layer, weights, activation, weight_format=weight_format, rhs_qb=rhs_qb
+    )
     if reason is not None:
         raise ValueError(f"adaptive fused MoE: {reason}")
     local_experts, hidden = w1.shape[:2]
     inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
     if layer.global_num_experts != local_experts * ep:
-        raise ValueError(
-            "adaptive fused MoE requires equal contiguous expert blocks")
+        raise ValueError("adaptive fused MoE requires equal contiguous expert blocks")
     if not 1 <= topk <= layer.global_num_experts:
         raise ValueError("topk must be between one and the expert count")
     if hidden <= 0 or hidden % host.HIDDEN_LANE_BLOCK or inter < host.HIDDEN_LANE_BLOCK:
@@ -141,7 +144,8 @@ def prebuild_adaptive_fused_moe(
     if host.chip_generation(info) < host.MIN_GENERATION:
         raise ValueError(
             f"adaptive fused MoE requires TPU generation >= {host.MIN_GENERATION}; "
-            f"got generation {host.chip_generation(info)}")
+            f"got generation {host.chip_generation(info)}"
+        )
     smem_bytes = _SMEM_OVERHEAD_BYTES + host.token_gather_smem_bytes(_TILE_M)
     if smem_bytes > info.smem_capacity_bytes:
         raise ValueError("adaptive fused MoE routing working set exceeds SMEM")
@@ -156,19 +160,20 @@ def prebuild_adaptive_fused_moe(
     )
     order = _mesh_expert_order(ep)
     global _RANK_BUFFER
-    _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
-                                dtype=torch.int32,
-                                device=layer.w13_weight.device)
-    groups = ep_token_replica_groups(
-        is_sequence_parallel=parallel.is_sequence_parallel)
-    op = _build_op(mesh,
-                   topk,
-                   renormalize,
-                   activation,
-                   order,
-                   weight_format,
-                   rhs_qb,
-                   token_replica_groups=groups)
+    _RANK_BUFFER = torch.tensor(
+        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+    )
+    groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
+    op = _build_op(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        order,
+        weight_format,
+        rhs_qb,
+        token_replica_groups=groups,
+    )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
         "hidden=%d inter=%d local_experts=%d rhs_qb=%s estimated_vmem_bytes=%d",
@@ -208,30 +213,33 @@ def prebuild_adaptive_nvfp4(
     # allocating another copy of the checkpoint. Strict prebuild also checks
     # routing, EP placement, alignment and memory before weights are replaced.
     weights = (
-        torch.empty((experts, hidden, inter),
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="meta"),
-        torch.empty((experts, inter, hidden // 2),
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="meta"),
-        torch.empty((experts, hidden // block, 1, 2 * inter),
-                    dtype=torch.float32,
-                    device="meta"),
-        torch.empty((experts, inter // block, 1, hidden),
-                    dtype=torch.float32,
-                    device="meta"),
+        torch.empty(
+            (experts, hidden, inter), dtype=torch.float4_e2m1fn_x2, device="meta"
+        ),
+        torch.empty(
+            (experts, inter, hidden // 2), dtype=torch.float4_e2m1fn_x2, device="meta"
+        ),
+        torch.empty(
+            (experts, hidden // block, 1, 2 * inter), dtype=torch.float32, device="meta"
+        ),
+        torch.empty(
+            (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
+        ),
     )
-    op = prebuild_adaptive_fused_moe(layer,
-                                     topk=layer.moe_config.experts_per_token,
-                                     renormalize=layer.renormalize,
-                                     activation=activation,
-                                     weights=weights,
-                                     rhs_qb=block)
+    op = prebuild_adaptive_fused_moe(
+        layer,
+        topk=layer.moe_config.experts_per_token,
+        renormalize=layer.renormalize,
+        activation=activation,
+        weights=weights,
+        rhs_qb=block,
+    )
     return op, block
 
 
-def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
-                           channels: int) -> torch.Tensor | None:
+def _squeeze_channel_scale(
+    scale: torch.Tensor, experts: int, channels: int
+) -> torch.Tensor | None:
     """Our GMM scales are 4-D ``[E, blocks, 1, N]``; the kernel takes ``[E, N]``.
 
     Only the per-output-channel form (one block) converts: a real block-scaled
@@ -279,8 +287,7 @@ def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
         return None
     order = tuple(order)
     if tuple(sorted(order)) != tuple(range(ep)):
-        raise ValueError(
-            f"EP rank order must permute range({ep}); got {order}")
+        raise ValueError(f"EP rank order must permute range({ep}); got {order}")
     if order == tuple(range(ep)):
         return None
     # A tuple, not a list: `info_once` keys its cache on the arguments.
@@ -319,11 +326,15 @@ def fused_moe_ep_unsupported_reason(
         # Match the packed-row geometry used by the kernel's FP4 readers.
         packed_row_tile = U32_SUBLANE_TILE * PACK4
         if rhs_qb % packed_row_tile:
-            return (f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
-                    f"the packed-weight row tile ({packed_row_tile})")
+            return (
+                f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
+                f"the packed-weight row tile ({packed_row_tile})"
+            )
         if hidden % rhs_qb or inter % rhs_qb:
-            return (f"NVFP4 fused EP block-{rhs_qb} must divide both "
-                    f"hidden={hidden} and inter={inter}")
+            return (
+                f"NVFP4 fused EP block-{rhs_qb} must divide both "
+                f"hidden={hidden} and inter={inter}"
+            )
         for name, scale, k, n in (
             ("w1_scale", w1_scale, hidden, 2 * inter),
             ("w2_scale", w2_scale, inter, hidden),
@@ -343,8 +354,10 @@ def fused_moe_ep_unsupported_reason(
     # bridge does not pass them, and dropping a bias is silent: the output is
     # simply wrong by the bias term on every routed token. Refuse until they
     # are wired through as operands.
-    if (getattr(layer, "w13_bias", None) is not None
-            or getattr(layer, "w2_bias", None) is not None):
+    if (
+        getattr(layer, "w13_bias", None) is not None
+        or getattr(layer, "w2_bias", None) is not None
+    ):
         return "expert biases are not wired through the fused EP op"
     return _unsupported_routing_reason(layer)
 
@@ -362,15 +375,20 @@ def _unsupported_routing_reason(layer: RoutedExperts) -> str | None:
     logged. Each of these is a refusal rather than a silent divergence.
     """
     if layer.custom_routing_function is not None:
-        return ("the layer supplies a custom_routing_function; the kernel "
-                "routes with its own softmax top-k")
+        return (
+            "the layer supplies a custom_routing_function; the kernel "
+            "routes with its own softmax top-k"
+        )
     scoring_fn = layer.scoring_func
     if scoring_fn != "softmax":
         return f"scoring_func {scoring_fn!r}; the kernel scores with softmax"
     if layer.e_score_correction_bias is not None:
         return "e_score_correction_bias is not applied inside the kernel"
-    if (layer.use_grouped_topk and layer.num_expert_group > 1
-            and layer.topk_group < layer.num_expert_group):
+    if (
+        layer.use_grouped_topk
+        and layer.num_expert_group > 1
+        and layer.topk_group < layer.num_expert_group
+    ):
         return "grouped top-k routing is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
         return "hash routing is not implemented in the kernel"
@@ -381,9 +399,11 @@ def _unsupported_routing_reason(layer: RoutedExperts) -> str | None:
     # that asked for it and got real routing is a profiling result that is
     # quietly not the thing it claims to measure.
     if moe_routing._SIMULATION_STRATEGY is not None:
-        return ("VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
-                "does its own routing, so the simulation would not be in "
-                "effect")
+        return (
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
+            "does its own routing, so the simulation would not be in "
+            "effect"
+        )
     return None
 
 
@@ -469,7 +489,7 @@ def _build_op(
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
         # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec, ) * 7,
+        input_partition_specs=(spec,) * 7,
         output_partition_specs=spec,
     )
 
@@ -497,8 +517,7 @@ def run_adaptive_fused_moe(
     """Execute a successfully prebuilt experimental op, or raise."""
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
     if op is None:
-        raise RuntimeError(
-            "adaptive fused MoE was not prebuilt for this layer")
+        raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -506,8 +525,7 @@ def run_adaptive_fused_moe(
             if scale.ndim == 4 and scale.shape[2] == 1:
                 return scale.squeeze(2)
             if scale.ndim != 3:
-                raise ValueError(
-                    "FP4 runtime scales require a contraction-block axis")
+                raise ValueError("FP4 runtime scales require a contraction-block axis")
             return scale
 
         return op(

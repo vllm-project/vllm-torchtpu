@@ -28,10 +28,14 @@ def test_fp4_scale_memory_is_bounded_by_pipeline_depth(experts):
     def scale_bytes(arrays):
         return sum(
             host.array_vmem_bytes(dims, dtype, info)
-            for name, dims, dtype in arrays if name in ("w1s_vm", "w2s_vm"))
+            for name, dims, dtype in arrays
+            if name in ("w1s_vm", "w2s_vm")
+        )
 
     old_bytes, new_bytes = scale_bytes(resident), scale_bytes(streamed)
     assert old_bytes == experts * 3 * 2**20
     assert new_bytes == 6 * 2**20
-    print(f"local_experts={experts} original_scale_MiB={old_bytes / 2**20} "
-          f"adaptive_scale_MiB={new_bytes / 2**20}")
+    print(
+        f"local_experts={experts} original_scale_MiB={old_bytes / 2**20} "
+        f"adaptive_scale_MiB={new_bytes / 2**20}"
+    )

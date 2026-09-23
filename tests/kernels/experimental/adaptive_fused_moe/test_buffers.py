@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Host checks for choosing asymmetric weight buffers within VMEM."""
+
 import dataclasses
 
 import pytest
@@ -24,11 +25,14 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize(
     "hidden,inter,weight_format,rhs_qb,expected,expected_mib",
-    [(4096, 1024, host.WeightFormat.FP8, 512, (3, 2), 40.390625),
-     (8192, 2048, host.WeightFormat.FP4, 64, (2, 1), 60.765625)])
-def test_model_geometry_selects_buffers_that_fit(hidden, inter, weight_format,
-                                                 rhs_qb, expected,
-                                                 expected_mib):
+    [
+        (4096, 1024, host.WeightFormat.FP8, 512, (3, 2), 40.390625),
+        (8192, 2048, host.WeightFormat.FP4, 64, (2, 1), 60.765625),
+    ],
+)
+def test_model_geometry_selects_buffers_that_fit(
+    hidden, inter, weight_format, rhs_qb, expected, expected_mib
+):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     shape = {
         "g_local": 64,
@@ -36,7 +40,7 @@ def test_model_geometry_selects_buffers_that_fit(hidden, inter, weight_format,
         "hidden": hidden,
         "inter": inter,
         "weight_format": weight_format,
-        "rhs_qb": rhs_qb
+        "rhs_qb": rhs_qb,
     }
     plan = host.select_weight_buffers(**shape, info=info)
     assert (plan.w1_nbuf, plan.w2_nbuf) == expected
@@ -44,7 +48,8 @@ def test_model_geometry_selects_buffers_that_fit(hidden, inter, weight_format,
     arrays = {
         name: dims
         for name, dims, _ in host.vmem_scratch_arrays(
-            **shape, nbuf=plan.w1_nbuf, w2_nbuf=plan.w2_nbuf)
+            **shape, nbuf=plan.w1_nbuf, w2_nbuf=plan.w2_nbuf
+        )
     }
     assert arrays["w1_vm"][0] == expected[0]
     assert arrays["w2_vm"][0] == expected[1]
@@ -52,8 +57,7 @@ def test_model_geometry_selects_buffers_that_fit(hidden, inter, weight_format,
     assert arrays["w1s_vm"][0] == arrays["w2s_vm"][0] == scale_slots
 
 
-def test_budget_boundary_falls_back_and_rejects_when_minimum_does_not_fit(
-        monkeypatch):
+def test_budget_boundary_falls_back_and_rejects_when_minimum_does_not_fit(monkeypatch):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     shape = {"g_local": 64, "capacity": 128, "hidden": 4096, "inter": 1024}
     monkeypatch.setattr(host, "VMEM_FRACTION", 1.0)

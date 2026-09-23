@@ -41,7 +41,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
-    AXIS, WeightFormat, adaptive_fused_moe)
+    AXIS,
+    WeightFormat,
+    adaptive_fused_moe,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -63,9 +66,11 @@ def _require_eight_devices():
     the eight-chip agent nothing here touches the accelerator at all.
     """
     if jax.device_count() < 8:
-        pytest.skip("the fused EP MoE kernel is an eight-way expert-parallel "
-                    "collective and this host reports fewer than 8 JAX "
-                    "devices")
+        pytest.skip(
+            "the fused EP MoE kernel is an eight-way expert-parallel "
+            "collective and this host reports fewer than 8 JAX "
+            "devices"
+        )
 
 
 # The expert-parallel width, and the tile height the serving adapter passes
@@ -112,7 +117,7 @@ ROTATED_CONTROL_FACTOR = 10
 
 def _mesh():
     """The single-axis expert-parallel mesh, over the first eight devices."""
-    return Mesh(np.asarray(jax.devices()[:EP]), axis_names=(AXIS, ))
+    return Mesh(np.asarray(jax.devices()[:EP]), axis_names=(AXIS,))
 
 
 def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
@@ -124,7 +129,7 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
     along each matmul's contraction axis, which is the layout the kernel
     takes: w1_scale [E, 2 * inter], w2_scale [E, hidden].
     """
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     g_local = e_total // mesh.shape[axis]
     quantized = weight_format == WeightFormat.FP8
 
@@ -132,8 +137,10 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
         me = lax.axis_index(axis)
         k1, k2 = jax.random.split(jax.random.fold_in(jax.random.key(seed), me))
         weights = []
-        for key, shape in ((k1, (g_local, hidden, 2 * inter)),
-                           (k2, (g_local, inter, hidden))):
+        for key, shape in (
+            (k1, (g_local, hidden, 2 * inter)),
+            (k2, (g_local, inter, hidden)),
+        ):
             w = jax.random.normal(key, shape, jnp.float32) / 10
             if not quantized:
                 weights.append((w.astype(jnp.bfloat16), None))
@@ -141,34 +148,39 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
             amax = jnp.max(jnp.abs(w), axis=1, keepdims=True)
             scale = jnp.where(amax == 0, 1.0, amax / float(jnp.finfo(FP8).max))
             weights.append(
-                ((w / scale).astype(FP8),
-                 scale.astype(jnp.float32).reshape(shape[0], shape[2])))
+                (
+                    (w / scale).astype(FP8),
+                    scale.astype(jnp.float32).reshape(shape[0], shape[2]),
+                )
+            )
         (w1, w1s), (w2, w2s) = weights
         return (w1, w2) if not quantized else (w1, w2, w1s, w2s)
 
-    out_specs = (P(axis), ) * (4 if quantized else 2)
+    out_specs = (P(axis),) * (4 if quantized else 2)
     built = jax.jit(
-        jax.shard_map(local,
-                      mesh=mesh,
-                      in_specs=(P(axis), ),
-                      out_specs=out_specs,
-                      check_vma=False))(jnp.zeros((EP, ), jnp.float32))
+        jax.shard_map(
+            local, mesh=mesh, in_specs=(P(axis),), out_specs=out_specs, check_vma=False
+        )
+    )(jnp.zeros((EP,), jnp.float32))
     return built if quantized else (built[0], built[1], None, None)
 
 
 def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     """(x, gating) as global arrays sharded on the tokens."""
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     shard = NamedSharding(mesh, P(axis))
 
     @jax.jit
     def build():
         kx, kg = jax.random.split(jax.random.key(seed))
         x = (jax.random.normal(kx, (tokens, hidden), jnp.float32) / 10).astype(
-            jnp.bfloat16)
+            jnp.bfloat16
+        )
         gating = jax.random.normal(kg, (tokens, e_total), jnp.float32)
-        return (lax.with_sharding_constraint(x, shard),
-                lax.with_sharding_constraint(gating, shard))
+        return (
+            lax.with_sharding_constraint(x, shard),
+            lax.with_sharding_constraint(gating, shard),
+        )
 
     return build()
 
@@ -187,7 +199,7 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
     summed across shards -- which is a distribution of the reference, not a
     change of it: the summands and their order are the same.
     """
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     g_local = w1.shape[0] // mesh.shape[axis]
     inter = w1.shape[2] // 2
     scaled = w1_scale is not None
@@ -201,16 +213,18 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
         x32 = x_g.astype(jnp.float32)
 
         def expert(e, acc):
-            w1e = lax.dynamic_index_in_dim(w1_l, e, 0,
-                                           keepdims=False).astype(jnp.float32)
-            w2e = lax.dynamic_index_in_dim(w2_l, e, 0,
-                                           keepdims=False).astype(jnp.float32)
+            w1e = lax.dynamic_index_in_dim(w1_l, e, 0, keepdims=False).astype(
+                jnp.float32
+            )
+            w2e = lax.dynamic_index_in_dim(w2_l, e, 0, keepdims=False).astype(
+                jnp.float32
+            )
             if scaled:
                 w1e = w1e * lax.dynamic_index_in_dim(s1, e, 0, keepdims=True)
                 w2e = w2e * lax.dynamic_index_in_dim(s2, e, 0, keepdims=True)
-            weight = jnp.sum(jnp.where(topk_idx == first + e, topk_weights,
-                                       0.0),
-                             axis=-1)[:, None]
+            weight = jnp.sum(
+                jnp.where(topk_idx == first + e, topk_weights, 0.0), axis=-1
+            )[:, None]
             acc1 = x32 @ w1e
             row = (jax.nn.silu(acc1[:, :inter]) * acc1[:, inter:]) @ w2e
             return acc + weight * row
@@ -218,15 +232,13 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
         mine = lax.fori_loop(0, g_local, expert, jnp.zeros_like(x32))
         return lax.psum(mine, axis)
 
-    in_specs = (P(), P(), P(axis), P(axis)) + ((P(axis), ) * 2 if scaled else
-                                               ())
+    in_specs = (P(), P(), P(axis), P(axis)) + ((P(axis),) * 2 if scaled else ())
     args = (x, gating, w1, w2) + ((w1_scale, w2_scale) if scaled else ())
     return jax.jit(
-        jax.shard_map(local,
-                      mesh=mesh,
-                      in_specs=in_specs,
-                      out_specs=P(),
-                      check_vma=False))(*args)
+        jax.shard_map(
+            local, mesh=mesh, in_specs=in_specs, out_specs=P(), check_vma=False
+        )
+    )(*args)
 
 
 def _relative_l2(actual, want):
@@ -245,80 +257,73 @@ def _worst_token_relative_l2(actual, want):
     return float(np.max(per_token / np.where(scale == 0, 1.0, scale)))
 
 
-def _check_against_the_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating,
-                                 *, topk, batch_bound, token_bound):
+def _check_against_the_reference(
+    mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, batch_bound, token_bound
+):
     """Run the layer, hold it to the dense reference, and rotate the experts.
 
     The rotation is the control the bands need: both are wide enough to
     cover an fp8 wire, so without it a layer that sent every token to the
     wrong expert could still pass one of them.
     """
-    out = adaptive_fused_moe(x,
-                             w1,
-                             w2,
-                             w1_scale,
-                             w2_scale,
-                             gating,
-                             topk=topk,
-                             renormalize=True,
-                             mesh=mesh,
-                             capacity=CAPACITY,
-                             weight_format=(WeightFormat.FP8 if w1.dtype == FP8
-                                            else WeightFormat.BF16))
+    out = adaptive_fused_moe(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=(WeightFormat.FP8 if w1.dtype == FP8 else WeightFormat.BF16),
+    )
     # [tokens, hidden] sharded the way x is: the combine leaves each token's
     # row on the shard that owns the token, so nothing has to be gathered.
     assert out.shape == x.shape
     assert out.dtype == x.dtype
     assert out.sharding.spec == x.sharding.spec
 
-    want = _dense_reference(mesh,
-                            x,
-                            w1,
-                            w2,
-                            w1_scale,
-                            w2_scale,
-                            gating,
-                            topk=topk)
+    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=topk)
     error = _relative_l2(out, want)
-    assert error < batch_bound, (
-        f"relative L2 {error:.4f} past the {batch_bound} band")
+    assert error < batch_bound, f"relative L2 {error:.4f} past the {batch_bound} band"
     worst = _worst_token_relative_l2(out, want)
     assert worst < token_bound, (
         f"worst token's relative error {worst:.4f} past the {token_bound} "
         f"per-token band; the batch norm was {error:.4f}, so this is a few "
-        f"tokens rather than the whole batch")
+        f"tokens rather than the whole batch"
+    )
 
     def roll(a):
         return None if a is None else jnp.roll(a, 1, axis=0)
 
-    rotated = _dense_reference(mesh,
-                               x,
-                               roll(w1),
-                               roll(w2),
-                               roll(w1_scale),
-                               roll(w2_scale),
-                               gating,
-                               topk=topk)
+    rotated = _dense_reference(
+        mesh, x, roll(w1), roll(w2), roll(w1_scale), roll(w2_scale), gating, topk=topk
+    )
     assert _relative_l2(out, rotated) > ROTATED_CONTROL_FACTOR * error
     return error, worst
 
 
-@pytest.mark.parametrize("weight_format",
-                         [WeightFormat.FP8, WeightFormat.BF16])
+@pytest.mark.parametrize("weight_format", [WeightFormat.FP8, WeightFormat.BF16])
 def test_small_shape_tracks_a_dense_reference(weight_format):
     """The layer end to end at a small but structurally complete shape."""
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               0,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=weight_format)
-    x, gating = _make_inputs(mesh,
-                             1,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        0,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=weight_format,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        1,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
     quantized = weight_format == WeightFormat.FP8
     _check_against_the_reference(
         mesh,
@@ -330,40 +335,41 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         gating,
         topk=SMALL["topk"],
         batch_bound=FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
-        token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND)
+        token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND,
+    )
 
 
 def test_sharded_routing_plan_matches_original_v2_replicated_plan():
     """Plan decomposition changes only how the kernel operands are built."""
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               20,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             21,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
-    common = dict(topk=SMALL["topk"],
-                  renormalize=True,
-                  mesh=mesh,
-                  capacity=CAPACITY,
-                  weight_format=WeightFormat.FP8)
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        20,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        21,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
     from vllm_torchtpu.kernels.fused_moe.v2 import fused_ep_moe_v2
 
-    replicated = fused_ep_moe_v2(x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 sharded_plan=False,
-                                 **common)
-    sharded = adaptive_fused_moe(x, w1, w2, w1_scale, w2_scale, gating,
-                                 **common)
+    replicated = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, sharded_plan=False, **common
+    )
+    sharded = adaptive_fused_moe(x, w1, w2, w1_scale, w2_scale, gating, **common)
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
@@ -376,17 +382,21 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     enabled, which is the served configuration.
     """
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               22,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             23,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        22,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        23,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
     order = (0, 1, 6, 7, 2, 3, 4, 5)
     g_local = SMALL["e_total"] // EP
     expert_sharding = NamedSharding(mesh, P(AXIS))
@@ -404,15 +414,9 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
         capacity=CAPACITY,
         weight_format=WeightFormat.FP8,
     )
-    identity = adaptive_fused_moe(x, w1, w2, w1_scale, w2_scale, gating,
-                                  **common)
-    placed = tuple(
-        place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
-    remapped = adaptive_fused_moe(x,
-                                  *placed,
-                                  gating,
-                                  mesh_ep_ranks=order,
-                                  **common)
+    identity = adaptive_fused_moe(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    placed = tuple(place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
+    remapped = adaptive_fused_moe(x, *placed, gating, mesh_ep_ranks=order, **common)
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
@@ -424,12 +428,14 @@ def production_weights():
     shapes below run against them.
     """
     mesh = _mesh()
-    weights = _make_weights(mesh,
-                            7,
-                            hidden=PROD["hidden"],
-                            inter=PROD["inter"],
-                            e_total=PROD["e_total"],
-                            weight_format=WeightFormat.FP8)
+    weights = _make_weights(
+        mesh,
+        7,
+        hidden=PROD["hidden"],
+        inter=PROD["inter"],
+        e_total=PROD["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
     jax.block_until_ready(weights)
     yield weights
     del weights
@@ -440,21 +446,21 @@ def test_production_shape_tracks_a_dense_reference(production_weights, tokens):
     """Qwen3.5-397B's MoE block at the decode and prefill batch shapes."""
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = production_weights
-    x, gating = _make_inputs(mesh,
-                             2,
-                             tokens=tokens,
-                             hidden=PROD["hidden"],
-                             e_total=PROD["e_total"])
-    _check_against_the_reference(mesh,
-                                 x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 topk=PROD["topk"],
-                                 batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+    x, gating = _make_inputs(
+        mesh, 2, tokens=tokens, hidden=PROD["hidden"], e_total=PROD["e_total"]
+    )
+    _check_against_the_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=PROD["topk"],
+        batch_bound=FP8_RELATIVE_BOUND,
+        token_bound=FP8_TOKEN_BOUND,
+    )
 
 
 def test_any_mesh_axis_name_works():
@@ -469,28 +475,34 @@ def test_any_mesh_axis_name_works():
     mesh it is handed, so nothing is left that hardcodes a name. Held here so
     the freedom is stated, and so a revert to axis_index fails loudly.
     """
-    mesh = Mesh(np.asarray(jax.devices()[:EP]), axis_names=("ep", ))
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               0,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             1,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
-    _check_against_the_reference(mesh,
-                                 x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 topk=SMALL["topk"],
-                                 batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+    mesh = Mesh(np.asarray(jax.devices()[:EP]), axis_names=("ep",))
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        0,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        1,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    _check_against_the_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        batch_bound=FP8_RELATIVE_BOUND,
+        token_bound=FP8_TOKEN_BOUND,
+    )
 
 
 def test_fp4_block512_tracks_dense_reference_and_routing_plan():
@@ -506,27 +518,27 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
         normalized = (grouped / scale[:, :, None, :]).reshape(shape)
         w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
         s = jax.device_put(scale, shard)
-        dequant = (w.astype(jnp.float32).reshape(grouped.shape) *
-                   s[:, :, None, :]).reshape(shape)
+        dequant = (
+            w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]
+        ).reshape(shape)
         weights.append(w)
         scales.append(s)
         decoded.append(dequant)
     x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
-    common = dict(topk=4,
-                  renormalize=True,
-                  mesh=mesh,
-                  capacity=CAPACITY,
-                  weight_format=WeightFormat.FP4,
-                  rhs_qb=512)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+    )
     out = adaptive_fused_moe(x, *weights, *scales, gating, **common)
     from vllm_torchtpu.kernels.fused_moe.v2 import fused_ep_moe_v2
 
-    replicated = fused_ep_moe_v2(x,
-                                 *weights,
-                                 *scales,
-                                 gating,
-                                 sharded_plan=False,
-                                 **common)
+    replicated = fused_ep_moe_v2(
+        x, *weights, *scales, gating, sharded_plan=False, **common
+    )
     np.testing.assert_array_equal(np.asarray(out), np.asarray(replicated))
     ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=4)
     error = _relative_l2(out, ref)
@@ -534,40 +546,41 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     print(f"FP4 block512 relative_l2={error} worst_token={worst}")
     assert error < FP8_RELATIVE_BOUND
     assert worst < FP8_TOKEN_BOUND
-    wrong = _dense_reference(mesh,
-                             x,
-                             jnp.roll(decoded[0], 1, axis=0),
-                             jnp.roll(decoded[1], 1, axis=0),
-                             None,
-                             None,
-                             gating,
-                             topk=4)
+    wrong = _dense_reference(
+        mesh,
+        x,
+        jnp.roll(decoded[0], 1, axis=0),
+        jnp.roll(decoded[1], 1, axis=0),
+        None,
+        None,
+        gating,
+        topk=4,
+    )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
 def test_single_local_expert_and_empty_visits_track_dense_reference():
     """Most ranks visit no experts; one rank reuses W2 across many tiles."""
     mesh = _mesh()
-    weights = _make_weights(mesh,
-                            61,
-                            hidden=512,
-                            inter=256,
-                            e_total=EP,
-                            weight_format=WeightFormat.FP8)
+    weights = _make_weights(
+        mesh, 61, hidden=512, inter=256, e_total=EP, weight_format=WeightFormat.FP8
+    )
     x, gating = _make_inputs(mesh, 62, tokens=1024, hidden=512, e_total=EP)
     # Every token goes to expert 0. That expert spans multiple token tiles,
     # while the other ranks must not start or wait on any weight DMA.
     gating = jax.device_put(
-        jnp.arange(EP, 0, -1, dtype=jnp.float32)[None, :].repeat(x.shape[0],
-                                                                 axis=0),
-        gating.sharding)
-    _check_against_the_reference(mesh,
-                                 x,
-                                 *weights,
-                                 gating,
-                                 topk=1,
-                                 batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+        jnp.arange(EP, 0, -1, dtype=jnp.float32)[None, :].repeat(x.shape[0], axis=0),
+        gating.sharding,
+    )
+    _check_against_the_reference(
+        mesh,
+        x,
+        *weights,
+        gating,
+        topk=1,
+        batch_bound=FP8_RELATIVE_BOUND,
+        token_bound=FP8_TOKEN_BOUND,
+    )
 
 
 def test_int8_asymmetric_buffers_track_dense_reference():
@@ -578,21 +591,26 @@ def test_int8_asymmetric_buffers_track_dense_reference():
     weights, scales = [], []
     for shape in ((32, 512, 1024), (32, 512, 512)):
         weights.append(
-            jax.device_put(rng.integers(-16, 17, shape, dtype=np.int8), shard))
+            jax.device_put(rng.integers(-16, 17, shape, dtype=np.int8), shard)
+        )
         scales.append(
             jax.device_put(
-                rng.uniform(0.005, 0.015,
-                            (shape[0], shape[-1])).astype(np.float32), shard))
+                rng.uniform(0.005, 0.015, (shape[0], shape[-1])).astype(np.float32),
+                shard,
+            )
+        )
     x, gating = _make_inputs(mesh, 72, tokens=256, hidden=512, e_total=32)
-    out = adaptive_fused_moe(x,
-                             *weights,
-                             *scales,
-                             gating,
-                             topk=4,
-                             renormalize=True,
-                             mesh=mesh,
-                             capacity=CAPACITY,
-                             weight_format=WeightFormat.INT8)
+    out = adaptive_fused_moe(
+        x,
+        *weights,
+        *scales,
+        gating,
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.INT8,
+    )
     want = _dense_reference(mesh, x, *weights, *scales, gating, topk=4)
     assert _relative_l2(out, want) < BF16_RELATIVE_BOUND
     assert _worst_token_relative_l2(out, want) < BF16_TOKEN_BOUND
@@ -604,19 +622,17 @@ def qwen38_weights():
     from vllm_torchtpu.layers.core.fused_moe_gmm import requant_unpack_kmajor
 
     mesh = _mesh()
-    axis, = mesh.axis_names
+    (axis,) = mesh.axis_names
 
     def local(_):
         key = jax.random.fold_in(jax.random.key(7), lax.axis_index(axis))
         keys = jax.random.split(key, 4)
         weights, scales = [], []
         for i, (n, k) in enumerate(((4096, 8192), (8192, 2048))):
-            packed = jax.random.bits(keys[2 * i], (512 // EP, n, k // 2),
-                                     jnp.uint8)
-            scale = jax.random.uniform(keys[2 * i + 1],
-                                       (512 // EP, n, k // 16),
-                                       minval=0.01,
-                                       maxval=0.05)
+            packed = jax.random.bits(keys[2 * i], (512 // EP, n, k // 2), jnp.uint8)
+            scale = jax.random.uniform(
+                keys[2 * i + 1], (512 // EP, n, k // 16), minval=0.01, maxval=0.05
+            )
             scale = scale.astype(jnp.float8_e4m3fn).astype(jnp.float32)
             weight, scale = requant_unpack_kmajor(packed, scale, block=64)
             weights.append(weight)
@@ -624,11 +640,14 @@ def qwen38_weights():
         return weights[0], weights[1], scales[0], scales[1]
 
     weights = jax.jit(
-        jax.shard_map(local,
-                      mesh=mesh,
-                      in_specs=(P(axis), ),
-                      out_specs=(P(axis), ) * 4,
-                      check_vma=False))(jnp.zeros((EP, ), jnp.float32))
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(P(axis),),
+            out_specs=(P(axis),) * 4,
+            check_vma=False,
+        )
+    )(jnp.zeros((EP,), jnp.float32))
     jax.block_until_ready(weights)
     yield weights
     del weights
@@ -637,29 +656,34 @@ def qwen38_weights():
 @pytest.mark.parametrize("tokens", (2048, 16384))
 def test_qwen38_nvfp4_tracks_dense_reference(qwen38_weights, tokens):
     """Full Qwen3.8 layer dimensions run through the experimental 2+1 path."""
-    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import \
-        select_weight_buffers
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+        select_weight_buffers,
+    )
 
     mesh = _mesh()
-    plan = select_weight_buffers(g_local=512 // EP,
-                                 capacity=CAPACITY,
-                                 hidden=8192,
-                                 inter=2048,
-                                 weight_format=WeightFormat.FP4,
-                                 rhs_qb=64)
+    plan = select_weight_buffers(
+        g_local=512 // EP,
+        capacity=CAPACITY,
+        hidden=8192,
+        inter=2048,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=64,
+    )
     assert (plan.w1_nbuf, plan.w2_nbuf) == (2, 1)
     w1, w2, s1, s2 = qwen38_weights
     x, gating = _make_inputs(mesh, 2, tokens=tokens, hidden=8192, e_total=512)
-    out = adaptive_fused_moe(x,
-                             w1,
-                             w2,
-                             s1,
-                             s2,
-                             gating,
-                             topk=10,
-                             renormalize=True,
-                             mesh=mesh,
-                             capacity=CAPACITY)
+    out = adaptive_fused_moe(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        gating,
+        topk=10,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+    )
     assert out.shape == x.shape
     assert out.dtype == x.dtype
     assert out.sharding.spec == x.sharding.spec
@@ -667,25 +691,30 @@ def test_qwen38_nvfp4_tracks_dense_reference(qwen38_weights, tokens):
     @jax.jit
     def decode(weight, scale):
         e, k, n = weight.shape
-        return (weight.astype(jnp.float32).reshape(e, k // 64, 64, n) *
-                scale[:, :, None, :]).reshape(e, k, n)
+        return (
+            weight.astype(jnp.float32).reshape(e, k // 64, 64, n) * scale[:, :, None, :]
+        ).reshape(e, k, n)
 
     d1, d2 = decode(w1, s1), decode(w2, s2)
     want = _dense_reference(mesh, x, d1, d2, None, None, gating, topk=10)
     error = _relative_l2(out, want)
     worst = _worst_token_relative_l2(out, want)
-    print(f"Qwen3.8 tokens={tokens} buffers={plan.w1_nbuf}+{plan.w2_nbuf} "
-          f"relative_l2={error} worst_token_relative_l2={worst}")
+    print(
+        f"Qwen3.8 tokens={tokens} buffers={plan.w1_nbuf}+{plan.w2_nbuf} "
+        f"relative_l2={error} worst_token_relative_l2={worst}"
+    )
     assert error < FP8_RELATIVE_BOUND
     assert worst < FP8_TOKEN_BOUND
-    wrong = _dense_reference(mesh,
-                             x,
-                             jnp.roll(d1, 1, axis=0),
-                             jnp.roll(d2, 1, axis=0),
-                             None,
-                             None,
-                             gating,
-                             topk=10)
+    wrong = _dense_reference(
+        mesh,
+        x,
+        jnp.roll(d1, 1, axis=0),
+        jnp.roll(d2, 1, axis=0),
+        None,
+        None,
+        gating,
+        topk=10,
+    )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
@@ -699,59 +728,65 @@ def test_fp4_scale_pipeline_sparse_visits_and_multiple_tiles(local_experts):
     experts, hidden, inter, block = local_experts * EP, 512, 256, 64
     rng = np.random.default_rng(94)
     active = (EP - 1) * local_experts + np.array(
-        [1, local_experts // 2, local_experts - 2, local_experts - 1])
+        [1, local_experts // 2, local_experts - 2, local_experts - 1]
+    )
     weights, scales, decoded = [], [], []
     for k, n in ((hidden, 2 * inter), (inter, hidden)):
         # Distinct scales for every expert and contraction block make a stale
         # ring slot or an expert-ID/visit-index mix-up observable.
         scale = (
-            0.01 +
-            np.arange(experts, dtype=np.float32)[:, None, None] * 0.0001 +
-            np.arange(k // block, dtype=np.float32)[None, :, None] * 0.001)
-        scale[active] += np.array([0.005, 0.02, 0.08, 0.32],
-                                  np.float32)[:, None, None]
+            0.01
+            + np.arange(experts, dtype=np.float32)[:, None, None] * 0.0001
+            + np.arange(k // block, dtype=np.float32)[None, :, None] * 0.001
+        )
+        scale[active] += np.array([0.005, 0.02, 0.08, 0.32], np.float32)[:, None, None]
         scale = np.broadcast_to(scale, (experts, k // block, n)).copy()
         s = jax.device_put(scale, shard)
-        w = jax.device_put(rng.integers(-3, 4, (experts, k, n), dtype=np.int8),
-                           shard).astype(jnp.float4_e2m1fn)
-        d = (w.astype(jnp.float32).reshape(experts, k // block, block, n) *
-             s[:, :, None, :]).reshape(experts, k, n)
+        w = jax.device_put(
+            rng.integers(-3, 4, (experts, k, n), dtype=np.int8), shard
+        ).astype(jnp.float4_e2m1fn)
+        d = (
+            w.astype(jnp.float32).reshape(experts, k // block, block, n)
+            * s[:, :, None, :]
+        ).reshape(experts, k, n)
         weights.append(w)
         scales.append(s)
         decoded.append(d)
-    x, gating = _make_inputs(mesh,
-                             93,
-                             tokens=1024,
-                             hidden=hidden,
-                             e_total=experts)
+    x, gating = _make_inputs(mesh, 93, tokens=1024, hidden=hidden, e_total=experts)
     scores = np.full((1024, experts), -100, np.float32)
     scores[:, active] = np.array([1, 2, 3, 4], np.float32)
     gating = jax.device_put(scores, gating.sharding)
-    out = adaptive_fused_moe(x,
-                             *weights,
-                             *scales,
-                             gating,
-                             topk=4,
-                             renormalize=True,
-                             mesh=mesh,
-                             capacity=CAPACITY)
-    original = fused_ep_moe_v2(x,
-                               *weights,
-                               *scales,
-                               gating,
-                               topk=4,
-                               renormalize=True,
-                               mesh=mesh,
-                               capacity=CAPACITY,
-                               weight_format=WeightFormat.FP4,
-                               rhs_qb=block,
-                               sharded_plan=True)
+    out = adaptive_fused_moe(
+        x,
+        *weights,
+        *scales,
+        gating,
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+    )
+    original = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=block,
+        sharded_plan=True,
+    )
     np.testing.assert_array_equal(np.asarray(out), np.asarray(original))
     want = _dense_reference(mesh, x, *decoded, None, None, gating, topk=4)
     error, worst = _relative_l2(out, want), _worst_token_relative_l2(out, want)
-    print(f"FP4 sparse scale pipeline local_experts={local_experts} "
-          f"bit_exact_original_v2=True relative_l2={error} "
-          f"worst_token_relative_l2={worst}")
+    print(
+        f"FP4 sparse scale pipeline local_experts={local_experts} "
+        f"bit_exact_original_v2=True relative_l2={error} "
+        f"worst_token_relative_l2={worst}"
+    )
     # This stress case validates scale DMA against resident-scale v2 bit for
     # bit. Strongly unequal expert scales can exceed the dense-reference
     # worst-token band in BOTH kernels; report that metric without making a

@@ -18,8 +18,9 @@ fused_moe.v2 package and its serving integration retain their original behavior.
 """
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host, kernel
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.layer import \
-    adaptive_fused_moe
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.layer import (
+    adaptive_fused_moe,
+)
 
 # The layout constants a caller has to match, and the VMEM accounting,
 # named here so a caller binds against the package rather than reaching
@@ -57,7 +58,11 @@ WeightBufferPlan = host.WeightBufferPlan
 # they are the part most likely to change and they are not API: a caller
 # outside this repository binds to the names below.
 __all__ = [
-    "WEIGHT_FORMS", "WeightFormat", "adaptive_fused_moe",
-    "vmem_estimate_bytes", "vmem_limit", "select_weight_buffers",
-    "WeightBufferPlan"
+    "WEIGHT_FORMS",
+    "WeightFormat",
+    "adaptive_fused_moe",
+    "vmem_estimate_bytes",
+    "vmem_limit",
+    "select_weight_buffers",
+    "WeightBufferPlan",
 ]
