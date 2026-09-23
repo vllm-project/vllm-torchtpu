@@ -100,7 +100,7 @@ class ServingConfigs:
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
-    max_schedule_size_multiplier: int = 16
+    max_schedule_size_multiplier: int = 64
     decode_query_size: int = 1
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
