@@ -35,7 +35,9 @@ def check_case(baseline, num_heads, dtype, lengths, verify_count, spec_tokens):
     rng = np.random.default_rng(42)
     qloc = np.r_[0, np.cumsum(lengths)].astype(np.int32)
     # Include inactive tokens and unowned state slots with nonzero contents.
-    tokens = max(8, int(qloc[-1]) + 3)
+    # The chunked prefill solve requires whole triangular blocks. Use
+    # serving-style padded buckets while keeping inactive tail tokens.
+    tokens = ((int(qloc[-1]) + 3 + 63) // 64) * 64
     blocks = n * window + 3
 
     def rand(shape, dt=jnp.float32):
