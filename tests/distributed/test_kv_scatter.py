@@ -14,6 +14,7 @@ Split into two groups:
     and later subprocess-spawning tests (e.g. test_async_scheduling.py)
     abort with "Internal error when accessing libtpu multi-process lockfile".
 """
+
 import multiprocessing
 import traceback
 
@@ -21,8 +22,11 @@ import pytest
 import torch
 
 from vllm_torchtpu.distributed.kv_transfer.kv_scatter import (
-    multi_layer_scatter_into, prepare_scatter_args, scatter_available,
-    smoke_test_multi_layer_scatter)
+    multi_layer_scatter_into,
+    prepare_scatter_args,
+    scatter_available,
+    smoke_test_multi_layer_scatter,
+)
 
 
 def _subprocess_worker(target, queue):
@@ -44,8 +48,7 @@ def _run_in_subprocess(target):
     p.start()
     p.join()
     if p.exitcode != 0 and queue.empty():
-        raise AssertionError(
-            f"Isolated TPU test crashed (exitcode={p.exitcode})")
+        raise AssertionError(f"Isolated TPU test crashed (exitcode={p.exitcode})")
     status, payload = queue.get()
     if status == "ERROR":
         raise AssertionError(f"Isolated TPU test failed:\n{payload}")
@@ -57,7 +60,6 @@ def _run_in_subprocess(target):
 
 
 class TestScatterAvailable:
-
     def test_returns_bool(self):
         assert isinstance(scatter_available(), bool)
 
@@ -75,16 +77,18 @@ class TestPrepareScatterArgs:
     def test_output_shapes(self):
         blocks = torch.tensor([3, 7, 1], dtype=torch.int64)
         num_chunks, src_offsets, dest_offsets = prepare_scatter_args(
-            blocks, torch.device("cpu"))
+            blocks, torch.device("cpu")
+        )
 
-        assert num_chunks.shape == (1, )
-        assert src_offsets.shape == (3, )
-        assert dest_offsets.shape == (3, )
+        assert num_chunks.shape == (1,)
+        assert src_offsets.shape == (3,)
+        assert dest_offsets.shape == (3,)
 
     def test_all_outputs_are_int32(self):
         blocks = torch.tensor([0, 1, 2], dtype=torch.int64)
         num_chunks, src_offsets, dest_offsets = prepare_scatter_args(
-            blocks, torch.device("cpu"))
+            blocks, torch.device("cpu")
+        )
 
         assert num_chunks.dtype == torch.int32
         assert src_offsets.dtype == torch.int32
@@ -108,7 +112,8 @@ class TestPrepareScatterArgs:
     def test_single_block(self):
         blocks = torch.tensor([7], dtype=torch.int64)
         num_chunks, src_offsets, dest_offsets = prepare_scatter_args(
-            blocks, torch.device("cpu"))
+            blocks, torch.device("cpu")
+        )
         assert int(num_chunks[0]) == 1
         assert src_offsets.tolist() == [0]
         assert dest_offsets.tolist() == [7]
@@ -126,34 +131,32 @@ class TestMultiLayerScatterIntoEdgeCases:
     so these tests are gated on scatter_available().
     """
 
-    @pytest.mark.skipif(not scatter_available(),
-                        reason="JAX/Pallas not available")
+    @pytest.mark.skipif(not scatter_available(), reason="JAX/Pallas not available")
     def test_empty_layer_list_returns_empty(self):
-        result = multi_layer_scatter_into(srcs=[],
-                                          dsts=[],
-                                          local_blocks=torch.tensor(
-                                              [], dtype=torch.int32))
+        result = multi_layer_scatter_into(
+            srcs=[], dsts=[], local_blocks=torch.tensor([], dtype=torch.int32)
+        )
         assert result == []
 
-    @pytest.mark.skipif(not scatter_available(),
-                        reason="JAX/Pallas not available")
+    @pytest.mark.skipif(not scatter_available(), reason="JAX/Pallas not available")
     def test_zero_blocks_returns_dsts_unchanged(self):
         dst = torch.zeros(8, 4, dtype=torch.float32)
-        result = multi_layer_scatter_into(srcs=[torch.zeros(0, 4)],
-                                          dsts=[dst],
-                                          local_blocks=torch.tensor(
-                                              [], dtype=torch.int32))
+        result = multi_layer_scatter_into(
+            srcs=[torch.zeros(0, 4)],
+            dsts=[dst],
+            local_blocks=torch.tensor([], dtype=torch.int32),
+        )
         assert len(result) == 1
         assert result[0] is dst
 
-    @pytest.mark.skipif(not scatter_available(),
-                        reason="JAX/Pallas not available")
+    @pytest.mark.skipif(not scatter_available(), reason="JAX/Pallas not available")
     def test_mismatched_srcs_dsts_raises_value_error(self):
         with pytest.raises(ValueError, match="multi_layer_scatter_into"):
-            multi_layer_scatter_into(srcs=[torch.zeros(2, 4)],
-                                     dsts=[],
-                                     local_blocks=torch.tensor(
-                                         [0, 1], dtype=torch.int32))
+            multi_layer_scatter_into(
+                srcs=[torch.zeros(2, 4)],
+                dsts=[],
+                local_blocks=torch.tensor([0, 1], dtype=torch.int32),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +188,9 @@ def _body_single_layer_scatter_correctness():
     out_cpu = outs[0].cpu()
     src_cpu = src.cpu()
     for i, dest_idx in enumerate([2, 5, 7]):
-        assert torch.equal(
-            out_cpu[dest_idx],
-            src_cpu[i]), (f"block {i} → dest[{dest_idx}] mismatch")
+        assert torch.equal(out_cpu[dest_idx], src_cpu[i]), (
+            f"block {i} → dest[{dest_idx}] mismatch"
+        )
     for untouched in [0, 1, 3, 4, 6]:
         assert torch.equal(out_cpu[untouched], torch.zeros(t, dtype=dtype))
 
@@ -202,10 +205,8 @@ def _body_multi_layer_scatter_all_layers_updated():
     t = _TRAILING
 
     srcs = [
-        torch.full((num_src_blocks, *t),
-                   float(layer_idx),
-                   dtype=dtype,
-                   device=device) for layer_idx in range(num_layers)
+        torch.full((num_src_blocks, *t), float(layer_idx), dtype=dtype, device=device)
+        for layer_idx in range(num_layers)
     ]
     dsts = [
         torch.zeros((num_dst_blocks, *t), dtype=dtype, device=device)
@@ -259,6 +260,5 @@ def _body_smoke_test_passes_on_tpu():
 
 @pytest.mark.skipif(not scatter_available(), reason="JAX/Pallas not available")
 class TestSmokeTestMultiLayerScatter:
-
     def test_smoke_test_passes_on_tpu(self):
         _run_in_subprocess(_body_smoke_test_passes_on_tpu)

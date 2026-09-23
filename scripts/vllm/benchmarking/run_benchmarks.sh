@@ -23,14 +23,14 @@
 #                         <results>/profile. Implied when EXTRA_SERVE_ARGS sets
 #                         --profiler-config.torch_profiler_dir, which then also
 #                         chooses the trace directory; CAPTURE_PROFILE=0 opts
-#                         back out. Bench gets --profile so /start_profile
-#                         and /stop_profile fire
-#                         around the main run; warmup runs aren't profiled.
-#                         --profile costs roughly +11% TTFT and −4% throughput,
-#                         so don't compare profile-on numbers to a non-profile
-#                         baseline. Prefer a single ISL/OSL case for clean
+#                         back out. --profile costs roughly +11% TTFT and −4%
+#                         throughput, so it runs once more per cell after the
+#                         measured run instead of profiling it; the gate and
+#                         uploader skip that <cell>.profile.json.
+#                         Prefer a single ISL/OSL case for clean
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
+#   PROFILE_NUM_PROMPTS   prompts for that run (default: the cell's concurrency).
 
 set -euo pipefail
 
@@ -373,7 +373,7 @@ run_benchmark_once() {
     local concurrency=$3
     local result_file=$4
     local bench_log=$5
-    local is_warmup=${6:-0}
+    local mode=${6:-measured}  # measured | warmup | profile
 
     # min-style ratios sample in [r*len, len]; vllm bench serve only supports
     # the symmetric [(1-h)*mid, (1+h)*mid], so pass mid = len*(1+r)/2 and
@@ -388,8 +388,11 @@ run_benchmark_once() {
     fi
 
     local profile_arg=""
-    if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
+    local num_prompts="${NUM_PROMPTS:-320}"
+    if [ "$mode" = "profile" ]; then
         profile_arg="--profile"
+        # One full wave, so decode reaches the measured run's batch width.
+        num_prompts="${PROFILE_NUM_PROMPTS:-$concurrency}"
     fi
 
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
@@ -425,7 +428,7 @@ run_benchmark_once() {
         --random-input-len "$bench_input_len" \
         --random-output-len "$bench_output_len" \
         --random-range-ratio "$bench_range_ratio" \
-        --num-prompts "${NUM_PROMPTS:-320}" \
+        --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --percentile-metrics ttft,tpot,itl,e2el \
@@ -482,8 +485,8 @@ if [ -n "$PROFILE_DIR" ]; then
 else
     profile_dir_json=null
 fi
-# Null outside Buildkite, where nothing performs the copy.
-if [ -n "${PROFILE_GCS_BASE:-}" ] && [ -n "${BUILDKITE_BUILD_NUMBER:-}" ]; then
+# Null when not profiling, and outside Buildkite where nothing performs the copy.
+if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ -n "${PROFILE_GCS_BASE:-}" ] && [ -n "${BUILDKITE_BUILD_NUMBER:-}" ]; then
     if [ "$(printf '%s' "$ISL_OSL_CONFIGS" | wc -w)" -ne 1 ]; then
         echo "ERROR: PROFILE_GCS_BASE needs exactly one ISL/OSL cell; got" \
              "'$ISL_OSL_CONFIGS'. One profile directory serves every cell." >&2
@@ -617,7 +620,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             warmup_file="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.json"
             warmup_log="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.log"
             echo "    Warmup run $warmup_idx/$BENCHMARK_WARMUP_RUNS"
-            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" 1; then
+            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" warmup; then
                 warmup_exit=0
             else
                 warmup_exit=$?
@@ -653,6 +656,21 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             if ! check_server_alive; then
                 exit_code=1
                 break 2
+            fi
+            if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
+                profile_file="${RESULTS_DIR}/${base_name}.profile.json"
+                profile_log="${RESULTS_DIR}/${base_name}.profile.log"
+                echo "    Profile run"
+                # A failed profile run doesn't fail the measured run; a dead server does.
+                if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$profile_file" "$profile_log" profile; then
+                    echo "    Profile OK -> $profile_file"
+                else
+                    echo "    PROFILE RUN FAILED (exit $?)"
+                fi
+                if ! check_server_alive; then
+                    exit_code=1
+                    break 2
+                fi
             fi
         else
             echo "    FAILED (exit $bench_exit)"

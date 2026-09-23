@@ -60,14 +60,14 @@ run_ray_multihost() {
   # Start Ray worker containers over ssh
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     echo "--- Starting Ray worker on ${worker_ip}"
-    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node abtest >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home"
-    base64 < "${RUN_CLUSTER}" > /tmp/run_cluster.b64
-    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster.sh" < /tmp/run_cluster.b64
+    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node abtest >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home" || return 1
+    base64 < "${RUN_CLUSTER}" > /tmp/run_cluster.b64 || return 1
+    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster.sh" < /tmp/run_cluster.b64 || return 1
     # shellcheck disable=SC2029
     (
       for _attempt in 1 2 3; do
         ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1${CONTAINER_TMPDIR:+ -e TMPDIR='${CONTAINER_TMPDIR}' -e RAY_TMPDIR=/tmp}" \
           && break
         echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
         sleep 15

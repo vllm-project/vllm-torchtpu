@@ -7,6 +7,7 @@ block lands on the first stage, which ignores it, so the permutation is one
 closed cycle. Every stage must call it at the same point in its launch
 sequence; ``pp_wave`` arranges that.
 """
+
 import inspect
 from typing import Any
 
@@ -15,9 +16,11 @@ import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from vllm_torchtpu.distributed.mesh_utils import (_collect_rank_to_device_id,
-                                                  _get_current_global_rank,
-                                                  _get_tpu_global_device_id)
+from vllm_torchtpu.distributed.mesh_utils import (
+    _collect_rank_to_device_id,
+    _get_current_global_rank,
+    _get_tpu_global_device_id,
+)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
@@ -39,21 +42,23 @@ def get_or_create_pp_mesh() -> Mesh:
     if _MESH is not None:
         return _MESH
     from vllm.distributed.parallel_state import get_pp_group
+
     group = get_pp_group()
     ranks = tuple(int(rank) for rank in group.ranks)
-    rank_to_device = _collect_rank_to_device_id(group,
-                                                _get_current_global_rank(),
-                                                _get_tpu_global_device_id())
+    rank_to_device = _collect_rank_to_device_id(
+        group, _get_current_global_rank(), _get_tpu_global_device_id()
+    )
     devices_by_id = {int(device.id): device for device in jax.devices()}
     device_ids = sorted(rank_to_device[rank] for rank in ranks)
-    _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]),
-                 axis_names=(AXIS, ))
-    _POS_OF_RANK = tuple(
-        device_ids.index(rank_to_device[rank]) for rank in ranks)
+    _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]), axis_names=(AXIS,))
+    _POS_OF_RANK = tuple(device_ids.index(rank_to_device[rank]) for rank in ranks)
     logger.info(
         "PP hand-off mesh (device order): %s",
-        ", ".join(f"rank{r}->pos{_POS_OF_RANK[i]}/dev{rank_to_device[r]}"
-                  for i, r in enumerate(ranks)))
+        ", ".join(
+            f"rank{r}->pos{_POS_OF_RANK[i]}/dev{rank_to_device[r]}"
+            for i, r in enumerate(ranks)
+        ),
+    )
     return _MESH
 
 
@@ -75,10 +80,8 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     in width and dtype; they are separate operands, not a packed buffer.
     """
     if num_tensors < 1:
-        raise ValueError(
-            f"a hand-off carries at least one tensor; got {num_tensors}")
-    key = ("permute", int(num_tensors)) + tuple(
-        int(d.id) for d in mesh.devices)
+        raise ValueError(f"a hand-off carries at least one tensor; got {num_tensors}")
+    key = ("permute", int(num_tensors)) + tuple(int(d.id) for d in mesh.devices)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -89,11 +92,13 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     if num_tensors == 1:
 
         def shift(x: jax.Array) -> jax.Array:
-            return shard_map(lambda xb: jax.lax.ppermute(xb, AXIS, perm),
-                             mesh=mesh,
-                             in_specs=(spec, ),
-                             out_specs=spec,
-                             check_rep=False)(x)
+            return shard_map(
+                lambda xb: jax.lax.ppermute(xb, AXIS, perm),
+                mesh=mesh,
+                in_specs=(spec,),
+                out_specs=spec,
+                check_rep=False,
+            )(x)
 
         name = "vllm_torchtpu::pp_permute"
         output_specs: Any = spec
@@ -103,27 +108,33 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
             return shard_map(
                 lambda *xb: tuple(jax.lax.ppermute(x, AXIS, perm) for x in xb),
                 mesh=mesh,
-                in_specs=(spec, ) * num_tensors,
-                out_specs=(spec, ) * num_tensors,
-                check_rep=False)(*xs)
+                in_specs=(spec,) * num_tensors,
+                out_specs=(spec,) * num_tensors,
+                check_rep=False,
+            )(*xs)
 
         # The op registry reads the signature to type the torch schema, and a
         # ``*args`` one carries no count; spell the operands out.
         shift.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
             [
-                inspect.Parameter(f"x{i}",
-                                  inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                  annotation=jax.Array)
+                inspect.Parameter(
+                    f"x{i}",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=jax.Array,
+                )
                 for i in range(num_tensors)
             ],
-            return_annotation=tuple[(jax.Array, ) * num_tensors])
+            return_annotation=tuple[(jax.Array,) * num_tensors],
+        )
         name = f"vllm_torchtpu::pp_permute{num_tensors}"
-        output_specs = (spec, ) * num_tensors
+        output_specs = (spec,) * num_tensors
 
-    op = sharded_jax_op(name,
-                        shift,
-                        mesh=mesh,
-                        input_partition_specs=(spec, ) * num_tensors,
-                        output_partition_specs=output_specs)
+    op = sharded_jax_op(
+        name,
+        shift,
+        mesh=mesh,
+        input_partition_specs=(spec,) * num_tensors,
+        output_partition_specs=output_specs,
+    )
     _OPS[key] = op
     return op

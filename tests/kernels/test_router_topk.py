@@ -64,8 +64,8 @@ def test_partial_last_block_does_not_leak(rows):
 def test_kernel_matches_torch_topk_on_real_routing_distribution():
     rng = np.random.default_rng(99)
     logits = torch.from_numpy(
-        rng.standard_normal(
-            (1024, EXPERTS), dtype=np.float32) * 2.0).to(torch.bfloat16)
+        rng.standard_normal((1024, EXPERTS), dtype=np.float32) * 2.0
+    ).to(torch.bfloat16)
     scores = logits.float().softmax(dim=-1)
     kw, ki = select(jnp.asarray(scores.numpy()), TOPK, interpret=True)
     ref_v, _ = torch.topk(scores, TOPK, dim=-1)
@@ -90,10 +90,9 @@ def test_all_nan_row_selects_k_distinct_experts():
     for row in ki:
         assert sorted(row.tolist()) == list(range(TOPK))
     iota = lax.broadcasted_iota(jnp.int32, scores.shape, 1)
-    _, sort_i = lax.sort((-jnp.asarray(scores), iota),
-                         dimension=1,
-                         is_stable=False,
-                         num_keys=1)
+    _, sort_i = lax.sort(
+        (-jnp.asarray(scores), iota), dimension=1, is_stable=False, num_keys=1
+    )
     for got, ref in zip(ki, np.asarray(sort_i)[:, :TOPK]):
         assert len(set(got.tolist())) == len(set(ref.tolist())) == TOPK
 
@@ -109,11 +108,14 @@ def test_partial_nan_row_selects_k_distinct_finite_experts():
         assert min(row.tolist()) >= 5
 
 
-@pytest.mark.parametrize("bad", [
-    pytest.param(np.nan, id="nan"),
-    pytest.param(-np.inf, id="neg_inf"),
-    pytest.param(np.finfo(np.float32).min, id="neg_flt_max"),
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(np.nan, id="nan"),
+        pytest.param(-np.inf, id="neg_inf"),
+        pytest.param(np.finfo(np.float32).min, id="neg_flt_max"),
+    ],
+)
 def test_row_at_or_below_the_sentinel_selects_k_distinct_experts(bad):
     """Kernel half of the same property, for all three spellings.
 
@@ -147,15 +149,18 @@ def test_kernel_ties_and_nan_match_the_reference():
     np.testing.assert_array_equal(kw[keep], rw[keep])
 
 
-@pytest.mark.parametrize("rows,grid", [
-    (4, 1),
-    (250, 1),
-    (512, 1),
-    (1000, 2),
-    (4384, 9),
-    (8191, 16),
-    (16384, 32),
-])
+@pytest.mark.parametrize(
+    "rows,grid",
+    [
+        (4, 1),
+        (250, 1),
+        (512, 1),
+        (1000, 2),
+        (4384, 9),
+        (8191, 16),
+        (16384, 32),
+    ],
+)
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid

@@ -986,6 +986,12 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None),  # partial lse
     )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    # One cache_layout below governs both caches, so they must agree.
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}")
+    cache_layout = nope_spec.layout.value
 
     def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
                topk_idx, seq_lens_, block_tables_, query_start_loc_,
@@ -1030,6 +1036,8 @@ def sparse_mla_attention_dcp(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             return_lse=True,
+            # The kernel defaults to tensorcore; the caches follow the spec.
+            cache_layout=cache_layout,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

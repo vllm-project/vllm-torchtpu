@@ -25,13 +25,15 @@ class PcpStaticConfig:
 
     @property
     def pcp_mtp_k1_enabled(self) -> bool:
-        return (self.enabled and self.speculative_method == "mtp"
-                and self.num_speculative_tokens == 1
-                and self.kv_role == "kv_producer")
+        return (
+            self.enabled
+            and self.speculative_method == "mtp"
+            and self.num_speculative_tokens == 1
+            and self.kv_role == "kv_producer"
+        )
 
 
 class PcpStaticSupportValidator:
-
     @staticmethod
     def from_vllm_config(vllm_config: Any) -> PcpStaticConfig:
         if vllm_config is None:
@@ -65,8 +67,7 @@ class PcpStaticSupportValidator:
         num_speculative_tokens = 0
         if speculative_config is not None:
             speculative_method = speculative_config.method
-            num_speculative_tokens = (
-                speculative_config.num_speculative_tokens)
+            num_speculative_tokens = speculative_config.num_speculative_tokens
 
         return PcpStaticConfig(
             pcp_size=parallel_config.prefill_context_parallel_size,
@@ -90,44 +91,54 @@ class PcpStaticSupportValidator:
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        if (config.enabled and kv_cache_layout == "HND"
-                and config.interleave_size % 128 != 0):
+        if (
+            config.enabled
+            and kv_cache_layout == "HND"
+            and config.interleave_size % 128 != 0
+        ):
             raise ValueError(
                 "PCP with HND KV cache layout requires "
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
-                f"got {config.interleave_size}.")
+                f"got {config.interleave_size}."
+            )
         if not config.enabled:
             return config
 
         if config.is_kv_producer is False:
             raise NotImplementedError(
                 "PCP runner path does not support KV consumer/decode workers "
-                "yet. Disable PCP on decode workers.")
+                "yet. Disable PCP on decode workers."
+            )
         if config.dcp_size > 1:
-            raise NotImplementedError(
-                "PCP runner path does not support DCP yet.")
+            raise NotImplementedError("PCP runner path does not support DCP yet.")
         if config.pipeline_parallel_size != 1:
             raise NotImplementedError(
-                "PCP runner path does not support pipeline parallelism yet.")
+                "PCP runner path does not support pipeline parallelism yet."
+            )
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
                 "PCP on an MoE model requires --enable-expert-parallel: "
                 f"--prefill-context-parallel-size={config.pcp_size} without "
                 "it would shard MoE experts across the PCP ranks, which the "
                 "TPU MoE kernels do not implement. Add the flag, or drop "
-                "--prefill-context-parallel-size.")
+                "--prefill-context-parallel-size."
+            )
         if config.speculative_enabled:
             if config.speculative_method != "mtp":
                 raise NotImplementedError(
-                    "PCP speculative decoding currently requires method=mtp.")
+                    "PCP speculative decoding currently requires method=mtp."
+                )
             if config.num_speculative_tokens != 1:
                 raise NotImplementedError(
-                    "PCP MTP currently requires num_speculative_tokens=1.")
+                    "PCP MTP currently requires num_speculative_tokens=1."
+                )
             if config.kv_role != "kv_producer":
                 raise NotImplementedError(
                     "PCP MTP currently requires kv_role=kv_producer, got "
-                    f"{config.kv_role!r}.")
+                    f"{config.kv_role!r}."
+                )
         if config.interleave_size <= 0:
             raise ValueError(
-                "PCP runner path requires cp_kv_cache_interleave_size > 0.")
+                "PCP runner path requires cp_kv_cache_interleave_size > 0."
+            )
         return config

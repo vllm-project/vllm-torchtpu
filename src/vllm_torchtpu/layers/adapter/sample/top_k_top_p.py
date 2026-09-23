@@ -54,15 +54,13 @@ def _int32_bsearch(
 
     # bit 31 is special, because it compares in the opposite order of all other
     # bits.
-    current_bits = current_bits | torch.where(predicate(current_bits),
-                                              sign_bit, zero)
+    current_bits = current_bits | torch.where(predicate(current_bits), sign_bit, zero)
 
     for i in range(31):
         bit = 1 << (30 - i)
         bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
-        current_bits = current_bits | torch.where(predicate(midpoint), zero,
-                                                  bit_t)
+        current_bits = current_bits | torch.where(predicate(midpoint), zero, bit_t)
     return current_bits
 
 
@@ -148,8 +146,9 @@ def _float32_bsearch(
         # to return True from the predicate. x>=0 is an easy way to achieve
         # that.
         predicate_on_nonfinite = x >= 0
-        return torch.where(is_finite, predicate(x.view(torch.float32)),
-                           predicate_on_nonfinite)
+        return torch.where(
+            is_finite, predicate(x.view(torch.float32)), predicate_on_nonfinite
+        )
 
     # We search over bit patterns, which requires bit shifting and ordering of
     # bit patterns. This is natively supported on int32 but not on float32.
@@ -157,9 +156,9 @@ def _float32_bsearch(
     return _monotonic_int32_to_float32(result)
 
 
-def topk_mask(logits: torch.Tensor,
-              k: torch.Tensor,
-              replace_val: float = MASKED_LOGIT_VALUE) -> torch.Tensor:
+def topk_mask(
+    logits: torch.Tensor, k: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
+) -> torch.Tensor:
     """Sets everything to replace_val, except the top k values per batch element.
 
     Sharding considerations: this function does 32 reductions over the
@@ -195,9 +194,9 @@ def topk_mask(logits: torch.Tensor,
     return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
-def topp_mask(logits: torch.Tensor,
-              p: torch.Tensor,
-              replace_val: float = MASKED_LOGIT_VALUE) -> torch.Tensor:
+def topp_mask(
+    logits: torch.Tensor, p: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
+) -> torch.Tensor:
     """Applies top-p masking to logits.
 
     Masks logits down to the smallest set of choices, such that the total
@@ -240,8 +239,9 @@ def topp_mask(logits: torch.Tensor,
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
-def apply_top_k_top_p(logits: torch.Tensor, top_k: torch.Tensor,
-                      top_p: torch.Tensor) -> torch.Tensor:
+def apply_top_k_top_p(
+    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
     topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)

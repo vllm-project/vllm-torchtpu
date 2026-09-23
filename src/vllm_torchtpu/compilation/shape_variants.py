@@ -95,8 +95,7 @@ def _holds_at(expr: sympy.Expr, substitution: dict) -> bool | None:
             value = sympy.simplify(value)
     except Exception:  # pragma: no cover - defensive; sympy is total here
         return None
-    return bool(value) if isinstance(value,
-                                     sympy.logic.boolalg.BooleanAtom) else None
+    return bool(value) if isinstance(value, sympy.logic.boolalg.BooleanAtom) else None
 
 
 def unsupported_reason(shape_env: Any, size: int) -> str | None:
@@ -145,8 +144,9 @@ def _signature(graph: fx.GraphModule) -> tuple:
     def shape(value: Any) -> Any:
         if not isinstance(value, torch.Tensor):
             return type(value).__name__
-        dims = tuple("?" if isinstance(d, torch.SymInt) else int(d)
-                     for d in value.shape)
+        dims = tuple(
+            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
+        )
         return (str(value.dtype), dims)
 
     return tuple(shape(value) for value in _placeholder_values(graph))
@@ -178,13 +178,13 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any],
-                                                     tuple]] = {}
+        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
-    def get(self, cache_dir: str, key: str,
-            graph: fx.GraphModule) -> Callable[..., Any] | None:
+    def get(
+        self, cache_dir: str, key: str, graph: fx.GraphModule
+    ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
@@ -195,11 +195,17 @@ class BucketExecutables:
                 f"inputs differ ({signature} vs {_signature(graph)}). The "
                 "graph is split, so its subgraph boundaries move with the "
                 "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model.")
+                "unset TPU_KERNEL_ITER_MODE to serve this model."
+            )
         return runnable
 
-    def put(self, cache_dir: str, key: str, graph: fx.GraphModule,
-            runnable: Callable[..., Any]) -> None:
+    def put(
+        self,
+        cache_dir: str,
+        key: str,
+        graph: fx.GraphModule,
+        runnable: Callable[..., Any],
+    ) -> None:
         self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
 
     def needs_retrace(self, size: int) -> bool:
@@ -229,10 +235,9 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
-def runnable_for(cache_dir: str,
-                 key: str,
-                 graph: fx.GraphModule,
-                 size: int | None = None) -> Callable[..., Any] | None:
+def runnable_for(
+    cache_dir: str, key: str, graph: fx.GraphModule, size: int | None = None
+) -> Callable[..., Any] | None:
     """What this compile should use instead of compiling, if anything.
 
     The load path is screened too: the cache key is (subgraph, bucket) with no
@@ -247,8 +252,7 @@ def runnable_for(cache_dir: str,
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready
 
-    reason = (None if size is None else unsupported_reason(
-        trace_shape_env(graph), size))
+    reason = None if size is None else unsupported_reason(trace_shape_env(graph), size)
     if reason is None:
         return None
     if _session is None:
@@ -258,7 +262,8 @@ def runnable_for(cache_dir: str,
             "token count while tracing, so every compile_size would share the "
             "structure of the one that was traced. Only the backbone is "
             "re-traced per bucket group today (see _precompile_backbone); make "
-            "this module's structure independent of the token count.")
+            "this module's structure independent of the token count."
+        )
 
     logger.info("[shape-variants] %s left to a later trace: %s", key, reason)
     _session.refused.add(size)
@@ -266,13 +271,15 @@ def runnable_for(cache_dir: str,
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise ShapeSpecializationError(
             f"{key} was left to a later trace ({reason}) and never compiled; "
-            "the warmup ladder is out of step with the partition.")
+            "the warmup ladder is out of step with the partition."
+        )
 
     return refuse
 
 
-def remember(cache_dir: str, key: str, graph: fx.GraphModule,
-             runnable: Callable[..., Any]) -> None:
+def remember(
+    cache_dir: str, key: str, graph: fx.GraphModule, runnable: Callable[..., Any]
+) -> None:
     """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:
         _session.put(cache_dir, key, graph, runnable)
@@ -306,8 +313,10 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
     """
-    from vllm.compilation.wrapper import (TorchCompileWithNoGuardsWrapper,
-                                          reset_compile_wrapper)
+    from vllm.compilation.wrapper import (
+        TorchCompileWithNoGuardsWrapper,
+        reset_compile_wrapper,
+    )
     from vllm.config import set_current_vllm_config
 
     if _session is not None:
@@ -315,11 +324,13 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
         # The refusals belong to the traces being replaced.
         _session.refused.clear()
 
-    wrappers = ([model]
-                if isinstance(model, TorchCompileWithNoGuardsWrapper) else [
-                    m for m in model.modules()
-                    if isinstance(m, TorchCompileWithNoGuardsWrapper)
-                ])
+    wrappers = (
+        [model]
+        if isinstance(model, TorchCompileWithNoGuardsWrapper)
+        else [
+            m for m in model.modules() if isinstance(m, TorchCompileWithNoGuardsWrapper)
+        ]
+    )
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
 

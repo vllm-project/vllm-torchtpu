@@ -26,10 +26,14 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.deepseek_v4.mhc import (fused_post_pre_kernel,
-                                                   post_kernel, pre_kernel)
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
+from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+    fused_post_pre_kernel,
+    post_kernel,
+    pre_kernel,
+)
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 # Every mHC tensor is token-major, so its leading axis is the attention-DP
 # token axis. As in the other DeepSeek-V4 ops, the mesh carries no such axis
@@ -52,9 +56,11 @@ def _gate_suffix(
     sinkhorn_repeat: int,
 ) -> str:
     """The gate constants are baked into the traced op, so they name it."""
-    return (f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
-            f"_s{_name_float(hc_sinkhorn_eps)}"
-            f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}")
+    return (
+        f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
+        f"_s{_name_float(hc_sinkhorn_eps)}"
+        f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
+    )
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -71,9 +77,17 @@ def _mhc_pre_jax(
     sinkhorn_repeat: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA."""
-    return pre_kernel.mhc_pre(residual, fn, hc_scale, hc_base, rms_eps,
-                              hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-                              sinkhorn_repeat)
+    return pre_kernel.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
 
 
 def _mhc_post_jax(
@@ -103,27 +117,39 @@ def _mhc_fused_post_pre_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
-        x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat)
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
 
 
 def _fake_pre_outputs(
-        residual: torch.Tensor
+    residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(post_mix, comb_mix, layer_input) placeholders for Dynamo tracing."""
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
     return (
-        torch.empty((*outer_shape, hc_mult, 1),
-                    dtype=torch.float32,
-                    device=residual.device),
-        torch.empty((*outer_shape, hc_mult, hc_mult),
-                    dtype=torch.float32,
-                    device=residual.device),
-        torch.empty((*outer_shape, hidden_size),
-                    dtype=residual.dtype,
-                    device=residual.device),
+        torch.empty(
+            (*outer_shape, hc_mult, 1), dtype=torch.float32, device=residual.device
+        ),
+        torch.empty(
+            (*outer_shape, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            (*outer_shape, hidden_size), dtype=residual.dtype, device=residual.device
+        ),
     )
 
 
@@ -137,8 +163,9 @@ def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     return torch.empty_like(residual)
 
 
-def _fake_mhc_fused_post_pre(x, residual, post_layer_mix, comb_res_mix, fn,
-                             hc_scale, hc_base, *args, **kwargs):
+def _fake_mhc_fused_post_pre(
+    x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, *args, **kwargs
+):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
@@ -151,18 +178,20 @@ def _mhc_pre_op(
     sinkhorn_repeat: int,
 ):
     op_name = "pallas::deepseek_v4_mhc_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat)
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
             op_name,
-            functools.partial(_mhc_pre_jax,
-                              rms_eps=rms_eps,
-                              hc_pre_eps=hc_pre_eps,
-                              hc_sinkhorn_eps=hc_sinkhorn_eps,
-                              hc_post_mult_value=hc_post_mult_value,
-                              sinkhorn_repeat=sinkhorn_repeat),
+            functools.partial(
+                _mhc_pre_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
             mesh=get_vllm_model_wrapper_context().mesh,
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None, None),  # residual
@@ -209,18 +238,20 @@ def _mhc_fused_post_pre_op(
     sinkhorn_repeat: int,
 ):
     op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat)
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
             op_name,
-            functools.partial(_mhc_fused_post_pre_jax,
-                              rms_eps=rms_eps,
-                              hc_pre_eps=hc_pre_eps,
-                              hc_sinkhorn_eps=hc_sinkhorn_eps,
-                              hc_post_mult_value=hc_post_mult_value,
-                              sinkhorn_repeat=sinkhorn_repeat),
+            functools.partial(
+                _mhc_fused_post_pre_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
             mesh=get_vllm_model_wrapper_context().mesh,
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
@@ -276,9 +307,11 @@ def get_mhc_ops(
     the traced graph entirely.
     """
     return MHCOps(
-        pre=_mhc_pre_op(rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-                        hc_post_mult_value, sinkhorn_repeat),
-        fused=_mhc_fused_post_pre_op(rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-                                     hc_post_mult_value, sinkhorn_repeat),
+        pre=_mhc_pre_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
+        fused=_mhc_fused_post_pre_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
         post=get_mhc_post_op(),
     )

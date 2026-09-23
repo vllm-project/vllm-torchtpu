@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -128,6 +129,7 @@ if TYPE_CHECKING:
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
 
 
 def env_with_choices(
@@ -598,6 +600,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # How many copies of the FFN body fused EP MoE v2 emits, standing in for
+    # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
+    # live rows, so one is the ladder off. Zero leaves the choice to the
+    # kernel.
+    "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE":
+    lambda: int(os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -830,6 +838,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # env_override.py resolves it from the chip family. 0 sets no flag.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
     env_nonnegative_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
+    # Enables steady-state fast path token substitution (direct device slicing
+    # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION":
+    env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
 }
 
 

@@ -50,12 +50,19 @@ import torch
 from jax.sharding import PartitionSpec
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order,
-                                               ep_token_replica_groups)
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    ep_rank_order,
+    ep_token_replica_groups,
+)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
-                                                     token_gather_smem_bytes)
+from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    PACK4,
+    U32_SUBLANE_TILE,
+    token_gather_smem_bytes,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -109,8 +116,9 @@ _RANK_BUFFER: Any = None
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 
 
-def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
-                           channels: int) -> torch.Tensor | None:
+def _squeeze_channel_scale(
+    scale: torch.Tensor, experts: int, channels: int
+) -> torch.Tensor | None:
     """Our GMM scales are 4-D ``[E, blocks, 1, N]``; the kernel takes ``[E, N]``.
 
     Only the per-output-channel form (one block) converts: a real block-scaled
@@ -153,26 +161,37 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
-def _build_op(mesh,
-              topk: int,
-              renormalize: bool,
-              activation: str,
-              mesh_expert_order: tuple[int, ...] | None,
-              sharded_plan: bool,
-              weight_format="fp8",
-              rhs_qb=None,
-              scoring_fn="softmax",
-              has_score_bias=False,
-              routed_scaling_factor=1.0,
-              *,
-              token_replica_groups=None):
+def _build_op(
+    mesh,
+    topk: int,
+    renormalize: bool,
+    activation: str,
+    mesh_expert_order: tuple[int, ...] | None,
+    sharded_plan: bool,
+    weight_format="fp8",
+    rhs_qb=None,
+    scoring_fn="softmax",
+    has_score_bias=False,
+    routed_scaling_factor=1.0,
+    *,
+    token_replica_groups=None,
+):
     """The op for this closure, built once per distinct closure and reused."""
-    from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
-                                                    fused_ep_moe_v2)
+    from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
-    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan,
-           weight_format, rhs_qb, scoring_fn, has_score_bias,
-           routed_scaling_factor, token_replica_groups)
+    key = (
+        topk,
+        renormalize,
+        activation,
+        mesh_expert_order,
+        sharded_plan,
+        weight_format,
+        rhs_qb,
+        scoring_fn,
+        has_score_bias,
+        routed_scaling_factor,
+        token_replica_groups,
+    )
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -180,58 +199,74 @@ def _build_op(mesh,
     # Each distinct closure gets its own torch op name: two `CustomOpDef`s
     # registered under one qualname do not raise, they silently share a
     # dispatch entry, and the second closure would then serve the first.
-    name = (FUSED_MOE_EP_OP_NAME
-            if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}")
+    name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
-    routing_kw = dict(scoring_fn=scoring_fn,
-                      routed_scaling_factor=routed_scaling_factor)
+    routing_kw = dict(
+        scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
+    )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
-        return fused_ep_moe_v2(x,
-                               w1,
-                               w2,
-                               w1_scale,
-                               w2_scale,
-                               gating.astype(jnp.float32),
-                               rank=rank,
-                               topk=topk,
-                               renormalize=renormalize,
-                               mesh=mesh,
-                               capacity=_TILE_M,
-                               block=None,
-                               ragged_stride=None,
-                               weight_format=WeightFormat(weight_format),
-                               rhs_qb=rhs_qb,
-                               act_fn=activation,
-                               mesh_ep_ranks=mesh_expert_order,
-                               sharded_plan=sharded_plan,
-                               token_replica_groups=token_replica_groups,
-                               **bias_kw,
-                               **routing_kw)
+        return fused_ep_moe_v2(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating.astype(jnp.float32),
+            rank=rank,
+            topk=topk,
+            renormalize=renormalize,
+            mesh=mesh,
+            capacity=_TILE_M,
+            block=None,
+            ragged_stride=None,
+            weight_format=WeightFormat(weight_format),
+            rhs_qb=rhs_qb,
+            act_fn=activation,
+            mesh_ep_ranks=mesh_expert_order,
+            sharded_plan=sharded_plan,
+            token_replica_groups=token_replica_groups,
+            **bias_kw,
+            **routing_kw,
+        )
 
     # Every operand is annotated jax.Array: torch_tpu infers static argnums
     # from the signature and refuses an unannotated one.
-    def moe(x: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
-            w2_scale: jax.Array, gating: jax.Array,
-            rank: jax.Array) -> jax.Array:
+    def moe(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
         return call(x, w1, w2, w1_scale, w2_scale, gating, rank)
 
-    def moe_with_score_bias(x: jax.Array, w1: jax.Array, w2: jax.Array,
-                            w1_scale: jax.Array, w2_scale: jax.Array,
-                            gating: jax.Array, rank: jax.Array,
-                            score_bias: jax.Array) -> jax.Array:
-        return call(x,
-                    w1,
-                    w2,
-                    w1_scale,
-                    w2_scale,
-                    gating,
-                    rank,
-                    score_bias=score_bias.astype(jnp.float32))
+    def moe_with_score_bias(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+        )
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -240,8 +275,7 @@ def _build_op(mesh,
     # straight to shard_map, so a heterogeneous tuple is what it wants; the
     # bias is NOT closed over as a constant because it differs per layer and
     # `_OPS` would then key one exported program per MoE layer.
-    input_specs = (spec, ) * 7 + ((PartitionSpec(), ) if has_score_bias else
-                                  ())
+    input_specs = (spec,) * 7 + ((PartitionSpec(),) if has_score_bias else ())
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
     # where a shard_map result is recorded as replicated, so this rank's 2048
     # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
@@ -297,12 +331,13 @@ def fused_moe_ep(
         # retain its axis; the per-channel helper would incorrectly drop it.
         scales = (w1_scale, w2_scale)
     else:
-        scales = (_squeeze_channel_scale_checked(w1_scale),
-                  _squeeze_channel_scale_checked(w2_scale))
+        scales = (
+            _squeeze_channel_scale_checked(w1_scale),
+            _squeeze_channel_scale_checked(w2_scale),
+        )
     if score_bias is None:
         return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER,
-              score_bias)
+    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, score_bias)
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -323,9 +358,7 @@ def register_score_bias_buffer(layer) -> torch.Tensor | None:
     if bias is None:
         return None
     staged = bias.detach().to(torch.float32).contiguous()
-    layer.register_buffer(FUSED_MOE_EP_SCORE_BIAS_ATTR,
-                          staged,
-                          persistent=False)
+    layer.register_buffer(FUSED_MOE_EP_SCORE_BIAS_ATTR, staged, persistent=False)
     return staged
 
 
@@ -346,14 +379,15 @@ def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
         return None
     order = tuple(order)
     if tuple(sorted(order)) != tuple(range(ep)):
-        raise ValueError(
-            f"EP rank order must permute range({ep}); got {order}")
+        raise ValueError(f"EP rank order must permute range({ep}); got {order}")
     if order == tuple(range(ep)):
         return None
     # A tuple, not a list: `info_once` keys its cache on the arguments.
     logger.info_once(
         "Fused EP MoE: EP ranks are not in device-id order, so the expert "
-        "IDs are relabelled after top-k | ep_rank_at_mesh_index=%s", order)
+        "IDs are relabelled after top-k | ep_rank_at_mesh_index=%s",
+        order,
+    )
     return order
 
 
@@ -374,14 +408,16 @@ def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
     return s
 
 
-def prebuild_fused_moe_ep(layer,
-                          topk: int,
-                          renormalize: bool,
-                          activation: str,
-                          *,
-                          weight_format="fp8",
-                          rhs_qb=None,
-                          weights=None) -> Any | None:
+def prebuild_fused_moe_ep(
+    layer,
+    topk: int,
+    renormalize: bool,
+    activation: str,
+    *,
+    weight_format="fp8",
+    rhs_qb=None,
+    weights=None,
+) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
     Called once per layer from `process_weights_after_loading`. Everything here
@@ -413,7 +449,8 @@ def prebuild_fused_moe_ep(layer,
     if not layer.moe_config.moe_parallel_config.use_ep:
         logger.info_once(
             "Fused EP MoE not engaged: the experts are replicated rather than "
-            "expert-parallel, so each shard would hold the whole expert set.")
+            "expert-parallel, so each shard would hold the whole expert set."
+        )
         return None
 
     # The token-gather table remains in HBM and is streamed through two fixed
@@ -427,8 +464,10 @@ def prebuild_fused_moe_ep(layer,
     pcp = _pcp_size(layer)
     mesh = build_ep_mesh()
     if mesh is None:
-        logger.info_once("Fused EP MoE requested but there is no EP group; "
-                         "the grouped-matmul path serves every step.")
+        logger.info_once(
+            "Fused EP MoE requested but there is no EP group; "
+            "the grouped-matmul path serves every step."
+        )
         return None
     ep = mesh.shape[EP_AXIS_NAME]
 
@@ -440,24 +479,36 @@ def prebuild_fused_moe_ep(layer,
             "Fused EP MoE not engaged: its fixed routing working set needs "
             "%d B of this chip's %d B SMEM (%d B for two streamed "
             "token-gather windows and about %d B for resident tables and "
-            "compiler working memory).", needed_smem, smem, gather_bytes,
-            _SMEM_OVERHEAD_BYTES)
+            "compiler working memory).",
+            needed_smem,
+            smem,
+            gather_bytes,
+            _SMEM_OVERHEAD_BYTES,
+        )
         return None
     global _RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
-    _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
-                                dtype=torch.int32,
-                                device=layer.w13_weight.device)
+    _RANK_BUFFER = torch.tensor(
+        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+    )
     mesh_expert_order = _mesh_expert_order(ep)
 
     if weights is None:
         if weight_format == "fp4":
-            weights = (layer.w13_weight, layer.w2_weight,
-                       layer.w13_weight_scale, layer.w2_weight_scale)
+            weights = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            )
         else:
-            weights = (layer.w13_weight, layer.w2_weight,
-                       layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+            weights = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
     w1, w2, w1_scale, w2_scale = weights
     local_experts, hidden = w1.shape[0], w1.shape[1]
     # Torch stores two FP4 output elements per byte; JAX sees the logical
@@ -474,7 +525,9 @@ def prebuild_fused_moe_ep(layer,
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
             "tokens, below MOE_FUSED_EP_KERNEL_MIN_TOKENS=%d.",
-            max_node_tokens, envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS)
+            max_node_tokens,
+            envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS,
+        )
         return None
 
     # The kernel reads a token's expert id as `mesh_index * (e_total // ep) +
@@ -490,43 +543,59 @@ def prebuild_fused_moe_ep(layer,
         logger.warning_once(
             "Fused EP MoE not engaged: the kernel needs one equal contiguous "
             "expert block per shard, but %d global experts over ep=%d does "
-            "not divide into this rank's %d.", layer.global_num_experts, ep,
-            local_experts)
+            "not divide into this rank's %d.",
+            layer.global_num_experts,
+            ep,
+            local_experts,
+        )
         return None
 
-    reason = fused_moe_ep_unsupported_reason(layer,
-                                             weights,
-                                             activation,
-                                             weight_format=weight_format,
-                                             rhs_qb=rhs_qb)
+    reason = fused_moe_ep_unsupported_reason(
+        layer, weights, activation, weight_format=weight_format, rhs_qb=rhs_qb
+    )
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
-        is_sequence_parallel=layer.moe_config.moe_parallel_config.
-        is_sequence_parallel)
+        is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+    )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
-    op = _build_op(mesh,
-                   topk,
-                   renormalize,
-                   activation,
-                   mesh_expert_order,
-                   sharded_plan,
-                   weight_format,
-                   rhs_qb,
-                   scoring_fn,
-                   has_score_bias,
-                   routed_scale,
-                   token_replica_groups=token_replica_groups)
+    op = _build_op(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        mesh_expert_order,
+        sharded_plan,
+        weight_format,
+        rhs_qb,
+        scoring_fn,
+        has_score_bias,
+        routed_scale,
+        token_replica_groups=token_replica_groups,
+    )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s routed_scale=%s token_replica_groups=%s",
-        hidden, inter, local_experts, ep, pcp, topk, _TILE_M, sharded_plan,
-        weight_format, rhs_qb, activation, scoring_fn, has_score_bias,
-        routed_scale, token_replica_groups)
+        hidden,
+        inter,
+        local_experts,
+        ep,
+        pcp,
+        topk,
+        _TILE_M,
+        sharded_plan,
+        weight_format,
+        rhs_qb,
+        activation,
+        scoring_fn,
+        has_score_bias,
+        routed_scale,
+        token_replica_groups,
+    )
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
@@ -538,16 +607,14 @@ def prebuild_fused_moe_ep(layer,
             "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
             "layer: the kernel routes and exchanges inside its own program.",
             envs.TPU_MOE_SKIP_PADDED_TOKENS,
-            envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
+            envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+        )
     return op
 
 
-def fused_moe_ep_unsupported_reason(layer,
-                                    weights,
-                                    activation,
-                                    *,
-                                    weight_format="fp8",
-                                    rhs_qb=None) -> str | None:
+def fused_moe_ep_unsupported_reason(
+    layer, weights, activation, *, weight_format="fp8", rhs_qb=None
+) -> str | None:
     """Validate prepared (or meta) weights and routing before installation."""
     w1, w2, w1_scale, w2_scale = weights
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
@@ -558,9 +625,11 @@ def fused_moe_ep_unsupported_reason(layer,
     if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
     from vllm_torchtpu.kernels.fused_moe.v2.kernel import ACT_FNS
+
     if activation not in ACT_FNS:
-        return (f"activation {activation!r} is not wired to the kernel's "
-                f"ACT_FNS {ACT_FNS}")
+        return (
+            f"activation {activation!r} is not wired to the kernel's ACT_FNS {ACT_FNS}"
+        )
     if weight_format == "fp4":
         if w1.dtype != torch.float4_e2m1fn_x2 or w2.dtype != w1.dtype:
             return "the FP4 form requires native float4_e2m1fn_x2 weights"
@@ -569,13 +638,19 @@ def fused_moe_ep_unsupported_reason(layer,
         # Match the packed-row geometry used by the kernel's FP4 readers.
         packed_row_tile = U32_SUBLANE_TILE * PACK4
         if rhs_qb % packed_row_tile:
-            return (f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
-                    f"the packed-weight row tile ({packed_row_tile})")
+            return (
+                f"NVFP4 fused EP block-{rhs_qb} must be a multiple of "
+                f"the packed-weight row tile ({packed_row_tile})"
+            )
         if hidden % rhs_qb or inter % rhs_qb:
-            return (f"NVFP4 fused EP block-{rhs_qb} must divide both "
-                    f"hidden={hidden} and inter={inter}")
-        for name, scale, k, n in (("w1_scale", w1_scale, hidden, 2 * inter),
-                                  ("w2_scale", w2_scale, inter, hidden)):
+            return (
+                f"NVFP4 fused EP block-{rhs_qb} must divide both "
+                f"hidden={hidden} and inter={inter}"
+            )
+        for name, scale, k, n in (
+            ("w1_scale", w1_scale, hidden, 2 * inter),
+            ("w2_scale", w2_scale, inter, hidden),
+        ):
             if tuple(scale.shape) != (local_experts, k // rhs_qb, 1, n):
                 return f"{name} is not the block-{rhs_qb} K-major scale layout"
     elif weight_format == "fp8":
@@ -591,8 +666,10 @@ def fused_moe_ep_unsupported_reason(layer,
     # bridge does not pass them, and dropping a bias is silent: the output is
     # simply wrong by the bias term on every routed token. Refuse until they
     # are wired through as operands.
-    if (getattr(layer, "w13_bias", None) is not None
-            or getattr(layer, "w2_bias", None) is not None):
+    if (
+        getattr(layer, "w13_bias", None) is not None
+        or getattr(layer, "w2_bias", None) is not None
+    ):
         return "expert biases are not wired through the fused EP op"
     return _unsupported_routing_reason(layer)
 
@@ -627,21 +704,30 @@ def _unsupported_routing_reason(layer) -> str | None:
     from vllm_torchtpu.layers.adapter import moe_routing
 
     if layer.custom_routing_function is not None:
-        return ("the layer supplies a custom_routing_function; the kernel "
-                "routes with its own top-k")
+        return (
+            "the layer supplies a custom_routing_function; the kernel "
+            "routes with its own top-k"
+        )
     scoring_fn, has_bias, _ = _routing_config(layer)
     if scoring_fn not in SCORING_FNS:
-        return (f"scoring_func {scoring_fn!r}; the kernel's router scores "
-                f"with {SCORING_FNS}")
+        return (
+            f"scoring_func {scoring_fn!r}; the kernel's router scores "
+            f"with {SCORING_FNS}"
+        )
     if has_bias:
         bias = layer.e_score_correction_bias
         # The bias is an operand, not a constant, so it has to be a real
         # per-global-expert vector this rank can hand over whole.
         if bias.ndim != 1 or bias.shape[0] != layer.global_num_experts:
-            return (f"e_score_correction_bias {tuple(bias.shape)} is not one "
-                    f"value per global expert [{layer.global_num_experts}]")
-    if (layer.use_grouped_topk and layer.num_expert_group > 1
-            and layer.topk_group < layer.num_expert_group):
+            return (
+                f"e_score_correction_bias {tuple(bias.shape)} is not one "
+                f"value per global expert [{layer.global_num_experts}]"
+            )
+    if (
+        layer.use_grouped_topk
+        and layer.num_expert_group > 1
+        and layer.topk_group < layer.num_expert_group
+    ):
         return "grouped top-k routing is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
         return "hash routing is not implemented in the kernel"
@@ -649,9 +735,11 @@ def _unsupported_routing_reason(layer) -> str | None:
     # that asked for it and got real routing is a profiling result that is
     # quietly not the thing it claims to measure.
     if moe_routing._SIMULATION_STRATEGY is not None:
-        return ("VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
-                "does its own routing, so the simulation would not be in "
-                "effect")
+        return (
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
+            "does its own routing, so the simulation would not be in "
+            "effect"
+        )
     return None
 
 
@@ -681,6 +769,7 @@ def _smem_capacity_bytes() -> int:
     """This chip's scalar memory, or tpu7x's outside a device process."""
     try:
         from jax.experimental.pallas import tpu as pltpu
+
         return int(pltpu.get_tpu_info().smem_capacity_bytes)
     except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
         return 1024 * 1024

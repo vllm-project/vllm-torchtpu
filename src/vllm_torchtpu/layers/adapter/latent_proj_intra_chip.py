@@ -24,8 +24,7 @@ latency would swamp the bandwidth saved.
 from __future__ import annotations
 
 import torch
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               ReplicatedLinear)
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
@@ -89,10 +88,12 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
         return output, output_bias
 
     def extra_repr(self) -> str:
-        return (f"in_features={self.input_size}, "
-                f"out_features={self.output_size}, "
-                f"out_per_chip_core={self.output_size_per_partition}, "
-                f"chip_tp_size={self.tp_size}")
+        return (
+            f"in_features={self.input_size}, "
+            f"out_features={self.output_size}, "
+            f"out_per_chip_core={self.output_size_per_partition}, "
+            f"chip_tp_size={self.tp_size}"
+        )
 
 
 def shard_group_or_none(output_size: int):
@@ -112,13 +113,17 @@ def shard_group_or_none(output_size: int):
     if group is None or group.world_size < 2:
         _warn_once(
             "TPU_LATENT_PROJ_INTRA_CHIP_TP is set but there is no usable "
-            "intra-chip group; leaving the latent projections replicated.")
+            "intra-chip group; leaving the latent projections replicated."
+        )
         return None
 
     if output_size % group.world_size != 0:
         _warn_once(
             "Latent projection output %d does not divide across %d cores per "
-            "chip; leaving it replicated.", output_size, group.world_size)
+            "chip; leaving it replicated.",
+            output_size,
+            group.world_size,
+        )
         return None
 
     return group
@@ -148,8 +153,12 @@ def make_latent_projection(
     # instead of one per distinct projection.
     logger.info_once(
         "Latent MoE projection [%d, %d] sharded across %d cores per chip "
-        "(%d columns each).", output_size, input_size, group.world_size,
-        output_size // group.world_size)
+        "(%d columns each).",
+        output_size,
+        input_size,
+        group.world_size,
+        output_size // group.world_size,
+    )
     return IntraChipColumnParallelLinear(
         input_size,
         output_size,

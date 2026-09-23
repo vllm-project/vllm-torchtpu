@@ -16,31 +16,42 @@
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
-    build_runtime_schedule_reference
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import (
+    build_runtime_schedule_reference,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     RuntimeScheduleField,
-    build_pcp_streaming_schedule_inputs_from_metadata_jax)
+    build_pcp_streaming_schedule_inputs_from_metadata_jax,
+)
 
 pytestmark = pytest.mark.multichip
 
 
-def _build_reference(*, kv_lens, page_indices, cu_q_lens, distribution,
-                     global_bucket_tokens, local_kv_cache_num_blocks,
-                     page_size, pcp_size, interleave_size, q_block_size):
-    tile_plan, block_tables, *_ = \
-        build_pcp_streaming_schedule_inputs_from_metadata_jax(
-            kv_lens=np.asarray(kv_lens, dtype=np.int32),
-            page_indices=np.asarray(page_indices, dtype=np.int32),
-            cu_q_lens=np.asarray(cu_q_lens, dtype=np.int32),
-            distribution=np.asarray(distribution, dtype=np.int32),
-            global_bucket_tokens=global_bucket_tokens,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            q_block_size=q_block_size,
-        )
+def _build_reference(
+    *,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    global_bucket_tokens,
+    local_kv_cache_num_blocks,
+    page_size,
+    pcp_size,
+    interleave_size,
+    q_block_size,
+):
+    tile_plan, block_tables, *_ = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+        kv_lens=np.asarray(kv_lens, dtype=np.int32),
+        page_indices=np.asarray(page_indices, dtype=np.int32),
+        cu_q_lens=np.asarray(cu_q_lens, dtype=np.int32),
+        distribution=np.asarray(distribution, dtype=np.int32),
+        global_bucket_tokens=global_bucket_tokens,
+        local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        q_block_size=q_block_size,
+    )
     return build_runtime_schedule_reference(
         tile_plan,
         block_tables,
@@ -77,8 +88,8 @@ def test_runtime_reference_separates_history_boundary_and_fresh_kv():
     boundary = current[0]
     boundary_active = _active_rows(boundary)
     assert np.all(
-        boundary[...,
-                 RuntimeScheduleField.KV_HBM_OFFSET][boundary_active] == -1)
+        boundary[..., RuntimeScheduleField.KV_HBM_OFFSET][boundary_active] == -1
+    )
     assert np.all(boundary[..., RuntimeScheduleField.CAPTURE_LEN] == 0)
     np.testing.assert_array_equal(
         boundary[:, 0, RuntimeScheduleField.KV_PAGE_IDX],
@@ -87,8 +98,8 @@ def test_runtime_reference_separates_history_boundary_and_fresh_kv():
 
     fresh = current[1:3]
     assert np.all(
-        fresh[...,
-              RuntimeScheduleField.KV_HBM_OFFSET][_active_rows(fresh)] >= 0)
+        fresh[..., RuntimeScheduleField.KV_HBM_OFFSET][_active_rows(fresh)] >= 0
+    )
     capture_len = fresh[..., RuntimeScheduleField.CAPTURE_LEN].sum(axis=-1)
     np.testing.assert_array_equal(
         capture_len,
@@ -96,8 +107,7 @@ def test_runtime_reference_separates_history_boundary_and_fresh_kv():
     )
 
     history_active = _active_rows(history)
-    assert np.all(
-        history[..., RuntimeScheduleField.KV_HBM_OFFSET][history_active] == 0)
+    assert np.all(history[..., RuntimeScheduleField.KV_HBM_OFFSET][history_active] == 0)
     np.testing.assert_array_equal(
         history[0, :, 0, RuntimeScheduleField.KV_PAGE_IDX],
         np.array([5, 5], dtype=np.int32),
@@ -130,8 +140,8 @@ def test_runtime_reference_routes_one_token_capture_to_absolute_cache_owner():
     assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
     assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_LEN]) == 1
     assert np.all(
-        np.delete(fresh_source_0[...,
-                                 RuntimeScheduleField.CAPTURE_LEN], 1) == 0)
+        np.delete(fresh_source_0[..., RuntimeScheduleField.CAPTURE_LEN], 1) == 0
+    )
 
 
 def test_runtime_reference_splits_capture_at_cache_owner_boundary():
@@ -157,8 +167,7 @@ def test_runtime_reference_splits_capture_at_cache_owner_boundary():
     assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 0
     assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
     assert int(fresh_source_0[1, RuntimeScheduleField.CAPTURE_LEN]) == 19
-    assert int(fresh_source_0[0,
-                              RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 19
+    assert int(fresh_source_0[0, RuntimeScheduleField.CAPTURE_SRC_OFFSET]) == 19
     assert int(fresh_source_0[0, RuntimeScheduleField.CAPTURE_DST_OFFSET]) == 0
     assert int(fresh_source_0[0, RuntimeScheduleField.CAPTURE_LEN]) == 13
 
@@ -169,8 +178,7 @@ def test_runtime_reference_preserves_long_absolute_history(history_tokens):
     page_size = 128
     q_len = 256
     kv_len = history_tokens + q_len
-    local_blocks = (kv_len + pcp_size * page_size - 1) // (pcp_size *
-                                                           page_size)
+    local_blocks = (kv_len + pcp_size * page_size - 1) // (pcp_size * page_size)
     reference = _build_reference(
         kv_lens=[kv_len],
         page_indices=np.arange(local_blocks, dtype=np.int32),
@@ -185,13 +193,15 @@ def test_runtime_reference_preserves_long_absolute_history(history_tokens):
     )
 
     active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
-    assert int(
-        reference.history_num_groups[active_tile]) == (history_tokens //
-                                                       (pcp_size * page_size))
+    assert int(reference.history_num_groups[active_tile]) == (
+        history_tokens // (pcp_size * page_size)
+    )
     current = reference.current_rows[active_tile]
     current_active = _active_rows(current)
-    assert np.all(current[..., RuntimeScheduleField.Q_GLOBAL_START]
-                  [current_active] >= history_tokens)
+    assert np.all(
+        current[..., RuntimeScheduleField.Q_GLOBAL_START][current_active]
+        >= history_tokens
+    )
 
 
 def test_runtime_reference_uses_only_runtime_abi_fields():
@@ -210,6 +220,6 @@ def test_runtime_reference_uses_only_runtime_abi_fields():
     for rows in (reference.current_rows, reference.history_rows):
         assert rows.shape[-1] == RuntimeScheduleField.PACKED_NUM_FIELDS
         np.testing.assert_array_equal(
-            rows[..., RuntimeScheduleField.NUM_FIELDS:],
-            np.zeros_like(rows[..., RuntimeScheduleField.NUM_FIELDS:]),
+            rows[..., RuntimeScheduleField.NUM_FIELDS :],
+            np.zeros_like(rows[..., RuntimeScheduleField.NUM_FIELDS :]),
         )

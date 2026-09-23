@@ -596,6 +596,8 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        self._fast_token_substitution: bool = bool(
+            envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION)
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -808,8 +810,11 @@ class TPUModelRunner(GPUModelRunner):
                                      if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
 
-    def start_phased_profiling(self,
-                               profile_prefix: str | None = None) -> None:
+    def start_phased_profiling(
+        self,
+        profile_prefix: str | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """Arms the phase-based profiler. Called from TPUWorker.profile()."""
         if not self.phased_profiling_dir:
             logger.warning(
@@ -831,7 +836,9 @@ class TPUModelRunner(GPUModelRunner):
         # the per-phase subdirectories sit beneath it.
 
         profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
-            self.phased_profiling_dir, profile_prefix)
+            self.phased_profiling_dir,
+            profile_prefix,
+            profiler_kwargs=profiler_kwargs)
 
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
@@ -1815,30 +1822,79 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
-        idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
+        if (self._pre_async_results is None
+                or self._pre_async_results.next_tokens_tpu is None):
+            return input_ids
 
-        # Pad according to the instructions written inside
-        # _substitute_placeholder_token: missing = the complement of
-        # cur_input_indices over [0, len(input_ids)). O(n) boolean mask instead
-        # of np.setdiff1d's O(n log n) sort; flatnonzero returns the same
-        # ascending order setdiff1d did over the (sorted, unique) full range.
-        _missing_mask = np.ones(len(input_ids), dtype=bool)
-        _missing_mask[token_in_tpu_cur_input_indices] = False
-        missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-        padded_token_in_tpu_cur_input_indices = np.concatenate(
-            (token_in_tpu_cur_input_indices, missing_values))
+        if getattr(self, "_fast_token_substitution", False):
+            # Fast path 1: Direct device token slicing for 1:1 steady-state decode
+            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
+            n_subst = len(token_in_tpu_cur_input_indices)
+            if (n_subst == len(input_ids) and np.array_equal(
+                    token_in_tpu_cur_input_indices,
+                    np.arange(len(input_ids), dtype=np.int32))
+                    and np.array_equal(
+                        token_in_tpu_pre_next_tokens_indices,
+                        np.arange(len(input_ids), dtype=np.int32))):
+                next_tpu = self._pre_async_results.next_tokens_tpu.flatten(
+                ).to(input_ids.dtype)
+                if len(next_tpu) >= len(input_ids):
+                    return next_tpu[:len(input_ids)]
 
-        padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-            token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
-            mode='constant',
-            constant_values=-1)
+            # Fast path 2: Cache persistent device indices to eliminate per-step H2D uploads
+            # Avoids Eager XLA overhead by relying on the compiled kernel + cached index tensors
+            subst_key = (
+                len(input_ids),
+                tuple(token_in_tpu_cur_input_indices),
+                tuple(token_in_tpu_pre_next_tokens_indices),
+            )
+            if (getattr(self, "_cached_subst_key", None) == subst_key
+                    and hasattr(self, "_cached_cur_input_indices")
+                    and hasattr(self, "_cached_pre_next_tokens_indices")):
+                cur_input_indices = self._cached_cur_input_indices
+                pre_next_tokens_indices = self._cached_pre_next_tokens_indices
+            else:
+                idx_pad_len = len(input_ids) - len(
+                    token_in_tpu_cur_input_indices)
+                _missing_mask = np.ones(len(input_ids), dtype=bool)
+                _missing_mask[token_in_tpu_cur_input_indices] = False
+                missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
+                padded_token_in_tpu_cur_input_indices = np.concatenate(
+                    (token_in_tpu_cur_input_indices, missing_values))
 
-        cur_input_indices = torch.from_numpy(
-            padded_token_in_tpu_cur_input_indices).to(self.device,
-                                                      non_blocking=True)
-        pre_next_tokens_indices = torch.from_numpy(
-            padded_token_in_tpu_pre_next_tokens_indices).to(self.device,
-                                                            non_blocking=True)
+                padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+                    token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
+                    mode='constant',
+                    constant_values=-1)
+
+                cur_input_indices = torch.from_numpy(
+                    padded_token_in_tpu_cur_input_indices).to(
+                        self.device, non_blocking=True)
+                pre_next_tokens_indices = torch.from_numpy(
+                    padded_token_in_tpu_pre_next_tokens_indices).to(
+                        self.device, non_blocking=True)
+                self._cached_subst_key = subst_key
+                self._cached_cur_input_indices = cur_input_indices
+                self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+        else:
+            idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
+            _missing_mask = np.ones(len(input_ids), dtype=bool)
+            _missing_mask[token_in_tpu_cur_input_indices] = False
+            missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
+            padded_token_in_tpu_cur_input_indices = np.concatenate(
+                (token_in_tpu_cur_input_indices, missing_values))
+
+            padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+                token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
+                mode='constant',
+                constant_values=-1)
+
+            cur_input_indices = torch.from_numpy(
+                padded_token_in_tpu_cur_input_indices).to(self.device,
+                                                          non_blocking=True)
+            pre_next_tokens_indices = torch.from_numpy(
+                padded_token_in_tpu_pre_next_tokens_indices).to(
+                    self.device, non_blocking=True)
 
         return _substitute_placeholder_token(
             input_ids, cur_input_indices, pre_next_tokens_indices,
@@ -2526,7 +2582,17 @@ class TPUModelRunner(GPUModelRunner):
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
-            combined_device = combined.to(self.device, non_blocking=True)
+            if getattr(self, "_fast_token_substitution", False):
+                chunk_comb_key = (chunk_num_decode, chunk_num_windowed,
+                                  num_reqs)
+                if (not hasattr(self, "_cached_comb_dev") or getattr(
+                        self, "_cached_comb_key", None) != chunk_comb_key):
+                    self._cached_comb_dev = combined.to(self.device,
+                                                        non_blocking=True)
+                    self._cached_comb_key = chunk_comb_key
+                combined_device = self._cached_comb_dev
+            else:
+                combined_device = combined.to(self.device, non_blocking=True)
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 

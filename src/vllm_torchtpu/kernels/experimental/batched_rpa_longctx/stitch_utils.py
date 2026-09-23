@@ -55,16 +55,14 @@ def _stitch_decode_lane(
     if cfgs.block.bq_sz == 1:
         # A single token needs neither a second destination column nor the
         # wrap-around source column: its source column is unambiguous.
-        dst_vreg = strided_vmem_ref[pl.ds(dst_chunk_idx, outer_dim,
-                                          lanes_per_col)]
-        src_vreg = strided_vmem_ref[pl.ds(src_tok_idx // num_lanes, outer_dim,
-                                          lanes_per_col)]
-        rolled = pltpu.roll(src_vreg,
-                            dst_rel - src_tok_idx % num_lanes,
-                            axis=1)
+        dst_vreg = strided_vmem_ref[pl.ds(dst_chunk_idx, outer_dim, lanes_per_col)]
+        src_vreg = strided_vmem_ref[
+            pl.ds(src_tok_idx // num_lanes, outer_dim, lanes_per_col)
+        ]
+        rolled = pltpu.roll(src_vreg, dst_rel - src_tok_idx % num_lanes, axis=1)
         merged_dst_vreg = lax.select(
-            lane_idx == dst_rel, rolled,
-            jnp.where(lane_idx < dst_rel, dst_vreg, 0))
+            lane_idx == dst_rel, rolled, jnp.where(lane_idx < dst_rel, dst_vreg, 0)
+        )
         return [dst_chunk_idx], outer_dim, lanes_per_col, [merged_dst_vreg]
 
     # Lanes below `shift` wrap in from the preceding source column.
@@ -74,10 +72,9 @@ def _stitch_decode_lane(
 
     def rolled_src(j: int) -> jax.Array:
         col = jnp.clip(dst_chunk_idx + j - src_base - 1, 0, max_col)
-        return pltpu.roll(strided_vmem_ref[pl.ds(col, outer_dim,
-                                                 lanes_per_col)],
-                          shift,
-                          axis=1)
+        return pltpu.roll(
+            strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)], shift, axis=1
+        )
 
     n_cols = pl.cdiv(num_lanes - 1 + cfgs.block.bq_sz, num_lanes)
     rolled = [rolled_src(j) for j in range(n_cols + 1)]
@@ -91,8 +88,8 @@ def _stitch_decode_lane(
         rel = k * num_lanes + lane_idx - dst_rel
         cols.append(col)
         merged.append(
-            jnp.where(rel < 0, dst_vreg,
-                      jnp.where(rel < bkv_sz_new, src_vreg, 0)))
+            jnp.where(rel < 0, dst_vreg, jnp.where(rel < bkv_sz_new, src_vreg, 0))
+        )
 
     return cols, outer_dim, lanes_per_col, merged
 
@@ -107,24 +104,25 @@ def _stitch_prefill_lane(
     cfgs: configs.RpaConfigs,
 ):
     """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
-    total_head_words = (cfgs.model.num_kv_heads * 2 *
-                        cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv)
+    total_head_words = (
+        cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+    )
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     words_per_sublane = total_head_words // num_sublanes
-    vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes,
-                                             v_len)
+    vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)
 
     roll_shift = (
-        bkv_sz_cache -
-        (cache_pages * cfgs.serve.page_size + new_tok_offset)) % v_len
+        bkv_sz_cache - (cache_pages * cfgs.serve.page_size + new_tok_offset)
+    ) % v_len
     rolled_u32 = pltpu.roll(vmem_u32_reshaped[...], roll_shift, axis=2)
 
-    lane_idx = jax.lax.broadcasted_iota(jnp.int32,
-                                        rolled_u32[..., :cfgs.bkv_sz].shape, 2)
+    lane_idx = jax.lax.broadcasted_iota(
+        jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
+    )
     merged_cache_u32 = jax.lax.select(
         lane_idx >= bkv_sz_cache,
-        rolled_u32[..., :cfgs.bkv_sz],
-        vmem_u32_reshaped[..., :cfgs.bkv_sz],
+        rolled_u32[..., : cfgs.bkv_sz],
+        vmem_u32_reshaped[..., : cfgs.bkv_sz],
     )
 
     return merged_cache_u32
@@ -158,15 +156,18 @@ def store_new_kv_lane(
 
     else:
         merged_cache_u32 = stitch_result
-        total_head_words = (cfgs.model.num_kv_heads * 2 *
-                            cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv)
+        total_head_words = (
+            cfgs.model.num_kv_heads
+            * 2
+            * cfgs.aligned_kv_head_dim
+            // cfgs.serve.packing_kv
+        )
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         words_per_sublane = total_head_words // num_sublanes
-        vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane,
-                                                 num_sublanes, v_len)
+        vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)
 
         # Store the fully stitched sequence back.
-        vmem_u32_reshaped[..., :cfgs.bkv_sz] = merged_cache_u32
+        vmem_u32_reshaped[..., : cfgs.bkv_sz] = merged_cache_u32
 
 
 def stitch_new_kv_lane(

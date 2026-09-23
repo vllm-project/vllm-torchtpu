@@ -30,19 +30,19 @@ class ChipTopology:
         """
         if not 0 <= rank < len(self.device_ids):
             raise ValueError(
-                f"rank {rank} outside the {len(self.device_ids)} visible "
-                "devices")
+                f"rank {rank} outside the {len(self.device_ids)} visible devices"
+            )
         device_id = self.device_ids[rank]
         for chip_index, ids in enumerate(self.chips):
             if device_id in ids:
                 return chip_index, ids.index(device_id)
-        raise RuntimeError(f"device {device_id} is on no chip; "
-                           f"chips={self.chips}")
+        raise RuntimeError(f"device {device_id} is on no chip; chips={self.chips}")
 
     def describe(self) -> str:
-        return (f"{self.num_chips} chip(s) x {self.cores_per_chip} core(s): " +
-                ", ".join(f"chip{i}={ids}"
-                          for i, ids in enumerate(self.chips)))
+        return (
+            f"{self.num_chips} chip(s) x {self.cores_per_chip} core(s): "
+            + ", ".join(f"chip{i}={ids}" for i, ids in enumerate(self.chips))
+        )
 
 
 @functools.lru_cache(maxsize=1)
@@ -55,6 +55,7 @@ def get_chip_topology() -> ChipTopology | None:
     """
     try:
         import jax
+
         devices = jax.devices()
     except Exception as error:  # noqa: BLE001 - optional capability probe
         logger.warning("Cannot enumerate devices for chip topology: %s", error)
@@ -69,7 +70,8 @@ def get_chip_topology() -> ChipTopology | None:
         if coords is None:
             logger.warning(
                 "Devices expose no `coords`; chip grouping unavailable, so "
-                "hierarchical MoE parallelism cannot be enabled.")
+                "hierarchical MoE parallelism cannot be enabled."
+            )
             return None
         grouped[tuple(coords)].append(int(device.id))
 
@@ -82,7 +84,9 @@ def get_chip_topology() -> ChipTopology | None:
     if len(sizes) != 1:
         logger.warning(
             "Chips hold differing core counts (%s); chip grouping "
-            "unusable for hierarchical parallelism.", sorted(sizes))
+            "unusable for hierarchical parallelism.",
+            sorted(sizes),
+        )
         return None
 
     topology = ChipTopology(chips, [int(d.id) for d in devices])
@@ -90,8 +94,9 @@ def get_chip_topology() -> ChipTopology | None:
     return topology
 
 
-def hierarchical_moe_split(world_size: int,
-                           rank: int) -> tuple[int, int, int, int] | None:
+def hierarchical_moe_split(
+    world_size: int, rank: int
+) -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)`` for hierarchical MoE.
 
     Expert parallelism runs *between* chips and tensor parallelism *within*
@@ -106,14 +111,18 @@ def hierarchical_moe_split(world_size: int,
     if topology.cores_per_chip < 2:
         logger.warning(
             "Only %d core(s) per chip; hierarchical MoE has "
-            "nothing to split within a chip.", topology.cores_per_chip)
+            "nothing to split within a chip.",
+            topology.cores_per_chip,
+        )
         return None
     if world_size != len(topology.device_ids):
         logger.warning(
             "World size %d does not match the %d visible devices; refusing to "
-            "guess the chip split.", world_size, len(topology.device_ids))
+            "guess the chip split.",
+            world_size,
+            len(topology.device_ids),
+        )
         return None
 
     chip_index, core_on_chip = topology.chip_of(rank)
-    return (topology.num_chips, chip_index, topology.cores_per_chip,
-            core_on_chip)
+    return (topology.num_chips, chip_index, topology.cores_per_chip, core_on_chip)

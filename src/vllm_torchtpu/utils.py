@@ -302,7 +302,7 @@ def synchronize_device() -> None:
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
 
 def synchronize_tensors(

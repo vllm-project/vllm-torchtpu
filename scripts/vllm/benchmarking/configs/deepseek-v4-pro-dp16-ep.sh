@@ -59,9 +59,10 @@ SERVER_READY_WAIT_MIN=240
 # 897.8 GiB of 945.
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --model-loader-extra-config={\"memory_limit\":4294967296,\"concurrency\":8} --enable-ep-weight-filter --safetensors-load-strategy=prefetch --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Pro-0813\"}"
 
-PROFILE_GCS_BUCKET="tpu-commons-ci"
-PROFILE_GCS_PATH="xprof/deepseek-v4-pro/torchtpu"
-PROFILE_GCS_BASE="gs://$PROFILE_GCS_BUCKET/$PROFILE_GCS_PATH"
+export CAPTURE_PROFILE="${CAPTURE_PROFILE:-1}"
+export USE_PHASED_PROFILER="$CAPTURE_PROFILE"
+
+PROFILE_GCS_BASE="gs://tpu-commons-ci/xprof/deepseek-v4-pro/torchtpu"
 
 BENCHMARK_TEMPERATURE=0
 # todo(patemotter) decrease tolerance to 0.02 once we have more nightly results

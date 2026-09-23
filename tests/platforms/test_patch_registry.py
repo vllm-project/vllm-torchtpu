@@ -13,8 +13,9 @@ from unittest.mock import Mock
 
 import pytest
 
-_REGISTRY_PATH = (Path(__file__).resolve().parents[2] /
-                  "src/vllm_torchtpu/patch_registry.py")
+_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/patch_registry.py"
+)
 
 
 def _load_registry():
@@ -38,7 +39,7 @@ def registry(monkeypatch):
 
 def _patch(registry, callbacks, name, stages, **kwargs):
     patch = registry.Patch(f"{callbacks.__name__}:{name}", stages, **kwargs)
-    registry.PATCHES += (patch, )
+    registry.PATCHES += (patch,)
     return patch
 
 
@@ -77,7 +78,7 @@ def test_order_and_idempotence_across_stages(registry):
     callbacks.worker = lambda: seen.append("worker")
     _patch(reg, callbacks, "first", ("platform_activation", "worker_init"))
     _patch(reg, callbacks, "second", ("platform_activation", "engine_core"))
-    _patch(reg, callbacks, "worker", ("worker_init", ))
+    _patch(reg, callbacks, "worker", ("worker_init",))
     with captured_records(reg._logger) as records:
         reg.apply("platform_activation")
         reg.apply("engine_core")
@@ -93,7 +94,7 @@ def test_failed_patch_retries_without_repeating_completed_patches(registry):
     callbacks.failing = Mock(side_effect=[RuntimeError("unavailable"), None])
     callbacks.last = Mock()
     for name in ("first", "failing", "last"):
-        _patch(reg, callbacks, name, ("worker_init", ))
+        _patch(reg, callbacks, name, ("worker_init",))
     with pytest.raises(RuntimeError, match="unavailable"):
         reg.apply("worker_init")
     callbacks.last.assert_not_called()
@@ -105,14 +106,15 @@ def test_failed_patch_retries_without_repeating_completed_patches(registry):
 
 def test_nonmatching_model_does_not_consume_patch(registry):
     reg, callbacks = registry
-    callbacks.model = Mock(
-        side_effect=lambda model_config: model_config.enabled)
-    patch = _patch(reg,
-                   callbacks,
-                   "model", ("platform_activation", "model_load"),
-                   model_config=True)
-    reg.apply("platform_activation",
-              model_config=SimpleNamespace(enabled=False))
+    callbacks.model = Mock(side_effect=lambda model_config: model_config.enabled)
+    patch = _patch(
+        reg,
+        callbacks,
+        "model",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    )
+    reg.apply("platform_activation", model_config=SimpleNamespace(enabled=False))
     assert patch.target not in reg._applied
     config = SimpleNamespace(enabled=True)
     reg.apply("model_load", model_config=config)
@@ -126,10 +128,13 @@ def test_refreshes_late_bindings_without_reinstalling(registry):
     callbacks.install = Mock()
     bindings = {}
     callbacks.refresh = lambda: bindings.update(late="patched")
-    _patch(reg,
-           callbacks,
-           "install", ("platform_activation", "engine_core"),
-           refresh=f"{callbacks.__name__}:refresh")
+    _patch(
+        reg,
+        callbacks,
+        "install",
+        ("platform_activation", "engine_core"),
+        refresh=f"{callbacks.__name__}:refresh",
+    )
     reg.apply("platform_activation")
     bindings["late"] = "original"
     reg.apply("engine_core")
@@ -141,10 +146,13 @@ def test_refresh_failure_does_not_reinstall_wrapper(registry):
     reg, callbacks = registry
     callbacks.install = Mock()
     callbacks.refresh = Mock(side_effect=[RuntimeError("refresh"), None])
-    _patch(reg,
-           callbacks,
-           "install", ("engine_core", ),
-           refresh=f"{callbacks.__name__}:refresh")
+    _patch(
+        reg,
+        callbacks,
+        "install",
+        ("engine_core",),
+        refresh=f"{callbacks.__name__}:refresh",
+    )
     reg.apply("engine_core")
     with pytest.raises(RuntimeError, match="refresh"):
         reg.apply("engine_core")
@@ -164,8 +172,8 @@ def test_import_reentry_preserves_order(registry):
 
     callbacks.first = first
     callbacks.second = lambda: seen.append("second")
-    _patch(reg, callbacks, "first", ("platform_activation", ))
-    _patch(reg, callbacks, "second", ("platform_activation", ))
+    _patch(reg, callbacks, "first", ("platform_activation",))
+    _patch(reg, callbacks, "second", ("platform_activation",))
     reg.apply("platform_activation")
     assert seen == ["start", "end", "second"]
 
@@ -173,7 +181,7 @@ def test_import_reentry_preserves_order(registry):
 def test_concurrent_application_installs_once(registry):
     reg, callbacks = registry
     callbacks.install = Mock()
-    _patch(reg, callbacks, "install", ("worker_init", ))
+    _patch(reg, callbacks, "install", ("worker_init",))
     with ThreadPoolExecutor(max_workers=4) as executor:
         list(executor.map(reg.apply, ["worker_init"] * 16))
     callbacks.install.assert_called_once_with()
@@ -190,29 +198,33 @@ def test_manifest_preserves_lifecycle_dependencies():
     targets = [p.target for p in reg.PATCHES]
     assert len(targets) == len(set(targets))
     stages = {
-        stage:
-        [p.target.split(":")[-1] for p in reg.PATCHES if stage in p.stages]
-        for stage in ("import", "platform_activation", "engine_core",
-                      "worker_init", "model_load")
+        stage: [p.target.split(":")[-1] for p in reg.PATCHES if stage in p.stages]
+        for stage in (
+            "import",
+            "platform_activation",
+            "engine_core",
+            "worker_init",
+            "model_load",
+        )
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
-        "_patch_vllm_hybrid_producer_prefix_hits",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
+        "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
-    assert stages["platform_activation"] == (stages["worker_init"] +
-                                             stages["model_load"])
-    assert stages["model_load"] == [
-        "maybe_patch_qwen2_5_vl", "maybe_patch_qwen3_vl"
-    ]
+    assert stages["platform_activation"] == (
+        stages["worker_init"] + stages["model_load"]
+    )
+    assert stages["model_load"] == ["maybe_patch_qwen2_5_vl", "maybe_patch_qwen3_vl"]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
-            "_patch_vllm_config_triton_tpu")
+            "_patch_vllm_config_triton_tpu"
+        )
 
 
 def test_plugin_import_sets_environment_before_jax():
@@ -222,7 +234,7 @@ def test_plugin_import_sets_environment_before_jax():
     source = _REGISTRY_PATH.parent.parent
     env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
     env.pop("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", None)
-    code = '''
+    code = """
 import builtins
 import os
 import sys
@@ -241,12 +253,14 @@ import vllm_torchtpu
 assert seen == ["jax._src.pallas.mosaic"]
 assert "vllm" not in sys.modules
 assert "torch_tpu" not in sys.modules
-'''
-    result = subprocess.run([sys.executable, "-c", code],
-                            env=env,
-                            capture_output=True,
-                            text=True,
-                            timeout=30)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -268,8 +282,8 @@ def test_fork_during_application_retains_completed_patches(registry):
         seen.append("pending")
 
     callbacks.pending = pending
-    _patch(reg, callbacks, "completed", ("worker_init", ))
-    _patch(reg, callbacks, "pending", ("worker_init", ))
+    _patch(reg, callbacks, "completed", ("worker_init",))
+    _patch(reg, callbacks, "pending", ("worker_init",))
     context = multiprocessing.get_context("fork")
     parent, child = context.Pipe(duplex=False)
 
@@ -279,7 +293,7 @@ def test_fork_during_application_retains_completed_patches(registry):
         child.send(seen)
         child.close()
 
-    thread = Thread(target=reg.apply, args=("worker_init", ))
+    thread = Thread(target=reg.apply, args=("worker_init",))
     process = context.Process(target=in_child)
     thread.start()
     try:

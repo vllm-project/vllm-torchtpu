@@ -59,7 +59,6 @@ def test_mamba_split_uses_scheduler_block_size_and_restores_cache_config():
 
 
 def test_mamba_split_restores_cache_config_when_upstream_raises(monkeypatch):
-
     def raising_split(self, *args, **kwargs):
         raise RuntimeError("upstream split failed")
 

@@ -72,13 +72,13 @@ same compiled program (one buffer padded to the largest token bucket), and
 every launch is submitted to the device right away, even on a stage that
 never reads the result.
 """
+
 from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.distributed.pp_shift import (get_or_create_pp_mesh,
-                                                pp_permute_op)
+from vllm_torchtpu.distributed.pp_shift import get_or_create_pp_mesh, pp_permute_op
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
@@ -94,12 +94,12 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
     if parallel_config.pipeline_parallel_size <= 1:
         return True, True
     from vllm.distributed.parallel_state import get_pp_group
+
     group = get_pp_group()
     return bool(group.is_first_rank), bool(group.is_last_rank)
 
 
-def _launch_now(op, carried: tuple[torch.Tensor,
-                                   ...]) -> tuple[torch.Tensor, ...]:
+def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     """Run one hand-off as its own device program, submitted immediately.
 
     vLLM runs torch_tpu in fused-eager mode, where ops are deferred, fused
@@ -107,10 +107,11 @@ def _launch_now(op, carried: tuple[torch.Tensor,
     producers are flushed first, then the launch alone; neither flush waits.
     """
     from torch_tpu._internal.sync import sync
+
     sync.synchronize(None, wait=False)
     out = op(*carried)
     if isinstance(out, torch.Tensor):
-        out = (out, )
+        out = (out,)
     else:
         out = tuple(out)
     sync.synchronize(list(out), wait=False)
@@ -118,37 +119,44 @@ def _launch_now(op, carried: tuple[torch.Tensor,
 
 
 class PPWave:
-
-    def __init__(self, device: torch.device, max_rows: int,
-                 template: dict[str, tuple[tuple[int, ...], torch.dtype]]):
+    def __init__(
+        self,
+        device: torch.device,
+        max_rows: int,
+        template: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ):
         from vllm.distributed.parallel_state import get_pp_group
+
         group = get_pp_group()
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
-        extras = [
-            key for key in template if key not in (HIDDEN_STATES, RESIDUAL)
-        ]
-        if (set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
-                or template[HIDDEN_STATES] != template[RESIDUAL] or any(
-                    len(template[key][0]) != 1
-                    for key in (HIDDEN_STATES, *extras))):
+        extras = [key for key in template if key not in (HIDDEN_STATES, RESIDUAL)]
+        if (
+            set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
+            or template[HIDDEN_STATES] != template[RESIDUAL]
+            or any(len(template[key][0]) != 1 for key in (HIDDEN_STATES, *extras))
+        ):
             raise ValueError(
                 "the pipeline hand-off carries hidden_states and residual, "
                 "two [tokens, hidden] tensors of one dtype, plus any number "
                 "of [tokens, width] side tensors; the model's intermediate "
-                f"tensors are {template}")
+                f"tensors are {template}"
+            )
         # The first is the activation sum; the rest are side data a stage
         # passes on unchanged. Every stage builds from the same template,
         # so the order matches across stages.
         self.carried = (HIDDEN_STATES, *extras)
         self.max_rows = int(max_rows)
-        self.op = pp_permute_op(get_or_create_pp_mesh(),
-                                num_tensors=len(self.carried))
+        self.op = pp_permute_op(get_or_create_pp_mesh(), num_tensors=len(self.carried))
         self.zeros = tuple(
-            torch.zeros((self.max_rows, *template[key][0]),
-                        dtype=template[key][1],
-                        device=device) for key in self.carried)
+            torch.zeros(
+                (self.max_rows, *template[key][0]),
+                dtype=template[key][1],
+                device=device,
+            )
+            for key in self.carried
+        )
         self.zero = self.zeros[0]
         self.launches = 0
         self.bursts = 0
@@ -157,31 +165,34 @@ class PPWave:
         self.forwards = 0
         self.pending: tuple[torch.Tensor, ...] | None = None
         logger.info(
-            "PP wave: rank %d/%d, hand-off carries %s", self.rank, self.size,
-            ", ".join(f"{key}[{self.max_rows}, {template[key][0][0]}] "
-                      f"{template[key][1]}" for key in self.carried))
+            "PP wave: rank %d/%d, hand-off carries %s",
+            self.rank,
+            self.size,
+            ", ".join(
+                f"{key}[{self.max_rows}, {template[key][0][0]}] {template[key][1]}"
+                for key in self.carried
+            ),
+        )
 
-    def _launch(self, carried: tuple[torch.Tensor,
-                                     ...]) -> tuple[torch.Tensor, ...]:
+    def _launch(self, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         with TraceAnnotation("PP:Handoff"):
             out = _launch_now(self.op, carried)
         self.launches += 1
         self.burst_launches += 1
         return out
 
-    def _pad(self, carried: tuple[torch.Tensor, ...],
-             rows: int) -> tuple[torch.Tensor, ...]:
+    def _pad(
+        self, carried: tuple[torch.Tensor, ...], rows: int
+    ) -> tuple[torch.Tensor, ...]:
         if rows == self.max_rows:
             return carried
-        return tuple(
-            torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
+        return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
 
     def warmup(self) -> None:
         """One launch outside any burst on every stage, carrying a known
         value; checks that it arrived on the next stage."""
         assert not self.burst_open and self.launches == 0
-        out = self._launch(
-            tuple(torch.full_like(z, self.rank + 1) for z in self.zeros))
+        out = self._launch(tuple(torch.full_like(z, self.rank + 1) for z in self.zeros))
         if self.rank > 0:
             want = float(self.rank)
             for key, x in zip(self.carried, out):
@@ -189,7 +200,8 @@ class PPWave:
                 if any(g != want for g in got):
                     raise RuntimeError(
                         f"PP wave rank {self.rank}: hand-off self-test tensor "
-                        f"{key!r} received {got}, expected {want}")
+                        f"{key!r} received {got}, expected {want}"
+                    )
         else:
             _ = out[0][0, 0].item()
         self.burst_launches = 0
@@ -213,7 +225,8 @@ class PPWave:
         if self.burst_launches != expected:
             raise RuntimeError(
                 f"PP wave rank {self.rank}: burst of {self.forwards} forwards "
-                f"issued {self.burst_launches} launches, expected {expected}")
+                f"issued {self.burst_launches} launches, expected {expected}"
+            )
 
     def start_forward(self, rows: int) -> IntermediateTensors | None:
         """Called before forward number m of the burst with its padded token
@@ -230,8 +243,7 @@ class PPWave:
         tensors[RESIDUAL] = self.zero[:rows].clone()
         return IntermediateTensors(tensors)
 
-    def end_forward(self, tensors: dict[str, torch.Tensor] | None,
-                    rows: int) -> None:
+    def end_forward(self, tensors: dict[str, torch.Tensor] | None, rows: int) -> None:
         """Called after the forward with its outgoing activations (None on
         the last stage)."""
         self.forwards += 1
@@ -243,7 +255,8 @@ class PPWave:
         if missing:
             raise RuntimeError(
                 f"PP wave rank {self.rank}: the forward produced no "
-                f"{missing} to hand on")
+                f"{missing} to hand on"
+            )
         # Summed in the model dtype; see the module docstring.
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
         outgoing = (total, *(tensors[key] for key in self.carried[1:]))
@@ -281,8 +294,7 @@ class PPWave:
                 assert self.pending is not None
                 self._launch(self.pending)
                 self.pending = None
-            zero_launches = (self.size - 2 -
-                             self.rank if self.rank < self.last else 0)
+            zero_launches = self.size - 2 - self.rank if self.rank < self.last else 0
             for _ in range(zero_launches):
                 self._launch(self.zeros)
         # Every stage now holds forwards + size - 1 launches.
@@ -290,8 +302,13 @@ class PPWave:
         if self.bursts <= 5 or self.bursts % 100 == 0:
             logger.debug(
                 "PP wave rank %d: burst %d settled after %d forwards, %d "
-                "launches (%d total)", self.rank, self.bursts, self.forwards,
-                self.burst_launches, self.launches)
+                "launches (%d total)",
+                self.rank,
+                self.bursts,
+                self.forwards,
+                self.burst_launches,
+                self.launches,
+            )
         self.burst_open = False
         self.forwards = 0
         self.burst_launches = 0

@@ -8,17 +8,16 @@ real upstream __init__, with fake child connector classes resolved from this
 module via kv_connector_module_path (the same mechanism the recipe uses for
 the real children). No TPU or network access is required.
 """
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import \
-    MultiConnector
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
-from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import \
-    TPUMultiConnector
+from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
 
 
 class _FakeRaidenChild:
@@ -55,18 +54,22 @@ def _make_vllm_config(kv_role="kv_consumer"):
         kv_transfer_config=KVTransferConfig(
             kv_connector="TPUMultiConnector",
             kv_connector_module_path=(
-                "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+                "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
+            ),
             kv_role=kv_role,
             kv_connector_extra_config={
-                "connectors": [{
-                    "kv_connector": "_FakeRaidenChild",
-                    "kv_connector_module_path": __name__,
-                    "kv_role": kv_role,
-                }, {
-                    "kv_connector": "_FakeOffloadChild",
-                    "kv_connector_module_path": __name__,
-                    "kv_role": "kv_both",
-                }],
+                "connectors": [
+                    {
+                        "kv_connector": "_FakeRaidenChild",
+                        "kv_connector_module_path": __name__,
+                        "kv_role": kv_role,
+                    },
+                    {
+                        "kv_connector": "_FakeOffloadChild",
+                        "kv_connector_module_path": __name__,
+                        "kv_role": "kv_both",
+                    },
+                ],
             },
         ),
         # The fake children don't implement SupportsHMA, so hybrid KV cache
@@ -80,7 +83,6 @@ def _build(role=KVConnectorRole.WORKER):
 
 
 class TestTPUMultiConnectorConstruction:
-
     def test_children_built_from_explicit_connectors_config(self):
         connector = _build()
 
@@ -97,8 +99,9 @@ class TestTPUMultiConnectorConstruction:
 
     def test_role_and_kv_cache_config_forwarded_to_children(self):
         kv_cache_config = MagicMock()
-        connector = TPUMultiConnector(_make_vllm_config(),
-                                      KVConnectorRole.WORKER, kv_cache_config)
+        connector = TPUMultiConnector(
+            _make_vllm_config(), KVConnectorRole.WORKER, kv_cache_config
+        )
 
         for child in connector._connectors:
             assert child.role == KVConnectorRole.WORKER
@@ -106,7 +109,6 @@ class TestTPUMultiConnectorConstruction:
 
 
 class TestTPUMultiConnectorRegisterRunner:
-
     def test_runner_reaches_children_that_accept_it(self):
         # tpu_runner dispatches register_runner via hasattr; upstream
         # MultiConnector doesn't forward it, so without this fan-out the

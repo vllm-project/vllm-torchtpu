@@ -99,9 +99,7 @@ def _rank_token_count_before(
     full_rounds = position // round_size
     round_offset = position - full_rounds * round_size
     rank_start = ranks * comm_chunk_size
-    rows_in_round = jnp.clip(round_offset - rank_start,
-                             min=0,
-                             max=comm_chunk_size)
+    rows_in_round = jnp.clip(round_offset - rank_start, min=0, max=comm_chunk_size)
     return full_rounds * comm_chunk_size + rows_in_round
 
 
@@ -121,8 +119,7 @@ def _schedule_capacities(
     # offset stays aligned for DMA.  The conservative rank factor keeps this
     # valid even in small test geometries where one communication chunk is
     # smaller than one GDN tile.
-    max_tiles = (pl.cdiv(cfg.batch_size, cfg.tile_size) +
-                 pcp_size * max_stages)
+    max_tiles = pl.cdiv(cfg.batch_size, cfg.tile_size) + pcp_size * max_stages
     return max_stages, max_tiles
 
 
@@ -149,11 +146,9 @@ def compute_pcp_stage_metadata(
     if seq_lens.size != state_indices.size:
         raise ValueError("state_indices and seq_lens must have equal size.")
     if query_start_loc.size != seq_lens.size + 1:
-        raise ValueError("query_start_loc must contain max_num_seqs + 1 "
-                         "entries.")
+        raise ValueError("query_start_loc must contain max_num_seqs + 1 entries.")
     q_lens = query_start_loc[1:] - query_start_loc[:-1]
-    request_absolute_starts = seq_lens.astype(jnp.int32) - q_lens.astype(
-        jnp.int32)
+    request_absolute_starts = seq_lens.astype(jnp.int32) - q_lens.astype(jnp.int32)
     token_owner_starts = query_start_loc[:-1].astype(jnp.int32)
     return _compute_pcp_stage_metadata_from_coordinates(
         cfg,
@@ -211,14 +206,13 @@ def _compute_pcp_stage_metadata_from_coordinates(
 
     max_num_seqs = state_indices.size
     if query_start_loc.size != max_num_seqs + 1:
-        raise ValueError("query_start_loc must contain max_num_seqs + 1 "
-                         "entries.")
+        raise ValueError("query_start_loc must contain max_num_seqs + 1 entries.")
     if token_owner_starts.size != max_num_seqs:
-        raise ValueError("token_owner_starts and state_indices must have "
-                         "equal size.")
+        raise ValueError("token_owner_starts and state_indices must have equal size.")
     if request_absolute_starts.size != max_num_seqs:
-        raise ValueError("request_absolute_starts and state_indices must have "
-                         "equal size.")
+        raise ValueError(
+            "request_absolute_starts and state_indices must have equal size."
+        )
 
     max_stages, max_tiles = _schedule_capacities(
         cfg,
@@ -240,23 +234,23 @@ def _compute_pcp_stage_metadata_from_coordinates(
         request_index=jnp.asarray(0, dtype=int_dtype),
         active_stages=jnp.asarray(0, dtype=int_dtype),
         active_tiles=jnp.asarray(0, dtype=int_dtype),
-        rank_row_offsets=jnp.zeros((pcp_size, ), dtype=int_dtype),
-        rank_active_row_end=jnp.zeros((pcp_size, ), dtype=int_dtype),
-        request_id=jnp.zeros((max_stages, ), dtype=int_dtype),
-        query_row_start=jnp.zeros((max_stages, ), dtype=int_dtype),
-        num_tokens=jnp.zeros((max_stages, ), dtype=int_dtype),
+        rank_row_offsets=jnp.zeros((pcp_size,), dtype=int_dtype),
+        rank_active_row_end=jnp.zeros((pcp_size,), dtype=int_dtype),
+        request_id=jnp.zeros((max_stages,), dtype=int_dtype),
+        query_row_start=jnp.zeros((max_stages,), dtype=int_dtype),
+        num_tokens=jnp.zeros((max_stages,), dtype=int_dtype),
         rank_row_start=jnp.zeros((max_stages, pcp_size), dtype=int_dtype),
         rank_valid_rows=jnp.zeros((max_stages, pcp_size), dtype=int_dtype),
         rank_recv_start=jnp.zeros((max_stages, pcp_size), dtype=int_dtype),
-        first_tile=jnp.zeros((max_stages, ), dtype=int_dtype),
-        stage_num_tiles=jnp.zeros((max_stages, ), dtype=int_dtype),
-        tile_stage=jnp.zeros((max_tiles, ), dtype=int_dtype),
-        tile_row_in_stage=jnp.zeros((max_tiles, ), dtype=int_dtype),
-        tile_request_id=jnp.zeros((max_tiles, ), dtype=int_dtype),
-        tile_query_row_start=jnp.zeros((max_tiles, ), dtype=int_dtype),
-        tile_num_tokens=jnp.zeros((max_tiles, ), dtype=int_dtype),
-        tile_is_first=jnp.zeros((max_tiles, ), dtype=jnp.bool_),
-        tile_is_last=jnp.zeros((max_tiles, ), dtype=jnp.bool_),
+        first_tile=jnp.zeros((max_stages,), dtype=int_dtype),
+        stage_num_tiles=jnp.zeros((max_stages,), dtype=int_dtype),
+        tile_stage=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_row_in_stage=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_request_id=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_query_row_start=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_num_tokens=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_is_first=jnp.zeros((max_tiles,), dtype=jnp.bool_),
+        tile_is_last=jnp.zeros((max_tiles,), dtype=jnp.bool_),
     )
 
     def _requests_pending(state: _BuilderState) -> jax.Array:
@@ -270,7 +264,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
         token_owner_begin = token_owner_starts[req]
         token_owner_end = token_owner_begin + query_len
 
-        rank_counts = (_rank_token_count_before(
+        rank_counts = _rank_token_count_before(
             token_owner_end,
             ranks,
             pcp_size=pcp_size,
@@ -280,14 +274,14 @@ def _compute_pcp_stage_metadata_from_coordinates(
             ranks,
             pcp_size=pcp_size,
             comm_chunk_size=comm_chunk_size,
-        ))
+        )
         request_rank_starts = state.rank_row_offsets
         next_rank_offsets = request_rank_starts + rank_counts
 
         should_emit = jnp.logical_and(req >= start_seq, query_len > 0)
         first_window = (token_owner_begin // round_size) * round_size
         initial_window = jnp.where(should_emit, first_window, token_owner_end)
-        initial_consumed = jnp.zeros((pcp_size, ), dtype=int_dtype)
+        initial_consumed = jnp.zeros((pcp_size,), dtype=int_dtype)
 
         def _windows_pending(carry) -> jax.Array:
             window, _, _ = carry
@@ -300,52 +294,63 @@ def _compute_pcp_stage_metadata_from_coordinates(
             overlap_begin = jnp.maximum(rank_chunk_begin, token_owner_begin)
             overlap_end = jnp.minimum(rank_chunk_end, token_owner_end)
             valid_rows = jnp.maximum(overlap_end - overlap_begin, 0)
-            dense_starts = (jnp.cumsum(valid_rows, dtype=int_dtype) -
-                            valid_rows)
+            dense_starts = jnp.cumsum(valid_rows, dtype=int_dtype) - valid_rows
             recv_starts = ranks * comm_chunk_size
             stage_tokens = jnp.sum(valid_rows, dtype=int_dtype)
-            stage_query_begin = (query_begin +
-                                 jnp.maximum(window, token_owner_begin) -
-                                 token_owner_begin)
+            stage_query_begin = (
+                query_begin + jnp.maximum(window, token_owner_begin) - token_owner_begin
+            )
             stage = inner_state.active_stages
             tile_begin = inner_state.active_tiles
 
             request_id = inner_state.request_id.at[stage].set(req)
-            query_rows = inner_state.query_row_start.at[stage].set(
-                stage_query_begin)
+            query_rows = inner_state.query_row_start.at[stage].set(stage_query_begin)
             num_tokens = inner_state.num_tokens.at[stage].set(stage_tokens)
             rank_rows = inner_state.rank_row_start.at[stage].set(
-                request_rank_starts + consumed)
+                request_rank_starts + consumed
+            )
             rank_valid = inner_state.rank_valid_rows.at[stage].set(valid_rows)
             rank_recv = inner_state.rank_recv_start.at[stage].set(recv_starts)
             first_tile = inner_state.first_tile.at[stage].set(tile_begin)
 
             def _emit_rank_tiles(source_rank, rank_state):
-                (tile_cursor, tile_stage, tile_row, tile_req, tile_query,
-                 tile_size, tile_first, tile_last) = rank_state
+                (
+                    tile_cursor,
+                    tile_stage,
+                    tile_row,
+                    tile_req,
+                    tile_query,
+                    tile_size,
+                    tile_first,
+                    tile_last,
+                ) = rank_state
                 source_rows = valid_rows[source_rank]
                 source_num_tiles = pl.cdiv(source_rows, cfg.tile_size)
                 source_physical_row = source_rank * comm_chunk_size
                 source_query_row = stage_query_begin + dense_starts[source_rank]
 
                 def _emit_tile(tile_in_rank, tile_state):
-                    (tile_stage, tile_row, tile_req, tile_query, tile_size,
-                     tile_first, tile_last) = tile_state
+                    (
+                        tile_stage,
+                        tile_row,
+                        tile_req,
+                        tile_query,
+                        tile_size,
+                        tile_first,
+                        tile_last,
+                    ) = tile_state
                     tile = tile_cursor + tile_in_rank
                     source_offset = tile_in_rank * cfg.tile_size
-                    real_size = jnp.minimum(source_rows - source_offset,
-                                            cfg.tile_size)
+                    real_size = jnp.minimum(source_rows - source_offset, cfg.tile_size)
                     query_row = source_query_row + source_offset
                     return (
                         tile_stage.at[tile].set(stage),
-                        tile_row.at[tile].set(source_physical_row +
-                                              source_offset),
+                        tile_row.at[tile].set(source_physical_row + source_offset),
                         tile_req.at[tile].set(req),
                         tile_query.at[tile].set(query_row),
                         tile_size.at[tile].set(real_size),
                         tile_first.at[tile].set(query_row == query_begin),
-                        tile_last.at[tile].set(query_row +
-                                               real_size == query_end),
+                        tile_last.at[tile].set(query_row + real_size == query_end),
                     )
 
                 tile_arrays = jax.lax.fori_loop(
@@ -364,25 +369,32 @@ def _compute_pcp_stage_metadata_from_coordinates(
                 )
                 return (tile_cursor + source_num_tiles, *tile_arrays)
 
-            (tile_end, tile_stage, tile_row, tile_req, tile_query, tile_size,
-             tile_first, tile_last) = jax.lax.fori_loop(
-                 0,
-                 pcp_size,
-                 _emit_rank_tiles,
-                 (
-                     tile_begin,
-                     inner_state.tile_stage,
-                     inner_state.tile_row_in_stage,
-                     inner_state.tile_request_id,
-                     inner_state.tile_query_row_start,
-                     inner_state.tile_num_tokens,
-                     inner_state.tile_is_first,
-                     inner_state.tile_is_last,
-                 ),
-             )
+            (
+                tile_end,
+                tile_stage,
+                tile_row,
+                tile_req,
+                tile_query,
+                tile_size,
+                tile_first,
+                tile_last,
+            ) = jax.lax.fori_loop(
+                0,
+                pcp_size,
+                _emit_rank_tiles,
+                (
+                    tile_begin,
+                    inner_state.tile_stage,
+                    inner_state.tile_row_in_stage,
+                    inner_state.tile_request_id,
+                    inner_state.tile_query_row_start,
+                    inner_state.tile_num_tokens,
+                    inner_state.tile_is_first,
+                    inner_state.tile_is_last,
+                ),
+            )
             num_stage_tiles = tile_end - tile_begin
-            stage_num_tiles = inner_state.stage_num_tiles.at[stage].set(
-                num_stage_tiles)
+            stage_num_tiles = inner_state.stage_num_tiles.at[stage].set(num_stage_tiles)
 
             stage_row_ends = request_rank_starts + consumed + valid_rows
             next_state = dataclasses.replace(
@@ -440,10 +452,10 @@ def _compute_pcp_stage_metadata_from_coordinates(
     )
 
     def _plan_projection_catchup(stage, carry):
-        (cumulative_catchup, catchup_starts, catchup_counts,
-         cumulative_after_stage) = carry
-        stage_row_end = (result.rank_row_start[stage] +
-                         result.rank_valid_rows[stage])
+        (cumulative_catchup, catchup_starts, catchup_counts, cumulative_after_stage) = (
+            carry
+        )
+        stage_row_end = result.rank_row_start[stage] + result.rank_valid_rows[stage]
         required_token_blocks = pl.cdiv(
             stage_row_end,
             projection_token_block_size,
@@ -456,9 +468,9 @@ def _compute_pcp_stage_metadata_from_coordinates(
         required_work = jnp.where(
             required_token_blocks <= 1,
             0,
-            num_z_out_blocks +
-            (required_token_blocks - 2) * num_projection_out_blocks +
-            num_qkv_out_blocks,
+            num_z_out_blocks
+            + (required_token_blocks - 2) * num_projection_out_blocks
+            + num_qkv_out_blocks,
         )
         # Stage zero launches before the pipeline.  Every later stage launches
         # from the preceding stage's first-tile prologue so its communication
@@ -475,22 +487,31 @@ def _compute_pcp_stage_metadata_from_coordinates(
         catchup_starts = catchup_starts.at[stage].set(work_before_stage)
         catchup_counts = catchup_counts.at[stage].set(catchup)
         cumulative_after_stage = cumulative_after_stage.at[stage].set(
-            cumulative_catchup)
-        return (cumulative_catchup, catchup_starts, catchup_counts,
-                cumulative_after_stage)
+            cumulative_catchup
+        )
+        return (
+            cumulative_catchup,
+            catchup_starts,
+            catchup_counts,
+            cumulative_after_stage,
+        )
 
-    (projection_work_offset_end, projection_catchup_start,
-     projection_catchup_count, cumulative_after_stage) = jax.lax.fori_loop(
-         0,
-         result.active_stages,
-         _plan_projection_catchup,
-         (
-             jnp.zeros((pcp_size, ), dtype=int_dtype),
-             projection_catchup_start,
-             projection_catchup_count,
-             projection_work_offset,
-         ),
-     )
+    (
+        projection_work_offset_end,
+        projection_catchup_start,
+        projection_catchup_count,
+        cumulative_after_stage,
+    ) = jax.lax.fori_loop(
+        0,
+        result.active_stages,
+        _plan_projection_catchup,
+        (
+            jnp.zeros((pcp_size,), dtype=int_dtype),
+            projection_catchup_start,
+            projection_catchup_count,
+            projection_work_offset,
+        ),
+    )
 
     def _set_body_projection_offset(stage, work_offsets):
         # Before stage ``s`` computes its first tile, catch-up for stage
@@ -500,8 +521,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
             stage + 1,
             result.active_stages - 1,
         )
-        return work_offsets.at[stage].set(
-            cumulative_after_stage[latest_launched_stage])
+        return work_offsets.at[stage].set(cumulative_after_stage[latest_launched_stage])
 
     projection_work_offset = jax.lax.fori_loop(
         0,
