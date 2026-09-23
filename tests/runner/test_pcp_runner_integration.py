@@ -74,7 +74,7 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
-    runner.reorder_batch_threshold = 1
+    runner.rpa_decode_query_size = 1
     runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
@@ -266,7 +266,7 @@ def test_prepare_inputs_routes_reordered_verify_per_chunk(
                           scheduled_tokens=scheduled,
                           token_paddings=[256],
                           pcp_size=1)
-    runner.reorder_batch_threshold = bucket
+    runner.rpa_decode_query_size = bucket
     runner.num_reqs_max_model_len = chunk_size
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
     runner.spec_decode_manager = SpeculativeDecodingManager(runner)

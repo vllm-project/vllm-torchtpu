@@ -1053,7 +1053,7 @@ class TestReorderBatchForRpa:
 
 
 class TestInitializeAttentionKernelsThreshold:
-    """`reorder_batch_threshold` is the smallest DECODE query width across the
+    """`rpa_decode_query_size` is the smallest DECODE query width across the
     kernels `_initialize_attention_kernels` builds, draft layers included."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
@@ -1064,7 +1064,7 @@ class TestInitializeAttentionKernelsThreshold:
         runner.model = None
         runner.mesh = MagicMock()
         runner.vllm_config = MagicMock()
-        runner.reorder_batch_threshold = 1
+        runner.rpa_decode_query_size = 1
         runner.drafter = SimpleNamespace(
             _draft_attn_layer_names=set(draft_names))
         runner.speculative_config = SimpleNamespace(
@@ -1084,17 +1084,41 @@ class TestInitializeAttentionKernelsThreshold:
              patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"):
             runner._initialize_attention_kernels()
 
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("width", [1, 4])
+    def test_attention_init_preserves_gpu_reordering_disabled(self, width):
+        runner, layers = self._make_runner({"target": width})
+        runner.reorder_batch_threshold = None
+        self._run(runner, layers)
+        runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+        runner.input_batch = SimpleNamespace(
+            req_ids=["p0", "p1", "d0", "d1"],
+            num_computed_tokens_cpu=np.array([0, 0, 32, 32]),
+            num_prompt_tokens=np.array([16, 16, 16, 16]),
+            swap_states=MagicMock(),
+        )
+        scheduler_output = SimpleNamespace(num_scheduled_tokens={
+            "p0": 16,
+            "p1": 16,
+            "d0": 1,
+            "d1": 1
+        })
+
+        TPUModelRunner._may_reorder_batch(runner, scheduler_output)
+
+        runner.input_batch.swap_states.assert_not_called()
+
     def test_uniform_width(self):
         runner, layers = self._make_runner({"a": 4, "b": 4})
         self._run(runner, layers)
-        assert runner.reorder_batch_threshold == 4
+        assert runner.rpa_decode_query_size == 4
         for layer in layers.values():
             layer.impl.initialize_kernel.assert_called_once()
 
     def test_min_across_layers(self):
         runner, layers = self._make_runner({"a": 4, "b": 1})
         self._run(runner, layers)
-        assert runner.reorder_batch_threshold == 1
+        assert runner.rpa_decode_query_size == 1
 
     def test_relocated_draft_forces_one_token_decode(self):
         runner, layers = self._make_runner({
@@ -1106,7 +1130,7 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
-        assert runner.reorder_batch_threshold == 1
+        assert runner.rpa_decode_query_size == 1
 
     def test_sharded_draft_keeps_width(self):
         runner, layers = self._make_runner({
@@ -1116,12 +1140,12 @@ class TestInitializeAttentionKernelsThreshold:
                                            draft_names=("draft", ),
                                            draft_tp=2)
         self._run(runner, layers)
-        assert runner.reorder_batch_threshold == 4
+        assert runner.rpa_decode_query_size == 4
 
     def test_no_pallas_layers(self):
         runner, layers = self._make_runner({})
         self._run(runner, layers)
-        assert runner.reorder_batch_threshold == 1
+        assert runner.rpa_decode_query_size == 1
 
 
 class TestMambaSlotReadOffsets:

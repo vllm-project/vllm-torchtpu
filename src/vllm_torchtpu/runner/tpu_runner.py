@@ -739,7 +739,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self.speculative_config = self.vllm_config.speculative_config
         # Maximum query length to be considered a decode.
-        self.reorder_batch_threshold = 1
+        self.rpa_decode_query_size = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -2235,9 +2235,8 @@ class TPUModelRunner(GPUModelRunner):
                         num_windowed_reqs: int | None = None):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
-        rpa_num_decode_reqs = (num_windowed_reqs
-                               if self.reorder_batch_threshold > 1 else
-                               num_decode_reqs)
+        rpa_num_decode_reqs = (num_windowed_reqs if self.rpa_decode_query_size
+                               > 1 else num_decode_reqs)
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -4027,7 +4026,7 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
-        self.reorder_batch_threshold = min(decode_query_sizes, default=1)
+        self.rpa_decode_query_size = min(decode_query_sizes, default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
