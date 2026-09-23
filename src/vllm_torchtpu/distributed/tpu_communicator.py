@@ -16,7 +16,9 @@ rank.
 
 import torch
 from vllm.distributed.device_communicators.base_device_communicator import (
-    All2AllManagerBase, DeviceCommunicatorBase)
+    All2AllManagerBase,
+    DeviceCommunicatorBase,
+)
 from vllm.distributed.parallel_state import get_dp_group
 
 
@@ -25,7 +27,6 @@ class TpuNullAll2AllManager(All2AllManagerBase):
 
 
 class TpuDeviceCommunicator(DeviceCommunicatorBase):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # TPU performs EP dispatch/combine directly (see dispatch/combine
@@ -47,7 +48,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     ):
         if extra_tensors is not None:
             raise NotImplementedError(
-                "extra_tensors is not supported by TpuDeviceCommunicator")
+                "extra_tensors is not supported by TpuDeviceCommunicator"
+            )
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, router_logits
@@ -65,7 +67,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     ):
         if extra_tensors is not None:
             raise NotImplementedError(
-                "extra_tensors is not supported by TpuDeviceCommunicator")
+                "extra_tensors is not supported by TpuDeviceCommunicator"
+            )
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, topk_weights, topk_ids
@@ -74,9 +77,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         topk_ids = self._dp_gather(topk_ids)
         return hidden_states, topk_weights, topk_ids
 
-    def combine(self,
-                hidden_states: torch.Tensor,
-                is_sequence_parallel: bool = False) -> torch.Tensor:
+    def combine(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states

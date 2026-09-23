@@ -516,30 +516,34 @@ def v3_state_source(
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
-    # Mosaic requires a BF16 typed ref to preserve the raw pool ref's minormost
-    # dimension, so load full-width and reshape the resulting array. FP32
-    # supports the d_v-wide ref view, avoiding a post-load lane-crossing
-    # relayout.
-    if recurrent_state_dtype.itemsize == 2:
-        ssm_lane_split = 1
-    else:
-        assert lanes % d_v == 0, (lanes, d_v)
-        ssm_lane_split = lanes // d_v
-    ssm_out_lanes = lanes // ssm_lane_split
+    assert lanes % d_v == 0, (lanes, d_v)
+    ssm_lane_split = lanes // d_v
+    ssm_out_lanes = d_v
+
     # load_state_region treats these rows as one contiguous element stream and
     # reshapes it to (n_v, d_k, d_v); store_state_region reverses that reshape.
-    # FP32 uses d_v-wide rows, while BF16 may pack multiple logical rows into
-    # one full-width carrier row. The logical state must contain a whole number
-    # of carrier rows.
     assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
+    ssm_rows_used = ssm_elements // ssm_out_lanes
+
+    # Reading/writing VMEM directly with a bfloat16 view_dtype emits excessive
+    # vrot instructions between VREG and VMEM. View BF16 recurrent state as
+    # uint32 in VMEM (2 bfloat16 elements per uint32) and bitcast in VREG,
+    # which halves the number of view rows used.
+    if recurrent_state_dtype == jnp.bfloat16:
+        ssm_view_dtype = jnp.dtype(jnp.uint32)
+        assert ssm_rows_used % 2 == 0, ssm_rows_used
+        ssm_rows_used //= 2
+    else:
+        ssm_view_dtype = recurrent_state_dtype
+
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
         nrows=ssm_nrows,
-        view_dtype=recurrent_state_dtype,
+        view_dtype=ssm_view_dtype,
         lane_split=ssm_lane_split,
-        rows_used=ssm_elements // ssm_out_lanes,
+        rows_used=ssm_rows_used,
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)

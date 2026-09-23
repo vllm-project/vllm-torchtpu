@@ -16,49 +16,61 @@
 from typing import Optional
 
 import torch
-from compressed_tensors.quantization import (QuantizationArgs,
-                                             QuantizationStrategy,
-                                             QuantizationType)
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization import \
-    register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import \
-    QuantizeMethodBase
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig, CompressedTensorsLinearMethod,
-    CompressedTensorsScheme)
+    CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
+    CompressedTensorsScheme,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
-    find_matched_target, should_ignore_layer)
+    find_matched_target,
+    should_ignore_layer,
+)
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
-    VllmCompressedTensorsMoEMethod
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+    VllmCompressedTensorsMoEMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    VllmFp8Config, VllmFp8LinearMethodTPU)
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedConfig
-from vllm_torchtpu.layers.core.quant_methods import (COMPRESSED_TENSORS,
-                                                     get_tpu_quant_method)
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+)
+from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
+from vllm_torchtpu.layers.core.quant_methods import (
+    COMPRESSED_TENSORS,
+    get_tpu_quant_method,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 
 def _is_weight_fp8(weight_quant: QuantizationArgs | None) -> bool:
-    return (weight_quant is not None
-            and weight_quant.type == QuantizationType.FLOAT
-            and weight_quant.num_bits == 8)
+    return (
+        weight_quant is not None
+        and weight_quant.type == QuantizationType.FLOAT
+        and weight_quant.num_bits == 8
+    )
 
 
 def _is_int4_w4aN(weight_quant: QuantizationArgs | None) -> bool:
     if weight_quant is None:
         return False
-    is_int4_weight = (int(weight_quant.num_bits) == 4
-                      and weight_quant.type == QuantizationType.INT)
+    is_int4_weight = (
+        int(weight_quant.num_bits) == 4 and weight_quant.type == QuantizationType.INT
+    )
     is_group_or_channel_weight = weight_quant.strategy in [
-        QuantizationStrategy.GROUP, QuantizationStrategy.CHANNEL
+        QuantizationStrategy.GROUP,
+        QuantizationStrategy.CHANNEL,
     ]
     is_static_weight = not weight_quant.dynamic
 
@@ -74,17 +86,20 @@ def _build_fp8_config(
     This reuses VllmFp8Config/VllmFp8LinearMethodTPU/VllmFp8MoEMethodTPU's
     existing dequant/requant runtime path instead of duplicating it.
     """
-    weight_block_size = (weight_quant.block_structure if weight_quant.strategy
-                         == QuantizationStrategy.BLOCK else None)
-    activation_scheme = ("dynamic" if (input_quant is None
-                                       or input_quant.dynamic) else "static")
+    weight_block_size = (
+        weight_quant.block_structure
+        if weight_quant.strategy == QuantizationStrategy.BLOCK
+        else None
+    )
+    activation_scheme = (
+        "dynamic" if (input_quant is None or input_quant.dynamic) else "static"
+    )
     fp8_config = VllmFp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme=activation_scheme,
         weight_block_size=weight_block_size,
     )
-    fp8_config.is_channel_quant = (
-        weight_quant.strategy == QuantizationStrategy.CHANNEL)
+    fp8_config.is_channel_quant = weight_quant.strategy == QuantizationStrategy.CHANNEL
     return fp8_config
 
 
@@ -94,8 +109,7 @@ def _build_fp8_linear_method(
     input_quant: QuantizationArgs | None,
 ) -> VllmFp8LinearMethodTPU:
     fp8_config = _build_fp8_config(weight_quant, input_quant)
-    return VllmFp8LinearMethodTPU(fp8_config,
-                                  fp8_config.get_linear_config(layer))
+    return VllmFp8LinearMethodTPU(fp8_config, fp8_config.get_linear_config(layer))
 
 
 def _raise_not_implemented(scheme_class: str) -> None:
@@ -106,7 +120,6 @@ def _raise_not_implemented(scheme_class: str) -> None:
 
 @register_quantization_config(get_tpu_quant_method(COMPRESSED_TENSORS))
 class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
-
     @classmethod
     def get_name(cls) -> str:
         return COMPRESSED_TENSORS
@@ -121,9 +134,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         VllmFp8Config.set_configs(vllm_config)
 
     def get_scheme(
-            self,
-            layer: torch.nn.Module,
-            layer_name: str | None = None
+        self, layer: torch.nn.Module, layer_name: str | None = None
     ) -> Optional["CompressedTensorsScheme"]:
         """
         compressed-tensors supports non uniform in the following way:
@@ -153,9 +164,11 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 input_quant = scheme_dict.get("input_activations")
 
         if weight_quant is None:
-            logger.warning_once("Acceleration for non-quantized schemes is "
-                                "not supported by Compressed Tensors. "
-                                "Falling back to UnquantizedLinearMethod")
+            logger.warning_once(
+                "Acceleration for non-quantized schemes is "
+                "not supported by Compressed Tensors. "
+                "Falling back to UnquantizedLinearMethod"
+            )
             return None
 
         # TODO: Add support for the unsupported format
@@ -171,55 +184,54 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
             _raise_not_implemented("VllmCompressedTensorsW8A8Fp8")
 
         if input_quant is not None and self._is_dynamic_token_w8a8(
-                weight_quant, input_quant):
+            weight_quant, input_quant
+        ):
             _raise_not_implemented("VllmCompressedTensorsW8A8Int8")
 
         raise NotImplementedError(
-            "No compressed-tensors compatible scheme was found for layer "
-            f"{layer_name}.")
+            f"No compressed-tensors compatible scheme was found for layer {layer_name}."
+        )
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
-        if should_ignore_layer(prefix,
-                               ignore=self.ignore,
-                               fused_mapping=self.packed_modules_mapping):
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
             return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
         match layer:
             case LinearBase():
                 scheme_dict = self.get_scheme_dict(layer, prefix)
-                weight_quant = scheme_dict.get(
-                    "weights") if scheme_dict else None
-                input_quant = scheme_dict.get(
-                    "input_activations") if scheme_dict else None
+                weight_quant = scheme_dict.get("weights") if scheme_dict else None
+                input_quant = (
+                    scheme_dict.get("input_activations") if scheme_dict else None
+                )
 
                 if weight_quant is None:
-                    return VllmUnquantizedConfig.get_quant_method(
-                        self, layer, prefix)
+                    return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
                 # This is a bypass way of handling FP8 as a compressed tensors method for this is
                 # not implemented yet in vllm-torchtpu. Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
                 if _is_weight_fp8(weight_quant):
-                    return _build_fp8_linear_method(layer, weight_quant,
-                                                    input_quant)
+                    return _build_fp8_linear_method(layer, weight_quant, input_quant)
 
                 # get_scheme will raise NotImplementedError since custom CompressedTensorsScheme subclasses (like
                 # W4A8, W8A8, NVFP4) have not been ported to vllm-torchtpu yet (except for non-quantized layouts).
                 scheme = self.get_scheme(layer=layer, layer_name=prefix)
                 if scheme is None:
-                    return VllmUnquantizedConfig.get_quant_method(
-                        self, layer, prefix)
+                    return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
                 layer.scheme = scheme
                 return CompressedTensorsLinearMethod(self)
 
             case RoutedExperts():
                 layer.moe_config = self.get_moe_config(layer)
                 return VllmCompressedTensorsMoEMethod.get_moe_method(
-                    self, layer, layer_name=prefix)
+                    self, layer, layer_name=prefix
+                )
 
             case Attention():
                 # TODO: KV-cache quantization for compressed-tensors checkpoints

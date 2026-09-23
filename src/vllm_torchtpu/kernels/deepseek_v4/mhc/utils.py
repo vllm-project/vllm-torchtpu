@@ -109,19 +109,21 @@ def mhc_pre_gates(
     pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
     pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
 
-    post_logits = (mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] +
-                   hc_base[hc_mult:2 * hc_mult])
+    post_logits = (
+        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    )
     post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
 
-    comb_logits = (
-        mixes[:, 2 * hc_mult:].reshape(num_tokens, hc_mult, hc_mult) *
-        hc_scale[2] + hc_base[2 * hc_mult:].reshape(1, hc_mult, hc_mult))
+    comb_logits = mixes[:, 2 * hc_mult :].reshape(
+        num_tokens, hc_mult, hc_mult
+    ) * hc_scale[2] + hc_base[2 * hc_mult :].reshape(1, hc_mult, hc_mult)
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) +
-                           hc_sinkhorn_eps)
+    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-1, keepdims=True) +
-                               hc_sinkhorn_eps)
-        comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) +
-                               hc_sinkhorn_eps)
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps
+        )
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
+        )
     return pre_mix, post_mix, comb_mix

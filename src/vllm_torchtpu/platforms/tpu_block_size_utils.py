@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
-    QWEN_GDN_ARCHITECTURES, PooledGDNStateLayout,
-    derive_pooled_gdn_state_layout, pooled_gdn_state_dtypes,
-    pooled_gdn_state_itemsize, unified_kv_layout_enabled_for_architecture)
+    QWEN_GDN_ARCHITECTURES,
+    PooledGDNStateLayout,
+    derive_pooled_gdn_state_layout,
+    pooled_gdn_state_dtypes,
+    pooled_gdn_state_itemsize,
+    unified_kv_layout_enabled_for_architecture,
+)
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.logger import init_logger
 
@@ -31,7 +35,8 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     one the other hybrid families implement.
     """
     return unified_kv_layout_enabled_for_architecture(
-        vllm_config.model_config.architecture)
+        vllm_config.model_config.architecture
+    )
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
@@ -61,6 +66,7 @@ def _align_block_to_backend(block_size: int, supported) -> int:
     splits manager blocks into kernel blocks); a MultipleOf(b) entry accepts
     any multiple of b directly."""
     from vllm.v1.attention.backend import MultipleOf
+
     candidates = []
     for entry in supported:
         base = entry.base if isinstance(entry, MultipleOf) else int(entry)
@@ -83,8 +89,9 @@ def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:
     return dtype
 
 
-def _tpu_attention_slot_size_bytes(vllm_config: VllmConfig, backend_cls,
-                                   block_size: int) -> int:
+def _tpu_attention_slot_size_bytes(
+    vllm_config: VllmConfig, backend_cls, block_size: int
+) -> int:
     model_config = vllm_config.model_config
     cache_dtype = _resolve_tpu_cache_dtype(vllm_config)
     page_size = backend_cls.get_kv_cache_page_size_bytes(
@@ -98,8 +105,7 @@ def _tpu_attention_slot_size_bytes(vllm_config: VllmConfig, backend_cls,
     return page_size
 
 
-def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
-                                   backend_cls) -> int:
+def _tpu_attention_page_size_bytes(vllm_config: VllmConfig, backend_cls) -> int:
     return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
 
 
@@ -113,13 +119,15 @@ def _pool_row_tokens(vllm_config: VllmConfig, backend_cls) -> int:
     the page stays flat until p tokens and doubles by 2p.
     """
     p = 1
-    while (_tpu_attention_slot_size_bytes(vllm_config, backend_cls, 2 * p)
-           != 2 * _tpu_attention_slot_size_bytes(vllm_config, backend_cls, p)):
+    while _tpu_attention_slot_size_bytes(
+        vllm_config, backend_cls, 2 * p
+    ) != 2 * _tpu_attention_slot_size_bytes(vllm_config, backend_cls, p):
         p *= 2
         if p > 128:
             raise ValueError(
                 "TPU FA page is not token-linear: page size does not settle "
-                "into a linear regime within 256 tokens")
+                "into a linear regime within 256 tokens"
+            )
     return p
 
 
@@ -132,7 +140,8 @@ def _localize_gdn_state_shapes_for_pcp(
     if len(tp_local_shapes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state regions "
-            f"(conv, SSM), got shapes={tp_local_shapes}")
+            f"(conv, SSM), got shapes={tp_local_shapes}"
+        )
 
     model_config = vllm_config.model_config
     hf_config = model_config.hf_text_config
@@ -145,19 +154,21 @@ def _localize_gdn_state_shapes_for_pcp(
     tp_local_v_heads = tp_geometry.local_num_v_heads
     d_k = int(hf_config.linear_key_head_dim)
     d_v = int(hf_config.linear_value_head_dim)
-    geometry = derive_gdn_head_geometry(tp_local_kq_heads, tp_local_v_heads,
-                                        pcp_size)
+    geometry = derive_gdn_head_geometry(tp_local_kq_heads, tp_local_v_heads, pcp_size)
 
     conv_shape, recurrent_shape = tp_local_shapes
-    expected_conv_dim = (2 * tp_local_kq_heads * d_k + tp_local_v_heads * d_v)
+    expected_conv_dim = 2 * tp_local_kq_heads * d_k + tp_local_v_heads * d_v
     if not conv_shape or conv_shape[-1] != expected_conv_dim:
         raise ValueError(
             "GDN state conv width does not match its TP-local heads: "
-            f"shape={conv_shape}, expected_width={expected_conv_dim}.")
+            f"shape={conv_shape}, expected_width={expected_conv_dim}."
+        )
     if not recurrent_shape or recurrent_shape[0] != tp_local_v_heads:
-        raise ValueError("GDN recurrent state does not match its TP-local V "
-                         f"heads: shape={recurrent_shape}, "
-                         f"expected_heads={tp_local_v_heads}.")
+        raise ValueError(
+            "GDN recurrent state does not match its TP-local V "
+            f"heads: shape={recurrent_shape}, "
+            f"expected_heads={tp_local_v_heads}."
+        )
 
     return geometry.local_state_shapes(tp_local_shapes, d_k, d_v)
 
@@ -176,39 +187,40 @@ def _hybrid_mamba_state_layout(
         model_config.architecture,
         model_config=model_config,
     )
-    tp_local_shapes = tuple(
-        model_cls.get_mamba_state_shape_from_config(vllm_config))
+    tp_local_shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
     parallel_config = vllm_config.parallel_config
     if model_config.architecture in QWEN_GDN_ARCHITECTURES:
         # mamba_utils imports current_platform, which loads this module while
         # selecting TpuPlatform. Defer until platform registration is complete.
-        from vllm.model_executor.layers.mamba.mamba_utils import \
-            is_conv_state_dim_first
+        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
         # Model-level sizing precedes layer construction. Use the same
         # whole-head TP geometry as the TPU GDN layer, including replicas.
         hf_config = model_config.hf_text_config
         geometry = derive_gdn_head_geometry(
-            hf_config.linear_num_key_heads, hf_config.linear_num_value_heads,
-            parallel_config.tensor_parallel_size)
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            parallel_config.tensor_parallel_size,
+        )
         tp_local_shapes = geometry.local_state_shapes(
             tp_local_shapes,
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
-            conv_dim_axis=0 if is_conv_state_dim_first() else -1)
+            conv_dim_axis=0 if is_conv_state_dim_first() else -1,
+        )
     pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size > 1:
         if model_config.architecture in QWEN_GDN_ARCHITECTURES:
             shapes = _localize_gdn_state_shapes_for_pcp(
-                vllm_config, tp_local_shapes, pcp_size)
+                vllm_config, tp_local_shapes, pcp_size
+            )
         else:
             # Other hybrid families retain their existing effective-TP state
             # sharding until they define a distinct PCP group layout.
             orig_tp = parallel_config.tensor_parallel_size
             try:
                 parallel_config.tensor_parallel_size = orig_tp * pcp_size
-                shapes = tuple(
-                    model_cls.get_mamba_state_shape_from_config(vllm_config))
+                shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
             finally:
                 parallel_config.tensor_parallel_size = orig_tp
     else:
@@ -217,7 +229,8 @@ def _hybrid_mamba_state_layout(
     if len(shapes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state regions "
-            f"(conv, SSM), got shapes={shapes}")
+            f"(conv, SSM), got shapes={shapes}"
+        )
 
     # Byte widths come from the pool's own layout helper. Conv remains fixed
     # BF16, while SSM follows the model class's configured dtype. Every other
@@ -237,28 +250,28 @@ def _hybrid_mamba_state_layout(
     if len(dtypes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state dtypes "
-            f"(conv, SSM), got dtypes={dtypes}")
+            f"(conv, SSM), got dtypes={dtypes}"
+        )
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
     conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
     ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
     conv_bytes = math.prod(shapes[0]) * conv_itemsize
     ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
-    if (pcp_size > 1
-            and model_config.architecture not in QWEN_GDN_ARCHITECTURES):
+    if pcp_size > 1 and model_config.architecture not in QWEN_GDN_ARCHITECTURES:
         # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
         full_conv_bytes = math.prod(tp_local_shapes[0]) * conv_itemsize
         full_ssm_bytes = math.prod(tp_local_shapes[1]) * ssm_itemsize
-        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes +
-                                                   full_ssm_bytes):
+        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes + full_ssm_bytes):
             raise ValueError(
                 "PCP-local Mamba state size must be exactly 1/pcp_size of "
                 "the TP-local state: "
                 f"architecture={model_config.architecture!r}, "
                 f"pcp_size={pcp_size}, full_page_size_bytes="
                 f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
-                f"{conv_bytes + ssm_bytes}")
+                f"{conv_bytes + ssm_bytes}"
+            )
 
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
@@ -270,9 +283,14 @@ def _hybrid_mamba_state_layout(
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
     model_config = vllm_config.model_config
     dtype_size = torch.empty(
-        (), dtype=_resolve_tpu_cache_dtype(vllm_config)).element_size()
-    return (model_config.get_num_kv_heads(vllm_config.parallel_config) * 2 *
-            model_config.get_head_size() * dtype_size)
+        (), dtype=_resolve_tpu_cache_dtype(vllm_config)
+    ).element_size()
+    return (
+        model_config.get_num_kv_heads(vllm_config.parallel_config)
+        * 2
+        * model_config.get_head_size()
+        * dtype_size
+    )
 
 
 def _derive_tpu_block_slot_config(
@@ -289,27 +307,34 @@ def _derive_tpu_block_slot_config(
     # packing — and stay a multiple of it.
     fa_pool_row_tokens = _pool_row_tokens(vllm_config, backend_cls)
     fa_physical_bytes_per_pool_row = _tpu_attention_page_size_bytes(
-        vllm_config, backend_cls)
-    fa_raw_payload_bytes_per_token = (
-        _tpu_attention_raw_payload_bytes_per_token(vllm_config))
+        vllm_config, backend_cls
+    )
+    fa_raw_payload_bytes_per_token = _tpu_attention_raw_payload_bytes_per_token(
+        vllm_config
+    )
     fa_layout_padding_bytes_per_pool_row = (
-        fa_physical_bytes_per_pool_row -
-        fa_pool_row_tokens * fa_raw_payload_bytes_per_token)
+        fa_physical_bytes_per_pool_row
+        - fa_pool_row_tokens * fa_raw_payload_bytes_per_token
+    )
 
-    mamba_layout = _hybrid_mamba_state_layout(vllm_config,
-                                              fa_physical_bytes_per_pool_row)
-    mamba_raw_state_bytes = (None if mamba_layout is None else
-                             mamba_layout.conv_bytes + mamba_layout.ssm_bytes)
-    mamba_required_state_bytes = (None if mamba_layout is None else
-                                  mamba_layout.required_bytes)
+    mamba_layout = _hybrid_mamba_state_layout(
+        vllm_config, fa_physical_bytes_per_pool_row
+    )
+    mamba_raw_state_bytes = (
+        None
+        if mamba_layout is None
+        else mamba_layout.conv_bytes + mamba_layout.ssm_bytes
+    )
+    mamba_required_state_bytes = (
+        None if mamba_layout is None else mamba_layout.required_bytes
+    )
     mamba_fit_block_size: int | None = None
     user_block_size_floor: int | None = None
     backend_min_page_size = backend_cls.get_min_page_size(vllm_config)
     final_block_size = input_block_size
     block_size_source = "input_block_size"
     if mamba_layout is not None:
-        mamba_fit_block_size = (mamba_layout.required_tokens *
-                                fa_pool_row_tokens)
+        mamba_fit_block_size = mamba_layout.required_tokens * fa_pool_row_tokens
         if vllm_config.cache_config.user_specified_block_size:
             user_block_size_floor = input_block_size
         block_size_floor = max(
@@ -318,10 +343,11 @@ def _derive_tpu_block_slot_config(
             backend_min_page_size,
         )
         final_block_size = _align_block_to_backend(block_size_floor, supported)
-        final_block_size = _round_up_to_multiple(final_block_size,
-                                                 fa_pool_row_tokens)
-        if (user_block_size_floor is not None
-                and block_size_floor == user_block_size_floor):
+        final_block_size = _round_up_to_multiple(final_block_size, fa_pool_row_tokens)
+        if (
+            user_block_size_floor is not None
+            and block_size_floor == user_block_size_floor
+        ):
             block_size_source = "user_block_size_floor"
         elif block_size_floor == backend_min_page_size:
             block_size_source = "backend_min_page_size"
@@ -329,7 +355,8 @@ def _derive_tpu_block_slot_config(
             block_size_source = "mamba_state_fit"
 
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
-        vllm_config, backend_cls, final_block_size)
+        vllm_config, backend_cls, final_block_size
+    )
     final_block_slot_bytes = fa_physical_slot_bytes
     assert final_block_slot_bytes % _SLOT_ALIGNMENT_BYTES == 0, (
         "TPU cache slot must preserve the existing byte-alignment contract",
@@ -337,37 +364,38 @@ def _derive_tpu_block_slot_config(
         _SLOT_ALIGNMENT_BYTES,
     )
     if mamba_layout is not None:
-        expected_fa_slot_bytes = ((final_block_size // fa_pool_row_tokens) *
-                                  fa_physical_bytes_per_pool_row)
+        expected_fa_slot_bytes = (
+            final_block_size // fa_pool_row_tokens
+        ) * fa_physical_bytes_per_pool_row
         if fa_physical_slot_bytes != expected_fa_slot_bytes:
-            raise ValueError("TPU unified hybrid FA page is not token-linear: "
-                             f"block_size={final_block_size}, "
-                             f"pool_row_tokens={fa_pool_row_tokens}, "
-                             f"fa_physical_bytes_per_pool_row="
-                             f"{fa_physical_bytes_per_pool_row}, "
-                             f"expected_page_bytes={expected_fa_slot_bytes}, "
-                             f"actual_page_bytes={fa_physical_slot_bytes}")
+            raise ValueError(
+                "TPU unified hybrid FA page is not token-linear: "
+                f"block_size={final_block_size}, "
+                f"pool_row_tokens={fa_pool_row_tokens}, "
+                f"fa_physical_bytes_per_pool_row="
+                f"{fa_physical_bytes_per_pool_row}, "
+                f"expected_page_bytes={expected_fa_slot_bytes}, "
+                f"actual_page_bytes={fa_physical_slot_bytes}"
+            )
         if fa_physical_slot_bytes < mamba_layout.required_bytes:
             raise ValueError(
                 "TPU unified hybrid FA page cannot contain pooled GDN state: "
                 f"fa_page_bytes={fa_physical_slot_bytes}, "
                 f"mamba_required_state_bytes="
-                f"{mamba_layout.required_bytes}")
+                f"{mamba_layout.required_bytes}"
+            )
 
-    fa_raw_payload_slot_bytes = (final_block_size *
-                                 fa_raw_payload_bytes_per_token)
-    fa_layout_padding_slot_bytes = (final_block_slot_bytes -
-                                    fa_raw_payload_slot_bytes)
+    fa_raw_payload_slot_bytes = final_block_size * fa_raw_payload_bytes_per_token
+    fa_layout_padding_slot_bytes = final_block_slot_bytes - fa_raw_payload_slot_bytes
     mamba_slot_padding_bytes: int | None = None
     mamba_layout_padding_bytes: int | None = None
     mamba_slot_tail_padding_bytes: int | None = None
     if mamba_layout is not None:
-        mamba_slot_padding_bytes = (final_block_slot_bytes -
-                                    mamba_raw_state_bytes)
-        mamba_layout_padding_bytes = (mamba_layout.required_bytes -
-                                      mamba_raw_state_bytes)
-        mamba_slot_tail_padding_bytes = (final_block_slot_bytes -
-                                         mamba_layout.required_bytes)
+        mamba_slot_padding_bytes = final_block_slot_bytes - mamba_raw_state_bytes
+        mamba_layout_padding_bytes = mamba_layout.required_bytes - mamba_raw_state_bytes
+        mamba_slot_tail_padding_bytes = (
+            final_block_slot_bytes - mamba_layout.required_bytes
+        )
 
     return {
         "backend": backend_cls.get_name(),
@@ -381,8 +409,7 @@ def _derive_tpu_block_slot_config(
         "fa_raw_payload_bytes_per_token": fa_raw_payload_bytes_per_token,
         "fa_pool_row_tokens": fa_pool_row_tokens,
         "fa_physical_bytes_per_pool_row": fa_physical_bytes_per_pool_row,
-        "fa_layout_padding_bytes_per_pool_row":
-        fa_layout_padding_bytes_per_pool_row,
+        "fa_layout_padding_bytes_per_pool_row": fa_layout_padding_bytes_per_pool_row,
         "mamba_fit_block_size": mamba_fit_block_size,
         "final_block_size": final_block_size,
         "fa_raw_payload_slot_bytes": fa_raw_payload_slot_bytes,
@@ -443,8 +470,7 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
     )
 
 
-def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig,
-                                          backend_cls) -> None:
+def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig, backend_cls) -> None:
     cache_config = vllm_config.cache_config
     input_block_size = cache_config.block_size
     if not input_block_size:
@@ -465,7 +491,8 @@ def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig,
             f"{input_block_size} -> {final_block_size}, "
             f"min_page_size={min_page_size}, "
             f"supported_kernel_block_sizes="
-            f"{derivation['backend_supported_kernel_block_sizes']}.")
+            f"{derivation['backend_supported_kernel_block_sizes']}."
+        )
 
     if final_block_size != input_block_size:
         logger.info(
@@ -479,19 +506,21 @@ def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig,
         )
         cache_config.block_size = final_block_size
 
-    if (vllm_config.model_config.is_hybrid
-            and derivation["mamba_raw_state_bytes"] is not None):
+    if (
+        vllm_config.model_config.is_hybrid
+        and derivation["mamba_raw_state_bytes"] is not None
+    ):
         logger.info(
             "Aligning hybrid Mamba KV cache to TPU block slot: "
             "mamba_block_size %s -> %s, mamba_page_size_padded %s -> %s.",
             cache_config.mamba_block_size,
-            final_block_size if cache_config.mamba_cache_mode == "align" else
-            cache_config.mamba_block_size,
+            final_block_size
+            if cache_config.mamba_cache_mode == "align"
+            else cache_config.mamba_block_size,
             cache_config.mamba_page_size_padded,
             derivation["final_block_slot_bytes"],
         )
         if cache_config.mamba_cache_mode == "align":
             # State follows the block table; mamba blocks are pool blocks.
             cache_config.mamba_block_size = final_block_size
-        cache_config.mamba_page_size_padded = int(
-            derivation["final_block_slot_bytes"])
+        cache_config.mamba_page_size_padded = int(derivation["final_block_slot_bytes"])

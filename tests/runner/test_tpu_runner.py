@@ -400,6 +400,26 @@ class TestStartStopPhasedProfiling:
 
         assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
 
+    def test_profiler_kwargs_overrides_options(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(
+                runner,
+                "decode",
+                profiler_kwargs={
+                    "host_tracer_level": 3,
+                    "e2e_enable_fw_throttle_event": True,
+                },
+            )
+
+        assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
+        assert mock_profiler_cls.call_args.kwargs["standard_opts"][
+            "host_tracer_level"] == 3
+        assert mock_profiler_cls.call_args.kwargs["advanced_opts"][
+            "e2e_enable_fw_throttle_event"] is True
+
     def test_start_twice_is_a_noop(self, monkeypatch):
         """Already armed; a second /start_profile must not replace it and
         lose the phases it has already marked as seen."""

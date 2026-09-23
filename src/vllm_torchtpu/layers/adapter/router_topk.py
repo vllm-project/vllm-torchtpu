@@ -27,10 +27,10 @@ from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 def _fake_router_topk(scores: torch.Tensor, topk: int):
     rows = scores.shape[0]
-    return (torch.empty((rows, topk),
-                        dtype=torch.float32,
-                        device=scores.device),
-            torch.empty((rows, topk), dtype=torch.int32, device=scores.device))
+    return (
+        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
+        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
+    )
 
 
 # Registered at import, not lazily: this op is called from inside the MoE
@@ -39,12 +39,12 @@ _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
 
 
-def rowmax_select(scores: torch.Tensor,
-                  topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores."""
     if scores.device.type != "tpu":
         return rowmax_topk(scores, topk)
     if scores.dim() != 2:
         raise ValueError(
-            f"router top-k kernel expects [rows, experts], got {scores.shape}")
+            f"router top-k kernel expects [rows, experts], got {scores.shape}"
+        )
     return _op(scores.float(), topk)

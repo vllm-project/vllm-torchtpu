@@ -101,6 +101,58 @@ curl -X POST http://localhost:8000/stop_profile
 `vllm bench serve --profile` fires those two endpoints around its main run for
 you.
 
+### Dynamic profiling options (`profiler_kwargs` and `profile_prefix`)
+
+Both the standard server-side profiler and the [phased profiler](#phased-profiling)
+resolve per-session options through
+[`src/vllm_torchtpu/tracing/options.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/tracing/options.py).
+You can override standard tracer levels (`host_tracer_level`,
+`device_tracer_level`, `python_tracer_level`) and pass advanced TPU
+`experimental_options` (such as `tpu_trace_mode`,
+`tpu_num_sparse_cores_to_trace`, `tpu_num_sparse_core_tiles_to_trace`, or
+firmware event flags like `e2e_enable_fw_throttle_event`,
+`e2e_enable_fw_power_level_event`, and `e2e_enable_fw_thermal_event`) dynamically
+at `/start_profile` time without restarting `vllm serve`:
+
+* **Online serving (`POST /start_profile`)** — pass a JSON payload (or query
+  parameters). `profile_prefix` names the output subdirectory under
+  `torch_profiler_dir`, and all other keys are forwarded via `profiler_kwargs`:
+
+```bash
+curl -X POST http://localhost:8000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_prefix": "fw_events_run",
+    "host_tracer_level": 3,
+    "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+    "e2e_enable_fw_throttle_event": true,
+    "e2e_enable_fw_power_level_event": true,
+    "e2e_enable_fw_thermal_event": true
+  }'
+```
+
+* **Offline Python API (`LLM.start_profile`)** — pass `profile_prefix` and
+  `profiler_kwargs` directly:
+
+```python
+llm.start_profile(
+    profile_prefix="fw_events_run",
+    profiler_kwargs={
+        "host_tracer_level": 3,
+        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "e2e_enable_fw_throttle_event": True,
+        "e2e_enable_fw_power_level_event": True,
+        "e2e_enable_fw_thermal_event": True,
+    },
+)
+```
+
+* **Legacy string format (`profile_prefix`)** — semicolon-delimited `key:value`
+  pairs in `profile_prefix` (e.g.,
+  `"host_tracer_level:3;e2e_enable_fw_throttle_event:true"`) remain supported
+  and are merged with any options supplied in `profiler_kwargs` (with
+  `profiler_kwargs` taking precedence on key collisions).
+
 Those are two separate steps, and the rest of this page keeps them distinct:
 
 * **Configured** — the server was started with a profiler kind and a trace
@@ -129,13 +181,18 @@ and `--profiler-config.max_iterations` limits are honored only by the
 
 [`scripts/vllm/benchmarking/run_benchmarks.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/run_benchmarks.sh)
 wires all of this up. Setting `CAPTURE_PROFILE=1` adds the profiler flags to the
-server and `--profile` to the bench client, writing traces to
-`<results-dir>/profile`:
+server and, after each cell's measured run, runs that cell once more with
+`--profile`, writing traces to `<results-dir>/profile`:
 
 ```bash
 CAPTURE_PROFILE=1 ./scripts/vllm/benchmarking/run_benchmarks.sh \
   --config qwen3.5-35b-fp8-tp4-ep
 ```
+
+Neither the warmup passes nor the measured run are profiled, so the numbers the
+harness reports stay comparable to a baseline. The extra run's
+`<cell>.profile.json` is ignored by the regression check and the results upload,
+and `PROFILE_NUM_PROMPTS` sizes it — one full concurrency wave by default.
 
 `CAPTURE_PROFILE=1` is *inferred* whenever `EXTRA_SERVE_ARGS` contains
 `--profiler-config.torch_profiler_dir`, which then also chooses the destination.
@@ -144,8 +201,7 @@ client would not send `--profile`, so nothing would call `/start_profile` and
 the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
 out.
 
-Warmup passes are never profiled. Prefer a single ISL/OSL case so the trace maps
-to one workload shape.
+Prefer a single ISL/OSL cell so the trace maps to one workload shape.
 
 ## Phased profiling
 
@@ -175,8 +231,8 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
 trace directory in `EXTRA_SERVE_ARGS`
 ([as above](#through-the-benchmark-harness)) and passes `--profile` to
-`vllm bench serve`, which POSTs to the two endpoints around the measured run.
-Warmup passes are excluded.
+`vllm bench serve` for the extra profile run, which POSTs to the two endpoints
+around it.
 
 ### Option 2: against your own `vllm serve`
 
@@ -252,7 +308,7 @@ Token accounting, from
 
 Each phase is captured **once per profiling session** — the window between
 `/start_profile` and `/stop_profile` — for `max_iterations` steps, and then not
-again within that session. A new session (for example, the next benchmark case
+again within that session. A new session (for example, the next benchmark cell
 run with `--profile`) starts with fresh phase tracking and captures each phase
 again. A phase that the workload never produces simply yields no subdirectory.
 

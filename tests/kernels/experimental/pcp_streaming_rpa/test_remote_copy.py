@@ -27,8 +27,9 @@ BLOCK = 16
 LOCAL_ROWS = 1
 
 
-def _copy_remote_hbm_to_vmem_kernel(x_ref, o_ref, send_sem, recv_sem,
-                                    local_sem, vmem_ref):
+def _copy_remote_hbm_to_vmem_kernel(
+    x_ref, o_ref, send_sem, recv_sem, local_sem, vmem_ref
+):
     my_id = lax.axis_index(AXIS)
     num_devices = lax.psum(1, AXIS)
     dst_id = lax.rem(my_id + 1, num_devices)
@@ -37,7 +38,7 @@ def _copy_remote_hbm_to_vmem_kernel(x_ref, o_ref, send_sem, recv_sem,
         dst_ref=vmem_ref.at[:, :],
         send_sem=send_sem,
         recv_sem=recv_sem,
-        device_id=(dst_id, ),
+        device_id=(dst_id,),
         device_id_type=pl.DeviceIdType.MESH,
     )
     remote_op.start()
@@ -66,16 +67,17 @@ def _pallas_remote_copy_call(x):
                 pltpu.SemaphoreType.DMA,
                 pltpu.VMEM((LOCAL_ROWS, BLOCK), x.dtype),
             ),
-            grid=(1, ),
+            grid=(1,),
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=8 * 1024 *
-                                             1024, ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=8 * 1024 * 1024,
+        ),
         name="pcp_streaming_remote_hbm_to_vmem_smoke",
     )(x)
 
 
 def _run_shard_map(x):
-    mesh = jax.sharding.Mesh(jax.local_devices(), (AXIS, ))
+    mesh = jax.sharding.Mesh(jax.local_devices(), (AXIS,))
     fn = jax.jit(
         jax.shard_map(
             _pallas_remote_copy_call,
@@ -83,7 +85,8 @@ def _run_shard_map(x):
             in_specs=P(AXIS, None),
             out_specs=P(AXIS, None),
             check_vma=False,
-        ))
+        )
+    )
     return fn(x)
 
 
@@ -94,13 +97,12 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_make_async_remote_copy_can_push_hbm_to_destination_vmem(
-        release_jax_backend):
+def test_make_async_remote_copy_can_push_hbm_to_destination_vmem(release_jax_backend):
     devices = _require_tpu_devices(
-        2, "PCP remote-copy smoke test requires at least two TPU devices.")
+        2, "PCP remote-copy smoke test requires at least two TPU devices."
+    )
     num_devices = len(devices)
-    x = jnp.arange(num_devices * BLOCK,
-                   dtype=jnp.int32).reshape(num_devices, BLOCK)
+    x = jnp.arange(num_devices * BLOCK, dtype=jnp.int32).reshape(num_devices, BLOCK)
 
     out = _run_shard_map(x)
     out.block_until_ready()

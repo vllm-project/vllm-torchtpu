@@ -23,17 +23,19 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import compressor as dsv4_compressor
-from vllm.models.deepseek_v4.compressor import (CompressorStateCache,
-                                                DeepseekCompressor)
+from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
-from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import \
-    config as compressor_config
-from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import \
-    compressor_forward
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
+    compressor_forward,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
@@ -282,9 +284,11 @@ class VllmCompressorStateCache(CompressorStateCache):
             if kv_cache_block_size // self.compress_ratio <= 0:
                 raise ValueError(
                     f"a page of {kv_cache_block_size} tokens holds no "
-                    f"compressed row at compress_ratio {self.compress_ratio}")
-            mode = compressor_config.select_mode(self.head_dim,
-                                                 self.compress_ratio == 4)
+                    f"compressed row at compress_ratio {self.compress_ratio}"
+                )
+            mode = compressor_config.select_mode(
+                self.head_dim, self.compress_ratio == 4
+            )
             block_size = compressor_config.state_block_size(
                 mode,
                 kv_cache_block_size,
@@ -294,20 +298,21 @@ class VllmCompressorStateCache(CompressorStateCache):
             if block_size <= 0:
                 raise ValueError(
                     f"{mode.value} state rows do not fit in a page derived "
-                    f"from a {kv_cache_block_size}-token KV block")
+                    f"from a {kv_cache_block_size}-token KV block"
+                )
         except (ValueError, AssertionError, ZeroDivisionError) as exc:
             raise ValueError(
                 f"DeepSeek-V4 compressor state cache {self.prefix!r} cannot "
                 f"be paged for cache block size {kv_cache_block_size} "
                 f"(head_dim {self.head_dim}, compress_ratio "
-                f"{self.compress_ratio}): {exc}") from exc
+                f"{self.compress_ratio}): {exc}"
+            ) from exc
         return block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # `_build_compressor_op` bakes `block_size` in as the kernel's
         # `state_block_size`, so spec and kernel must not disagree.
-        self.block_size = self._derive_block_size(
-            vllm_config.cache_config.block_size)
+        self.block_size = self._derive_block_size(vllm_config.cache_config.block_size)
         # uint8 is deliberate: the kernel writes raw f32 state bytes, and
         # declaring the real dtype would make the byte budget disagree with
         # the packed layout the host array actually uses. The physical overlay
@@ -324,7 +329,7 @@ class VllmCompressorStateCache(CompressorStateCache):
 
 
 class VllmDeepseekCompressor(DeepseekCompressor):
-    """TPU compressor: projects, saves state, compresses and stores. """
+    """TPU compressor: projects, saves state, compresses and stores."""
 
     def __init__(self, *args, **kwargs) -> None:
         orig_state_cache = dsv4_compressor.CompressorStateCache
@@ -341,9 +346,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             raise NotImplementedError(
                 "DeepSeek-V4 on TPU does not support "
                 "`attention_config.use_fp4_indexer_cache`; the compressor "
-                "kernel only emits the FP8/UE8M0 cache layout.")
-        self.num_layers = get_current_vllm_config(
-        ).model_config.hf_config.num_hidden_layers
+                "kernel only emits the FP8/UE8M0 cache layout."
+            )
+        self.num_layers = (
+            get_current_vllm_config().model_config.hf_config.num_hidden_layers
+        )
 
     def transpose_wkv_wgate(self) -> None:
         """Stores ``fused_wkv_wgate.weight`` transposed, once, at load time.
@@ -357,8 +364,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         if self._wkv_wgate_transposed:
             return
         weight = self.fused_wkv_wgate.weight.data.t().contiguous()
-        self.fused_wkv_wgate.weight = torch.nn.Parameter(weight,
-                                                         requires_grad=False)
+        self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
@@ -408,9 +414,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             quant_block=self._quant_block,
         )
 
-        op_name = (f"pallas::deepseek_v4_compressor_{variant}"
-                   f"_{self.head_dim}_{self.compress_ratio}"
-                   f"_{self.state_cache.block_size}")
+        op_name = (
+            f"pallas::deepseek_v4_compressor_{variant}"
+            f"_{self.head_dim}_{self.compress_ratio}"
+            f"_{self.state_cache.block_size}"
+        )
 
         global _compressor_op_cache
         if op_name in _compressor_op_cache:
@@ -431,10 +439,10 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             P(),  # request_distribution
             P(),  # cache
         )
-        donate_argnums = (len(input_partition_specs) - 1, )  # cache
+        donate_argnums = (len(input_partition_specs) - 1,)  # cache
         if variant != "indexer":
-            input_partition_specs += (P(), )  # rope_cache / state_cache
-            donate_argnums += (len(input_partition_specs) - 1, )
+            input_partition_specs += (P(),)  # rope_cache / state_cache
+            donate_argnums += (len(input_partition_specs) - 1,)
 
         compressor_jax_op = pallas.jax_op(
             op_name,
@@ -446,18 +454,40 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         if variant == "indexer":
 
-            def _fake_compressor(hidden_states, wkv_wgate, ape, norm_weight,
-                                 cos_sin_cache, positions, state_block_tables,
-                                 query_start_loc, k_block_tables,
-                                 request_distribution, cache, *args, **kwargs):
+            def _fake_compressor(
+                hidden_states,
+                wkv_wgate,
+                ape,
+                norm_weight,
+                cos_sin_cache,
+                positions,
+                state_block_tables,
+                query_start_loc,
+                k_block_tables,
+                request_distribution,
+                cache,
+                *args,
+                **kwargs,
+            ):
                 return torch.empty_like(cache)
         else:
 
-            def _fake_compressor(hidden_states, wkv_wgate, ape, norm_weight,
-                                 cos_sin_cache, positions, state_block_tables,
-                                 query_start_loc, k_block_tables,
-                                 request_distribution, cache, second_cache,
-                                 *args, **kwargs):
+            def _fake_compressor(
+                hidden_states,
+                wkv_wgate,
+                ape,
+                norm_weight,
+                cos_sin_cache,
+                positions,
+                state_block_tables,
+                query_start_loc,
+                k_block_tables,
+                request_distribution,
+                cache,
+                second_cache,
+                *args,
+                **kwargs,
+            ):
                 return torch.empty_like(cache), torch.empty_like(second_cache)
 
         compressor_jax_op.register_fake(_fake_compressor)
@@ -466,8 +496,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return compressor_jax_op
 
     @staticmethod
-    def _as_kernel_cache_view(
-            cache: torch.Tensor | None) -> torch.Tensor | None:
+    def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
         """The kernels require uint8; vLLM allocates as `kv_cache_dtype`.
 
         Every candidate dtype is one byte wide, so `.view` is a lossless
@@ -495,17 +524,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # would scatter rows into that layer's pages.
         state_prefix = self.state_cache.prefix
         _k_cache_obj = getattr(self, "k_cache", None)
-        k_cache_prefix = getattr(_k_cache_obj, "prefix",
-                                 getattr(_k_cache_obj, "custom_prefix",
-                                         None)) or getattr(
-                                             self, "k_cache_prefix", None)
-        for _name, _key in (("state_cache", state_prefix), ("k_cache",
-                                                            k_cache_prefix)):
+        k_cache_prefix = getattr(
+            _k_cache_obj, "prefix", getattr(_k_cache_obj, "custom_prefix", None)
+        ) or getattr(self, "k_cache_prefix", None)
+        for _name, _key in (("state_cache", state_prefix), ("k_cache", k_cache_prefix)):
             if _key not in attn_ctx:
                 raise KeyError(
                     f"DeepSeek-V4 compressor {_name} prefix {_key!r} has no "
                     "attention metadata; using another layer's would corrupt "
-                    f"its pages. Known: {sorted(attn_ctx)}")
+                    f"its pages. Known: {sorted(attn_ctx)}"
+                )
         state_metadata = attn_ctx[state_prefix]
         k_cache_metadata = attn_ctx[k_cache_prefix]
         if state_metadata is None or k_cache_metadata is None:
@@ -531,10 +559,12 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                     "companion RoPE KV array; the kernel writes the RoPE "
                     "channels there, and without it they would be dropped. "
                     "Expected the runner to have bound a (nope, rope) pair "
-                    f"onto layer {k_cache_prefix!r}.")
+                    f"onto layer {k_cache_prefix!r}."
+                )
         if self._separate_state:
             state_cache = self._as_kernel_cache_view(
-                getattr(self.state_cache, "kv_cache", None))
+                getattr(self.state_cache, "kv_cache", None)
+            )
             if state_cache is None:
                 # `cache` is already real by here, so this is not the
                 # profiling pass: skipping the compressor would silently
@@ -544,13 +574,15 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                     "compressed-KV array but no state array; the kernel needs "
                     "a separate buffer for the f32 state, an HCA page being "
                     "far too small to host it. Expected the runner to have "
-                    "overlaid this state cache onto a CSA NoPE array.")
+                    "overlaid this state cache onto a CSA NoPE array."
+                )
 
         assert self._wkv_wgate_transposed, (
             "fused_wkv_wgate must be transposed at load time; the model's "
             "load_weights is expected to call transpose_wkv_wgate(). It has "
             "quant_config=None, so it never reaches a TPU linear method and "
-            "the canonical (k, n) flip does not apply to it.")
+            "the canonical (k, n) flip does not apply to it."
+        )
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
@@ -565,13 +597,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             cache,
         )
         if rope_cache is not None:
-            new_cache, new_rope_cache = self.compressor_op(
-                *operands, rope_cache)
+            new_cache, new_rope_cache = self.compressor_op(*operands, rope_cache)
             cache.copy_(new_cache)
             rope_cache.copy_(new_rope_cache)
         elif state_cache is not None:
-            new_cache, new_state_cache = self.compressor_op(
-                *operands, state_cache)
+            new_cache, new_state_cache = self.compressor_op(*operands, state_cache)
             cache.copy_(new_cache)
             state_cache.copy_(new_state_cache)
         else:

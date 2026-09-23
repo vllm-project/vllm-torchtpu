@@ -6,10 +6,10 @@ import re
 # Metric name prefix
 RAIDEN_METRIC_PREFIX = "tpu_raiden_"
 
-_LABELED_METRIC_KEY_REGEX = re.compile(
-    r"([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?")
+_LABELED_METRIC_KEY_REGEX = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?")
 _LABEL_PAIR_REGEX = re.compile(
-    r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+    r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"'
+)
 _UNESCAPE_PATTERN = re.compile(r'\\([\\n"tr])')
 
 
@@ -42,5 +42,8 @@ def parse_raiden_metric_key(raw_key: str) -> tuple[str, dict[str, str]]:
 
 def normalize_raiden_metric_name(name: str) -> str:
     """Ensures a Raiden metric name starts with RAIDEN_METRIC_PREFIX."""
-    return (name if name.startswith(RAIDEN_METRIC_PREFIX) else
-            f"{RAIDEN_METRIC_PREFIX}{name}")
+    return (
+        name
+        if name.startswith(RAIDEN_METRIC_PREFIX)
+        else f"{RAIDEN_METRIC_PREFIX}{name}"
+    )

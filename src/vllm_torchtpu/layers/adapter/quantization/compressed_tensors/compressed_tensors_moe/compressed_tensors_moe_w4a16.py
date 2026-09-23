@@ -21,23 +21,33 @@ import ctypes
 import jax.numpy as jnp
 import torch
 from compressed_tensors.quantization import QuantizationArgs
-from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
-                                                  FusedMoEMethodBase,
-                                                  RoutedExperts)
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import \
-    CompressedTensorsWNA16MoEMethod
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
+    CompressedTensorsWNA16MoEMethod,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.fused_moe import (fused_moe_gmm,
-                                                    get_fused_moe_activation,
-                                                    prebuild_fused_moe_kernel)
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    fused_moe_gmm,
+    get_fused_moe_activation,
+    prebuild_fused_moe_kernel,
+)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
+    enable_pipelined_collective_and_compute,
+    pipelined_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
-    get_cpu_weight_loader_hook, release_memory_to_os,
-    requantize_int4_to_fp4_weights, requantize_int4_weights)
+    get_cpu_weight_loader_hook,
+    release_memory_to_os,
+    requantize_int4_to_fp4_weights,
+    requantize_int4_weights,
+)
 
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
@@ -57,7 +67,6 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         moe: FusedMoEConfig,
         layer_name: str | None = None,
     ):
-
         # Skip CompressedTensorsWNA16MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_quant = weight_quant
@@ -89,8 +98,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         num_bits = int(scheme.num_bits)
         quant_type = getattr(scheme, "type", None)
-        if quant_type is None or "int" not in str(
-                quant_type).lower() or num_bits != 4:
+        if quant_type is None or "int" not in str(quant_type).lower() or num_bits != 4:
             raise NotImplementedError(
                 "TPU W4A16 MoE supports integer INT4 weights only; "
                 f"received quantization type {quant_type!r}. num_bits {num_bits}"
@@ -98,20 +106,21 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         if not bool(getattr(scheme, "symmetric", False)):
             raise NotImplementedError(
-                "TPU W4A16 MoE currently supports symmetric INT4 only.")
+                "TPU W4A16 MoE currently supports symmetric INT4 only."
+            )
 
     def _validate_int32_weight_carriers(self, layer: torch.nn.Module) -> None:
         for param_name in self._PACKED_WEIGHT_NAMES:
             if not hasattr(layer, param_name):
-                raise ValueError(
-                    f"Missing required W4A16 parameter: {param_name}.")
+                raise ValueError(f"Missing required W4A16 parameter: {param_name}.")
 
             param = getattr(layer, param_name)
 
             if param.dtype != torch.int32:
                 raise NotImplementedError(
                     "TPU W4A16 MoE requires INT4 weights packed in INT32; "
-                    f"{param_name} has dtype {param.dtype}.")
+                    f"{param_name} has dtype {param.dtype}."
+                )
 
     def create_weights(
         self,
@@ -131,9 +140,11 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             num_groups_w2 = num_groups_w13 = 1
         else:
             if self.group_size is None or self.group_size <= 0:
-                raise ValueError(
-                    f"Invalid group_size for W4A16 MoE: {self.group_size}")
-            if hidden_size % self.group_size != 0 or intermediate_size_per_partition % self.group_size != 0:
+                raise ValueError(f"Invalid group_size for W4A16 MoE: {self.group_size}")
+            if (
+                hidden_size % self.group_size != 0
+                or intermediate_size_per_partition % self.group_size != 0
+            ):
                 raise ValueError(
                     f"hidden_size ({hidden_size}) and intermediate_size_per_partition "
                     f"({intermediate_size_per_partition}) must be divisible by group_size ({self.group_size})"
@@ -148,21 +159,29 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         # Inject our optimized TPU CPU weight loader hook
         extra_weight_attrs["weight_loader"] = get_cpu_weight_loader_hook(
-            layer, orig_loader, self.moe.tp_size, self.moe.tp_rank)
+            layer, orig_loader, self.moe.tp_size, self.moe.tp_rank
+        )
 
-        extra_weight_attrs.update({
-            "is_transposed": self.is_transposed,
-            "quant_method": self.strategy
-        })
+        extra_weight_attrs.update(
+            {"is_transposed": self.is_transposed, "quant_method": self.strategy}
+        )
 
         w13_shards = 2 if getattr(self.moe, "is_act_and_mul", True) else 1
-        w13_shape = (num_experts, hidden_size // self.packed_factor,
-                     w13_shards * intermediate_size_per_partition)
-        w2_shape = (num_experts,
-                    intermediate_size_per_partition // self.packed_factor,
-                    hidden_size)
-        w13_scale_shape = (num_experts, num_groups_w13,
-                           w13_shards * intermediate_size_per_partition)
+        w13_shape = (
+            num_experts,
+            hidden_size // self.packed_factor,
+            w13_shards * intermediate_size_per_partition,
+        )
+        w2_shape = (
+            num_experts,
+            intermediate_size_per_partition // self.packed_factor,
+            hidden_size,
+        )
+        w13_scale_shape = (
+            num_experts,
+            num_groups_w13,
+            w13_shards * intermediate_size_per_partition,
+        )
         w2_scale_shape = (num_experts, num_groups_w2, hidden_size)
 
         for name, shape, dtype in [
@@ -171,19 +190,20 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             ("w13_weight_scale", w13_scale_shape, params_dtype),
             ("w2_weight_scale", w2_scale_shape, params_dtype),
         ]:
-            param = torch.nn.Parameter(torch.empty(0, dtype=dtype),
-                                       requires_grad=False)
+            param = torch.nn.Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
             param._orig_shape = shape
             layer.register_parameter(name, param)
             set_weight_attrs(param, extra_weight_attrs)
 
-        w13_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2),
-                                              requires_grad=False)
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
-        w2_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2),
-                                             requires_grad=False)
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
         layer.register_parameter("w2_weight_shape", w2_weight_shape)
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
 
@@ -214,10 +234,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
                 block,
                 in_group_size=in_group_size or block,
             )
-            w_out = w_raw.transpose(
-                -2, -1).contiguous() if w_raw.dim() >= 2 else w_raw
-            s_out = s_raw.transpose(
-                -2, -1).contiguous() if s_raw.dim() >= 2 else s_raw
+            w_out = w_raw.transpose(-2, -1).contiguous() if w_raw.dim() >= 2 else w_raw
+            s_out = s_raw.transpose(-2, -1).contiguous() if s_raw.dim() >= 2 else s_raw
         else:
             # 1. Optional Block-Wise Requantization (100% on TPU)
             if requant_block is not None and in_group_size is not None:
@@ -230,10 +248,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
             # 2. Standard W4A16 Layout & Sign Preparation (Common to All Paths)
             w_raw.bitwise_xor_(self._INT4_SIGN_XOR)
-            w_out = w_raw.transpose(
-                -2, -1).contiguous() if w_raw.dim() >= 2 else w_raw
-            s_out = s_raw.transpose(
-                -2, -1).contiguous() if s_raw.dim() >= 2 else s_raw
+            w_out = w_raw.transpose(-2, -1).contiguous() if w_raw.dim() >= 2 else w_raw
+            s_out = s_raw.transpose(-2, -1).contiguous() if s_raw.dim() >= 2 else s_raw
 
         packed_param.data = w_out
         scale_param.data = s_out
@@ -251,16 +267,17 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self._validate_int32_weight_carriers(layer)
 
         in_group_size = getattr(self.weight_quant, "group_size", None)
-        in_group_size = int(
-            in_group_size) if in_group_size is not None else None
+        in_group_size = int(in_group_size) if in_group_size is not None else None
 
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        requant_block = int(requant_block) if (
-            requant_block is not None and in_group_size is not None) else None
+        requant_block = (
+            int(requant_block)
+            if (requant_block is not None and in_group_size is not None)
+            else None
+        )
 
         target_dtype_str = (envs.MOE_REQUANTIZE_WEIGHT_DTYPE or "").lower()
-        if target_dtype_str in ("fp4", "float4_e2m1fn", "mxfp4", "nvfp4",
-                                "float4"):
+        if target_dtype_str in ("fp4", "float4_e2m1fn", "mxfp4", "nvfp4", "float4"):
             layer._rhs_quant_dtype = jnp.float4_e2m1fn
         else:
             layer._rhs_quant_dtype = jnp.int4
@@ -286,10 +303,10 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         release_memory_to_os()
 
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
+        activation_str = get_fused_moe_activation(layer.activation, layer.moe_config)
         moe_routing.register_experts_start_buffer(
-            layer, device=layer.w13_weight_packed.device)
+            layer, device=layer.w13_weight_packed.device
+        )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -304,8 +321,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
+        activation_str = get_fused_moe_activation(layer.activation, layer.moe_config)
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

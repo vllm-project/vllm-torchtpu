@@ -58,3 +58,41 @@ def test_parse_profile_options_none_or_empty():
     s, a = parse_profile_options("   ")
     assert s == {}
     assert a == {}
+
+
+def test_resolve_with_profiler_kwargs():
+    profile_dir, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base",
+        None,
+        profiler_kwargs={
+            "host_tracer_level": 3,
+            "e2e_enable_fw_throttle": True,
+            "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        },
+    )
+    assert profile_dir == "/tmp/base"
+    assert standard == {
+        "host_tracer_level": 3,
+        "device_tracer_level": 1,
+        "python_tracer_level": 1,
+    }
+    assert advanced == {
+        "e2e_enable_fw_throttle": True,
+        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "tpu_num_sparse_cores_to_trace": 1,
+        "tpu_num_sparse_core_tiles_to_trace": 1,
+    }
+
+
+def test_resolve_with_profile_prefix_and_profiler_kwargs():
+    profile_dir, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base",
+        "custom_run",
+        profiler_kwargs={
+            "host_tracer_level": 3,
+            "e2e_true": "true"
+        },
+    )
+    assert profile_dir == "/tmp/base/custom_run"
+    assert standard["host_tracer_level"] == 3
+    assert advanced["e2e_true"] is True

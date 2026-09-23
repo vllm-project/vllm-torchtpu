@@ -29,20 +29,16 @@ def mesh_cache(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "group",
-    [None, SimpleNamespace(world_size=1),
-     SimpleNamespace(world_size=4)])
+    "group", [None, SimpleNamespace(world_size=1), SimpleNamespace(world_size=4)]
+)
 def test_ep_group_requires_multiple_ranks(monkeypatch, group):
     monkeypatch.setattr(parallel_state, "get_ep_group", lambda: group)
-    assert ep.get_ep_group() is (group
-                                 if group and group.world_size > 1 else None)
+    assert ep.get_ep_group() is (group if group and group.world_size > 1 else None)
 
 
-@pytest.mark.parametrize("error",
-                         [AssertionError, AttributeError, RuntimeError])
+@pytest.mark.parametrize("error", [AssertionError, AttributeError, RuntimeError])
 def test_uninitialized_ep_group(monkeypatch, error):
-    monkeypatch.setattr(parallel_state, "get_ep_group",
-                        Mock(side_effect=error))
+    monkeypatch.setattr(parallel_state, "get_ep_group", Mock(side_effect=error))
     assert ep.get_ep_group() is None
 
 
@@ -73,11 +69,9 @@ def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
 
 
 def test_missing_rank_mapping(monkeypatch, group):
-    monkeypatch.setattr(ep, "_collect_rank_to_device_id", lambda *args: {
-        2: 40,
-        4: 20,
-        8: 30
-    })
+    monkeypatch.setattr(
+        ep, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}
+    )
     with pytest.raises(RuntimeError, match=r"missing=\[6\]"):
         ep.ep_device_ids()
 
@@ -96,12 +90,12 @@ def test_mesh_orders_devices_and_caches_by_axis_and_ids(monkeypatch):
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
     first = ep.build_ep_mesh()
     assert [d.id for d in mesh.call_args.args[0]] == [10, 20, 30, 40]
-    assert mesh.call_args.kwargs == {"axis_names": ("d", )}
+    assert mesh.call_args.kwargs == {"axis_names": ("d",)}
     assert ep.build_ep_mesh() is first
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20, 30, 40))
     assert ep.build_ep_mesh() is first
     assert ep.build_ep_mesh("experts") is not first
-    assert mesh.call_args.kwargs == {"axis_names": ("experts", )}
+    assert mesh.call_args.kwargs == {"axis_names": ("experts",)}
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20))
     assert ep.build_ep_mesh() is not first
     assert mesh.call_count == 3
@@ -125,45 +119,51 @@ def test_missing_native_ep_symbol(monkeypatch):
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_token_groups_use_native_membership_and_mesh_order(
-        monkeypatch, group, sequence_parallel):
+    monkeypatch, group, sequence_parallel
+):
     group.cpu_group = object()
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
-    monkeypatch.setattr(parallel_state, "get_tp_group",
-                        lambda: SimpleNamespace(ranks=[6, 2]))
-    reports = ([(r, (r, ))
-                for r in group.ranks] if sequence_parallel else [(2, (6, 2)),
-                                                                 (4, (8, 4)),
-                                                                 (6, (6, 2)),
-                                                                 (8, (8, 4))])
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(ranks=[6, 2])
+    )
+    reports = (
+        [(r, (r,)) for r in group.ranks]
+        if sequence_parallel
+        else [(2, (6, 2)), (4, (8, 4)), (6, (6, 2)), (8, (8, 4))]
+    )
 
     def gather(output, value, *, group):
         assert group is not None
-        assert value == (6, (6, ) if sequence_parallel else (6, 2))
+        assert value == (6, (6,) if sequence_parallel else (6, 2))
         output[:] = reports
 
     collect = Mock(side_effect=gather)
     monkeypatch.setattr(ep.torch.distributed, "all_gather_object", collect)
-    expected = ((0, ), (1, ), (2, ), (3, )) if sequence_parallel else ((0, 3),
-                                                                       (2, 1))
-    assert ep.ep_token_replica_groups(
-        is_sequence_parallel=sequence_parallel) == expected
-    assert ep.ep_token_replica_groups(
-        is_sequence_parallel=sequence_parallel) == expected
+    expected = ((0,), (1,), (2,), (3,)) if sequence_parallel else ((0, 3), (2, 1))
+    assert (
+        ep.ep_token_replica_groups(is_sequence_parallel=sequence_parallel) == expected
+    )
+    assert (
+        ep.ep_token_replica_groups(is_sequence_parallel=sequence_parallel) == expected
+    )
     assert collect.call_count == 1
 
 
-@pytest.mark.parametrize("reports", [
-    [None] * 4,
-    [(2, (2, 6)), (4, (4, 8)), (6, (6, 2)), (8, (4, 8))],
-    [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (8, (8, 10))],
-    [(2, (2, )), (4, (4, 8)), (6, (6, )), (8, (4, 8))],
-])
-def test_token_groups_reject_inconsistent_membership(monkeypatch, group,
-                                                     reports):
+@pytest.mark.parametrize(
+    "reports",
+    [
+        [None] * 4,
+        [(2, (2, 6)), (4, (4, 8)), (6, (6, 2)), (8, (4, 8))],
+        [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (8, (8, 10))],
+        [(2, (2,)), (4, (4, 8)), (6, (6,)), (8, (4, 8))],
+    ],
+)
+def test_token_groups_reject_inconsistent_membership(monkeypatch, group, reports):
     group.cpu_group = object()
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
-    monkeypatch.setattr(parallel_state, "get_tp_group",
-                        lambda: SimpleNamespace(ranks=[6, 2]))
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(ranks=[6, 2])
+    )
 
     def gather(output, value, *, group):
         output[:] = reports

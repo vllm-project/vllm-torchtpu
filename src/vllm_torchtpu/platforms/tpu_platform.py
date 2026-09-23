@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Union
 import portpicker
 import torch
 import vllm.envs as vllm_envs
+
 # Ensure the "tpu" torch.compile backend is registered before vllm
 # tries to use it (e.g. in @torch.compile decorators at import time).
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
@@ -20,10 +21,11 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.platforms.pp_validation import \
-    validate_pipeline_parallel_config
+from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
+    unified_kv_layout_enabled,
+    update_tpu_block_size_and_slot_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -160,7 +162,8 @@ def get_tpu_multihost_topology(
     if topo is None:
         raise ValueError(
             f"Cannot find topology for {world_size} devices in {topo_map}. "
-            "Please export TORCH_TPU_TOPOLOGY in your environment.")
+            "Please export TORCH_TPU_TOPOLOGY in your environment."
+        )
     return topo
 
 
@@ -169,10 +172,11 @@ def get_tpu_multihost_topology(
 # Each entry is (module_path, function_name).
 # ---------------------------------------------------------------------------
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
-    ("vllm.model_executor.layers.vocab_parallel_embedding",
-     "get_masked_input_and_mask"),
-    ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router",
-     "grouped_topk"),
+    (
+        "vllm.model_executor.layers.vocab_parallel_embedding",
+        "get_masked_input_and_mask",
+    ),
+    ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
     ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
     ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
@@ -184,18 +188,23 @@ _tpu_kv_connectors_registered = False
 
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
+
     previous_mode = execution_mode.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
     # kernel program is context-free, so a swap costs one kernel compile.
     if envs.TPU_KERNEL_ITER_MODE:
-        logger.info("TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).",
-                    previous_mode.name)
+        logger.info(
+            "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
+        )
         return
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
-    logger.info("TorchTPU eager mode configured: %s (previous=%s)",
-                execution_mode.eager_mode.name, previous_mode.name)
+    logger.info(
+        "TorchTPU eager mode configured: %s (previous=%s)",
+        execution_mode.eager_mode.name,
+        previous_mode.name,
+    )
 
 
 def _unwrap_dynamic_compile_fns() -> None:
@@ -220,8 +229,11 @@ def _unwrap_dynamic_compile_fns() -> None:
         fn = getattr(mod, fn_name, None)
         if fn is not None and hasattr(fn, "__wrapped__"):
             setattr(mod, fn_name, fn.__wrapped__)
-            logger.debug("Unwrapped @torch.compile(dynamic=True) from %s.%s",
-                         module_path, fn_name)
+            logger.debug(
+                "Unwrapped @torch.compile(dynamic=True) from %s.%s",
+                module_path,
+                fn_name,
+            )
 
 
 def _patch_api_server_kernel_reload_endpoint() -> None:
@@ -236,9 +248,9 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     if not envs.TPU_KERNEL_ITER_MODE:
         return
     import sys
+
     api_server = sys.modules.get("vllm.entrypoints.openai.api_server")
-    if api_server is None or getattr(api_server, "_tpu_kernel_reload_patch",
-                                     False):
+    if api_server is None or getattr(api_server, "_tpu_kernel_reload_patch", False):
         return
 
     orig_build_app = api_server.build_app
@@ -254,6 +266,7 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
             body = await raw_request.body()
             if body:
                 import json
+
                 modules = json.loads(body).get("modules")
             client = raw_request.app.state.engine_client
             # The next request after the swap pays the kernel compile; make
@@ -271,8 +284,9 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
 
     api_server.build_app = build_app_with_reload
     api_server._tpu_kernel_reload_patch = True
-    logger.info("Applied TPU patch: /reload_kernel dev endpoint "
-                "(TPU_KERNEL_ITER_MODE).")
+    logger.info(
+        "Applied TPU patch: /reload_kernel dev endpoint (TPU_KERNEL_ITER_MODE)."
+    )
 
 
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
@@ -284,14 +298,16 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     assert "phased_profiling_dir" not in vllm_config.additional_config, (
         "Legacy additional_config['phased_profiling_dir'] is no longer "
         "supported. Set USE_PHASED_PROFILER=true and "
-        "--profiler-config.torch_profiler_dir=<dir> instead.")
+        "--profiler-config.torch_profiler_dir=<dir> instead."
+    )
     if envs.USE_PHASED_PROFILER:
         # torch_profiler_dir truthy already implies profiler == "torch";
         # ProfilerConfig's own validator rejects the dir without it.
         assert vllm_config.profiler_config.torch_profiler_dir, (
             "USE_PHASED_PROFILER is set but there is nowhere to write traces. "
             "Add --profiler-config.profiler=torch with "
-            "--profiler-config.torch_profiler_dir=<dir>.")
+            "--profiler-config.torch_profiler_dir=<dir>."
+        )
 
 
 def _register_tpu_kv_connectors() -> None:
@@ -313,16 +329,15 @@ def _register_tpu_kv_connectors() -> None:
         return
     _tpu_kv_connectors_registered = True
 
-    from vllm.distributed.kv_transfer.kv_connector.factory import \
-        KVConnectorFactory
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
     for name, module_path in (
-        ("TPURaidenConnector",
-         "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
-        ("TPUMultiConnector",
-         "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
-        ("TPURaidenOffloadingConnector",
-         "vllm_torchtpu.offload.raiden_connector"),
+        ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        (
+            "TPUMultiConnector",
+            "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+        ),
+        ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
 
@@ -340,22 +355,38 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
-        "modelopt_fp4", "deepseek_v4_fp8"
+        "tpu_int8",
+        "compressed-tensors",
+        "awq",
+        "fp8",
+        "mxfp4",
+        "modelopt_fp4",
+        "deepseek_v4_fp8",
     ]
 
     additional_env_vars: list[str] = [
-        "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
-        "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "MIXED_Q_SPLIT", "MIXED_NUM_QUERIES_PER_BLOCK",
-        "MIXED_NUM_KV_PAGES_PER_BLOCK", "ENABLE_QUANTIZED_MATMUL_KERNEL",
-        "REQUANTIZE_BLOCK_SIZE", "REQUANTIZE_WEIGHT_DTYPE",
-        "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+        "TPU_MULTIHOST_BACKEND",
+        "VLLM_MLA_DISABLE",
+        "TPU_BACKEND_TYPE",
+        "MIXED_Q_SPLIT",
+        "MIXED_NUM_QUERIES_PER_BLOCK",
+        "MIXED_NUM_KV_PAGES_PER_BLOCK",
+        "ENABLE_QUANTIZED_MATMUL_KERNEL",
+        "REQUANTIZE_BLOCK_SIZE",
+        "REQUANTIZE_WEIGHT_DTYPE",
+        "MOE_REQUANTIZE_BLOCK_SIZE",
+        "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-        "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
-        "MOE_FUSED_EP_V2_SHARDED_PLAN", "MOE_FUSED_EP_ENABLE_W4A8"
+        "TORCHINDUCTOR_AUTOGRAD_CACHE",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+        "TPU_KERNEL_ITER_MODE",
+        "TPU_KERNEL_RELOAD_MODULES",
+        "TPU_MOE_ROUTER_TOPK",
+        "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_ENABLE_W4A8",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -375,9 +406,7 @@ class TpuPlatform(Platform):
         """
         device_control_env = os.environ.get(cls.device_control_env_var, "")
         if device_control_env:
-            device_ids = [
-                s.strip() for s in device_control_env.split(",") if s.strip()
-            ]
+            device_ids = [s.strip() for s in device_control_env.split(",") if s.strip()]
             if device_ids:
                 return int(device_ids[device_id % len(device_ids)])
         return int(device_id % max(1, cls.device_count()))
@@ -401,6 +430,7 @@ class TpuPlatform(Platform):
         context entirely and always returns the true local chip count.
         """
         from vllm_torchtpu.tpu_info import get_num_chips
+
         return get_num_chips()
 
     @classmethod
@@ -424,8 +454,7 @@ class TpuPlatform(Platform):
         match the actual number of workers. A single TPU does not need the
         distributed PjRt bootstrap.
         """
-        os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID",
-                              str(time.time_ns()))
+        os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID", str(time.time_ns()))
 
         if world_size == 1:
             os.environ.pop("WORLD_SIZE", None)
@@ -441,11 +470,10 @@ class TpuPlatform(Platform):
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
         if sb_count != world_size:
-            sb_ports = [
-                portpicker.pick_unused_port() for _ in range(world_size)
-            ]
+            sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-                f"localhost:{p}" for p in sb_ports)
+                f"localhost:{p}" for p in sb_ports
+            )
 
         # A per-engine DP config copy (data_parallel_size collapsed to 1,
         # see the caller) re-enters this function in a child process that
@@ -455,8 +483,7 @@ class TpuPlatform(Platform):
         # would fail: this process only has world_size's local share of
         # chips, not the whole cross-host slice.
         if "TORCH_TPU_TOPOLOGY" not in os.environ:
-            os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(
-                world_size)
+            os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
@@ -467,21 +494,26 @@ class TpuPlatform(Platform):
         return topology
 
     @classmethod
-    def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
-                             attn_selector_config: "AttentionSelectorConfig",
-                             **kwargs) -> str:
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+        **kwargs,
+    ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [
-            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM,
-            AttentionBackendEnum.FLASH_ATTN_MLA
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.CUSTOM,
+            AttentionBackendEnum.FLASH_ATTN_MLA,
         ]
         if selected_backend not in supported_backends:
-            logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
-                        selected_backend)
+            logger.info(
+                "Cannot use %s backend on TPU. Setting to FLASH_ATTN.", selected_backend
+            )
             selected_backend = AttentionBackendEnum.FLASH_ATTN
         logger.info("Using %s backend.", selected_backend.name)
         return selected_backend.get_path()
@@ -493,8 +525,7 @@ class TpuPlatform(Platform):
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
         if cls.get_device_name().lower() == "tpu v6e":
-            logger.info(
-                "Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.")
+            logger.info("Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.")
             return torch.float8_e5m2
         return torch.float8_e4m3fn
 
@@ -503,8 +534,7 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_current_memory_usage(cls,
-                                 device: torch.device | None = None) -> float:
+    def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         if not torch.tpu.is_initialized():
             return 0.0
         free, total = torch.accelerator.get_memory_info(device)
@@ -554,29 +584,32 @@ class TpuPlatform(Platform):
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
                     # Frozen dataclass fallback.
-                    object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu",
-                                       tpu_t)
+                    object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
         return {}
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
-            "Use --data-parallel-size and --enable-expert-parallel instead.")
+            "Use --data-parallel-size and --enable-expert-parallel instead."
+        )
         _validate_phased_profiling_config(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
-                "USE_MOE_FUSED_EP_KERNEL=1.")
-        patch_registry.apply("platform_activation",
-                             model_config=vllm_config.model_config)
+                "USE_MOE_FUSED_EP_KERNEL=1."
+            )
+        patch_registry.apply(
+            "platform_activation", model_config=vllm_config.model_config
+        )
         _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
                 "Pathways is not supported by vllm-torchtpu. "
-                "Unset VLLM_TPU_USING_PATHWAYS.")
+                "Unset VLLM_TPU_USING_PATHWAYS."
+            )
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         # TPU's page geometry and block-size selection depend on layout while
@@ -585,18 +618,25 @@ class TpuPlatform(Platform):
         # value to workers, rather than maintaining a process-global getter.
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
         from vllm.v1.attention.backends.utils import (
-            get_flashinfer_layout_string, resolve_kv_cache_layout)
+            get_flashinfer_layout_string,
+            resolve_kv_cache_layout,
+        )
 
         from vllm_torchtpu.layers.adapter.attention import (
-            PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
-        backend = (PallasBatchedRPAAttentionBackend
-                   if vllm_config.attention_config.backend
-                   == AttentionBackendEnum.CUSTOM else PallasAttentionBackend)
-        supported = [
-            layout.name for layout in backend.supported_kv_cache_layouts()
-        ]
-        if (vllm_config.model_config is not None and "DeepseekV4ForCausalLM"
-                in vllm_config.model_config.architectures):
+            PallasAttentionBackend,
+            PallasBatchedRPAAttentionBackend,
+        )
+
+        backend = (
+            PallasBatchedRPAAttentionBackend
+            if vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
+            else PallasAttentionBackend
+        )
+        supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
+        if (
+            vllm_config.model_config is not None
+            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         kv_cache_layout = get_flashinfer_layout_string(layout)
@@ -606,19 +646,22 @@ class TpuPlatform(Platform):
         )
         pcp_size = pcp_config.pcp_size
         if pcp_config.enabled:
-            logger.info("Using vLLM native multiprocess PCP world; PCP is not "
-                        "represented as a JAX mesh axis.")
+            logger.info(
+                "Using vLLM native multiprocess PCP world; PCP is not "
+                "represented as a JAX mesh axis."
+            )
         validate_pipeline_parallel_config(vllm_config)
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off push here; engine-core processes install it
             # again on their side.
-            from vllm_torchtpu.distributed.pp_push import \
-                patch_executor_for_pp_wave
+            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
 
         from vllm.config import CompilationMode
+
         compilation_config = vllm_config.compilation_config
         if compilation_config.mode == CompilationMode.NONE:
             # --enforce-eager is set
@@ -660,8 +703,7 @@ class TpuPlatform(Platform):
                 extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
             )
         else:
-            compilation_config.compile_sizes = sorted(
-                compilation_config.compile_sizes)
+            compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
@@ -670,21 +712,24 @@ class TpuPlatform(Platform):
         # retrace that trips PiecewiseBackend's single-entry assert;
         # size-oblivious backed shapes keep the graph dynamic at size 1.
         from vllm.config.compilation import DynamicShapesType
+
         dynamic_shapes_config = compilation_config.dynamic_shapes_config
-        if (1 in compilation_config.compile_sizes
-                and dynamic_shapes_config.type == DynamicShapesType.BACKED):
-            dynamic_shapes_config.type = (
-                DynamicShapesType.BACKED_SIZE_OBLIVIOUS)
+        if (
+            1 in compilation_config.compile_sizes
+            and dynamic_shapes_config.type == DynamicShapesType.BACKED
+        ):
+            dynamic_shapes_config.type = DynamicShapesType.BACKED_SIZE_OBLIVIOUS
             logger.info(
                 "compile_sizes contains 1, which backed dynamic shapes "
                 "cannot compile (0/1 specialization); switching to "
-                "backed_size_oblivious dynamic shapes.")
+                "backed_size_oblivious dynamic shapes."
+            )
 
         model_config = vllm_config.model_config
 
         if model_config is not None and model_config.dtype in (
-                torch.float16,
-                torch.float32,
+            torch.float16,
+            torch.float32,
         ):
             logger.warning(
                 "The TPU backend currently does not support %s. "
@@ -697,26 +742,31 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
-        if vllm_config.speculative_config is not None and scheduler_config.async_scheduling:
+        if (
+            vllm_config.speculative_config is not None
+            and scheduler_config.async_scheduling
+        ):
             method = vllm_config.speculative_config.method
             if not vllm_config.speculative_config.use_eagle():
                 # Ngram needs the sampled tokens on the host, which async defers.
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
-                    "not supported on TPU; Run with async_scheduling=False.")
+                    "not supported on TPU; Run with async_scheduling=False."
+                )
         # Real hybrid prefix hits need pooled Mamba state seed copies.
         # DecodeBench installs synthetic state for each request instead.
         transfer_config = vllm_config.kv_transfer_config
-        is_decode_bench = (transfer_config is not None
-                           and transfer_config.kv_connector
-                           == "DecodeBenchConnector")
-        if (is_hybrid and cache_config.enable_prefix_caching
-                and not is_decode_bench):
+        is_decode_bench = (
+            transfer_config is not None
+            and transfer_config.kv_connector == "DecodeBenchConnector"
+        )
+        if is_hybrid and cache_config.enable_prefix_caching and not is_decode_bench:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
-                    f"{cache_config.mamba_cache_mode!r}).")
+                    f"{cache_config.mamba_cache_mode!r})."
+                )
             if not unified_kv_layout_enabled(vllm_config):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and
@@ -724,11 +774,11 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires the "
                     "unified KV pool; remove "
-                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
+                )
 
         parallel_config = vllm_config.parallel_config
-        parallel_config.worker_cls = \
-                        "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
@@ -742,15 +792,21 @@ class TpuPlatform(Platform):
             # forked. This must be checked before the "not multihost_backend"
             # single-host branch below: an unset TPU_MULTIHOST_BACKEND still
             # means "mp" whenever --nnodes > 1 was actually passed.
-            from vllm_torchtpu.distributed.tpu_mp_multihost import \
-                prepare_mp_multihost_env
+            from vllm_torchtpu.distributed.tpu_mp_multihost import (
+                prepare_mp_multihost_env,
+            )
+
             prepare_mp_multihost_env(parallel_config)
             logger.info(
                 "Force using TpuMultiprocExecutor for TPU multi-host "
-                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
-                parallel_config.node_rank)
-            from vllm_torchtpu.executors.tpu_multiproc_executor import \
-                TpuMultiprocExecutor
+                "(nnodes=%d, node_rank=%d).",
+                parallel_config.nnodes,
+                parallel_config.node_rank,
+            )
+            from vllm_torchtpu.executors.tpu_multiproc_executor import (
+                TpuMultiprocExecutor,
+            )
+
             parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "mp" or not multihost_backend:
             # Single host, or genuine multi-host DP without --nnodes (this
@@ -767,80 +823,101 @@ class TpuPlatform(Platform):
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_ADDR",
-                    parallel_config.data_parallel_master_ip or "localhost")
-                os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
-                                      str(portpicker.pick_unused_port()))
+                    parallel_config.data_parallel_master_ip or "localhost",
+                )
+                os.environ.setdefault(
+                    "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
+                )
                 if parallel_config.enable_expert_parallel:
                     # EP's expert-combine collective genuinely spans every
                     # DP*TP worker, so torch_tpu needs one shared slice
                     # across all of them; the worker spawn shim exposes a
                     # DP-adjusted chip ordinal to TorchTPU for physical
                     # binding.
-                    cls.device_control_env_var = \
+                    cls.device_control_env_var = (
                         "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+                    )
                 # Genuine multi-host DP (this host only owns a slice of the
                 # DP ranks) needs a TCPStore rendezvous across hosts instead
                 # of the single-host localhost/PCI-scan bootstrap below.
-                from vllm_torchtpu.distributed.tpu_mp_multihost import \
-                    prepare_mp_multihost_dp_env
+                from vllm_torchtpu.distributed.tpu_mp_multihost import (
+                    prepare_mp_multihost_dp_env,
+                )
+
                 if not prepare_mp_multihost_dp_env(
-                        parallel_config, parallel_config.world_size_across_dp):
+                    parallel_config, parallel_config.world_size_across_dp
+                ):
                     cls._prepare_singlehost_tpu_env(
-                        parallel_config.world_size_across_dp)
+                        parallel_config.world_size_across_dp
+                    )
             else:
                 # vLLM hands each DP engine a ParallelConfig with
                 # data_parallel_size collapsed to 1, so the inherited
                 # TORCH_TPU_DP_SIZE is the only record of how wide the slice
                 # really is. Keep sizing the bootstrap by the whole slice.
-                dp_slice_size = int(
-                    os.environ.pop("TORCH_TPU_DP_SIZE", "1") or 1)
-                torch_tpu_world_size = (parallel_config.world_size *
-                                        dp_slice_size)
+                dp_slice_size = int(os.environ.pop("TORCH_TPU_DP_SIZE", "1") or 1)
+                torch_tpu_world_size = parallel_config.world_size * dp_slice_size
                 if pcp_size > 1:
                     logger.info(
                         "Preparing TorchTPU bootstrap env for native PCP "
-                        "multiprocess world_size=%d.", torch_tpu_world_size)
+                        "multiprocess world_size=%d.",
+                        torch_tpu_world_size,
+                    )
                 cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
-            if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
-                    and parallel_config.pipeline_parallel_size == 1
-                    and parallel_config.tensor_parallel_size == 1):
-                logger.info("Force using UniProcExecutor for TPU on "
-                            "single host without tensor/pipeline parallelism.")
+            if (
+                pcp_size <= 1
+                and parallel_config.data_parallel_size == 1
+                and parallel_config.pipeline_parallel_size == 1
+                and parallel_config.tensor_parallel_size == 1
+            ):
+                logger.info(
+                    "Force using UniProcExecutor for TPU on "
+                    "single host without tensor/pipeline parallelism."
+                )
                 parallel_config.distributed_executor_backend = "uni"
             else:
                 logger.info(
                     "Force using TpuMultiprocExecutor for TPU on single host "
-                    "with tensor/pipeline/PCP parallelism.")
-                from vllm_torchtpu.executors.tpu_multiproc_executor import \
-                    TpuMultiprocExecutor
+                    "with tensor/pipeline/PCP parallelism."
+                )
+                from vllm_torchtpu.executors.tpu_multiproc_executor import (
+                    TpuMultiprocExecutor,
+                )
+
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
             if parallel_config.data_parallel_size > 1:
                 if pcp_size > 1:
                     raise NotImplementedError(
                         "Prefill context parallelism is not supported "
-                        "together with multihost data parallelism.")
+                        "together with multihost data parallelism."
+                    )
                 if not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                     raise NotImplementedError(
                         "Multihost data parallelism requires the Ray V2 "
-                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1.")
+                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
+                    )
             if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
-                    RayDistributedExecutorV2
+                from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+                    RayDistributedExecutorV2,
+                )
+
                 parallel_config.distributed_executor_backend = RayDistributedExecutorV2
                 logger.info(
                     "Force using RayDistributedExecutorV2 for TPU on multihost."
                 )
             else:
-                from vllm_torchtpu.executors.ray_distributed_executor import \
-                    RayDistributedExecutor
+                from vllm_torchtpu.executors.ray_distributed_executor import (
+                    RayDistributedExecutor,
+                )
+
                 parallel_config.distributed_executor_backend = RayDistributedExecutor
-                logger.info(
-                    "Force using RayDistributedExecutor for TPU on multihost.")
+                logger.info("Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
-                "Using uniproc_executor.")
+                "Using uniproc_executor."
+            )
             parallel_config.distributed_executor_backend = "uni"
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
@@ -848,11 +925,13 @@ class TpuPlatform(Platform):
             if scheduler_config.scheduler_cls != dp_sched_cls:
                 assert scheduler_config.scheduler_cls is None, (
                     "Cannot have DP_SCHED_ENABLED enabled and also a custom "
-                    "scheduler being provided.")
+                    "scheduler being provided."
+                )
                 scheduler_config.scheduler_cls = dp_sched_cls
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
-                    parallel_config.data_parallel_size)
+                    parallel_config.data_parallel_size,
+                )
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
@@ -863,23 +942,23 @@ class TpuPlatform(Platform):
                 "TPUMultiConnector",
                 "TPURaidenOffloadingConnector",
             }
-            assert kv_transfer_config.kv_connector in \
-                _TPU_SUPPORTED_KV_CONNECTORS, (
+            assert kv_transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
                 f"TPU only supports the following KV connectors: "
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
-            is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "TPURaidenOffloadingConnector"
-                                    and is_hybrid)
-            if (is_hybrid_offloading
-                    and not unified_kv_layout_enabled(vllm_config)):
+            is_hybrid_offloading = (
+                kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
+                and is_hybrid
+            )
+            if is_hybrid_offloading and not unified_kv_layout_enabled(vllm_config):
                 # Hybrid model offloading transfers uniform pool rows; the non-unified
                 # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
                     f"CPU offloading ({kv_transfer_config.kv_connector}) "
                     "on hybrid attention+Mamba models requires the unified "
-                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"
+                )
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
@@ -894,26 +973,36 @@ class TpuPlatform(Platform):
         # to the KV connector and so needs a current config. Upstream's
         # `update_block_size_for_backend` wraps the same calls.
         from vllm.config.vllm import set_current_vllm_config
+
         with set_current_vllm_config(vllm_config):
-            architectures = getattr(
-                getattr(vllm_config.model_config, "hf_config", None),
-                "architectures", None) or []
+            architectures = (
+                getattr(
+                    getattr(vllm_config.model_config, "hf_config", None),
+                    "architectures",
+                    None,
+                )
+                or []
+            )
             is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
 
             if is_ds_v4 and not cache_config.user_specified_block_size:
                 # DSv4 pages hold compressed rows. Its backend's
                 # get_preferred_block_size is a hardcoded 256, which does not fit
                 # the packed latent record, so take the MLA page size directly.
-                from vllm_torchtpu.layers.adapter.attention import \
-                    PallasMLAttentionBackend
+                from vllm_torchtpu.layers.adapter.attention import (
+                    PallasMLAttentionBackend,
+                )
+
                 cache_config.block_size = (  # type: ignore[assignment]
-                    PallasMLAttentionBackend.get_page_size(vllm_config))
+                    PallasMLAttentionBackend.get_page_size(vllm_config)
+                )
             else:
                 is_hybrid = vllm_config.model_config.is_hybrid
                 if not is_hybrid and not cache_config.user_specified_block_size:
                     default = backend_cls.get_page_size(vllm_config)
                     cache_config.block_size = (  # type: ignore[assignment]
-                        backend_cls.get_preferred_block_size(default))
+                        backend_cls.get_preferred_block_size(default)
+                    )
             if unified_kv_layout_enabled(vllm_config):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
@@ -926,8 +1015,7 @@ class TpuPlatform(Platform):
                     min_page_size,
                 )
                 cache_config.block_size = min_page_size  # type: ignore[assignment]
-            logger.info("Using KV cache block size: %s",
-                        cache_config.block_size)
+            logger.info("Using KV cache block size: %s", cache_config.block_size)
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -936,9 +1024,11 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        from vllm_torchtpu.distributed.tpu_communicator import \
-            TpuDeviceCommunicator
-        return f"{TpuDeviceCommunicator.__module__}.{TpuDeviceCommunicator.__qualname__}"
+        from vllm_torchtpu.distributed.tpu_communicator import TpuDeviceCommunicator
+
+        return (
+            f"{TpuDeviceCommunicator.__module__}.{TpuDeviceCommunicator.__qualname__}"
+        )
 
     @classmethod
     def use_all_gather(cls) -> bool:
@@ -962,15 +1052,15 @@ class TpuPlatform(Platform):
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
-            if params.sampling_type not in (SamplingType.GREEDY,
-                                            SamplingType.RANDOM):
+            if params.sampling_type not in (SamplingType.GREEDY, SamplingType.RANDOM):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
                 )
 
     @classmethod
-    def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,
-                                    _model_config: ModelConfig) -> bool:
+    def is_kv_cache_dtype_supported(
+        cls, kv_cache_dtype: str, _model_config: ModelConfig
+    ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
         return kv_cache_dtype in supported
 
@@ -987,8 +1077,9 @@ class TpuPlatform(Platform):
         return True
 
 
-def _get_exponential_token_paddings(min_token_size: int,
-                                    max_token_size: int) -> list[int]:
+def _get_exponential_token_paddings(
+    min_token_size: int, max_token_size: int
+) -> list[int]:
     """Sizes doubling from min_token_size, capped exactly at max_token_size.
 
     The last bucket is max_token_size itself rather than the next power of
@@ -1013,35 +1104,38 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     scheduler or another scheduler is configured, or when chunked prefill is
     disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
-        SCHEDULER_CLS, patch_engine_core_for_pp_chunks)
+        SCHEDULER_CLS,
+        patch_engine_core_for_pp_chunks,
+    )
+
     scheduler_config = vllm_config.scheduler_config
     if not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
-    if (envs.DP_SCHED_ENABLED
-            and vllm_config.parallel_config.data_parallel_size > 1):
-        logger.warning(
-            "Pipeline chunk sizing is off: the DP scheduler is enabled.")
+    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
-            scheduler_config.scheduler_cls)
+            scheduler_config.scheduler_cls,
+        )
         return
     if not scheduler_config.enable_chunked_prefill:
-        logger.warning(
-            "Pipeline chunk sizing is off: chunked prefill is disabled.")
+        logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
         return
     if envs.TPU_PP_CHUNK_SLACK < 0:
-        raise ValueError("TPU_PP_CHUNK_SLACK must not be negative: "
-                         f"{envs.TPU_PP_CHUNK_SLACK}")
+        raise ValueError(
+            f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
+        )
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     patch_engine_core_for_pp_chunks(vllm_config)
 
 
 def _get_token_paddings(
-        min_token_size: int,
-        max_token_size: int,
-        extra_bucket_sizes: list[int] | None = None) -> list[int]:
+    min_token_size: int,
+    max_token_size: int,
+    extra_bucket_sizes: list[int] | None = None,
+) -> list[int]:
     """Generate a list of padding size, starting from min_token_size,
     ending with a number that can cover max_token_size.
 
@@ -1054,9 +1148,7 @@ def _get_token_paddings(
     if extra_bucket_sizes:
         paddings = sorted(
             set(paddings)
-            | {
-                size
-                for size in extra_bucket_sizes if 0 < size <= max_token_size
-            })
+            | {size for size in extra_bucket_sizes if 0 < size <= max_token_size}
+        )
     logger.info("Using token paddings: %s", paddings)
     return paddings

@@ -112,7 +112,7 @@ run_mp_multihost() {
     ${extra_args}
   )
 
-  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --data-parallel-start-rank=0 --host 0.0.0.0 --port "${PORT}")
+  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --host 0.0.0.0 --port "${PORT}")
 
   WORKER_SERVE_ARGS_ARR=()
   for arg in "${COMMON_SERVE_ARGS_ARR[@]}"; do
@@ -129,9 +129,9 @@ run_mp_multihost() {
     start_rank=$((worker_idx * DATA_PARALLELISM_LOCAL))
     worker_serve_cmd=$(printf '%q ' vllm serve "${WORKER_SERVE_ARGS_ARR[@]}" --headless --data-parallel-start-rank="${start_rank}")
     echo "--- Starting mp worker ${worker_idx} on ${worker_ip} (data-parallel-start-rank=${start_rank})"
-    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home"
-    base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64
-    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster_mp.sh" < /tmp/run_cluster_mp.b64
+    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home" || return 1
+    base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64 || return 1
+    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster_mp.sh" < /tmp/run_cluster_mp.b64 || return 1
     # shellcheck disable=SC2029
     (
       for _attempt in 1 2 3; do
@@ -148,20 +148,48 @@ run_mp_multihost() {
   echo "--- Starting mp head on ${HEAD_INTERNAL_IP}"
   bash "${RUN_CLUSTER_MP}" "${IMAGE_TAG}" "${HOST_HF_HOME}" "${HEAD_SERVE_CMD}" "${CONTAINER_ENV_HEAD[@]}" &
 
+  # The container holds the only copy of the head's output, and the collection
+  # below cannot reach it once it is gone - which is exactly the case where the
+  # output was worth having. Stream it to a file as it is written instead.
+  # -f blocks until the container exists, so retry while it is starting.
+  HEAD_LOG="${PWD}/perf_eval_results/head_server.log"
+  mkdir -p "$(dirname "${HEAD_LOG}")"
+  (
+    for _ in $(seq 1 60); do
+      docker logs -f node >>"${HEAD_LOG}" 2>&1 && break
+      sleep 2
+    done
+  ) &
+
   # Wait for head server /health
   echo "--- Waiting for head server /health"
   deadline=$((SECONDS + SERVER_READY_WAIT_MIN * 60))
   head_up=0
+  head_gone=0
   while [ "$SECONDS" -lt "$deadline" ]; do
     if docker exec node curl -s -o /dev/null --connect-timeout 1 "http://localhost:${PORT}/health" 2>/dev/null; then
       head_up=1
       break
     fi
+    # `docker exec` against a container that has gone fails exactly like a
+    # server that is still booting, and this loop cannot tell them apart. On
+    # 2026-09-22 the head died four minutes in and the step polled the corpse
+    # for the remaining 176, then found no container left to take logs from.
+    if ! docker inspect -f '{{.State.Running}}' node 2>/dev/null | grep -qx true; then
+      head_gone=1
+      break
+    fi
     sleep 10
   done
   if [ "$head_up" != "1" ]; then
-    echo "ERROR: head server did not become healthy within ${SERVER_READY_WAIT_MIN} minutes"
-    docker logs node --tail 200 2>&1 || true
+    if [ "$head_gone" = "1" ]; then
+      echo "ERROR: the head container exited before the server became healthy"
+    else
+      echo "ERROR: head server did not become healthy within ${SERVER_READY_WAIT_MIN} minutes"
+    fi
+    # --tail rather than the whole log, but from the streamed copy when the
+    # container itself is already gone.
+    docker logs node --tail 200 2>&1 || tail -200 "${HEAD_LOG}" 2>/dev/null || true
     return 1
   fi
   echo "Head server is healthy."
@@ -178,7 +206,14 @@ run_mp_multihost() {
   set -e
 
   echo "~~~ Collecting server logs"
-  docker logs node --tail 2000 > perf_eval_results/head_server.log 2>&1 || true
+  # Via a temporary file: the redirection would truncate the streamed copy
+  # before docker ran, so a container that has already gone would take the log
+  # with it a second time.
+  if docker logs node --tail 2000 > "${HEAD_LOG}.tmp" 2>/dev/null; then
+    mv "${HEAD_LOG}.tmp" "${HEAD_LOG}"
+  else
+    rm -f "${HEAD_LOG}.tmp"
+  fi
   widx=0
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     widx=$((widx + 1))

@@ -57,12 +57,8 @@ CHOICE_PROMPT = "Sentiment of 'what a great movie': "
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "name": {
-            "type": "string"
-        },
-        "age": {
-            "type": "integer"
-        },
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
     },
     "required": ["name", "age"],
 }
@@ -71,8 +67,7 @@ JSON_PARAMS = SamplingParams(
     max_tokens=64,
     structured_outputs=StructuredOutputsParams(json=JSON_SCHEMA),
 )
-JSON_PROMPT = ("Generate a JSON object with a name (string) and an age "
-               "(integer): ")
+JSON_PROMPT = "Generate a JSON object with a name (string) and an age (integer): "
 
 REGEX_PATTERN = r"[0-9]{3}-[0-9]{4}"
 REGEX_PARAMS = SamplingParams(
@@ -108,9 +103,7 @@ COMPLEX_AST_SCHEMA = {
         },
         "operands": {
             "type": "array",
-            "items": {
-                "$ref": "#/$defs/SubTree"
-            },
+            "items": {"$ref": "#/$defs/SubTree"},
             "minItems": 2,
             "maxItems": 2,
         },
@@ -120,15 +113,10 @@ COMPLEX_AST_SCHEMA = {
         "SubTree": {
             "type": "object",
             "properties": {
-                "operator": {
-                    "type": "string",
-                    "enum": AST_SUB_OPERATORS
-                },
+                "operator": {"type": "string", "enum": AST_SUB_OPERATORS},
                 "operands": {
                     "type": "array",
-                    "items": {
-                        "type": "number"
-                    },
+                    "items": {"type": "number"},
                     "minItems": 2,
                     "maxItems": 2,
                 },
@@ -167,7 +155,8 @@ def _assert_number(value: object, text: str) -> None:
     # would accept a JSON `true` as a number -- precisely the kind of leak a
     # dropped bitmask produces, and the one this suite exists to catch.
     assert isinstance(value, (int, float)) and not isinstance(value, bool), (
-        f"operand must be a number: {value!r} in {text!r}")
+        f"operand must be a number: {value!r} in {text!r}"
+    )
 
 
 def _assert_sub_tree(node: object, text: str) -> None:
@@ -192,14 +181,15 @@ def _assert_complex_ast_json(text: str) -> None:
         # surfacing a bare JSONDecodeError.
         raise AssertionError(
             f"output is not valid JSON ({exc}) -- truncated at max_tokens? "
-            f"raw: {text!r}") from exc
+            f"raw: {text!r}"
+        ) from exc
     assert isinstance(parsed, dict), text
     assert parsed.get("operator") in AST_OPERATORS, text
     desc = parsed.get("description")
     assert isinstance(desc, str), text
-    assert re.fullmatch(
-        AST_DESCRIPTION_PATTERN,
-        desc), (f"invalid description pattern: {desc!r} in {text!r}")
+    assert re.fullmatch(AST_DESCRIPTION_PATTERN, desc), (
+        f"invalid description pattern: {desc!r} in {text!r}"
+    )
     operands = parsed.get("operands")
     assert isinstance(operands, list) and len(operands) == 2, text
     # The schema pins the top-level operands to SubTree refs, so a bare
@@ -223,8 +213,7 @@ def _is_complex_ast_json(text: str) -> bool:
 
 
 def _assert_regex(text: str) -> None:
-    assert re.fullmatch(REGEX_PATTERN,
-                        text), (f"regex constraint violated: {text!r}")
+    assert re.fullmatch(REGEX_PATTERN, text), f"regex constraint violated: {text!r}"
 
 
 @pytest.fixture(scope="module")
@@ -306,7 +295,8 @@ def test_complex_ast_json_schema_unconstrained_negative(llm: LLM):
     texts = [output.outputs[0].text for output in outputs]
     assert not any(_is_complex_ast_json(text) for text in texts), (
         "unconstrained generation already satisfies the AST schema, so "
-        f"test_complex_ast_json_schema_greedy proves nothing: {texts!r}")
+        f"test_complex_ast_json_schema_greedy proves nothing: {texts!r}"
+    )
 
 
 def test_regex_greedy(llm: LLM):
@@ -321,12 +311,8 @@ def test_mixed_batch(llm: LLM):
     request gets its own mask row, unstructured rows stay untouched (a
     misaligned scatter shows up as either a violated constraint or an
     unconstrained request going silent/garbled)."""
-    prompts = [
-        CHOICE_PROMPT, UNCONSTRAINED_PROMPT, JSON_PROMPT, UNCONSTRAINED_PROMPT
-    ]
-    params = [
-        CHOICE_PARAMS, UNCONSTRAINED_PARAMS, JSON_PARAMS, UNCONSTRAINED_PARAMS
-    ]
+    prompts = [CHOICE_PROMPT, UNCONSTRAINED_PROMPT, JSON_PROMPT, UNCONSTRAINED_PROMPT]
+    params = [CHOICE_PARAMS, UNCONSTRAINED_PARAMS, JSON_PARAMS, UNCONSTRAINED_PARAMS]
     outputs = llm.generate(prompts, params)
     _assert_choice(outputs[0].outputs[0].text)
     _assert_json(outputs[2].outputs[0].text)
@@ -369,21 +355,17 @@ def test_multi_chunk_row_alignment(llm: LLM):
 
     Cap=2 with a 4-request batch forces two chunks per step; structured
     requests are placed in both chunks."""
-    saved = llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2, ))
+    saved = llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2,))
     try:
-        prompts = [
-            CHOICE_PROMPT, UNCONSTRAINED_PROMPT, CHOICE_PROMPT, JSON_PROMPT
-        ]
-        params = [
-            CHOICE_PARAMS, UNCONSTRAINED_PARAMS, CHOICE_PARAMS, JSON_PARAMS
-        ]
+        prompts = [CHOICE_PROMPT, UNCONSTRAINED_PROMPT, CHOICE_PROMPT, JSON_PROMPT]
+        params = [CHOICE_PARAMS, UNCONSTRAINED_PARAMS, CHOICE_PARAMS, JSON_PARAMS]
         outputs = llm.generate(prompts, params)
         _assert_choice(outputs[0].outputs[0].text)
         _assert_choice(outputs[2].outputs[0].text)
         _assert_json(outputs[3].outputs[0].text)
         assert outputs[1].outputs[0].text, "unconstrained request went silent"
     finally:
-        llm.llm_engine.collective_rpc(_restore_chunk_cap, args=(saved[0], ))
+        llm.llm_engine.collective_rpc(_restore_chunk_cap, args=(saved[0],))
 
 
 def test_more_requests_than_max_num_seqs(llm: LLM):
@@ -415,8 +397,9 @@ def test_more_requests_than_max_num_seqs(llm: LLM):
     # 4x the fixture's max_num_seqs, so the batch turns over several times.
     selected = [kinds[i % len(kinds)] for i in range(16)]
 
-    outputs = llm.generate([prompt for prompt, _, _ in selected],
-                           [params for _, params, _ in selected])
+    outputs = llm.generate(
+        [prompt for prompt, _, _ in selected], [params for _, params, _ in selected]
+    )
 
     assert len(outputs) == len(selected)
     for i, (output, (_, _, check)) in enumerate(zip(outputs, selected)):
@@ -425,5 +408,6 @@ def test_more_requests_than_max_num_seqs(llm: LLM):
         # cannot accept; vLLM then fails to advance the FSM and terminates
         # the request with finish_reason "error".
         assert completion.finish_reason != "error", (
-            f"request {i} was terminated mid-generation: {completion.text!r}")
+            f"request {i} was terminated mid-generation: {completion.text!r}"
+        )
         check(completion.text)

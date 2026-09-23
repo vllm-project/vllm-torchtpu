@@ -15,16 +15,43 @@ logger = init_logger(__name__)
 def apply_omni_tpu_patches() -> None:
     """Extend async output timeout and patch TPU unsupported ops."""
 
-    # Extend async output timeout for large model weight loading.
-    # Keep deferred here: moving to module top level causes a circular import
-    # during plugin discovery (rotary_embedding.mrope -> platforms.__getattr__
-    # -> OmniTpuPlatform -> patches -> diffusion_engine -> stage_utils ->
-    # current_omni_platform).
-    from vllm_omni.diffusion import diffusion_engine
-    diffusion_engine._ASYNC_OUTPUT_TIMEOUT = 1800.0
-    logger.info("Applied TPU patch: extended _ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # 1. Lazy execution attributes failure to sync point: In PyTorch/XLA
+    #    and torch_tpu, forward passes are queued lazily in the computation
+    #    graph. diffusion_worker emits COMPUTE_DONE prematurely before the TPU
+    #    hardware finishes execution. When the async output background loop
+    #    triggers host synchronization (.cpu()), it blocks on multi-step diffusion
+    #    graph execution and initial compilation.
+    # 2. Recompilation storms & JIT compile latency: Initial JIT/AOT
+    #    compilation and weight distribution for large diffusion models (e.g.
+    #    Wan 14B) take >600s, exceeding vLLM-Omni's default 600s timeout.
+    #
+    # REMOVAL / FIX CONDITION:
+    # This patch can be removed/reduced once:
+    # 1. OmniTpuPlatform.record_device_event() implements hardware synchronization
+    #    (torch.tpu.synchronize()) to ensure execution completes before COMPUTE_DONE.
+    # 2. AOT compilation caching stabilizes startup compile times.
+    # -------------------------------------------------------------------------
+    import os
 
-    # Patch 1D linear interpolation on TPU to run on CPU to avoid missing aten::upsample_linear1d
+    os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
+    logger.info(
+        "Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # Missing aten::upsample_linear1d.out operator in torch_tpu.
+    # Calling torch.nn.functional.interpolate(..., mode="linear") on 3D tensors
+    # fails with:
+    #   RuntimeError: operator 'aten::upsample_linear1d.out' is not implemented for TPU
+    # Used in temporal/audio diffusion alignment (Wan 2.2 S2V, LongCat, audio vocoders).
+    #
+    # UPSTREAM STATUS & REMOVAL CONDITION:
+    # Fixed upstream in torch_tpu commit a0b184ed27d ("Implement aten::upsample_linear1d.out",
+    # Sep 14, 2026). This CPU fallback patch can be deleted once vllm-torchtpu
+    # bumps to a torch_tpu development wheel >= 0.1.1.dev20260914 containing that commit.
+    # -------------------------------------------------------------------------
     orig_interpolate = torch.nn.functional.interpolate
 
     def _safe_interpolate(
@@ -51,10 +78,50 @@ def apply_omni_tpu_patches() -> None:
 def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
 
-    # Output tensors must be moved to CPU before IPC serialization back to the
-    # orchestrator process; holding TPU tensors across process boundaries causes
-    # unpickling errors, PJRT re-initialization, and /tmp/libtpu_lockfile lock
-    # contention in the orchestrator.
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # 1. Pickling a device tensor aborts process: In torch_tpu, calling
+    #    pickle.dumps on a device tensor hits ABSL_CHECK(tensor.storage().allocator() == nullptr)
+    #    in csrc/eager/tensor_to_buffer.cc:260-261, terminating the worker process
+    #    with SIGABRT (exit code 134) with no Python traceback.
+    # 2. libtpu per-process lockfile prevents cross-process init:
+    #    Holding TPU tensors across process boundaries causes the CPU-only
+    #    orchestrator process to trigger PJRT backend initialization during
+    #    unpickling, colliding with the worker on /tmp/libtpu_lockfile.
+    #
+    # REMOVAL / FIX CONDITION:
+    # This patch can be removed once torch_tpu supports safe inter-process tensor
+    # serialization / proxy unpickling without triggering PJRT initialization
+    # in host processes that do not own TPU hardware.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion import ipc
+
+    orig_pack_tensor = ipc._pack_tensor_if_large
+
+    def _safe_pack_tensor_if_large(
+        val: torch.Tensor,
+        d2h_stream: Any = None,
+    ) -> Any:
+        return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
+
+    ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
+    logger.info(
+        "Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
+
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # In LTX-2, LTXRuntime._decode_output produces a (video, audio) tuple. Audio
+    # tensors are sub-threshold (<1MB) and returned directly in the output object,
+    # bypassing SHM packing. If audio remains on TPU, unpickling in the orchestrator
+    # triggers PJRT re-initialization and /tmp/libtpu_lockfile collision, while
+    # pickling in the worker risks tensor_to_buffer.cc ABSL_CHECK aborts.
+    # Moving video and audio to CPU prevents device tensors entering the IPC stream.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Can be removed once torch_tpu provides safe cross-process device tensor
+    # serialization, or once vllm_omni universally ensures all diffusion output
+    # payloads are moved to host CPU before IPC serialization.
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
     orig_decode_output = ltx2_runtime.LTXRuntime._decode_output

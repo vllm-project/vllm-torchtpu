@@ -180,8 +180,8 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      # DeepSeek-V4-Pro, two jobs in the deepseek-v4-flash shape but on the Ray
-      # path since the model spans two hosts.
+      # DeepSeek-V4-Pro, in the deepseek-v4-flash shape but on the Ray path since
+      # the model spans two hosts.
       - label: "Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_deepseek_v4_pro_dp16_ep"
         if: 'build.env("NIGHTLY") == "1"'
@@ -192,42 +192,18 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"
+          # Compile writes ~40 GB/host of inductor cache and the profile run
+          # ~30 GB of temp JSON; the boot disk has ~30 GB free.
+          CONTAINER_TMPDIR: "/dev/shm"
         commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Perf: Nightly deepseek-v4-pro xprof capture (TPU v7x-16)"
-        key: "perf_nightly_deepseek_v4_pro_xprof"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 600
-        agents:
-          queue: "tpu_v7x_16_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-          RUN_TYPE: "PROFILE"
-        commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep-profile --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep-profile"
           - |
-            results_dir=perf_eval_results/deepseek-v4-pro-dp16-ep-profile
-            profile_dir=$$results_dir/profile
-            for phase in "$$profile_dir"/*/; do
-              [ -d "$$phase" ] || continue
-              echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
-            done
-            if ! find "$$profile_dir" -name '*.xplane.pb' -print -quit | grep -q .; then
-              echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
-              exit 1
+            case "$$(LC_ALL=C TZ=America/Los_Angeles date +%a)" in Mon|Wed|Fri) export CAPTURE_PROFILE=1 ;; *) export CAPTURE_PROFILE=0 ;; esac
+            rc=0
+            bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep || rc=$$?
+            if [ "$$CAPTURE_PROFILE" = "1" ]; then
+              bash .buildkite/scripts/upload_profile.sh perf_eval_results/deepseek-v4-pro-dp16-ep || { [ "$$rc" -ne 0 ] || rc=1; }
             fi
-            # artifact_paths would upload the traces again, so drop them here.
-            dest=$$(jq -r '.profile_gcs_dir // ""' "$$results_dir/config.json")
-            if [ -z "$$dest" ]; then
-              echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
-              exit 1
-            fi
-            gcloud storage cp -r "$$profile_dir"/* "$$dest/" \
-              && rm -rf "$$profile_dir"
+            exit $$rc
         artifact_paths:
           - "perf_eval_results/**/*"
 
@@ -242,42 +218,14 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Perf: Nightly deepseek-v4-flash xprof capture (TPU v7x-8)"
-        key: "perf_nightly_deepseek_v4_flash_xprof"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 240
-        agents:
-          queue: "tpu_v7x_8_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-          RUN_TYPE: "PROFILE"
-        commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep-profile"
           - |
-            results_dir=perf_eval_results/deepseek-v4-flash-dp8-ep-profile
-            profile_dir=$$results_dir/profile
-            for phase in "$$profile_dir"/*/; do
-              [ -d "$$phase" ] || continue
-              echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
-            done
-            if ! find "$$profile_dir" -name '*.xplane.pb' -print -quit | grep -q .; then
-              echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
-              exit 1
+            case "$$(LC_ALL=C TZ=America/Los_Angeles date +%a)" in Mon|Wed|Fri) export CAPTURE_PROFILE=1 ;; *) export CAPTURE_PROFILE=0 ;; esac
+            rc=0
+            bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep || rc=$$?
+            if [ "$$CAPTURE_PROFILE" = "1" ]; then
+              bash .buildkite/scripts/upload_profile.sh perf_eval_results/deepseek-v4-flash-dp8-ep || { [ "$$rc" -ne 0 ] || rc=1; }
             fi
-            # artifact_paths would upload the traces again, so drop them here.
-            dest=$$(jq -r '.profile_gcs_dir // ""' "$$results_dir/config.json")
-            if [ -z "$$dest" ]; then
-              echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
-              exit 1
-            fi
-            gcloud storage cp -r "$$profile_dir"/* "$$dest/" \
-              && rm -rf "$$profile_dir"
+            exit $$rc
         artifact_paths:
           - "perf_eval_results/**/*"
 

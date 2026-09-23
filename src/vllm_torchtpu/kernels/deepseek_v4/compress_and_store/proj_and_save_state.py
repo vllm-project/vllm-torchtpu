@@ -75,9 +75,7 @@ def load_from_acc_ref(ref, dtype=None):
     ref_flat = ref.reshape(-1, num_lanes)
 
     # Gather the chunks into the original head dimension.
-    chunks = [
-        ref_flat[pl.ds(m, tile_n, num_chunks)] for m in range(num_chunks)
-    ]
+    chunks = [ref_flat[pl.ds(m, tile_n, num_chunks)] for m in range(num_chunks)]
     vec = jnp.concat(chunks, axis=1)
     if dtype is not None:
         return pltpu.bitcast(vec, dtype)
@@ -95,7 +93,7 @@ def store_to_acc_ref(ref, val, dtype=None):
 
     ref_flat = ref.reshape(-1, num_lanes)
     for i in range(num_chunks):
-        val_slice = val[:, i * num_lanes:(i + 1) * num_lanes]
+        val_slice = val[:, i * num_lanes : (i + 1) * num_lanes]
         ref_flat[pl.ds(i, tile_n, num_chunks)] = val_slice
 
 
@@ -129,14 +127,14 @@ def kernel(
     def _dma_copy_out(n_idx_val, m_idx_val, buf_idx_val):
         """Copys one tile from accumulator to the KV cache.
 
-    We run the dma one tile after the previous tile is done computing, using a
-    double buffer on the k dimension.
+        We run the dma one tile after the previous tile is done computing, using a
+        double buffer on the k dimension.
 
-    The reason we do this in the following tile is that we hope to pipeline the
-    DMA with the matmuls.
+        The reason we do this in the following tile is that we hope to pipeline the
+        DMA with the matmuls.
 
-    (however, this is awaiting RAW no-hazard flag to land)
-    """
+        (however, this is awaiting RAW no-hazard flag to land)
+        """
         slot_offset = m_idx_val * slots_per_m_tile
         num_valid_writes = 0
         for i in range(tile_n):
@@ -160,9 +158,9 @@ def kernel(
         write_counts_ref[buf_idx_val] = num_valid_writes
 
     def inner_kernel(
-            tiled_wgate_ref,  # (tile_k, tile_m)
-            tiled_hidden_states_ref,  # (tile_n, tile_k)
-            tiled_positions_ref,  # (tile_n,)
+        tiled_wgate_ref,  # (tile_k, tile_m)
+        tiled_hidden_states_ref,  # (tile_n, tile_k)
+        tiled_positions_ref,  # (tile_n,)
     ):
         n_idx = pl.program_id(0)
         m_idx = pl.program_id(1)
@@ -180,7 +178,7 @@ def kernel(
             prod = lax.dot_general(
                 lhs,
                 rhs,
-                (((1, ), (0, )), ((), (()))),
+                (((1,), (0,)), ((), (()))),
                 preferred_element_type=jnp.float32,
             )
             return prod
@@ -195,13 +193,15 @@ def kernel(
             # )
             # ape_selected = jnp.take_along_axis(ape_val, gather_indices, axis=0)
             # matmul path
-            one_hot = (ape_rows[:, None] == jnp.arange(
-                cfgs.dims.compress_ratio)[None, :]).astype(jnp.float32)
+            one_hot = (
+                ape_rows[:, None] == jnp.arange(cfgs.dims.compress_ratio)[None, :]
+            ).astype(jnp.float32)
             ape_selected = jnp.matmul(
-                one_hot, ape_val,
-                precision=lax.Precision.HIGHEST)  #  (tile_n, state_width)
-            existing_acc = load_from_acc_ref(acc_ref.at[buf_idx, ...],
-                                             dtype=jnp.float32)
+                one_hot, ape_val, precision=lax.Precision.HIGHEST
+            )  #  (tile_n, state_width)
+            existing_acc = load_from_acc_ref(
+                acc_ref.at[buf_idx, ...], dtype=jnp.float32
+            )
             new_acc = existing_acc + ape_selected  # (tile_n, state_width)
             store_to_acc_ref(acc_ref.at[buf_idx], new_acc)
 
@@ -227,8 +227,7 @@ def kernel(
             prod = _matmul()
 
             # 4. Unified Accumulate/Assign
-            acc_val = load_from_acc_ref(acc_ref.at[buf_idx, ...],
-                                        dtype=jnp.float32)
+            acc_val = load_from_acc_ref(acc_ref.at[buf_idx, ...], dtype=jnp.float32)
             old_acc = lax.select(
                 k_idx > 0,
                 acc_val,
@@ -280,8 +279,8 @@ def kernel(
         memory_space=pltpu.VMEM,
     )
     positions_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n, ),
-        lambda n, m, k: (n, ),
+        (cfgs.tile_sizes.tile_n,),
+        lambda n, m, k: (n,),
         memory_space=pltpu.VMEM,
     )
 
@@ -319,8 +318,7 @@ def kernel(
 
 
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
-    """Largest 128-aligned k tile that *divides* ``size_k``.
-    """
+    """Largest 128-aligned k tile that *divides* ``size_k``."""
     cap = max(align, (min(cap, size_k) // align) * align)
     for cand in range(cap, 0, -align):
         if size_k % cand == 0:
@@ -348,18 +346,18 @@ def proj_and_save_state(
 ) -> jax.Array:
     """Projects hidden states and saves them to the KV cache in HBM.
 
-  Args:
-    hidden_states: Input hidden states.
-    wkv_wgate: Projection weights.
-    ape: Absolute Position Embeddings.
-    positions: Token positions.
-    slot_mapping: Mapping from token index to cache slot.
-    cache: KV cache tensor in HBM (updated in-place).
-    compress_ratio: APE compression ratio.
+    Args:
+      hidden_states: Input hidden states.
+      wkv_wgate: Projection weights.
+      ape: Absolute Position Embeddings.
+      positions: Token positions.
+      slot_mapping: Mapping from token index to cache slot.
+      cache: KV cache tensor in HBM (updated in-place).
+      compress_ratio: APE compression ratio.
 
-  Returns:
-    The updated KV cache tensor.
-  """
+    Returns:
+      The updated KV cache tensor.
+    """
     num_tokens, hidden_size = hidden_states.shape
     _, state_dim = wkv_wgate.shape
 
@@ -399,8 +397,8 @@ def proj_and_save_state(
     slots_per_m_tile = tile_m // last_dim
     scratch_shapes = [
         pltpu.VMEM((2, tile_n, slots_per_m_tile, 1, last_dim), jnp.float32),
-        pltpu.SemaphoreType.REGULAR((2, )),
-        pltpu.SMEM((2, ), jnp.int32),
+        pltpu.SemaphoreType.REGULAR((2,)),
+        pltpu.SMEM((2,), jnp.int32),
     ]
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
@@ -415,15 +413,16 @@ def proj_and_save_state(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # positions
                 pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
                 pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
-                pl.BlockSpec(
-                    memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
+                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
                 pl.BlockSpec(memory_space=pltpu.HBM),  # cache
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
         ),
         input_output_aliases={5: 0},  # Alias output to cache (index 5)
-        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, ),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+        ),
         interpret=interpret,
         name="proj_and_save_state",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)

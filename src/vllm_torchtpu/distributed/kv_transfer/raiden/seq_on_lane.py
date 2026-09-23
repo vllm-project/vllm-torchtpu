@@ -39,11 +39,18 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-    PoolByteSpan, PoolSpanRegistration, lower_gdn_state_shard_spans,
-    owned_token_ranges)
+    PoolByteSpan,
+    PoolSpanRegistration,
+    lower_gdn_state_shard_spans,
+    owned_token_ranges,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
-    FaLayoutHook, GdnHeadGeometry, PoolManifest, RegionSpec,
-    build_qwen35_pool_manifest)
+    FaLayoutHook,
+    GdnHeadGeometry,
+    PoolManifest,
+    RegionSpec,
+    build_qwen35_pool_manifest,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden.tags import TAG_FA, class_tag
 
 # One vreg lane row: the DMA / tile granule of the layout.
@@ -107,32 +114,35 @@ class SolFaGeometry:
         if dst_shards <= 0 or self.num_kv_heads % dst_shards:
             raise SeqOnLaneError(
                 "destination shards must divide the local KV head count: "
-                f"num_kv_heads={self.num_kv_heads}, dst_shards={dst_shards}")
+                f"num_kv_heads={self.num_kv_heads}, dst_shards={dst_shards}"
+            )
         return self.kernel_page_bytes // dst_shards
 
 
-def sol_fa_geometry_from_shape(shape: Sequence[int],
-                               *,
-                               itemsize: int = 1) -> SolFaGeometry:
+def sol_fa_geometry_from_shape(
+    shape: Sequence[int], *, itemsize: int = 1
+) -> SolFaGeometry:
     """Validates ``[pages, kv_rows, packed_rows, 4, page_tokens]`` fp8 and
     returns its geometry; any other shape (notably the token-major
     ``[pages, page_tokens, groups, 4, head_dim]``) is refused."""
     dims = tuple(int(d) for d in shape)
     if len(dims) != 5:
-        raise SeqOnLaneError(
-            f"seq-on-lane FA cache must be rank-5: got shape {dims}")
+        raise SeqOnLaneError(f"seq-on-lane FA cache must be rank-5: got shape {dims}")
     if itemsize != 1:
         raise SeqOnLaneError(
-            f"seq-on-lane FA cache must be fp8 (itemsize 1): got {itemsize}")
+            f"seq-on-lane FA cache must be fp8 (itemsize 1): got {itemsize}"
+        )
     pages, kv_rows, packed_rows, packing, page_tokens = dims
     if packing != PACKING:
         raise SeqOnLaneError(
             f"seq-on-lane FA cache packing must be {PACKING}: got {packing} "
-            f"(shape {dims})")
+            f"(shape {dims})"
+        )
     if page_tokens <= 0 or page_tokens % LANE_WIDTH:
         raise SeqOnLaneError(
             "seq-on-lane FA cache kernel page must be a whole number of "
-            f"{LANE_WIDTH}-lane tiles: got {page_tokens} (shape {dims})")
+            f"{LANE_WIDTH}-lane tiles: got {page_tokens} (shape {dims})"
+        )
     if pages <= 0 or kv_rows <= 0 or packed_rows <= 0:
         raise SeqOnLaneError(f"seq-on-lane FA cache has an empty dim: {dims}")
     # The kernel pads head_dim to a multiple of sublanes*packing (32); a
@@ -146,30 +156,35 @@ def sol_fa_geometry_from_shape(shape: Sequence[int],
     if kv_rows % 2:
         raise SeqOnLaneError(
             "seq-on-lane FA cache kv_rows must be even (K and V per KV "
-            f"head): got {kv_rows}")
-    return SolFaGeometry(kv_rows=kv_rows,
-                         packed_rows=packed_rows,
-                         page_tokens=page_tokens)
+            f"head): got {kv_rows}"
+        )
+    return SolFaGeometry(
+        kv_rows=kv_rows, packed_rows=packed_rows, page_tokens=page_tokens
+    )
 
 
-def sol_fa_regions(*, block_size_tokens: int,
-                   geometry: SolFaGeometry) -> tuple[RegionSpec, ...]:
+def sol_fa_regions(
+    *, block_size_tokens: int, geometry: SolFaGeometry
+) -> tuple[RegionSpec, ...]:
     """One dense region per manager block: ``num_units`` kernel pages of
     ``num_kv_heads`` K+V head pairs each (compact-live == physical)."""
     if block_size_tokens <= 0 or block_size_tokens % geometry.page_tokens:
         raise SeqOnLaneError(
             "seq-on-lane manager block must be a whole number of kernel "
             f"pages: block_size={block_size_tokens}, "
-            f"kernel_page={geometry.page_tokens}")
+            f"kernel_page={geometry.page_tokens}"
+        )
     kernel_pages = block_size_tokens // geometry.page_tokens
-    return (RegionSpec(
-        name=SOL_REGION_NAME,
-        offset_bytes=0,
-        stride_bytes=geometry.kernel_page_bytes,
-        unit_bytes=geometry.pair_bytes,
-        num_units=kernel_pages,
-        units_per_stride=geometry.num_kv_heads,
-    ), )
+    return (
+        RegionSpec(
+            name=SOL_REGION_NAME,
+            offset_bytes=0,
+            stride_bytes=geometry.kernel_page_bytes,
+            unit_bytes=geometry.pair_bytes,
+            num_units=kernel_pages,
+            units_per_stride=geometry.num_kv_heads,
+        ),
+    )
 
 
 class SolFaLayout(FaLayoutHook):
@@ -181,29 +196,38 @@ class SolFaLayout(FaLayoutHook):
         geometry = sol_fa_geometry_from_shape(shape)
         return int(shape[0]) * geometry.page_tokens
 
-    def regions(self, *, block_size_tokens: int, shape: Sequence[int],
-                nbytes: int, num_kv_heads: int, head_size: int,
-                itemsize: int) -> tuple[RegionSpec, ...]:
+    def regions(
+        self,
+        *,
+        block_size_tokens: int,
+        shape: Sequence[int],
+        nbytes: int,
+        num_kv_heads: int,
+        head_size: int,
+        itemsize: int,
+    ) -> tuple[RegionSpec, ...]:
         geometry = sol_fa_geometry_from_shape(shape, itemsize=itemsize)
         if geometry.kv_rows != 2 * int(num_kv_heads):
             raise SeqOnLaneError(
                 "seq-on-lane FA cache kv_rows disagree with the cache spec: "
                 f"shape has {geometry.kv_rows}, spec num_kv_heads="
-                f"{num_kv_heads}")
+                f"{num_kv_heads}"
+            )
         # head_size may be padded up to a multiple of 8*packing (=32) by the
         # kernel; the live tensor is authoritative, the spec only bounds it.
         if geometry.head_dim < int(head_size):
             raise SeqOnLaneError(
                 "seq-on-lane FA cache head_dim is smaller than the spec's: "
-                f"shape {geometry.head_dim} < spec {head_size}")
+                f"shape {geometry.head_dim} < spec {head_size}"
+            )
         total = int(shape[0]) * geometry.page_tokens
         if nbytes != total * geometry.bytes_per_token:
             raise SeqOnLaneError(
                 "seq-on-lane FA cache byte size disagrees with its shape: "
                 f"nbytes={nbytes}, tokens={total}, "
-                f"bytes_per_token={geometry.bytes_per_token}")
-        return sol_fa_regions(block_size_tokens=block_size_tokens,
-                              geometry=geometry)
+                f"bytes_per_token={geometry.bytes_per_token}"
+            )
+        return sol_fa_regions(block_size_tokens=block_size_tokens, geometry=geometry)
 
 
 def build_qwen35_pool_manifest_sol(
@@ -231,28 +255,29 @@ def build_qwen35_pool_manifest_sol(
 
 def sol_fa_geometry_from_manifest(manifest: PoolManifest) -> SolFaGeometry:
     """The admitted FA geometry (validated against the FA storage shape)."""
-    fa_pools = [
-        pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA
-    ]
+    fa_pools = [pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA]
     if not fa_pools:
         raise SeqOnLaneError("manifest has no FA pool")
     storage = manifest.storages[fa_pools[0].storage_index]
     shape = tuple(int(d) for d in getattr(storage, "shape", ()))
-    itemsize = int(storage.element_size()) if hasattr(storage,
-                                                      "element_size") else 1
+    itemsize = int(storage.element_size()) if hasattr(storage, "element_size") else 1
     geometry = sol_fa_geometry_from_shape(shape, itemsize=itemsize)
     for pool in fa_pools:
         if len(pool.regions) != 1 or pool.regions[0].name != SOL_REGION_NAME:
             raise SeqOnLaneError(
                 "FA pools were not admitted with seq-on-lane regions "
-                f"({pool.layer_name}: {[r.name for r in pool.regions]})")
+                f"({pool.layer_name}: {[r.name for r in pool.regions]})"
+            )
         region = pool.regions[0]
-        if (region.stride_bytes != geometry.kernel_page_bytes
-                or region.unit_bytes != geometry.pair_bytes
-                or region.units_per_stride != geometry.num_kv_heads):
+        if (
+            region.stride_bytes != geometry.kernel_page_bytes
+            or region.unit_bytes != geometry.pair_bytes
+            or region.units_per_stride != geometry.num_kv_heads
+        ):
             raise SeqOnLaneError(
                 f"FA pool {pool.layer_name} regions disagree with the "
-                "seq-on-lane geometry")
+                "seq-on-lane geometry"
+            )
     return geometry
 
 
@@ -267,12 +292,14 @@ def sol_fa_page_tokens(manifest: PoolManifest) -> int:
         page_tokens.add(int(pool.regions[0].num_units) * geometry.page_tokens)
     if len(page_tokens) != 1:
         raise SeqOnLaneError(
-            f"FA page geometry differs across pools: {sorted(page_tokens)}")
+            f"FA page geometry differs across pools: {sorted(page_tokens)}"
+        )
     return next(iter(page_tokens))
 
 
-def sol_fa_skip_bytes(skip_tokens: int, *, geometry: SolFaGeometry,
-                      dst_shards: int) -> int:
+def sol_fa_skip_bytes(
+    skip_tokens: int, *, geometry: SolFaGeometry, dst_shards: int
+) -> int:
     """Prefix-aware clip in one destination shard's compact byte space: a
     locally cached prefix can only be skipped in whole kernel pages."""
     if skip_tokens <= 0:
@@ -280,9 +307,9 @@ def sol_fa_skip_bytes(skip_tokens: int, *, geometry: SolFaGeometry,
     if skip_tokens % geometry.page_tokens:
         raise SeqOnLaneError(
             "seq-on-lane prefix clip must be a whole number of kernel pages: "
-            f"skip_tokens={skip_tokens}, page_tokens={geometry.page_tokens}")
-    return (skip_tokens //
-            geometry.page_tokens) * geometry.shard_bytes(dst_shards)
+            f"skip_tokens={skip_tokens}, page_tokens={geometry.page_tokens}"
+        )
+    return (skip_tokens // geometry.page_tokens) * geometry.shard_bytes(dst_shards)
 
 
 def _tp_head_range(heads: int, degree: int, rank: int) -> tuple[int, int]:
@@ -294,7 +321,8 @@ def _tp_head_range(heads: int, degree: int, rank: int) -> tuple[int, int]:
     unique = min(heads, degree)
     if heads % unique or degree % unique:
         raise SeqOnLaneError(
-            f"KV heads and TP degree must divide evenly: {heads=}, {degree=}")
+            f"KV heads and TP degree must divide evenly: {heads=}, {degree=}"
+        )
     width = heads // unique
     start = (rank // (degree // unique)) * width
     return start, start + width
@@ -341,80 +369,95 @@ def lower_fa_spans_sol(
         raise SeqOnLaneError("num_tokens must be positive")
     if parallelism <= 0 or not 0 <= transfer_rank < parallelism:
         raise SeqOnLaneError(
-            f"transfer_rank {transfer_rank} is outside parallelism "
-            f"{parallelism}")
+            f"transfer_rank {transfer_rank} is outside parallelism {parallelism}"
+        )
     kp_tokens = geometry.page_tokens
     if parallelism > 1 and interleave_tokens != kp_tokens:
         raise SeqOnLaneError(
             "seq-on-lane PCP lowering requires cp_kv_cache_interleave_size "
             f"== kernel page ({kp_tokens}) (decision D1): got "
-            f"{interleave_tokens}")
+            f"{interleave_tokens}"
+        )
     if page_tokens <= 0 or page_tokens % kp_tokens:
         raise SeqOnLaneError(
             "seq-on-lane manager page must be a whole number of kernel "
-            f"pages: page_tokens={page_tokens}, kernel_page={kp_tokens}")
-    heads = (geometry.num_kv_heads *
-             producer_tp_size if total_kv_heads is None else total_kv_heads)
-    src_start, src_end = _tp_head_range(heads, producer_tp_size,
-                                        producer_tp_rank)
+            f"pages: page_tokens={page_tokens}, kernel_page={kp_tokens}"
+        )
+    heads = (
+        geometry.num_kv_heads * producer_tp_size
+        if total_kv_heads is None
+        else total_kv_heads
+    )
     if producer_tp_size > 1 and total_kv_heads is None:
         raise SeqOnLaneError("total_kv_heads is required for a TP producer")
+    src_start, src_end = _tp_head_range(heads, producer_tp_size, producer_tp_rank)
     if src_end - src_start != geometry.num_kv_heads:
-        raise SeqOnLaneError(
-            "source head geometry disagrees with TP ownership")
+        raise SeqOnLaneError("source head geometry disagrees with TP ownership")
     if dst_dcp_size <= 0 or dst_shards <= 0 or dst_shards % dst_dcp_size:
         raise SeqOnLaneError("DCP size must divide destination TP degree")
     destinations = [
         _tp_head_range(heads, dst_shards, rank) for rank in range(dst_shards)
     ]
     for base in range(0, dst_shards, dst_dcp_size):
-        if any(head_range != destinations[base]
-               for head_range in destinations[base:base + dst_dcp_size]):
+        if any(
+            head_range != destinations[base]
+            for head_range in destinations[base : base + dst_dcp_size]
+        ):
             raise SeqOnLaneError("DCP group ranks must own identical KV heads")
     source_replicas = producer_tp_size // min(heads, producer_tp_size)
     is_source_owner = producer_tp_rank % source_replicas == 0
     kps_per_block = page_tokens // kp_tokens
-    ranges = owned_token_ranges(num_tokens=num_tokens,
-                                transfer_rank=transfer_rank,
-                                parallelism=parallelism,
-                                interleave_tokens=interleave_tokens)
+    ranges = owned_token_ranges(
+        num_tokens=num_tokens,
+        transfer_rank=transfer_rank,
+        parallelism=parallelism,
+        interleave_tokens=interleave_tokens,
+    )
     spans: list[PoolByteSpan] = []
     local_kp = 0
     for start, end in ranges:
         if start % kp_tokens:
             raise SeqOnLaneError(
                 "PCP chunk does not start on a kernel page boundary: "
-                f"start={start}, kernel_page={kp_tokens}")
+                f"start={start}, kernel_page={kp_tokens}"
+            )
         first_kp = start // kp_tokens
         last_kp = (end + kp_tokens - 1) // kp_tokens  # exclusive; tail whole
         for global_kp in range(first_kp, last_kp):
             block_ordinal, in_block_kp = divmod(local_kp, kps_per_block)
             for shard, (dst_start, dst_end) in enumerate(destinations):
-                start, end = max(src_start, dst_start), min(src_end, dst_end)
-                if (not is_source_owner or start >= end
-                        or global_kp % dst_dcp_size != shard % dst_dcp_size):
+                head_start, head_end = max(src_start, dst_start), min(src_end, dst_end)
+                if (
+                    not is_source_owner
+                    or head_start >= head_end
+                    or global_kp % dst_dcp_size != shard % dst_dcp_size
+                ):
                     continue
                 dst_page_bytes = (dst_end - dst_start) * geometry.pair_bytes
                 spans.append(
                     PoolByteSpan(
                         src_block_ordinal=block_ordinal,
                         src_offset_bytes=(
-                            in_block_kp * geometry.kernel_page_bytes +
-                            (start - src_start) * geometry.pair_bytes),
+                            in_block_kp * geometry.kernel_page_bytes
+                            + (head_start - src_start) * geometry.pair_bytes
+                        ),
                         dst_block_index=0,
                         dst_offset_bytes=(
-                            (global_kp // dst_dcp_size) * dst_page_bytes +
-                            (start - dst_start) * geometry.pair_bytes),
-                        size_bytes=(end - start) * geometry.pair_bytes,
+                            (global_kp // dst_dcp_size) * dst_page_bytes
+                            + (head_start - dst_start) * geometry.pair_bytes
+                        ),
+                        size_bytes=(head_end - head_start) * geometry.pair_bytes,
                         dst_unit_ordinal=(shard if dst_shards > 1 else None),
-                    ))
+                    )
+                )
             local_kp += 1
     expected_blocks = (local_kp + kps_per_block - 1) // kps_per_block
     if len(block_ids) != expected_blocks:
         raise SeqOnLaneError(
             "block_ids do not match dense kernel-page packing: "
             f"got {len(block_ids)}, expected {expected_blocks} for "
-            f"{local_kp} owned kernel pages")
+            f"{local_kp} owned kernel pages"
+        )
     return PoolSpanRegistration(
         tag=TAG_FA,
         block_ids=tuple(int(block_id) for block_id in block_ids),
@@ -456,9 +499,12 @@ def lower_gdn_state_shard_spans_sol(
     # Worker enumeration is PCP-major, but GDN head ownership follows the
     # (TP, PCP) state axis in gdn_attention._gdn_pcp_tp_state_axis. DCP only
     # partitions FA history; it does not partition GDN recurrent states.
-    if (parallelism <= 0 or not 0 <= transfer_rank < parallelism
-            or producer_tp_size <= 0
-            or not 0 <= producer_tp_rank < producer_tp_size):
+    if (
+        parallelism <= 0
+        or not 0 <= transfer_rank < parallelism
+        or producer_tp_size <= 0
+        or not 0 <= producer_tp_rank < producer_tp_size
+    ):
         raise SeqOnLaneError("invalid producer PCP/TP rank or degree")
     transfer_rank += producer_tp_rank * parallelism
     parallelism *= producer_tp_size
@@ -470,11 +516,13 @@ def lower_gdn_state_shard_spans_sol(
             block_id=block_id,
             regions=regions,
             dst_shards=dst_shards,
-            physical_granule_bytes=physical_granule_bytes)
+            physical_granule_bytes=physical_granule_bytes,
+        )
     if parallelism % dst_shards:
         raise SeqOnLaneError(
             "destination shards must divide the producer parallelism: "
-            f"parallelism={parallelism}, dst_shards={dst_shards}")
+            f"parallelism={parallelism}, dst_shards={dst_shards}"
+        )
     if dst_shards == 1:
         return lower_gdn_state_shard_spans(
             tag=tag,
@@ -482,7 +530,8 @@ def lower_gdn_state_shard_spans_sol(
             transfer_rank=transfer_rank,
             parallelism=parallelism,
             regions=regions,
-            physical_granule_bytes=physical_granule_bytes)
+            physical_granule_bytes=physical_granule_bytes,
+        )
     fan_in = parallelism // dst_shards
     shard, rank_in_shard = divmod(int(transfer_rank), fan_in)
     registration = lower_gdn_state_shard_spans(
@@ -491,12 +540,14 @@ def lower_gdn_state_shard_spans_sol(
         transfer_rank=rank_in_shard,
         parallelism=fan_in,
         regions=regions,
-        physical_granule_bytes=physical_granule_bytes)
+        physical_granule_bytes=physical_granule_bytes,
+    )
     return dataclasses.replace(
         registration,
         spans=tuple(
             dataclasses.replace(span, dst_unit_ordinal=shard)
-            for span in registration.spans),
+            for span in registration.spans
+        ),
     )
 
 
@@ -519,7 +570,8 @@ def _lower_gdn_state_split_spans(
         transfer_rank=0,
         parallelism=1,
         regions=regions,
-        physical_granule_bytes=physical_granule_bytes)
+        physical_granule_bytes=physical_granule_bytes,
+    )
     spans: list[PoolByteSpan] = []
     segments = list(full.spans)  # conv: [QK, V] strided x taps; ssm: [one]
     if not segments:
@@ -531,12 +583,14 @@ def _lower_gdn_state_split_spans(
         if span.size_bytes % dst_shards:
             raise SeqOnLaneError(
                 f"{tag} segment of {span.size_bytes} B does not split into "
-                f"{dst_shards} shards")
+                f"{dst_shards} shards"
+            )
         part = span.size_bytes // dst_shards
-        if part % WORD_ROW_BYTES:
+        if part % physical_granule_bytes:
             raise SeqOnLaneError(
                 f"{tag} shard segment {part} B is not a whole physical "
-                f"word-row ({WORD_ROW_BYTES} B)")
+                f"granule ({physical_granule_bytes} B)"
+            )
         for shard in range(dst_shards):
             spans.append(
                 PoolByteSpan(
@@ -549,7 +603,8 @@ def _lower_gdn_state_split_spans(
                     dst_stride_bytes=shard_row if span.count > 1 else 0,
                     count=span.count,
                     dst_unit_ordinal=shard,
-                ))
+                )
+            )
         dst_segment_base += part
     return dataclasses.replace(full, spans=tuple(spans))
 
@@ -561,10 +616,9 @@ def _default_layout_getter(tensor: Any) -> Any:
 
 
 def canonical_fingerprint(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(dict(payload),
-                         sort_keys=True,
-                         separators=(",", ":"),
-                         ensure_ascii=True).encode("ascii")
+    encoded = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -584,28 +638,34 @@ def measured_sol_layout_fingerprint(
     consumers hash identically.
     """
     geometry = sol_fa_geometry_from_manifest(manifest)
-    fa_pool = next(pool for pool in manifest.pools
-                   if class_tag(pool.tag) == TAG_FA)
+    fa_pool = next(pool for pool in manifest.pools if class_tag(pool.tag) == TAG_FA)
     tensor = manifest.storages[fa_pool.storage_index]
     getter = layout_getter or _default_layout_getter
     layout = getter(tensor)
     if layout is None:
         raise RuntimeError(
-            "admitted seq-on-lane FA storage has no materialized TPU layout")
+            "admitted seq-on-lane FA storage has no materialized TPU layout"
+        )
     raw_minor_to_major, raw_tiles, raw_element_bits = layout
     minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
     tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
     element_bits = int(raw_element_bits or 8)
     if minor_to_major != EXPECTED_SOL_MINOR_TO_MAJOR:
-        raise RuntimeError("seq-on-lane FA layout failed E0' minor-to-major "
-                           f"gate: measured={minor_to_major} "
-                           f"expected={EXPECTED_SOL_MINOR_TO_MAJOR}")
+        raise RuntimeError(
+            "seq-on-lane FA layout failed E0' minor-to-major "
+            f"gate: measured={minor_to_major} "
+            f"expected={EXPECTED_SOL_MINOR_TO_MAJOR}"
+        )
     if tiles != EXPECTED_SOL_TILES:
-        raise RuntimeError("seq-on-lane FA layout failed E0' tile gate: "
-                           f"measured={tiles} expected={EXPECTED_SOL_TILES}")
+        raise RuntimeError(
+            "seq-on-lane FA layout failed E0' tile gate: "
+            f"measured={tiles} expected={EXPECTED_SOL_TILES}"
+        )
     if element_bits != 8:
-        raise RuntimeError("seq-on-lane FA layout failed E0' element-size "
-                           f"gate: measured={element_bits} expected=8")
+        raise RuntimeError(
+            "seq-on-lane FA layout failed E0' element-size "
+            f"gate: measured={element_bits} expected=8"
+        )
     version = package_version or importlib.metadata.version
     qk_pair = bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", True))
     payload = {

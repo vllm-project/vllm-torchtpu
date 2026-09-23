@@ -38,21 +38,29 @@ def test_chip_coordinates_and_runtime_rank_order(monkeypatch):
     result = topology.get_chip_topology()
     assert result.chips == [[4, 5], [8, 9]]
     assert result.device_ids == [9, 5, 8, 4]
-    assert [result.chip_of(r) for r in range(4)] == [(1, 1), (0, 1), (1, 0),
-                                                     (0, 0)]
-    assert [topology.hierarchical_moe_split(4, r)
-            for r in range(4)] == [(2, 1, 2, 1), (2, 0, 2, 1), (2, 1, 2, 0),
-                                   (2, 0, 2, 0)]
+    assert [result.chip_of(r) for r in range(4)] == [(1, 1), (0, 1), (1, 0), (0, 0)]
+    assert [topology.hierarchical_moe_split(4, r) for r in range(4)] == [
+        (2, 1, 2, 1),
+        (2, 0, 2, 1),
+        (2, 1, 2, 0),
+        (2, 0, 2, 0),
+    ]
     assert topology.get_chip_topology() is result
     enumerate_devices.assert_called_once_with()
 
 
-@pytest.mark.parametrize("devices", [[], [SimpleNamespace(id=0)],
-                                     [
-                                         SimpleNamespace(id=0, coords=(0, )),
-                                         SimpleNamespace(id=1, coords=(0, )),
-                                         SimpleNamespace(id=2, coords=(1, ))
-                                     ]])
+@pytest.mark.parametrize(
+    "devices",
+    [
+        [],
+        [SimpleNamespace(id=0)],
+        [
+            SimpleNamespace(id=0, coords=(0,)),
+            SimpleNamespace(id=1, coords=(0,)),
+            SimpleNamespace(id=2, coords=(1,)),
+        ],
+    ],
+)
 def test_unusable_topology_returns_none(monkeypatch, devices):
     monkeypatch.setattr(jax, "devices", lambda: devices)
     assert topology.get_chip_topology() is None
@@ -60,18 +68,20 @@ def test_unusable_topology_returns_none(monkeypatch, devices):
 
 
 def test_device_enumeration_failure_returns_none(monkeypatch):
-    monkeypatch.setattr(jax, "devices",
-                        Mock(side_effect=RuntimeError("no runtime")))
+    monkeypatch.setattr(jax, "devices", Mock(side_effect=RuntimeError("no runtime")))
     assert topology.get_chip_topology() is None
 
 
-@pytest.mark.parametrize("chips,ids,world_size",
-                         [([[0], [1]], [0, 1], 2),
-                          ([[0, 1], [2, 3]], [0, 1, 2, 3], 2), ([], [], 0)])
+@pytest.mark.parametrize(
+    "chips,ids,world_size",
+    [([[0], [1]], [0, 1], 2), ([[0, 1], [2, 3]], [0, 1, 2, 3], 2), ([], [], 0)],
+)
 def test_hierarchical_split_requires_full_multicore_world(
-        monkeypatch, chips, ids, world_size):
-    monkeypatch.setattr(topology, "get_chip_topology",
-                        lambda: topology.ChipTopology(chips, ids))
+    monkeypatch, chips, ids, world_size
+):
+    monkeypatch.setattr(
+        topology, "get_chip_topology", lambda: topology.ChipTopology(chips, ids)
+    )
     assert topology.hierarchical_moe_split(world_size, 0) is None
 
 

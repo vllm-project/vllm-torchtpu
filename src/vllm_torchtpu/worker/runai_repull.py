@@ -66,8 +66,7 @@ ranks do not re-pull.
 
 import os
 
-from vllm.model_executor.model_loader.weight_utils import (atomic_writer,
-                                                           get_lock)
+from vllm.model_executor.model_loader.weight_utils import atomic_writer, get_lock
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 
 from vllm_torchtpu.logger import init_logger
@@ -89,8 +88,9 @@ def _is_complete(local_dir: str) -> bool:
     # Populated by the API server's own pull (no worker-side sentinel) —
     # complete by construction: __post_init__ returned before the engine
     # spawned any worker.
-    return (os.path.exists(os.path.join(local_dir, "config.json"))
-            and not os.path.exists(os.path.join(local_dir, PULLING_SENTINEL)))
+    return os.path.exists(
+        os.path.join(local_dir, "config.json")
+    ) and not os.path.exists(os.path.join(local_dir, PULLING_SENTINEL))
 
 
 def ensure_runai_aux_files(model_config) -> None:
@@ -126,7 +126,10 @@ def ensure_runai_aux_files(model_config) -> None:
             return
         logger.info(
             "[runai-repull] pulling aux files for %s on this host "
-            "(model_config.model=%s)", uri, model_config.model)
+            "(model_config.model=%s)",
+            uri,
+            model_config.model,
+        )
         # Upstream treats a set model_weights as "already pulled".
         model_config.model_weights = None
         if rewritten:
@@ -146,12 +149,18 @@ def _report_tokenizer_gap(model_config) -> None:
     does not retain that URI — so it cannot be mirrored here. Say so
     instead of letting the worker die on an opaque repo-id error."""
     tokenizer = model_config.tokenizer
-    if (tokenizer and tokenizer != model_config.model
-            and not is_runai_obj_uri(tokenizer) and os.path.isabs(tokenizer)
-            and not os.path.isdir(tokenizer)):
+    if (
+        tokenizer
+        and tokenizer != model_config.model
+        and not is_runai_obj_uri(tokenizer)
+        and os.path.isabs(tokenizer)
+        and not os.path.isdir(tokenizer)
+    ):
         logger.error(
             "[runai-repull] tokenizer dir %s is missing on this host and its "
             "object-storage URI is not retained on ModelConfig, so it cannot "
             "be re-pulled; any worker-side tokenizer use will fail. Pass the "
             "model URI as --tokenizer (shared dir) or stage the tokenizer on "
-            "every host.", tokenizer)
+            "every host.",
+            tokenizer,
+        )

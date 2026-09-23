@@ -134,7 +134,7 @@ class RpaCase(enum.StrEnum):
     def get_range(
         self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
-        assert distribution.shape == (3, )
+        assert distribution.shape == (3,)
         match self:
             case RpaCase.DECODE:
                 return 0, distribution[0]
@@ -199,8 +199,9 @@ class RpaConfigs:
         # dma_q: 2 * 4 = 8
         # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
         # dma_kv_new: bkv_p_new * self.dma_kv_new_size * 4
-        bytes_per_step = (28 + 12 * self.bkv_p_cache +
-                          4 * self.dma_kv_new_size * self.bkv_p_new)
+        bytes_per_step = (
+            28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
+        )
         bytes_per_step *= self.block.batch_size
 
         max_steps_ub = available_bytes // bytes_per_step
@@ -229,8 +230,7 @@ class RpaConfigs:
 
     @property
     def bkv_stride(self) -> int:
-        bkv_stride = pl.cdiv(self.model.num_kv_heads * 2,
-                             self.serve.packing_kv)
+        bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
         if utils.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
@@ -247,8 +247,7 @@ class RpaConfigs:
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return utils.align_to(self.model.head_dim,
-                                  num_sublanes * kv_packing)
+            return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
         return utils.align_to(self.model.head_dim, num_lanes)
 
     @property
@@ -266,8 +265,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
-        return utils.align_to(self.model.num_kv_heads * 2,
-                              kv_packing) // kv_packing
+        return utils.align_to(self.model.num_kv_heads * 2, kv_packing) // kv_packing
 
     @property
     def fuse_accum(self) -> bool:
@@ -275,8 +273,7 @@ class RpaConfigs:
 
     @property
     def q_vmem_shape(self):
-        q_per_kv_packing = (self.aligned_num_q_heads_per_kv_head //
-                            self.serve.packing_q)
+        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
@@ -344,23 +341,27 @@ class RpaConfigs:
 
         if not q.ndim == k.ndim == v.ndim == 3:
             raise ValueError(
-                f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")
+                f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}"
+            )
         if k.shape != v.shape:
             raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
         if not (q.shape[0] == k.shape[0] == v.shape[0]):
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
-                f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}")
+                f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}"
+            )
         if not (q.shape[2] == k.shape[2] == v.shape[2]):
             raise ValueError(
                 "Expected number of head dimensions in Q, K, and V to be the same,"
-                f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}")
+                f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}"
+            )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             if self.serve.page_size != 128:
                 raise ValueError(
                     "Expected page_size=128 for SEQ_ALONG_LANE tile alignment, but got"
-                    f" {self.serve.page_size=}")
+                    f" {self.serve.page_size=}"
+                )
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
                 self.model.num_kv_heads * 2,
@@ -378,28 +379,36 @@ class RpaConfigs:
             )
 
         if kv_cache.shape != expected_kv_cache_shape:
-            raise ValueError(f"Expected {kv_cache.shape=} to be equal to"
-                             f" {expected_kv_cache_shape=}")
+            raise ValueError(
+                f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
+            )
 
         # Integer kv quantization is currently not supported.
         if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
-            raise ValueError(
-                f"Expected {kv_cache.dtype=} to be a floating point.")
+            raise ValueError(f"Expected {kv_cache.dtype=} to be a floating point.")
         if not (kv_cache.dtype == k.dtype == v.dtype):
             raise ValueError(
                 "Expected KV cache dtype and K/V dtype to be the same, but got"
-                f" {kv_cache.dtype=}, {k.dtype=}, and {v.dtype=}")
+                f" {kv_cache.dtype=}, {k.dtype=}, and {v.dtype=}"
+            )
 
-        if not (jnp.int32 == kv_lens.dtype == page_indices.dtype ==
-                cu_q_lens.dtype == distribution.dtype):
+        if not (
+            jnp.int32
+            == kv_lens.dtype
+            == page_indices.dtype
+            == cu_q_lens.dtype
+            == distribution.dtype
+        ):
             raise ValueError(
                 f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
-                f" {cu_q_lens.dtype=}, {distribution.dtype=}")
+                f" {cu_q_lens.dtype=}, {distribution.dtype=}"
+            )
 
         if not (kv_lens.ndim == page_indices.ndim == cu_q_lens.ndim == 1):
             raise ValueError(
                 f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
-                f" {cu_q_lens.shape=}")
+                f" {cu_q_lens.shape=}"
+            )
 
         max_num_seqs = kv_lens.shape[0]
         num_page_indices = page_indices.shape[0]
@@ -407,8 +416,9 @@ class RpaConfigs:
             raise ValueError(
                 f"Expected {num_page_indices=} to be divisible by {max_num_seqs=}."
             )
-        if cu_q_lens.shape != (max_num_seqs + 1, ):
+        if cu_q_lens.shape != (max_num_seqs + 1,):
             raise ValueError(
-                f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
-        if distribution.shape != (3, ):
+                f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},)."
+            )
+        if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")

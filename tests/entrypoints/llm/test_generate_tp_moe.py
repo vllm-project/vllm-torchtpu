@@ -41,12 +41,13 @@ def _print_generation_outputs(test_name: str, outputs) -> None:
         print(f"Generated: {output.outputs[0].text!r}")
 
 
-def _run_moe_generation(async_scheduling: bool,
-                        enable_expert_parallel: bool = False):
+def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = False):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 8:
-        pytest.skip(f"MoE TP test expects an 8-chip agent, found {tp_size} "
-                    "chips; running here would silently reduce TP coverage")
+        pytest.skip(
+            f"MoE TP test expects an 8-chip agent, found {tp_size} "
+            "chips; running here would silently reduce TP coverage"
+        )
 
     llm = LLM(
         model=MOE_MODEL_NAME,
@@ -64,9 +65,9 @@ def _run_moe_generation(async_scheduling: bool,
     try:
         outputs = llm.generate(
             MOE_PROMPTS,
-            sampling_params=SamplingParams(temperature=0.0,
-                                           max_tokens=4,
-                                           ignore_eos=True),
+            sampling_params=SamplingParams(
+                temperature=0.0, max_tokens=4, ignore_eos=True
+            ),
         )
     finally:
         del llm
@@ -76,14 +77,18 @@ def _run_moe_generation(async_scheduling: bool,
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, marks=pytest.mark.nightly, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, marks=pytest.mark.nightly, id="async"),
+    ],
+)
 def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(async_scheduling=async_scheduling)
     _print_generation_outputs(
-        f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs)
+        f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs
+    )
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)
@@ -91,26 +96,32 @@ def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     assert all(output.outputs[0].text.strip() for output in outputs)
     # Greedy decoding of "The capital of France is" must produce "Paris";
     # catches MoE channel-misalignment bugs that yield non-empty token salad.
-    assert "paris" in outputs[0].outputs[0].text.lower(), \
+    assert "paris" in outputs[0].outputs[0].text.lower(), (
         f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
+    )
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, marks=pytest.mark.nightly, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, marks=pytest.mark.nightly, id="async"),
+    ],
+)
 def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(
         async_scheduling=async_scheduling,
         enable_expert_parallel=True,
     )
     _print_generation_outputs(
-        f"MoE EP ({'async' if async_scheduling else 'sync'})", outputs)
+        f"MoE EP ({'async' if async_scheduling else 'sync'})", outputs
+    )
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)
     assert all(len(output.outputs) == 1 for output in outputs)
     assert all(output.outputs[0].text.strip() for output in outputs)
-    assert "paris" in outputs[0].outputs[0].text.lower(), \
+    assert "paris" in outputs[0].outputs[0].text.lower(), (
         f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
+    )

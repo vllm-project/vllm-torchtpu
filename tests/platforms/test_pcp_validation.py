@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
 
@@ -47,21 +48,29 @@ def _vllm_config(
             is_moe_model=is_moe_model,
         ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
-        speculative_config=(None
-                            if speculative_method is None else SimpleNamespace(
-                                method=speculative_method,
-                                num_speculative_tokens=num_speculative_tokens,
-                            )),
-        kv_transfer_config=(None if kv_role is None else SimpleNamespace(
-            kv_role=kv_role,
-            is_kv_producer=kv_role in ("kv_producer", "kv_both"),
-        )),
+        speculative_config=(
+            None
+            if speculative_method is None
+            else SimpleNamespace(
+                method=speculative_method,
+                num_speculative_tokens=num_speculative_tokens,
+            )
+        ),
+        kv_transfer_config=(
+            None
+            if kv_role is None
+            else SimpleNamespace(
+                kv_role=kv_role,
+                is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+            )
+        ),
     )
 
 
 def test_from_vllm_config_records_kv_role():
     config = PcpStaticSupportValidator.from_vllm_config(
-        _vllm_config(kv_role="kv_consumer"))
+        _vllm_config(kv_role="kv_consumer")
+    )
 
     assert config.enabled
     assert config.pcp_size == 4
@@ -76,29 +85,51 @@ def test_from_vllm_config_records_kv_role():
 @pytest.mark.parametrize(
     ("config", "error_type", "message"),
     [
-        (_vllm_config(kv_role="kv_consumer"), NotImplementedError,
-         "KV consumer"),
+        (_vllm_config(kv_role="kv_consumer"), NotImplementedError, "KV consumer"),
         (_vllm_config(dcp_size=2), NotImplementedError, "DCP"),
-        (_vllm_config(pipeline_parallel_size=2), NotImplementedError,
-         "pipeline parallelism"),
-        (_vllm_config(
-            speculative_method="eagle3",
-            num_speculative_tokens=1,
-            kv_role="kv_producer"), NotImplementedError, "method=mtp"),
-        (_vllm_config(speculative_method="mtp",
-                      num_speculative_tokens=2,
-                      kv_role="kv_producer"), NotImplementedError,
-         "num_speculative_tokens=1"),
-        (_vllm_config(speculative_method="mtp", num_speculative_tokens=1),
-         NotImplementedError, "kv_role=kv_producer"),
-        (_vllm_config(interleave_size=0), ValueError,
-         "cp_kv_cache_interleave_size > 0"),
-        (_vllm_config(is_moe_model=True), NotImplementedError,
-         "requires --enable-expert-parallel"),
+        (
+            _vllm_config(pipeline_parallel_size=2),
+            NotImplementedError,
+            "pipeline parallelism",
+        ),
+        (
+            _vllm_config(
+                speculative_method="eagle3",
+                num_speculative_tokens=1,
+                kv_role="kv_producer",
+            ),
+            NotImplementedError,
+            "method=mtp",
+        ),
+        (
+            _vllm_config(
+                speculative_method="mtp",
+                num_speculative_tokens=2,
+                kv_role="kv_producer",
+            ),
+            NotImplementedError,
+            "num_speculative_tokens=1",
+        ),
+        (
+            _vllm_config(speculative_method="mtp", num_speculative_tokens=1),
+            NotImplementedError,
+            "kv_role=kv_producer",
+        ),
+        (
+            _vllm_config(interleave_size=0),
+            ValueError,
+            "cp_kv_cache_interleave_size > 0",
+        ),
+        (
+            _vllm_config(is_moe_model=True),
+            NotImplementedError,
+            "requires --enable-expert-parallel",
+        ),
     ],
 )
 def test_static_validator_rejects_unsupported_platform_config(
-        config, error_type, message):
+    config, error_type, message
+):
     with pytest.raises(error_type, match=message):
         PcpStaticSupportValidator.validate_platform_config(
             config,

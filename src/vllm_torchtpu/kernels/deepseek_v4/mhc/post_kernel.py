@@ -20,32 +20,28 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import \
-    DEFAULT_VMEM_LIMIT_BYTES
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
-def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult,
-                 hidden_size):
+def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
     """One token block of the unrolled stream recombine."""
     x = x_ref[...].astype(jnp.float32)  # (tb, hidden)
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
     streams = [
-        res_ref[:, i * hidden_size:(i + 1) * hidden_size].astype(jnp.float32)
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
         for i in range(hc_mult)
     ]
     for j in range(hc_mult):
-        acc = post[:, j:j + 1] * x
+        acc = post[:, j : j + 1] * x
         for i in range(hc_mult):
             k = i * hc_mult + j
-            acc = acc + comb[:, k:k + 1] * streams[i]
-        out_ref[:, j * hidden_size:(j + 1) * hidden_size] = acc.astype(
-            out_ref.dtype)
+            acc = acc + comb[:, k : k + 1] * streams[i]
+        out_ref[:, j * hidden_size : (j + 1) * hidden_size] = acc.astype(out_ref.dtype)
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("token_block_size", "vmem_limit_bytes"))
+@functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
 def mhc_post_2d(
     x: jax.Array,
     res2d: jax.Array,
@@ -86,8 +82,9 @@ def mhc_post_2d(
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 in/out blocks (x + old streams + new
         # streams) plus f32 accumulator transients; x2 spill headroom.
-        return 2 * (tb * hidden_size *
-                    (2 + 2 * hc_mult * 2) * 2 + tb * hidden_size * 4 * 2)
+        return 2 * (
+            tb * hidden_size * (2 + 2 * hc_mult * 2) * 2 + tb * hidden_size * 4 * 2
+        )
 
     tb, padded_tokens = utils.select_token_block(
         num_tokens,
@@ -95,18 +92,17 @@ def mhc_post_2d(
         vmem_need=_vmem_need,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d,
-                                              post2d, comb2d)
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
-    compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
-                                           vmem_limit_bytes=vmem_limit_bytes,
-                                           disable_bounds_checks=True)
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel",),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
 
     out = pl.pallas_call(
-        functools.partial(_post_kernel,
-                          hc_mult=hc_mult,
-                          hidden_size=hidden_size),
-        grid=(padded_tokens // tb, ),
+        functools.partial(_post_kernel, hc_mult=hc_mult, hidden_size=hidden_size),
+        grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hidden_size), lambda i: (i, 0)),
@@ -114,12 +110,13 @@ def mhc_post_2d(
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
         ],
         out_specs=pl.BlockSpec((tb, hc_mult * hidden_size), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((padded_tokens, hc_mult * hidden_size),
-                                       res2d.dtype),
+        out_shape=jax.ShapeDtypeStruct(
+            (padded_tokens, hc_mult * hidden_size), res2d.dtype
+        ),
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d)
 
-    (out, ) = utils.trim_to(num_tokens, out)
+    (out,) = utils.trim_to(num_tokens, out)
     return out
 
 

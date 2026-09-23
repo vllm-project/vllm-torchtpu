@@ -15,6 +15,7 @@ them look redundant until you know what got through without them:
 * the complement. A kernel that writes correct values into the target slots
   and quietly disturbs their neighbours passes a naive value check.
 """
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -32,8 +33,7 @@ def _pool(shape, seed=0):
 
 def _vals(n, trailing, seed=1):
     rng = np.random.default_rng(seed)
-    return jnp.asarray(rng.standard_normal((n, ) + trailing),
-                       dtype=jnp.bfloat16)
+    return jnp.asarray(rng.standard_normal((n,) + trailing), dtype=jnp.bfloat16)
 
 
 def _reference(pool, indices, vals):
@@ -150,7 +150,7 @@ def test_rank2_num_slots_must_tile_evenly():
     """A partial trailing block would write past the end of the aliased
     output, so this raises rather than corrupting."""
     pool = _pool((4100, LANES * 8))
-    vals = _vals(2, (LANES * 8, ))
+    vals = _vals(2, (LANES * 8,))
 
     with pytest.raises(ValueError, match="multiple of"):
         _scatter(pool, [0, 9], vals)
@@ -169,4 +169,4 @@ def test_dtype_mismatch_raises():
 
 def test_rank1_is_rejected():
     with pytest.raises(ValueError, match="ndim"):
-        _scatter(_pool((4096, )), [0], jnp.zeros((1, ), dtype=jnp.bfloat16))
+        _scatter(_pool((4096,)), [0], jnp.zeros((1,), dtype=jnp.bfloat16))

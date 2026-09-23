@@ -239,10 +239,10 @@ def _sharded_runai_weights_iterator(
 
         def _device_sync() -> None:
             try:
-                torch.tpu.synchronize()
+                torch.accelerator.synchronize()
             except Exception:
                 logger.warning_once(
-                    "[sharded-ep-load] torch.tpu.synchronize() unavailable "
+                    "[sharded-ep-load] torch.accelerator.synchronize() unavailable "
                     "during load; host memory may accumulate.")
 
         progress = tqdm(total=kept,

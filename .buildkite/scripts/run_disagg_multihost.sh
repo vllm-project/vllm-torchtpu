@@ -34,7 +34,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then

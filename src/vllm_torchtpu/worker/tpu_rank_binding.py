@@ -101,7 +101,8 @@ def _get_spawned_pcp_local_rank(
     if not 0 <= local_rank < local_world:
         raise ValueError(
             f"LOCAL_RANK={local_rank_env} is out of range for PCP local "
-            f"world {local_world} with offset {local_rank_offset}.")
+            f"world {local_world} with offset {local_rank_offset}."
+        )
     return local_rank
 
 
@@ -141,16 +142,16 @@ def _slice_binding_from_env(
     if not present:
         return None
     if len(present) != len(_SLICE_BINDING_ENV_VARS):
-        missing = [
-            name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)
-        ]
+        missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
         raise ValueError(
             "Executor-assigned TPU slice binding is incomplete: missing "
-            f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none.")
+            f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none."
+        )
     if pcp_size > 1:
         raise NotImplementedError(
             "Prefill context parallelism is not supported together with "
-            "multihost data parallelism.")
+            "multihost data parallelism."
+        )
 
     world_size = parallel_config.world_size
     slice_rank = int(env[SLICE_RANK_ENV])
@@ -163,18 +164,23 @@ def _slice_binding_from_env(
         raise ValueError(
             f"{SLICE_WORLD_SIZE_ENV}={slice_world} does not match "
             f"world_size ({world_size}) x data_parallel_size ({dp_size}) "
-            f"= {expected_world}.")
+            f"= {expected_world}."
+        )
     if not 0 <= slice_rank < slice_world:
-        raise ValueError(f"{SLICE_RANK_ENV}={slice_rank} is out of range for "
-                         f"slice world size {slice_world}.")
+        raise ValueError(
+            f"{SLICE_RANK_ENV}={slice_rank} is out of range for "
+            f"slice world size {slice_world}."
+        )
     if not 0 < slice_local_world <= slice_world:
         raise ValueError(
             f"{SLICE_LOCAL_WORLD_SIZE_ENV}={slice_local_world} is out of "
-            f"range for slice world size {slice_world}.")
+            f"range for slice world size {slice_world}."
+        )
     if not 0 <= slice_local_rank < slice_local_world:
         raise ValueError(
             f"{SLICE_LOCAL_RANK_ENV}={slice_local_rank} is out of range for "
-            f"slice local world size {slice_local_world}.")
+            f"slice local world size {slice_local_world}."
+        )
 
     return TpuWorkerBinding(
         rank=slice_rank,
@@ -201,8 +207,9 @@ def get_tpu_worker_binding(
 ) -> TpuWorkerBinding:
     world_size = parallel_config.world_size
     pcp_size = parallel_config.prefill_context_parallel_size
-    dp_size = (_get_int_env(env, "TORCH_TPU_DP_SIZE", 0)
-               or parallel_config.data_parallel_size)
+    dp_size = (
+        _get_int_env(env, "TORCH_TPU_DP_SIZE", 0) or parallel_config.data_parallel_size
+    )
     local_rank_offset = _get_int_env(env, "TPU_LOCAL_RANK_OFFSET", 0)
 
     rank = int(rank)
@@ -211,7 +218,8 @@ def get_tpu_worker_binding(
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "
-            "data_parallel_size > 1")
+            "data_parallel_size > 1"
+        )
 
         executor_binding = _slice_binding_from_env(
             env,
