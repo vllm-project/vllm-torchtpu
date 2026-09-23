@@ -4,10 +4,12 @@ Quality and accuracy evaluation runner using lm-evaluation-harness on Cloud TPUs
 Executes standard benchmarks (e.g., MMLU-Pro) via the vLLM OpenAI-compatible endpoint.
 """
 
+import copy
 import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -16,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+import yaml
 from core.env import HF_HOME
 from core.models import BenchmarkResult, ExecutionContext
 from runners.base_runner import BaseVllmRunner
@@ -23,6 +26,61 @@ from runners.base_runner import BaseVllmRunner
 
 class TpuEvalRunner(BaseVllmRunner):
     """Executes accuracy evaluation via lm-evaluation-harness against an OpenAI-compatible vLLM server."""
+
+    @staticmethod
+    def _load_task_overrides(context: ExecutionContext) -> Dict[str, Any]:
+        """Reads ``evaluation.task_overrides`` from the run's metadata.yaml.
+
+        The orchestrator persists the exact sweep config to <output_dir>/metadata.yaml
+        before any runner executes, so this reads the very values the run is recorded
+        against without widening the shared ExecutionContext contract. Returns an empty
+        dict when the file is absent, e.g. when a runner is driven directly in a test.
+        """
+        metadata_file = Path(context.output_dir) / "metadata.yaml"
+        if not metadata_file.is_file():
+            return {}
+        with open(metadata_file) as handle:
+            metadata = yaml.safe_load(handle) or {}
+        return (metadata.get("evaluation") or {}).get("task_overrides") or {}
+
+    def _materialize_task_overrides(self, task_overrides: Dict[str, Any],
+                                    dest_root: Path) -> Path:
+        """Clones upstream lm_eval task YAMLs and merges sweep-config overrides into them.
+
+        lm_eval resolves ``include:`` by loading the base template first and then applying
+        the including file's own keys, so writing the override keys into each leaf task
+        YAML wins without mutating the shared template. The generated tree is written under
+        the run's output directory so every result carries the exact task definitions used.
+        """
+        from lm_eval.tasks import TaskManager
+
+        task_manager = TaskManager()
+        dest_root = Path(dest_root)
+        for group_name, patch in task_overrides.items():
+            index_entry = task_manager.task_index.get(group_name)
+            if index_entry is None:
+                raise KeyError(
+                    f"lm_eval task/group '{group_name}' listed in evaluation.task_overrides "
+                    "was not found in the installed lm_eval task index.")
+            src_dir = Path(index_entry.yaml_path).parent
+            dst_dir = dest_root / group_name
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+
+            patched = []
+            for yaml_path in sorted(dst_dir.glob("*.yaml")):
+                with open(yaml_path) as handle:
+                    task_cfg = yaml.safe_load(handle)
+                # Leaf tasks carry a scalar `task:`; group files carry a list, skip those.
+                if not isinstance(task_cfg, dict) or not isinstance(
+                        task_cfg.get("task"), str):
+                    continue
+                task_cfg.update(copy.deepcopy(patch))
+                with open(yaml_path, "w") as handle:
+                    yaml.safe_dump(task_cfg, handle, sort_keys=False)
+                patched.append(task_cfg["task"])
+            print(f">>> [EVALUATION] Applied task_overrides to {len(patched)} "
+                  f"'{group_name}' subtasks -> {dst_dir}")
+        return dest_root
 
     def execute(self, context: ExecutionContext) -> BenchmarkResult:
         """Launches vLLM server, polls health, runs lm_eval, parses metrics, and cleans up."""
@@ -130,6 +188,14 @@ class TpuEvalRunner(BaseVllmRunner):
             if "humaneval_instruct" in context.tasks or "mbpp_plus_instruct" in context.tasks:
                 eval_env["HF_ALLOW_CODE_EVAL"] = "1"
                 eval_cmd.append("--confirm_run_unsafe_code")
+            # Apply any lm_eval task-definition overrides declared in the sweep config.
+            task_overrides = self._load_task_overrides(context)
+            if task_overrides:
+                overrides_dir = self._materialize_task_overrides(
+                    task_overrides,
+                    Path(context.output_dir) / "lm_eval_task_overrides",
+                )
+                eval_cmd.extend(["--include_path", str(overrides_dir)])
 
             print(
                 f">>> [EVALUATION] Executing lm_eval command: {' '.join(eval_cmd)}"
