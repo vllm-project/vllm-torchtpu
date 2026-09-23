@@ -140,13 +140,6 @@ def inner_kernel(
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
-    if cfg.is_kda and cfg.window_size > 1:
-        # The one-token K3 decode kernel stores the post-SiLU activation in
-        # the model activation dtype before promoting it for the recurrent
-        # math. Preserve that numerical contract for a fused verify window;
-        # otherwise its target logits can drift solely because the KDA window
-        # keeps this intermediate in fp32.
-        qkv_out_compact = qkv_out_compact.astype(cfg.dtypes.act_out).astype(jnp.float32)
 
     # Step 2: GDN.
 

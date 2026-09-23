@@ -250,7 +250,8 @@ def kda_attention_spec_ref(
             )
         if conv_bias is not None:
             acc += conv_bias.astype(jnp.float32)[None, :]
-        conv_out = jax.nn.silu(acc).astype(qkv.dtype)
+        # Keep post-SiLU Q/K/V in FP32 for the fused recurrence.
+        conv_out = jax.nn.silu(acc)
         for t in range(query_len):
             new_conv_state = new_conv_state.at[base + t].set(
                 x_full[t + 1 : t + kernel_size]
