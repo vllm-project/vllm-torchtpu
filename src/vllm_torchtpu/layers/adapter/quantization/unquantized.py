@@ -38,29 +38,38 @@ from typing import Any
 
 import torch
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (RoutedExperts,
-                                                  UnquantizedFusedMoEMethod)
+from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
-from vllm.model_executor.layers.quantization import \
-    register_quantization_config
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig, QuantizeMethodBase)
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.fused_moe import (TpuMoEActivationMixin,
-                                                    fused_moe_gmm,
-                                                    prebuild_fused_moe_kernel)
-from vllm_torchtpu.layers.adapter.linear_common import (KEEP_VLLM_LAYOUT_ATTR,
-                                                        WEIGHT_FLIPPED_ATTR)
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
+    fused_moe_gmm,
+    prebuild_fused_moe_kernel,
+)
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
+    enable_pipelined_collective_and_compute,
+    pipelined_fused_moe_gmm,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import (
-    VllmQuantConfig, should_quantize_on_load)
-from vllm_torchtpu.layers.core.quant_methods import (UNQUANTIZED,
-                                                     get_tpu_quant_method)
+    VllmQuantConfig,
+    should_quantize_on_load,
+)
+from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -95,8 +104,9 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
             # Not a plain dense weight; leave the stock behaviour alone.
             return
         weight = weight.transpose(0, 1).contiguous()
-        replace_parameter(layer, "weight",
-                          torch.nn.Parameter(weight, requires_grad=False))
+        replace_parameter(
+            layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
+        )
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if layer.weight.device.type == "tpu":
             synchronize_tensors([layer.weight])
@@ -172,17 +182,19 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         if isinstance(layer, LinearBase):
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
-            if should_quantize_on_load(
-                    prefix) and "kv_b_proj" not in prefix.split("."):
+            if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
                 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-                    VllmFp8Config, VllmFp8LinearMethodTPU)
+                    VllmFp8Config,
+                    VllmFp8LinearMethodTPU,
+                )
+
                 fp8_config = VllmFp8Config(
                     is_checkpoint_fp8_serialized=False,
                     activation_scheme="dynamic",
                 )
-                return VllmFp8LinearMethodTPU(fp8_config,
-                                              self.get_linear_config(layer),
-                                              prefix=prefix)
+                return VllmFp8LinearMethodTPU(
+                    fp8_config, self.get_linear_config(layer), prefix=prefix
+                )
 
             # TPU-native dense linear: canonical (k, n) weight layout so the
             # forward pass is (m, k) @ (k, n) rather than vLLM's
@@ -199,8 +211,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
-class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
-                                    UnquantizedFusedMoEMethod):
+class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
 
@@ -253,13 +264,13 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
         half = w13_weight.shape[-1] // 2
         aligned_half = (half + 127) // 128 * 128
         if aligned_half != half:
-            pad = w13_weight.new_zeros(
-                (*w13_weight.shape[:-1], aligned_half - half))
+            pad = w13_weight.new_zeros((*w13_weight.shape[:-1], aligned_half - half))
             w13_weight = torch.cat(
-                [w13_weight[..., :half], pad, w13_weight[..., half:], pad],
-                dim=-1).contiguous()
+                [w13_weight[..., :half], pad, w13_weight[..., half:], pad], dim=-1
+            ).contiguous()
             pad2 = w2_weight.new_zeros(
-                (w2_weight.shape[0], aligned_half - half, w2_weight.shape[2]))
+                (w2_weight.shape[0], aligned_half - half, w2_weight.shape[2])
+            )
             w2_weight = torch.cat([w2_weight, pad2], dim=1).contiguous()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
@@ -275,11 +286,10 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
                 w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
 
             if aligned_half != half:
-                bpad = w13_bias.new_zeros(
-                    (*w13_bias.shape[:-1], aligned_half - half))
+                bpad = w13_bias.new_zeros((*w13_bias.shape[:-1], aligned_half - half))
                 w13_bias = torch.cat(
-                    [w13_bias[..., :half], bpad, w13_bias[..., half:], bpad],
-                    dim=-1).contiguous()
+                    [w13_bias[..., :half], bpad, w13_bias[..., half:], bpad], dim=-1
+                ).contiguous()
 
             layer.w13_bias = torch.nn.Parameter(
                 w13_bias.unsqueeze(1).to(torch.float32),
@@ -297,13 +307,14 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
                 to_sync.append(layer.w2_bias)
             synchronize_tensors(to_sync)
 
-        logger.info_once("Unquantized weights transposed for GMM kernel: "
-                         f"w13={list(layer.w13_weight.shape)}, "
-                         f"w2={list(layer.w2_weight.shape)}")
+        logger.info_once(
+            "Unquantized weights transposed for GMM kernel: "
+            f"w13={list(layer.w13_weight.shape)}, "
+            f"w2={list(layer.w2_weight.shape)}"
+        )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
-        moe_routing.register_experts_start_buffer(
-            layer, device=layer.w13_weight.device)
+        moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -320,7 +331,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
         """Forward pass using TPU-native GMM kernel."""
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
-            "[moe] process_weights_after_loading did not run for this layer")
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -333,8 +345,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
             "w2": layer.w2_weight,
             "w1_scale": None,
             "w2_scale": None,
-            "w1_bias": getattr(layer, 'w13_bias', None),
-            "w2_bias": getattr(layer, 'w2_bias', None),
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
             "experts_start": layer._experts_start,

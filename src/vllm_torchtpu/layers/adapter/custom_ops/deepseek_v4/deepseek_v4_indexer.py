@@ -23,17 +23,18 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
-from vllm.models.deepseek_v4.attention import (DeepseekV4Indexer,
-                                               DeepseekV4IndexerCache)
+from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
-    VllmDeepseekCompressor
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    VllmDeepseekCompressor,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
@@ -65,19 +66,27 @@ def _indexer_jax(
         # the compiled signature because torch_tpu jits with keep_unused=True.
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
 
-    def _indexer_local(q, positions, cos_sin_cache, indexer_weights, cache_kv,
-                       seq_lens, page_indices, cu_q_lens, distribution):
+    def _indexer_local(
+        q,
+        positions,
+        cos_sin_cache,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    ):
         # One kernel rotates the queries and quantizes each row on the way out.
         # Note: vLLM's implementation rounds the scale factors up to the next
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
-        q_quant, q_scales = rope_quant(q,
-                                       positions,
-                                       cos_sin_cache,
-                                       quant_dtype=jnp.float8_e4m3fn)
+        q_quant, q_scales = rope_quant(
+            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+        )
 
         # Fold the query quantization scales into the weights.
-        weights = (indexer_weights * softmax_scale * (n_head**-0.5) * q_scales)
+        weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
 
         return streamindex_topk(
             q=q_quant,
@@ -94,9 +103,17 @@ def _indexer_jax(
             num_queries_per_block=(1, 128, 128),
         )
 
-    return _indexer_local(q, positions, cos_sin_cache, indexer_weights,
-                          cache_kv, seq_lens, page_indices, cu_q_lens,
-                          distribution)
+    return _indexer_local(
+        q,
+        positions,
+        cos_sin_cache,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
 
 
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
@@ -142,10 +159,15 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             n_head=self.n_head,
         )
 
-        _scale = f"{self.softmax_scale:.6g}".replace(".", "p").replace(
-            "-", "m").replace("+", "")
-        op_name = (f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
-                   f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}")
+        _scale = (
+            f"{self.softmax_scale:.6g}".replace(".", "p")
+            .replace("-", "m")
+            .replace("+", "")
+        )
+        op_name = (
+            f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
+            f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
+        )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
             return _indexer_op_cache[op_name]
@@ -171,9 +193,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         )
 
         def _fake_indexer(q, *args, **kwargs):
-            return torch.empty((q.shape[0], self.topk_tokens),
-                               dtype=torch.int32,
-                               device=q.device)
+            return torch.empty(
+                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+            )
 
         indexer_jax_op.register_fake(_fake_indexer)
 
@@ -199,18 +221,18 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # placeholder rather than None, so test emptiness.
         kv_cache = getattr(self.k_cache, "kv_cache", None)
         if kv_cache is None or kv_cache.numel() == 0:
-            return torch.zeros((q.shape[0], self.topk_tokens),
-                               dtype=torch.int32,
-                               device=q.device)
+            return torch.zeros(
+                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+            )
 
         attn_ctx = get_forward_context().attn_metadata
         if isinstance(attn_ctx, dict):
-            prefix_key = getattr(getattr(self, "k_cache", None), "prefix",
-                                 None)
+            prefix_key = getattr(getattr(self, "k_cache", None), "prefix", None)
             if prefix_key not in attn_ctx:
                 raise KeyError(
                     f"DeepSeek-V4 indexer prefix {prefix_key!r} has no "
-                    f"attention metadata. Known: {sorted(attn_ctx)}")
+                    f"attention metadata. Known: {sorted(attn_ctx)}"
+                )
             attn_metadata = attn_ctx[prefix_key]
         else:
             attn_metadata = attn_ctx

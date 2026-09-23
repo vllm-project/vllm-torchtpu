@@ -202,8 +202,6 @@ ignore = [
 "src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
 
 
-# layers/adapter (src)
-"src/vllm_torchtpu/layers/adapter/**" = ["I"]
 
 # tests/layers
 "tests/layers/**" = ["I"]
@@ -298,8 +296,6 @@ exclude = [
     "src/vllm_torchtpu/kernels/typed_ldst.py",
 
 
-    # layers/adapter (src)
-    "src/vllm_torchtpu/layers/adapter/**",
 
     # tests/layers
     "tests/layers/**",

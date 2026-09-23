@@ -47,8 +47,6 @@ repos:
       |src/vllm_torchtpu/kernels/typed_ldst\.py$
 
 
-      # layers/adapter (src)
-      |src/vllm_torchtpu/layers/adapter/
 
       # tests/layers
       |tests/layers/
