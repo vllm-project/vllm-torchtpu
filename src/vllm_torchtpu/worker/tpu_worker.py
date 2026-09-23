@@ -39,6 +39,7 @@ from vllm_torchtpu.distributed.pcp_rank_order import (
 )
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runai_assets import ensure_runai_assets_local
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -107,6 +108,13 @@ class TPUWorker(WorkerBase):
         # so hasattr(self.worker, "device") returns False and the call skips.
         if hasattr(self, "device"):
             del self.device
+
+        # A gs:// model has its config/tokenizer files staged into a local
+        # cache dir by ModelConfig.__post_init__, which runs only where the
+        # config was built. Every other host of a multi-host slice receives
+        # that head-local path through the pickled VllmConfig and finds
+        # nothing there, so re-stage before anything reads model_config.model.
+        ensure_runai_assets_local(self.model_config)
 
         # TPU compilation requires static shapes, so clear dynamic compile
         # ranges vLLM might have added.
