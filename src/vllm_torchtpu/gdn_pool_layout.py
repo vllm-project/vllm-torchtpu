@@ -11,10 +11,14 @@ from dataclasses import dataclass
 # instead. Other hybrid architectures unpack two state tensors unconditionally,
 # so they stay on the per-layer KV caches until they grow a pooled path.
 # Extend this set in the same change that adds one.
-POOLED_GDN_ARCHITECTURES = frozenset({
+QWEN_GDN_ARCHITECTURES = frozenset({
     "Qwen3NextForCausalLM",
+    "Qwen3_5ForCausalLM",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+})
+POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset({
     # Kimi-Linear and Kimi-K3 run their KDA layers through the gather/scatter
     # pooled op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3
     # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are

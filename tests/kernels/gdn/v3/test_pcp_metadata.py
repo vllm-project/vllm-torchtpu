@@ -47,16 +47,16 @@ def _cfg(batch_size: int, tile_size: int = 64) -> config.GDNConfig:
 def _metadata_inputs(lengths, offsets, *, max_num_seqs):
     lengths = np.asarray(lengths, dtype=np.int32)
     offsets = np.asarray(offsets, dtype=np.int32)
-    query_start = np.zeros((max_num_seqs + 1, ), dtype=np.int32)
-    query_start[1:lengths.size + 1] = np.cumsum(lengths, dtype=np.int32)
-    query_start[lengths.size + 1:] = query_start[lengths.size]
-    seq_lens = np.zeros((max_num_seqs, ), dtype=np.int32)
-    seq_lens[:lengths.size] = lengths + offsets
+    query_start = np.zeros((max_num_seqs + 1,), dtype=np.int32)
+    query_start[1 : lengths.size + 1] = np.cumsum(lengths, dtype=np.int32)
+    query_start[lengths.size + 1 :] = query_start[lengths.size]
+    seq_lens = np.zeros((max_num_seqs,), dtype=np.int32)
+    seq_lens[: lengths.size] = lengths + offsets
     state_indices = np.arange(max_num_seqs, dtype=np.int32)
     distribution = np.array([0, lengths.size, lengths.size], dtype=np.int32)
     return tuple(
-        jnp.asarray(x)
-        for x in (seq_lens, query_start, state_indices, distribution))
+        jnp.asarray(x) for x in (seq_lens, query_start, state_indices, distribution)
+    )
 
 
 def _assert_pytree_array_equal(actual, expected):
@@ -65,8 +65,9 @@ def _assert_pytree_array_equal(actual, expected):
     expected_leaves = jax.tree.leaves(expected)
     assert len(actual_leaves) == len(expected_leaves)
     for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
-        np.testing.assert_array_equal(np.asarray(actual_leaf),
-                                      np.asarray(expected_leaf))
+        np.testing.assert_array_equal(
+            np.asarray(actual_leaf), np.asarray(expected_leaf)
+        )
 
 
 def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
@@ -92,8 +93,7 @@ def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
     )
 
     assert int(schedule.num_stages) == 3
-    np.testing.assert_array_equal(np.asarray(schedule.num_tokens[:3]),
-                                  [13, 3, 8])
+    np.testing.assert_array_equal(np.asarray(schedule.num_tokens[:3]), [13, 3, 8])
     np.testing.assert_array_equal(
         np.asarray(schedule.rank_valid_rows[:3]),
         [
@@ -150,7 +150,7 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
     # Batch-flat request 1 starts inside rank 3's owner chunk [12, 16), while
     # its absolute sequence position remains 22 for GDN state semantics.
     batch_flat_owner_starts = jnp.asarray([0, 13, 0, 0], dtype=jnp.int32)
-    fresh_absolute_starts = jnp.zeros((4, ), dtype=jnp.int32)
+    fresh_absolute_starts = jnp.zeros((4,), dtype=jnp.int32)
 
     common_kwargs = dict(
         cfg=cfg,
@@ -182,19 +182,22 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
             token_owner_starts=request_absolute_starts,
             request_absolute_starts=request_absolute_starts,
             **common_kwargs,
-        ))
+        )
+    )
     owner_metadata, owner_schedule = (
         pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
             token_owner_starts=batch_flat_owner_starts,
             request_absolute_starts=request_absolute_starts,
             **common_kwargs,
-        ))
+        )
+    )
     fresh_metadata, fresh_schedule = (
         pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
             token_owner_starts=batch_flat_owner_starts,
             request_absolute_starts=fresh_absolute_starts,
             **common_kwargs,
-        ))
+        )
+    )
 
     # The public path now supplies batch-flat owner starts while retaining the
     # independently reconstructed request-absolute starts for state semantics.
@@ -202,12 +205,11 @@ def test_dual_coordinates_separate_token_ownership_from_absolute_state():
     _assert_pytree_array_equal(public_schedule, owner_schedule)
 
     assert int(owner_schedule.num_stages) == 3
-    np.testing.assert_array_equal(np.asarray(owner_schedule.request_id[:3]),
-                                  [0, 1, 1])
+    np.testing.assert_array_equal(np.asarray(owner_schedule.request_id[:3]), [0, 1, 1])
     np.testing.assert_array_equal(
-        np.asarray(owner_schedule.query_row_start[:3]), [0, 13, 16])
-    np.testing.assert_array_equal(np.asarray(owner_schedule.num_tokens[:3]),
-                                  [13, 3, 8])
+        np.asarray(owner_schedule.query_row_start[:3]), [0, 13, 16]
+    )
+    np.testing.assert_array_equal(np.asarray(owner_schedule.num_tokens[:3]), [13, 3, 8])
     np.testing.assert_array_equal(
         np.asarray(owner_schedule.rank_valid_rows[:3]),
         [[4, 4, 4, 1], [0, 0, 0, 3], [4, 4, 0, 0]],
@@ -304,21 +306,20 @@ def test_projection_schedule_catches_up_only_the_imbalanced_owner_rank():
         max_num_seqs=16,
     )
 
-    metadata, schedule = (
-        pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
-            cfg,
-            query_start,
-            state_indices,
-            distribution[0],
-            distribution[-1],
-            token_owner_starts=jnp.zeros_like(seq_lens),
-            request_absolute_starts=jnp.zeros_like(seq_lens),
-            pcp_size=8,
-            comm_chunk_size=256,
-            projection_token_block_size=_PROJECTION_TOKEN_BLOCK_SIZE,
-            num_qkv_out_blocks=_NUM_QKV_OUT_BLOCKS,
-            num_projection_out_blocks=_NUM_PROJECTION_OUT_BLOCKS,
-        ))
+    metadata, schedule = pcp_metadata._compute_pcp_stage_metadata_from_coordinates(
+        cfg,
+        query_start,
+        state_indices,
+        distribution[0],
+        distribution[-1],
+        token_owner_starts=jnp.zeros_like(seq_lens),
+        request_absolute_starts=jnp.zeros_like(seq_lens),
+        pcp_size=8,
+        comm_chunk_size=256,
+        projection_token_block_size=_PROJECTION_TOKEN_BLOCK_SIZE,
+        num_qkv_out_blocks=_NUM_QKV_OUT_BLOCKS,
+        num_projection_out_blocks=_NUM_PROJECTION_OUT_BLOCKS,
+    )
 
     assert int(schedule.num_stages) == 5
     assert int(metadata.num_tiles) == 20

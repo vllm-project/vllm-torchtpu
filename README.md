@@ -1,9 +1,14 @@
-<h1 align="center">vLLM TPU</h1>
+<p align="center">
+   <!-- This image will ONLY show up in GitHub's dark mode -->
+  <img src="docs/assets/torch_tpu_dark_mode_short.png#gh-dark-mode-only" alt="vLLM TorchTPU" style="width: 86%;">
+    <!-- This image will ONLY show up in GitHub's light mode (and on other platforms) -->
+  <img src="docs/assets/torch_tpu_light_mode_short.png#gh-light-mode-only" alt="vLLM TorchTPU" style="width: 86%;">
+</p>
 
 This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 
 > [!IMPORTANT] Pre-Public Development Governance
-> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
+> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
 
 ---
 
@@ -209,34 +214,3 @@ python3 examples/offline_inference.py \
   --tensor_parallel_size=1 \
   --no-async-scheduling
 ```
-
-PP currently requires `--no-async-scheduling`, and Ray deployments require
-the Ray V2 executor (`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`); it does not yet
-support speculative decoding or KV transfer connectors other than
-`TPURaidenConnector`, which needs a full-attention layer in every stage.
-
-The stages advance in lockstep, so a step lasts as long as the slowest
-chunk in flight, and a prefill chunk late in a long prompt costs more than
-a first chunk of the same size. The scheduler therefore sizes prefill
-chunks against a per-step time budget: at startup every stage times its
-forward at each token bucket, and the larger buckets behind one and two
-steps of prefix; the slowest stage's numbers fit a step cost model, and a
-chunk behind a long prefix is cut so the step stays within the time of a
-full prefix-free step plus `TPU_PP_CHUNK_SLACK` (default 0.1). Chunks are
-cut in granules of an eighth of `--max-num-batched-tokens` (whole KV blocks
-when the mamba cache needs block-aligned chunk ends), and a bucket at every
-granule multiple is compiled so a shortened step pads to its own size.
-Decode requests count toward a step before any prefill chunk is sized, and
-the first prefill chunk of a step always advances. When the prefill work
-still to schedule cannot fill every stage with a full step, the step
-shrinks to that work spread over the pipeline (a lone 32K prompt runs as
-eight 4K steps), so a lone prompt keeps every stage busy instead of
-trailing itself through the pipeline one full step at a time; a busy
-server keeps full steps and first-come order. The batched attention
-kernel schedules a step's (query block, KV block) pairs from an SMEM table
-of fixed capacity, so a step also holds at most as many pairs as that
-table (computed from the kernel's tiles and the serving shape at startup),
-the profile skips timing points past it, and a step that would overrun it
-is refused with an error instead of halting the TPU.
-`TPU_PP_DYNAMIC_CHUNKS=0` returns to token budgets; the DP scheduler
-(`DP_SCHED_ENABLED=1`) takes precedence.

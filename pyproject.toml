@@ -7,7 +7,10 @@ name = "vllm_torchtpu"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
-requires-python = ">=3.12"
+# 3.12 only: every tpu-raiden-torch wheel is cp312-only, so any other interpreter
+# fails to resolve. Stating it here makes that an up-front error rather than an
+# unsatisfiable-requirements failure partway through a Docker build.
+requires-python = ">=3.12,<3.13"
 authors = [
     { name = "vllm_torchtpu Contributors" }
 ]
@@ -25,20 +28,31 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # Note: we **intentionally** build vllm from source, see README.
-    # vllm==0.27.0 is required for Kimi K3 compatibility
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
+    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
-    # time in their HF processors. We must explicitly pin torchvision statically
-    # matching our torch==2.13.0 constraint to prevent the CI Docker base image
-    # from leaking structurally incompatible pre-compiled nms operators!
+    # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
+    # are built against a specific torch ABI, so this stays pinned in lockstep with
+    # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
+    # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260910000446",
+    "torch-tpu==0.1.1.dev20260912075415",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
-    # raiden KV connector (disaggregated serving) and host KV offload. The
-    # wheel bundles one extension per supported torch ABI and dispatches to
-    # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260827124357",
+    # raiden KV connector (disaggregated serving) and host KV offload; the
+    # import name is `tpu_sync`. The wheel bundles one extension per
+    # supported torch ABI and dispatches to the variant matching the
+    # installed torch at import time.
+    "tpu-sync-torch==0.0.1.dev20260917080754",
+    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
+    # declared here rather than leaned on as a vLLM transitive.
+    #
+    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
+    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
+    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
+    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
+    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -49,11 +63,12 @@ dependencies = [
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
     "jax==0.10.2",
     "jaxlib==0.10.2",
-    # This libtpu pin needs the workarounds in src/vllm_torchtpu/env_override.py
-    # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
-    # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
-    # bumping.
-    "libtpu==0.0.44.1",
+    # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
+    # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
+    # per-config LIBTPU_INIT_ARGS additions under
+    # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
+    # re-verify those runs when bumping.
+    "libtpu==0.0.47",
     "ray[default]",
     "ray[data]",
 ]
@@ -61,10 +76,14 @@ dependencies = [
 [project.optional-dependencies]
 # Required for running tests
 test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
     "pytest",
     "pytest-mock",
     "pytest-timeout",
+    "pytest-cov",
     "parameterized",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
 ]
 
 # Dev tools (linting, formatting)
@@ -90,7 +109,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.27.0rc1",
+    "vllm-omni==0.29.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -111,6 +130,192 @@ markers = [
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
+]
+
+[tool.ruff]
+# Without this, ruff ignores its `exclude` lists for any path named directly
+# on the command line, which is exactly how pre-commit invokes it. Setting it
+# makes `exclude` hold for both `ruff format .` and the hook.
+force-exclude = true
+
+# protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
+# would make every regeneration produce a spurious diff.
+exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+
+[tool.ruff.lint]
+# E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
+# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
+# G logging calls, ISC string concatenation.
+# Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+
+ignore = [
+    # Off on purpose, matching upstream vllm.
+    "B905",   # zip() without an explicit strict=
+    "B007",   # loop control variable not used in the body
+    "UP032",  # .format() that could be an f-string
+
+    # Firing today and not fixed yet. `ruff check --fix` does not clear any of
+    # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
+    # change. Delete the entry once its count reaches zero.
+    "G004",    #  39  f-string passed to a logging call
+    "SIM108",  #  15  if/else that could be a conditional expression
+    "SIM102",  #  13  nested if that could be one
+    "SIM117",  #  12  nested with statements
+    "SIM105",  #  12  try/except/pass that could be contextlib.suppress
+    "UP022",   #   4  subprocess stdout=PIPE, stderr=PIPE
+    "ISC002",  #   3  implicit string concatenation over several lines
+    "SIM401",  #   2  if/else that could be dict.get
+    "SIM103",  #   2  returning a condition through if/else
+    "B904",    #   2  raise inside except without from
+    "UP047",   #   1  generic function that could use PEP 695 syntax
+    "UP040",   #   1  TypeAlias that could be the type statement
+    "UP031",   #   1  printf-style string formatting
+    "SIM115",  #   1  open() outside a context manager
+    "B020",    #   1  loop variable shadows the iterable
+    "B011",    #   1  assert False
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Paths isort still owns, one per line, so a migration PR deletes exactly the
+# lines for the paths it converts. Every entry has a twin in `exclude` under
+# [tool.ruff.format] and in `files` on the isort and yapf hooks in
+# .pre-commit-config.yaml. All three move together, otherwise two tools format
+# the same file. Use `dir/**` or a full path: in a `*` pattern the star also
+# matches `/`, so `dir/*.py` silently covers the whole subtree.
+
+
+
+
+
+
+
+
+
+# runner
+"src/vllm_torchtpu/runner/**" = ["I"]
+"tests/runner/**" = ["I"]
+
+# models, spec_decode, offload
+"src/vllm_torchtpu/models/**" = ["I"]
+"src/vllm_torchtpu/offload/**" = ["I"]
+"src/vllm_torchtpu/spec_decode/**" = ["I"]
+"tests/models/**" = ["I"]
+"tests/offload/**" = ["I"]
+"tests/spec_decode/**" = ["I"]
+
+
+# core, tracing, omni, tools, loose modules
+"src/vllm_torchtpu/core/**" = ["I"]
+"src/vllm_torchtpu/omni/**" = ["I"]
+"src/vllm_torchtpu/tools/**" = ["I"]
+"src/vllm_torchtpu/tracing/**" = ["I"]
+"tests/model_loader/**" = ["I"]
+"tests/omni/**" = ["I"]
+"tests/scripts/**" = ["I"]
+"tests/tools/**" = ["I"]
+"tests/tracing/**" = ["I"]
+"src/sitecustomize.py" = ["I"]
+"src/vllm_torchtpu/__init__.py" = ["I"]
+"src/vllm_torchtpu/env_override.py" = ["I"]
+"src/vllm_torchtpu/envs.py" = ["I"]
+"src/vllm_torchtpu/gdn_pool_layout.py" = ["I"]
+"src/vllm_torchtpu/kv_cache_materializer.py" = ["I"]
+"src/vllm_torchtpu/kv_cache_spec_normalizer.py" = ["I"]
+"src/vllm_torchtpu/logger.py" = ["I"]
+"src/vllm_torchtpu/model_loader_patches.py" = ["I"]
+"src/vllm_torchtpu/patch_registry.py" = ["I"]
+"src/vllm_torchtpu/profiler_trace.py" = ["I"]
+"src/vllm_torchtpu/tokenizers.py" = ["I"]
+"src/vllm_torchtpu/tpu_info.py" = ["I"]
+"src/vllm_torchtpu/utils.py" = ["I"]
+"tests/conftest.py" = ["I"]
+"tests/test_envs.py" = ["I"]
+"tests/test_envs_builders.py" = ["I"]
+"tests/test_package_import.py" = ["I"]
+"tests/test_pp_chunk_scheduler.py" = ["I"]
+"tests/test_pp_chunks.py" = ["I"]
+"tests/test_profiler_trace.py" = ["I"]
+"tests/test_token_padding.py" = ["I"]
+"tests/test_tokenizers.py" = ["I"]
+"tests/test_tpu_release.py" = ["I"]
+"tests/test_tpu_scheduler.py" = ["I"]
+"tests/tpu_release.py" = ["I"]
+
+# Pallas runs a kernel closure the moment it is defined: `pl.when` and
+# `pl.loop` trace the body during the decorator call, inside the iteration
+# that built it. B023 warns that a closure outliving its loop sees the last
+# value of the loop variable, which cannot happen to a body that never
+# outlives the iteration.
+#
+# Switching the rule off here would also hide a capture that does escape, so
+# tools/check_b023_baseline.py counts the findings per file and fails when a
+# file gains one. Both move together.
+"src/vllm_torchtpu/kernels/**" = ["B023"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
+exclude = [
+
+
+
+
+
+
+
+
+
+    # runner
+    "src/vllm_torchtpu/runner/**",
+    "tests/runner/**",
+
+    # models, spec_decode, offload
+    "src/vllm_torchtpu/models/**",
+    "src/vllm_torchtpu/offload/**",
+    "src/vllm_torchtpu/spec_decode/**",
+    "tests/models/**",
+    "tests/offload/**",
+    "tests/spec_decode/**",
+
+
+    # core, tracing, omni, tools, loose modules
+    "src/vllm_torchtpu/core/**",
+    "src/vllm_torchtpu/omni/**",
+    "src/vllm_torchtpu/tools/**",
+    "src/vllm_torchtpu/tracing/**",
+    "tests/model_loader/**",
+    "tests/omni/**",
+    "tests/scripts/**",
+    "tests/tools/**",
+    "tests/tracing/**",
+    "src/sitecustomize.py",
+    "src/vllm_torchtpu/__init__.py",
+    "src/vllm_torchtpu/env_override.py",
+    "src/vllm_torchtpu/envs.py",
+    "src/vllm_torchtpu/gdn_pool_layout.py",
+    "src/vllm_torchtpu/kv_cache_materializer.py",
+    "src/vllm_torchtpu/kv_cache_spec_normalizer.py",
+    "src/vllm_torchtpu/logger.py",
+    "src/vllm_torchtpu/model_loader_patches.py",
+    "src/vllm_torchtpu/patch_registry.py",
+    "src/vllm_torchtpu/profiler_trace.py",
+    "src/vllm_torchtpu/tokenizers.py",
+    "src/vllm_torchtpu/tpu_info.py",
+    "src/vllm_torchtpu/utils.py",
+    "tests/conftest.py",
+    "tests/test_envs.py",
+    "tests/test_envs_builders.py",
+    "tests/test_package_import.py",
+    "tests/test_pp_chunk_scheduler.py",
+    "tests/test_pp_chunks.py",
+    "tests/test_profiler_trace.py",
+    "tests/test_token_padding.py",
+    "tests/test_tokenizers.py",
+    "tests/test_tpu_release.py",
+    "tests/test_tpu_scheduler.py",
+    "tests/tpu_release.py",
 ]
 
 [tool.pyrefly]
@@ -177,4 +382,4 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
-tpu-raiden-torch = { index = "torch-tpu-registry" }
+tpu-sync-torch = { index = "torch-tpu-registry" }

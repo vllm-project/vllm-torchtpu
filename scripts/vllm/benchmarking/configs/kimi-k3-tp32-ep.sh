@@ -2,9 +2,11 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly perf benchmark for Kimi-K3 on the multihost TPU v7x-32 pod
 # (4 hosts x 8 chips): TP=32 with EP. Single-request latency probe at
-# 8k in / 1k out. Baseline calibrated on the pod from three repeats in one
-# server lifetime, run-to-run spread <= 0.3% on every gated metric — the
-# default 5% perf tolerance applies.
+# 8k in / 1k out. Run-to-run spread on this case is <= 0.3% on every gated
+# metric; the default 5% perf tolerance applies. The baseline was adjusted
+# down after PR #561 put K3 on the unified KV pool, whose pooled KDA path is
+# expected to be slower until it is optimized (see the _source note in
+# baselines/perf/kimi-k3-tp32-ep.baseline.json and issue #991).
 # Serve flags select the tuned MLA path for this model on this topology. The v2
 # MLA tuning table carries an entry for K3 at TP32 keyed on (max_num_tokens,
 # q_heads, kv_dtype, page_size_per_kv_packing, max_num_seqs, pages_per_seq), and

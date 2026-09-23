@@ -32,11 +32,30 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
+# Point Test Steps to the Metadata-Driven Image Tag
+IMAGE_TAG=""
+if command -v buildkite-agent &> /dev/null; then
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+fi
+
+# Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
+if [ -z "${IMAGE_TAG:-}" ]; then
+  if [ "${BUILDKITE:-false}" == "true" ]; then
+    echo "ERROR: CI_IMAGE_TAG metadata is missing in Buildkite CI environment." >&2
+    exit 1
+  fi
+  VLLM_REF="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+  if [ -z "${VLLM_REF}" ]; then
+    echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
+    exit 1
+  fi
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+fi
 
 # Buildkite expands the last `---` group whenever a log contains no `+++` group
 # at all. Every group below that is pure housekeeping is therefore `~~~`
@@ -132,6 +151,8 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
+  ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"} \
+  ${CONTAINER_TMPDIR:+-e TMPDIR="${CONTAINER_TMPDIR}" -e RAY_TMPDIR=/tmp} \
   ${EVAL_SOFT_FAIL:+-e EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL}"} \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \

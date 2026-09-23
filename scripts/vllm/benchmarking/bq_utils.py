@@ -29,8 +29,7 @@ import sys
 from datetime import datetime
 
 DEFAULT_BQ_PROJECT_ID = "cloud-ullm-inference-ci-cd"
-DEFAULT_BQ_TABLE = ("cloud-ullm-inference-ci-cd"
-                    ".llm_benchmark_analytics.benchmark_runs")
+DEFAULT_BQ_TABLE = "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.benchmark_runs"
 
 # Leaf keys exactly as `vllm bench serve` emits them.
 BENCH_METRIC_FIELDS = (
@@ -84,17 +83,20 @@ def created_time_sql(date_str) -> str:
             print(
                 f"Warning: Could not parse date string: {date_str}. "
                 "Using CURRENT_TIMESTAMP()",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
     return "CURRENT_TIMESTAMP()"
 
 
-def build_insert_sql(record_id: str,
-                     created_time: str,
-                     run_type: str,
-                     model_id: str,
-                     metrics: list,
-                     config: dict,
-                     bq_table=None) -> str:
+def build_insert_sql(
+    record_id: str,
+    created_time: str,
+    run_type: str,
+    model_id: str,
+    metrics: list,
+    config: dict,
+    bq_table=None,
+) -> str:
     """Render one INSERT statement for the benchmark_runs table.
 
     `metrics` is a list of (type, payload-dict) pairs, one array element
@@ -106,11 +108,22 @@ def build_insert_sql(record_id: str,
     """
     table = (bq_table or os.getenv("BQ_TABLE") or DEFAULT_BQ_TABLE).strip("`")
     repository = os.getenv("REPOSITORY") or "vllm-torchtpu"
+    # Which fleet produced the row, when the fleet says. Two lanes measure the
+    # same benchmarks on the same hardware and write this one table, so a
+    # reader needs to be able to hold one of them constant. In config rather
+    # than a column of its own because config is JSON for exactly this: a
+    # dimension one producer has and the others do not. A row without the key
+    # came from the bare-metal lane, which is unchanged and sets nothing.
+    runner = os.getenv("CI_RUNNER")
+    if runner:
+        config = {**config, "runner": runner}
     config_json = sql_escape(json.dumps(config))
     metrics_elems = ", ".join(
         f"STRUCT('{metrics_type}', "
         f"PARSE_JSON('{sql_escape(json.dumps(payload))}', "
-        "wide_number_mode=>'round'))" for metrics_type, payload in metrics)
+        "wide_number_mode=>'round'))"
+        for metrics_type, payload in metrics
+    )
     sql = f"""
     INSERT INTO `{table}` (
         record_id, created_time, repository, run_type, model_id, metrics, config
@@ -126,11 +139,9 @@ def build_insert_sql(record_id: str,
     return " ".join(sql.split())
 
 
-def run_insert(sql: str,
-               project=None,
-               label: str = "",
-               record_id: str = "",
-               skip: bool = False) -> bool:
+def run_insert(
+    sql: str, project=None, label: str = "", record_id: str = "", skip: bool = False
+) -> bool:
     """Execute one INSERT via the bq CLI. Prints the statement either way;
     with skip=True it is printed but not executed."""
     print(f"SQL for BigQuery ({label}):")
@@ -141,27 +152,22 @@ def run_insert(sql: str,
         return True
 
     project = project or os.getenv("BQ_PROJECT_ID") or DEFAULT_BQ_PROJECT_ID
-    cmd = [
-        "bq", "query", "--use_legacy_sql=false", f"--project_id={project}", sql
-    ]
+    cmd = ["bq", "query", "--use_legacy_sql=false", f"--project_id={project}", sql]
     print(f"Executing: {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE,
-                              text=True)
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
     except FileNotFoundError:
         print(
             f"Failed to insert BigQuery record for {label}: 'bq' CLI not found.",
-            file=sys.stderr)
+            file=sys.stderr,
+        )
         return False
     if proc.returncode != 0:
-        print(f"Failed to insert BigQuery record for {label}!",
-              file=sys.stderr)
+        print(f"Failed to insert BigQuery record for {label}!", file=sys.stderr)
         print(f"Stdout:\n{proc.stdout}", file=sys.stderr)
         print(f"Stderr:\n{proc.stderr}", file=sys.stderr)
         return False
-    print(
-        f"Successfully inserted BigQuery record for {label}. record_id: {record_id}"
-    )
+    print(f"Successfully inserted BigQuery record for {label}. record_id: {record_id}")
     return True

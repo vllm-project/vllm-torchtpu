@@ -6,8 +6,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
 from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
+                                                    PallasMLAttentionBackend)
 
 
 def normalize_kv_cache_specs_for_tpu(
@@ -120,12 +120,14 @@ def _normalize_one_spec(
             spec.head_size,
             kv_cache_dtype,
         )
-    target_spec = replace(spec, dtype=kv_cache_dtype)
+    backend = (PallasMLAttentionBackend
+               if isinstance(spec, MLAAttentionSpec) else attention_backend)
+    target_spec = backend.customize_spec(replace(spec, dtype=kv_cache_dtype))
     padded_page_size = spec.page_size_padded or 0
     page_size = max(page_size, target_spec.real_page_size_bytes,
                     padded_page_size)
-    if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:
-        return spec
+    if target_spec.page_size_padded == page_size:
+        return target_spec
     return replace(target_spec, page_size_padded=page_size)
 
 

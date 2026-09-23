@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -24,12 +25,14 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
+    TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_DST_SHARDS: int | None = None
     TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
@@ -46,6 +49,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    MIXED_Q_SPLIT: int | None = None
+    MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
+    MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -58,6 +64,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -66,6 +73,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
@@ -73,8 +81,8 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
-    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
-    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -98,6 +106,30 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
+    QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
+    KDA_MANUAL_STATE_DMA: bool | None = None
+    KDA_MANUAL_H0_DMA: bool | None = None
+    KDA_MANUAL_HT_DMA: bool | None = None
+    KDA_OVERLAP_H0_DMA: bool = True
+    KDA_OVERLAP_HT_DMA: bool = True
+    KDA_PACK_HEAD_INV: bool = True
+    KDA_PACKED_METADATA: bool = True
+    KDA_FWD_MB: int | None = None
+    TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
+    SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
+    SPEC_WARMUP: bool = True
+    RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
+    RAIDEN_SHM_KEY: str = ""
+    VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
+    VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TORCHTPU_IPC_KEY: str = ""
+    TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
+    VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
+    TPU_LOCAL_RANK_OFFSET: int = 0
+    DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
+    TORCH_TPU_BASE_PORT: int = 8070
+    TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
 
 
 def env_with_choices(
@@ -180,7 +212,12 @@ def env_int(env_name: str, default: int) -> Callable[[], int]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return int(value)
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be an integer."
+            ) from exc
 
     return _get_int_env
 
@@ -212,7 +249,12 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
         value = os.getenv(env_name)
         if value is None or value.strip() == "":
             return default
-        return float(value)
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be a number."
+            ) from exc
 
     return _get_float_env
 
@@ -244,6 +286,21 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
     return _get_optional_bool_env
 
 
+def env_nonnegative_int_or_auto(env_name: str) -> Callable[[], int | None]:
+    """Size knob where unset, empty or ``auto`` (any case) reads as ``None``,
+    meaning the caller picks the value itself. Anything else must parse as
+    an integer that is not negative."""
+    parse_int = env_nonnegative_int(env_name, 0)
+
+    def _get_nonnegative_int_or_auto_env() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip().lower() in ("", "auto"):
+            return None
+        return parse_int()
+
+    return _get_nonnegative_int_or_auto_env
+
+
 def env_optional_int(env_name: str) -> Callable[[], int | None]:
     """
     Integer parsing where, like ``env_optional_bool``, an unset or empty
@@ -260,7 +317,27 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
+def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+    """Optional size knob that must be greater than zero when it is set.
+
+    Unset or empty reads as ``None``, meaning the feature is off.
+    """
+    parse_int = env_optional_int(env_name)
+
+    def _get_positive_int_or_none_env() -> int | None:
+        value = parse_int()
+        if value is not None and value <= 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_or_none_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Opt in to K3 TP32/EP32 sequence-parallel prefill.
+    "TPU_K3_SP_PREFILL":
+    env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -279,10 +356,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
@@ -350,6 +427,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    # Kimi K3 entry point to shared hybrid-pool admission.
+    "TPU_RAIDEN_KIMIK3_ADMISSION":
+    env_bool("TPU_RAIDEN_KIMIK3_ADMISSION"),
     # Tag every raiden pool with its layer index so pools pair up by layer
     # across a pipeline-parallel producer and its decode peer. Both peers
     # must set it identically.
@@ -372,6 +452,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
+    # TP shards in one decode engine, not its DP replica count. Configure
+    # both roles alike; the producer uses this to route head-sharded state.
+    "TPU_RAIDEN_DST_SHARDS":
+    env_optional_int("TPU_RAIDEN_DST_SHARDS"),
     "TPU_RAIDEN_MAX_TRANSFER_TOKENS":
     env_optional_int("TPU_RAIDEN_MAX_TRANSFER_TOKENS"),
     # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
@@ -451,6 +535,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    "MIXED_Q_SPLIT":
+    env_optional_int("MIXED_Q_SPLIT"),
+    "MIXED_NUM_QUERIES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
+    "MIXED_NUM_KV_PAGES_PER_BLOCK":
+    env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
@@ -510,6 +600,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # How many copies of the FFN body fused EP MoE v2 emits, standing in for
+    # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
+    # live rows, so one is the ladder off. Zero leaves the choice to the
+    # kernel.
+    "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE":
+    lambda: int(os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -546,6 +642,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
+    # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
+    # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
+    # Unset means unchunked: one single pass, no pipelining.
+    "TPU_STREAMIDX_CHUNK_TOKENS":
+    env_positive_int_or_none("TPU_STREAMIDX_CHUNK_TOKENS"),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
@@ -650,6 +752,96 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD":
     env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
+    # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
+    "QUANTIZE_ON_LOAD_PREFIXES":
+    lambda: [
+        p.strip()
+        for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
+        if p.strip()
+    ],
+    # Kimi K3 KDA kernel DMA and performance tuning knobs.
+    "KDA_MANUAL_STATE_DMA":
+    env_optional_bool("KDA_MANUAL_STATE_DMA"),
+    "KDA_MANUAL_H0_DMA":
+    env_optional_bool("KDA_MANUAL_H0_DMA"),
+    "KDA_MANUAL_HT_DMA":
+    env_optional_bool("KDA_MANUAL_HT_DMA"),
+    "KDA_OVERLAP_H0_DMA":
+    env_bool("KDA_OVERLAP_H0_DMA", default=True),
+    "KDA_OVERLAP_HT_DMA":
+    env_bool("KDA_OVERLAP_HT_DMA", default=True),
+    "KDA_PACK_HEAD_INV":
+    env_bool("KDA_PACK_HEAD_INV", default=True),
+    "KDA_PACKED_METADATA":
+    env_bool("KDA_PACKED_METADATA", default=True),
+    "KDA_FWD_MB":
+    env_optional_int("KDA_FWD_MB"),
+
+    # Startup and host-side knobs. None of them change what gets compiled;
+    # each is also listed in _TPU_COMPILE_ENV_IGNORED so it stays out of the
+    # compile-cache key.
+
+    # Run the real spec-decode dispatch once at startup so the first request
+    # does not pay for those compiles. Off skips that warmup.
+    "SPEC_WARMUP":
+    env_bool("SPEC_WARMUP", default=True),
+    # Raiden library switch, on by default. The TPU offloading connector
+    # cannot run next to the raiden singleton worker, so it rejects an
+    # explicit off and exports the variable as on for the raiden library.
+    "RAIDEN_DISABLE_SINGLETON_WORKER":
+    env_bool("RAIDEN_DISABLE_SINGLETON_WORKER", default=True),
+    # The raiden library's shared-memory key, a string naming the segment
+    # behind its shm-backed host pools. The TPU offloading connector cannot
+    # serve those pools, so it refuses to start when the key is set at all.
+    # Read raw, not through env_str: the check must see the same bytes the
+    # raiden library sees, and a whitespace-only key still counts as set.
+    "RAIDEN_SHM_KEY":
+    lambda: os.getenv("RAIDEN_SHM_KEY", ""),
+    # Seconds; upper bound on a scheduler-side drain of in-flight offload
+    # jobs whose blocks are about to be reused.
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S":
+    env_float("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
+    # How many times an offload save whose transfer failed is retried.
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES":
+    env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Secret for the KV-transfer IPC socket; "" derives one from the host.
+    # Read raw, not through env_str: a secret's bytes must not be trimmed.
+    "VLLM_TORCHTPU_IPC_KEY":
+    lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
+    # Sync the device every N tensors during sharded EP weight loading so
+    # queued host copies are released; 0 disables the periodic sync.
+    "TPU_SHARDED_LOAD_SYNC_EVERY":
+    env_int("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    # Log the PCP sequence layout window on every step.
+    "VLLM_TPU_DEBUG_PCP_LAYOUT":
+    env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
+    # Added to every worker's local rank when it binds to a physical chip.
+    # worker/tpu_rank_binding.py reads it from the env mapping it is given.
+    "TPU_LOCAL_RANK_OFFSET":
+    env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Same offset for the legacy worker init path; debug only.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET":
+    env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+    # First slicebuilder port; each chip on a host takes base + local rank.
+    "TORCH_TPU_BASE_PORT":
+    env_int("TORCH_TPU_BASE_PORT", 8070),
+    # TCPStore port for the mp multihost rendezvous; unset means the vLLM
+    # coordination port plus one.
+    "TORCH_TPU_MP_RENDEZVOUS_PORT":
+    env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
+    # Directory for the on-disk TorchTPU compilation cache; read raw because
+    # env_override.py copies it verbatim into the TORCH_TPU_INTERNAL_* vars.
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
+    lambda: os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
+    # SparseCore offload threshold in bytes; None means "auto" and
+    # env_override.py resolves it from the chip family. 0 sets no flag.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
+    env_nonnegative_int_or_auto("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"),
+    # Enables steady-state fast path token substitution (direct device slicing
+    # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION":
+    env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
 }
 
 

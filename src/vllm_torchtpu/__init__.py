@@ -8,58 +8,79 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
-    """Require a common local prefix hit on a hybrid KV producer.
+def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
+    """Backport hybrid KV cache load failure recovery from vLLM #50388.
 
-    vLLM 0.26.1rc0 lets a hybrid model with any KV connector resume from the
-    deepest per-group local hit. That is valid on a consumer when the connector
-    transfers the missing groups, but a producer has no external state to fill
-    the gap. In particular, FA can have a cached page where Mamba has no state
-    checkpoint, and resuming from the FA-only boundary corrupts generation.
-
-    This is the producer-only subset of the reconciliation merged upstream in
-    vllm-project/vllm#48425. Keep it local to the coordinator instance so
-    consumer-side divergent lookup and remote suffix transfer are unchanged.
+    In vLLM <= 0.29.0 (prior to vLLM #50388),
+    ``Scheduler._update_requests_with_invalid_blocks`` unpacks
+    ``(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)``, which
+    raises ``ValueError: too many values to unpack (expected 1)`` whenever a
+    hybrid model (multiple KV cache groups) encounters a failed KV load.
     """
-    from types import MethodType
+    from functools import wraps
 
-    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
-
-    kv_transfer_config = scheduler.vllm_config.kv_transfer_config
-    coordinator = scheduler.kv_cache_manager.coordinator
-    if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
-            or not scheduler.has_mamba_layers
-            or not isinstance(coordinator, HybridKVCacheCoordinator)):
-        return
-
-    def find_common_prefix_hit(self, block_hashes, max_cache_hit_length):
-        blocks, hit_length, _ = self.find_longest_cache_hit(
-            block_hashes, max_cache_hit_length)
-        per_group_hits = (hit_length, ) * len(
-            self.kv_cache_config.kv_cache_groups)
-        return blocks, per_group_hits
-
-    coordinator.find_longest_cache_hit_per_group = MethodType(
-        find_common_prefix_hit, coordinator)
-    logger.info("Reconciled hybrid producer prefix hits to a common boundary.")
-
-
-def _patch_vllm_hybrid_producer_prefix_hits() -> None:
-    """Backport vLLM's hybrid connector hit reconciliation to 0.26.0."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
+    if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
         return
 
-    original_init = Scheduler.__init__
+    original_update = getattr(Scheduler,
+                              "_update_requests_with_invalid_blocks", None)
+    if original_update is None:
+        return
 
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        _reconcile_hybrid_producer_prefix_hits(self)
+    @wraps(original_update)
+    def _hybrid_update_requests_with_invalid_blocks(
+        self,
+        requests,
+        invalid_block_ids: set[int],
+        num_scheduled_tokens: dict[str, int],
+        evict_blocks: bool = True,
+    ) -> tuple[set[str], int, set[int]]:
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            return original_update(
+                self,
+                requests,
+                invalid_block_ids,
+                num_scheduled_tokens,
+                evict_blocks=evict_blocks,
+            )
 
-    Scheduler.__init__ = patched_init
-    Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
-    logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
+        affected_req_ids: set[str] = set()
+        total_affected_tokens = 0
+        blocks_to_evict: set[int] = set()
+        marked_invalid_block_ids: set[int] = set()
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        for request in requests:
+            req_id = request.request_id
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(
+                req_id)
+            req_num_computed_tokens = (request.num_computed_tokens -
+                                       num_scheduled_tokens.get(req_id, 0))
+            request_invalid_block_ids = {
+                block_id
+                for req_block_ids in req_block_ids_per_group
+                for block_id in req_block_ids
+                if block_id != null_block_id and block_id in invalid_block_ids
+            }
+            if request_invalid_block_ids:
+                marked_invalid_block_ids |= request_invalid_block_ids
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    for req_block_ids in req_block_ids_per_group:
+                        blocks_to_evict.update(block_id
+                                               for block_id in req_block_ids
+                                               if block_id != null_block_id)
+                affected_req_ids.add(req_id)
+        return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    Scheduler._update_requests_with_invalid_blocks = (
+        _hybrid_update_requests_with_invalid_blocks)
+    Scheduler._tpu_hybrid_kv_load_failure_patch = True
+    logger.info(
+        "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."
+    )
 
 
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
@@ -252,7 +273,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
         except ImportError:
             return original.fget(self)
@@ -312,7 +333,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
             return fused_moe_ep_supported(getattr(self, "_quant_method", None))
 
@@ -525,14 +546,9 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    # Platform activation can happen from inside the first Scheduler.__init__.
-    # Install this constructor patch at the engine-core boundary instead, before
-    # the first scheduler is created.
-    _patch_vllm_hybrid_producer_prefix_hits()
-    _patch_vllm_merge_multimodal_embeddings()
+    from vllm_torchtpu import patch_registry
+
+    patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import \
         patch_engine_core_for_pp_chunks
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
@@ -706,11 +722,16 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 _has_spec_type(group.kv_cache_spec, AttentionSpec)
                 for group in groups)
 
-    def _with_effective_block_size(spec: KVCacheSpec, pcp: int) -> KVCacheSpec:
+    def _with_effective_block_size(spec: KVCacheSpec,
+                                   pcp: int,
+                                   dcp: int = 1) -> KVCacheSpec:
         """Restate a rank-local spec in the logical (all-ranks) page size."""
+        assert not (pcp > 1 and dcp > 1), (
+            f"Concurrent PCP and DCP are not supported: got pcp={pcp}, dcp={dcp}."
+        )
         if isinstance(spec, UniformTypeKVCacheSpecs):
             effective_specs = {
-                name: _with_effective_block_size(leaf, pcp)
+                name: _with_effective_block_size(leaf, pcp, dcp)
                 for name, leaf in spec.kv_cache_specs.items()
             }
             effective_block_size = math.lcm(
@@ -718,12 +739,24 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             return replace(spec,
                            block_size=effective_block_size,
                            kv_cache_specs=effective_specs)
-        if isinstance(spec, (AttentionSpec, MambaSpec)):
+        if isinstance(spec, AttentionSpec):
+            # Attention KV cache is partitioned along the 1D Context Parallel (CP)
+            # axis during prefill (PCP) or decode (DCP). Because PCP and DCP share
+            # the same physical axis (rather than forming a 2D grid), the effective
+            # sharding factor is max(pcp, dcp).
+            cp_world_size = max(pcp, dcp)
+            return replace(spec, block_size=spec.block_size * cp_world_size)
+        if isinstance(spec, MambaSpec):
+            # Mamba/GDN recurrent state has a fixed per-sequence footprint that
+            # is partitioned across ranks during prefill (PCP), but maintains
+            # full per-rank state during decode and is not sharded by DCP.
             return replace(spec, block_size=spec.block_size * pcp)
         return spec
 
-    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
-        return _with_effective_block_size(spec, pcp).block_size
+    def _effective_block_size(spec: KVCacheSpec,
+                              pcp: int,
+                              dcp: int = 1) -> int:
+        return _with_effective_block_size(spec, pcp, dcp).block_size
 
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         cache_config = vllm_config.cache_config
@@ -788,7 +821,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  pcp_world_size,
                                                  scheduler_block_size,
                                                  hash_block_size,
-                                                 metrics_collector=None):
+                                                 metrics_collector=None,
+                                                 num_prefill_lookahead=0):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
             if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
@@ -797,7 +831,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 # constructing KVCacheManager. Recover the folded PCP factor
                 # from the logical scheduler block and the rank-local specs.
                 physical_scheduler_block_size = math.lcm(
-                    *(_effective_block_size(group.kv_cache_spec, 1)
+                    *(_effective_block_size(group.kv_cache_spec, 1,
+                                            dcp_world_size)
                       for group in groups))
                 if scheduler_block_size % physical_scheduler_block_size != 0:
                     raise ValueError(
@@ -849,6 +884,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_prefill_lookahead=num_prefill_lookahead,
             )
 
         hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
@@ -861,7 +897,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
         module = sys.modules.get(module_name)
         if module is not None:
-            setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
+            module.resolve_kv_cache_block_sizes = patched_resolve
 
     # Upstream _promote_local_kv_cache_specs asserts that all workers share a
     # uniform KV cache spec across groups, raising ValueError when encountering
@@ -888,7 +924,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             mod = sys.modules.get(module_name)
             if mod is not None and hasattr(mod,
                                            "_promote_local_kv_cache_specs"):
-                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+                mod._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
@@ -954,8 +990,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     for mod_name, mod in list(sys.modules.items()):
         if mod_name.startswith("vllm.model_executor.models") and hasattr(
                 mod, "_merge_multimodal_embeddings"):
-            if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
-                setattr(mod, "_merge_multimodal_embeddings", patched_fn)
+            if mod._merge_multimodal_embeddings is not patched_fn:
+                mod._merge_multimodal_embeddings = patched_fn
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
@@ -1183,17 +1219,15 @@ def _patch_vllm_config_triton_tpu() -> None:
 
 
 def _patch_vllm_force_v1_runner_tpu() -> None:
-    """Keep ``use_v2_model_runner`` False for DSpark on TPU.
+    """Keep TPU's V1 scheduler contract and validate its own capabilities.
 
-    Upstream forces the flag True for dspark (and for hybrid DFlash drafts
-    via ``_dflash_needs_multi_kv_group``), because those methods are only
-    implemented by the V2 *GPU* model runner. The flag is not just a runner
-    selector: the scheduler, async scheduler, and input processor all branch
-    on it and emit V2-shaped request data (resumed requests folded into
-    scheduled_new_reqs, no prev_step_scheduled_req_ids, ...). TPUModelRunner
-    subclasses the V1 GPUModelRunner and expects V1-shaped output, so the
-    flag must stay False for DSpark. An explicit VLLM_USE_V2_MODEL_RUNNER env
-    setting still wins, matching upstream's own precedence.
+    vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
+    rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
+    PCP, DSpark, and mixed-attention DFlash implementations, but consumes
+    V1-shaped scheduler output. Keep that default regardless of Triton and
+    remove only those implemented features from the native V1 rejection
+    list. The other native checks and TPU's combination checks still apply.
+    An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
     from vllm.config.vllm import VllmConfig
 
@@ -1204,7 +1238,7 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
     if not isinstance(original_prop, property):
         logger.warning(
             "VllmConfig.use_v2_model_runner is no longer a property; skipping "
-            "the TPU V1-runner patch. DSpark on TPU may misbehave until this "
+            "the TPU V1-runner patch. TPU execution may misbehave until this "
             "is updated for the current vLLM version.")
         return
 
@@ -1213,13 +1247,30 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
             return original_prop.fget(self)
         device_config = getattr(self, "device_config", None)
-        spec_config = getattr(self, "speculative_config", None)
-        if (device_config is not None and device_config.device_type == "tpu"
-                and spec_config is not None
-                and getattr(spec_config, "method", None) == "dspark"):
+        if device_config is not None and device_config.device_type == "tpu":
             return False
         return original_prop.fget(self)
 
+    original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
+
+    def patched_unsupported(self):
+        unsupported = original_unsupported(self)
+        device_config = getattr(self, "device_config", None)
+        if device_config is None or device_config.device_type != "tpu":
+            return unsupported
+        # These are limitations of the upstream GPU V1 runner. Do not bypass
+        # the validator: adaptive verification, DFlash2, and future features
+        # must remain rejected until TPU implements them.
+        implemented = {
+            "prefill context parallel",
+            "dspark speculative decoding",
+            "mixed sliding/full dflash drafts",
+        }
+        return [
+            feature for feature in unsupported if feature not in implemented
+        ]
+
+    VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
     VllmConfig._tpu_force_v1_runner_patch = True
     logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
@@ -1294,6 +1345,73 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     BlockPool._tpu_lifo_free_patch = True
     logger.info(
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+
+
+def _patch_vllm_same_step_prefix_hits() -> None:
+    """Keep prefix-cache hits off blocks the current step has not written.
+
+    vLLM publishes a block's hash when the block is allocated, before the
+    forward that fills it runs, so a request admitted later in the same
+    `schedule()` can hit a block an earlier request fills in that very step.
+    GPU attention writes the whole batch's KV before any request reads it,
+    which makes that hit safe there. The TPU ragged paged attention kernel
+    writes each sequence's new KV as it walks the batch instead: a sequence
+    ordered before the one filling the block DMAs the block from HBM
+    unwritten and attends over stale KV. Identical prompts admitted together
+    (n > 1 sampling, a repeated prompt) then decode garbage.
+
+    Blocks hashed during the current `schedule()` therefore count as misses,
+    and a request that would have hit one recomputes that prefix itself.
+    From the next `schedule()` on they hit normally: the worker runs the
+    steps' forwards in order, so the step that fills a block has run before
+    any later step reads it, with or without async scheduling.
+    """
+    import functools
+
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch",
+               False):
+        return
+
+    original_insert_block_hash = BlockPool._insert_block_hash
+    original_get_cached_block = BlockPool.get_cached_block
+    original_schedule = Scheduler.schedule
+
+    def unwritten_block_ids(pool) -> set[int]:
+        return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
+
+    # Every path that makes a block hittable (full blocks, partial blocks,
+    # re-pointed hashes) goes through here.
+    @functools.wraps(original_insert_block_hash)
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+        original_insert_block_hash(self, block_hash_with_group_id, block,
+                                   num_tokens)
+        unwritten_block_ids(self).add(block.block_id)
+
+    @functools.wraps(original_get_cached_block)
+    def get_cached_block(self, block_hash, kv_cache_group_ids):
+        blocks = original_get_cached_block(self, block_hash,
+                                           kv_cache_group_ids)
+        unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
+        if blocks and unwritten and any(block.block_id in unwritten
+                                        for block in blocks):
+            return None
+        return blocks
+
+    @functools.wraps(original_schedule)
+    def schedule(self, *args, **kwargs):
+        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
+        return original_schedule(self, *args, **kwargs)
+
+    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+        wrapper._tpu_same_step_prefix_hit_patch = True
+    BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool.get_cached_block = get_cached_block
+    Scheduler.schedule = schedule
+    logger.info("Applied TPU patch: no prefix-cache hits on blocks the "
+                "current step has not written.")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

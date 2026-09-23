@@ -69,6 +69,34 @@ CASES = (
         "v_scale": 1.0,
     },
     {
+        "name": "fp8_mha_seq_along_lane",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "kv_layout": "SEQ_ALONG_LANE",
+    },
+    {
+        "name": "fp8_mha_layout_reference",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "layout_equivalence": True,
+    },
+    {
+        "name": "fp8_mha_seq_along_lane_equivalence",
+        "kv_dtype": "float8_e4m3fn",
+        "num_kv_heads": 2,
+        "q_per_kv": 1,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "kv_layout": "SEQ_ALONG_LANE",
+        "layout_equivalence": True,
+    },
+    {
         "name": "fp8_gqa_odd_kv_heads",
         "kv_dtype": "float8_e4m3fn",
         "num_kv_heads": 3,
@@ -96,8 +124,9 @@ def _worker_command(result_dir: Path) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-            prepare_tpu_environment
+        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
+            prepare_tpu_environment,
+        )
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
 
@@ -121,8 +150,7 @@ def _prepare_worker_env() -> dict[str, str]:
             else:
                 os.environ[key] = value
 
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                   "false")
+    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     return env
@@ -147,10 +175,10 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
-        raise AssertionError("Unified PCP workers timed out. Output tail:\n"
-                             f"{output[-12000:]}") from exc
-    return subprocess.CompletedProcess(process.args, process.returncode,
-                                       output, "")
+        raise AssertionError(
+            f"Unified PCP workers timed out. Output tail:\n{output[-12000:]}"
+        ) from exc
+    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
 def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
@@ -167,15 +195,15 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
 def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
-        device_id for device_id in global_device_ids
-        if device_id not in devices_by_id
+        device_id for device_id in global_device_ids if device_id not in devices_by_id
     ]
     if missing:
-        raise RuntimeError(f"JAX does not expose worker TPU ids {missing}; "
-                           f"available={sorted(devices_by_id)}")
-    devices = np.asarray(
-        [devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name, ))
+        raise RuntimeError(
+            f"JAX does not expose worker TPU ids {missing}; "
+            f"available={sorted(devices_by_id)}"
+        )
+    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
+    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
 
 
 def _torch_dtype(torch, name: str):
@@ -186,7 +214,11 @@ def _torch_dtype(torch, name: str):
     raise ValueError(f"Unsupported dtype name: {name}")
 
 
-def _kv_cache_shape(num_kv_heads: int, kv_packing: int) -> tuple[int, ...]:
+def _kv_cache_shape(
+    num_kv_heads: int, kv_packing: int, kv_layout: str
+) -> tuple[int, ...]:
+    if kv_layout == "SEQ_ALONG_LANE":
+        return (1, 2 * num_kv_heads, HEAD_DIM // kv_packing, kv_packing, PAGE_SIZE)
     packed_kv_groups = math.ceil((2 * num_kv_heads) / kv_packing)
     return (1, PAGE_SIZE, packed_kv_groups, kv_packing, HEAD_DIM)
 
@@ -197,36 +229,57 @@ def _make_case_inputs(torch, case: dict[str, object]):
     num_q_heads = num_kv_heads * q_per_kv
     kv_dtype = _torch_dtype(torch, str(case["kv_dtype"]))
     kv_packing = 4 if case["kv_dtype"] == "float8_e4m3fn" else 2
+    kv_layout = str(case.get("kv_layout", "HEAD_ALONG_SUBLANE"))
 
-    q = torch.zeros((LOCAL_TOKENS, num_q_heads, HEAD_DIM),
-                    dtype=torch.bfloat16,
-                    device="tpu")
-    k = torch.zeros((LOCAL_TOKENS, num_kv_heads, HEAD_DIM),
-                    dtype=torch.bfloat16,
-                    device="tpu")
-    v = torch.full((LOCAL_TOKENS, num_kv_heads, HEAD_DIM),
-                   2.0,
-                   dtype=torch.bfloat16,
-                   device="tpu")
-    kv_cache = torch.zeros(_kv_cache_shape(num_kv_heads, kv_packing),
-                           dtype=kv_dtype,
-                           device="tpu")
+    q = torch.zeros(
+        (LOCAL_TOKENS, num_q_heads, HEAD_DIM), dtype=torch.bfloat16, device="tpu"
+    )
+    k = torch.zeros(
+        (LOCAL_TOKENS, num_kv_heads, HEAD_DIM), dtype=torch.bfloat16, device="tpu"
+    )
+    v = torch.full(
+        (LOCAL_TOKENS, num_kv_heads, HEAD_DIM), 2.0, dtype=torch.bfloat16, device="tpu"
+    )
+    if case.get("layout_equivalence"):
+        rank = int(os.environ["RANK"])
+        absolute_positions = (
+            torch.arange(LOCAL_TOKENS, dtype=torch.float32, device="tpu")
+            + rank * LOCAL_TOKENS
+        ) / GLOBAL_TOKENS
+        q.zero_()
+        k.zero_()
+        v.zero_()
+        q[:, :, 0] = 1.0
+        q[:, 0, 1] = 0.5
+        q[:, 1, 1] = -0.5
+        k[:, 0, 0] = absolute_positions
+        k[:, 1, 0] = -absolute_positions
+        v[:, 0, 0] = absolute_positions
+        v[:, 0, 1] = 0.25
+        v[:, 1, 0] = 1.0 - absolute_positions
+        v[:, 1, 1] = -0.25
+    kv_cache = torch.zeros(
+        _kv_cache_shape(num_kv_heads, kv_packing, kv_layout),
+        dtype=kv_dtype,
+        device="tpu",
+    )
     seq_lens = torch.tensor([GLOBAL_TOKENS], dtype=torch.int32, device="tpu")
     block_tables = torch.tensor([0], dtype=torch.int32, device="tpu")
-    query_start_loc = torch.tensor([0, GLOBAL_TOKENS],
-                                   dtype=torch.int32,
-                                   device="tpu")
+    query_start_loc = torch.tensor([0, GLOBAL_TOKENS], dtype=torch.int32, device="tpu")
     distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device="tpu")
-    return kv_cache, (q, k, v, seq_lens, block_tables, query_start_loc,
-                      distribution)
+    return kv_cache, (q, k, v, seq_lens, block_tables, query_start_loc, distribution)
 
 
-def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
+def _run_case(torch, sync, mesh, case: dict[str, object]):
+    from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
     from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-        PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, make_pcp_streaming_rpa_kernel,
-        pcp_streaming_jax_op)
+        PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
+        make_pcp_streaming_rpa_kernel,
+        pcp_streaming_jax_op,
+    )
 
     kv_cache, args = _make_case_inputs(torch, case)
+    kv_layout = KVLayout[str(case.get("kv_layout", "HEAD_ALONG_SUBLANE"))]
     sync.synchronize([kv_cache, *args], wait=True)
     entry = make_pcp_streaming_rpa_kernel(
         q_scale=None,
@@ -237,15 +290,15 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
         sm_scale=1.0 / math.sqrt(HEAD_DIM),
         soft_cap=None,
         skip_kv_update=False,
-        cp_kv_cache_interleave_size=int(case.get("interleave_size",
-                                                 PAGE_SIZE)),
+        cp_kv_cache_interleave_size=int(case.get("interleave_size", PAGE_SIZE)),
         q_block_size=LOCAL_TOKENS,
         q_compute_size=64,
+        kv_layout=kv_layout,
     )
     attention = pcp_streaming_jax_op(
         f"pcp_unified_head_matrix::{case['name']}",
         entry,
-        donate_argnums=(0, ),
+        donate_argnums=(0,),
         mesh=mesh,
         input_partition_specs=PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
     )
@@ -253,15 +306,27 @@ def _run_case(torch, sync, mesh, case: dict[str, object]) -> dict[str, object]:
     kv_cache.copy_(new_kv_cache)
     sync.synchronize([kv_cache, output], wait=True)
     output_cpu = output.cpu().float()
-    max_abs = float((output_cpu - 2.0).abs().max().item())
-    if max_abs > 0.03:
-        raise AssertionError(f"{case['name']} output max_abs={max_abs}")
+    if case.get("layout_equivalence"):
+        max_abs = 0.0
+        comparison_output = output_cpu
+    else:
+        max_abs = float((output_cpu - 2.0).abs().max().item())
+        comparison_output = None
+        if max_abs > 0.03:
+            raise AssertionError(f"{case['name']} output max_abs={max_abs}")
+    cache_max_abs = 0.0
+    if kv_layout == KVLayout.SEQ_ALONG_LANE and not case.get("layout_equivalence"):
+        cached_v = kv_cache[:, 1::2].cpu().float()
+        cache_max_abs = float((cached_v - 2.0).abs().max().item())
+        if cache_max_abs > 0.03:
+            raise AssertionError(f"{case['name']} cache V max_abs={cache_max_abs}")
     return {
         "name": case["name"],
         "output_max_abs": max_abs,
         "output_shape": tuple(output.shape),
         "kv_cache_shape": tuple(kv_cache.shape),
-    }
+        "cache_max_abs": cache_max_abs,
+    }, comparison_output
 
 
 def _run_worker(result_dir: Path) -> None:
@@ -279,18 +344,40 @@ def _run_worker(result_dir: Path) -> None:
     try:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
-        torch.empty((1, ), device="tpu").cpu()
+        torch.empty((1,), device="tpu").cpu()
         import jax
 
-        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import \
-            PCP_AXIS_NAME
+        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
+            PCP_AXIS_NAME,
+        )
 
-        global_device_ids = _gather_global_device_ids(torch, dist,
-                                                      tpu_distributed)
+        global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
         mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
-        case_results = [_run_case(torch, sync, mesh, case) for case in CASES]
-        result = {"rank": rank, "cases": case_results}
-    except BaseException as exc:
+        case_results = []
+        comparison_outputs = []
+        for case in CASES:
+            case_result, comparison_output = _run_case(torch, sync, mesh, case)
+            case_results.append(case_result)
+            if comparison_output is not None:
+                comparison_outputs.append(comparison_output)
+        if len(comparison_outputs) != 2:
+            raise AssertionError(
+                f"Expected two layout comparison outputs, got "
+                f"{len(comparison_outputs)}."
+            )
+        layout_max_abs = float(
+            (comparison_outputs[0] - comparison_outputs[1]).abs().max().item()
+        )
+        if layout_max_abs > 0.03:
+            raise AssertionError(
+                f"SEQ_ALONG_LANE vs legacy output max_abs={layout_max_abs}"
+            )
+        result = {
+            "rank": rank,
+            "cases": case_results,
+            "layout_equivalence_max_abs": layout_max_abs,
+        }
+    except BaseException as exc:  # noqa: BLE001 - report worker failures
         traceback.print_exc()
         result = {"rank": rank, "error": repr(exc)}
     finally:
@@ -298,15 +385,14 @@ def _run_worker(result_dir: Path) -> None:
         if initialized:
             try:
                 dist.destroy_process_group()
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort worker cleanup
                 traceback.print_exc()
     if "error" in result:
         raise SystemExit(1)
 
 
 @pytest.mark.nightly
-def test_pcp_attention_executes_unified_bf16_fp8_single_multi_head_matrix(
-        tmp_path):
+def test_pcp_attention_executes_unified_bf16_fp8_single_multi_head_matrix(tmp_path):
     result_dir = tmp_path / "pcp_unified_head_matrix"
     result_dir.mkdir()
     completed = _run_worker_group(result_dir)
@@ -322,17 +408,17 @@ def test_pcp_attention_executes_unified_bf16_fp8_single_multi_head_matrix(
     errors = [result for result in results if "error" in result]
     assert completed.returncode == 0 and not errors, (
         f"Unified PCP matrix failure: returncode={completed.returncode}, "
-        f"results={errors}\nworker output tail:\n{combined_output[-12000:]}")
+        f"results={errors}\nworker output tail:\n{combined_output[-12000:]}"
+    )
 
     summary = {
-        case["name"]:
-        max(result["cases"][idx]["output_max_abs"] for result in results)
+        case["name"]: max(result["cases"][idx]["output_max_abs"] for result in results)
         for idx, case in enumerate(CASES)
     }
-    (result_dir / "summary.json").write_text(json.dumps(summary, indent=2),
-                                             encoding="utf-8")
-    print("Unified PCP head/dtype matrix summary:",
-          json.dumps(summary, sort_keys=True))
+    (result_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    print("Unified PCP head/dtype matrix summary:", json.dumps(summary, sort_keys=True))
 
 
 def _parse_args() -> argparse.Namespace:

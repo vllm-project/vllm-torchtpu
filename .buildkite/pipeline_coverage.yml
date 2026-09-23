@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unit-test line-coverage measurement, including engine subprocess coverage
+# (see .coveragerc). Runs the same test selection as CI's unit-test jobs on
+# the 2-chip and 8-chip queues, then combines the data and reports.
+#
+# Uploaded by a dedicated coverage Buildkite pipeline; run on demand.
+#
+# NOTES
+# ─────
+# * Coverage data files must NOT be dotfiles: run_in_docker.sh copies
+#   results out of the container with 'cp -r .../*', which skips dotfiles.
+# * The combine step runs on a cpu agent outside docker; it installs
+#   coverage with pip --user because those agents lack python3-venv.
+
+steps:
+
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "coverage: 2-chip (not multichip)"
+    key: cov_2chip
+    depends_on: build_docker
+    agents:
+      queue: tpu_v7x_2_queue
+    timeout_in_minutes: 330
+    commands:
+      - |
+        .buildkite/scripts/run_in_docker.sh bash -c '
+          test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
+          COVERAGE_FILE=/perf_eval_results/coverage_2chip.dat \
+          python3 -m pytest -q --timeout=1800 -m "not nightly and not multichip" \
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
+          ls -la /perf_eval_results/'
+    artifact_paths:
+      - "perf_eval_results/coverage_2chip.dat*"
+
+  - label: "coverage: 8-chip (multichip)"
+    key: cov_8chip
+    depends_on: build_docker
+    agents:
+      queue: tpu_v7x_8_queue
+    timeout_in_minutes: 330
+    commands:
+      - |
+        .buildkite/scripts/run_in_docker.sh bash -c '
+          test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
+          COVERAGE_FILE=/perf_eval_results/coverage_8chip.dat \
+          python3 -m pytest -q --timeout=3600 -m "not nightly and multichip" \
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
+          ls -la /perf_eval_results/'
+    artifact_paths:
+      - "perf_eval_results/coverage_8chip.dat*"
+
+  - label: "coverage: combine + report"
+    key: cov_combine
+    depends_on:
+      - cov_2chip
+      - cov_8chip
+    agents:
+      queue: cpu
+    timeout_in_minutes: 30
+    commands:
+      - buildkite-agent artifact download "perf_eval_results/coverage_*" .
+      - ls -la perf_eval_results/
+      - python3 -m pip install -q --break-system-packages --user coverage
+      - python3 -m coverage combine perf_eval_results/coverage_*chip.dat*
+      - python3 -m coverage report | tee coverage_summary.txt
+      - python3 -m coverage xml -o coverage.xml
+      - python3 -m coverage html -d cov_html
+    artifact_paths:
+      - "coverage_summary.txt"
+      - "coverage.xml"
+      - "cov_html/**/*"

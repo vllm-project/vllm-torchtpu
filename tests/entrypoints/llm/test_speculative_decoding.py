@@ -30,12 +30,37 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from tpu_release import wait_for_tpu_release
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
+
+
+@pytest.fixture(autouse=True)
+def _release_tpu_between_tests(request):
+    """Hold the next test until the finished one has given its chips back.
+
+    Tests here that tear an engine down in the test body leave nothing waiting
+    on it, so the next test's first engine races the previous one's workers for
+    the same device. This supplies that wait.
+
+    It is scoped to this module rather than to every test because other suites
+    keep a module-scoped engine alive on purpose, and waiting for those to exit
+    between tests would never finish.
+
+    A failed test is skipped. Its engine is still referenced by the traceback
+    pytest is holding, so the chips stay busy until the report is written, and
+    charging the full timeout there would bury the assertion that matters.
+    """
+    yield
+    report = getattr(request.node, "report_call", None)
+    if report is not None and report.failed:
+        return
+    wait_for_tpu_release()
+
 
 # Spec-decode e2e integration suite, split across the PR and nightly steps in
 # `.buildkite/pipeline_tests.yml`:
@@ -76,8 +101,7 @@ def get_ngram_test_prompts():
     prompts = []
     for _ in range(num_prompts):
         w = rng.choice(list(string.ascii_lowercase))
-        prompts.append(
-            f"Keep repeating: {w} {w} {w} {w} {w} {w} {w} {w} {w} {w}")
+        prompts.append(f"Keep repeating: {w} {w} {w} {w} {w} {w} {w} {w} {w} {w}")
     return prompts
 
 
@@ -187,10 +211,7 @@ QWEN35_KWARGS = {
     # Qwen3.5 declares a vision modality; run it text-only so vLLM takes the
     # language-model-only path (see TpuPlatform.check_and_update_config).
     "language_model_only": True,
-    "limit_mm_per_prompt": {
-        "image": 0,
-        "video": 0
-    },
+    "limit_mm_per_prompt": {"image": 0, "video": 0},
     # Qwen3.5 is hybrid (GDN linear attention + full attention). TpuPlatform
     # rejects prefix caching together with speculative decoding on hybrid
     # Mamba models, so keep it off on both the reference and the spec engine
@@ -212,16 +233,19 @@ def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
 EAGLE3_PERF_MAX_TOKENS = 16
 
 
-def _make_sampling_config(temperature: float = 0,
-                          max_tokens: int = 200) -> SamplingParams:
-    return SamplingParams(temperature=temperature,
-                          max_tokens=max_tokens,
-                          ignore_eos=True,
-                          repetition_penalty=1,
-                          frequency_penalty=0,
-                          presence_penalty=0,
-                          min_p=0,
-                          logprobs=None)
+def _make_sampling_config(
+    temperature: float = 0, max_tokens: int = 200
+) -> SamplingParams:
+    return SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+        repetition_penalty=1,
+        frequency_penalty=0,
+        presence_penalty=0,
+        min_p=0,
+        logprobs=None,
+    )
 
 
 @pytest.fixture
@@ -241,10 +265,12 @@ SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
 
 
-def _assert_no_spec_divergence(prompts: list[str],
-                               ref_texts: list[str],
-                               spec_texts: list[str],
-                               group_keys: list | None = None):
+def _assert_no_spec_divergence(
+    prompts: list[str],
+    ref_texts: list[str],
+    spec_texts: list[str],
+    group_keys: list | None = None,
+):
     """Speculation must not change greedy output. Shared by the in-process
     and served correctness tests so both apply the same standard.
 
@@ -274,10 +300,12 @@ def _assert_no_spec_divergence(prompts: list[str],
     """
     assert len(ref_texts) == len(spec_texts) == len(prompts), (
         f"{len(prompts)} prompts, reference produced {len(ref_texts)} "
-        f"outputs, speculative produced {len(spec_texts)}")
+        f"outputs, speculative produced {len(spec_texts)}"
+    )
     keys = prompts if group_keys is None else group_keys
     assert len(keys) == len(prompts), (
-        f"{len(prompts)} prompts but {len(keys)} group keys")
+        f"{len(prompts)} prompts but {len(keys)} group keys"
+    )
 
     rows_by_key: dict[object, list[int]] = collections.defaultdict(list)
     for i, key in enumerate(keys):
@@ -289,19 +317,22 @@ def _assert_no_spec_divergence(prompts: list[str],
         distinct = {prompts[i] for i in rows}
         assert len(distinct) == 1, (
             f"group key {key!r} pools {len(distinct)} different prompts "
-            f"across rows {rows}; the key must include the prompt")
+            f"across rows {rows}; the key must include the prompt"
+        )
 
-    def majority(texts: list[str], rows: list[int], label: str,
-                 key: object) -> str:
+    def majority(texts: list[str], rows: list[int], label: str, key: object) -> str:
         counts = collections.Counter(texts[i] for i in rows)
         modal_text, modal_rows = counts.most_common(1)[0]
         if modal_rows != len(rows):
-            print(f"{label} is not row-uniform for {key!r}: {len(counts)} "
-                  f"distinct outputs across {len(rows)} rows "
-                  f"(majority {modal_rows}/{len(rows)})")
+            print(
+                f"{label} is not row-uniform for {key!r}: {len(counts)} "
+                f"distinct outputs across {len(rows)} rows "
+                f"(majority {modal_rows}/{len(rows)})"
+            )
         assert modal_rows * 2 > len(rows), (
             f"no majority {label} output for {key!r}; it is too unstable to "
-            f"compare against: {dict(counts)}")
+            f"compare against: {dict(counts)}"
+        )
         return modal_text
 
     misses = 0
@@ -335,9 +366,10 @@ def _assert_acceptance_rate(
         print("num_draft_tokens:" + str(num_draft_tokens))
 
     assert num_draft_tokens > 0, "Draft tokens should be greater than 0."
-    assert acceptance_rate >= min_acceptance_rate, \
-        f"Expected at least {min_acceptance_rate:.2%} acceptance rate for " \
+    assert acceptance_rate >= min_acceptance_rate, (
+        f"Expected at least {min_acceptance_rate:.2%} acceptance rate for "
         f"{method}, got {acceptance_rate:.2%}"
+    )
     return acceptance_rate
 
 
@@ -347,8 +379,9 @@ class _InProcessEngine:
     def __init__(self, llm: LLM):
         self._llm = llm
 
-    def generate(self, prompts: list[str],
-                 sampling_config: SamplingParams) -> list[str]:
+    def generate(
+        self, prompts: list[str], sampling_config: SamplingParams
+    ) -> list[str]:
         outputs = self._llm.generate(prompts, sampling_config)
         return [output.outputs[0].text for output in outputs]
 
@@ -386,9 +419,7 @@ def _engine(model_name: str, speculative_config: dict | None, kwargs: dict):
         return
 
     llm_kwargs = {k: v for k, v in kwargs.items() if k != "data_parallel_size"}
-    llm = LLM(model=model_name,
-              speculative_config=speculative_config,
-              **llm_kwargs)
+    llm = LLM(model=model_name, speculative_config=speculative_config, **llm_kwargs)
     engine = _InProcessEngine(llm)
     try:
         yield engine
@@ -396,8 +427,7 @@ def _engine(model_name: str, speculative_config: dict | None, kwargs: dict):
         engine.shutdown()
         del llm, engine
         cleanup_dist_env_and_memory()
-        # Waiting for TPUs to be fully released.
-        time.sleep(15)
+        wait_for_tpu_release()
 
 
 def _test_correctness_helper(
@@ -439,21 +469,28 @@ def test_ngram_correctness_greedy(
     model_name: str,
 ):
     _test_correctness_helper(
-        monkeypatch, sampling_config, model_name, {
+        monkeypatch,
+        sampling_config,
+        model_name,
+        {
             "method": "ngram",
             "prompt_lookup_max": 5,
             "prompt_lookup_min": 3,
             "num_speculative_tokens": 3,
-        })
+        },
+    )
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
-    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
-    pytest.param(1, True, id="bs1-async"),
-    pytest.param(10, False, id="bs10-sync"),
-    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
-])
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(10, False, id="bs10-sync"),
+        pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+    ],
+)
 def test_eagle3_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -478,12 +515,15 @@ def test_eagle3_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
-    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
-    pytest.param(1, True, id="bs1-async"),
-    pytest.param(10, False, id="bs10-sync"),
-    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
-])
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(10, False, id="bs10-sync"),
+        pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+    ],
+)
 def test_dflash_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -510,12 +550,15 @@ def test_dflash_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
-    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
-    pytest.param(1, True, id="bs1-async"),
-    pytest.param(10, False, id="bs10-sync"),
-    pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
-])
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(10, False, id="bs10-sync"),
+        pytest.param(10, True, id="bs10-async", marks=pytest.mark.nightly),
+    ],
+)
 def test_dspark_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -549,12 +592,15 @@ def test_dspark_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("max_num_seqs,async_scheduling", [
-    pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
-    pytest.param(1, True, id="bs1-async"),
-    pytest.param(4, False, id="bs4-sync"),
-    pytest.param(4, True, id="bs4-async", marks=pytest.mark.nightly),
-])
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(4, False, id="bs4-sync"),
+        pytest.param(4, True, id="bs4-async", marks=pytest.mark.nightly),
+    ],
+)
 def test_qwen35_mtp_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -629,23 +675,28 @@ def _test_performance_helper(
 
         with _engine(model_name, speculative_config, kwargs) as spec_engine:
             spec_engine.generate(test_prompts, sampling_config)
-            num_draft_tokens, num_accepted_tokens, per_engine = \
+            num_draft_tokens, num_accepted_tokens, per_engine = (
                 spec_engine.spec_counters()
+            )
 
         # Every engine must have drafted. Under data parallelism a drafter
         # that failed to load on one engine leaves the summed rate looking
         # healthy; with one engine this is just "the drafter ran".
         expected_engines = kwargs.get("data_parallel_size", 1)
         print(f"{speculative_config['method']} per_engine={per_engine}")
-        assert len(per_engine) == expected_engines, \
-            f"expected {expected_engines} engine(s) to report draft " \
+        assert len(per_engine) == expected_engines, (
+            f"expected {expected_engines} engine(s) to report draft "
             f"counters, got {per_engine}"
+        )
         idle = sorted(e for e, n in per_engine.items() if n <= 0)
         assert not idle, f"engine(s) {idle} produced no draft tokens"
 
-        _assert_acceptance_rate(num_draft_tokens, num_accepted_tokens,
-                                min_acceptance_rate,
-                                speculative_config["method"])
+        _assert_acceptance_rate(
+            num_draft_tokens,
+            num_accepted_tokens,
+            min_acceptance_rate,
+            speculative_config["method"],
+        )
 
 
 @pytest.mark.nightly
@@ -654,25 +705,27 @@ def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
 ):
-    _test_performance_helper(monkeypatch,
-                             sampling_config, {
-                                 "method": "ngram",
-                                 "prompt_lookup_max": 2,
-                                 "prompt_lookup_min": 2,
-                                 "num_speculative_tokens": 4,
-                             },
-                             min_acceptance_rate=0.85)
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        {
+            "method": "ngram",
+            "prompt_lookup_max": 2,
+            "prompt_lookup_min": 2,
+            "num_speculative_tokens": 4,
+        },
+        min_acceptance_rate=0.85,
+    )
 
 
 @pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
+    "async_scheduling", [pytest.param(False, id="sync"), pytest.param(True, id="async")]
+)
 @pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(10, id="bs10")])
+    "max_num_seqs", [pytest.param(1, id="bs1"), pytest.param(10, id="bs10")]
+)
 @pytest.mark.parametrize(
     "temperature, min_acceptance_rate",
     # Non-greedy accepts fewer drafts than greedy (the target samples instead
@@ -681,10 +734,8 @@ def test_ngram_performance_greedy(
     # collapsing to ~0, hangs, or empty output), not a quality target. The run
     # is deterministic: sampling draws come from the runner's seeded generator
     # (model_config.seed, default 0), so the rate is reproducible run-to-run.
-    [
-        pytest.param(0.0, 0.75, id="greedy"),
-        pytest.param(0.7, 0.3, id="non_greedy")
-    ])
+    [pytest.param(0.0, 0.75, id="greedy"), pytest.param(0.7, 0.3, id="non_greedy")],
+)
 def test_eagle3_performance(
     monkeypatch: pytest.MonkeyPatch,
     max_num_seqs: int,
@@ -711,17 +762,16 @@ def test_eagle3_performance(
 @pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
+    "async_scheduling", [pytest.param(False, id="sync"), pytest.param(True, id="async")]
+)
 @pytest.mark.parametrize(
     "max_num_seqs, min_acceptance_rate",
     # The floor is a collapse guard (acceptance ~0, hangs), not a quality
     # target. Nightly v7x/TP2 runs are deterministic per batch size: bs1
     # accepts exactly one draft token per step (80/1200 = 6.67%), bs4 lands
     # at ~7.7-10.8%, so bs1 gets a 5% floor and bs4 gets a 7% floor.
-    [pytest.param(1, 0.05, id="bs1"),
-     pytest.param(4, 0.07, id="bs4")])
+    [pytest.param(1, 0.05, id="bs1"), pytest.param(4, 0.07, id="bs4")],
+)
 def test_dflash_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -751,13 +801,12 @@ def test_dflash_performance_greedy(
 @pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
+    "async_scheduling", [pytest.param(False, id="sync"), pytest.param(True, id="async")]
+)
 @pytest.mark.parametrize(
     "max_num_seqs, min_acceptance_rate",
-    [pytest.param(1, 0.05, id="bs1"),
-     pytest.param(4, 0.07, id="bs4")])
+    [pytest.param(1, 0.05, id="bs1"), pytest.param(4, 0.07, id="bs4")],
+)
 def test_dspark_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -793,12 +842,11 @@ def test_dspark_performance_greedy(
 @pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
+    "async_scheduling", [pytest.param(False, id="sync"), pytest.param(True, id="async")]
+)
 @pytest.mark.parametrize(
-    "max_num_seqs", [pytest.param(1, id="bs1"),
-                     pytest.param(4, id="bs4")])
+    "max_num_seqs", [pytest.param(1, id="bs1"), pytest.param(4, id="bs4")]
+)
 def test_qwen35_mtp_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -855,8 +903,9 @@ def test_sd_supports_non_greedy(
             outputs = spec_llm.generate(prompts, non_greedy)
             assert len(outputs) == len(prompts)
             for output in outputs:
-                assert output.outputs[0].text, \
+                assert output.outputs[0].text, (
                     "non-greedy spec decode produced empty output"
+                )
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
@@ -890,11 +939,13 @@ def test_sd_correctness_greedy_multi_chunk(
         )
 
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        time.sleep(15)
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         spec_llm = LLM(
             model=model_name,
@@ -906,23 +957,25 @@ def test_sd_correctness_greedy_multi_chunk(
             },
             **kwargs,
         )
-        # Force the runner's while-loop in execute_model to iterate at
-        # least twice for any batch larger than 2.
-        spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2, ))
+        try:
+            # Force the runner's while-loop in execute_model to iterate at
+            # least twice for any batch larger than 2.
+            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2,))
 
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 # ---------------------------------------------------------------------------
@@ -943,8 +996,8 @@ def get_structured_spec_prompts() -> list[str]:
     # drafts inside the constrained generation, driving real (masked) verify
     # traffic instead of degenerating to draft-free steps.
     return [
-        f"Repeat exactly this JSON and nothing else: {STRUCTURED_SPEC_JSON}\n"
-        f"JSON: " for _ in range(8)
+        f"Repeat exactly this JSON and nothing else: {STRUCTURED_SPEC_JSON}\nJSON: "
+        for _ in range(8)
     ]
 
 
@@ -965,10 +1018,10 @@ def _assert_valid_structured_json(text: str) -> None:
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("multi_chunk", [
-    pytest.param(False, id="single_chunk"),
-    pytest.param(True, id="multi_chunk")
-])
+@pytest.mark.parametrize(
+    "multi_chunk",
+    [pytest.param(False, id="single_chunk"), pytest.param(True, id="multi_chunk")],
+)
 def test_structured_output_spec_decode_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
@@ -990,12 +1043,8 @@ def test_structured_output_spec_decode_correctness_greedy(
     schema = {
         "type": "object",
         "properties": {
-            "name": {
-                "type": "string"
-            },
-            "age": {
-                "type": "integer"
-            },
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
         },
         "required": ["name", "age"],
     }
@@ -1027,64 +1076,74 @@ def test_structured_output_spec_decode_correctness_greedy(
 
         # 1. Reference run: structured outputs, no speculation.
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, params)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        time.sleep(15)
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, params)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Speculative run with the same structured params.
-        spec_llm = LLM(model=model_name,
-                       speculative_config=_structured_spec_ngram_config(),
-                       **kwargs)
-        if multi_chunk:
-            # Cap=2 with max_num_seqs=4: any batch with >2 reqs splits, so
-            # the bitmask scatter runs its chunk-local path.
-            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap,
-                                               args=(2, ))
-        spec_outputs = spec_llm.generate(test_prompts, params)
+        spec_llm = LLM(
+            model=model_name,
+            speculative_config=_structured_spec_ngram_config(),
+            **kwargs,
+        )
+        try:
+            if multi_chunk:
+                # Cap=2 with max_num_seqs=4: any batch with >2 reqs splits, so
+                # the bitmask scatter runs its chunk-local path.
+                spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2,))
+            spec_outputs = spec_llm.generate(test_prompts, params)
 
-        # (a) Constraint holds on every structured request.
-        for i, spec in enumerate(spec_outputs):
-            if i % 2 == 0:
-                _assert_valid_structured_json(spec.outputs[0].text)
+            # (a) Constraint holds on every structured request.
+            for i, spec in enumerate(spec_outputs):
+                if i % 2 == 0:
+                    _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output. Compared per-group
-        # majority, not row-for-row: the unconstrained rows run the full 64
-        # free tokens, and at this batch size either run can flip one row on
-        # a near-tie (see _assert_no_spec_divergence) -- both directions have
-        # been observed here. Structured and unconstrained rows share a
-        # prompt but not sampling params, so the group key carries the params
-        # too; they must not vote in one majority. Every structured row is
-        # still checked individually by (a) above.
-        ref_texts = [o.outputs[0].text for o in ref_outputs]
-        spec_texts = [o.outputs[0].text for o in spec_outputs]
-        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
-                      for i, prompt in enumerate(test_prompts)]
-        _assert_no_spec_divergence(test_prompts,
-                                   ref_texts,
-                                   spec_texts,
-                                   group_keys=group_keys)
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            group_keys = [
+                (prompt, "structured" if i % 2 == 0 else "free")
+                for i, prompt in enumerate(test_prompts)
+            ]
+            _assert_no_spec_divergence(
+                test_prompts, ref_texts, spec_texts, group_keys=group_keys
+            )
 
-        # (c) The masked verify path actually saw draft traffic.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == SPEC_DRAFT_METRIC:
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == SPEC_ACCEPTED_METRIC:
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"structured+spec: accepted={num_accepted_tokens} "
-              f"drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, \
-            "no draft tokens proposed under structured outputs"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under structured outputs"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (c) The masked verify path actually saw draft traffic.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == SPEC_DRAFT_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(
+                f"structured+spec: accepted={num_accepted_tokens} "
+                f"drafted={num_draft_tokens}"
+            )
+            assert num_draft_tokens > 0, (
+                "no draft tokens proposed under structured outputs"
+            )
+            assert num_accepted_tokens > 0, (
+                "no draft tokens accepted under structured outputs"
+            )
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(1800)
@@ -1126,20 +1185,22 @@ def test_structured_output_spec_decode_non_greedy(
             assert len(outputs) == len(prompts)
             for output in outputs:
                 assert output.outputs[0].text in choices, (
-                    f"constraint violated: {output.outputs[0].text!r}")
+                    f"constraint violated: {output.outputs[0].text!r}"
+                )
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
             cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(2400)
 @pytest.mark.parametrize(
-    "async_scheduling",
-    [pytest.param(False, id="sync"),
-     pytest.param(True, id="async")])
-def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
-                                         async_scheduling: bool):
+    "async_scheduling", [pytest.param(False, id="sync"), pytest.param(True, id="async")]
+)
+def test_structured_output_eagle3_greedy(
+    monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
+):
     """Structured outputs under greedy eagle3 speculative decoding.
 
     Same three assertions as the ngram combo test -- (a) every structured
@@ -1154,12 +1215,8 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
     schema = {
         "type": "object",
         "properties": {
-            "name": {
-                "type": "string"
-            },
-            "age": {
-                "type": "integer"
-            },
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
         },
         "required": ["name", "age"],
     }
@@ -1186,69 +1243,81 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
 
         # 1. Reference run: structured outputs, no speculation.
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, params)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        time.sleep(15)
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, params)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. eagle3 speculative run with the same structured params.
-        spec_llm = LLM(model=model_name,
-                       speculative_config={
-                           "method": "eagle3",
-                           "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
-                           "num_speculative_tokens": 3,
-                           "draft_tensor_parallel_size": 1,
-                       },
-                       **kwargs)
-        spec_outputs = spec_llm.generate(test_prompts, params)
+        spec_llm = LLM(
+            model=model_name,
+            speculative_config={
+                "method": "eagle3",
+                "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                "num_speculative_tokens": 3,
+                "draft_tensor_parallel_size": 1,
+            },
+            **kwargs,
+        )
+        try:
+            spec_outputs = spec_llm.generate(test_prompts, params)
 
-        # (a) Constraint holds on every structured request.
-        for i, spec in enumerate(spec_outputs):
-            if i % 2 == 0:
-                _assert_valid_structured_json(spec.outputs[0].text)
+            # (a) Constraint holds on every structured request.
+            for i, spec in enumerate(spec_outputs):
+                if i % 2 == 0:
+                    _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output. Compared per-group
-        # majority, not row-for-row: the unconstrained rows run the full 64
-        # free tokens, and at this batch size either run can flip one row on
-        # a near-tie (see _assert_no_spec_divergence) -- both directions have
-        # been observed here. Structured and unconstrained rows share a
-        # prompt but not sampling params, so the group key carries the params
-        # too; they must not vote in one majority. Every structured row is
-        # still checked individually by (a) above.
-        ref_texts = [o.outputs[0].text for o in ref_outputs]
-        spec_texts = [o.outputs[0].text for o in spec_outputs]
-        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
-                      for i, prompt in enumerate(test_prompts)]
-        _assert_no_spec_divergence(test_prompts,
-                                   ref_texts,
-                                   spec_texts,
-                                   group_keys=group_keys)
+            # (b) Speculation must not change greedy output. Compared per-group
+            # majority, not row-for-row: the unconstrained rows run the full 64
+            # free tokens, and at this batch size either run can flip one row on
+            # a near-tie (see _assert_no_spec_divergence) -- both directions have
+            # been observed here. Structured and unconstrained rows share a
+            # prompt but not sampling params, so the group key carries the params
+            # too; they must not vote in one majority. Every structured row is
+            # still checked individually by (a) above.
+            ref_texts = [o.outputs[0].text for o in ref_outputs]
+            spec_texts = [o.outputs[0].text for o in spec_outputs]
+            group_keys = [
+                (prompt, "structured" if i % 2 == 0 else "free")
+                for i, prompt in enumerate(test_prompts)
+            ]
+            _assert_no_spec_divergence(
+                test_prompts, ref_texts, spec_texts, group_keys=group_keys
+            )
 
-        # (c) The masked verify path actually saw draft traffic.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == SPEC_DRAFT_METRIC:
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == SPEC_ACCEPTED_METRIC:
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
-              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, \
-            "no draft tokens proposed under structured outputs"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under structured outputs"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (c) The masked verify path actually saw draft traffic.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == SPEC_DRAFT_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(
+                f"structured+eagle3({'async' if async_scheduling else 'sync'}): "
+                f"accepted={num_accepted_tokens} drafted={num_draft_tokens}"
+            )
+            assert num_draft_tokens > 0, (
+                "no draft tokens proposed under structured outputs"
+            )
+            assert num_accepted_tokens > 0, (
+                "no draft tokens accepted under structured outputs"
+            )
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(2400)
 def test_structured_output_eagle3_async_adversarial_choice(
-        monkeypatch: pytest.MonkeyPatch):
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Async + eagle3 + a choice constraint that fights greedy decoding.
 
     The repeat-JSON workload above can pass even with a degraded bitmask:
@@ -1286,10 +1355,7 @@ def test_structured_output_eagle3_async_adversarial_choice(
         "My favorite color is " if i % 2 == 0 else get_eagle3_test_prompts()[0]
         for i in range(8)
     ]
-    params = [
-        constrained if i % 2 == 0 else unconstrained
-        for i in range(len(prompts))
-    ]
+    params = [constrained if i % 2 == 0 else unconstrained for i in range(len(prompts))]
 
     with monkeypatch.context():
         spec_llm = LLM(
@@ -1313,7 +1379,8 @@ def test_structured_output_eagle3_async_adversarial_choice(
                 if i % 2:
                     continue  # unconstrained control row
                 assert output.outputs[0].text in choices, (
-                    f"constraint violated: {output.outputs[0].text!r}")
+                    f"constraint violated: {output.outputs[0].text!r}"
+                )
 
             # Speculation must have actually run, or the checks above are
             # just plain decoding and say nothing about the masked verify
@@ -1344,15 +1411,19 @@ def test_structured_output_eagle3_async_adversarial_choice(
                 elif metric.name == SPEC_ACCEPTED_METRIC:
                     assert isinstance(metric, Counter)
                     num_accepted_tokens += metric.value
-            print("adversarial choice + eagle3(async): "
-                  f"accepted={num_accepted_tokens} "
-                  f"drafted(net of grammar-rejected)={num_draft_tokens}")
-            assert num_accepted_tokens > 0, \
+            print(
+                "adversarial choice + eagle3(async): "
+                f"accepted={num_accepted_tokens} "
+                f"drafted(net of grammar-rejected)={num_draft_tokens}"
+            )
+            assert num_accepted_tokens > 0, (
                 "no draft tokens accepted on the unconstrained control rows"
+            )
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
             cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 @pytest.mark.timeout(1200)
@@ -1397,52 +1468,59 @@ def test_eagle3_correctness_greedy_multi_chunk(
 
         # 1. Reference run (no speculation).
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        time.sleep(15)
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Speculative run, forced multi-chunk.
-        spec_llm = LLM(model=model_name,
-                       speculative_config=speculative_config,
-                       **kwargs)
-        # cap=2 with max_num_seqs=4 -> any batch with >2 reqs chunks, so the
-        # draft propose() runs its per-chunk loop for >=2 chunks.
-        spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2, ))
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+        spec_llm = LLM(
+            model=model_name, speculative_config=speculative_config, **kwargs
+        )
+        try:
+            # cap=2 with max_num_seqs=4 -> any batch with >2 reqs chunks, so the
+            # draft propose() runs its per-chunk loop for >=2 chunks.
+            spec_llm.llm_engine.collective_rpc(_force_multi_chunk_cap, args=(2,))
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        # (a) Chunked drafting must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+            # (a) Chunked drafting must not change greedy output.
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
 
-        # (b) The chunked draft actually proposed and got tokens accepted.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"multi-chunk eagle3: accepted={num_accepted_tokens} "
-              f"drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, "no draft tokens produced under chunking"
-        assert num_accepted_tokens > 0, \
-            "no draft tokens accepted under chunking"
+            # (b) The chunked draft actually proposed and got tokens accepted.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == "vllm:spec_decode_num_draft_tokens":
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(
+                f"multi-chunk eagle3: accepted={num_accepted_tokens} "
+                f"drafted={num_draft_tokens}"
+            )
+            assert num_draft_tokens > 0, "no draft tokens produced under chunking"
+            assert num_accepted_tokens > 0, "no draft tokens accepted under chunking"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
 
-
-@pytest.mark.skipif(_get_tensor_parallel_size() < 2,
-                    reason="sharded draft (draft_tp == target_tp) needs TP>1")
+@pytest.mark.skipif(
+    _get_tensor_parallel_size() < 2,
+    reason="sharded draft (draft_tp == target_tp) needs TP>1",
+)
 @pytest.mark.timeout(1200)
 def test_eagle3_sharded_draft(
     monkeypatch: pytest.MonkeyPatch,
@@ -1455,7 +1533,6 @@ def test_eagle3_sharded_draft(
     tp = _get_tensor_parallel_size()
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
     with monkeypatch.context():
-
         test_prompts = get_eagle3_test_prompts()
         kwargs = dict(
             max_model_len=256,
@@ -1471,11 +1548,13 @@ def test_eagle3_sharded_draft(
 
         # 1. Reference run (no speculation).
         ref_llm = LLM(model=model_name, **kwargs)
-        ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        ref_llm.llm_engine.engine_core.shutdown()
-        del ref_llm
-        cleanup_dist_env_and_memory()
-        time.sleep(15)
+        try:
+            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
+        finally:
+            ref_llm.llm_engine.engine_core.shutdown()
+            del ref_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
         # 2. Sharded eagle3 draft (draft_tp == target tp).
         spec_llm = LLM(
@@ -1488,34 +1567,38 @@ def test_eagle3_sharded_draft(
             },
             **kwargs,
         )
-        spec_outputs = spec_llm.generate(test_prompts, sampling_config)
+        try:
+            spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
-        # (a) Sharded drafting must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+            # (a) Sharded drafting must not change greedy output.
+            misses = 0
+            for ref, spec in zip(ref_outputs, spec_outputs):
+                if ref.outputs[0].text != spec.outputs[0].text:
+                    misses += 1
+                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"spec: {spec.outputs[0].text}")
+            assert misses == 0
 
-        # (b) The sharded draft actually proposed + got tokens accepted.
-        num_draft_tokens = num_accepted_tokens = 0
-        for metric in spec_llm.get_metrics():
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
-                assert isinstance(metric, Counter)
-                num_draft_tokens += metric.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                assert isinstance(metric, Counter)
-                num_accepted_tokens += metric.value
-        print(f"sharded eagle3 (tp={tp}, draft_tp={tp}): "
-              f"accepted={num_accepted_tokens} drafted={num_draft_tokens}")
-        assert num_draft_tokens > 0, "no draft tokens produced (sharded draft)"
-        assert num_accepted_tokens > 0, "no draft tokens accepted (sharded draft)"
-
-        spec_llm.llm_engine.engine_core.shutdown()
-        del spec_llm
-        cleanup_dist_env_and_memory()
+            # (b) The sharded draft actually proposed + got tokens accepted.
+            num_draft_tokens = num_accepted_tokens = 0
+            for metric in spec_llm.get_metrics():
+                if metric.name == "vllm:spec_decode_num_draft_tokens":
+                    assert isinstance(metric, Counter)
+                    num_draft_tokens += metric.value
+                elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print(
+                f"sharded eagle3 (tp={tp}, draft_tp={tp}): "
+                f"accepted={num_accepted_tokens} drafted={num_draft_tokens}"
+            )
+            assert num_draft_tokens > 0, "no draft tokens produced (sharded draft)"
+            assert num_accepted_tokens > 0, "no draft tokens accepted (sharded draft)"
+        finally:
+            spec_llm.llm_engine.engine_core.shutdown()
+            del spec_llm
+            cleanup_dist_env_and_memory()
+            wait_for_tpu_release()
 
 
 # ---------------------------------------------------------------------------
@@ -1568,15 +1651,20 @@ def _serve_args(kwargs: dict) -> list[str]:
     receives is what keeps a served run honest: the two transports cannot
     drift apart without this raising.
     """
-    unhandled = {k for k, v in kwargs.items() if v is not None} - \
-        _SERVE_TRANSLATED_KEYS
+    unhandled = {k for k, v in kwargs.items() if v is not None} - _SERVE_TRANSLATED_KEYS
     assert not unhandled, (
         f"engine kwargs gained {sorted(unhandled)}; add the matching `vllm "
-        "serve` flag here so served runs keep matching in-process runs")
+        "serve` flag here so served runs keep matching in-process runs"
+    )
 
     args: list[str] = []
-    for key in ("max_model_len", "max_num_seqs", "tensor_parallel_size",
-                "data_parallel_size", "kv_cache_dtype"):
+    for key in (
+        "max_model_len",
+        "max_num_seqs",
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "kv_cache_dtype",
+    ):
         if kwargs.get(key) is not None:
             args += [f"--{key.replace('_', '-')}", str(kwargs[key])]
 
@@ -1592,10 +1680,7 @@ def _serve_args(kwargs: dict) -> list[str]:
     if kwargs.get("enable_expert_parallel"):
         args.append("--enable-expert-parallel")
     if kwargs.get("limit_mm_per_prompt") is not None:
-        args += [
-            "--limit-mm-per-prompt",
-            json.dumps(kwargs["limit_mm_per_prompt"])
-        ]
+        args += ["--limit-mm-per-prompt", json.dumps(kwargs["limit_mm_per_prompt"])]
     # Stats are on by default, which is what /metrics needs; only the
     # disabling direction has a flag.
     if kwargs.get("disable_log_stats"):
@@ -1621,8 +1706,10 @@ def _require_chips_for_dp(
     needed = dp_size * tp
     available = _get_local_tpu_chip_count()
     if available < needed:
-        pytest.skip(f"DP spec decode needs {needed} chips (dp={dp_size} x "
-                    f"tp={tp}), found {available}")
+        pytest.skip(
+            f"DP spec decode needs {needed} chips (dp={dp_size} x "
+            f"tp={tp}), found {available}"
+        )
 
 
 def _pick_free_port() -> int:
@@ -1638,8 +1725,9 @@ class _ServedEngine:
         self._base = base
         self._model = model_name
 
-    def generate(self, prompts: list[str],
-                 sampling_config: SamplingParams) -> list[str]:
+    def generate(
+        self, prompts: list[str], sampling_config: SamplingParams
+    ) -> list[str]:
         """Send the prompts concurrently and return their texts.
 
         Concurrency is required, not incidental: vLLM's DP load balancer only
@@ -1649,20 +1737,24 @@ class _ServedEngine:
         """
 
         def one(prompt: str) -> str:
-            payload = json.dumps({
-                "model": self._model,
-                "prompt": prompt,
-                "max_tokens": sampling_config.max_tokens,
-                "temperature": sampling_config.temperature,
-                "ignore_eos": sampling_config.ignore_eos,
-            }).encode()
+            payload = json.dumps(
+                {
+                    "model": self._model,
+                    "prompt": prompt,
+                    "max_tokens": sampling_config.max_tokens,
+                    "temperature": sampling_config.temperature,
+                    "ignore_eos": sampling_config.ignore_eos,
+                }
+            ).encode()
             request = urllib.request.Request(
                 f"{self._base}/v1/completions",
                 data=payload,
                 headers={"Content-Type": "application/json"},
-                method="POST")
+                method="POST",
+            )
             with urllib.request.urlopen(
-                    request, timeout=DP_REQUEST_TIMEOUT_S) as response:
+                request, timeout=DP_REQUEST_TIMEOUT_S
+            ) as response:
                 body = json.loads(response.read().decode())
             return body["choices"][0]["text"]
 
@@ -1676,8 +1768,7 @@ class _ServedEngine:
         ...). Matching on `name{` stops the accepted-token counter from also
         swallowing `..._per_pos_total`, which shares its prefix.
         """
-        with urllib.request.urlopen(f"{self._base}/metrics",
-                                    timeout=60) as response:
+        with urllib.request.urlopen(f"{self._base}/metrics", timeout=60) as response:
             body = response.read().decode()
 
         totals = {_DRAFT_METRIC: 0.0, _ACCEPTED_METRIC: 0.0}
@@ -1686,8 +1777,7 @@ class _ServedEngine:
             if line.startswith("#"):
                 continue
             for name in totals:
-                if not (line.startswith(name + "{")
-                        or line.startswith(name + " ")):
+                if not (line.startswith(name + "{") or line.startswith(name + " ")):
                     continue
                 try:
                     value = float(line.rsplit(" ", 1)[1])
@@ -1705,9 +1795,14 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     """Run `vllm serve` with these engine kwargs; yield a _ServedEngine."""
     port = _pick_free_port()
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", model_name,
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        model_name,
         "--port",
-        str(port), *_serve_args(kwargs)
+        str(port),
+        *_serve_args(kwargs),
     ]
     if speculative_config is not None:
         cmd += ["--speculative-config", json.dumps(speculative_config)]
@@ -1717,10 +1812,9 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     # Log to a file rather than a pipe. vLLM startup writes far more than a
     # pipe buffer holds, and nothing here drains it, so PIPE would block the
     # server mid-startup and the health poll would never succeed.
-    log = tempfile.NamedTemporaryFile(mode="w+",
-                                      suffix=".log",
-                                      prefix="vllm_serve_dp_",
-                                      delete=False)
+    log = tempfile.NamedTemporaryFile(
+        mode="w+", suffix=".log", prefix="vllm_serve_dp_", delete=False
+    )
 
     def _fail(message: str) -> RuntimeError:
         log.flush()
@@ -1733,29 +1827,29 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     # worker-RPC deadline -- the engine is torn down mid-compile and every
     # request 500s. Raise the deadline past the compile.
     env = dict(
-        os.environ,
-        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S))
+        os.environ, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S)
+    )
 
-    server = subprocess.Popen(cmd,
-                              stdout=log,
-                              stderr=subprocess.STDOUT,
-                              env=env,
-                              text=True)
+    server = subprocess.Popen(
+        cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
+    )
     try:
         deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
         while True:
             if server.poll() is not None:
                 raise _fail(
-                    f"vllm serve exited with {server.returncode} during "
-                    "startup")
+                    f"vllm serve exited with {server.returncode} during startup"
+                )
             try:
                 urllib.request.urlopen(f"{base}/health", timeout=10).close()
                 break
             except (urllib.error.URLError, OSError):
                 pass
             if time.time() > deadline:
-                raise _fail("vllm serve did not become healthy within "
-                            f"{DP_SERVER_STARTUP_TIMEOUT_S}s")
+                raise _fail(
+                    "vllm serve did not become healthy within "
+                    f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
+                )
             time.sleep(10)
         print(f"vllm serve ready at {base}; log: {log.name}")
         yield _ServedEngine(base, model_name)
@@ -1767,8 +1861,7 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
             server.kill()
             server.wait(timeout=60)
         log.close()
-        # Waiting for TPUs to be fully released before the next engine starts.
-        time.sleep(15)
+        wait_for_tpu_release()
 
 
 def _qwen35_dp_kwargs() -> dict:

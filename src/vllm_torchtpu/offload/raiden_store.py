@@ -82,6 +82,7 @@ from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
                                      ScheduleEndContext, TransferResult)
 from vllm.v1.kv_offload.config import OffloadingConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract, resolve_block_major_contract)
@@ -93,14 +94,13 @@ logger = init_logger(__name__)
 
 # Upper bound (seconds) on a scheduler-side drain of in-flight store/load
 # jobs whose source/destination blocks are about to be reused.
-_DRAIN_TIMEOUT_S = float(
-    os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
+_DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 
 # A save whose transfer failed is retried this many times (a failed save
 # leaves the entry HBM+pinned, so a second save() works). Retries are
 # suppressed for drained jobs: a drain means the source blocks are about to
 # be reused, so re-reading them would ship garbage.
-_SAVE_RETRIES = int(os.environ.get("VLLM_TPU_OFFLOAD_SAVE_RETRIES", "1"))
+_SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
 _DEFAULT_CONTROLLER_PORT = 51515
 
@@ -999,7 +999,7 @@ def derive_offload_namespace(
         num_kv_cache_groups: int,
         num_kv_cache_tensors: int,
         cp_geometry: tuple[int, ...] = (),
-        block_major_contract: "BlockMajorContract | None" = None) -> bytes:
+        block_major_contract: BlockMajorContract | None = None) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and registry key.
 
     Ensures cache keys never collide across incompatible engine deployments by
@@ -1083,7 +1083,7 @@ def _resolve_multi_shapes_kv_geometry(
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
     for leaf in mla_leaves:
-        shape = (leaf.storage_block_size, leaf.num_kv_heads, leaf.head_size)
+        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
         per_block_shapes.add(shape)
         kv_dtypes.add(leaf.dtype)
     return block_size, per_block_shapes, kv_dtypes, block_size
@@ -1546,7 +1546,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
         # Fail fast during initialization to prevent serving corrupted cache.
-        if os.environ.get("RAIDEN_SHM_KEY"):
+        if envs.RAIDEN_SHM_KEY:
             raise ValueError(
                 "TPURaidenOffloadingConnector: RAIDEN_SHM_KEY is not supported: "
                 "shm-backed host pools are unsupported.")

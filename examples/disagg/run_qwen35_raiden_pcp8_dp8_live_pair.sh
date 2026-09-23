@@ -91,7 +91,7 @@ Advanced port overrides:
   --side-channel-port PORT         Connector side-channel base (9600)
 
 Both machines need an 8-chip TPU host, the exact model snapshot, and matching
-installed vllm, vllm-torchtpu, torch-tpu, and Torch tpu-raiden environments.
+installed vllm, vllm-torchtpu, torch-tpu, and tpu-sync-torch environments.
 The routable host values are not necessarily the SSH names. Raiden advertises
 dynamic worker endpoints, so the hosts need bidirectional TCP reachability.
 
@@ -424,7 +424,7 @@ print(json.dumps({
     "vllm_torchtpu_file": vllm_torchtpu.__file__,
     "torch_version": torch.__version__,
     "torch_tpu_version": dist_version("torch-tpu"),
-    "tpu_raiden_torch_version": dist_version("tpu-raiden-torch"),
+    "tpu_raiden_torch_version": dist_version("tpu-sync-torch"),
     "raiden_native_file": _tpu_raiden_torch.__file__,
     "vllm_torchtpu_fingerprint": package_fingerprint(vllm_torchtpu, {".py", ".so"}),
     "tpu_raiden_fingerprint": package_fingerprint(tpu_sync, {".py", ".so"}),

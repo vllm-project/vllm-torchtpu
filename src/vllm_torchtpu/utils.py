@@ -2,8 +2,9 @@
 import importlib
 import os
 import time
+from collections.abc import Callable, Sequence
 from functools import wraps
-from typing import Any, Callable, List, NamedTuple, Sequence, Tuple, Union
+from typing import Any, NamedTuple
 
 import jax
 import torch
@@ -57,7 +58,7 @@ def get_dp_size(parallel_config) -> int:
             or parallel_config.data_parallel_size)
 
 
-def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
+def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
     if multihost_backend == "ray":
@@ -117,7 +118,7 @@ def get_device_name(num_devices: int | None = None):
 
 def get_mesh_shape_product(
     mesh: Mesh,
-    axes: Union[str, list[str], None],
+    axes: str | list[str] | None,
 ) -> int:
     """
     Get the product of mesh dimensions for one or more axes.
@@ -145,7 +146,7 @@ def get_mesh_shape_product(
     return product
 
 
-def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
+def hbm_usage_gb(devices: Any) -> list[tuple[float, float]]:
     usage = hbm_usage_bytes(devices)
     usage = [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
              for used, limit in usage]
@@ -263,7 +264,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor],
+    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
@@ -281,7 +282,11 @@ def tpu_bind_kv_cache(
 
     for layer_index in sorted(index2name.keys()):
         for layer_name in sorted(index2name[layer_index]):
-            runner_kv_caches.append(kv_caches[layer_name])
+            cache = kv_caches[layer_name]
+            if isinstance(cache, (list, tuple)):
+                runner_kv_caches.extend(cache)
+            else:
+                runner_kv_caches.append(cache)
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
@@ -297,11 +302,11 @@ def synchronize_device() -> None:
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
 
 def synchronize_tensors(
-    tensors: Union[torch.Tensor, Sequence[torch.Tensor], None] = None,
+    tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,
 ) -> None:
     """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).

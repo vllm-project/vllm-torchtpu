@@ -29,6 +29,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
+
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
@@ -36,12 +39,12 @@ if TYPE_CHECKING:
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import \
     fused_reverse_rope_wo_a_projection
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
     BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca,
     get_packed_mla_head_size)
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_indexer import \
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
     VllmDeepseekV4Indexer
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -50,6 +53,13 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 logger = init_logger(__name__)
 
 _pallas_op_cache: dict[str, Any] = {}
+
+
+class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.BLHNC, )
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -215,8 +225,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         return num_heads
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
-        return PallasAttentionBackend
+        return DeepseekV4TPUAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """Derive the main compressed-KV cache spec, or None for SWA-only layers."""
@@ -241,7 +250,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             num_kv_heads=1,
             head_size=head_size,
             dtype=torch.uint8,
-            compress_ratio=min(comp_ratio, block_size),
+            tokens_per_state=min(comp_ratio, block_size),
             alignment=None,
         )
 
@@ -317,6 +326,15 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                 f"{self.custom_prefix}: attention scale unavailable at "
                 "attention-op build time.")
 
+        # Draft (DSpark/DFlash) layers attend bidirectionally within their
+        # query block on the SWA path; set by the draft model at construction.
+        # TODO: MLA draft model classes to set
+        # `non_causal_multi_token_decode = True` on each of their attention
+        # layers -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark). Absent the
+        # attribute a layer stays causal, so target layers are unaffected.
+        non_causal = bool(getattr(self, "non_causal_multi_token_decode",
+                                  False))
+
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
             sm_scale=sm_scale,
@@ -324,13 +342,16 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             logical_page_size=logical_page_size,
             swa_only=swa_only,
             two_caches_same_buffer=two_caches_same_buffer,
+            non_causal_block=non_causal,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
-        # Build unique cache key encoding geometry, overlay status, and profiling stage.
+        # Build unique cache key encoding geometry, overlay status, block
+        # causality, and profiling stage.
         op_name = (f"pallas::deepseek_v4_attention_{op_type}"
                    f"_p{logical_page_size}"
                    f"{'_aliased' if two_caches_same_buffer else ''}"
+                   f"{'_ncb' if non_causal else ''}"
                    f"{'' if built_from_real_caches else '_prof'}")
 
         if op_name in _pallas_op_cache:

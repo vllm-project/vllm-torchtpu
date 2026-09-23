@@ -20,11 +20,13 @@ def create_parser():
 
     # Add sampling params
     sampling_group = parser.add_argument_group("Sampling parameters")
-    sampling_group.add_argument("--prompt",
-                                type=str,
-                                nargs="+",
-                                default=None,
-                                help="Custom prompt(s) for offline inference.")
+    sampling_group.add_argument(
+        "--prompt",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Custom prompt(s) for offline inference.",
+    )
     sampling_group.add_argument("--max-tokens", type=int)
     sampling_group.add_argument("--temperature", type=float, default=0.0)
     sampling_group.add_argument("--top-p", type=float)
@@ -35,9 +37,7 @@ def create_parser():
     chat_group.add_argument("--use-chat-template", action="store_true")
     # A few models (like Qwen3.5) can use this to disable thinking using,
     # `--chat-template-kwargs='{"enable_thinking": false}'`
-    chat_group.add_argument('--chat-template-kwargs',
-                            type=json.loads,
-                            default={})
+    chat_group.add_argument("--chat-template-kwargs", type=json.loads, default={})
 
     return parser
 
@@ -51,7 +51,7 @@ def main(args: dict):
     top_k = args.pop("top_k")
 
     use_chat_template = args.pop("use_chat_template")
-    chat_template_kwargs = args.pop('chat_template_kwargs')
+    chat_template_kwargs = args.pop("chat_template_kwargs")
     # Safeguard in case the user doesn't provide use_chat_template
     if chat_template_kwargs != {}:
         use_chat_template = True
@@ -118,13 +118,12 @@ def main(args: dict):
         logger.info(
             f"Using LLM chat API for inference with extra chat kwargs: {chat_template_kwargs}"
         )
-        conversations = [[{
-            "role": "user",
-            "content": prompt
-        }] for prompt in prompts]
-        outputs = llm.chat(messages=conversations,
-                           sampling_params=sampling_params,
-                           chat_template_kwargs=chat_template_kwargs)
+        conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
+        outputs = llm.chat(
+            messages=conversations,
+            sampling_params=sampling_params,
+            chat_template_kwargs=chat_template_kwargs,
+        )
     else:
         logger.info("Using LLM generate API for inference")
         outputs = llm.generate(prompts, sampling_params)

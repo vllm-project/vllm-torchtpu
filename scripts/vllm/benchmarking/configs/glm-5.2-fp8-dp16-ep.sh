@@ -61,15 +61,11 @@ KV_CACHE_DTYPE="fp8"
 # FLASH_ATTN_MLA whenever use_mla is set.
 
 # Parser flags for tool call / reasoning compatibility.
-# --api-server-count=1: with DP, vllm defaults one API frontend per DP
-# rank and the frontends race resolving the gs:// model into the
-# streamer cache (empty config.json read -> pydantic error, dev build
-# 164).
 # --enable-ep-weight-filter: with EP + the runai gs:// path, each rank
 # streams only the byte ranges of its own experts plus dense weights
 # (model_loader_patches.py, #373) instead of the full 761GB checkpoint
 # (validated: 16/256 experts per rank, dev build 184).
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --api-server-count=1 --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
 
 # MoE headroom analysis note:
 # FORCE_MOE_RANDOM_ROUTING=1 can be set in the environment for headroom analysis

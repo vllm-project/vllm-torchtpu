@@ -25,14 +25,18 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
-    ragged_gather_reduce as ragged_gather_reduce_v1
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
-    config as rgr_v2_config
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
-    ragged_gather_reduce_v2
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
-    ragged_gather_reduce as ragged_gather_reduce_v3
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
+    ragged_gather_reduce as ragged_gather_reduce_v1,
+)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
+    config as rgr_v2_config,
+)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
+    ragged_gather_reduce_v2,
+)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
+    ragged_gather_reduce as ragged_gather_reduce_v3,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
 
 jax.config.parse_flags_with_absl()
@@ -69,7 +73,8 @@ def ragged_scatter_and_reduce(
     topk_weights = topk_weights.reshape((-1, reduce_group_size))[..., None]
     out = out * topk_weights
     out = jnp.where(
-        valid_rows_mask.reshape((-1, reduce_group_size))[:, :, None], out, 0.0)
+        valid_rows_mask.reshape((-1, reduce_group_size))[:, :, None], out, 0.0
+    )
     out = out.sum(axis=-2)
     return out
 
@@ -91,45 +96,43 @@ def _time_function(fn, *args, n_repeats=100):
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class ScatterTest(jtu.JaxTestCase):
     _test_cases = [
-        dict(out_size=o,
-             start_end=se,
-             hidden_size=h,
-             dtype=d,
-             reduce_group_size=rg) for o, se, h, d, rg in itertools.chain(
-                 itertools.product(
-                     [400, 840],
-                     [(3, 338), (10, 255)],
-                     [128, 512, 8192],
-                     [jnp.bfloat16, jnp.float32],
-                     [8, 5],
-                 ),
-                 itertools.product(
-                     [16384],
-                     [(99, 1120)],
-                     [7168],
-                     [jnp.bfloat16],
-                     [8],
-                 ),
-                 itertools.product(
-                     [16384],
-                     [(300, 2358)],
-                     [6144],
-                     [jnp.bfloat16],
-                     [8],
-                 ),
-                 itertools.product(
-                     [20480],
-                     [(300, 2850)],
-                     [4096],
-                     [jnp.bfloat16],
-                     [10],
-                 ),
-             )
+        dict(out_size=o, start_end=se, hidden_size=h, dtype=d, reduce_group_size=rg)
+        for o, se, h, d, rg in itertools.chain(
+            itertools.product(
+                [400, 840],
+                [(3, 338), (10, 255)],
+                [128, 512, 8192],
+                [jnp.bfloat16, jnp.float32],
+                [8, 5],
+            ),
+            itertools.product(
+                [16384],
+                [(99, 1120)],
+                [7168],
+                [jnp.bfloat16],
+                [8],
+            ),
+            itertools.product(
+                [16384],
+                [(300, 2358)],
+                [6144],
+                [jnp.bfloat16],
+                [8],
+            ),
+            itertools.product(
+                [20480],
+                [(300, 2850)],
+                [4096],
+                [jnp.bfloat16],
+                [10],
+            ),
+        )
     ]
 
     @parameterized.parameters(*_test_cases)
-    def test_sc_ragged_gather_reduce(self, out_size, hidden_size, start_end,
-                                     dtype, reduce_group_size):
+    def test_sc_ragged_gather_reduce(
+        self, out_size, hidden_size, start_end, dtype, reduce_group_size
+    ):
         start, end = start_end
         start = min(start, out_size)
         end = min(end, out_size)
@@ -137,7 +140,7 @@ class ScatterTest(jtu.JaxTestCase):
         x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
         x = x.astype(dtype)
         indices = jax.random.permutation(key, out_size)
-        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
         valid_rows_mask = jnp.where(
             jnp.logical_and(
                 jnp.array([start], jnp.int32) <= indices,
@@ -147,21 +150,19 @@ class ScatterTest(jtu.JaxTestCase):
             False,
         )
         # Correctness check.
-        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
-                                                 valid_rows_mask,
-                                                 reduce_group_size)
+        desired = reference_ragged_gather_reduce(
+            x, indices, topk_weights, valid_rows_mask, reduce_group_size
+        )
         for rgr, name in (
             (ragged_gather_reduce_v1, "ragged_gather_reduce_v1"),
             (ragged_gather_reduce_v2, "ragged_gather_reduce_v2"),
             (ragged_gather_reduce_v3, "ragged_gather_reduce_v3"),
         ):
             try:
-                actual = rgr(x, indices, topk_weights, valid_rows_mask,
-                             reduce_group_size)
-                np.testing.assert_allclose(actual,
-                                           desired,
-                                           atol=1e-2,
-                                           rtol=1e-2)
+                actual = rgr(
+                    x, indices, topk_weights, valid_rows_mask, reduce_group_size
+                )
+                np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
             except AssertionError:
                 raise
             except Exception as e:  # pylint: disable=broad-except
@@ -177,16 +178,20 @@ class ScatterTest(jtu.JaxTestCase):
         key = jax.random.key(0)
         x = jax.random.normal(key, (out_size, hidden), jnp.bfloat16)
         indices = jax.random.permutation(key, out_size)
-        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
         # all-valid exercises the windowing; ~94% valid puts the per-partition
         # valid-row count above one window so reduce groups straddle a window
         # boundary (and many straddle row-block boundaries within a window).
-        for valid_rows_mask in (jnp.ones((out_size, ), jnp.bool_), indices
-                                < int(out_size * 0.9375)):
-            desired = reference_ragged_gather_reduce(x, indices, topk_weights,
-                                                     valid_rows_mask, rgs)
-            actual = ragged_gather_reduce_v2(x, indices, topk_weights,
-                                             valid_rows_mask, rgs)
+        for valid_rows_mask in (
+            jnp.ones((out_size,), jnp.bool_),
+            indices < int(out_size * 0.9375),
+        ):
+            desired = reference_ragged_gather_reduce(
+                x, indices, topk_weights, valid_rows_mask, rgs
+            )
+            actual = ragged_gather_reduce_v2(
+                x, indices, topk_weights, valid_rows_mask, rgs
+            )
             np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
     def test_sc_ragged_gather_reduce_v2_fallback_keys_on_the_source(self):
@@ -224,8 +229,7 @@ class ScatterTest(jtu.JaxTestCase):
         hidden, input_size, rgs = 2048, 1024, 8
         # Twice the source the threshold asks for, so the premise below holds
         # whatever this TPU's VMEM capacity is.
-        source_rows = 2 * int(info.vmem_capacity_bytes * 0.6 /
-                              (2 * hidden * 4))
+        source_rows = 2 * int(info.vmem_capacity_bytes * 0.6 / (2 * hidden * 4))
         cfg = rgr_v2_config.Config(
             input_size=input_size,
             hidden_size=hidden,
@@ -237,21 +241,20 @@ class ScatterTest(jtu.JaxTestCase):
             tpu_info=info,
         )
         self.assertFalse(cfg.should_fallback)
-        if (cfg.num_tot_cores // cfg.num_column_partitions
-                > cfg.sc_info.num_lanes):
+        if cfg.num_tot_cores // cfg.num_column_partitions > cfg.sc_info.num_lanes:
             self.skipTest("hidden size unsupported on this TPU")
 
         key = jax.random.key(0)
         x = jax.random.normal(key, (source_rows, hidden), jnp.float32)
         indices = jax.random.permutation(key, source_rows)[:input_size]
-        topk_weights = jax.random.normal(key, (input_size, ), jnp.bfloat16)
-        valid_rows_mask = jnp.ones((input_size, ), jnp.bool_)
+        topk_weights = jax.random.normal(key, (input_size,), jnp.bfloat16)
+        valid_rows_mask = jnp.ones((input_size,), jnp.bool_)
 
-        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
-                                         valid_rows_mask, rgs)
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights, valid_rows_mask, rgs)
         self.assertEqual(actual.dtype, jnp.float32)
-        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
-                                                 valid_rows_mask, rgs)
+        desired = reference_ragged_gather_reduce(
+            x, indices, topk_weights, valid_rows_mask, rgs
+        )
         np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
     def test_sc_ragged_gather_reduce_v2_tiling_cost_model(self):
@@ -274,14 +277,17 @@ class ScatterTest(jtu.JaxTestCase):
                 in_dtype=jnp.bfloat16,
                 core_axis_name="core",
                 subcore_axis_name="subcore",
-                tpu_info=dataclasses.replace(live,
-                                             generation=generation,
-                                             num_lanes=128,
-                                             sparse_core=dataclasses.replace(
-                                                 live.sparse_core,
-                                                 num_cores=2,
-                                                 num_subcores=16,
-                                                 num_lanes=num_simd_lanes)),
+                tpu_info=dataclasses.replace(
+                    live,
+                    generation=generation,
+                    num_lanes=128,
+                    sparse_core=dataclasses.replace(
+                        live.sparse_core,
+                        num_cores=2,
+                        num_subcores=16,
+                        num_lanes=num_simd_lanes,
+                    ),
+                ),
             )
 
         # The limits are spelled out rather than read from _CostModelConstants,
@@ -289,8 +295,8 @@ class ScatterTest(jtu.JaxTestCase):
         for input_size, hidden_size in ((20480, 4096), (32768, 4096)):
             cfg = tiling(input_size, hidden_size, 7, 16)
             self.assertLessEqual(
-                input_size // (cfg.row_chunk_size * cfg.num_row_partitions),
-                40)
+                input_size // (cfg.row_chunk_size * cfg.num_row_partitions), 40
+            )
             self.assertLessEqual(cfg.col_chunk_size, 1024)
 
         # This device makes the rounding observable: rounding the chunk's VMEM
@@ -307,7 +313,8 @@ class ScatterTest(jtu.JaxTestCase):
             dtype=d,
             reduce_group_size=rg,
             col_chunk_size=c_sz,
-        ) for o, se, h, d, rg, c_sz in itertools.chain(
+        )
+        for o, se, h, d, rg, c_sz in itertools.chain(
             itertools.product(
                 [16384],
                 [(99, 1120)],
@@ -353,7 +360,7 @@ class ScatterTest(jtu.JaxTestCase):
         x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
         x = x.astype(dtype)
         indices = jax.random.permutation(key, out_size)
-        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
         valid_rows_mask = jnp.where(
             jnp.logical_and(
                 jnp.array([start], jnp.int32) <= indices,
@@ -363,13 +370,15 @@ class ScatterTest(jtu.JaxTestCase):
             False,
         )
 
-        print(f"\n=== Running shape: out={out_size},"
-              f" hidden={hidden_size}, start={start}, end={end} ===")
+        print(
+            f"\n=== Running shape: out={out_size},"
+            f" hidden={hidden_size}, start={start}, end={end} ==="
+        )
 
         def run_and_time(name, fn, *args):
             try:
                 t_val = _time_function(fn, *args)
-                print(f"{name}: {t_val*1000:.3f} ms")
+                print(f"{name}: {t_val * 1000:.3f} ms")
             except Exception as e:  # pylint: disable=broad-except
                 print(f"{name} failed: {e}")
 

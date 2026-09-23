@@ -6,8 +6,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
-    config, memory_ref)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import config, memory_ref
 
 
 def call_kernel_pipeline(
@@ -16,8 +15,7 @@ def call_kernel_pipeline(
     col_start: jax.Array,
     cfg: config.Config,
 ):
-    num_rows_per_row_partition = refs.scratch.num_rows_per_row_partition_vmem[
-        ...]
+    num_rows_per_row_partition = refs.scratch.num_rows_per_row_partition_vmem[...]
     num_rows_current_row_partition = jnp.array(0, jnp.int32)
     for i in range(cfg.num_row_partitions):
         num_rows_current_row_partition = jnp.where(
@@ -25,8 +23,7 @@ def call_kernel_pipeline(
             num_rows_per_row_partition[i],
             num_rows_current_row_partition,
         )
-    num_row_blocks = pl.cdiv(num_rows_current_row_partition,
-                             cfg.row_chunk_size)
+    num_row_blocks = pl.cdiv(num_rows_current_row_partition, cfg.row_chunk_size)
 
     # Sentinel for the cross-block reduction carry (no previous group). The carry
     # is kernel scratch, so it also persists across window boundaries.
@@ -36,15 +33,17 @@ def call_kernel_pipeline(
     # are run one window at a time. The window count is a runtime value (it follows
     # the row partition's row count), hence a pl.loop over the window index.
     num_windows = pl.cdiv(num_row_blocks, cfg.max_window)
-    pl.loop(0, num_windows)(functools.partial(
-        _window_kernel,
-        refs=refs,
-        row_partition_id=row_partition_id,
-        num_row_blocks=num_row_blocks,
-        num_rows_current_row_partition=num_rows_current_row_partition,
-        col_start=col_start,
-        cfg=cfg,
-    ))
+    pl.loop(0, num_windows)(
+        functools.partial(
+            _window_kernel,
+            refs=refs,
+            row_partition_id=row_partition_id,
+            num_row_blocks=num_row_blocks,
+            num_rows_current_row_partition=num_rows_current_row_partition,
+            col_start=col_start,
+            cfg=cfg,
+        )
+    )
 
 
 def _window_kernel(
@@ -62,8 +61,9 @@ def _window_kernel(
     sorted_by_validity = refs.index.sorted_by_validity
     recv_sem = refs.scratch.sem.at[0]
     window_words = cfg.window_size
-    window_start = (row_partition_id * cfg.row_partition_size_padded +
-                    window_id * window_words)
+    window_start = (
+        row_partition_id * cfg.row_partition_size_padded + window_id * window_words
+    )
     window_block_base = window_id * cfg.max_window
 
     # Streaming one window at a time bounds the resident scratch (it no longer
@@ -82,8 +82,7 @@ def _window_kernel(
     # last window fetches a harmless past-the-end row instead.
     last_start = sorted_by_validity.shape[0] - num_simd_lanes
     next_window_start = jnp.minimum(window_start + window_words, last_start)
-    next_window_rows = sorted_by_validity.at[pl.ds(next_window_start,
-                                                   num_simd_lanes)]
+    next_window_rows = sorted_by_validity.at[pl.ds(next_window_start, num_simd_lanes)]
     next_window_dma = pltpu.make_async_copy(
         next_window_rows,
         refs.scratch.next_window_first_row_vmem,
@@ -92,12 +91,10 @@ def _window_kernel(
     next_window_dma.start()
     next_window_dma.wait()
 
-    blocks_in_window = jnp.minimum(cfg.max_window,
-                                   num_row_blocks - window_block_base)
+    blocks_in_window = jnp.minimum(cfg.max_window, num_row_blocks - window_block_base)
 
     # The index maps read the resident sort window staged above.
-    row_gather_specs = _row_gather_specs(refs.scratch.sorted_by_validity_vmem,
-                                         cfg)
+    row_gather_specs = _row_gather_specs(refs.scratch.sorted_by_validity_vmem, cfg)
     row_pipeline_fn = pltpu.emit_pipeline(
         functools.partial(
             _row_kernel,
@@ -108,27 +105,28 @@ def _window_kernel(
             window_block_base=window_block_base,
             blocks_in_window=blocks_in_window,
         ),
-        grid=(blocks_in_window, ),
+        grid=(blocks_in_window,),
         in_specs=(row_gather_specs, row_gather_specs),
     )
     row_pipeline_fn(
-        ((refs.index.indices, ) * cfg.num_row_subchunks),
-        ((refs.data.topk_weights, ) * cfg.num_row_subchunks),
+        ((refs.index.indices,) * cfg.num_row_subchunks),
+        ((refs.data.topk_weights,) * cfg.num_row_subchunks),
     )
 
 
 def _pack_scalars_to_vector(scalar_list: list[jax.Array]) -> jax.Array:
     """Pack list of scalar values into a single VMEM lane."""
     num_lanes = len(scalar_list)
-    idx_vec = jax.lax.broadcasted_iota(jnp.int32, (num_lanes, ), 0)
-    vec = jnp.zeros((num_lanes, ), jnp.int32)
+    idx_vec = jax.lax.broadcasted_iota(jnp.int32, (num_lanes,), 0)
+    vec = jnp.zeros((num_lanes,), jnp.int32)
     for i in range(num_lanes):
         vec = jnp.where(idx_vec == i, scalar_list[i], vec)
     return vec
 
 
-def _row_gather_specs(sorted_by_validity_vmem: jax.Ref,
-                      cfg: config.Config) -> tuple[pl.BlockSpec, ...]:
+def _row_gather_specs(
+    sorted_by_validity_vmem: jax.Ref, cfg: config.Config
+) -> tuple[pl.BlockSpec, ...]:
     """Indirect BlockSpec gathering rows of a 1-D input."""
     num_simd_lanes = cfg.sc_info.num_lanes
 
@@ -136,12 +134,15 @@ def _row_gather_specs(sorted_by_validity_vmem: jax.Ref,
         start = r * cfg.row_chunk_size + offset * num_simd_lanes
         return sorted_by_validity_vmem[pl.ds(start, num_simd_lanes)]
 
-    return tuple([
-        pl.BlockSpec(
-            (pl.Indirect(num_simd_lanes), ),
-            functools.partial(row_index_map, offset=offset),
-        ) for offset in range(cfg.num_row_subchunks)
-    ])
+    return tuple(
+        [
+            pl.BlockSpec(
+                (pl.Indirect(num_simd_lanes),),
+                functools.partial(row_index_map, offset=offset),
+            )
+            for offset in range(cfg.num_row_subchunks)
+        ]
+    )
 
 
 def _col_gather_spec(
@@ -152,8 +153,9 @@ def _col_gather_spec(
     """Indirect BlockSpec gathering columns of a 2-D input."""
     num_simd_lanes = cfg.sc_info.num_lanes
 
-    def col_index_map(s: int | jax.Array,
-                      c: int | jax.Array) -> tuple[jax.Array, jax.Array]:
+    def col_index_map(
+        s: int | jax.Array, c: int | jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         row = jnp.bitwise_right_shift(
             src_indices_vmem[pl.ds(s * num_simd_lanes, num_simd_lanes)],
             cfg.row_shift,
@@ -193,8 +195,7 @@ def _row_kernel(
     dst_indices_list = []
     for s in range(cfg.num_row_subchunks):
         start = row_block_id * cfg.row_chunk_size + s * num_simd_lanes
-        gather_dst = refs.scratch.sorted_by_validity_vmem[pl.ds(
-            start, num_simd_lanes)]
+        gather_dst = refs.scratch.sorted_by_validity_vmem[pl.ds(start, num_simd_lanes)]
         dst_indices_list.append(gather_dst // cfg.reduce_group_size)
 
     # Stage the gathered indices/weights and the destinations in VMEM.
@@ -214,9 +215,9 @@ def _row_kernel(
             prev_dst = refs.scratch.prev_dst_row_smem[0]
         else:
             prev_dst = dst_indices_list[s - 1][num_simd_lanes - 1]
-        refs.scratch.prev_dst_val_vmem[pl.ds(
-            s * num_simd_lanes,
-            num_simd_lanes)] = (jnp.broadcast_to(prev_dst, (num_simd_lanes, )))
+        refs.scratch.prev_dst_val_vmem[pl.ds(s * num_simd_lanes, num_simd_lanes)] = (
+            jnp.broadcast_to(prev_dst, (num_simd_lanes,))
+        )
 
     # For each source row, find the VMEM row that will hold its group's fully
     # reduced value -- the last row of the group within this block. Scanning
@@ -232,15 +233,13 @@ def _row_kernel(
             quot_next, rem_next = divmod(row_vmem_idx + 1, num_simd_lanes)
             same_group_as_next = jnp.logical_and(
                 rev_is_row_valid[-1],
-                dst_indices_list[quot][rem] == dst_indices_list[quot_next]
-                [rem_next],
+                dst_indices_list[quot][rem] == dst_indices_list[quot_next][rem_next],
             )
-            next_src_row_idx = jnp.where(same_group_as_next,
-                                         rev_src_row_idx_in_vmem[-1],
-                                         row_vmem_idx)
+            next_src_row_idx = jnp.where(
+                same_group_as_next, rev_src_row_idx_in_vmem[-1], row_vmem_idx
+            )
         global_row_idx = global_block_id * cfg.row_chunk_size + row_vmem_idx
-        rev_is_row_valid.append(
-            global_row_idx < num_rows_current_row_partition)
+        rev_is_row_valid.append(global_row_idx < num_rows_current_row_partition)
         rev_src_row_idx_in_vmem.append(next_src_row_idx)
     src_row_idx_in_vmem = rev_src_row_idx_in_vmem[::-1]
     is_row_valid = rev_is_row_valid[::-1]
@@ -257,17 +256,19 @@ def _row_kernel(
     # window. Both arms of the select are evaluated, so the resident offset is
     # clamped to stay in bounds on that last block (where its value is unused).
     next_block_first_row_in_window = jnp.minimum(
-        (row_block_id + 1) * cfg.row_chunk_size, window_words - num_simd_lanes)
+        (row_block_id + 1) * cfg.row_chunk_size, window_words - num_simd_lanes
+    )
     next_block_first_idx = jnp.where(
         is_last_block_in_window,
         refs.scratch.next_window_first_row_vmem[...][0],
-        refs.scratch.sorted_by_validity_vmem[pl.ds(
-            next_block_first_row_in_window, num_simd_lanes)][0],
+        refs.scratch.sorted_by_validity_vmem[
+            pl.ds(next_block_first_row_in_window, num_simd_lanes)
+        ][0],
     )
     group_continues = jnp.logical_and(
         next_block_first_row < num_rows_current_row_partition,
-        (next_block_first_idx //
-         cfg.reduce_group_size) == dst_indices_list[-1][num_simd_lanes - 1],
+        (next_block_first_idx // cfg.reduce_group_size)
+        == dst_indices_list[-1][num_simd_lanes - 1],
     )
 
     # Per source row, the (VMEM source row, HBM destination row) of its
@@ -290,23 +291,21 @@ def _row_kernel(
             # sub-chunks already route such a group to garbage.
             if s == cfg.num_row_subchunks - 1:
                 merges_at_block_end = merge_target == cfg.row_chunk_size - 1
-                spans_next_block = jnp.logical_and(merges_at_block_end,
-                                                   group_continues)
+                spans_next_block = jnp.logical_and(merges_at_block_end, group_continues)
                 is_final_write = jnp.logical_and(
-                    is_final_write, jnp.logical_not(spans_next_block))
-            sub_src.append(
-                jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
+                    is_final_write, jnp.logical_not(spans_next_block)
+                )
+            sub_src.append(jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
             sub_dst.append(
-                jnp.where(is_final_write, dst_indices_list[s][i], garbage_dst))
+                jnp.where(is_final_write, dst_indices_list[s][i], garbage_dst)
+            )
         dma_src_rows.append(sub_src)
         dma_dst_rows.append(sub_dst)
 
     for s in range(cfg.num_row_subchunks):
         sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
-        refs.scratch.dma_src_row_vmem[sub] = _pack_scalars_to_vector(
-            dma_src_rows[s])
-        refs.scratch.dma_dst_row_vmem[sub] = _pack_scalars_to_vector(
-            dma_dst_rows[s])
+        refs.scratch.dma_src_row_vmem[sub] = _pack_scalars_to_vector(dma_src_rows[s])
+        refs.scratch.dma_dst_row_vmem[sub] = _pack_scalars_to_vector(dma_dst_rows[s])
 
     col_pipeline = pltpu.emit_pipeline(
         functools.partial(
@@ -316,12 +315,10 @@ def _row_kernel(
             cfg=cfg,
         ),
         grid=(cfg.num_row_subchunks, cfg.num_col_chunks),
-        in_specs=_col_gather_spec(refs.scratch.src_indices_vmem, col_start,
-                                  cfg),
+        in_specs=_col_gather_spec(refs.scratch.src_indices_vmem, col_start, cfg),
     )
     col_pipeline(in_32b_hbm_ref)
-    refs.scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes -
-                                                             1]
+    refs.scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes - 1]
 
 
 def _col_kernel(
@@ -347,8 +344,7 @@ def _col_kernel(
     def col_loop(col_compute_offset: jax.Array):
         col_slice = pl.ds(col_compute_offset, num_simd_lanes)
         # Running sum, seeded by the carry from the previous sub-chunk.
-        previous_accumulated_data = refs.scratch.prev_iter_last_row_vmem[
-            c, col_slice]
+        previous_accumulated_data = refs.scratch.prev_iter_last_row_vmem[c, col_slice]
         for row_src in range(num_simd_lanes):
             val_u32 = gather_ref[row_src, col_slice]
             if cfg.in_dtype == jnp.bfloat16:
@@ -359,8 +355,7 @@ def _col_kernel(
                 shift = jnp.where(is_even_row, 16, 0)
                 lower_mask = jnp.uint32(jnp.iinfo(jnp.uint16).max)
                 upper_mask = jnp.left_shift(lower_mask, 16)
-                shifted = jnp.bitwise_and(jnp.left_shift(val_u32, shift),
-                                          upper_mask)
+                shifted = jnp.bitwise_and(jnp.left_shift(val_u32, shift), upper_mask)
                 data_f32 = plsc.bitcast(shifted, jnp.float32)
             else:
                 data_f32 = plsc.bitcast(val_u32, jnp.float32)
@@ -387,8 +382,7 @@ def _col_kernel(
             # legal for 32-bit elements. The cast happens in the wrapper.
             refs.scratch.out_vmem[row_src, col_slice] = accumulated_data
             if row_src == num_simd_lanes - 1:
-                refs.scratch.prev_iter_last_row_vmem[
-                    c, col_slice] = accumulated_data
+                refs.scratch.prev_iter_last_row_vmem[c, col_slice] = accumulated_data
 
     # Scatter every source row's reduced value to its output row. Rows
     # that share a group write the same value (idempotent); rows routed to
@@ -398,10 +392,12 @@ def _col_kernel(
     copies = []
     for i in range(num_simd_lanes):
         copy = pltpu.make_async_copy(
-            refs.scratch.out_vmem.at[dma_src_row_slice[i],
-                                     pl.ds(0, cfg.col_chunk_size)],
-            refs.data.out.at[dma_dst_row_slice[i],
-                             pl.ds(col_hbm_start, cfg.col_chunk_size)],
+            refs.scratch.out_vmem.at[
+                dma_src_row_slice[i], pl.ds(0, cfg.col_chunk_size)
+            ],
+            refs.data.out.at[
+                dma_dst_row_slice[i], pl.ds(col_hbm_start, cfg.col_chunk_size)
+            ],
             send_sem,
         )
         copy.start()

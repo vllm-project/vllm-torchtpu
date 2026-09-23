@@ -29,7 +29,6 @@ from vllm_torchtpu.distributed import dcp, mesh_utils, pcp
 
 
 class _FakeGroup:
-
     def __init__(self, ranks, rank_in_group=0):
         self.ranks = list(ranks)
         self.world_size = len(ranks)
@@ -65,8 +64,10 @@ def test_an_explicit_axis_name_wins_over_the_default(monkeypatch):
     seen = {}
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: _FakeGroup([0, 1]))
     monkeypatch.setattr(
-        dcp, "get_or_create_cp_mesh",
-        lambda axis_name, group: seen.setdefault("axis_name", axis_name))
+        dcp,
+        "get_or_create_cp_mesh",
+        lambda axis_name, group: seen.setdefault("axis_name", axis_name),
+    )
 
     dcp.get_or_create_dcp_mesh(axis_name="something_else")
     assert seen["axis_name"] == "something_else"
@@ -82,9 +83,11 @@ def test_layout_describes_the_group_it_is_given(monkeypatch):
     dcp_group = _FakeGroup([0, 1, 2, 3], rank_in_group=2)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: pcp_group)
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: dcp_group)
-    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id",
-                        lambda group, *_: {r: 10 + r
-                                           for r in group.ranks})
+    monkeypatch.setattr(
+        mesh_utils,
+        "_collect_rank_to_device_id",
+        lambda group, *_: {r: 10 + r for r in group.ranks},
+    )
     monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 2)
     monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 12)
 
@@ -100,8 +103,7 @@ def test_layout_describes_the_group_it_is_given(monkeypatch):
 
 
 @pytest.mark.parametrize("world_size", [1, 2, 8])
-def test_the_plain_accessors_survive_an_uninitialized_group(
-        monkeypatch, world_size):
+def test_the_plain_accessors_survive_an_uninitialized_group(monkeypatch, world_size):
     """Rank and world size have to answer before distributed init, too.
 
     `get_dcp_group` returns None then, and callers read these two without

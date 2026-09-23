@@ -37,6 +37,7 @@ def _scheduler():
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,
+        mamba_has_prefill_checkpoint_blocks=False,
         hash_block_size=3072,
     )
     return scheduler, physical_cache_config
@@ -58,7 +59,6 @@ def test_mamba_split_uses_scheduler_block_size_and_restores_cache_config():
 
 
 def test_mamba_split_restores_cache_config_when_upstream_raises(monkeypatch):
-
     def raising_split(self, *args, **kwargs):
         raise RuntimeError("upstream split failed")
 

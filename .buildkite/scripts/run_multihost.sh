@@ -58,14 +58,33 @@ if [ -f /etc/environment ]; then
   source /etc/environment || true
 fi
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${VLLM_TORCHTPU_IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="${REPO_DIR}"
 RUN_CLUSTER="${REPO_DIR}/scripts/multihost/run_cluster.sh"
 RUN_CLUSTER_MP="${REPO_DIR}/scripts/multihost/run_cluster_mp.sh"
+
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
+# Point Test Steps to the Metadata-Driven Image Tag
+IMAGE_TAG=""
+if command -v buildkite-agent &> /dev/null; then
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+fi
+
+# Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
+if [ -z "${IMAGE_TAG:-}" ]; then
+  if [ "${BUILDKITE:-false}" == "true" ]; then
+    echo "ERROR: CI_IMAGE_TAG metadata is missing in Buildkite CI environment." >&2
+    exit 1
+  fi
+  VLLM_REF="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+  if [ -z "${VLLM_REF}" ]; then
+    echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
+    exit 1
+  fi
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+fi
 
 SSH_USER="${SSH_USER:-$(whoami)}"
 if [ ! -f ~/.ssh/id_rsa ]; then
@@ -157,9 +176,10 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
 done
 
-# The backends tee the command they run in the head container here so the
-# failure summary below can quote it.
-MULTIHOST_RUN_LOG="$(mktemp)"
+
+# The backends tee the command they run in the head container to MULTIHOST_RUN_LOG
+# so the failure summary below can quote it.
+export MULTIHOST_RUN_LOG="${MULTIHOST_RUN_LOG:-perf_eval_results/multihost.log}"
 
 # Test suite and BigQuery tracking env vars
 TEST_SUITE_VARS=()
@@ -190,8 +210,11 @@ CONTAINER_ENV_COMMON=(
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
-  -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0"
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
   ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
+  ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"}
+  # RAY_TMPDIR keeps Ray on /tmp; following TMPDIR breaks log collection.
+  ${CONTAINER_TMPDIR:+-e TMPDIR="${CONTAINER_TMPDIR}" -e RAY_TMPDIR=/tmp}
   ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"}
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"}
 )
@@ -215,16 +238,17 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     "docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true$( [ "$BACKEND" = "ray" ] && echo "; sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true" )" || true
 done
 
+# Both backends return the command's exit code. Catch it rather than letting
+# set -e kill the script here, which skipped the copy-back and the summary.
+EXIT_CODE=0
 if [ "$BACKEND" = "ray" ]; then
   # shellcheck source=.buildkite/scripts/run_multihost_ray.sh
   source "${SCRIPT_DIR}/run_multihost_ray.sh"
-  run_ray_multihost "$@"
-  EXIT_CODE=$?
+  run_ray_multihost "$@" || EXIT_CODE=$?
 elif [ "$BACKEND" = "mp" ]; then
   # shellcheck source=.buildkite/scripts/run_multihost_mp.sh
   source "${SCRIPT_DIR}/run_multihost_mp.sh"
-  run_mp_multihost "$@"
-  EXIT_CODE=$?
+  run_mp_multihost "$@" || EXIT_CODE=$?
 else
   echo "ERROR: Unknown backend: ${BACKEND}. Supported backends: ray, mp"
   exit 1
@@ -241,7 +265,7 @@ find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || tru
 # command ever ran. There is nothing to summarise, so skip the `+++` on purpose
 # and let Buildkite's own fallback expand the last `---` group -- which in that
 # case is the bring-up step that actually failed.
-if [ "${EXIT_CODE}" -ne 0 ] && [ -s "${MULTIHOST_RUN_LOG}" ]; then
+if [ "${EXIT_CODE}" -ne 0 ] && [ -n "${MULTIHOST_RUN_LOG:-}" ] && [ -s "${MULTIHOST_RUN_LOG}" ]; then
   echo "+++ :boom: ${BUILDKITE_LABEL:-Command} failed (exit ${EXIT_CODE})"
   FATAL_LINES="$(grep -m5 -E '\b[A-Za-z_]*(Error|Exception): |\[Errno [0-9]+\]|_FAIL:|^FAILED ' "${MULTIHOST_RUN_LOG}" || true)"
   if [ -n "${FATAL_LINES}" ]; then
@@ -252,6 +276,8 @@ if [ "${EXIT_CODE}" -ne 0 ] && [ -s "${MULTIHOST_RUN_LOG}" ]; then
   echo "Last 40 lines of head-container output:"
   tail -n 40 "${MULTIHOST_RUN_LOG}"
 fi
-rm -f "${MULTIHOST_RUN_LOG}"
+if [[ "${MULTIHOST_RUN_LOG:-}" == /tmp/* ]]; then
+  rm -f "${MULTIHOST_RUN_LOG}"
+fi
 
 exit "${EXIT_CODE}"

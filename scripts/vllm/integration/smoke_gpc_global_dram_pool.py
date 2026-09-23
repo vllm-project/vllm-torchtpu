@@ -42,6 +42,7 @@ Gates use external-hit deltas plus first-tokens divergence, never full
 output equality: TPU serving is not run-to-run deterministic, while
 corrupt recalled KV garbles output immediately.
 """
+
 import argparse
 import json
 import re
@@ -49,10 +50,12 @@ import sys
 import time
 import urllib.request
 
-KEYS = dict(pre_s="request_prefill_time_seconds_sum",
-            pre_n="request_prefill_time_seconds_count",
-            hit="external_prefix_cache_hits_total",
-            q="external_prefix_cache_queries_total")
+KEYS = dict(
+    pre_s="request_prefill_time_seconds_sum",
+    pre_n="request_prefill_time_seconds_count",
+    hit="external_prefix_cache_hits_total",
+    q="external_prefix_cache_queries_total",
+)
 
 # Each prompt repeats one distinct token; prompt i repeats BASE_TOKEN + i.
 BASE_TOKEN = 700
@@ -79,28 +82,34 @@ def main() -> int:
     parser.add_argument("--base", required=True, help="http://host:port")
     parser.add_argument("--model", required=True)
     parser.add_argument("--prompts", type=int, default=12)
-    parser.add_argument("--pool-prompts",
-                        type=int,
-                        required=True,
-                        help="Host pool capacity in prompts' worth of "
-                        "offloaded blocks, parsed from the server log by "
-                        "the runner. The node-recall stage only proves "
-                        "anything while the prompt count exceeds it by "
-                        "enough that the oldest prompts cannot still be "
-                        "local.")
-    parser.add_argument("--prompt-tokens",
-                        type=int,
-                        default=16448,
-                        help="Must EXCEED a whole number of offloaded "
-                        "blocks: vLLM caps prefix hits at num_tokens - 1, "
-                        "so a prompt of exactly whole blocks can never "
-                        "claim its own last block and the lookup "
-                        "short-circuits before the registry.")
-    parser.add_argument("--sweep-wait-s",
-                        type=float,
-                        default=15.0,
-                        help="Settle time after seeding for the last sweep "
-                        "episode to demote and publish.")
+    parser.add_argument(
+        "--pool-prompts",
+        type=int,
+        required=True,
+        help="Host pool capacity in prompts' worth of "
+        "offloaded blocks, parsed from the server log by "
+        "the runner. The node-recall stage only proves "
+        "anything while the prompt count exceeds it by "
+        "enough that the oldest prompts cannot still be "
+        "local.",
+    )
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=16448,
+        help="Must EXCEED a whole number of offloaded "
+        "blocks: vLLM caps prefix hits at num_tokens - 1, "
+        "so a prompt of exactly whole blocks can never "
+        "claim its own last block and the lookup "
+        "short-circuits before the registry.",
+    )
+    parser.add_argument(
+        "--sweep-wait-s",
+        type=float,
+        default=15.0,
+        help="Settle time after seeding for the last sweep "
+        "episode to demote and publish.",
+    )
     parser.add_argument("--request-timeout-s", type=float, default=900.0)
     args = parser.parse_args()
 
@@ -109,7 +118,8 @@ def main() -> int:
             f"prompts={args.prompts} vs a pool of {args.pool_prompts} "
             "prompts' worth of KV: seeding must overflow the pool by at "
             "least the three node-recall prompts, or their recall "
-            "location is ambiguous")
+            "location is ambiguous"
+        )
 
     def ask(prompt: list[int], max_tokens: int) -> list[int]:
         payload = {
@@ -125,14 +135,16 @@ def main() -> int:
         req = urllib.request.Request(
             args.base + "/v1/completions",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=args.request_timeout_s) as r:
             return json.loads(r.read())["choices"][0].get("token_ids")
 
     # Serial requests on a max_num_seqs=1 engine: a per-request metrics
     # delta is exactly that request.
-    def measured(prompt: list[int],
-                 max_tokens: int) -> tuple[list[int], dict[str, float]]:
+    def measured(
+        prompt: list[int], max_tokens: int
+    ) -> tuple[list[int], dict[str, float]]:
         before = scrape(args.base)
         out = ask(prompt, max_tokens)
         after = scrape(args.base)
@@ -150,8 +162,10 @@ def main() -> int:
         return [BASE_TOKEN + i] * plen
 
     # ---- stage 1: cold seed ----
-    print(f"=== stage 1: seeding {args.prompts} prompts of {plen} tokens "
-          f"into a pool that holds {args.pool_prompts} ===")
+    print(
+        f"=== stage 1: seeding {args.prompts} prompts of {plen} tokens "
+        f"into a pool that holds {args.pool_prompts} ==="
+    )
     cold: list[list[int]] = []
     cold_hits = cold_qs = 0.0
     for i in range(args.prompts):
@@ -162,11 +176,13 @@ def main() -> int:
         print(
             f"[seed] prompt{i} prefill={r['prefill']:.3f}s "
             f"ext_hit={int(r['hit'])}/{int(r['q'])}",
-            flush=True)
+            flush=True,
+        )
     if cold_qs and 100 * cold_hits / cold_qs > 5:
         failures.append(
             f"cold seed ext_hit_pct={100 * cold_hits / cold_qs:.1f}: fresh "
-            "prompts are not cold, the recall stages are invalid")
+            "prompts are not cold, the recall stages are invalid"
+        )
     if any(not c for c in cold):
         failures.append("a cold seed request returned no token_ids")
 
@@ -185,11 +201,13 @@ def main() -> int:
         print(
             f"[{tag}] prompt{i} prefill={r['prefill']:.3f}s "
             f"ext_hit={int(r['hit'])}/{int(r['q'])}",
-            flush=True)
+            flush=True,
+        )
         if out and cold[i] and out[:2] != cold[i][:2]:
             failures.append(
                 f"{tag}: prompt{i} diverged at the first tokens (corrupt "
-                f"recalled KV?): cold={cold[i]} recalled={out}")
+                f"recalled KV?): cold={cold[i]} recalled={out}"
+            )
         return r["hit"]
 
     # ---- stage 2: host pool recall ----
@@ -202,7 +220,8 @@ def main() -> int:
         failures.append(
             "host pool recall produced no external hits — the prompt's "
             "blocks fell out of the host pool (over-demotion?) or "
-            "offloading never admitted them")
+            "offloading never admitted them"
+        )
 
     # ---- stage 3: store node recall ----
     # The three oldest prompts. Capacity arithmetic (prompts >= pool + 3)
@@ -218,17 +237,21 @@ def main() -> int:
             "store node recall produced no external hits on any of the "
             "oldest prompts — demotion dropped their blocks instead of "
             "moving them to the store node (no placement target? sweep "
-            "dead?)")
+            "dead?)"
+        )
     elif hit_prompts < 2:
         failures.append(
             f"store node recall hit only {hit_prompts}/3 oldest prompts — "
-            "demotion or recall is losing blocks")
+            "demotion or recall is losing blocks"
+        )
 
     if failures:
         print("RESULT: FAIL (" + "; ".join(failures) + ")")
         return 1
-    print(f"RESULT: PASS (cold seed stayed cold; host pool recall hit; "
-          f"store node recall hit {hit_prompts}/3 oldest prompts)")
+    print(
+        f"RESULT: PASS (cold seed stayed cold; host pool recall hit; "
+        f"store node recall hit {hit_prompts}/3 oldest prompts)"
+    )
     return 0
 
 

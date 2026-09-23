@@ -13,9 +13,10 @@ import importlib.util
 import json
 import os
 import pickle
+from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch._guards
@@ -50,6 +51,7 @@ class TpuCompilationHandle:
     class keeps its own __dict__ and picks up these class defaults for the
     fields it lacks, so it fails the version check rather than being replayed.
     """
+
     key: str
     entry: Any | None = None
     signature: tuple | None = None
@@ -71,8 +73,10 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     for a fake has to swap this too, since the fake's "entry" never came from
     torch and cannot go back through it.
     """
-    from torch._functorch._aot_autograd.aot_autograd_result import \
-        deserialize_bundled_cache_entry
+    from torch._functorch._aot_autograd.aot_autograd_result import (
+        deserialize_bundled_cache_entry,
+    )
+
     return deserialize_bundled_cache_entry(entry)
 
 
@@ -128,6 +132,26 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    # Startup and host-side knobs: ports, an IPC secret, two raiden startup
+    # checks, offload retry and drain limits, a weight-load sync cadence, a
+    # debug log switch, and the local-rank offsets, which move a worker to a
+    # different chip without changing the executable it runs.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "RAIDEN_DISABLE_SINGLETON_WORKER",
+    "RAIDEN_SHM_KEY",
+    # Compiles the same spec-decode artifacts, just eagerly at startup.
+    "SPEC_WARMUP",
+    "TORCH_TPU_BASE_PORT",
+    "TORCH_TPU_MP_RENDEZVOUS_PORT",
+    "TPU_LOCAL_RANK_OFFSET",
+    "TPU_SHARDED_LOAD_SYNC_EVERY",
+    "VLLM_TORCHTPU_IPC_KEY",
+    "VLLM_TPU_DEBUG_PCP_LAYOUT",
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -141,27 +165,30 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
-    "vllm_torchtpu/layers/common",
-    "vllm_torchtpu/layers/vllm/attention.py",
-    "vllm_torchtpu/layers/vllm/cp_attention.py",
-    "vllm_torchtpu/layers/vllm/custom_ops",
-    "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/core",
+    "vllm_torchtpu/layers/adapter/attention.py",
+    "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/custom_ops",
+    "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
-    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
     # the kernel's remote DMAs resolve their peer coordinates against, so an
     # edit to the ordering changes where every routed row goes without
     # changing a byte of the kernel.
     "vllm_torchtpu/distributed/ep_mesh.py",
-    "vllm_torchtpu/layers/vllm/linear_common.py",
-    "vllm_torchtpu/layers/vllm/router_topk.py",
-    "vllm_torchtpu/layers/vllm/quantization",
-    "vllm_torchtpu/layers/vllm/vision_attention.py",
+    "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/quantization",
+    "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # K3 custom-op registration, sharding, and Attention Residual bridges.
+    "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
 
@@ -179,8 +206,7 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 child_relpath = child.relative_to(repo_root).as_posix()
                 files_by_relpath[child_relpath] = child
             continue
-        logger.warning(
-            "[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+        logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
 
     if envs.TPU_KERNEL_ITER_MODE:
         for relpath in _reloadable_kernel_relpaths(repo_root):
@@ -207,11 +233,12 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
         if not origin:
             logger.warning(
                 "[TpuCompilerAdaptor] Cannot resolve reload module %s; its "
-                "file stays in the cache key.", mod_name)
+                "file stays in the cache key.",
+                mod_name,
+            )
             continue
         try:
-            relpaths.append(
-                Path(origin).resolve().relative_to(repo_root).as_posix())
+            relpaths.append(Path(origin).resolve().relative_to(repo_root).as_posix())
         except ValueError:
             # Outside the repo root: never part of the hashed set anyway.
             continue
@@ -227,8 +254,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
         try:
             factors[name] = getter()
         except Exception as exc:
-            logger.warning("Skipping TPU compile environment variable %s: %s",
-                           name, exc)
+            logger.warning(
+                "Skipping TPU compile environment variable %s: %s", name, exc
+            )
     return factors
 
 
@@ -244,13 +272,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
-        "native_env": {
-            name: os.getenv(name)
-            for name in _NATIVE_TPU_COMPILE_ENV_VARS
-        },
+        "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
-            "effective_data_parallel_size":
-            utils.get_dp_size(vllm_config.parallel_config),
+            "effective_data_parallel_size": utils.get_dp_size(
+                vllm_config.parallel_config
+            ),
         },
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
@@ -268,18 +294,20 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "max_num_seqs": scheduler_config.max_num_seqs,
         },
         "speculative": {
-            "model":
-            spec.model if spec is not None else None,
-            "draft_tensor_parallel_size":
-            spec.draft_tensor_parallel_size if spec is not None else None,
-            "num_speculative_tokens":
-            spec.num_speculative_tokens if spec is not None else None,
+            "model": spec.model if spec is not None else None,
+            "draft_tensor_parallel_size": spec.draft_tensor_parallel_size
+            if spec is not None
+            else None,
+            "num_speculative_tokens": spec.num_speculative_tokens
+            if spec is not None
+            else None,
         },
     }
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(
-        json.dumps(factors, sort_keys=True, separators=(",", ":")).encode())
+        json.dumps(factors, sort_keys=True, separators=(",", ":")).encode()
+    )
     for path in _iter_runtime_cache_key_files(repo_root):
         relpath = path.relative_to(repo_root).as_posix()
         hash_obj.update(relpath.encode())
@@ -320,7 +348,7 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 
     # Single return value — wrap in a tuple
     with graph.graph.inserting_before(output_node):
-        output_node.args = ((output_args, ), )
+        output_node.args = ((output_args,),)
     graph.graph.lint()
     graph.recompile()
     return graph, True
@@ -345,10 +373,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         self.cache_dir: str | None = None
         self._disable_cache = False
 
-    def initialize_cache(self,
-                         cache_dir: str,
-                         disable_cache: bool = False,
-                         prefix: str = "") -> None:
+    def initialize_cache(
+        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
+    ) -> None:
         self.cache_dir = cache_dir
         self._disable_cache = disable_cache
 
@@ -393,13 +420,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         # is fatal for these static graphs. An (empty) ShapeEnv yields empty
         # guards -- correct for static shapes -- and lets the artifact cache work.
         from torch._subclasses.fake_tensor import FakeTensor
+
         fake_mode = next(
-            (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)),
-            None)
+            (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)), None
+        )
         if fake_mode is not None and fake_mode.shape_env is None:
             fake_mode.shape_env = ShapeEnv()
-        tracing_ctx = (torch._guards.TracingContext(fake_mode)
-                       if fake_mode is not None else None)
+        tracing_ctx = (
+            torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
+        )
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
@@ -414,7 +443,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             except Exception as e:
                 logger.warning(
                     "[TpuCompilerAdaptor] serialize() failed, this graph will "
-                    "not be cached: %s", e)
+                    "not be cached: %s",
+                    e,
+                )
         return compiled_fn, entry
 
     def _save_handle(
@@ -441,14 +472,12 @@ class TpuCompilerAdaptor(CompilerInterface):
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
-            logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s",
-                        path)
+            logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s", path)
             return True
         except Exception as e:
             # Non-fatal by design: a failed save costs a recompile next run,
             # which is strictly better than persisting something unloadable.
-            logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s",
-                           e)
+            logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", e)
             return False
 
     def _replay(
@@ -467,8 +496,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             with open(path, "rb") as f:
                 payload = pickle.load(f)
         except Exception as e:
-            logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s",
-                           path, e)
+            logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s", path, e)
             return None
 
         reason = None
@@ -487,21 +515,26 @@ class TpuCompilerAdaptor(CompilerInterface):
             # ourselves never goes through AOTAutogradCache.try_load.
             # Placeholders only, so a changed graph *body* still passes -- that
             # is compute_tpu_compilation_hash's job, not this one.
-            reason = (f"graph signature changed ({payload.signature} vs "
-                      f"{shape_variants.graph_signature(graph)})")
+            reason = (
+                f"graph signature changed ({payload.signature} vs "
+                f"{shape_variants.graph_signature(graph)})"
+            )
         elif payload.was_wrapped != was_wrapped:
             reason = "output-tuple wrapping differs from the saved graph"
         if reason is not None:
-            logger.warning("[TpuCompilerAdaptor] Ignoring artifact %s: %s",
-                           path, reason)
+            logger.warning(
+                "[TpuCompilerAdaptor] Ignoring artifact %s: %s", path, reason
+            )
             return None
 
         try:
             return _deserialize_entry(payload.entry)
         except Exception as e:
             logger.warning(
-                "[TpuCompilerAdaptor] Could not replay artifact %s, "
-                "recompiling: %s", path, e)
+                "[TpuCompilerAdaptor] Could not replay artifact %s, recompiling: %s",
+                path,
+                e,
+            )
             return None
 
     def compile(
@@ -529,8 +562,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # model already built, is not compiled here (see shape_variants).
         size = _single_size(compile_range)
         if key is not None and size is not None:
-            elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
-                                                    size)
+            elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph, size)
             if elsewhere is not None:
                 return elsewhere, None
 
@@ -566,8 +598,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        caching = (key is not None and self.cache_dir is not None
-                   and not self._disable_cache)
+        caching = (
+            key is not None and self.cache_dir is not None and not self._disable_cache
+        )
         if caching and entry is not None:
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(key, save_path, entry, graph, was_wrapped):
@@ -575,7 +608,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         elif caching:
             logger.info(
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
-                "it will be recompiled on the next start", compile_range)
+                "it will be recompiled on the next start",
+                compile_range,
+            )
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -612,13 +647,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # "unsupported bucket": vLLM's key is (subgraph, bucket) with no graph
         # identity, so without this a re-traced variant would adopt an artifact
         # another trace compiled (see shape_variants.runnable_for).
-        elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph,
-                                                size)
+        elsewhere = shape_variants.runnable_for(self.cache_dir, key, graph, size)
         if elsewhere is not None:
             return elsewhere
 
-        logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s",
-                    path)
+        logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
@@ -630,8 +663,11 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
-            if (entry is not None and self.cache_dir is not None
-                    and not self._disable_cache):
+            if (
+                entry is not None
+                and self.cache_dir is not None
+                and not self._disable_cache
+            ):
                 self._save_handle(key, path, entry, graph, was_wrapped)
 
         if was_wrapped:

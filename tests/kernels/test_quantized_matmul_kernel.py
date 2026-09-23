@@ -25,8 +25,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.quantized_matmul import (blockwise_kernel, kernel,
-                                                    tuned_block_sizes, util)
+from vllm_torchtpu.kernels.quantized_matmul import (
+    blockwise_kernel,
+    kernel,
+    tuned_block_sizes,
+    util,
+)
 
 jax.config.update("jax_numpy_dtype_promotion", "standard")
 
@@ -52,10 +56,9 @@ def _require_tpu_v7() -> None:
 
 
 def _assert_allclose(actual, expected, atol=0.5, rtol=0.5) -> None:
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=atol,
-                               rtol=rtol)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=atol, rtol=rtol
+    )
 
 
 def reference_block_quantized_matmul(
@@ -71,7 +74,8 @@ def reference_block_quantized_matmul(
 
     if n_in % block_size != 0:
         raise ValueError(
-            f"Input dimension {n_in} not divisible by block_size {block_size}")
+            f"Input dimension {n_in} not divisible by block_size {block_size}"
+        )
 
     x_reshaped = x.reshape(n_batch, -1, block_size)
     x_q, x_s = util.quantize_block(x_reshaped, axis=2, target_dtype=x_q_dtype)
@@ -79,8 +83,9 @@ def reference_block_quantized_matmul(
     w_q_reshaped = w_q.reshape(n_out, -1, block_size)
     w_s_aligned = w_scale.transpose(1, 0, 2)
 
-    dot_blocks = jnp.einsum("bnk, onk -> bno", x_q.astype(jnp.float32),
-                            w_q_reshaped.astype(jnp.float32))
+    dot_blocks = jnp.einsum(
+        "bnk, onk -> bno", x_q.astype(jnp.float32), w_q_reshaped.astype(jnp.float32)
+    )
     scaled_blocks = dot_blocks * x_s * w_s_aligned
     out = jnp.sum(scaled_blocks, axis=1)
 
@@ -104,22 +109,17 @@ def _test_quantized_matmul(
 
     prng_key = jax.random.key(1234)
     k0, k1 = jax.random.split(prng_key, 2)
-    x = jax.random.uniform(k0, (bs, n_input_features),
-                           dtype=dtype,
-                           minval=0,
-                           maxval=1)
-    w = jax.random.uniform(k1, (n_output_features, n_input_features),
-                           dtype=dtype,
-                           minval=-1,
-                           maxval=1)
+    x = jax.random.uniform(k0, (bs, n_input_features), dtype=dtype, minval=0, maxval=1)
+    w = jax.random.uniform(
+        k1, (n_output_features, n_input_features), dtype=dtype, minval=-1, maxval=1
+    )
 
     w_q, w_scale = quantize_tensor(w, q_dtype, block_size=block_size)
     if block_size is None:
         w_scale = jnp.squeeze(w_scale)
-        assert w_scale.shape == (n_output_features, )
+        assert w_scale.shape == (n_output_features,)
     else:
-        assert w_scale.shape == (n_input_features // block_size, 1,
-                                 n_output_features)
+        assert w_scale.shape == (n_input_features // block_size, 1, n_output_features)
 
     if x_q_dtype is None:
         x_q_dtype = w_q.dtype if quantize_activation else dtype
@@ -138,17 +138,25 @@ def _test_quantized_matmul(
         # `w_q` is N-major `[n_out, n_in]` for the kernel under test;
         # `xla_quantized_matmul` takes the canonical (k, n) layout.
         expected = xla_quantized_matmul(
-            x, w_q.T, w_scale, quantize_activation=quantize_activation)
+            x, w_q.T, w_scale, quantize_activation=quantize_activation
+        )
     else:
-        expected = reference_block_quantized_matmul(x, w_q, w_scale,
-                                                    block_size, x_q_dtype)
+        expected = reference_block_quantized_matmul(
+            x, w_q, w_scale, block_size, x_q_dtype
+        )
 
     _assert_allclose(output, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize(
-    ("dtype", "q_dtype", "bs", "n_input_features", "n_output_features",
-     "quantize_activation"),
+    (
+        "dtype",
+        "q_dtype",
+        "bs",
+        "n_input_features",
+        "n_output_features",
+        "quantize_activation",
+    ),
     itertools.product(
         [jnp.bfloat16, jnp.float32],
         [jnp.int8, jnp.float8_e4m3fn],
@@ -169,9 +177,13 @@ def test_quantized_matmul_various_input_shapes(
     # bf16 / fp8_e4m3fn at (256, 512, 128) has one borderline element
     # (~0.55 abs diff); loosen atol just for this combo. Mirrors the same
     # carve-out in tpu-inference's quantized_matmul_kernel_test.
-    noisy = (dtype == jnp.bfloat16 and q_dtype == jnp.float8_e4m3fn
-             and bs == 256 and n_input_features == 512
-             and n_output_features == 128)
+    noisy = (
+        dtype == jnp.bfloat16
+        and q_dtype == jnp.float8_e4m3fn
+        and bs == 256
+        and n_input_features == 512
+        and n_output_features == 128
+    )
     _test_quantized_matmul(
         dtype,
         q_dtype,
@@ -185,8 +197,14 @@ def test_quantized_matmul_various_input_shapes(
 
 
 @pytest.mark.parametrize(
-    ("dtype", "q_dtype", "bs", "n_input_features", "n_output_features",
-     "quantize_activation"),
+    (
+        "dtype",
+        "q_dtype",
+        "bs",
+        "n_input_features",
+        "n_output_features",
+        "quantize_activation",
+    ),
     itertools.product(
         [jnp.bfloat16, jnp.float32],
         [jnp.int8, jnp.float8_e4m3fn],
@@ -216,8 +234,14 @@ def test_quantized_matmul_unaligned_input_shapes(
 
 
 @pytest.mark.parametrize(
-    ("dtype", "q_dtype", "bs", "n_input_features", "n_output_features",
-     "quantize_activation"),
+    (
+        "dtype",
+        "q_dtype",
+        "bs",
+        "n_input_features",
+        "n_output_features",
+        "quantize_activation",
+    ),
     [
         (jnp.bfloat16, jnp.int8, 128, 1280, 8192, True),
         (jnp.bfloat16, jnp.int8, 128, 28672, 4096, True),

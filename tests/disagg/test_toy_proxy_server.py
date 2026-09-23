@@ -6,8 +6,12 @@ from pathlib import Path
 
 
 def _load_toy_proxy_server():
-    path = (Path(__file__).resolve().parents[2] / "examples" / "disagg" /
-            "toy_proxy_server.py")
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / "disagg"
+        / "toy_proxy_server.py"
+    )
     spec = importlib.util.spec_from_file_location("toy_proxy_server", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -19,7 +23,8 @@ def _load_toy_proxy_server():
 _toy_proxy_server = _load_toy_proxy_server()
 _AsciiSafeStreamEncoder = _toy_proxy_server._AsciiSafeStreamEncoder
 _replace_prompt_with_rendered_token_ids = (
-    _toy_proxy_server._replace_prompt_with_rendered_token_ids)
+    _toy_proxy_server._replace_prompt_with_rendered_token_ids
+)
 
 
 def test_ascii_safe_stream_encoder_handles_split_utf8() -> None:
@@ -83,9 +88,7 @@ def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
     }
 
     try:
-        _replace_prompt_with_rendered_token_ids(request, [{
-            "token_ids": ["1"]
-        }])
+        _replace_prompt_with_rendered_token_ids(request, [{"token_ids": ["1"]}])
     except ValueError as exc:
         assert "token_ids" in str(exc)
     else:

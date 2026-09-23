@@ -22,7 +22,6 @@ from vllm_torchtpu.distributed import tpu_communicator as comm
 
 @pytest.fixture
 def communicator(monkeypatch):
-
     def init(instance, *args, **kwargs):
         instance.use_all2all = False
 
@@ -49,17 +48,17 @@ def test_all2all_probe_manager(monkeypatch, use_all2all):
         manager.assert_not_called()
 
 
-@pytest.mark.parametrize("method,count", [("dispatch", 3),
-                                          ("dispatch_router_logits", 2),
-                                          ("combine", 1)])
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
 @pytest.mark.parametrize("dp_size", [1, 2])
-def test_dispatch_and_combine_use_dp_group(monkeypatch, communicator, method,
-                                           count, dp_size):
+def test_dispatch_and_combine_use_dp_group(
+    monkeypatch, communicator, method, count, dp_size
+):
     group = Mock(world_size=dp_size)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
-    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10],
-                                                            dim=dim)
+    group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
     group.reduce_scatter.return_value = torch.tensor([[11, 12]])
     result = getattr(communicator, method)(*tensors)
     if method == "combine":
@@ -72,28 +71,28 @@ def test_dispatch_and_combine_use_dp_group(monkeypatch, communicator, method,
         group.all_gather.assert_not_called()
     elif dp_size == 1:
         assert len(result) == count
-        assert all(actual is expected
-                   for actual, expected in zip(result, tensors))
+        assert all(actual is expected for actual, expected in zip(result, tensors))
         group.all_gather.assert_not_called()
     else:
         assert len(result) == count
         for actual, expected, invocation in zip(
-                result, tensors, group.all_gather.call_args_list):
-            torch.testing.assert_close(actual,
-                                       torch.cat([expected, expected + 10]))
+            result, tensors, group.all_gather.call_args_list
+        ):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
             assert invocation.args[0] is expected
             assert invocation.kwargs == {"dim": 0}
         assert group.all_gather.call_count == count
         group.reduce_scatter.assert_not_called()
 
 
-@pytest.mark.parametrize("method,count", [("dispatch", 3),
-                                          ("dispatch_router_logits", 2)])
-def test_extra_tensors_rejected_before_collectives(monkeypatch, communicator,
-                                                   method, count):
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2)]
+)
+def test_extra_tensors_rejected_before_collectives(
+    monkeypatch, communicator, method, count
+):
     get_group = Mock()
     monkeypatch.setattr(comm, "get_dp_group", get_group)
     with pytest.raises(NotImplementedError, match="extra_tensors"):
-        getattr(communicator, method)(*[torch.ones(1)] * count,
-                                      extra_tensors=[])
+        getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()

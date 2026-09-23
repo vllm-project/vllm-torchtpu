@@ -163,30 +163,30 @@ echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
 # ---------------------------------------------------------------------------
 # Version preflight: the runtime must match pyproject.toml exactly.
 # ---------------------------------------------------------------------------
-RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-raiden-torch==([^"]+)".*/\1/p' \
+RAIDEN_PIN="$(sed -nE 's/^[[:space:]]*"tpu-sync-torch==([^"]+)".*/\1/p' \
   "${repo_root}/pyproject.toml" | head -1)"
 [[ -n "${RAIDEN_PIN}" ]] \
-  || fail "no tpu-raiden-torch== pin found in pyproject.toml"
+  || fail "no tpu-sync-torch== pin found in pyproject.toml"
 
 python3 - "${RAIDEN_PIN}" <<'PY'
 import importlib.metadata
 import sys
 
 raiden_pin = sys.argv[1]
-raiden_installed = importlib.metadata.version("tpu-raiden-torch")
+raiden_installed = importlib.metadata.version("tpu-sync-torch")
 if raiden_installed != raiden_pin:
     raise SystemExit(
-        f"installed tpu-raiden-torch {raiden_installed} != pyproject pin "
+        f"installed tpu-sync-torch {raiden_installed} != pyproject pin "
         f"{raiden_pin}: the CI image must install the pinned wheel")
-print(f"tpu-raiden-torch {raiden_installed} matches pyproject pin")
+print(f"tpu-sync-torch {raiden_installed} matches pyproject pin")
 PY
 
 for cmd in global_registry_server kv_cache_host_store_node_main; do
   command -v "${cmd}" >/dev/null || fail \
-    "${cmd} not found: tpu-raiden-torch==${RAIDEN_PIN} does not bundle the \
+    "${cmd} not found: tpu-sync-torch==${RAIDEN_PIN} does not bundle the \
 global DRAM pool control plane — bump the pin in pyproject.toml"
 done
-echo "control plane from the tpu-raiden-torch ${RAIDEN_PIN} wheel"
+echo "control plane from the tpu-sync-torch ${RAIDEN_PIN} wheel"
 
 # ---------------------------------------------------------------------------
 # Global registry: the directory and placement plane everything else joins.

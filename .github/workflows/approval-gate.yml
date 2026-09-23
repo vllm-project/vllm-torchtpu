@@ -1,7 +1,8 @@
 name: Approval Gate
 
 # Reports whether a PR has the CODEOWNERS approvals our policy requires: at
-# least one approval from the owners of every area the PR touches.
+# least one approval from the owners of every area the PR touches, and on a
+# newly opened PR requests review from the owners who would satisfy it.
 #
 # This check is ADVISORY today. Branch protection and rulesets are unavailable
 # on this repository's plan, so nothing stops a merge with the gate unmet, and
@@ -23,7 +24,8 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  # Write, not read, to request reviews. See AUTO_REQUEST_REVIEWERS.
+  pull-requests: write
   # To create and update the check run that carries the verdict.
   checks: write
 
@@ -48,6 +50,13 @@ env:
   # people to ignore the check. `failure` is the setting to switch to when
   # branch rulesets arrive and the gate is meant to block.
   MISSING_APPROVAL_CONCLUSION: neutral
+  # When true, request review from the minimal set of owners covering the PR
+  # -- the same set `scripts/find_owners.py --request` would ask for. Only on
+  # `opened` and `ready_for_review`: re-requesting someone whose review is
+  # still pending is a no-op, but re-requesting someone who already reviewed
+  # re-adds them and notifies them again, so doing this on `synchronize` would
+  # nag every reviewer on every push.
+  AUTO_REQUEST_REVIEWERS: 'true'
 
 jobs:
   check-approvals:
@@ -83,6 +92,25 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
 
+      # A handle that does not exist, or a user without write access, cannot
+      # approve and cannot be sent a review request -- and `requestReviewers`
+      # rejects the whole batch rather than the one bad entry, so one typo
+      # would silently stop assignment for everyone. GitHub validates this for
+      # us; we have no equivalent check of our own.
+      - name: Validate CODEOWNERS on the base branch
+        id: codeowners_errors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if ! gh api "repos/${REPO}/codeowners/errors?ref=${BASE_REF}" \
+              > "${RUNNER_TEMP}/codeowners_errors.json" 2>/dev/null; then
+            echo "Could not read CODEOWNERS errors; continuing." >&2
+            echo '{"errors": []}' > "${RUNNER_TEMP}/codeowners_errors.json"
+          fi
+          cat "${RUNNER_TEMP}/codeowners_errors.json"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -107,15 +135,89 @@ jobs:
             --codeowners "${RUNNER_TEMP}/CODEOWNERS" \
             --json | tee "${RUNNER_TEMP}/owners.json"
 
-      - name: Validate approvals
+      # Both steps below read the resolver's output above; neither talks to
+      # CODEOWNERS itself. Requesting reviewers and judging approvals are
+      # separate concerns -- one writes to the PR and only on a new one, the
+      # other reads and runs on every event -- so they are separate steps.
+      - name: Request review from the owners
+        # Only where nobody has had a chance to review yet. See
+        # AUTO_REQUEST_REVIEWERS for why this is not every event.
+        if: >-
+          env.AUTO_REQUEST_REVIEWERS == 'true' &&
+          github.event_name == 'pull_request' &&
+          (github.event.action == 'opened' ||
+           github.event.action == 'ready_for_review')
+        # Assignment is a convenience and the verdict has to stand without it,
+        # so a failure here must not skip the step after it. A PR from a fork
+        # gets a read-only token and cannot make this call at all.
+        continue-on-error: true
         uses: actions/github-script@v7
         env:
           OWNERS_JSON: ${{ runner.temp }}/owners.json
+          CODEOWNERS_ERRORS_JSON: ${{ runner.temp }}/codeowners_errors.json
+        with:
+          script: |
+            const fs = require('fs');
+            const { reviewers = [] } = JSON.parse(
+              fs.readFileSync(process.env.OWNERS_JSON, 'utf8'));
+            const { errors = [] } = JSON.parse(
+              fs.readFileSync(process.env.CODEOWNERS_ERRORS_JSON, 'utf8'));
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const author = pr.user.login.toLowerCase();
+
+            const overrideLabel = process.env.OVERRIDE_LABEL.toLowerCase();
+            if ((pr.labels || []).some(
+                  l => l.name.toLowerCase() === overrideLabel)) {
+              core.info(
+                `'${overrideLabel}' is set; not requesting reviewers.`);
+              return;
+            }
+            if (errors.length) {
+              core.warning(
+                `Not requesting reviewers: CODEOWNERS has ${errors.length} ` +
+                `error(s), so the owner list is not trustworthy and the API ` +
+                `rejects the whole batch if any handle is bad.`);
+              return;
+            }
+
+            // Already-pending requests are left alone by the API, but anyone
+            // who has already reviewed would be re-added and re-notified.
+            const pending = new Set(
+              (pr.requested_reviewers || []).map(r => r.login.toLowerCase()));
+            const wanted = reviewers
+              .map(r => r.replace(/^@/, ''))
+              .filter(r => r.toLowerCase() !== author &&
+                           !pending.has(r.toLowerCase()));
+            if (!wanted.length) {
+              core.info('No new reviewers to request.');
+              return;
+            }
+
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner, repo, pull_number: pr.number, reviewers: wanted,
+              });
+              core.info(`Requested review from ${wanted.join(', ')}`);
+            } catch (err) {
+              core.warning(
+                `Could not request review from ${wanted.join(', ')}: ` +
+                `${err.status || ''} ${err.message}`);
+            }
+
+      - name: Check owner approvals
+        uses: actions/github-script@v7
+        env:
+          OWNERS_JSON: ${{ runner.temp }}/owners.json
+          CODEOWNERS_ERRORS_JSON: ${{ runner.temp }}/codeowners_errors.json
         with:
           script: |
             const fs = require('fs');
             const { groups } = JSON.parse(
               fs.readFileSync(process.env.OWNERS_JSON, 'utf8'));
+            const { errors: codeownersErrors = [] } = JSON.parse(
+              fs.readFileSync(process.env.CODEOWNERS_ERRORS_JSON, 'utf8'));
 
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
@@ -238,6 +340,9 @@ jobs:
               .write();
 
             for (const note of staleNotes) core.warning(note);
+            for (const e of codeownersErrors) {
+              core.warning(`CODEOWNERS ${e.path}:${e.line}: ${e.message}`);
+            }
 
             if (!groups.length) {
               await publish('neutral', 'Nothing to gate',
@@ -252,10 +357,22 @@ jobs:
               '| --- | --- | --- | --- |',
               ...rows.map(r => `| ${r.join(' | ')} |`),
             ].join('\n');
-            const notes = staleNotes.length
+            const staleSection = staleNotes.length
               ? '\n\n**Stale approvals** (counted, but predating the current ' +
                 `head):\n\n- ${staleNotes.join('\n- ')}`
               : '';
+            // An owner GitHub rejects can neither approve nor be sent a review
+            // request, so the area they cover is unsatisfiable until someone
+            // fixes the file. Worth saying on the check rather than only in
+            // the log, since the symptom is a gate that never goes green.
+            const errorSection = codeownersErrors.length
+              ? `\n\n**CODEOWNERS has ${codeownersErrors.length} error(s)** ` +
+                'on the base branch. Reviewer assignment is disabled until ' +
+                'they are fixed:\n\n' +
+                codeownersErrors.map(
+                  e => `- \`${e.path}\` line ${e.line}: ${e.message}`).join('\n')
+              : '';
+            const notes = staleSection + errorSection;
 
             if (blocked.length) {
               const title = `Missing approval for ${blocked.length} of ` +

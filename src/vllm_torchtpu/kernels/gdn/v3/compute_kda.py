@@ -35,8 +35,7 @@ def _l2_norm_f32(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     goldens.
     """
     x_f32 = x.astype(jnp.float32)
-    inv_norm = jax.lax.rsqrt(
-        jnp.sum(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
+    inv_norm = jax.lax.rsqrt(jnp.sum(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
     return (x_f32 * inv_norm).astype(x.dtype)
 
 
@@ -61,8 +60,7 @@ def activate_gate(
         return -jnp.exp(a_log) * jax.nn.softplus(a_f32 + dt_bias)
     # Bounded: the log-decay is floored at `gate_lower_bound`, so the
     # per-token decay never drops below exp(gate_lower_bound).
-    return cfg.gate_lower_bound * jax.nn.sigmoid(
-        jnp.exp(a_log) * (a_f32 + dt_bias))
+    return cfg.gate_lower_bound * jax.nn.sigmoid(jnp.exp(a_log) * (a_f32 + dt_bias))
 
 
 def chunked_kda_per_seq(
@@ -78,11 +76,11 @@ def chunked_kda_per_seq(
     k = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
     beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta = beta[:cfg.num_v_heads]
+    beta = beta[: cfg.num_v_heads]
 
     g_cum_sum_list = [gating_log[:, :1]]
     for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row:row + 1])
+        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
     g_cumsum = jnp.concat(g_cum_sum_list, axis=1)
 
     # The chunk is partitioned into sub-blocks of `block_size`. For each row
@@ -134,8 +132,9 @@ def chunked_kda_per_seq(
     num_blocks = cfg.chunk_size // block_size
 
     identity_chunk = jnp.eye(cfg.chunk_size, dtype=jnp.float32)
-    causal_mask_block = (jnp.arange(block_size)[:, None]
-                         >= jnp.arange(block_size)[None, :])
+    causal_mask_block = (
+        jnp.arange(block_size)[:, None] >= jnp.arange(block_size)[None, :]
+    )
 
     aqk_row_strips = []
     t_inv_row_strips = []
@@ -166,12 +165,11 @@ def chunked_kda_per_seq(
 
                 # [H, 2*BC, K] @ [H, BC, K]^T -> [H, 2*BC, BC], giving
                 # both Aqk[r_b, c_b] and L[r_b, c_b] in one instruction.
-                qk_scaled_merged = jnp.concat([q_scaled, k_beta_scaled],
-                                              axis=1)
+                qk_scaled_merged = jnp.concat([q_scaled, k_beta_scaled], axis=1)
                 gemm_out = jax.lax.dot(
                     qk_scaled_merged,
                     k_col_scaled,
-                    dimension_numbers=(((2, ), (2, )), ((0, ), (0, ))),
+                    dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                     preferred_element_type=jnp.float32,
                 )
                 b_aqk, b_L = jnp.split(gemm_out, 2, axis=1)
@@ -192,8 +190,9 @@ def chunked_kda_per_seq(
                 aqk_col_blocks.append(b_aqk)
 
             else:
-                b_zero = jnp.zeros((cfg.num_v_heads, block_size, block_size),
-                                   dtype=jnp.float32)
+                b_zero = jnp.zeros(
+                    (cfg.num_v_heads, block_size, block_size), dtype=jnp.float32
+                )
                 aqk_col_blocks.append(b_zero)
 
         # concat into: [H, BC, chunk_size]
@@ -210,14 +209,14 @@ def chunked_kda_per_seq(
 
         if r_b > 0:
             # Subtract the already-solved rows: L_past @ T_inv_past.
-            L_past = jnp.concat(L_interaction_blocks,
-                                axis=2)  # [H, BC, r_start]
-            T_inv_past = jnp.concat(t_inv_row_strips,
-                                    axis=1)  # [H, r_start, chunk_size]
+            L_past = jnp.concat(L_interaction_blocks, axis=2)  # [H, BC, r_start]
+            T_inv_past = jnp.concat(
+                t_inv_row_strips, axis=1
+            )  # [H, r_start, chunk_size]
             prev_contribution = jax.lax.dot(
                 L_past,
                 T_inv_past,
-                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
             target_rhs = target_rhs - prev_contribution
@@ -231,22 +230,19 @@ def chunked_kda_per_seq(
             else:
                 # Pairwise channel decay against strictly preceding
                 # tokens in this sub-block.
-                delta_g_i = g_row[:, i:i + 1, :] - g_row[:, :i, :]
-                k_decayed_prev = k_row[:, :i, :] * jnp.exp(
-                    jnp.minimum(delta_g_i, 0.0))
+                delta_g_i = g_row[:, i : i + 1, :] - g_row[:, :i, :]
+                k_decayed_prev = k_row[:, :i, :] * jnp.exp(jnp.minimum(delta_g_i, 0.0))
 
                 # Transition row: beta[i] * k[i] @ (k[:i] * decay)^T
                 L_row_i = jnp.sum(
-                    (k_row[:, i:i + 1, :] * beta_row[:, i:i + 1, :]) *
-                    k_decayed_prev,
+                    (k_row[:, i : i + 1, :] * beta_row[:, i : i + 1, :])
+                    * k_decayed_prev,
                     axis=-1,
                 )  # [H, i]
 
                 # x[i] = rhs[i] - sum_{j < i} (L[i, j] * x[j])
-                solved_so_far = jnp.stack(x_local_rows,
-                                          axis=1)  # [H, i, chunk_size]
-                x_row = rhs_row - jnp.sum(L_row_i[..., None] * solved_so_far,
-                                          axis=1)
+                solved_so_far = jnp.stack(x_local_rows, axis=1)  # [H, i, chunk_size]
+                x_row = rhs_row - jnp.sum(L_row_i[..., None] * solved_so_far, axis=1)
 
             x_local_rows.append(x_row)
 
@@ -262,7 +258,7 @@ def chunked_kda_per_seq(
     merged_uw = jax.lax.dot(
         T_inv,
         merged_v_k,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
 
@@ -273,7 +269,7 @@ def chunked_kda_per_seq(
     ws_and_out = jax.lax.dot_general(
         wq,
         state_prev,
-        (((2, ), (1, )), ((0, ), (0, ))),
+        (((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
     ws, out_updated = jnp.split(ws_and_out, 2, axis=1)
@@ -285,7 +281,7 @@ def chunked_kda_per_seq(
     state_new = jax.lax.dot_general(
         k_gating_last,
         u_ws,
-        (((1, ), (1, )), ((0, ), (0, ))),
+        (((1,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
     state_updated = state_prev * jnp.exp(g_last.swapaxes(1, 2))
@@ -294,7 +290,7 @@ def chunked_kda_per_seq(
     out_new = jax.lax.dot(
         Aqk,
         u_ws,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
     out = (out_updated + out_new).astype(cfg.dtypes.compute)
@@ -315,9 +311,9 @@ def chunked_kda(
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
-    iota = jax.lax.broadcasted_iota(mask_dtype,
-                                    (cfg.seq_tile_size, 1, cfg.chunk_size, 1),
-                                    2)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1), 2
+    )
     mask = iota < real_sizes.reshape(-1, 1, 1, 1).astype(mask_dtype)
 
     # (seqs, num_kq_heads, chunk, kq_head_dim)
@@ -336,8 +332,9 @@ def chunked_kda(
     beta = jnp.where(mask, beta, 0.0)
 
     a_log_kda = a_log.reshape(1, -1, 1, 1).astype(jnp.float32)
-    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1,
-                                  cfg.kq_head_dim).astype(jnp.float32)
+    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1, cfg.kq_head_dim).astype(
+        jnp.float32
+    )
     gating_log = activate_gate(a_large, a_log_kda, dt_bias_kda, cfg)
     gating_log = jnp.where(mask, gating_log, 0)
 
@@ -356,58 +353,73 @@ def chunked_kda(
         out_list.append(out.swapaxes(0, 1))
         state_list.append(state)
     out = jnp.stack(out_list, axis=0)
-    # The caller expects one state per window position. KDA rejects
-    # speculative decoding, so `window_size` is always 1 and the only
-    # checkpoint is the end-of-tile state.
+    # Chunked KDA is only selected for a one-checkpoint window; speculative
+    # verify uses the recurrent scan below.
     state = jnp.stack(state_list, axis=0)[:, jnp.newaxis]
     return out, state
 
 
 def recurrent_kda_per_seq(
-    q_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    k_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    v_curr: jax.Array,  # (num_v_heads, v_head_dim)
-    gating_curr: jax.Array,  # (num_v_heads, kq_head_dim)
-    beta_curr: jax.Array,  # (num_v_heads, 1)
+    q: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    k: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    v: jax.Array,  # (num_v_heads, chunk, v_head_dim)
+    gating_decay: jax.Array,  # (num_v_heads, chunk, kq_head_dim)
+    beta: jax.Array,  # (num_v_heads, chunk, 1)
     state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    # Repeat Q and K for GQA
-    q_heads = jnp.repeat(q_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads = jnp.repeat(k_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads_t = compute_gdn.fused_transpose_broadcast(
-        k_heads, src_dim=2, dst_dim=1)  # (num_v_heads, kq_head_dim, 1)
+    """Run the token recurrence and retain one state per verify position.
 
-    v_heads = v_curr[:, None, :]  # (num_v_heads, 1, v_head_dim)
-    beta_heads = beta_curr[:, None]  # (num_v_heads, 1, 1)
-    gating_decay = gating_curr[..., None]  # (num_v_heads, kq_head_dim, 1)
+    BATCHED speculative decode sets ``chunk_size == window_size`` so every
+    post-token state is retained.  The ordinary decode case is the degenerate
+    one-token window.  Invalid ragged tail rows have q/k/v/beta zeroed and a
+    unit decay, therefore their output is zero and their state is unchanged;
+    memory_ref only writes checkpoints belonging to real rows.
+    """
+    out_list = []
+    state_list = []
+    contract_dk = (((2,), (1,)), ((0,), (0,)))
 
-    state_updated = state * gating_decay
+    for c_idx in range(cfgs.chunk_size):
+        # Repeat Q and K for GQA.  K3 currently has one V head per QK head,
+        # but keeping this here preserves the generic KDA ABI.
+        q_heads = jnp.repeat(q[:, c_idx], cfgs.v_per_kq_head, axis=0)[
+            :, None, :
+        ]  # (num_v_heads, 1, kq_head_dim)
+        k_heads = jnp.repeat(k[:, c_idx], cfgs.v_per_kq_head, axis=0)[
+            :, None, :
+        ]  # (num_v_heads, 1, kq_head_dim)
+        k_heads_t = compute_gdn.fused_transpose_broadcast(
+            k_heads, src_dim=2, dst_dim=1
+        )  # (num_v_heads, kq_head_dim, 1)
 
-    contract_dk = (((2, ), (1, )), ((0, ), (0, )))
-    v_updated = jax.lax.dot(
-        k_heads,
-        state_updated,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+        v_heads = v[:, c_idx : c_idx + 1]
+        beta_heads = beta[:, c_idx : c_idx + 1]
+        decay = gating_decay[:, c_idx, :, None]
 
-    v_diff = v_heads - v_updated
-    v_new = beta_heads * v_diff
+        state_updated = state * decay
+        v_updated = jax.lax.dot(
+            k_heads,
+            state_updated,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
 
-    state_new = k_heads_t * v_new
-    state = state_updated + state_new
+        v_new = beta_heads * (v_heads - v_updated)
+        state = state_updated + k_heads_t * v_new
 
-    out = jax.lax.dot(
-        q_heads,
-        state,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+        out = jax.lax.dot(
+            q_heads,
+            state,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
+        out_list.append(out[:, 0, :])
 
-    return out[:, 0, :], state
+        if c_idx >= cfgs.chunk_size - cfgs.window_size:
+            state_list.append(state)
+
+    return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
 def recurrent_kda(
@@ -422,35 +434,43 @@ def recurrent_kda(
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
-    valid_seq_mask = (real_sizes[:, None, None] > 0).astype(mask_dtype)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+    )
+    mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
-    # squeeze unnecessary axis
-    q = q_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    k = k_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    v = v_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    a = a_compact[:, :, 0, 0, :].astype(jnp.float32)
-
-    # Beta: [seqs, num_v_heads, 1]
-    b = b_compact[:, 0, 0, 0, :cfg.num_v_heads, None].astype(jnp.float32)
-
-    q = jnp.where(valid_seq_mask, q, 0.0)
-    k = jnp.where(valid_seq_mask, k, 0.0)
-    v = jnp.where(valid_seq_mask, v, 0.0)
+    q = jnp.where(mask, q_compact.astype(cfg.dtypes.compute), 0.0)
+    k = jnp.where(mask, k_compact.astype(cfg.dtypes.compute), 0.0)
+    v = jnp.where(mask, v_compact.astype(cfg.dtypes.compute), 0.0)
 
     q = _l2_norm_f32(q) * (cfg.kq_head_dim**-0.5)
     k = _l2_norm_f32(k)
 
     # Delta rule step-size beta in [0, 1]
-    beta = jnp.where(valid_seq_mask, jax.nn.sigmoid(b), 0.0)
+    beta = jnp.where(mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0)
+    if cfg.window_size > 1:
+        # Match `_activate_beta` feeding the one-token K3 decode kernel: its
+        # sigmoid result is rounded to the model activation dtype before the
+        # recurrent update. Return to fp32 here so the fused scan itself keeps
+        # its existing compute dtype and layout.
+        beta = beta.astype(cfg.dtypes.act_out).astype(jnp.float32)
+    beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
+    beta = beta[:, : cfg.num_v_heads, :, 0, :]
 
-    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1).astype(jnp.float32)
-    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads,
-                                  cfg.kq_head_dim).astype(jnp.float32)
-    gating_log = activate_gate(a, a_log_kda, dt_bias_kda, cfg)
-    gating_log = jnp.where(valid_seq_mask, gating_log, 0.0)
-    gating_decay = jnp.exp(gating_log)  # [seqs, num_v_heads, kq_head_dim]
+    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1, 1, 1).astype(jnp.float32)
+    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1, 1, cfg.kq_head_dim).astype(
+        jnp.float32
+    )
+    gating_log = activate_gate(a_compact, a_log_kda, dt_bias_kda, cfg)
+    # Invalid ragged tail tokens must leave the state untouched.
+    gating_log = jnp.where(mask, gating_log, 0.0)
+    gating_decay = jnp.exp(gating_log)[:, :, :, 0, :]
+
+    # Drop the compact layout's singleton dimension before the token scan.
+    q = q[:, :, :, 0, :]
+    k = k[:, :, :, 0, :]
+    v = v[:, :, :, 0, :]
 
     out_list = []
     new_state_list = []
@@ -464,10 +484,9 @@ def recurrent_kda(
             state_prev[idx],
             cfg,
         )
-        out_list.append(out[None, :])
+        out_list.append(out)
         new_state_list.append(state)
 
     out = jnp.stack(out_list, axis=0)
-    # One state per window position; see `chunked_kda`.
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)[:, jnp.newaxis]
+    new_recurrent_state = jnp.stack(new_state_list, axis=0)
     return out, new_recurrent_state

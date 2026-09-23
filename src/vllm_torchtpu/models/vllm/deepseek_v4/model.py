@@ -41,9 +41,9 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor  # noqa: E501
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps, get_mhc_ops, get_mhc_post_op)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
@@ -656,9 +656,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         import safetensors.torch  # pyrefly: ignore
         safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
-        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights,
-                                            mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(self)
+        loaded_params = loader.load_weights(
+            self.hf_to_vllm_mapper.apply(weights),
+            mapper=WeightsMapper(orig_to_new_substr={"mtp.": None}))
 
         # Post-load weight surgery goes here.
         # `fused_wkv_wgate` is built with `quant_config=None`, so it never

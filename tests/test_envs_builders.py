@@ -24,7 +24,8 @@ is a launch-script bug and defaulting hides it.
 import pytest
 
 from vllm_torchtpu.envs import (env_bool, env_float, env_int,
-                                env_nonnegative_int, env_str)
+                                env_nonnegative_int,
+                                env_nonnegative_int_or_auto, env_str)
 
 VAR = "TPU_TEST_ONLY_KNOB"
 
@@ -115,7 +116,7 @@ def test_int_parses_and_accepts_negatives(monkeypatch):
 @pytest.mark.parametrize("value", ["2.5", "banana", "1_000_000_000_000x"])
 def test_int_rejects_non_integers(monkeypatch, value):
     monkeypatch.setenv(VAR, value)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=VAR):
         env_int(VAR, 0)()
 
 
@@ -141,8 +142,28 @@ def test_float_parses_ints_too(monkeypatch):
 
 def test_float_rejects_non_numbers(monkeypatch):
     monkeypatch.setenv(VAR, "soon")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=VAR):
         env_float(VAR, 1.0)()
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", "auto", "AUTO", " Auto "])
+def test_int_or_auto_reads_none_for_unset_empty_or_auto(monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv(VAR, value)
+    assert env_nonnegative_int_or_auto(VAR)() is None
+
+
+@pytest.mark.parametrize("value,expected", [("12", 12), ("0", 0)])
+def test_int_or_auto_parses_integers(monkeypatch, value, expected):
+    monkeypatch.setenv(VAR, value)
+    assert env_nonnegative_int_or_auto(VAR)() == expected
+
+
+@pytest.mark.parametrize("value", ["automatic", "-1"])
+def test_int_or_auto_rejects_other_words_and_negatives(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_nonnegative_int_or_auto(VAR)()
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +210,46 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
     ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
     ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
     ("TPU_RAIDEN_INLINE_LOAD", False),
+    ("KDA_MANUAL_STATE_DMA", None),
+    ("KDA_MANUAL_H0_DMA", None),
+    ("KDA_MANUAL_HT_DMA", None),
+    ("KDA_OVERLAP_H0_DMA", True),
+    ("KDA_OVERLAP_HT_DMA", True),
+    ("KDA_PACK_HEAD_INV", True),
+    ("KDA_PACKED_METADATA", True),
+    ("KDA_FWD_MB", None),
+    ("SPEC_WARMUP", True),
+    ("RAIDEN_DISABLE_SINGLETON_WORKER", True),
+    ("RAIDEN_SHM_KEY", ""),
+    ("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
+    ("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    ("VLLM_TORCHTPU_IPC_KEY", ""),
+    ("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    ("VLLM_TPU_DEBUG_PCP_LAYOUT", False),
+    ("TPU_LOCAL_RANK_OFFSET", 0),
+    ("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+    ("TORCH_TPU_BASE_PORT", 8070),
+    ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
+    ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
+    ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
 ])
 def test_migrated_knob_defaults(monkeypatch, name, expected):
     from vllm_torchtpu import envs
 
     monkeypatch.delenv(name, raising=False)
     assert envs.environment_variables[name]() == expected
+
+
+def test_spec_warmup_off_spellings(monkeypatch):
+    """SPEC_WARMUP accepts the usual on/off spellings; anything else raises
+    rather than silently leaving warmup on."""
+    from vllm_torchtpu import envs
+
+    for value in ("0", "false", "off"):
+        monkeypatch.setenv("SPEC_WARMUP", value)
+        assert envs.SPEC_WARMUP is False
+    monkeypatch.setenv("SPEC_WARMUP", "1")
+    assert envs.SPEC_WARMUP is True
+    monkeypatch.setenv("SPEC_WARMUP", "nope")
+    with pytest.raises(ValueError, match="SPEC_WARMUP"):
+        _ = envs.SPEC_WARMUP

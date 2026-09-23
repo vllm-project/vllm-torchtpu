@@ -23,11 +23,14 @@ The two tolerances swap over at lo=1000, and which one wins is the whole point
 of the function, so the boundary is worth a test that does not depend on any
 executor plumbing.
 """
+
 import pytest
 
 from vllm_torchtpu.executors.kv_block_override import (
-    _NUM_BLOCKS_OVERRIDE_REL_TOL, _NUM_BLOCKS_OVERRIDE_TOL,
-    reconcile_num_gpu_blocks_override)
+    _NUM_BLOCKS_OVERRIDE_REL_TOL,
+    _NUM_BLOCKS_OVERRIDE_TOL,
+    reconcile_num_gpu_blocks_override,
+)
 
 
 def test_no_worker_set_an_override():

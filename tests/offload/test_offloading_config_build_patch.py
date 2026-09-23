@@ -37,6 +37,7 @@ def _vllm_config(*, pcp: int, block_size: int = 4096):
             cache_dtype="fp8",
             enable_prefix_caching=True,
             prefix_match_unit=None,
+            kv_cache_layout="LBNHC",
         ),
         parallel_config=SimpleNamespace(
             rank=0,
@@ -46,6 +47,8 @@ def _vllm_config(*, pcp: int, block_size: int = 4096):
             prefill_context_parallel_size=pcp,
             decode_context_parallel_size=1,
             data_parallel_index=0,
+            data_parallel_size=1,
+            data_parallel_rank_local=0,
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="test-engine",
@@ -73,8 +76,15 @@ def _kv_cache_config(block_size: int = 4096):
     return KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[
-            KVCacheTensor(size=128 * 1024, shared_by=["attn"]),
-            KVCacheTensor(size=128 * 1024, shared_by=["gdn"]),
+            KVCacheTensor(size=256 * 1024,
+                          layers=["attn"],
+                          layer_stride=128 * 1024,
+                          block_stride=1024),
+            KVCacheTensor(size=256 * 1024,
+                          layers=["gdn"],
+                          layer_stride=128 * 1024,
+                          block_stride=1024,
+                          offset=128 * 1024),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(["attn"], attn),

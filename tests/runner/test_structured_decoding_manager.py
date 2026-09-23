@@ -162,7 +162,6 @@ class TestPrepareStructuredDecodingInput:
         require, bitmask, arange = manager.prepare_structured_decoding_input(
             logits, grammar_output, 0, 2)
 
-        assert require.data_ptr() == manager.device_all_true_require.data_ptr()
         assert require[:, 0].tolist() == [True, True]
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [BLOCK_ALL, ALLOW_ALL]
@@ -184,6 +183,67 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [0, 0]
         assert arange.tolist() == list(range(32))
+
+    def test_scheduler_order_permutes_batch_order(self):
+        # Bitmask rows follow `structured_output_request_ids`, i.e. the
+        # scheduler's order. That order is not the runner's batch order:
+        # `InputBatch.condense()` moves the last request into the slot a
+        # finished request vacated, so with more requests than `max_num_seqs`
+        # the two orders permute against each other.
+        #
+        # Here all four requests are structured, they fill batch rows 0..3,
+        # and their bitmask rows are contiguous -- every property a
+        # block-copy shortcut keys on -- yet rows 1 and 2 belong to the
+        # requests sitting at batch rows 2 and 1. Each row must still land on
+        # its own request's logits.
+        manager = make_manager(req_id_to_index={
+            "reqA": 0,
+            "reqB": 2,
+            "reqC": 1,
+            "reqD": 3,
+        })
+        grammar_output = make_grammar_output(
+            ["reqA", "reqB", "reqC", "reqD"],
+            [row(10), row(20), row(30), row(40)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=4)
+
+        assert require[:, 0].tolist() == [True, True, True, True]
+        assert bitmask[0].tolist() == row(10)
+        assert bitmask[1].tolist() == row(30)  # reqC sits at batch row 1.
+        assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 2.
+        assert bitmask[3].tolist() == row(40)
+
+    def test_scheduler_order_permutes_batch_order_in_later_chunk(self):
+        # Same permutation one chunk further in, so the block of rows does
+        # not start at row 0: `req0` belongs to an earlier chunk and owns
+        # bitmask row 0, and the four rows that follow cover batch rows 4..7
+        # in a different order than the scheduler listed them.
+        manager = make_manager(req_id_to_index={
+            "req0": 0,
+            "reqA": 4,
+            "reqB": 6,
+            "reqC": 5,
+            "reqD": 7,
+        })
+        grammar_output = make_grammar_output(
+            ["req0", "reqA", "reqB", "reqC", "reqD"],
+            [row(1), row(10), row(20),
+             row(30), row(40)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=4, cur_end_idx=8)
+
+        assert require[:, 0].tolist() == [True, True, True, True]
+        assert bitmask[0].tolist() == row(10)  # reqA sits at batch row 4.
+        assert bitmask[1].tolist() == row(30)  # reqC sits at batch row 5.
+        assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 6.
+        assert bitmask[3].tolist() == row(40)  # reqD sits at batch row 7.
 
 
 class TestStructuredDecode:
@@ -222,6 +282,79 @@ class TestStructuredDecode:
 
         assert torch.equal(out[0, :32], logits[0, :32])
         assert torch.isinf(out[0, 32:]).all()
+        assert torch.equal(out[1:], logits[1:])
+
+    @pytest.mark.parametrize(
+        ("vocab_size", "padded_vocab_dim"),
+        [
+            (50,
+             128),  # Tail truncation + padding (bitmask unpacks 64 cols < 128)
+            (64, 128),  # Exact multiple of 32 + padding
+            (100, 128),  # 4 packed words (128 cols), target_dim=128
+            (128, 256),  # Padded to 256 lanes
+        ],
+    )
+    def test_padded_vocab_dimension(self, vocab_size, padded_vocab_dim):
+        """Hardware-padded logits slots (target_dim > vocab_size) must be masked to -inf."""
+        torch.manual_seed(0)
+        num_reqs = 4
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(num_reqs, padded_vocab_dim)
+        bitmask = torch.randint(torch.iinfo(torch.int32).min,
+                                torch.iinfo(torch.int32).max,
+                                (num_reqs, num_words),
+                                dtype=torch.int32)
+        arange = torch.arange(32)
+
+        out = manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+        assert out.shape == (num_reqs, padded_vocab_dim)
+        # Active vocab tokens match reference bitmask behavior.
+        expected_active = reference_apply_bitmask(logits[:, :vocab_size],
+                                                  bitmask, vocab_size)
+        assert torch.equal(out[:, :vocab_size], expected_active)
+        # Padded slots beyond vocab_size must be masked to -inf.
+        assert torch.isneginf(out[:, vocab_size:]).all()
+
+    def test_smaller_vocab_dimension_raises_value_error(self):
+        """Logits dimension smaller than vocab_size must raise ValueError."""
+        vocab_size = 64
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(2, 32)  # 32 < 64
+        bitmask = torch.zeros((2, num_words), dtype=torch.int32)
+        arange = torch.arange(32)
+
+        with pytest.raises(
+                ValueError,
+                match=
+                r"TPU logits vocab dimension must be at least vocab_size \(64\) "
+                r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
+        ):
+            manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+    def test_structured_decode_with_padded_vocab(self):
+        """End-to-end _structured_decode with mixed batch and hardware-padded logits."""
+        torch.manual_seed(0)
+        vocab_size = 50
+        padded_vocab_dim = 128
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(3, padded_vocab_dim)
+        # Row 0 structured (blocks tokens 32..49), rows 1-2 unstructured.
+        bitmask = torch.tensor([[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]],
+                               dtype=torch.int32)
+        require = torch.tensor([[True], [False], [False]])
+        arange = torch.arange(32)
+
+        out = manager._structured_decode(require, bitmask, logits, arange)
+
+        assert out.shape == (3, padded_vocab_dim)
+        # Row 0 (structured): tokens 0..31 allowed, 32..49 blocked (-inf), 50..127 padded (-inf)
+        assert torch.equal(out[0, :32], logits[0, :32])
+        assert torch.isneginf(out[0, 32:vocab_size]).all()
+        assert torch.isneginf(out[0, vocab_size:]).all()
+        # Rows 1-2 (unstructured): untouched, pass through all logits intact
         assert torch.equal(out[1:], logits[1:])
 
 

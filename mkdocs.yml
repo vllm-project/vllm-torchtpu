@@ -1,14 +1,19 @@
-site_name: vLLM TPU
+site_name: vLLM TorchTPU
 site_url: !ENV READTHEDOCS_CANONICAL_URL
 repo_url: https://github.com/vllm-project/vllm-torchtpu
 edit_uri: edit/main/docs/
 docs_dir: docs
+# Theme override templates live under docs/ but are not site content.
+exclude_docs: |
+  overrides/
 strict: true
 
 theme:
   name: material
-  logo: https://docs.vllm.ai/en/latest/assets/logos/vllm-logo-only-light.ico
-  favicon: https://docs.vllm.ai/en/latest/assets/logos/vllm-logo-only-light.ico
+  custom_dir: docs/overrides
+  # The header logo is a composite (vLLM + PyTorch) rendered by
+  # docs/overrides/partials/logo.html, so theme.logo is not set here.
+  favicon: assets/logos/vllm-logo-only-light.png
   palette:
     # Palette toggle for automatic mode
     - media: "(prefers-color-scheme)"
@@ -41,18 +46,24 @@ theme:
     - toc.follow
 
 nav:
-  - Home: README.md
-  - Getting Started:
-    - TPU Setup: getting_started/tpu_setup.md
-    - Installation: getting_started/installation.md
-    - Quickstart: getting_started/quickstart.md
-    - 'Out-of-Tree Usage': getting_started/out-of-tree.md
-  - 'Recommended Models and Features': recommended_models_features.md
-  - Developer Guides:
-    - 'JAX Model Development': developer_guides/jax_model_development.md
-    - 'Torch Model Development': developer_guides/torchax_model_development.md
-  - 'TPU Recipes (external)': https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/inference/trillium/vLLM
-  - 'Profiling' : profiling.md
+  - 'Home': README.md
+  - 'Features & Usage':
+    - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
+    - 'Docker': docker.md
+  - 'Developers Guides':
+    - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
+    - 'TPU Patch Mechanism': tpu_patch_mechanism.md
+    - 'Profiling': developers_guide/profiling.md
+
+validation:
+  nav:
+    omitted_files: info
+    not_found: warn
+  links:
+    not_found: ignore
+    absolute_links: ignore
+    unrecognized_links: ignore
+
 plugins:
   - search
   - same-dir
@@ -79,7 +90,13 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      # Resolve snippet paths against the repo root (where README.md lives),
+      # independent of the current working directory.
+      base_path: !relative $config_dir
+      # Fail the build instead of silently rendering an empty page if a
+      # snippet target goes missing.
+      check_paths: true
   # For emoji and icons
   - pymdownx.emoji:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
@@ -91,8 +108,13 @@ markdown_extensions:
   - mdx_math:
       enable_dollar_delimiter: true
 
+extra_css:
+  - mkdocs/stylesheets/extra.css
+  - mkdocs/stylesheets/interactive.css
+
 extra_javascript:
   - https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS_HTML
+  - mkdocs/javascripts/interactive.js
 
 use_directory_urls: true
 
