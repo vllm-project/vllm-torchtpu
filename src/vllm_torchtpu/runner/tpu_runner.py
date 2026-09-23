@@ -3583,10 +3583,17 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
                 if grammar_output is not None:
-                    logits = self.structured_decoding_manager.mask_logits(
-                        logits, grammar_output, cur_start_idx, cur_end_idx)
+                    if all_greedy and not needs_logprobs:
+                        selected_token_ids = (self.structured_decoding_manager.
+                                              mask_and_greedy_sample(
+                                                  logits, grammar_output,
+                                                  cur_start_idx, cur_end_idx))
+                    else:
+                        logits = self.structured_decoding_manager.mask_logits(
+                            logits, grammar_output, cur_start_idx, cur_end_idx)
                 if all_greedy:
-                    selected_token_ids = self._greedy_sample(logits)
+                    if grammar_output is None or needs_logprobs:
+                        selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
                         self._build_padded_sampling_params(
@@ -4480,15 +4487,19 @@ class TPUModelRunner(GPUModelRunner):
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decoding_manager.structured_decode_arange
             for num_reqs in self.num_reqs_paddings:
+                req_sd = (self.structured_decoding_manager.
+                          require_structured_out_cpu[:num_reqs].to(
+                              self.device))
+                bitmask = (self.structured_decoding_manager.
+                           grammar_bitmask_cpu[:num_reqs].to(self.device))
+                dummy = self._dummy_logits(num_reqs)
                 out = self.structured_decoding_manager.structured_decode(
-                    self.structured_decoding_manager.
-                    require_structured_out_cpu[:num_reqs].to(self.device),
-                    self.structured_decoding_manager.
-                    grammar_bitmask_cpu[:num_reqs].to(self.device),
-                    self._dummy_logits(num_reqs),
-                    arange,
-                )
+                    req_sd, bitmask, dummy, arange)
                 synchronize_tensors(out)
+                out_greedy = (
+                    self.structured_decoding_manager.structured_greedy_sample(
+                        req_sd, bitmask, dummy, arange))
+                synchronize_tensors(out_greedy)
                 logger.info("  -- num_seqs: %d", num_reqs)
             # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
             # we skip it here as well.

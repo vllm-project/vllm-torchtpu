@@ -244,6 +244,31 @@ class StructuredDecodingManager:
                              cur_end_idx=cur_end_idx):
             return self.structured_decode(require_sd, bitmask, logits, arange)
 
+    def mask_and_greedy_sample(
+        self,
+        logits: torch.Tensor,
+        grammar_output: GrammarOutput,
+        cur_start_idx: int,
+        cur_end_idx: int,
+    ) -> torch.Tensor:
+        """Fused structured decode + argmax greedy sample in a single compiled pass."""
+        num_reqs = cur_end_idx - cur_start_idx
+        padded_num_reqs = logits.shape[0]
+        with TraceAnnotation("SD:PrepareInput",
+                             num_reqs=num_reqs,
+                             padded_num_reqs=padded_num_reqs,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            require_sd, bitmask, arange = self.prepare_structured_decoding_input(
+                logits, grammar_output, cur_start_idx, cur_end_idx)
+        with TraceAnnotation("SD:MaskLogits",
+                             num_reqs=num_reqs,
+                             padded_num_reqs=padded_num_reqs,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            return self.structured_greedy_sample(require_sd, bitmask, logits,
+                                                 arange)
+
     def mask_spec_logits(
         self,
         target_logits: torch.Tensor | None,
@@ -298,6 +323,19 @@ class StructuredDecodingManager:
     ) -> torch.Tensor:
         return self._structured_decode(require_struct_decoding,
                                        grammar_bitmask, logits, arange)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def structured_greedy_sample(
+        self,
+        require_struct_decoding: torch.Tensor,
+        grammar_bitmask: torch.Tensor,
+        logits: torch.Tensor,
+        arange: torch.Tensor,
+    ) -> torch.Tensor:
+        masked_logits = self._structured_decode(require_struct_decoding,
+                                                grammar_bitmask, logits,
+                                                arange)
+        return torch.argmax(masked_logits, dim=-1, keepdim=True)
 
     def _structured_decode(
         self,

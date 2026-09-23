@@ -521,6 +521,39 @@ class TestMaskLogitsWithTrace:
             "SD:MaskLogits#num_reqs=2,padded_num_reqs=4,cur_start_idx=0,cur_end_idx=2#"
             in name for name in events), f"SD:MaskLogits not found in {events}"
 
+    def test_mask_and_greedy_sample(self, monkeypatch):
+        manager = make_manager(req_id_to_index={"req0": 0, "req1": 1})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, BLOCK_ALL]],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+        # Give higher logit to a blocked token on row 0, and token 10 on row 0.
+        logits[0, 50] = 10.0  # Blocked!
+        logits[0, 10] = 5.0  # Allowed!
+        logits[1, 50] = 10.0  # Allowed (not structured)
+        monkeypatch.setattr(
+            manager, "structured_greedy_sample",
+            lambda req, bitmask, logits_in, arange_in: torch.argmax(
+                manager._structured_decode(req, bitmask, logits_in, arange_in),
+                dim=-1,
+                keepdim=True))
+
+        with capture_trace() as prof:
+            tokens = manager.mask_and_greedy_sample(logits,
+                                                    grammar_output,
+                                                    cur_start_idx=0,
+                                                    cur_end_idx=2)
+
+        # Row 0: token 50 is blocked (-inf), so token 10 is picked.
+        assert tokens[0, 0].item() == 10
+        # Row 1: unmasked, so token 50 is picked.
+        assert tokens[1, 0].item() == 50
+
+        events = [evt.name for evt in prof.events()]
+        assert any("SD:PrepareInput" in name for name in events)
+        assert any("SD:MaskLogits" in name for name in events)
+
     def test_mask_spec_logits(self, monkeypatch):
         manager = make_manager(num_spec_tokens=1, req_id_to_index={"req0": 0})
         grammar_output = make_grammar_output(
