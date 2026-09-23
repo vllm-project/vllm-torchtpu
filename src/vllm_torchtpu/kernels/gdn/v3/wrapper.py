@@ -556,15 +556,11 @@ def fused_conv1d_gdn(
         )
 
         if is_kda:
-            # Keep exactly one KDA sequence in each window tile.  The state
-            # pipeline issues one async recurrent-state DMA per sequence but
-            # shares a semaphore and drains the tile with one aggregate wait.
-            # Bounding only the total bytes is insufficient: TP32's four
-            # 3-head sequences have the same 6 MiB footprint as one TP8
-            # 12-head sequence, but the former still has four independent DMA
-            # starts and corrupts recurrent checkpoints in long-running
-            # serving.  A one-sequence tile is the only schedule validated for
-            # repeated rollback and slot reuse on v7, independent of TP size.
+            # Keep speculative KDA tiles single-sequence until the checkpoint
+            # buffer-reuse dependency is fixed. Multi-sequence tests exposed a
+            # race where a subsequent state load could overwrite VMEM before
+            # the previous checkpoint store completed. This is a correctness
+            # workaround, not an inherent KDA or VMEM-capacity constraint.
             decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size

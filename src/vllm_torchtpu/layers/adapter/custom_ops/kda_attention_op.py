@@ -303,9 +303,9 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
 
     The fused kernel replaces the four-stage manual pipeline and
     owns the convolution, silu, q/k L2-norm, the gate activation, beta's
-    sigmoid, both recurrences and the state write-back. Speculative decoding
-    invokes its batched and per-sequence programs separately so empty verify
-    windows and empty prefill segments do not touch state.
+    sigmoid, both recurrences and the state write-back. The wrapper owns
+    speculative segment dispatch and skips empty verify/prefill segments
+    without touching their state.
 
     Only `_gated_output_norm` stays outside, since the fused kernel has no
     notion of the output gate.
@@ -360,41 +360,37 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 raise ValueError("slot_read_offsets are required for KDA verify")
             read_offsets = slot_read_offsets[state_indices]
 
-        def run_kernel(conv_in, rec_in):
-            return gdn_wrapper.fused_conv1d_gdn(
-                qkv=mixed_qkv,
-                # Raw: the kernel applies sigmoid to `b` and the gate activation
-                # to `a` itself.
-                b=beta,
-                a=raw_gate,
-                conv_state=conv_in,
-                recurrent_state=rec_in,
-                conv_weight=conv_weight_flat,
-                # Kimi's short convolution is bias-free.
-                conv_bias=None,
-                a_log=a_log,
-                # Per-channel under KDA, and Mosaic rejects the flat form.
-                dt_bias=dt_bias.reshape(num_heads, head_dim),
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                # The batched segment contains both ordinary one-token decodes and
-                # K+1 target-verify windows.  Ragged query lengths distinguish the
-                # two while the recurrent kernel uses one static window shape.
-                distribution=window_distribution,
-                seq_lens=seq_lens,
-                read_offsets=read_offsets,
-                n_kq=num_heads,
-                n_v=num_heads,
-                d_k=head_dim,
-                d_v=head_dim,
-                kernel_size=kernel_size,
-                attention_mode=gdn_config.AttentionMode.KDA,
-                gate_lower_bound=lower_bound,
-                num_spec_tokens=num_spec_tokens,
-            )
-
-        (new_conv_state, new_pool), out = run_kernel(conv_state,
-                                                     recurrent_state)
+        (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            # Raw: the kernel applies sigmoid to `b` and the gate activation
+            # to `a` itself.
+            b=beta,
+            a=raw_gate,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            conv_weight=conv_weight_flat,
+            # Kimi's short convolution is bias-free.
+            conv_bias=None,
+            a_log=a_log,
+            # Per-channel under KDA, and Mosaic rejects the flat form.
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            # The batched segment contains both ordinary one-token decodes and
+            # K+1 target-verify windows.  Ragged query lengths distinguish the
+            # two while the recurrent kernel uses one static window shape.
+            distribution=window_distribution,
+            seq_lens=seq_lens,
+            read_offsets=read_offsets,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+            num_spec_tokens=num_spec_tokens,
+        )
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(
@@ -413,7 +409,7 @@ def build_kimi_dispatched_kda_op(
     state_dim_first: bool,
     num_spec_tokens: int = 0,
 ):
-    """Build fused KDA with separately guarded speculative and prefill segments."""
+    """Build a KDA op whose fused wrapper owns speculative segment dispatch."""
     core = _build_fused_core(lower_bound, eps, num_spec_tokens)
     variant = "fused_window" if num_spec_tokens else "fused"
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
