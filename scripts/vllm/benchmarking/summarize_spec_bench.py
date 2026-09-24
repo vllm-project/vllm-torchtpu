@@ -125,7 +125,11 @@ def aggregate_spec_results(results_dir: Path) -> dict[int, dict[int, dict[str, A
                 ):
                     ar = r["spec_decode_stats"].get("acceptance_rate")
                 if ar is not None:
-                    acceptance_rates.append(float(ar))
+                    ar_val = float(ar)
+                    # Normalize if vLLM emitted it as a percentage (e.g. 52.3) rather than ratio (0.523)
+                    if ar_val > 1.0:
+                        ar_val = ar_val / 100.0
+                    acceptance_rates.append(ar_val)
 
                 comp = r.get("completed")
                 if comp is not None:
