@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
-Stage = Literal["import", "platform_activation", "engine_core", "worker_init",
-                "model_load"]
+Stage = Literal[
+    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+]
 
 
 @dataclass(frozen=True)
@@ -47,11 +48,8 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 # Tuple order is application order, including when several stages share a patch.
 PATCHES = (
     # Environment setup and custom-op registration.
-    Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering",
-          ("import", )),
-    Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops",
-          _ACTIVE),
-
+    Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
+    Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
@@ -60,70 +58,72 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_disable_compile_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
-
     # MoE routing and collectives.
     Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
     Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),
-
     # KV cache, scheduling, and offloading.
-    Patch("vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
-          _ENGINE,
-          refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes"),
-    Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size",
-          _ENGINE),
+    Patch(
+        "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
+    ),
+    Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
-    Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery",
-          _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
-
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
-
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",
-        _ACTIVE),
+        _ACTIVE,
+    ),
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_runai_sharded_expert_streaming",
-        _ACTIVE),
+        _ACTIVE,
+    ),
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
-        _ACTIVE),
-    Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging",
-          _ACTIVE),
+        _ACTIVE,
+    ),
+    Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
-          _ENGINE,
-          refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings"),
+    Patch(
+        "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
+    ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
-
     # Platform runtime configuration.
     Patch(
-        "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode",
-        _ACTIVE),
-    Patch("vllm_torchtpu.platforms.tpu_platform:_unwrap_dynamic_compile_fns",
-          _ACTIVE),
+        "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
+    ),
+    Patch("vllm_torchtpu.platforms.tpu_platform:_unwrap_dynamic_compile_fns", _ACTIVE),
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
-        _ACTIVE),
-
+        _ACTIVE,
+    ),
     # Model-specific patches.
     # Append patches for new models here with stages=("platform_activation", "model_load")
     # and model_config=True. See docs/tpu_patch_mechanism.md for details.
-    Patch("vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
-          ("platform_activation", "model_load"),
-          model_config=True),
-    Patch("vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
-          ("platform_activation", "model_load"),
-          model_config=True),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()
@@ -160,8 +160,13 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     outer invocation already owns that ordered pass. Failures propagate and
     leave the failing patch eligible for retry, retaining completed patches.
     """
-    if stage not in ("import", "platform_activation", "engine_core",
-                     "worker_init", "model_load"):
+    if stage not in (
+        "import",
+        "platform_activation",
+        "engine_core",
+        "worker_init",
+        "model_load",
+    ):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
         if stage in _active_stages:
@@ -178,9 +183,9 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
                     continue
                 _applying.add(patch.target)
                 try:
-                    kwargs = {
-                        "model_config": model_config
-                    } if patch.model_config else {}
+                    kwargs = (
+                        {"model_config": model_config} if patch.model_config else {}
+                    )
                     result = _invoke(patch.target, **kwargs)
                 finally:
                     _applying.discard(patch.target)
@@ -191,5 +196,6 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
         finally:
             _active_stages.discard(stage)
             if applied:
-                _logger.info("Completed TPU patch callbacks at %s: %s", stage,
-                             ", ".join(applied))
+                _logger.info(
+                    "Completed TPU patch callbacks at %s: %s", stage, ", ".join(applied)
+                )

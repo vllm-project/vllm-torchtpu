@@ -67,8 +67,7 @@ _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
-    from vllm.model_executor.model_loader.ep_weight_filter import \
-        parse_expert_id
+    from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
     expert_id = parse_expert_id(name)
     if expert_id is None:
@@ -78,8 +77,7 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     return expert_id not in local_expert_ids
 
 
-def _should_skip_weight_tpu(name: str,
-                            local_expert_ids: set[int] | None) -> bool:
+def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
@@ -105,8 +103,11 @@ def _compute_local_expert_ids() -> set[int] | None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
 
-    if not (model_config.is_moe and parallel_config.enable_expert_parallel
-            and parallel_config.enable_ep_weight_filter):
+    if not (
+        model_config.is_moe
+        and parallel_config.enable_expert_parallel
+        and parallel_config.enable_ep_weight_filter
+    ):
         return None
     # EPLB redundant slots may need foreign logical experts; do not filter.
     if parallel_config.enable_eplb:
@@ -115,8 +116,12 @@ def _compute_local_expert_ids() -> set[int] | None:
     if num_experts <= 0:
         return None
 
-    from vllm.distributed import (get_dp_group, get_pcp_group,
-                                  get_tensor_model_parallel_rank)
+    from vllm.distributed import (
+        get_dp_group,
+        get_pcp_group,
+        get_tensor_model_parallel_rank,
+    )
+
     dp_size = parallel_config.data_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -139,8 +144,12 @@ def _compute_local_expert_ids() -> set[int] | None:
         logger.info(
             "[sharded-ep-load] ep_size=%d ep_rank=%d placement=%s: "
             "this rank keeps %d/%d experts",
-            ep_size, ep_rank, parallel_config.expert_placement_strategy,
-            len(local_ids), num_experts)
+            ep_size,
+            ep_rank,
+            parallel_config.expert_placement_strategy,
+            len(local_ids),
+            num_experts,
+        )
     return local_ids
 
 
@@ -158,8 +167,9 @@ def _sharded_runai_weights_iterator(
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
-    from runai_model_streamer.safetensors_streamer.safetensors_streamer import \
-        SafetensorsStreamer
+    from runai_model_streamer.safetensors_streamer.safetensors_streamer import (
+        SafetensorsStreamer,
+    )
     from tqdm.auto import tqdm
     from vllm.model_executor.model_loader.weight_utils import enable_tqdm
 
@@ -187,15 +197,13 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
-                requests.append(
-                    FileChunks(len(requests), path, run_start, run_sizes))
+                requests.append(FileChunks(len(requests), path, run_start, run_sizes))
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
 
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
-            for tensor_meta, size in zip(meta.tensors_metadata,
-                                         meta.read_sizes):
+            for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
                 if _should_skip(tensor_meta.name, local_expert_ids):
                     skipped += 1
                     skipped_bytes += size
@@ -219,13 +227,14 @@ def _sharded_runai_weights_iterator(
         logger.info(
             "[sharded-ep-load] fetching %d tensors (%.1f GB) in %d ranges; "
             "skipping %d non-local expert tensors (%.1f GB) before fetch",
-            kept, kept_bytes / 1e9, len(requests), skipped,
-            skipped_bytes / 1e9)
+            kept,
+            kept_bytes / 1e9,
+            len(requests),
+            skipped,
+            skipped_bytes / 1e9,
+        )
 
-        fs.stream_files(requests,
-                        credentials=None,
-                        device="cpu",
-                        is_distributed=False)
+        fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
 
         # Under torch-tpu's deferred eager mode, weight_loader's device
         # copies queue up and keep their HOST source tensors referenced
@@ -243,24 +252,32 @@ def _sharded_runai_weights_iterator(
             except Exception:
                 logger.warning_once(
                     "[sharded-ep-load] torch.accelerator.synchronize() unavailable "
-                    "during load; host memory may accumulate.")
+                    "during load; host memory may accumulate."
+                )
 
-        progress = tqdm(total=kept,
-                        desc="Loading safetensors (EP-sharded Run:AI)",
-                        disable=not enable_tqdm(use_tqdm_on_load),
-                        mininterval=2)
+        progress = tqdm(
+            total=kept,
+            desc="Loading safetensors (EP-sharded Run:AI)",
+            disable=not enable_tqdm(use_tqdm_on_load),
+            mininterval=2,
+        )
         try:
             for tensor_meta in zero_size_tensors:
                 # create_torch_tensor returns torch.empty for zero-element
                 # metadata without touching the buffer.
-                yield tensor_meta.name, sp.create_torch_tensor(
-                    memoryview(b""), tensor_meta)
+                yield (
+                    tensor_meta.name,
+                    sp.create_torch_tensor(memoryview(b""), tensor_meta),
+                )
                 progress.update(1)
-            for yielded, (request_id, chunk_index,
-                          buffer) in enumerate(fs.get_chunks(), start=1):
+            for yielded, (request_id, chunk_index, buffer) in enumerate(
+                fs.get_chunks(), start=1
+            ):
                 tensor_meta = tensors_by_request[request_id][chunk_index]
-                yield tensor_meta.name, sp.create_torch_tensor(
-                    buffer, tensor_meta).clone()
+                yield (
+                    tensor_meta.name,
+                    sp.create_torch_tensor(buffer, tensor_meta).clone(),
+                )
                 progress.update(1)
                 if sync_every and yielded % sync_every == 0:
                     _device_sync()
@@ -292,12 +309,14 @@ def patch_runai_sharded_expert_streaming() -> None:
             # enable_ep_weight_filter / expert_placement_strategy fields).
             logger.info_once(
                 "[sharded-ep-load] this vLLM has no EP weight filter; "
-                "using stock full-checkpoint streaming.")
+                "using stock full-checkpoint streaming."
+            )
             local_expert_ids = None
         except Exception:
             logger.exception(
                 "[sharded-ep-load] filter setup failed; falling back to "
-                "full-checkpoint streaming")
+                "full-checkpoint streaming"
+            )
             local_expert_ids = None
         if local_expert_ids is None:
             return original_get_iterator(self, model_or_path, revision)
@@ -308,16 +327,19 @@ def patch_runai_sharded_expert_streaming() -> None:
             logger.info_once(
                 "[sharded-ep-load] ignoring model_loader_extra_config "
                 "'distributed': incompatible with per-rank sharded fetch "
-                "plans; streaming per rank instead.")
+                "plans; streaming per rank instead."
+            )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids,
-            self.load_config.use_tqdm_on_load)
+            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+        )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
-    logger.info("Applied TPU patch: EP-sharded Run:AI weight streaming "
-                "(fetch only local experts when the EP weight filter is on).")
+    logger.info(
+        "Applied TPU patch: EP-sharded Run:AI weight streaming "
+        "(fetch only local experts when the EP weight filter is on)."
+    )
 
 
 def patch_default_loader_ep_weight_filter() -> None:
@@ -338,8 +360,10 @@ def patch_default_loader_ep_weight_filter() -> None:
     weight_utils.should_skip_weight = _should_skip_weight_tpu
     ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
     weight_utils._tpu_ep_filter_patch = True
-    logger.info("Applied TPU patch: EP weight filter covers "
-                ".weight_packed/.weight_scale (DefaultModelLoader).")
+    logger.info(
+        "Applied TPU patch: EP weight filter covers "
+        ".weight_packed/.weight_scale (DefaultModelLoader)."
+    )
 
 
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
@@ -400,22 +424,19 @@ def patch_default_model_loader_page_cache() -> None:
             self._loaded_weight_files = res[1]
         return res
 
-    def load_weights(self, model: torch.nn.Module,
-                     model_config: ModelConfig) -> None:
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
         original_load_weights(self, model, model_config)
 
         if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
             return
 
         # Host page cache is shared across ranks; only local rank 0 issues the eviction
-        local_rank = int(
-            os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
         if local_rank == 0 and hasattr(self, "_loaded_weight_files"):
             try:
                 _evict_checkpoint_page_cache(self._loaded_weight_files)
             except Exception as e:
-                logger.warning(
-                    "[tpu-model-loader] Page cache eviction skipped: %s", e)
+                logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
 
     dl.DefaultModelLoader._prepare_weights = _prepare_weights
     dl.DefaultModelLoader.load_weights = load_weights
@@ -443,8 +464,7 @@ class ExpertWriteTracker:
     def __init__(self) -> None:
         self._seen: dict[int, set[tuple[int, str]]] = {}
 
-    def record(self, param: torch.Tensor, expert_id: int,
-               shard_id: str) -> bool:
+    def record(self, param: torch.Tensor, expert_id: int, shard_id: str) -> bool:
         shards = _SHARDS_PER_EXPERT.get(shard_id)
         if shards is None:
             return False
@@ -501,8 +521,11 @@ class ExpertParamStager:
                 self.flush(oldest)
             key = (tuple(param.shape), param.dtype)
             free = self._pool.get(key)
-            buffer = free.pop() if free else torch.empty(
-                param.shape, dtype=param.dtype, device="cpu")
+            buffer = (
+                free.pop()
+                if free
+                else torch.empty(param.shape, dtype=param.dtype, device="cpu")
+            )
             # The stand-in keeps the parameter's class and attributes so the
             # loader's dispatch on them (is_transposed, quant flags) holds.
             host = torch.Tensor._make_subclass(type(param), buffer, False)
@@ -511,8 +534,7 @@ class ExpertParamStager:
             self._staged[id(param)] = entry
         return entry[1]
 
-    def written(self, param: torch.nn.Parameter, expert_id: int,
-                shard_id: str) -> bool:
+    def written(self, param: torch.nn.Parameter, expert_id: int, shard_id: str) -> bool:
         """Note one expert write; flush the parameter if it is complete."""
         if not self._tracker.record(param, expert_id, shard_id):
             return False
@@ -535,23 +557,27 @@ class ExpertParamStager:
         per_row = max(1, host[0].numel() * host.element_size())
         step = max(1, _UPLOAD_CHUNK_BYTES // per_row)
         chunks = [
-            host[start:start + step].to(device)
+            host[start : start + step].to(device)
             for start in range(0, host.shape[0], step)
         ]
         param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
         del chunks
         if device.type == "tpu":
             from vllm_torchtpu.utils import synchronize_tensors
+
             synchronize_tensors([param.data], wait=True)
         self.flushed += 1
         buffer = torch.Tensor._make_subclass(torch.Tensor, host.data, False)
-        self._pool.setdefault((tuple(host.shape), host.dtype),
-                              []).append(buffer)
+        self._pool.setdefault((tuple(host.shape), host.dtype), []).append(buffer)
         logger.debug(
             "Staged expert parameter %d written: shape=%s staged=%d "
-            "pooled=%d rss=%.1f GiB", self.flushed, tuple(param.shape),
-            len(self._staged), sum(len(v) for v in self._pool.values()),
-            _rss_gib())
+            "pooled=%d rss=%.1f GiB",
+            self.flushed,
+            tuple(param.shape),
+            len(self._staged),
+            sum(len(v) for v in self._pool.values()),
+            _rss_gib(),
+        )
 
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
@@ -590,39 +616,50 @@ def patch_moe_expert_write_staging() -> None:
     # wraps keeps the attributes model loaders read off the upstream
     # loader, such as ``supports_moe_loading``.
     @functools.wraps(orig_weight_loader)
-    def weight_loader(self,
-                      param,
-                      loaded_weight,
-                      weight_name,
-                      shard_id,
-                      expert_id,
-                      return_success=False):
+    def weight_loader(
+        self,
+        param,
+        loaded_weight,
+        weight_name,
+        shard_id,
+        expert_id,
+        return_success=False,
+    ):
         # Experts of other ranks and parameters already written early take
         # the direct path, which skips or writes them as before.
-        if (param.data.device.type != "tpu" or not stager.staging(param)
-                or self._map_global_expert_id_to_local_expert_id(expert_id)
-                == -1):
-            return orig_weight_loader(self,
-                                      param,
-                                      loaded_weight,
-                                      weight_name,
-                                      shard_id,
-                                      expert_id,
-                                      return_success=return_success)
-        result = orig_weight_loader(self,
-                                    stager.host_param(param),
-                                    loaded_weight,
-                                    weight_name,
-                                    shard_id,
-                                    expert_id,
-                                    return_success=return_success)
+        if (
+            param.data.device.type != "tpu"
+            or not stager.staging(param)
+            or self._map_global_expert_id_to_local_expert_id(expert_id) == -1
+        ):
+            return orig_weight_loader(
+                self,
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success=return_success,
+            )
+        result = orig_weight_loader(
+            self,
+            stager.host_param(param),
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=return_success,
+        )
         if result is not False:
             stager.written(param, expert_id, shard_id)
         calls[0] += 1
         if calls[0] % 1000 == 0:
             logger.debug(
-                "Expert writes: %d, parameters staged: %d, rss=%.1f "
-                "GiB", calls[0], len(stager), _rss_gib())
+                "Expert writes: %d, parameters staged: %d, rss=%.1f GiB",
+                calls[0],
+                len(stager),
+                _rss_gib(),
+            )
         return result
 
     def process_weights_after_loading(model, model_config, target_device):
@@ -630,12 +667,16 @@ def patch_moe_expert_write_staging() -> None:
         stager.flush_all()
         logger.info(
             "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.", during_load,
-            stager.flushed - during_load)
+            "expert landed, %d at the end of loading.",
+            during_load,
+            stager.flushed - during_load,
+        )
         return orig_process(model, model_config, target_device)
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
     base_loader.process_weights_after_loading = process_weights_after_loading
-    logger.info("Applied TPU patch: expert parameters are staged on the host "
-                "and written to the device once each.")
+    logger.info(
+        "Applied TPU patch: expert parameters are staged on the host "
+        "and written to the device once each."
+    )

@@ -196,42 +196,6 @@ ignore = [
 
 
 
-# core, tracing, omni, tools, loose modules
-"src/vllm_torchtpu/core/**" = ["I"]
-"src/vllm_torchtpu/omni/**" = ["I"]
-"src/vllm_torchtpu/tools/**" = ["I"]
-"src/vllm_torchtpu/tracing/**" = ["I"]
-"tests/model_loader/**" = ["I"]
-"tests/omni/**" = ["I"]
-"tests/scripts/**" = ["I"]
-"tests/tools/**" = ["I"]
-"tests/tracing/**" = ["I"]
-"src/sitecustomize.py" = ["I"]
-"src/vllm_torchtpu/__init__.py" = ["I"]
-"src/vllm_torchtpu/env_override.py" = ["I"]
-"src/vllm_torchtpu/envs.py" = ["I"]
-"src/vllm_torchtpu/gdn_pool_layout.py" = ["I"]
-"src/vllm_torchtpu/kv_cache_materializer.py" = ["I"]
-"src/vllm_torchtpu/kv_cache_spec_normalizer.py" = ["I"]
-"src/vllm_torchtpu/logger.py" = ["I"]
-"src/vllm_torchtpu/model_loader_patches.py" = ["I"]
-"src/vllm_torchtpu/patch_registry.py" = ["I"]
-"src/vllm_torchtpu/profiler_trace.py" = ["I"]
-"src/vllm_torchtpu/tokenizers.py" = ["I"]
-"src/vllm_torchtpu/tpu_info.py" = ["I"]
-"src/vllm_torchtpu/utils.py" = ["I"]
-"tests/conftest.py" = ["I"]
-"tests/test_envs.py" = ["I"]
-"tests/test_envs_builders.py" = ["I"]
-"tests/test_package_import.py" = ["I"]
-"tests/test_pp_chunk_scheduler.py" = ["I"]
-"tests/test_pp_chunks.py" = ["I"]
-"tests/test_profiler_trace.py" = ["I"]
-"tests/test_token_padding.py" = ["I"]
-"tests/test_tokenizers.py" = ["I"]
-"tests/test_tpu_release.py" = ["I"]
-"tests/test_tpu_scheduler.py" = ["I"]
-"tests/tpu_release.py" = ["I"]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
@@ -261,42 +225,6 @@ exclude = [
 
 
 
-    # core, tracing, omni, tools, loose modules
-    "src/vllm_torchtpu/core/**",
-    "src/vllm_torchtpu/omni/**",
-    "src/vllm_torchtpu/tools/**",
-    "src/vllm_torchtpu/tracing/**",
-    "tests/model_loader/**",
-    "tests/omni/**",
-    "tests/scripts/**",
-    "tests/tools/**",
-    "tests/tracing/**",
-    "src/sitecustomize.py",
-    "src/vllm_torchtpu/__init__.py",
-    "src/vllm_torchtpu/env_override.py",
-    "src/vllm_torchtpu/envs.py",
-    "src/vllm_torchtpu/gdn_pool_layout.py",
-    "src/vllm_torchtpu/kv_cache_materializer.py",
-    "src/vllm_torchtpu/kv_cache_spec_normalizer.py",
-    "src/vllm_torchtpu/logger.py",
-    "src/vllm_torchtpu/model_loader_patches.py",
-    "src/vllm_torchtpu/patch_registry.py",
-    "src/vllm_torchtpu/profiler_trace.py",
-    "src/vllm_torchtpu/tokenizers.py",
-    "src/vllm_torchtpu/tpu_info.py",
-    "src/vllm_torchtpu/utils.py",
-    "tests/conftest.py",
-    "tests/test_envs.py",
-    "tests/test_envs_builders.py",
-    "tests/test_package_import.py",
-    "tests/test_pp_chunk_scheduler.py",
-    "tests/test_pp_chunks.py",
-    "tests/test_profiler_trace.py",
-    "tests/test_token_padding.py",
-    "tests/test_tokenizers.py",
-    "tests/test_tpu_release.py",
-    "tests/test_tpu_scheduler.py",
-    "tests/tpu_release.py",
 ]
 
 [tool.pyrefly]

@@ -26,8 +26,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @property
     def dist_backend(self) -> str:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
-        return TpuPlatform.get_worker_distributed_backend(
-            world_size=world_size)
+        return TpuPlatform.get_worker_distributed_backend(world_size=world_size)
 
     def __init__(self) -> None:
         super().__init__()
@@ -40,13 +39,13 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
-        from vllm_torchtpu.omni.patches import \
-            apply_omni_model_specific_patches
+        from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
         logger.info_once(
             "Using TpuSDPABackend for diffusion attention (requested: %s).",
-            selected_backend)
+            selected_backend,
+        )
         return "vllm_torchtpu.omni.attention.TpuSDPABackend"
 
     @classmethod
@@ -123,8 +122,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return torch.accelerator.max_memory_allocated(device)
 
     @classmethod
-    def reset_peak_memory_stats(cls,
-                                device: torch.device | None = None) -> None:
+    def reset_peak_memory_stats(cls, device: torch.device | None = None) -> None:
         torch.accelerator.reset_peak_memory_stats(device)
 
     @classmethod

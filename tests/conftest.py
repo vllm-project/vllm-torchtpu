@@ -17,8 +17,7 @@ import os
 import sys
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
-os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                      "false")
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
 # Forking after TorchTPU/JAX/PyTorch background threads have started can
@@ -46,8 +45,9 @@ def pytest_collection_modifyitems(items):
     no release API, so the only safe ordering is spawn-first. The sort is
     stable, so relative order within each group is unchanged.
     """
-    items.sort(key=lambda item: 0
-               if item.get_closest_marker("spawns_tpu_workers") else 1)
+    items.sort(
+        key=lambda item: 0 if item.get_closest_marker("spawns_tpu_workers") else 1
+    )
 
 
 def pytest_addoption(parser):
@@ -80,6 +80,7 @@ def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
     config = VllmConfig()
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     with set_current_vllm_config(config):
@@ -98,6 +99,7 @@ def device(request):
     if use_tpu:
         try:
             import torch_tpu  # noqa: F401
+
             return torch.device("tpu")
         except ImportError:
             pytest.skip("torch_tpu not available")
@@ -127,6 +129,7 @@ def pytest_collection_finish(session):
     if "jax" not in sys.modules:
         return
     from jax._src import xla_bridge
+
     if not xla_bridge.backends_are_initialized():
         return
     raise pytest.UsageError(
@@ -136,4 +139,5 @@ def pytest_collection_finish(session):
         "accelerator at import time -- most often a module-level "
         "`jax.device_count()` in a `skipif`. Move it into a fixture. To find "
         "the module: bisect with `pytest --collect-only <subset>` and check "
-        "`jax._src.xla_bridge.backends_are_initialized()` after each.")
+        "`jax._src.xla_bridge.backends_are_initialized()` after each."
+    )

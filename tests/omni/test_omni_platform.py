@@ -30,8 +30,7 @@ def test_register_omni_tpu_platform(monkeypatch):
     assert register_omni_tpu_platform() is None
 
     monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
-    assert register_omni_tpu_platform(
-    ) == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
+    assert register_omni_tpu_platform() == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
 
 
 def test_platform_attributes():
@@ -41,8 +40,10 @@ def test_platform_attributes():
     assert platform.dist_backend == "gloo"
     assert platform.supports_torch_inductor() is False
     assert platform.supports_diffusion_dense_flash_attention() is False
-    assert (platform.get_diffusion_attn_backend_cls(
-        None, 64) == "vllm_torchtpu.omni.attention.TpuSDPABackend")
+    assert (
+        platform.get_diffusion_attn_backend_cls(None, 64)
+        == "vllm_torchtpu.omni.attention.TpuSDPABackend"
+    )
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
@@ -53,9 +54,7 @@ def test_device_control_env_var():
 
 
 def test_memory_methods(monkeypatch):
-
     class MockAccelerator:
-
         @staticmethod
         def get_memory_info(device=None):
             return (16 * 1024**3, 32 * 1024**3)
@@ -70,13 +69,12 @@ def test_memory_methods(monkeypatch):
 
     monkeypatch.setattr(torch, "accelerator", MockAccelerator(), raising=False)
     with patch(
-            "torch_tpu._internal.utils.hardware.get_hbm_bytes_per_device",
-            return_value=32 * 1024**3,
+        "torch_tpu._internal.utils.hardware.get_hbm_bytes_per_device",
+        return_value=32 * 1024**3,
     ):
         assert OmniTpuPlatform.get_device_total_memory() == 32 * 1024**3
         assert OmniTpuPlatform.get_free_memory() == 16 * 1024**3
-        assert OmniTpuPlatform.get_device_memory() == (16 * 1024**3,
-                                                       32 * 1024**3)
+        assert OmniTpuPlatform.get_device_memory() == (16 * 1024**3, 32 * 1024**3)
         assert OmniTpuPlatform.max_memory_reserved() == 16 * 1024**3
         assert OmniTpuPlatform.max_memory_allocated() == 16 * 1024**3
 
@@ -95,10 +93,9 @@ def test_tpu_sdpa_attention_backend():
     assert res.shape == (2, 8, 4, 16)
 
     # GQA
-    impl_gqa = TpuSDPAImpl(num_heads=8,
-                           head_size=16,
-                           softmax_scale=0.25,
-                           num_kv_heads=2)
+    impl_gqa = TpuSDPAImpl(
+        num_heads=8, head_size=16, softmax_scale=0.25, num_kv_heads=2
+    )
     query_gqa = torch.randn(1, 16, 8, 16)
     key_gqa = torch.randn(1, 16, 2, 16)
     value_gqa = torch.randn(1, 16, 2, 16)
@@ -169,19 +166,18 @@ def test_safe_pack_tensor_if_large():
     # Provide an original pack function to mock_omni's ipc
     orig_mock = MagicMock(
         side_effect=lambda tensor, d2h_stream=None: {
-            "packed":
-            True,
-            "device":
-            getattr(tensor, "device", None).type
-            if hasattr(tensor, "device") else "unknown"
-        })
+            "packed": True,
+            "device": getattr(tensor, "device", None).type
+            if hasattr(tensor, "device")
+            else "unknown",
+        }
+    )
     ipc._pack_tensor_if_large = orig_mock
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
 
     class MockDeviceTensor:
-
         def __init__(self, device_type="tpu"):
             self.device = MagicMock()
             self.device.type = device_type

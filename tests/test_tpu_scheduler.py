@@ -20,8 +20,7 @@ def test_unthrottled_step_opens_drain_window():
     scheduler = _make_scheduler(waiting=[object()])
     expected = object()
 
-    with patch.object(AsyncScheduler, "schedule",
-                      return_value=expected) as schedule:
+    with patch.object(AsyncScheduler, "schedule", return_value=expected) as schedule:
         result = scheduler.schedule(throttle_prefills=False)
 
     assert result is expected
@@ -40,8 +39,7 @@ def test_throttled_step_pauses_new_requests():
         seen["pause_state"] = scheduler._pause_state
         return expected
 
-    with patch.object(AsyncScheduler, "schedule",
-                      side_effect=capture) as schedule:
+    with patch.object(AsyncScheduler, "schedule", side_effect=capture) as schedule:
         result = scheduler.schedule(throttle_prefills=True)
 
     assert result is expected

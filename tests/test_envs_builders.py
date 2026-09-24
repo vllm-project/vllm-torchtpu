@@ -21,11 +21,17 @@ these tests pin it rather than any individual knob.
 The house rule: a value that does not parse raises, because a misspelled flag
 is a launch-script bug and defaulting hides it.
 """
+
 import pytest
 
-from vllm_torchtpu.envs import (env_bool, env_float, env_int,
-                                env_nonnegative_int,
-                                env_nonnegative_int_or_auto, env_str)
+from vllm_torchtpu.envs import (
+    env_bool,
+    env_float,
+    env_int,
+    env_nonnegative_int,
+    env_nonnegative_int_or_auto,
+    env_str,
+)
 
 VAR = "TPU_TEST_ONLY_KNOB"
 
@@ -40,22 +46,28 @@ def _clear(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("builder,default", [
-    (env_bool, True),
-    (env_int, 7),
-    (env_nonnegative_int, 7),
-    (env_float, 1.5),
-])
+@pytest.mark.parametrize(
+    "builder,default",
+    [
+        (env_bool, True),
+        (env_int, 7),
+        (env_nonnegative_int, 7),
+        (env_float, 1.5),
+    ],
+)
 def test_unset_reads_as_the_default(builder, default):
     assert builder(VAR, default)() == default
 
 
-@pytest.mark.parametrize("builder,default", [
-    (env_bool, True),
-    (env_int, 7),
-    (env_nonnegative_int, 7),
-    (env_float, 1.5),
-])
+@pytest.mark.parametrize(
+    "builder,default",
+    [
+        (env_bool, True),
+        (env_int, 7),
+        (env_nonnegative_int, 7),
+        (env_float, 1.5),
+    ],
+)
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_reads_as_the_default(monkeypatch, builder, default, value):
     """`FOO=` is how a shell unsets a value in practice. The old inline int
@@ -70,14 +82,16 @@ def test_empty_reads_as_the_default(monkeypatch, builder, default, value):
 
 
 @pytest.mark.parametrize(
-    "value", ["1", "true", "True", "TRUE", "yes", "YES", "on", " on "])
+    "value", ["1", "true", "True", "TRUE", "yes", "YES", "on", " on "]
+)
 def test_bool_true_spellings(monkeypatch, value):
     monkeypatch.setenv(VAR, value)
     assert env_bool(VAR, default=False)() is True
 
 
 @pytest.mark.parametrize(
-    "value", ["0", "false", "False", "FALSE", "no", "NO", "off", " off "])
+    "value", ["0", "false", "False", "FALSE", "no", "NO", "off", " off "]
+)
 def test_bool_false_spellings(monkeypatch, value):
     monkeypatch.setenv(VAR, value)
     assert env_bool(VAR, default=True)() is False
@@ -189,50 +203,53 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name,expected", [
-    ("TPU_KV_TRANSFER_PORT", "9100"),
-    ("TPU_SIDE_CHANNEL_PORT", "9600"),
-    ("TPU_NODE_ID", 0),
-    ("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
-    ("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
-    ("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
-    ("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", True),
-    ("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
-    ("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
-    ("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
-    ("TPU_KV_SHM_POOL_GB", 128.0),
-    ("TPU_KV_TRANSFER_NAMESPACE", ""),
-    ("TPU_IPC_SOCKET_DIR", "/tmp"),
-    ("TPU_KV_WARMUP_ENABLED", True),
-    ("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
-    ("TPU_KV_PIN_SHM", False),
-    ("TPU_USE_RAIDEN_CONNECTOR", False),
-    ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
-    ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
-    ("TPU_RAIDEN_INLINE_LOAD", False),
-    ("KDA_MANUAL_STATE_DMA", None),
-    ("KDA_MANUAL_H0_DMA", None),
-    ("KDA_MANUAL_HT_DMA", None),
-    ("KDA_OVERLAP_H0_DMA", True),
-    ("KDA_OVERLAP_HT_DMA", True),
-    ("KDA_PACK_HEAD_INV", True),
-    ("KDA_PACKED_METADATA", True),
-    ("KDA_FWD_MB", None),
-    ("SPEC_WARMUP", True),
-    ("RAIDEN_DISABLE_SINGLETON_WORKER", True),
-    ("RAIDEN_SHM_KEY", ""),
-    ("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
-    ("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
-    ("VLLM_TORCHTPU_IPC_KEY", ""),
-    ("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
-    ("VLLM_TPU_DEBUG_PCP_LAYOUT", False),
-    ("TPU_LOCAL_RANK_OFFSET", 0),
-    ("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
-    ("TORCH_TPU_BASE_PORT", 8070),
-    ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
-    ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
-    ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
-])
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("TPU_KV_TRANSFER_PORT", "9100"),
+        ("TPU_SIDE_CHANNEL_PORT", "9600"),
+        ("TPU_NODE_ID", 0),
+        ("TPU_KV_TRANSFER_CHANNEL_NUMBER", 0),
+        ("TPU_P2P_WAIT_PULL_TIMEOUT", 120),
+        ("TPU_RAIDEN_STAGE3_STATUS_PROBE_S", 1.0),
+        ("TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", True),
+        ("TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0),
+        ("TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0),
+        ("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
+        ("TPU_KV_SHM_POOL_GB", 128.0),
+        ("TPU_KV_TRANSFER_NAMESPACE", ""),
+        ("TPU_IPC_SOCKET_DIR", "/tmp"),
+        ("TPU_KV_WARMUP_ENABLED", True),
+        ("TPU_KV_LATENCY_LOG_INTERVAL", 30.0),
+        ("TPU_KV_PIN_SHM", False),
+        ("TPU_USE_RAIDEN_CONNECTOR", False),
+        ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
+        ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
+        ("TPU_RAIDEN_INLINE_LOAD", False),
+        ("KDA_MANUAL_STATE_DMA", None),
+        ("KDA_MANUAL_H0_DMA", None),
+        ("KDA_MANUAL_HT_DMA", None),
+        ("KDA_OVERLAP_H0_DMA", True),
+        ("KDA_OVERLAP_HT_DMA", True),
+        ("KDA_PACK_HEAD_INV", True),
+        ("KDA_PACKED_METADATA", True),
+        ("KDA_FWD_MB", None),
+        ("SPEC_WARMUP", True),
+        ("RAIDEN_DISABLE_SINGLETON_WORKER", True),
+        ("RAIDEN_SHM_KEY", ""),
+        ("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", 30.0),
+        ("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+        ("VLLM_TORCHTPU_IPC_KEY", ""),
+        ("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+        ("VLLM_TPU_DEBUG_PCP_LAYOUT", False),
+        ("TPU_LOCAL_RANK_OFFSET", 0),
+        ("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
+        ("TORCH_TPU_BASE_PORT", 8070),
+        ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
+        ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
+        ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
+    ],
+)
 def test_migrated_knob_defaults(monkeypatch, name, expected):
     from vllm_torchtpu import envs
 

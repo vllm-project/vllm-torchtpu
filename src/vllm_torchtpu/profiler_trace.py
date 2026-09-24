@@ -122,8 +122,7 @@ def resolve_canonical_dst_ts(
     return fallback_ts
 
 
-def clear_canonical_ts_marker(dst_root: str,
-                              session_key: str | None = None) -> None:
+def clear_canonical_ts_marker(dst_root: str, session_key: str | None = None) -> None:
     """Drop the marker once the run it describes is merged (rank 0 only)."""
     if session_key is None:
         session_key = profile_session_id()
@@ -170,8 +169,7 @@ def merge_rank_capture(
                 # Mind the two spellings of the same idea: the capture
                 # sandbox is `rank_<N>` (see `rank_capture_dir`), the merged
                 # filename is `rank<N>_`.
-                new_fname = (f"rank{worker_rank}_{fname}"
-                             if multi_worker else fname)
+                new_fname = f"rank{worker_rank}_{fname}" if multi_worker else fname
                 shutil.move(
                     os.path.join(src_ts_dir, fname),
                     os.path.join(dst_ts_dir, new_fname),
@@ -184,15 +182,14 @@ def merge_rank_capture(
         # when the caller left other artifacts (batch composition stats) in
         # it and is cleaned up when the trace was all it held.
         for cleanup in (
-                source_profile_path,
-                os.path.dirname(source_profile_path),
-                capture_dir,
+            source_profile_path,
+            os.path.dirname(source_profile_path),
+            capture_dir,
         ):
             try:
                 os.rmdir(cleanup)
             except OSError:
                 pass
-        logger.info("Successfully merged profile directories into: %s",
-                    dst_ts_dir)
+        logger.info("Successfully merged profile directories into: %s", dst_ts_dir)
     except Exception as e:
         logger.warning("Failed to merge profile directories: %s", e)
