@@ -82,8 +82,9 @@ def _rendezvous_port(base_port: int) -> int:
     return int(base_port) + 1
 
 
-def _rendezvous_host_ips(*, num_peers: int, peer_index: int, master_addr: str,
-                         port: int, key_prefix: str) -> tuple[list[str], str]:
+def _rendezvous_host_ips(
+    *, num_peers: int, peer_index: int, master_addr: str, port: int, key_prefix: str
+) -> tuple[list[str], str]:
     """Exchange every peer's IP (and a shared xprof session id) via TCPStore.
 
     Returns (host_ips ordered by peer_index, xprof_session_id).
@@ -139,21 +140,28 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     logger.info(
         "TPU mp multihost: rendezvousing node_rank=%d/%d "
-        "local_world_size=%d master_addr=%s rendezvous_port=%d", node_rank,
-        nnodes, local_world_size, master_addr, rendezvous_port)
+        "local_world_size=%d master_addr=%s rendezvous_port=%d",
+        node_rank,
+        nnodes,
+        local_world_size,
+        master_addr,
+        rendezvous_port,
+    )
 
     host_ips, xprof_session_id = _rendezvous_host_ips(
         num_peers=nnodes,
         peer_index=node_rank,
         master_addr=master_addr,
         port=rendezvous_port,
-        key_prefix="tpu_mp_nnodes")
+        key_prefix="tpu_mp_nnodes",
+    )
 
     # Same construction as ray_distributed_executor.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
-        f"{ip}:{base_port + local_rank}" for ip in host_ips
+        f"{ip}:{base_port + local_rank}"
+        for ip in host_ips
         for local_rank in range(local_world_size)
     ]
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
@@ -162,6 +170,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     # check_and_update_config to avoid a top-level circular import. Mirrors
     # the lookup ray_distributed_executor.py uses for the Ray backend.
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+
     topology = get_tpu_multihost_topology(total_chips)
     os.environ["TORCH_TPU_TOPOLOGY"] = topology
     os.environ["TPU_NUM_HOSTS"] = str(nnodes)
@@ -171,8 +180,12 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     logger.info(
         "TPU mp multihost: node_rank=%d host_ips=%s "
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s", node_rank,
-        host_ips, os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"], topology)
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
+        node_rank,
+        host_ips,
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
+        topology,
+    )
 
 
 def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
@@ -198,7 +211,8 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     if dp_size % dp_size_local != 0:
         raise ValueError(
             f"data_parallel_size ({dp_size}) must be a multiple of "
-            f"data_parallel_size_local ({dp_size_local}) for multi-host DP.")
+            f"data_parallel_size_local ({dp_size_local}) for multi-host DP."
+        )
 
     # Each host's `vllm serve` process picks its own random DP-init ports via
     # ParallelConfig.__post_init__ -> get_open_ports_list():
@@ -228,13 +242,20 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     logger.info(
         "TPU mp multihost DP: rendezvousing node_index=%d/%d "
         "data_parallel_size_local=%d master_addr=%s rendezvous_port=%d",
-        node_index, num_hosts, dp_size_local, master_addr, rendezvous_port)
+        node_index,
+        num_hosts,
+        dp_size_local,
+        master_addr,
+        rendezvous_port,
+    )
 
-    host_ips, xprof_session_id = _rendezvous_host_ips(num_peers=num_hosts,
-                                                      peer_index=node_index,
-                                                      master_addr=master_addr,
-                                                      port=rendezvous_port,
-                                                      key_prefix="tpu_mp_dp")
+    host_ips, xprof_session_id = _rendezvous_host_ips(
+        num_peers=num_hosts,
+        peer_index=node_index,
+        master_addr=master_addr,
+        port=rendezvous_port,
+        key_prefix="tpu_mp_dp",
+    )
 
     # One address per local chip on each host (world_size per DP replica x
     # data_parallel_size_local replicas here), ordered by (host, local
@@ -245,12 +266,14 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
-        f"{ip}:{base_port + local_slot}" for ip in host_ips
+        f"{ip}:{base_port + local_slot}"
+        for ip in host_ips
         for local_slot in range(local_chip_count)
     ]
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
 
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+
     topology = get_tpu_multihost_topology(total_chips)
     os.environ["TORCH_TPU_TOPOLOGY"] = topology
     os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
@@ -259,6 +282,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     logger.info(
         "TPU mp multihost DP: node_index=%d host_ips=%s "
         "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
-        node_index, host_ips, os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
-        topology)
+        node_index,
+        host_ips,
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
+        topology,
+    )
     return True

@@ -69,8 +69,9 @@ def _worker_command(result_dir: Path) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-            prepare_tpu_environment
+        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
+            prepare_tpu_environment,
+        )
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
 
@@ -96,8 +97,7 @@ def _prepare_worker_env() -> dict[str, str]:
             else:
                 os.environ[key] = value
 
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                   "false")
+    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     return env
@@ -124,9 +124,9 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
             output, _ = process.communicate()
         raise AssertionError(
             "PCP workers timed out and were terminated. Output tail:\n"
-            f"{output[-12000:]}") from exc
-    return subprocess.CompletedProcess(process.args, process.returncode,
-                                       output, "")
+            f"{output[-12000:]}"
+        ) from exc
+    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
 def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
@@ -143,19 +143,18 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
 def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
-        device_id for device_id in global_device_ids
-        if device_id not in devices_by_id
+        device_id for device_id in global_device_ids if device_id not in devices_by_id
     ]
     if missing:
-        raise RuntimeError(f"JAX does not expose worker TPU ids {missing}; "
-                           f"available={sorted(devices_by_id)}")
-    devices = np.asarray(
-        [devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name, ))
+        raise RuntimeError(
+            f"JAX does not expose worker TPU ids {missing}; "
+            f"available={sorted(devices_by_id)}"
+        )
+    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
+    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
 
 
 def _make_inputs(torch, sync, rank: int):
-
     def make_qkv(valid_tokens: int, value: float):
         q = torch.zeros(
             (LOCAL_PADDED_TOKENS, NUM_HEADS, HEAD_DIM),
@@ -172,8 +171,9 @@ def _make_inputs(torch, sync, rank: int):
             v[:valid_tokens].fill_(value)
         return q, k, v
 
-    prefill_valid_tokens = (PAGE_SIZE if rank == 0 else PREFILL_TOKENS -
-                            PAGE_SIZE if rank == 1 else 0)
+    prefill_valid_tokens = (
+        PAGE_SIZE if rank == 0 else PREFILL_TOKENS - PAGE_SIZE if rank == 1 else 0
+    )
     # The one-token decode is the first row in the batch-flat query stream, so
     # rank 0 owns its Q/K/V row. Its request-absolute position is 432, which is
     # in rank 1's cache interval [256, 512); the ring must therefore carry the
@@ -192,50 +192,56 @@ def _make_inputs(torch, sync, rank: int):
     )
     caches = tuple(
         torch.zeros(cache_shape, dtype=torch.bfloat16, device="tpu")
-        for _ in range(NUM_LAYERS))
-    block_tables = torch.arange(local_cache_blocks,
-                                dtype=torch.int32,
-                                device="tpu")
-    prefill_seq_lens = torch.tensor([PREFILL_TOKENS],
-                                    dtype=torch.int32,
-                                    device="tpu")
-    decode_seq_lens = torch.tensor([PREFILL_TOKENS + 1],
-                                   dtype=torch.int32,
-                                   device="tpu")
-    prefill_query_start_loc = torch.tensor([0, PREFILL_TOKENS],
-                                           dtype=torch.int32,
-                                           device="tpu")
-    decode_query_start_loc = torch.tensor([0, 1],
-                                          dtype=torch.int32,
-                                          device="tpu")
-    prefill_distribution = torch.tensor([0, 0, 1],
-                                        dtype=torch.int32,
-                                        device="tpu")
-    decode_distribution = torch.tensor([1, 1, 1],
-                                       dtype=torch.int32,
-                                       device="tpu")
-    sync.synchronize([
-        *caches,
+        for _ in range(NUM_LAYERS)
+    )
+    block_tables = torch.arange(local_cache_blocks, dtype=torch.int32, device="tpu")
+    prefill_seq_lens = torch.tensor([PREFILL_TOKENS], dtype=torch.int32, device="tpu")
+    decode_seq_lens = torch.tensor(
+        [PREFILL_TOKENS + 1], dtype=torch.int32, device="tpu"
+    )
+    prefill_query_start_loc = torch.tensor(
+        [0, PREFILL_TOKENS], dtype=torch.int32, device="tpu"
+    )
+    decode_query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device="tpu")
+    prefill_distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device="tpu")
+    decode_distribution = torch.tensor([1, 1, 1], dtype=torch.int32, device="tpu")
+    sync.synchronize(
+        [
+            *caches,
+            prefill_q,
+            prefill_k,
+            prefill_v,
+            decode_q,
+            decode_k,
+            decode_v,
+            block_tables,
+            prefill_seq_lens,
+            decode_seq_lens,
+            prefill_query_start_loc,
+            decode_query_start_loc,
+            prefill_distribution,
+            decode_distribution,
+        ],
+        wait=True,
+    )
+    prefill_args = (
         prefill_q,
         prefill_k,
         prefill_v,
+        prefill_seq_lens,
+        block_tables,
+        prefill_query_start_loc,
+        prefill_distribution,
+    )
+    decode_args = (
         decode_q,
         decode_k,
         decode_v,
-        block_tables,
-        prefill_seq_lens,
         decode_seq_lens,
-        prefill_query_start_loc,
+        block_tables,
         decode_query_start_loc,
-        prefill_distribution,
         decode_distribution,
-    ],
-                     wait=True)
-    prefill_args = (prefill_q, prefill_k, prefill_v, prefill_seq_lens,
-                    block_tables, prefill_query_start_loc,
-                    prefill_distribution)
-    decode_args = (decode_q, decode_k, decode_v, decode_seq_lens, block_tables,
-                   decode_query_start_loc, decode_distribution)
+    )
     return caches, prefill_args, decode_args
 
 
@@ -243,8 +249,10 @@ def _build_compiled_steps(torch, mesh):
     from torch_tpu._internal import compile as tpu_compile
 
     from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-        PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, make_pcp_streaming_rpa_kernel,
-        pcp_streaming_jax_op)
+        PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
+        make_pcp_streaming_rpa_kernel,
+        pcp_streaming_jax_op,
+    )
 
     entry = make_pcp_streaming_rpa_kernel(
         q_scale=None,
@@ -262,13 +270,14 @@ def _build_compiled_steps(torch, mesh):
     attention = pcp_streaming_jax_op(
         "pcp_barrier_regression::streaming_attention",
         entry,
-        donate_argnums=(0, ),
+        donate_argnums=(0,),
         mesh=mesh,
         input_partition_specs=PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
     )
 
-    def run_layers(caches, q, k, v, seq_lens, block_tables, query_start_loc,
-                   distribution):
+    def run_layers(
+        caches, q, k, v, seq_lens, block_tables, query_start_loc, distribution
+    ):
         output = q
         for layer_cache in caches:
             new_cache, output = attention(
@@ -284,15 +293,15 @@ def _build_compiled_steps(torch, mesh):
             layer_cache.copy_(new_cache)
         return output
 
-    def prefill(caches, q, k, v, seq_lens, block_tables, query_start_loc,
-                distribution):
-        return run_layers(caches, q, k, v, seq_lens, block_tables,
-                          query_start_loc, distribution)
+    def prefill(caches, q, k, v, seq_lens, block_tables, query_start_loc, distribution):
+        return run_layers(
+            caches, q, k, v, seq_lens, block_tables, query_start_loc, distribution
+        )
 
-    def decode(caches, q, k, v, seq_lens, block_tables, query_start_loc,
-               distribution):
-        return run_layers(caches, q, k, v, seq_lens, block_tables,
-                          query_start_loc, distribution)
+    def decode(caches, q, k, v, seq_lens, block_tables, query_start_loc, distribution):
+        return run_layers(
+            caches, q, k, v, seq_lens, block_tables, query_start_loc, distribution
+        )
 
     backend = tpu_compile.TpuBackend()
     return (
@@ -301,8 +310,7 @@ def _build_compiled_steps(torch, mesh):
     )
 
 
-def _validate_outputs(torch, caches, output,
-                      rank: int) -> dict[str, float | int]:
+def _validate_outputs(torch, caches, output, rank: int) -> dict[str, float | int]:
     expected_cache = torch.zeros_like(caches[0], device="cpu").float()
     if rank == 0:
         expected_cache[0, :PAGE_SIZE, :, 1, :].fill_(1.0)
@@ -321,11 +329,11 @@ def _validate_outputs(torch, caches, output,
     output_max_abs = 0.0
     if rank == DECODE_QUERY_OWNER_RANK:
         expected_output = (PREFILL_TOKENS + 9.0) / (PREFILL_TOKENS + 1)
-        output_max_abs = float(
-            (output_cpu[0] - expected_output).abs().max().item())
+        output_max_abs = float((output_cpu[0] - expected_output).abs().max().item())
     if cache_max_abs != 0.0 or output_max_abs > 0.01:
-        raise AssertionError(f"rank={rank} cache_max_abs={cache_max_abs} "
-                             f"output_max_abs={output_max_abs}")
+        raise AssertionError(
+            f"rank={rank} cache_max_abs={cache_max_abs} output_max_abs={output_max_abs}"
+        )
     return {
         "decode_query_owner": int(rank == DECODE_QUERY_OWNER_RANK),
         "decode_cache_owner": int(rank == DECODE_CACHE_OWNER_RANK),
@@ -349,18 +357,17 @@ def _run_worker(result_dir: Path) -> None:
     try:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
-        cpu_group = dist.new_group(ranks=list(range(WORLD_SIZE)),
-                                   backend="gloo")
+        cpu_group = dist.new_group(ranks=list(range(WORLD_SIZE)), backend="gloo")
 
         # Match vLLM startup: initialize TorchTPU before querying JAX topology.
-        torch.empty((1, ), device="tpu").cpu()
+        torch.empty((1,), device="tpu").cpu()
         import jax
 
-        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import \
-            PCP_AXIS_NAME
+        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
+            PCP_AXIS_NAME,
+        )
 
-        global_device_ids = _gather_global_device_ids(torch, dist,
-                                                      tpu_distributed)
+        global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
         mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
         caches, prefill_args, decode_args = _make_inputs(torch, sync, rank)
         prefill, decode = _build_compiled_steps(torch, mesh)
@@ -411,7 +418,8 @@ def test_consecutive_attention_layers_tolerate_rank_schedule_skew(tmp_path):
     errors = [result for result in results if "error" in result]
     assert completed.returncode == 0 and not errors, (
         f"PCP worker failure: returncode={completed.returncode}, "
-        f"results={errors}\nworker output tail:\n{combined_output[-12000:]}")
+        f"results={errors}\nworker output tail:\n{combined_output[-12000:]}"
+    )
     assert all(result["cache_max_abs"] == 0.0 for result in results)
     assert all(result["output_max_abs"] <= 0.01 for result in results)
 

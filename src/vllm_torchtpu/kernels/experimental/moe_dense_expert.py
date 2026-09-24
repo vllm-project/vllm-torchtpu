@@ -7,6 +7,7 @@ all tokens are evaluated in their original order, and weighted outputs are
 accumulated in FP32 VMEM. Neither intermediate activations nor per-expert
 outputs are written to HBM. The caller still owns top-k and EP collectives.
 """
+
 import functools
 
 import jax
@@ -32,19 +33,19 @@ def _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes):
     fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
     fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
     budget = vmem_capacity_bytes * 4 // 5
-    return max(
-        1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
+    return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
 
 
-def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
-                         rhs_quant_dtype, skip_padded_tokens):
+def can_use_dense_expert(
+    hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype, skip_padded_tokens
+):
     """Check arithmetic/layout support; the compiler owns resource limits.
 
     Zero routing coefficients already suppress padded tokens, so either
     skip_padded_tokens setting is supported. There is no prefill/decode
     inference here: the MoE entry applies its configurable token threshold.
     """
-    if activation != 'silu':
+    if activation != "silu":
         return False
     if rhs_quant_dtype not in (None, jnp.float8_e4m3fn):
         return False
@@ -60,11 +61,18 @@ def can_use_dense_expert(hidden, w1, w2, s1, s2, b1, b2, *, activation,
         return False
     if out != h or w1.shape != (e, h, 2 * i):
         return False
-    if (hidden.dtype != jnp.bfloat16 or w1.dtype != jnp.float8_e4m3fn
-            or w2.dtype != jnp.float8_e4m3fn):
+    if (
+        hidden.dtype != jnp.bfloat16
+        or w1.dtype != jnp.float8_e4m3fn
+        or w2.dtype != jnp.float8_e4m3fn
+    ):
         return False
-    if (s1.shape != (e, 1, 1, 2 * i) or s2.shape != (e, 1, 1, h)
-            or s1.dtype != jnp.float32 or s2.dtype != jnp.float32):
+    if (
+        s1.shape != (e, 1, 1, 2 * i)
+        or s2.shape != (e, 1, 1, h)
+        or s1.dtype != jnp.float32
+        or s2.dtype != jnp.float32
+    ):
         return False
     return True
 
@@ -74,65 +82,91 @@ def _quantize(x, q_ref, scale_ref):
     # Keep K blocks first so each scale read is a contiguous [tokens, 128]
     # plane; placing K between tokens and lanes causes expensive relayouts.
     for k in range(0, x.shape[1], 512):
-        block = x[:, k:k + 512]
+        block = x[:, k : k + 512]
         scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / 448.0
         inv = jnp.where(scale == 0, 0, 1 / scale)
-        q_ref[:, k:k + 512] = (block * inv).astype(jnp.float8_e4m3fn)
+        q_ref[:, k : k + 512] = (block * inv).astype(jnp.float8_e4m3fn)
         scale_ref[k // 512, :, :] = jnp.broadcast_to(scale, (x.shape[0], 128))
 
 
-def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
-            out_ref, w1_ref, w2_ref, s1_ref, s2_ref, xq_ref, xs_ref, a_ref,
-            aq_ref, asc_ref, owner_ref, active_ids_ref, sem_ref, *, m, h, i,
-            experts, num_buffers):
+def _kernel(
+    active_ref,
+    x_ref,
+    coeff_ref,
+    w1_hbm,
+    w2_hbm,
+    s1_hbm,
+    s2_hbm,
+    out_ref,
+    w1_ref,
+    w2_ref,
+    s1_ref,
+    s2_ref,
+    xq_ref,
+    xs_ref,
+    a_ref,
+    aq_ref,
+    asc_ref,
+    owner_ref,
+    active_ids_ref,
+    sem_ref,
+    *,
+    m,
+    h,
+    i,
+    experts,
+    num_buffers,
+):
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     _quantize(x_ref[...], xq_ref, xs_ref)
     expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
 
     def compute(e, w1_ref, w2_ref, s1_ref, s2_ref):
-        coeff = jnp.sum(jnp.where(expert_columns == e, coeff_ref[...], 0),
-                        axis=1,
-                        keepdims=True)
+        coeff = jnp.sum(
+            jnp.where(expert_columns == e, coeff_ref[...], 0), axis=1, keepdims=True
+        )
         # Gate/up projections in interleaved 128-column pairs, matching
         # the original fused GMM's arithmetic and BF16 rounding points.
         for n in range(0, i, 128):
             acc = jnp.zeros((m, 256), jnp.bfloat16)
             scale = jnp.concatenate(
-                (s1_ref[:, n:n + 128], s1_ref[:, i + n:i + n + 128]), axis=1)
+                (s1_ref[:, n : n + 128], s1_ref[:, i + n : i + n + 128]), axis=1
+            )
             for k in range(0, h, 512):
                 rhs = jnp.concatenate(
-                    (w1_ref[k:k + 512, n:n + 128], w1_ref[k:k + 512,
-                                                          i + n:i + n + 128]),
-                    axis=1)
-                part = jnp.matmul(xq_ref[:, k:k + 512],
-                                  rhs,
-                                  preferred_element_type=jnp.float32).astype(
-                                      jnp.bfloat16)
+                    (
+                        w1_ref[k : k + 512, n : n + 128],
+                        w1_ref[k : k + 512, i + n : i + n + 128],
+                    ),
+                    axis=1,
+                )
+                part = jnp.matmul(
+                    xq_ref[:, k : k + 512], rhs, preferred_element_type=jnp.float32
+                ).astype(jnp.bfloat16)
                 xs = xs_ref[k // 512, :, :]
                 part *= jnp.concatenate((xs, xs), axis=1)
                 part *= scale.astype(jnp.bfloat16)
                 acc += part
-            a_ref[:, n:n + 128] = jax.nn.silu(acc[:, :128]) * acc[:, 128:]
+            a_ref[:, n : n + 128] = jax.nn.silu(acc[:, :128]) * acc[:, 128:]
         _quantize(a_ref[...], aq_ref, asc_ref)
         for n in range(0, h, 256):
             acc = jnp.zeros((m, 256), jnp.bfloat16)
             for k in range(0, i, 512):
-                part = jnp.matmul(aq_ref[:, k:k + 512],
-                                  w2_ref[k:k + 512, n:n + 256],
-                                  preferred_element_type=jnp.float32).astype(
-                                      jnp.bfloat16)
+                part = jnp.matmul(
+                    aq_ref[:, k : k + 512],
+                    w2_ref[k : k + 512, n : n + 256],
+                    preferred_element_type=jnp.float32,
+                ).astype(jnp.bfloat16)
                 asc = asc_ref[k // 512, :, :]
                 part *= jnp.concatenate((asc, asc), axis=1)
-                part *= s2_ref[:, n:n + 256].astype(jnp.bfloat16)
+                part *= s2_ref[:, n : n + 256].astype(jnp.bfloat16)
                 acc += part
             # Mask before accumulation; zero routing must suppress even
             # non-finite unused expert outputs, rather than multiply NaN*0.
-            weighted = jnp.where(coeff != 0,
-                                 acc.astype(jnp.float32) * coeff, 0)
-            owner_ref[:, n:n + 256] += weighted
+            weighted = jnp.where(coeff != 0, acc.astype(jnp.float32) * coeff, 0)
+            owner_ref[:, n : n + 256] += weighted
 
     def compact(e, count):
-
         @pl.when(active_ref[e] != 0)
         def record():
             active_ids_ref[count] = e
@@ -144,14 +178,14 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
     def transfers(step):
         e, slot = active_ids_ref[step], step % num_buffers
         return [
-            pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot],
-                                  sem_ref.at[slot, 0]),
-            pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot],
-                                  sem_ref.at[slot, 1]),
-            pltpu.make_async_copy(s1_hbm.at[e, 0], s1_ref.at[slot],
-                                  sem_ref.at[slot, 2]),
-            pltpu.make_async_copy(s2_hbm.at[e, 0], s2_ref.at[slot],
-                                  sem_ref.at[slot, 3]),
+            pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], sem_ref.at[slot, 0]),
+            pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot], sem_ref.at[slot, 1]),
+            pltpu.make_async_copy(
+                s1_hbm.at[e, 0], s1_ref.at[slot], sem_ref.at[slot, 2]
+            ),
+            pltpu.make_async_copy(
+                s2_hbm.at[e, 0], s2_ref.at[slot], sem_ref.at[slot, 3]
+            ),
         ]
 
     @pl.when(count > 0)
@@ -178,8 +212,13 @@ def _kernel(active_ref, x_ref, coeff_ref, w1_hbm, w2_hbm, s1_hbm, s2_hbm,
                         copy.start()
 
             slot = step % num_buffers
-            compute(active_ids_ref[step], w1_ref.at[slot], w2_ref.at[slot],
-                    s1_ref.at[slot], s2_ref.at[slot])
+            compute(
+                active_ids_ref[step],
+                w1_ref.at[slot],
+                w2_ref.at[slot],
+                s1_ref.at[slot],
+                s2_ref.at[slot],
+            )
             return None
 
         # Prefetch up to num_buffers - 1 experts ahead. With one slot, each
@@ -210,25 +249,21 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
     weights = topk_weights.astype(jnp.float32)
     coeff = jnp.zeros((m, experts), jnp.float32)
     for route in range(local_ids.shape[1]):
-        selected = (local_ids[:, route:route + 1] == expert_ids)
-        coeff = coeff + selected.astype(jnp.float32) * weights[:,
-                                                               route:route + 1]
+        selected = local_ids[:, route : route + 1] == expert_ids
+        coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
     return pl.pallas_call(
-        functools.partial(_kernel,
-                          m=m,
-                          h=h,
-                          i=i,
-                          experts=experts,
-                          num_buffers=num_buffers),
+        functools.partial(
+            _kernel, m=m, h=h, i=i, experts=experts, num_buffers=num_buffers
+        ),
         out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
-                *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4
+                *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=[
@@ -242,11 +277,10 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
                 pltpu.VMEM((m, i), jnp.float8_e4m3fn),
                 pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
-                pltpu.SMEM((experts, ), jnp.int32),
+                pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),
-            ]),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_capacity_bytes),
-        name=(f'dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}'
-              f'-buffers_{num_buffers}'),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
+        name=(f"dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}-buffers_{num_buffers}"),
     )(active, hidden, coeff, w1, w2, s1, s2)

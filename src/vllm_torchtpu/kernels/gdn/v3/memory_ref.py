@@ -127,7 +127,6 @@ class MetadataRef:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BaseBufferedRef(pltpu.BufferedRef):
-
     cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
     # NOTE: Despite being ref, metadata_ref should be set to static. This is
     # because the memory will be allocated outside of kernel and metadata_ref
@@ -168,7 +167,6 @@ class BaseBufferedRef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
-
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -208,7 +206,6 @@ class InBufferedRef(BaseBufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
-
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -294,12 +291,10 @@ class StateBufferedRef(BaseBufferedRef):
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
-
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, self._unit(), 0)
 
@@ -324,8 +319,7 @@ class StateBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
@@ -416,7 +410,8 @@ class ExternalStateBufferedRef(StateBufferedRef):
     # Other V3 callers leave this unset and continue to write directly to the
     # aliased external source.
     compact_output_ref: Any | None = dataclasses.field(
-        default=None, metadata=dict(static=True))
+        default=None, metadata=dict(static=True)
+    )
 
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
@@ -433,12 +428,13 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         base = state_idx * self.stride + self.region.kb0
-        if self.cfg.state_plan.whole_block_dma or (self.region.row0 == 0
-                                                   and self.region.nrows
-                                                   == src_ref.shape[1]):
+        if self.cfg.state_plan.whole_block_dma or (
+            self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
+        ):
             return src_ref.at[pl.ds(base, nblocks)]
-        return src_ref.at[pl.ds(base, nblocks),
-                          pl.ds(self.region.row0, self.region.nrows)]
+        return src_ref.at[
+            pl.ds(base, nblocks), pl.ds(self.region.row0, self.region.nrows)
+        ]
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -451,8 +447,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             nblocks = jnp.where(should_read, self.region.nblocks, 0)
 
@@ -539,8 +534,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
@@ -586,24 +580,25 @@ def create_allocs(
     conv_state_output_ref: jax.Array | None = None,
     recurrent_state_output_ref: jax.Array | None = None,
 ) -> tuple[
-        InBufferedRef,
-        InBufferedRef,
-        InBufferedRef,
-        StateBufferedRef,
-        StateBufferedRef,
-        OutBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    StateBufferedRef,
+    StateBufferedRef,
+    OutBufferedRef,
 ]:
     compact_state_output = conv_state_output_ref is not None
     if compact_state_output != (recurrent_state_output_ref is not None):
         raise ValueError(
-            "Conv and recurrent compact state outputs must be set together.")
+            "Conv and recurrent compact state outputs must be set together."
+        )
     if compact_state_output and cfg.state_plan is None:
-        raise ValueError(
-            "Compact state outputs require an external state source plan.")
+        raise ValueError("Compact state outputs require an external state source plan.")
     if compact_state_output and cfg.window_size != 1:
         raise ValueError(
             "Compact external state outputs do not support checkpoint "
-            f"windows, got window_size={cfg.window_size}.")
+            f"windows, got window_size={cfg.window_size}."
+        )
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -618,13 +613,12 @@ def create_allocs(
         cfg.v_head_dim,
     )
 
-    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers,
-                                use_lookahead=False)
+    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
 
     block_spec_partial = functools.partial(
         pl.BlockSpec,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         pipeline_mode=pipeline_mode,
     )
 
@@ -654,8 +648,13 @@ def create_allocs(
     if cfg.state_plan is None:
         # One state checkpoint per window position per sequence (a single one
         # without speculative decoding, where window_size is 1).
-        conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size,
-                      1, cfg.dim_size)
+        conv_shape = (
+            cfg.seq_tile_size,
+            cfg.window_size,
+            cfg.prev_kernel_size,
+            1,
+            cfg.dim_size,
+        )
         recurrent_shape = (
             cfg.seq_tile_size,
             cfg.window_size,
@@ -672,10 +671,12 @@ def create_allocs(
         )
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),
-            dtype_or_type=conv_state_ref)
+            dtype_or_type=conv_state_ref,
+        )
         recurrent_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=recurrent_state_ref)
+            dtype_or_type=recurrent_state_ref,
+        )
     else:
         # Both state regions stream from the one external source ref
         # (passed as both state refs); the tiles keep the source's raw
@@ -685,18 +686,34 @@ def create_allocs(
         plan = cfg.state_plan
         if plan.whole_block_dma:
             # Whole-block DMA transfers complete pages, retaining all inner dims.
-            conv_shape = (cfg.seq_tile_size, cfg.window_size,
-                          plan.conv.nblocks, *conv_state_ref.shape[1:])
-            recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
-                               plan.recurrent.nblocks,
-                               *recurrent_state_ref.shape[1:])
+            conv_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.conv.nblocks,
+                *conv_state_ref.shape[1:],
+            )
+            recurrent_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.recurrent.nblocks,
+                *recurrent_state_ref.shape[1:],
+            )
         else:
             payload = conv_state_ref.shape[2:]
-            conv_shape = (cfg.seq_tile_size, cfg.window_size,
-                          plan.conv.nblocks, plan.conv.nrows, *payload)
-            recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
-                               plan.recurrent.nblocks, plan.recurrent.nrows,
-                               *payload)
+            conv_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.conv.nblocks,
+                plan.conv.nrows,
+                *payload,
+            )
+            recurrent_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.recurrent.nblocks,
+                plan.recurrent.nrows,
+                *payload,
+            )
         state_buffered_partial = functools.partial(
             ExternalStateBufferedRef.input_output,
             buffer_count=pipeline_mode.buffer_count,
@@ -709,11 +726,13 @@ def create_allocs(
             spec=block_spec_partial(block_shape=conv_shape),
             dtype_or_type=conv_state_ref,
             region=plan.conv,
-            compact_output_ref=conv_state_output_ref)
+            compact_output_ref=conv_state_output_ref,
+        )
         recurrent_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
             dtype_or_type=conv_state_ref,
             region=plan.recurrent,
-            compact_output_ref=recurrent_state_output_ref)
+            compact_output_ref=recurrent_state_output_ref,
+        )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

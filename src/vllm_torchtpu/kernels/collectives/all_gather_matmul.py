@@ -10,8 +10,7 @@ from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.collectives import (
-    all_gather_matmul_tuned_block_sizes, util)
+from vllm_torchtpu.kernels.collectives import all_gather_matmul_tuned_block_sizes, util
 
 P = jax.sharding.PartitionSpec
 
@@ -54,21 +53,21 @@ def _all_gather_kernel(
 ):
     """Pallas kernel for all-gather.
 
-  Args:
-    x_hbm_ref: LHS of the matmul before all-gather.
-    y_hbm_ref: RHS of the matmul.
-    o_hbm_ref: Output of the matmul.
-    x_hbm_scratch_ref: Scratch memory for LHS of the matmul.
-    x_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
-    y_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
-    o_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
-    send_sem: DMA semaphore for the remote send.
-    capacity_sem: Capacity semaphore for the remote send.
-    recv_sems: DMA semaphore for the remote receive.
-    x_vmem_scratch_ref: Scratch memory for LHS of the matmul.
-    y_vmem_scratch_ref: Scratch memory for RHS of the matmul.
-    o_vmem_scratch_ref: Scratch memory for output of the matmul.
-  """
+    Args:
+      x_hbm_ref: LHS of the matmul before all-gather.
+      y_hbm_ref: RHS of the matmul.
+      o_hbm_ref: Output of the matmul.
+      x_hbm_scratch_ref: Scratch memory for LHS of the matmul.
+      x_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
+      y_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
+      o_local_copy_sem: DMA semaphore for a local HBM-VMEM copy.
+      send_sem: DMA semaphore for the remote send.
+      capacity_sem: Capacity semaphore for the remote send.
+      recv_sems: DMA semaphore for the remote receive.
+      x_vmem_scratch_ref: Scratch memory for LHS of the matmul.
+      y_vmem_scratch_ref: Scratch memory for RHS of the matmul.
+      o_vmem_scratch_ref: Scratch memory for output of the matmul.
+    """
     num_devices = pl.num_programs(0) - 2
     grid_n = pl.num_programs(1)
     grid_k = pl.num_programs(2)
@@ -204,11 +203,12 @@ def _all_gather_kernel(
         )
         left_remote_copy_op = pltpu.make_async_remote_copy(
             src_ref=x_hbm_ref.at[0:m_per_device_per_direction],
-            dst_ref=x_hbm_scratch_ref.at[x_hbm_receiving_slot,
-                                         0:m_per_device_per_direction],
+            dst_ref=x_hbm_scratch_ref.at[
+                x_hbm_receiving_slot, 0:m_per_device_per_direction
+            ],
             send_sem=send_sems.at[0, outer_step],
             recv_sem=recv_sems.at[0, outer_step],
-            device_id=(left_neighbor, ),
+            device_id=(left_neighbor,),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         _start_or_wait_copy(left_remote_copy_op, wait)
@@ -224,10 +224,11 @@ def _all_gather_kernel(
         right_remote_copy_op = pltpu.make_async_remote_copy(
             src_ref=x_hbm_ref.at[m_per_device_per_direction:m_per_device],
             dst_ref=x_hbm_scratch_ref.at[
-                x_hbm_receiving_slot, m_per_device_per_direction:m_per_device],
+                x_hbm_receiving_slot, m_per_device_per_direction:m_per_device
+            ],
             send_sem=send_sems.at[1, outer_step],
             recv_sem=recv_sems.at[1, outer_step],
-            device_id=(right_neighbor, ),
+            device_id=(right_neighbor,),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         _start_or_wait_copy(right_remote_copy_op, wait)
@@ -241,13 +242,15 @@ def _all_gather_kernel(
             x_hbm_working_slot,
         )
         left_remote_copy_op = pltpu.make_async_remote_copy(
-            src_ref=x_hbm_scratch_ref.at[x_hbm_working_slot,
-                                         0:m_per_device_per_direction],
-            dst_ref=x_hbm_scratch_ref.at[x_hbm_receiving_slot,
-                                         0:m_per_device_per_direction],
+            src_ref=x_hbm_scratch_ref.at[
+                x_hbm_working_slot, 0:m_per_device_per_direction
+            ],
+            dst_ref=x_hbm_scratch_ref.at[
+                x_hbm_receiving_slot, 0:m_per_device_per_direction
+            ],
             send_sem=send_sems.at[0, outer_step],
             recv_sem=recv_sems.at[0, outer_step],
-            device_id=(left_neighbor, ),
+            device_id=(left_neighbor,),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         _start_or_wait_copy(left_remote_copy_op, wait)
@@ -262,12 +265,14 @@ def _all_gather_kernel(
         )
         right_remote_copy_op = pltpu.make_async_remote_copy(
             src_ref=x_hbm_scratch_ref.at[
-                x_hbm_working_slot, m_per_device_per_direction:m_per_device],
+                x_hbm_working_slot, m_per_device_per_direction:m_per_device
+            ],
             dst_ref=x_hbm_scratch_ref.at[
-                x_hbm_receiving_slot, m_per_device_per_direction:m_per_device],
+                x_hbm_receiving_slot, m_per_device_per_direction:m_per_device
+            ],
             send_sem=send_sems.at[1, outer_step],
             recv_sem=recv_sems.at[1, outer_step],
-            device_id=(right_neighbor, ),
+            device_id=(right_neighbor,),
             device_id_type=pltpu.DeviceIdType.MESH,
         )
         _start_or_wait_copy(right_remote_copy_op, wait)
@@ -294,7 +299,7 @@ def _all_gather_kernel(
                 o_vmem_scratch_ref.at[o_receiving_slot][...] = lax.dot_general(
                     lhs,
                     rhs,
-                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    dimension_numbers=(((1,), (1,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 ).astype(x_vmem_scratch_ref.dtype)
             else:
@@ -306,19 +311,17 @@ def _all_gather_kernel(
         else:
             # TODO(chengjiyao): optimize the vstore
             if rhs_transpose:
-                lhs = x_vmem_scratch_ref.at[x_vmem_working_slot, :,
-                                            k_slice][...]
+                lhs = x_vmem_scratch_ref.at[x_vmem_working_slot, :, k_slice][...]
                 rhs = y_vmem_scratch_ref.at[n_slice, k_slice][...]
                 acc_vmem_scratch_ref[...] += lax.dot_general(
                     lhs,
                     rhs,
-                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    dimension_numbers=(((1,), (1,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
             else:
                 acc_vmem_scratch_ref[...] += jnp.dot(
-                    x_vmem_scratch_ref.at[x_vmem_working_slot, :,
-                                          k_slice][...],
+                    x_vmem_scratch_ref.at[x_vmem_working_slot, :, k_slice][...],
                     y_vmem_scratch_ref.at[k_slice, n_slice][...],
                     preferred_element_type=jnp.float32,
                 )
@@ -329,9 +332,9 @@ def _all_gather_kernel(
                     "[AGMM debug] update, o_receiving_slot={}",
                     o_receiving_slot,
                 )
-                o_vmem_scratch_ref.at[o_receiving_slot][
-                    ...] = acc_vmem_scratch_ref[...].astype(
-                        x_vmem_scratch_ref.dtype)
+                o_vmem_scratch_ref.at[o_receiving_slot][...] = acc_vmem_scratch_ref[
+                    ...
+                ].astype(x_vmem_scratch_ref.dtype)
                 # TODO(chengjiyao): based on the kyuyeunk' suggestion:
                 # this logic can be more optimized. right now it does this.
                 # line 316 performs dot
@@ -347,8 +350,7 @@ def _all_gather_kernel(
                 # from previous step. If not, skip this process.
                 # if working_bk_i == gk - 1, store the result from step 2 into
                 # o_vmem_scratch_ref, if not, store it into acc_vmem_scratch_ref
-                acc_vmem_scratch_ref[...] = jnp.zeros_like(
-                    acc_vmem_scratch_ref)
+                acc_vmem_scratch_ref[...] = jnp.zeros_like(acc_vmem_scratch_ref)
 
     def _do_o_local_copy(wait: bool = False):
         working_global_step_id = global_step_id - grid_k - 1
@@ -369,8 +371,7 @@ def _all_gather_kernel(
             working_bn_i,
         )
         o_left_local_copy_op = pltpu.make_async_copy(
-            src_ref=o_vmem_scratch_ref.at[
-                o_working_slot, :m_per_device_per_direction],
+            src_ref=o_vmem_scratch_ref.at[o_working_slot, :m_per_device_per_direction],
             dst_ref=o_hbm_ref.at[
                 pl.ds(
                     m_per_device_per_direction * left_o_idx,
@@ -381,8 +382,7 @@ def _all_gather_kernel(
             sem=o_local_copy_sem,
         )
         o_right_local_copy_op = pltpu.make_async_copy(
-            src_ref=o_vmem_scratch_ref.at[o_working_slot,
-                                          m_per_device_per_direction:],
+            src_ref=o_vmem_scratch_ref.at[o_working_slot, m_per_device_per_direction:],
             dst_ref=o_hbm_ref.at[
                 pl.ds(
                     m_per_device_per_direction * right_o_idx,
@@ -433,7 +433,8 @@ def _all_gather_kernel(
         _do_first_x_local_copy(wait=False)
 
     cond_subsequent_x_local_copy = jnp.logical_and(
-        jnp.logical_and(outer_step > 0, outer_step < num_devices), bn_i == 0)
+        jnp.logical_and(outer_step > 0, outer_step < num_devices), bn_i == 0
+    )
 
     @pl.when(cond_subsequent_x_local_copy)
     @jax.named_scope("_start_subsequent_x_local_copy")
@@ -448,8 +449,9 @@ def _all_gather_kernel(
 
     def _get_start_o_local_copy_cond():
         if grid_k == 1:
-            return jnp.logical_and(global_step_id >= 2, global_step_id
-                                   < mxu_total_steps + 2)
+            return jnp.logical_and(
+                global_step_id >= 2, global_step_id < mxu_total_steps + 2
+            )
         else:
             return jnp.logical_and(
                 jnp.logical_and(
@@ -464,17 +466,16 @@ def _all_gather_kernel(
     def _start_o_local_copy():
         _do_o_local_copy(wait=False)
 
-    @pl.when(
-        jnp.logical_and(global_step_id >= 1, global_step_id
-                        < 1 + mxu_total_steps))
+    @pl.when(jnp.logical_and(global_step_id >= 1, global_step_id < 1 + mxu_total_steps))
     @jax.named_scope("_mxu")
     def _mxu():
         _do_mxu()
 
     def _get_wait_o_local_copy_cond():
         if grid_k == 1:
-            return jnp.logical_and(global_step_id >= 2, global_step_id
-                                   < mxu_total_steps + 2)
+            return jnp.logical_and(
+                global_step_id >= 2, global_step_id < mxu_total_steps + 2
+            )
         else:
             return jnp.logical_and(
                 jnp.logical_and(
@@ -542,11 +543,9 @@ def get_vmem_estimate_bytes(
     n_per_device = n // tp_size
     y_vmem_bytes = n_per_device * k * dtypes.itemsize_bits(y_dtype) // 8
     total_bytes = (
-        2 * m_per_device * k * dtypes.itemsize_bits(x_dtype) //
-        8  # x_vmem_scratch_ref
+        2 * m_per_device * k * dtypes.itemsize_bits(x_dtype) // 8  # x_vmem_scratch_ref
         + y_vmem_bytes  # y_vmem_scratch_ref
-        +
-        2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8  # o_vmem_scratch_ref
+        + 2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8  # o_vmem_scratch_ref
         + acc_bytes  # acc_vmem_scratch_ref, jnp.float32
     )
     return total_bytes
@@ -555,11 +554,9 @@ def get_vmem_estimate_bytes(
 def validate_inputs(x, y, tp_size, rhs_transpose=False):
     """Validates the inputs to the all_gather_matmul kernel."""
     if x.ndim != 2 or y.ndim != 2:
-        raise ValueError(
-            f"Inputs must be 2D, got shapes {x.shape} and {y.shape}.")
+        raise ValueError(f"Inputs must be 2D, got shapes {x.shape} and {y.shape}.")
     if x.dtype != y.dtype:
-        raise ValueError(
-            f"Input dtypes must match, got {x.dtype} and {y.dtype}.")
+        raise ValueError(f"Input dtypes must match, got {x.dtype} and {y.dtype}.")
     m, k = x.shape
     if rhs_transpose:
         n, k_from_y = y.shape
@@ -568,7 +565,8 @@ def validate_inputs(x, y, tp_size, rhs_transpose=False):
     if k != k_from_y:
         raise ValueError(
             "Incompatible shapes for matmul: contracting dimension mismatch:"
-            f" {x.shape} and {y.shape}.")
+            f" {x.shape} and {y.shape}."
+        )
 
     if k % 128 != 0:
         raise ValueError(f"k ({k}) must be divisible by 128.")
@@ -587,7 +585,8 @@ def validate_inputs(x, y, tp_size, rhs_transpose=False):
     if n % tp_size != 0:
         raise ValueError(
             f"y.shape[{0 if rhs_transpose else 1}] ({n}) must be divisible by"
-            f" tp_size ({tp_size}) on axis '{tp_size}'.")
+            f" tp_size ({tp_size}) on axis '{tp_size}'."
+        )
 
 
 def all_gather_matmul(
@@ -602,19 +601,19 @@ def all_gather_matmul(
 ):
     """Performs all-gather on the input tensor and then a matmul.
 
-  Args:
-    x: LHS of the matmul before all-gather.
-    y: RHS of the matmul.
-    mesh: JAX mesh.
-    axis_name: Name of the axis to all-gather over.
-    collective_id: An integer used for barrier semaphore allocation.
-    bn: Number of blocks in the n dimension.
-    bk: Number of blocks in the k dimension.
-    rhs_transpose: If True, y is transposed.
+    Args:
+      x: LHS of the matmul before all-gather.
+      y: RHS of the matmul.
+      mesh: JAX mesh.
+      axis_name: Name of the axis to all-gather over.
+      collective_id: An integer used for barrier semaphore allocation.
+      bn: Number of blocks in the n dimension.
+      bk: Number of blocks in the k dimension.
+      rhs_transpose: If True, y is transposed.
 
-  Returns:
-    all-gather(x, axis=0) @ y
-  """
+    Returns:
+      all-gather(x, axis=0) @ y
+    """
     tp_size = mesh.shape[axis_name]
     validate_inputs(x, y, tp_size, rhs_transpose)
     m, k = x.shape
@@ -626,10 +625,9 @@ def all_gather_matmul(
         y_in_spec = P(None, axis_name)
     m_per_device = m // tp_size
     n_per_device = n // tp_size
-    tuned_bn, tuned_bk = (
-        all_gather_matmul_tuned_block_sizes.get_tuned_block_sizes(
-            m, n, k,
-            jnp.dtype(x.dtype).name, tp_size))
+    tuned_bn, tuned_bk = all_gather_matmul_tuned_block_sizes.get_tuned_block_sizes(
+        m, n, k, jnp.dtype(x.dtype).name, tp_size
+    )
     if bn is None:
         bn = tuned_bn if tuned_bn is not None else n
     if bk is None:
@@ -640,8 +638,7 @@ def all_gather_matmul(
     # NOTE(chengjiyao): acc buffer is not used in the grid_k == 1 case.
     if grid_k == 1:
         acc_shape = (8, 128)
-    acc_bytes = acc_shape[0] * acc_shape[1] * dtypes.itemsize_bits(
-        jnp.float32) // 8
+    acc_bytes = acc_shape[0] * acc_shape[1] * dtypes.itemsize_bits(jnp.float32) // 8
     y_vmem_shape = (n_per_device, k) if rhs_transpose else (k, n_per_device)
     estimated_vmem_bytes = get_vmem_estimate_bytes(
         m,
@@ -656,8 +653,7 @@ def all_gather_matmul(
     )
     out_shape = [
         jax.ShapeDtypeStruct((m, n_per_device), x.dtype),  # output
-        jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k),
-                             x.dtype),  # x HBM scratch
+        jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k), x.dtype),  # x HBM scratch
     ]
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=0,
@@ -673,12 +669,13 @@ def all_gather_matmul(
             pltpu.SemaphoreType.DMA,  # x_local_copy_sem
             pltpu.SemaphoreType.DMA,  # y_local_copy_sem
             pltpu.SemaphoreType.DMA,  # o_local_copy_sem
+            pltpu.SemaphoreType.DMA((2, tp_size - 1)),  # left and right send semaphores
             pltpu.SemaphoreType.DMA(
-                (2, tp_size - 1)),  # left and right send semaphores
-            pltpu.SemaphoreType.DMA((
-                2,
-                tp_size - 1,
-            )),  # left and right recv semaphores
+                (
+                    2,
+                    tp_size - 1,
+                )
+            ),  # left and right recv semaphores
             pltpu.VMEM((2, m_per_device, k), x.dtype),  # x vmem scratch
             pltpu.VMEM(y_vmem_shape, y.dtype),  # y vmem scratch
             pltpu.VMEM((2, m_per_device, bn), x.dtype),  # output vmem scratch
@@ -687,11 +684,10 @@ def all_gather_matmul(
         grid=(tp_size + 2, grid_n, grid_k),
     )
     flops = 2 * m * k * n_per_device
-    bytes_accessed = x.dtype.itemsize * (m * k + k * n_per_device +
-                                         m * n_per_device)
-    cost_estimate = pl.CostEstimate(flops=flops,
-                                    bytes_accessed=bytes_accessed,
-                                    transcendentals=0)
+    bytes_accessed = x.dtype.itemsize * (m * k + k * n_per_device + m * n_per_device)
+    cost_estimate = pl.CostEstimate(
+        flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
+    )
 
     @functools.partial(jax.jit, static_argnames=["bn", "bk", "rhs_transpose"])
     def _all_gather_matmul_call(x, y, bn, bk, rhs_transpose):
@@ -725,12 +721,11 @@ def all_gather_matmul(
             in_specs=(P(axis_name, None), y_in_spec),
             out_specs=P(None, axis_name),
             check_vma=False,
-        ), )
+        ),
+    )
 
     return shard_map_kernel(x, y)
 
 
 def get_kernel_name(bn: int, bk: int, rhs_transpose: bool):
-    return (
-        f"all_gather_matmul_kernel_bn_{bn}_bk_{bk}_rhs_transpose_{rhs_transpose}"
-    )
+    return f"all_gather_matmul_kernel_bn_{bn}_bk_{bk}_rhs_transpose_{rhs_transpose}"

@@ -59,7 +59,6 @@ def test_vision_flash_attention_pads_and_builds_segments(monkeypatch):
 
 
 def test_vision_attention_falls_back_for_cross_attention(monkeypatch):
-
     def fail_vision_op(*args, **kwargs):
         raise AssertionError("flash path should not handle q_len != kv_len")
 
@@ -72,10 +71,8 @@ def test_vision_attention_falls_back_for_cross_attention(monkeypatch):
 
     called = {}
 
-    def fake_native(query, key, value, cu_seqlens, max_seqlen,
-                    sequence_lengths):
-        called["args"] = (query, key, value, cu_seqlens, max_seqlen,
-                          sequence_lengths)
+    def fake_native(query, key, value, cu_seqlens, max_seqlen, sequence_lengths):
+        called["args"] = (query, key, value, cu_seqlens, max_seqlen, sequence_lengths)
         return torch.full_like(query, 7.0)
 
     monkeypatch.setattr(attn, "forward_native", fake_native)

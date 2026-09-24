@@ -43,38 +43,38 @@ def derive_metadata(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Derives token_to_req_indices, slot_mapping_slots, and kv_slot_mapping.
 
-  The page geometry is taken from ``config.Configs`` keyed on
-  ``cache.shape[1]`` (compressed KV) and ``state_cache.shape[1]`` (state),
-  which is the same derivation ``compress_norm_rope_store`` and
-  ``proj_and_save_state`` use. It must not be recomputed from a separate model
-  here: the three only agree for CSA, and diverge by 2x (HCA) and 4x (indexer)
-  otherwise, which silently scatters state and compressed-KV writes across the
-  wrong pages.
+    The page geometry is taken from ``config.Configs`` keyed on
+    ``cache.shape[1]`` (compressed KV) and ``state_cache.shape[1]`` (state),
+    which is the same derivation ``compress_norm_rope_store`` and
+    ``proj_and_save_state`` use. It must not be recomputed from a separate model
+    here: the three only agree for CSA, and diverge by 2x (HCA) and 4x (indexer)
+    otherwise, which silently scatters state and compressed-KV writes across the
+    wrong pages.
 
-  Args:
-    positions: [num_tokens]. Logical position of each token in its request.
-    block_table: [num_reqs * max_blocks]. Flattened row-major page table for the
-      state cache.
-    query_start_loc: [num_reqs + 1]. Cumulative sum of query lengths.
-    kv_block_table: [num_reqs * max_kv_blocks]. Flattened row-major page table
-      for the compressed KV cache.
-    cache: [num_pages, physical_page_size, 4, lanes] uint8. The compressed-KV
-      buffer; only its shape is read here.
-    compress_ratio: Compression ratio (e.g. 4 for CSA, 128 for HCA).
-    state_block_size: Block size vLLM used to build ``block_table``. One page
-      must be able to hold that many token states; it may hold more with the
-      tail rows unused.
-    head_dim: Dimensionality of attention heads.
-    overlap: Whether to use overlap (CSA path).
-    cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
-    state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
-      state shares ``cache``'s buffer. Only its shape is read here.
-  Returns:
-    token_to_req_indices: [num_tokens]. Request index for each token.
-    slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
-    kv_slot_mapping: [num_tokens]. Sub-slot index in the compressed KV cache
-      (``// tokens_in_second_minor`` gives the physical row).
-  """
+    Args:
+      positions: [num_tokens]. Logical position of each token in its request.
+      block_table: [num_reqs * max_blocks]. Flattened row-major page table for the
+        state cache.
+      query_start_loc: [num_reqs + 1]. Cumulative sum of query lengths.
+      kv_block_table: [num_reqs * max_kv_blocks]. Flattened row-major page table
+        for the compressed KV cache.
+      cache: [num_pages, physical_page_size, 4, lanes] uint8. The compressed-KV
+        buffer; only its shape is read here.
+      compress_ratio: Compression ratio (e.g. 4 for CSA, 128 for HCA).
+      state_block_size: Block size vLLM used to build ``block_table``. One page
+        must be able to hold that many token states; it may hold more with the
+        tail rows unused.
+      head_dim: Dimensionality of attention heads.
+      overlap: Whether to use overlap (CSA path).
+      cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
+      state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
+        state shares ``cache``'s buffer. Only its shape is read here.
+    Returns:
+      token_to_req_indices: [num_tokens]. Request index for each token.
+      slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
+      kv_slot_mapping: [num_tokens]. Sub-slot index in the compressed KV cache
+        (``// tokens_in_second_minor`` gives the physical row).
+    """
     num_tokens = positions.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
     state_source = cache if state_cache is None else state_cache
@@ -103,14 +103,15 @@ def derive_metadata(
     assert state_block_size <= cfgs.state_page_capacity, (
         f"state cache block_size {state_block_size} overruns the "
         f"{cfgs.dims.mode.value} state cache geometry {state_source.shape}, "
-        f"which holds {cfgs.state_page_capacity} token states per page ")
+        f"which holds {cfgs.state_page_capacity} token states per page "
+    )
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
     query_lens = jnp.diff(query_start_loc)
     batch_size = query_start_loc.shape[0] - 1
-    token_to_req_indices = jnp.repeat(jnp.arange(batch_size),
-                                      query_lens,
-                                      total_repeat_length=num_tokens)
+    token_to_req_indices = jnp.repeat(
+        jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
+    )
     req = token_to_req_indices
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
@@ -120,8 +121,9 @@ def derive_metadata(
     state_page_idx = positions // state_block_size
     state_page_offset = positions % state_block_size
     state_page_numbers = block_table[req * block_table_stride + state_page_idx]
-    slot_mapping_slots = (state_page_numbers * page_size +
-                          state_page_offset * state_rows_per_token)
+    slot_mapping_slots = (
+        state_page_numbers * page_size + state_page_offset * state_rows_per_token
+    )
 
     # 4. Compressed KV Cache Slot Mapping (Virtual -> Physical)
     kv_idx = positions // compress_ratio
@@ -130,8 +132,7 @@ def derive_metadata(
 
     kv_page_number = kv_block_table[req * kv_block_table_stride + kv_page_idx]
 
-    kv_slot_mapping = (kv_page_number * kv_page_stride +
-                       kv_page_offset * kv_stride)
+    kv_slot_mapping = kv_page_number * kv_page_stride + kv_page_offset * kv_stride
 
     is_boundary = ((positions + 1) % compress_ratio) == 0
     kv_slot_mapping = jnp.where(is_boundary, kv_slot_mapping, -1)
@@ -162,9 +163,9 @@ def prepare_boundary_batch(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Generates a combined batch of boundary tokens in a single scatter.
 
-  Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
-  prefill_row_tiled (K_aligned..) | pad ]
-  """
+    Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
+    prefill_row_tiled (K_aligned..) | pad ]
+    """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
     packed_size = num_tokens + max_prefill_boundary
@@ -207,8 +208,11 @@ def prepare_boundary_batch(
 
     # 6. Scatter to output once
     def scatter(default_val, src):
-        return jnp.full((output_size, ), default_val,
-                        dtype=src.dtype).at[dest].set(src, mode="drop")
+        return (
+            jnp.full((output_size,), default_val, dtype=src.dtype)
+            .at[dest]
+            .set(src, mode="drop")
+        )
 
     return (
         scatter(0, pos),
@@ -236,11 +240,9 @@ def compressor_forward(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
-    state_cache: jax.Array
-    | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+    state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Projects, saves state, then compresses and stores the boundary records.
-    """
+    """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
     shares_buffer = state_cache is None

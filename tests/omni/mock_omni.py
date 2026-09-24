@@ -120,6 +120,7 @@ sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
 sys.modules[
     "vllm_omni.platforms.interface"] = vllm_omni_mock.platforms.interface
 sys.modules["vllm_omni.diffusion"] = vllm_omni_mock.diffusion
+sys.modules["vllm_omni.diffusion.ipc"] = vllm_omni_mock.diffusion.ipc
 sys.modules[
     "vllm_omni.diffusion.diffusion_engine"] = vllm_omni_mock.diffusion.diffusion_engine
 sys.modules[

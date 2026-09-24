@@ -15,7 +15,8 @@ class ProjectionScaleLayout(Enum):
 
 
 def projection_scale_layout(
-        weight_shape, scale_shape) -> tuple[ProjectionScaleLayout, int, int]:
+    weight_shape, scale_shape
+) -> tuple[ProjectionScaleLayout, int, int]:
     """Validate N-major weights and return (layout, N blocks, K blocks).
 
     Accept tensor scales, channel vectors, N/K block grids, and the existing
@@ -26,7 +27,7 @@ def projection_scale_layout(
     shape = tuple(scale_shape)
     if math.prod(shape) == 1:
         return ProjectionScaleLayout.TENSOR, 1, 1
-    if shape == (n, ):
+    if shape == (n,):
         return ProjectionScaleLayout.CHANNEL, n, 1
     if len(shape) == 2:
         nb, kb = shape
@@ -35,15 +36,20 @@ def projection_scale_layout(
         nb, kb = n, shape[1]
         layout = ProjectionScaleLayout.LINEAR_RUNTIME
     else:
-        raise ValueError("FP8 QKVZ scale must be scalar, per-channel [N], "
-                         "block grid [N_blocks, K_blocks], or "
-                         "Linear runtime [1, K_blocks, 1, N].")
+        raise ValueError(
+            "FP8 QKVZ scale must be scalar, per-channel [N], "
+            "block grid [N_blocks, K_blocks], or "
+            "Linear runtime [1, K_blocks, 1, N]."
+        )
     if nb <= 0 or kb <= 0 or n % nb or k % kb:
-        raise ValueError("FP8 QKVZ scale block counts must divide N and K "
-                         f"exactly: weight={weight_shape}, scale={shape}.")
+        raise ValueError(
+            "FP8 QKVZ scale block counts must divide N and K "
+            f"exactly: weight={weight_shape}, scale={shape}."
+        )
     if kb > 1 and (k // kb) % 128:
-        raise ValueError("FP8 QKVZ K block size must be a multiple of 128 "
-                         "for VMEM slicing.")
+        raise ValueError(
+            "FP8 QKVZ K block size must be a multiple of 128 for VMEM slicing."
+        )
     return layout, nb, kb
 
 
@@ -57,7 +63,7 @@ def normalize_projection_scale(weight_shape, scale):
     layout, nb, kb = projection_scale_layout(weight_shape, scale.shape)
     n, _ = weight_shape
     if layout is ProjectionScaleLayout.TENSOR:
-        return jnp.broadcast_to(scale.reshape(()), (n, ))
+        return jnp.broadcast_to(scale.reshape(()), (n,))
     if layout is ProjectionScaleLayout.CHANNEL:
         return scale
     if layout is ProjectionScaleLayout.BLOCK_GRID:

@@ -8,10 +8,8 @@ live here rather than inside either transport module.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import \
-    KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 ReqId = str
 
@@ -37,7 +35,7 @@ class LoadMeta:
     remote_block_ids: list[int]
     remote_host: str | list[str]
     remote_port: int | list[int]
-    remote_side_channel_port: Optional[int] = None
+    remote_side_channel_port: int | None = None
     # Whether the worker reports this load's completion to the scheduler as
     # finished_recving. False when this connector doesn't own the request's
     # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
@@ -45,6 +43,8 @@ class LoadMeta:
     # report would trip the scheduler's assert or prematurely resume the
     # request.
     report_completion: bool = True
+    # The scheduler rejected this load after allocation.
+    fail_only: bool = False
 
 
 @dataclass

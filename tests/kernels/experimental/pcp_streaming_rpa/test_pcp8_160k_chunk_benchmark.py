@@ -106,8 +106,7 @@ def _selected_kv_layout_name() -> str:
 
 def _require_benchmark() -> None:
     if os.getenv("TPU_RUN_PCP8_160K_BENCHMARK") != "1":
-        pytest.skip(
-            "set TPU_RUN_PCP8_160K_BENCHMARK=1 to run the PCP8 benchmark")
+        pytest.skip("set TPU_RUN_PCP8_160K_BENCHMARK=1 to run the PCP8 benchmark")
 
 
 def _worker_command(result_dir: Path) -> list[str]:
@@ -127,8 +126,9 @@ def _worker_command(result_dir: Path) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import \
-            prepare_tpu_environment
+        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
+            prepare_tpu_environment,
+        )
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
 
@@ -160,13 +160,13 @@ def _prepare_worker_env() -> dict[str, str]:
     env.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("TPU_PARALLEL_PRECOMPILE", "1")
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                   "false")
+    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "disabled")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     if env.get("TPU_PCP8_160K_PROFILE_DIR"):
         env["TPU_PCP8_PROFILE_SESSION_KEY"] = (
-            f"pcp8_160k_{os.getpid()}_{time.time_ns()}")
+            f"pcp8_160k_{os.getpid()}_{time.time_ns()}"
+        )
     return env
 
 
@@ -189,10 +189,10 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
-        raise AssertionError("PCP8 benchmark workers timed out. Output tail:\n"
-                             f"{output[-12000:]}") from exc
-    return subprocess.CompletedProcess(process.args, process.returncode,
-                                       output, "")
+        raise AssertionError(
+            f"PCP8 benchmark workers timed out. Output tail:\n{output[-12000:]}"
+        ) from exc
+    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
 def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
@@ -209,15 +209,15 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
 def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
-        device_id for device_id in global_device_ids
-        if device_id not in devices_by_id
+        device_id for device_id in global_device_ids if device_id not in devices_by_id
     ]
     if missing:
-        raise RuntimeError(f"JAX does not expose worker TPU ids {missing}; "
-                           f"available={sorted(devices_by_id)}")
-    devices = np.asarray(
-        [devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name, ))
+        raise RuntimeError(
+            f"JAX does not expose worker TPU ids {missing}; "
+            f"available={sorted(devices_by_id)}"
+        )
+    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
+    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
 
 
 def _make_inputs(torch):
@@ -249,33 +249,35 @@ def _make_inputs(torch):
             KV_PACKING,
             HEAD_DIM,
         )
-    kv_cache = torch.zeros(kv_cache_shape,
-                           dtype=torch.float8_e4m3fn,
-                           device="tpu")
+    kv_cache = torch.zeros(kv_cache_shape, dtype=torch.float8_e4m3fn, device="tpu")
 
     # Production pads request metadata to max_num_seqs=64 even though only the
     # first request is live in this benchmark.
-    seq_lens = torch.zeros((MAX_NUM_SEQS, ), dtype=torch.int32, device="tpu")
+    seq_lens = torch.zeros((MAX_NUM_SEQS,), dtype=torch.int32, device="tpu")
     seq_lens[0] = TOTAL_KV_TOKENS
-    query_start_loc = torch.full((MAX_NUM_SEQS + 1, ),
-                                 CHUNK_TOKENS,
-                                 dtype=torch.int32,
-                                 device="tpu")
+    query_start_loc = torch.full(
+        (MAX_NUM_SEQS + 1,), CHUNK_TOKENS, dtype=torch.int32, device="tpu"
+    )
     query_start_loc[0] = 0
-    request_distribution = torch.tensor([0, 0, 1],
-                                        dtype=torch.int32,
-                                        device="tpu")
+    request_distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device="tpu")
 
     block_tables = torch.zeros(
         (MAX_NUM_SEQS, MAX_LOCAL_PAGES_PER_SEQ),
         dtype=torch.int32,
         device="tpu",
     )
-    block_tables[0] = torch.arange(MAX_LOCAL_PAGES_PER_SEQ,
-                                   dtype=torch.int32,
-                                   device="tpu")
-    return kv_cache, (query, key, value, seq_lens, block_tables,
-                      query_start_loc, request_distribution)
+    block_tables[0] = torch.arange(
+        MAX_LOCAL_PAGES_PER_SEQ, dtype=torch.int32, device="tpu"
+    )
+    return kv_cache, (
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
 
 
 def _expected_local_output(torch, rank: int):
@@ -294,8 +296,9 @@ def _expected_local_output(torch, rank: int):
     return (offsets_t + 1.0) / (HISTORY_TOKENS + offsets_t + 1.0)
 
 
-def _profile_attention(torch, dist, cpu_group, sync, attention, kv_cache, args,
-                       rank: int):
+def _profile_attention(
+    torch, dist, cpu_group, sync, attention, kv_cache, args, rank: int
+):
     configured = os.getenv("TPU_PCP8_160K_PROFILE_DIR", "").strip()
     if not configured:
         return kv_cache, None, []
@@ -309,11 +312,13 @@ def _profile_attention(torch, dist, cpu_group, sync, attention, kv_cache, args,
     capture_dir = profiler_trace.rank_capture_dir(profile_dir, rank)
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
     canonical_ts = profiler_trace.resolve_canonical_dst_ts(
-        profile_dir, rank, session_key=session_key)
+        profile_dir, rank, session_key=session_key
+    )
     Path(capture_dir).mkdir(parents=True, exist_ok=True)
 
-    handler = torch.profiler.tensorboard_trace_handler(dir_name=capture_dir,
-                                                       use_gzip=True)
+    handler = torch.profiler.tensorboard_trace_handler(
+        dir_name=capture_dir, use_gzip=True
+    )
     config = TpuProfilerConfig(
         run_dir=capture_dir,
         host_tracer_level=2,
@@ -344,8 +349,7 @@ def _profile_attention(torch, dist, cpu_group, sync, attention, kv_cache, args,
         dist.barrier(group=cpu_group)
         for step in range(PROFILE_STEPS):
             start = time.perf_counter()
-            with torch.profiler.record_function(
-                    f"pcp8_160k_attention_step_{step}"):
+            with torch.profiler.record_function(f"pcp8_160k_attention_step_{step}"):
                 kv_cache, output = attention(kv_cache, *args)
                 sync.synchronize([kv_cache, output], wait=True)
             profile_samples_ms.append((time.perf_counter() - start) * 1e3)
@@ -383,23 +387,23 @@ def _run_worker(result_dir: Path) -> None:
     try:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
-        cpu_group = dist.new_group(ranks=list(range(WORLD_SIZE)),
-                                   backend="gloo")
+        cpu_group = dist.new_group(ranks=list(range(WORLD_SIZE)), backend="gloo")
 
         # Match vLLM startup: initialize TorchTPU before querying JAX topology.
-        torch.empty((1, ), device="tpu").cpu()
+        torch.empty((1,), device="tpu").cpu()
         import jax
 
-        from vllm_torchtpu.kernels.experimental.batched_rpa.configs import \
-            KVLayout
+        from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
             PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
-            make_pcp_streaming_rpa_kernel, pcp_streaming_jax_op)
-        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import \
-            PCP_AXIS_NAME
+            make_pcp_streaming_rpa_kernel,
+            pcp_streaming_jax_op,
+        )
+        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
+            PCP_AXIS_NAME,
+        )
 
-        global_device_ids = _gather_global_device_ids(torch, dist,
-                                                      tpu_distributed)
+        global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
         mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
         kv_cache, args = _make_inputs(torch)
         kv_layout = KVLayout[_selected_kv_layout_name()]
@@ -420,10 +424,9 @@ def _run_worker(result_dir: Path) -> None:
             kv_layout=kv_layout,
         )
         attention = pcp_streaming_jax_op(
-            "pcp8_160k_benchmark::qwen35_397b_h128k_q32k_"
-            f"{kv_layout.name.lower()}",
+            f"pcp8_160k_benchmark::qwen35_397b_h128k_q32k_{kv_layout.name.lower()}",
             entry,
-            donate_argnums=(0, ),
+            donate_argnums=(0,),
             mesh=mesh,
             input_partition_specs=PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
         )
@@ -434,7 +437,8 @@ def _run_worker(result_dir: Path) -> None:
             sync.synchronize([kv_cache, output], wait=True)
 
         kv_cache, profiled_output, profile_samples_ms = _profile_attention(
-            torch, dist, cpu_group, sync, attention, kv_cache, args, rank)
+            torch, dist, cpu_group, sync, attention, kv_cache, args, rank
+        )
         if profiled_output is not None:
             output = profiled_output
 
@@ -451,8 +455,7 @@ def _run_worker(result_dir: Path) -> None:
         expected = _expected_local_output(torch, rank)
         output_max_abs = float((actual - expected).abs().max().item())
         if output_max_abs > 0.01:
-            raise AssertionError(
-                f"rank={rank} output_max_abs={output_max_abs}")
+            raise AssertionError(f"rank={rank} output_max_abs={output_max_abs}")
 
         result = {
             "rank": rank,
@@ -482,8 +485,11 @@ def _run_worker(result_dir: Path) -> None:
 def _resolve_result_dir(tmp_path: Path) -> Path:
     configured = os.getenv("TPU_PCP8_160K_RESULT_DIR", "").strip()
     layout = _selected_kv_layout_name().lower()
-    result_dir = Path(configured).resolve() if configured else (
-        tmp_path / f"pcp8_qwen35_397b_h128k_q32k_{layout}")
+    result_dir = (
+        Path(configured).resolve()
+        if configured
+        else (tmp_path / f"pcp8_qwen35_397b_h128k_q32k_{layout}")
+    )
     result_dir.mkdir(parents=True, exist_ok=True)
     return result_dir
 
@@ -496,17 +502,14 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
     import jax
 
     prefixes = {
-        "current":
-        "%pcp_streaming_attention_current_state_page_groups_multi_head.",
-        "history":
-        "%pcp_streaming_attention_history_output_page_groups_multi_head.",
+        "current": "%pcp_streaming_attention_current_state_page_groups_multi_head.",
+        "history": "%pcp_streaming_attention_history_output_page_groups_multi_head.",
     }
     core_step_samples = []
     for xplane_path in sorted(Path(configured).rglob("*.xplane.pb")):
         profile = jax.profiler.ProfileData.from_file(str(xplane_path))
         for plane in profile.planes:
-            if (not plane.name.startswith("/device:TPU:")
-                    or "SparseCore" in plane.name):
+            if not plane.name.startswith("/device:TPU:") or "SparseCore" in plane.name:
                 continue
             events = {key: [] for key in prefixes}
             for line in plane.lines:
@@ -523,60 +526,58 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
             assert len(events["current"]) == PROFILE_STEPS
             assert len(events["history"]) == PROFILE_STEPS
             for step, (current, history) in enumerate(
-                    zip(events["current"], events["history"])):
+                zip(events["current"], events["history"])
+            ):
                 current_ms = current.duration_ns / 1e6
                 history_ms = history.duration_ns / 1e6
-                core_step_samples.append({
-                    "xplane":
-                    xplane_path.name,
-                    "device_plane":
-                    plane.name,
-                    "step":
-                    step,
-                    "current_state_ms":
-                    current_ms,
-                    "history_output_ms":
-                    history_ms,
-                    "kernel_sum_ms":
-                    current_ms + history_ms,
-                })
+                core_step_samples.append(
+                    {
+                        "xplane": xplane_path.name,
+                        "device_plane": plane.name,
+                        "step": step,
+                        "current_state_ms": current_ms,
+                        "history_output_ms": history_ms,
+                        "kernel_sum_ms": current_ms + history_ms,
+                    }
+                )
 
     expected_samples = WORLD_SIZE * PROFILE_STEPS
     assert len(core_step_samples) == expected_samples, (
         f"expected {expected_samples} profiled core-steps, found "
-        f"{len(core_step_samples)}")
+        f"{len(core_step_samples)}"
+    )
     current_samples = [
         float(sample["current_state_ms"]) for sample in core_step_samples
     ]
     history_samples = [
         float(sample["history_output_ms"]) for sample in core_step_samples
     ]
-    sum_samples = [
-        float(sample["kernel_sum_ms"]) for sample in core_step_samples
-    ]
+    sum_samples = [float(sample["kernel_sum_ms"]) for sample in core_step_samples]
     critical_step_samples = [
         max(
-            float(sample["kernel_sum_ms"]) for sample in core_step_samples
-            if sample["step"] == step) for step in range(PROFILE_STEPS)
+            float(sample["kernel_sum_ms"])
+            for sample in core_step_samples
+            if sample["step"] == step
+        )
+        for step in range(PROFILE_STEPS)
     ]
     return {
-        "profiled_kernel_current_state_core_step_median_ms":
-        statistics.median(current_samples),
-        "profiled_kernel_history_output_core_step_median_ms":
-        statistics.median(history_samples),
-        "profiled_kernel_sum_core_step_median_ms":
-        statistics.median(sum_samples),
-        "profiled_kernel_critical_step_samples_ms":
-        critical_step_samples,
-        "profiled_kernel_critical_step_median_ms":
-        statistics.median(critical_step_samples),
-        "profiled_kernel_core_step_samples":
-        core_step_samples,
+        "profiled_kernel_current_state_core_step_median_ms": statistics.median(
+            current_samples
+        ),
+        "profiled_kernel_history_output_core_step_median_ms": statistics.median(
+            history_samples
+        ),
+        "profiled_kernel_sum_core_step_median_ms": statistics.median(sum_samples),
+        "profiled_kernel_critical_step_samples_ms": critical_step_samples,
+        "profiled_kernel_critical_step_median_ms": statistics.median(
+            critical_step_samples
+        ),
+        "profiled_kernel_core_step_samples": core_step_samples,
     }
 
 
-def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(
-        tmp_path, capsys):
+def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(tmp_path, capsys):
     _require_benchmark()
     result_dir = _resolve_result_dir(tmp_path)
     completed = _run_worker_group(result_dir)
@@ -591,7 +592,8 @@ def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(
     errors = [result for result in results if "error" in result]
     assert completed.returncode == 0 and not errors, (
         f"PCP8 benchmark failure: returncode={completed.returncode}, "
-        f"results={errors}\nworker output tail:\n{completed.stdout[-12000:]}")
+        f"results={errors}\nworker output tail:\n{completed.stdout[-12000:]}"
+    )
 
     # A distributed step completes when its slowest rank completes. Aggregate
     # sample-by-sample rank maxima instead of averaging independently timed
@@ -604,92 +606,66 @@ def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(
     ordered = sorted(step_samples_ms)
     p90_ms = ordered[math.ceil(0.9 * len(ordered)) - 1]
     summary = {
-        "model":
-        "Qwen3.5-397B-A17B-FP8",
-        "layout":
-        _selected_kv_layout_name(),
-        "world_size":
-        WORLD_SIZE,
-        "data_parallel_size":
-        1,
-        "prefill_context_parallel_size":
-        WORLD_SIZE,
-        "tensor_parallel_size":
-        1,
-        "num_q_heads":
-        NUM_Q_HEADS,
-        "num_kv_heads":
-        NUM_KV_HEADS,
-        "head_dim":
-        HEAD_DIM,
-        "kv_cache_dtype":
-        "float8_e4m3fn",
-        "max_model_len":
-        MAX_MODEL_LEN,
-        "max_num_batched_tokens":
-        MAX_NUM_BATCHED_TOKENS,
-        "max_num_seqs":
-        MAX_NUM_SEQS,
-        "manager_block_size":
-        MANAGER_BLOCK_SIZE,
-        "kernel_page_size":
-        KERNEL_PAGE_SIZE,
-        "pcp_interleave_size":
-        PCP_INTERLEAVE_SIZE,
-        "q_block_size":
-        Q_BLOCK_SIZE,
-        "q_compute_size":
-        Q_COMPUTE_SIZE,
-        "history_tokens_global":
-        HISTORY_TOKENS,
-        "chunk_tokens_global":
-        CHUNK_TOKENS,
-        "history_tokens_per_rank":
-        LOCAL_HISTORY_TOKENS,
-        "query_tokens_per_rank":
-        LOCAL_QUERY_TOKENS,
-        "active_local_pages":
-        ACTIVE_LOCAL_PAGES,
-        "allocated_local_pages":
-        MAX_LOCAL_PAGES_PER_SEQ,
-        "warmup_steps":
-        WARMUP_STEPS,
-        "benchmark_steps":
-        BENCHMARK_STEPS,
-        "profile_steps":
-        PROFILE_STEPS,
-        "profile_dir":
-        os.getenv("TPU_PCP8_160K_PROFILE_DIR") or None,
+        "model": "Qwen3.5-397B-A17B-FP8",
+        "layout": _selected_kv_layout_name(),
+        "world_size": WORLD_SIZE,
+        "data_parallel_size": 1,
+        "prefill_context_parallel_size": WORLD_SIZE,
+        "tensor_parallel_size": 1,
+        "num_q_heads": NUM_Q_HEADS,
+        "num_kv_heads": NUM_KV_HEADS,
+        "head_dim": HEAD_DIM,
+        "kv_cache_dtype": "float8_e4m3fn",
+        "max_model_len": MAX_MODEL_LEN,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": MAX_NUM_SEQS,
+        "manager_block_size": MANAGER_BLOCK_SIZE,
+        "kernel_page_size": KERNEL_PAGE_SIZE,
+        "pcp_interleave_size": PCP_INTERLEAVE_SIZE,
+        "q_block_size": Q_BLOCK_SIZE,
+        "q_compute_size": Q_COMPUTE_SIZE,
+        "history_tokens_global": HISTORY_TOKENS,
+        "chunk_tokens_global": CHUNK_TOKENS,
+        "history_tokens_per_rank": LOCAL_HISTORY_TOKENS,
+        "query_tokens_per_rank": LOCAL_QUERY_TOKENS,
+        "active_local_pages": ACTIVE_LOCAL_PAGES,
+        "allocated_local_pages": MAX_LOCAL_PAGES_PER_SEQ,
+        "warmup_steps": WARMUP_STEPS,
+        "benchmark_steps": BENCHMARK_STEPS,
+        "profile_steps": PROFILE_STEPS,
+        "profile_dir": os.getenv("TPU_PCP8_160K_PROFILE_DIR") or None,
         "profile_step_samples_ms_by_rank": {
-            str(result["rank"]): result["profile_samples_ms"]
-            for result in results
+            str(result["rank"]): result["profile_samples_ms"] for result in results
         },
-        "step_samples_ms":
-        step_samples_ms,
+        "step_samples_ms": step_samples_ms,
         # These wall-time fields include host dispatch and scheduling. The
         # profiled device-kernel fields below are the primary performance
         # metric when profiling is enabled.
-        "median_attention_call_wall_ms":
-        median_ms,
-        "min_attention_call_wall_ms":
-        min(step_samples_ms),
-        "p90_attention_call_wall_ms":
-        p90_ms,
-        "max_output_abs_error":
-        max(float(result["output_max_abs"]) for result in results),
+        "median_attention_call_wall_ms": median_ms,
+        "min_attention_call_wall_ms": min(step_samples_ms),
+        "p90_attention_call_wall_ms": p90_ms,
+        "max_output_abs_error": max(
+            float(result["output_max_abs"]) for result in results
+        ),
     }
     summary.update(_extract_profiled_kernel_summary())
-    (result_dir / "summary.json").write_text(json.dumps(summary, indent=2),
-                                             encoding="utf-8")
+    (result_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
     with capsys.disabled():
         kernel_ms = summary.get("profiled_kernel_critical_step_median_ms")
-        kernel_text = (f", device_kernel={float(kernel_ms):.3f} ms/layer"
-                       if kernel_ms is not None else "")
-        print(f"\nPCP8 Qwen3.5-397B {summary['layout']} RPA benchmark: "
-              f"history=128K, chunk=32K, local_q=4K{kernel_text}, "
-              f"call_wall_median={median_ms:.3f} ms, "
-              f"call_wall_p90={p90_ms:.3f} ms, "
-              f"samples={step_samples_ms}, result_dir={result_dir}")
+        kernel_text = (
+            f", device_kernel={float(kernel_ms):.3f} ms/layer"
+            if kernel_ms is not None
+            else ""
+        )
+        print(
+            f"\nPCP8 Qwen3.5-397B {summary['layout']} RPA benchmark: "
+            f"history=128K, chunk=32K, local_q=4K{kernel_text}, "
+            f"call_wall_median={median_ms:.3f} ms, "
+            f"call_wall_p90={p90_ms:.3f} ms, "
+            f"samples={step_samples_ms}, result_dir={result_dir}"
+        )
 
 
 def _parse_args() -> argparse.Namespace:

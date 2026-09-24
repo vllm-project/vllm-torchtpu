@@ -76,9 +76,17 @@ class _KernelDispatch:
     directly.
     """
 
-    _COPY_ATTRS = ("__name__", "__qualname__", "__module__", "__doc__",
-                   "__globals__", "__annotations__", "__signature__",
-                   "__defaults__", "__kwdefaults__")
+    _COPY_ATTRS = (
+        "__name__",
+        "__qualname__",
+        "__module__",
+        "__doc__",
+        "__globals__",
+        "__annotations__",
+        "__signature__",
+        "__defaults__",
+        "__kwdefaults__",
+    )
 
     def __init__(self, name: str, template: Callable) -> None:
         self._name = name
@@ -131,8 +139,7 @@ def reload_kernels(modules: Sequence[str] | None = None) -> dict:
         if mod is not None:
             importlib.reload(mod)
         else:
-            logger.warning("Reload module %s is not imported; skipping.",
-                           mod_name)
+            logger.warning("Reload module %s is not imported; skipping.", mod_name)
     reimport_s = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -143,8 +150,12 @@ def reload_kernels(modules: Sequence[str] | None = None) -> dict:
     rebuild_s = time.perf_counter() - t0
 
     logger.info(
-        "Kernel hot-reload: re-imported %d modules (%.3fs), rebuilt "
-        "ops %s (%.3fs).", len(module_names), reimport_s, rebuilt, rebuild_s)
+        "Kernel hot-reload: re-imported %d modules (%.3fs), rebuilt ops %s (%.3fs).",
+        len(module_names),
+        reimport_s,
+        rebuilt,
+        rebuild_s,
+    )
     return {
         "reimport_s": round(reimport_s, 3),
         "rebuild_s": round(rebuild_s, 3),

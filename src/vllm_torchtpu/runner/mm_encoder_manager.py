@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -60,21 +60,21 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
-        self.budget_templates: Dict[str, Dict[int, Dict[
-            str, torch.Tensor]]] = {
-                path: {
-                    budget:
-                    self.model.prepare_encoder_cudagraph_capture_inputs(
-                        budget,
-                        self.max_batch_size,
-                        self.max_frames_per_batch,
-                        self.device,
-                        self.dtype,
-                        path=path).values
-                    for budget in budgets if budget > 0
-                }
-                for path, budgets in self.path_token_budgets.items()
+        self.budget_templates: dict[str, dict[int, dict[str, torch.Tensor]]] = {
+            path: {
+                budget: self.model.prepare_encoder_cudagraph_capture_inputs(
+                    budget,
+                    self.max_batch_size,
+                    self.max_frames_per_batch,
+                    self.device,
+                    self.dtype,
+                    path=path,
+                ).values
+                for budget in budgets
+                if budget > 0
             }
+            for path, budgets in self.path_token_budgets.items()
+        }
 
         # We compile the forward pass function using the TPU backend.
         # This acts as our XLA cache. We compile it once, and it will generate
@@ -83,21 +83,23 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.model.encoder_cudagraph_forward,
             backend="tpu",
             fullgraph=True,
-            dynamic=False)
+            dynamic=False,
+        )
 
         logger.info(
             f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
-            f"max_batch_size={self.max_batch_size}")
+            f"max_batch_size={self.max_batch_size}"
+        )
 
     def _pad_to_template(
         self,
-        replay_values: Dict[str, torch.Tensor],
+        replay_values: dict[str, torch.Tensor],
         budget: int,
         path: str = "default",
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Zero-pads dynamic multimodal inputs up to the static budget template."""
         template = self.budget_templates[path][budget]
-        padded: Dict[str, torch.Tensor] = {}
+        padded: dict[str, torch.Tensor] = {}
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
@@ -117,16 +119,15 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 continue
 
             padding_logic = self.config.padding_logics.get(
-                key, self._copy_padded_buffer)
+                key, self._copy_padded_buffer
+            )
             padding_logic(tmpl, src)
             padded[key] = tmpl
 
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self,
-                              token_budget: int,
-                              path: str = "default") -> None:
+    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
@@ -138,28 +139,32 @@ class MMEncoderManager(EncoderCudaGraphManager):
         except Exception as e:
             logger.warning(
                 "[mm_encoder_manager] Failed to precompile vision encoder "
-                "for budget=%d, path='%s': %s", token_budget, path, e)
+                "for budget=%d, path='%s': %s",
+                token_budget,
+                path,
+                e,
+            )
 
     @torch.no_grad()
     def _run_budget_graph(
         self,
-        mm_kwargs: Dict[str, Any],
+        mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
         num_items = len(self._get_item_specs(mm_kwargs))
-        if (path not in self.budget_templates
-                or token_budget not in self.budget_templates[path]):
+        if (
+            path not in self.budget_templates
+            or token_budget not in self.budget_templates[path]
+        ):
             self.graph_misses += num_items
             return None
 
         # Prepare dynamic inputs
         replay = self.model.prepare_encoder_cudagraph_replay_buffers(
-            mm_kwargs,
-            self.max_batch_size,
-            self.max_frames_per_batch,
-            path=path)
+            mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path=path
+        )
 
         # Pad dynamic inputs to strictly match the static budget shape
         padded = self._pad_to_template(replay.values, token_budget, path=path)
@@ -173,7 +178,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
             logger.warning(
                 "[mm_encoder_manager] Compiled vision encoder forward failed "
                 "for budget=%d, path='%s': %s. Falling back to "
-                "encoder_eager_forward.", token_budget, path, e)
+                "encoder_eager_forward.",
+                token_budget,
+                path,
+                e,
+            )
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)

@@ -20,7 +20,9 @@ import torch
 from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
-    VllmCompressorStateCache, VllmDeepseekCompressor)
+    VllmCompressorStateCache,
+    VllmDeepseekCompressor,
+)
 
 
 def _state_cache(compress_ratio: int, head_dim: int = 512):
@@ -58,8 +60,9 @@ def _state_cache(compress_ratio: int, head_dim: int = 512):
         (4, 128, 1024, 16),
     ],
 )
-def test_state_block_size_follows_the_host_page(compress_ratio, head_dim,
-                                                cache_block_size, expected):
+def test_state_block_size_follows_the_host_page(
+    compress_ratio, head_dim, cache_block_size, expected
+):
     """Block size must come from the kernel's own layout model.
 
     It is not a closed form -- HCA writes two rows per record, the indexer
@@ -89,7 +92,8 @@ def test_state_cache_spec_is_raw_uint8_at_the_host_page_size():
     cache = _state_cache(4)
     assert cache.block_size == 0, "fixture starts unset"
     spec = cache.get_kv_cache_spec(
-        SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)))
+        SimpleNamespace(cache_config=SimpleNamespace(block_size=1024))
+    )
 
     assert spec.dtype == torch.uint8
     assert spec.block_size == 16
@@ -109,15 +113,15 @@ def test_compressor_op_is_built_lazily_and_cached():
     That constant is the base class's CUDA value until `get_kv_cache_spec`
     replaces it, so an eagerly built op traces against the wrong page geometry.
     """
-    assert isinstance(
-        VllmDeepseekCompressor.__dict__["compressor_op"],
-        property), "compressor_op must stay a property, not an __init__ field"
+    assert isinstance(VllmDeepseekCompressor.__dict__["compressor_op"], property), (
+        "compressor_op must stay a property, not an __init__ field"
+    )
 
     compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
     sentinel = object()
-    with patch.object(VllmDeepseekCompressor,
-                      "_build_compressor_op",
-                      return_value=sentinel) as build:
+    with patch.object(
+        VllmDeepseekCompressor, "_build_compressor_op", return_value=sentinel
+    ) as build:
         assert compressor.compressor_op is sentinel
         assert compressor.compressor_op is sentinel
     build.assert_called_once()

@@ -59,6 +59,7 @@ class StateRegion:
     128-lane split); the leading ``rows_used`` typed rows carry the
     state, the rest is zero padding.
     """
+
     kb0: int
     nblocks: int
     row0: int
@@ -85,6 +86,7 @@ class StateSourcePlan:
     decoding every checkpoint is an independent source block named by
     ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
     so nothing here varies with the verify window."""
+
     stride: int
     conv: StateRegion
     recurrent: StateRegion
@@ -205,8 +207,7 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return (f"fused_conv1d_{self.attention_mode.value}"
-                f"_{self.mode.value}{suffix}")
+        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -233,13 +234,15 @@ class GDNConfig:
 
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
-        fraction = (self.WINDOWED_VMEM_FRACTION
-                    if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
+        fraction = (
+            self.WINDOWED_VMEM_FRACTION
+            if self.window_size > 1
+            else self.DEFAULT_VMEM_FRACTION
+        )
         return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
-        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,
-                      self.dim_size)
+        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
         recurrent_shape = (
             self.seq_tile_size,
             self.num_v_heads,

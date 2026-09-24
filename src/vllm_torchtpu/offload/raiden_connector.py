@@ -42,6 +42,7 @@ Core mechanisms:
   stores are cancelled before launching, while active transfers are drained
   synchronously before shipping metadata, preventing torn reads upon block reuse.
 """
+
 from __future__ import annotations
 
 import os
@@ -51,30 +52,44 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1, KVConnectorMetadata)
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
-    config as offloading_config_module
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+    config as offloading_config_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
-    OffloadingConnectorMetadata, OffloadingWorkerMetadata)
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import \
-    OffloadingConnectorScheduler
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
-    OffloadingConnectorWorker
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
-    OffloadingConnector
+    OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.base import (CanonicalKVCacheRef, CanonicalKVCaches,
-                                     CanonicalKVCacheTensor, GPULoadStoreSpec,
-                                     OffloadKey)
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+    OffloadKey,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.offload.raiden_store import (AdmissionOp,
-                                                RaidenLoadStoreSpec,
-                                                RaidenOffloadingManager,
-                                                TPURaidenStoreOffloadingSpec)
+from vllm_torchtpu.offload.raiden_store import (
+    AdmissionOp,
+    RaidenLoadStoreSpec,
+    RaidenOffloadingManager,
+    TPURaidenStoreOffloadingSpec,
+)
 
 logger = init_logger(__name__)
 
@@ -88,6 +103,7 @@ def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
     work when the writes are already enqueued.
     """
     from torch_tpu._internal import sync
+
     sync.synchronize(pool_tensors, wait=False)
 
 
@@ -123,6 +139,7 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     Transfers are controller-driven (load_jobs and store_jobs are empty);
     extra fields carry fence requests and completion echoes.
     """
+
     # Store jobs awaiting device fence from all ranks before launching save.
     fence_job_ids: set[int] = field(default_factory=set)
     # Completed store jobs to echo back to the scheduler state machine.
@@ -136,6 +153,7 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
 @dataclass
 class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
     """Worker -> scheduler metadata: contains completed-job echoes and per-rank fence acks."""
+
     fenced_jobs: dict[int, int] = field(default_factory=dict)
 
     def aggregate(self, other):
@@ -156,6 +174,7 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
+
     keys: list[OffloadKey]
     device_block_ids: list[int]
     acks: int = 0
@@ -168,15 +187,20 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     via RaidenOffloadingManager.
     """
 
-    def __init__(self, spec: TPURaidenStoreOffloadingSpec,
-                 vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
+    def __init__(
+        self,
+        spec: TPURaidenStoreOffloadingSpec,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
         super().__init__(spec, vllm_config, kv_cache_config)
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
 
     def build_connector_meta(
-            self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
 
@@ -189,10 +213,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             assert isinstance(src_spec, GPULoadStoreSpec)
             assert isinstance(dst_spec, RaidenLoadStoreSpec)
             device_block_ids = src_spec.block_ids.tolist()
-            assert len(device_block_ids) == len(
-                dst_spec.keys), (len(device_block_ids), len(dst_spec.keys))
+            assert len(device_block_ids) == len(dst_spec.keys), (
+                len(device_block_ids),
+                len(dst_spec.keys),
+            )
             self._fence_pending[job_id] = _ParkedStore(
-                keys=dst_spec.keys, device_block_ids=device_block_ids)
+                keys=dst_spec.keys, device_block_ids=device_block_ids
+            )
             new_fence_ids.add(job_id)
 
         # Submit load jobs immediately: destination HBM blocks are freshly
@@ -202,13 +229,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             assert isinstance(src_spec, RaidenLoadStoreSpec)
             assert isinstance(dst_spec, GPULoadStoreSpec)
             device_block_ids = dst_spec.block_ids.tolist()
-            assert len(device_block_ids) == len(
-                src_spec.keys), (len(device_block_ids), len(src_spec.keys))
-            manager.submit_load_job(job_id,
-                                    src_spec.keys,
-                                    device_block_ids,
-                                    job.req_id,
-                                    pinned=src_spec.pinned)
+            assert len(device_block_ids) == len(src_spec.keys), (
+                len(device_block_ids),
+                len(src_spec.keys),
+            )
+            manager.submit_load_job(
+                job_id,
+                src_spec.keys,
+                device_block_ids,
+                job.req_id,
+                pinned=src_spec.pinned,
+            )
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
@@ -227,11 +258,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 new_fence_ids.discard(job_id)
                 logger.debug(
                     "TPURaidenOffloadingConnector: cancelled fence-pending store job %d "
-                    "(source blocks reused)", job_id)
+                    "(source blocks reused)",
+                    job_id,
+                )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
-        drained = (manager.drain_jobs(launched_flush_ids)
-                   if launched_flush_ids else [])
+        drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
@@ -240,8 +272,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
-                failed_load_block_ids.extend(
-                    finished_job.failed_device_block_ids)
+                failed_load_block_ids.extend(finished_job.failed_device_block_ids)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -257,8 +288,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
-        if isinstance(meta, RaidenOffloadingWorkerMetadata) and \
-                meta.fenced_jobs:
+        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
                 if parked is None:
@@ -269,7 +299,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids)
+                        job_id, parked.keys, parked.device_block_ids
+                    )
         super().update_connector_output(connector_output)
 
 
@@ -277,8 +308,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
     @classmethod
-    def get_required_kvcache_layout(cls,
-                                    vllm_config: VllmConfig) -> str | None:
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
         """No layout preference, unlike the `OffloadingConnector` this extends.
 
         Upstream hardcodes "HND" for NIXL on CUDA. On TPU "HND" names
@@ -294,8 +324,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # bundled tensor allocation in the TPU model runner.
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
 
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
-                 kv_cache_config: KVCacheConfig):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig,
+    ):
         # Skip OffloadingConnector.__init__: default factory cannot carry
         # vllm_config / kv_cache_config directly into the spec.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
@@ -308,24 +342,29 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "TPURaidenOffloadingConnector requires the raiden singleton "
                 "worker to be disabled (it collides with the in-process "
                 "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER "
-                "was explicitly set to off. Unset it or set it to '1'.")
+                "was explicitly set to off. Unset it or set it to '1'."
+            )
         os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.
         offloading_config = offloading_config_module.build_offloading_config(
-            vllm_config, kv_cache_config)
-        spec = TPURaidenStoreOffloadingSpec(offloading_config, vllm_config,
-                                            kv_cache_config)
+            vllm_config, kv_cache_config
+        )
+        spec = TPURaidenStoreOffloadingSpec(
+            offloading_config, vllm_config, kv_cache_config
+        )
 
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = TPURaidenOffloadingScheduler(
-                spec, vllm_config, kv_cache_config)
+                spec, vllm_config, kv_cache_config
+            )
         elif role == KVConnectorRole.WORKER:
             # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
             self.connector_worker = OffloadingConnectorWorker(
-                spec, vllm_config, kv_cache_config)
+                spec, vllm_config, kv_cache_config
+            )
             # Track per-step fence acknowledgments and completion echoes for worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
@@ -343,13 +382,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # failure through the endpoint's documented channel instead of raising an exception here
         logger.warning(
             "TPURaidenOffloadingConnector: external cache reset is not "
-            "supported by the Raiden offload store; reporting failure.")
+            "supported by the Raiden offload store; reporting failure."
+        )
         return False
 
     # -- worker-side hooks -------------------------------------------------
-    def register_kv_caches(self,
-                           kv_caches: dict[str,
-                                           torch.Tensor | list[torch.Tensor]]):
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ):
         """Register the TPU UBP as zero-copy canonical offload tensors.
 
         vLLM's generic per-layer registration does not support the TPU
@@ -360,47 +400,54 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         assert self.connector_worker is not None
         num_blocks = self.connector_worker.kv_cache_config.num_blocks
 
-        pool_storages: dict[int, tuple[torch.UntypedStorage,
-                                       torch.device]] = {}
+        pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
         for layer_kv_cache in kv_caches.values():
-            state_tensors = ([layer_kv_cache] if isinstance(
-                layer_kv_cache, torch.Tensor) else layer_kv_cache)
+            state_tensors = (
+                [layer_kv_cache]
+                if isinstance(layer_kv_cache, torch.Tensor)
+                else layer_kv_cache
+            )
             for tensor in state_tensors:
                 storage = tensor.untyped_storage()
-                pool_storages.setdefault(storage.data_ptr(),
-                                         (storage, tensor.device))
+                pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
 
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
             storage_bytes = storage.nbytes()
             assert storage_bytes % num_blocks == 0, (
                 "KV pool storage must hold whole scheduler blocks: "
-                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}")
+                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
+            )
             page_size_bytes = storage_bytes // num_blocks
-            int8_view = torch.empty(0, dtype=torch.int8,
-                                    device=device).set_(storage).view(
-                                        num_blocks, page_size_bytes)
+            int8_view = (
+                torch.empty(0, dtype=torch.int8, device=device)
+                .set_(storage)
+                .view(num_blocks, page_size_bytes)
+            )
             pool_tensors.append(
-                CanonicalKVCacheTensor(tensor=int8_view,
-                                       page_size_bytes=page_size_bytes))
+                CanonicalKVCacheTensor(
+                    tensor=int8_view, page_size_bytes=page_size_bytes
+                )
+            )
 
         # Retain pool tensor references to dispatch their writes during save fences.
-        self._pool_sync_tensors = [
-            pool_tensor.tensor for pool_tensor in pool_tensors
+        self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
+
+        group_data_refs = [
+            [
+                CanonicalKVCacheRef(
+                    tensor_idx=idx, page_size_bytes=pool_tensor.page_size_bytes
+                )
+                for idx, pool_tensor in enumerate(pool_tensors)
+            ]
+            for _ in self.connector_worker.kv_cache_config.kv_cache_groups
         ]
 
-        group_data_refs = [[
-            CanonicalKVCacheRef(tensor_idx=idx,
-                                page_size_bytes=pool_tensor.page_size_bytes)
-            for idx, pool_tensor in enumerate(pool_tensors)
-        ] for _ in self.connector_worker.kv_cache_config.kv_cache_groups]
-
         self.connector_worker._init_worker(
-            CanonicalKVCaches(tensors=pool_tensors,
-                              group_data_refs=group_data_refs))
+            CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
+        )
 
-    def get_finished(self,
-                     finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
@@ -410,10 +457,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # 1. Dispatch any deferred pool writes so they precede the fence event.
             # 2. Record a stream event to track completion without host-side blocking.
             assert self._pool_sync_tensors, (
-                "KV pool tensors must be registered before the save fence")
+                "KV pool tensors must be registered before the save fence"
+            )
             _enqueue_pool_writes(self._pool_sync_tensors)
             self._pending_fences.append(
-                (set(meta.fence_job_ids), _record_fence_event()))
+                (set(meta.fence_job_ids), _record_fence_event())
+            )
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

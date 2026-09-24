@@ -21,12 +21,18 @@ tokens_per_hash matches the runtime (PCP-patched) resolve.
 from types import SimpleNamespace
 
 import torch
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, KVCacheTensor,
-                                        MambaSpec)
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+)
 
-from vllm_torchtpu import (_patch_vllm_hybrid_pcp_block_sizes,
-                           _patch_vllm_offloading_config_build)
+from vllm_torchtpu import (
+    _patch_vllm_hybrid_pcp_block_sizes,
+    _patch_vllm_offloading_config_build,
+)
 
 
 def _vllm_config(*, pcp: int, block_size: int = 4096):
@@ -69,22 +75,26 @@ def _kv_cache_config(block_size: int = 4096):
     )
     mamba = MambaSpec(
         block_size=block_size,
-        shapes=((3, 8192), ),
-        dtypes=(torch.bfloat16, ),
+        shapes=((3, 8192),),
+        dtypes=(torch.bfloat16,),
         mamba_cache_mode="align",
     )
     return KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[
-            KVCacheTensor(size=256 * 1024,
-                          layers=["attn"],
-                          layer_stride=128 * 1024,
-                          block_stride=1024),
-            KVCacheTensor(size=256 * 1024,
-                          layers=["gdn"],
-                          layer_stride=128 * 1024,
-                          block_stride=1024,
-                          offset=128 * 1024),
+            KVCacheTensor(
+                size=256 * 1024,
+                layers=["attn"],
+                layer_stride=128 * 1024,
+                block_stride=1024,
+            ),
+            KVCacheTensor(
+                size=256 * 1024,
+                layers=["gdn"],
+                layer_stride=128 * 1024,
+                block_stride=1024,
+                offset=128 * 1024,
+            ),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(["attn"], attn),
@@ -96,8 +106,10 @@ def _kv_cache_config(block_size: int = 4096):
 def _patched_offloading_config_module():
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_offloading_config_build()
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
-        config as offloading_config_module
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        config as offloading_config_module,
+    )
+
     return offloading_config_module
 
 

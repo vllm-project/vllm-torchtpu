@@ -16,9 +16,11 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import (LANE,
-                                                            gather_cos_sin,
-                                                            wo_a_projection)
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    LANE,
+    gather_cos_sin,
+    wo_a_projection,
+)
 
 from .rope_test import make_cos_sin_cache, rope_ref_impl
 
@@ -36,21 +38,21 @@ def o_projection_ref_impl(activations, wo_a, wo_a_scale, *, num_groups):
     reduction = o_f.shape[-1]
     w = wo_a.reshape(reduction, num_groups, -1)
     s = wo_a_scale.reshape(num_groups, -1)
-    z = (jnp.einsum(
-        "tgd,dgr->tgr",
-        o_f,
-        w.astype(jnp.bfloat16),
-        preferred_element_type=jnp.float32,
-    ) * s.astype(jnp.bfloat16)[None, ...])
+    z = (
+        jnp.einsum(
+            "tgd,dgr->tgr",
+            o_f,
+            w.astype(jnp.bfloat16),
+            preferred_element_type=jnp.float32,
+        )
+        * s.astype(jnp.bfloat16)[None, ...]
+    )
     return z.astype(jnp.bfloat16).reshape(num_tokens, -1)
 
 
-def make_inputs(rng,
-                *,
-                num_tokens,
-                num_groups,
-                lora_rank,
-                heads_per_group=HEADS_PER_GROUP):
+def make_inputs(
+    rng, *, num_tokens, num_groups, lora_rank, heads_per_group=HEADS_PER_GROUP
+):
     """Activations in the ``[T, G * H, head_dim]`` view the kernel takes."""
     reduction = heads_per_group * HEAD_DIM
     num_heads = num_groups * heads_per_group
@@ -62,15 +64,14 @@ def make_inputs(rng,
         rng.standard_normal((reduction, num_groups * lora_rank)),
         dtype=jnp.float8_e4m3fn,
     )
-    wo_a_scale = jnp.asarray(rng.uniform(0.5, 1.5,
-                                         size=num_groups * lora_rank),
-                             dtype=jnp.float32)
+    wo_a_scale = jnp.asarray(
+        rng.uniform(0.5, 1.5, size=num_groups * lora_rank), dtype=jnp.float32
+    )
     return activations, wo_a, wo_a_scale
 
 
 # TODO: improve test coverage.
 class OProjectionTest(parameterized.TestCase):
-
     @parameterized.named_parameters(
         dict(  # DeepSeek-V4-Flash, unsharded.
             testcase_name="dsv4_flash",
@@ -103,13 +104,12 @@ class OProjectionTest(parameterized.TestCase):
             num_groups=num_groups,
             lora_rank=lora_rank,
         )
-        positions = jnp.asarray(rng.integers(0,
-                                             MAX_POSITION,
-                                             size=(num_tokens, )),
-                                dtype=jnp.int32)
-        cos_sin_cache = jnp.asarray(make_cos_sin_cache(MAX_POSITION,
-                                                       ROTARY_DIM),
-                                    dtype=jnp.float32)
+        positions = jnp.asarray(
+            rng.integers(0, MAX_POSITION, size=(num_tokens,)), dtype=jnp.int32
+        )
+        cos_sin_cache = jnp.asarray(
+            make_cos_sin_cache(MAX_POSITION, ROTARY_DIM), dtype=jnp.float32
+        )
         cos_sin = gather_cos_sin(positions, cos_sin_cache, inverse=True)
         self.assertEqual(cos_sin.shape, (num_tokens, 2 * LANE))
         out = wo_a_projection(
@@ -123,14 +123,8 @@ class OProjectionTest(parameterized.TestCase):
             quantize_activations=False,
         )
 
-        roped = rope_ref_impl(activations,
-                              positions,
-                              cos_sin_cache,
-                              inverse=True)
-        expected = o_projection_ref_impl(roped,
-                                         wo_a,
-                                         wo_a_scale,
-                                         num_groups=num_groups)
+        roped = rope_ref_impl(activations, positions, cos_sin_cache, inverse=True)
+        expected = o_projection_ref_impl(roped, wo_a, wo_a_scale, num_groups=num_groups)
 
         np.testing.assert_allclose(
             np.asarray(out, dtype=np.float32),

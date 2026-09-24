@@ -6,6 +6,7 @@ registrations on both sides of a disagg pair, and the live-pair acceptance
 gate builds its expected tag list from them. The values are frozen; changing
 one is a coupled two-repo protocol change, not a refactor.
 """
+
 TAG_FA = "fa"
 TAG_GDN_CONV = "gdn.conv"
 TAG_GDN_SSM = "gdn.ssm"

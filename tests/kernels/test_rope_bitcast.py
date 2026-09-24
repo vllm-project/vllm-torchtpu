@@ -16,7 +16,8 @@ def test_rope_bitcast_correctness():
     # known sequential bfloat16 values: 1.0, 2.0, 3.0, ..., 64.0.
     gt_values = jnp.arange(1.0, num_rope_elements + 1, dtype=jnp.bfloat16)
     gt_bytes = jax.lax.bitcast_convert_type(gt_values, jnp.uint8).reshape(
-        1, rope_byte_len)
+        1, rope_byte_len
+    )
 
     # Embed it into a mock [bkv_sz, 640] bkv array
     bkv = jnp.zeros((bkv_sz, 640), dtype=jnp.uint8)

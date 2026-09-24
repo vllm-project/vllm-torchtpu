@@ -8,6 +8,16 @@ mounts and select the JAX CPU backend. Host model caches and test results
 use `$HOME/.cache/vllm-torchtpu-ci` on CPU agents and `/mnt/disks/persist`
 on TPU agents.
 
+The CI image is pushed to
+`us-central1-docker.pkg.dev/inferact-vllm-tpu/vllm-tpu-ci/vllm-torchtpu`, and
+mirrored to the old
+`us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu`
+under the same tag. Steps pull the first of those: it is what the build
+publishes as `CI_IMAGE_TAG`. `scripts/ci_image.sh` holds both names and every
+script that builds or pulls the image sources it; set `CI_IMAGE_REPO` to push
+somewhere else, and `CI_IMAGE_MIRROR_REPOS` (space separated, empty to disable)
+to change what else receives a copy.
+
 For a test file that runs entirely without accelerator hardware, add
 `pytestmark = pytest.mark.cpu_test` after its imports. Use
 `@pytest.mark.cpu_test` for individual tests in mixed files. Module imports

@@ -6,9 +6,11 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
-                                                  get_cp_group_layout,
-                                                  get_or_create_cp_mesh)
+from vllm_torchtpu.distributed.mesh_utils import (
+    CpGroupLayout,
+    get_cp_group_layout,
+    get_or_create_cp_mesh,
+)
 
 PcpGroupLayout = CpGroupLayout
 
@@ -33,8 +35,7 @@ def get_pcp_world_size() -> int:
     return 1 if group is None else int(group.world_size)
 
 
-def all_gather_equal_tokens(tensor: torch.Tensor,
-                            dim: int = 0) -> torch.Tensor:
+def all_gather_equal_tokens(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """Gather equal-shaped tensors across the native PCP group."""
     group = get_pcp_group()
     if group is None or int(group.world_size) == 1:
@@ -62,15 +63,14 @@ def get_pcp_cache_rank() -> int:
     Index of the PCP chunk whose KV this worker's device physically holds.
     """
     from torch_tpu._internal.distributed import tpu_distributed
+
     group = get_pcp_group()
     if group is None or int(group.world_size) == 1:
         return 0
     world_size = int(group.world_size)
 
     device_id = int(tpu_distributed.global_device_id())
-    device_ids = [
-        int(value) for value in tpu_distributed.all_global_device_ids()
-    ]
+    device_ids = [int(value) for value in tpu_distributed.all_global_device_ids()]
     # A slice wider than the PCP world means the kernels' partition space is
     # not the PCP group, so no index into it would mean what callers expect.
     if len(device_ids) != world_size:
@@ -78,11 +78,13 @@ def get_pcp_cache_rank() -> int:
             f"torch_tpu exposes {len(device_ids)} devices {device_ids} but the "
             f"PCP group has world_size={world_size}; the kernels' partition "
             f"space does not match the PCP group, so the chunk this worker "
-            f"holds is undefined.")
+            f"holds is undefined."
+        )
     if device_id not in device_ids:
         raise RuntimeError(
             f"This worker's TPU device id {device_id} is not in torch_tpu's "
-            f"device list {device_ids}.")
+            f"device list {device_ids}."
+        )
     return device_ids.index(device_id)
 
 

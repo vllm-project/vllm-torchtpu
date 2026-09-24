@@ -35,7 +35,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
@@ -150,6 +151,8 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
+  ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"} \
+  ${CONTAINER_TMPDIR:+-e TMPDIR="${CONTAINER_TMPDIR}" -e RAY_TMPDIR=/tmp} \
   ${EVAL_SOFT_FAIL:+-e EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL}"} \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \

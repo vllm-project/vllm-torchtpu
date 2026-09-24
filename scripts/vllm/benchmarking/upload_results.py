@@ -49,7 +49,7 @@ def load_config_json(results_dir: Path) -> dict:
     config_path = results_dir / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 return json.load(f)
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}", file=sys.stderr)
@@ -66,7 +66,7 @@ def load_accuracy_metrics(results_dir: Path) -> dict:
     )
     for path in eval_jsons:
         try:
-            with open(path, "r") as fh:
+            with open(path) as fh:
                 data = json.load(fh)
             for task, task_metrics in (data.get("results") or {}).items():
                 if not isinstance(task_metrics, dict):
@@ -102,6 +102,13 @@ def main():
         "--skip-db-upload",
         action="store_true",
         help="If set, only print SQL query without executing upload.",
+    )
+    parser.add_argument(
+        "--skip-spanner",
+        action="store_true",
+        help="Skip the Spanner insert but still write to BigQuery. For a "
+        "fleet that reports into the shared table and has no Spanner "
+        "record of its own; --skip-db-upload still skips both.",
     )
     parser.add_argument(
         "--project",
@@ -187,7 +194,7 @@ def main():
         concurrency = int(m.group(3))
 
         try:
-            with open(rf, "r") as f:
+            with open(rf) as f:
                 res = json.load(f)
         except Exception as e:
             print(f"Error loading {rf}: {e}", file=sys.stderr)
@@ -287,9 +294,10 @@ def main():
         print(f"SQL for Spanner ({rf.name}):")
         print(sql)
 
-        if args.skip_db_upload:
+        if args.skip_db_upload or args.skip_spanner:
+            why = "--skip-db-upload" if args.skip_db_upload else "--skip-spanner"
             print(
-                f"=== Skipping Spanner DB Upload (--skip-db-upload specified) ===. RecordId: {record_id}"
+                f"=== Skipping Spanner DB Upload ({why} specified) ===. RecordId: {record_id}"
             )
         else:
             cmd = [

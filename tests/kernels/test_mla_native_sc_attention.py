@@ -33,63 +33,56 @@ def _build_problem(rng, *, k_scale, query_tokens=128, topk=256):
     num_heads = 8
 
     def quantized_bytes(dim):
-        values = (rng.random(
-            (pages, page_size, dim), dtype=np.float32) * 2 - 1)
+        values = rng.random((pages, page_size, dim), dtype=np.float32) * 2 - 1
         fp8 = jnp.asarray(values / k_scale).astype(jnp.float8_e4m3fn)
         return np.asarray(jax.lax.bitcast_convert_type(fp8, jnp.uint8))
 
     nope_bytes = quantized_bytes(NOPE_DIM)
     rope_bytes = quantized_bytes(ROPE_DIM)
     tensorcore_nope = nope_bytes.reshape(pages, page_size, 4, 128)
-    tensorcore_rope = np.pad(rope_bytes,
-                             ((0, 0), (0, 0),
-                              (0, ROPE_DIM))).reshape(pages, page_size // 4, 4,
-                                                      128)
+    tensorcore_rope = np.pad(rope_bytes, ((0, 0), (0, 0), (0, ROPE_DIM))).reshape(
+        pages, page_size // 4, 4, 128
+    )
 
     page_table = rng.permutation(pages).astype(np.int32)
     inverse_page_table = np.argsort(page_table)
-    physical = np.stack([
-        rng.choice(cache_tokens, size=topk, replace=False)
-        for _ in range(query_tokens)
-    ]).astype(np.int32)
-    logical = (inverse_page_table[physical // page_size] * page_size +
-               physical % page_size).astype(np.int32)
-    q = jnp.asarray(rng.normal(size=(query_tokens, num_heads,
-                                     HEAD_DIM)).astype(np.float32),
-                    dtype=jnp.bfloat16)
+    physical = np.stack(
+        [
+            rng.choice(cache_tokens, size=topk, replace=False)
+            for _ in range(query_tokens)
+        ]
+    ).astype(np.int32)
+    logical = (
+        inverse_page_table[physical // page_size] * page_size + physical % page_size
+    ).astype(np.int32)
+    q = jnp.asarray(
+        rng.normal(size=(query_tokens, num_heads, HEAD_DIM)).astype(np.float32),
+        dtype=jnp.bfloat16,
+    )
     return {
-        "q":
-        q,
-        "tensorcore_nope":
-        jnp.asarray(tensorcore_nope),
-        "tensorcore_rope":
-        jnp.asarray(tensorcore_rope),
-        "sparsecore_nope":
-        jnp.asarray(native_sc_cache_layout.pack_nope(tensorcore_nope)),
-        "sparsecore_rope":
-        jnp.asarray(native_sc_cache_layout.pack_rope_banded(tensorcore_rope)),
-        "topk":
-        jnp.asarray(logical),
-        "physical_topk":
-        jnp.asarray(physical),
-        "page_table":
-        jnp.asarray(page_table),
-        "cu_q_lens":
-        jnp.array([0, query_tokens], jnp.int32),
-        "distribution":
-        jnp.array([0, 1, 1], jnp.int32),
+        "q": q,
+        "tensorcore_nope": jnp.asarray(tensorcore_nope),
+        "tensorcore_rope": jnp.asarray(tensorcore_rope),
+        "sparsecore_nope": jnp.asarray(
+            native_sc_cache_layout.pack_nope(tensorcore_nope)
+        ),
+        "sparsecore_rope": jnp.asarray(
+            native_sc_cache_layout.pack_rope_banded(tensorcore_rope)
+        ),
+        "topk": jnp.asarray(logical),
+        "physical_topk": jnp.asarray(physical),
+        "page_table": jnp.asarray(page_table),
+        "cu_q_lens": jnp.array([0, query_tokens], jnp.int32),
+        "distribution": jnp.array([0, 1, 1], jnp.int32),
     }
 
 
 class SparseMlaCacheLayoutsTest(parameterized.TestCase):
-
     @parameterized.product(k_scale=(0.75, 1.0), return_lse=(False, True))
-    def test_sparsecore_layout_matches_tensorcore_layout(
-            self, k_scale, return_lse):
+    def test_sparsecore_layout_matches_tensorcore_layout(self, k_scale, return_lse):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
-        problem = _build_problem(np.random.default_rng(20260830),
-                                 k_scale=k_scale)
+        problem = _build_problem(np.random.default_rng(20260830), k_scale=k_scale)
         kwargs = {
             "return_lse": return_lse,
             "sm_scale": 0.125,
@@ -121,22 +114,25 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             **kwargs,
         )
         tensorcore_out, sparsecore_out = jax.block_until_ready(
-            (tensorcore_out, sparsecore_out))
+            (tensorcore_out, sparsecore_out)
+        )
 
         if return_lse:
             tensorcore_out, tensorcore_lse = tensorcore_out
             sparsecore_out, sparsecore_lse = sparsecore_out
-            np.testing.assert_allclose(np.asarray(sparsecore_lse),
-                                       np.asarray(tensorcore_lse),
-                                       rtol=2e-2,
-                                       atol=2e-2)
+            np.testing.assert_allclose(
+                np.asarray(sparsecore_lse),
+                np.asarray(tensorcore_lse),
+                rtol=2e-2,
+                atol=2e-2,
+            )
 
-        np.testing.assert_allclose(np.asarray(sparsecore_out,
-                                              dtype=np.float32),
-                                   np.asarray(tensorcore_out,
-                                              dtype=np.float32),
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(
+            np.asarray(sparsecore_out, dtype=np.float32),
+            np.asarray(tensorcore_out, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     def test_cache_layouts_support_physical_indices_and_padding(self):
         if jax.devices()[0].platform != "tpu":
@@ -151,9 +147,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         }
 
         paged_out = sparse_mla.sparse_ragged_paged_attention(
-            problem["q"], problem["tensorcore_nope"],
-            problem["tensorcore_rope"], logical_topk, problem["page_table"],
-            problem["cu_q_lens"], problem["distribution"], **kwargs)
+            problem["q"],
+            problem["tensorcore_nope"],
+            problem["tensorcore_rope"],
+            logical_topk,
+            problem["page_table"],
+            problem["cu_q_lens"],
+            problem["distribution"],
+            **kwargs,
+        )
         tensorcore_physical_out = sparse_mla.sparse_ragged_paged_attention(
             problem["q"],
             problem["tensorcore_nope"],
@@ -177,22 +179,24 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         )
         paged_out, tensorcore_physical_out, sparsecore_physical_out = (
             jax.block_until_ready(
-                (paged_out, tensorcore_physical_out, sparsecore_physical_out)))
+                (paged_out, tensorcore_physical_out, sparsecore_physical_out)
+            )
+        )
 
         for physical_out in (tensorcore_physical_out, sparsecore_physical_out):
-            np.testing.assert_allclose(np.asarray(physical_out,
-                                                  dtype=np.float32),
-                                       np.asarray(paged_out, dtype=np.float32),
-                                       rtol=2e-2,
-                                       atol=2e-2)
+            np.testing.assert_allclose(
+                np.asarray(physical_out, dtype=np.float32),
+                np.asarray(paged_out, dtype=np.float32),
+                rtol=2e-2,
+                atol=2e-2,
+            )
 
     def test_sparsecore_layout_supports_short_query_chunk(self):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
-        problem = _build_problem(np.random.default_rng(20260903),
-                                 k_scale=1.0,
-                                 query_tokens=16,
-                                 topk=2048)
+        problem = _build_problem(
+            np.random.default_rng(20260903), k_scale=1.0, query_tokens=16, topk=2048
+        )
         kwargs = {
             "sm_scale": 0.125,
             "gather_and_attention_chunk_size": 64,
@@ -200,9 +204,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         }
 
         tensorcore_out = sparse_mla.sparse_ragged_paged_attention(
-            problem["q"], problem["tensorcore_nope"],
-            problem["tensorcore_rope"], problem["topk"], problem["page_table"],
-            problem["cu_q_lens"], problem["distribution"], **kwargs)
+            problem["q"],
+            problem["tensorcore_nope"],
+            problem["tensorcore_rope"],
+            problem["topk"],
+            problem["page_table"],
+            problem["cu_q_lens"],
+            problem["distribution"],
+            **kwargs,
+        )
         sparsecore_out = sparse_mla.sparse_ragged_paged_attention(
             problem["q"],
             problem["sparsecore_nope"],
@@ -215,14 +225,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             **kwargs,
         )
         tensorcore_out, sparsecore_out = jax.block_until_ready(
-            (tensorcore_out, sparsecore_out))
+            (tensorcore_out, sparsecore_out)
+        )
 
-        np.testing.assert_allclose(np.asarray(sparsecore_out,
-                                              dtype=np.float32),
-                                   np.asarray(tensorcore_out,
-                                              dtype=np.float32),
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(
+            np.asarray(sparsecore_out, dtype=np.float32),
+            np.asarray(tensorcore_out, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     def test_sparsecore_layout_validation(self):
         q = jnp.zeros((128, 8, HEAD_DIM), jnp.bfloat16)

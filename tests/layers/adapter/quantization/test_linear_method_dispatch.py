@@ -26,8 +26,9 @@ import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase
 
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedLinearMethod
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
 
 SKIPPED = "model.layers.0.skipme"
 
@@ -51,53 +52,60 @@ def linear_layer():
 
 
 def _fp8_config(cls):
-    return cls.from_config({
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "ignored_layers": [SKIPPED],
-    })
+    return cls.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "ignored_layers": [SKIPPED],
+        }
+    )
 
 
 class TestUnquantizedFallbackDispatch:
-
     def test_fp8_skipped_layer(self, linear_layer):
         from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+
         cfg = _fp8_config(VllmFp8Config)
         method = cfg.get_quant_method(linear_layer, prefix=SKIPPED)
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_deepseek_v4_fp8_skipped_layer(self, linear_layer):
-        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import \
-            VllmDeepseekV4Fp8Config
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+            VllmDeepseekV4Fp8Config,
+        )
+
         cfg = _fp8_config(VllmDeepseekV4Fp8Config)
         method = cfg.get_quant_method(linear_layer, prefix=SKIPPED)
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_nvfp4_excluded_layer(self, linear_layer):
-        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import \
-            VllmNvfp4Config
+        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+
         cfg = VllmNvfp4Config.from_config({"quant_algo": "NVFP4"})
         # ModelOpt nests exclude_modules in the checkpoint config; set it
         # directly so this test pins the dispatch branch, not config parsing.
         cfg.exclude_modules = [SKIPPED]
-        assert cfg.is_layer_excluded(
-            SKIPPED), "fixture must hit the excluded path"
+        assert cfg.is_layer_excluded(SKIPPED), "fixture must hit the excluded path"
         method = cfg.get_quant_method(linear_layer, prefix=SKIPPED)
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_mxfp4_uses_kn_for_every_linear_layer(self, linear_layer):
         """MXFP4 quantizes only MoE, so all linear layers take this path."""
-        from vllm_torchtpu.layers.adapter.quantization.mxfp4 import \
-            VllmMxfp4Config
+        from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
+
         cfg = VllmMxfp4Config.from_config({})
         method = cfg.get_quant_method(
-            linear_layer, prefix="model.layers.0.self_attn.qkv_proj")
+            linear_layer, prefix="model.layers.0.self_attn.qkv_proj"
+        )
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
     def test_unquantized_config_uses_kn(self, linear_layer):
-        from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-            VllmUnquantizedConfig
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            VllmUnquantizedConfig,
+        )
+
         cfg = VllmUnquantizedConfig.from_config({})
         method = cfg.get_quant_method(
-            linear_layer, prefix="model.layers.0.self_attn.qkv_proj")
+            linear_layer, prefix="model.layers.0.self_attn.qkv_proj"
+        )
         assert isinstance(method, VllmUnquantizedLinearMethod)

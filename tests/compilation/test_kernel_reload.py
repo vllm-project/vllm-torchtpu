@@ -38,6 +38,7 @@ def test_dispatcher_copies_function_introspection():
     # __wrapped__), not __call__(*args, **kwargs) — torch.library's
     # infer_schema rejects varargs signatures.
     import inspect
+
     assert list(inspect.signature(dispatcher).parameters) == ["x", "y"]
 
 
@@ -56,7 +57,8 @@ def test_reload_kernels_reimports_and_rebuilds(tmp_path, monkeypatch):
         textwrap.dedent("""
         def kernel(x):
             return x + 1
-        """))
+        """)
+    )
     monkeypatch.syspath_prepend(str(tmp_path))
     mod = importlib.import_module("reloadable_kernel_mod")
     try:
@@ -74,7 +76,8 @@ def test_reload_kernels_reimports_and_rebuilds(tmp_path, monkeypatch):
             textwrap.dedent("""
             def kernel(x):
                 return x + 100
-            """))
+            """)
+        )
         stats = kernel_reload.reload_kernels(modules=["reloadable_kernel_mod"])
 
         assert stats["rebuilt_ops"] == ["ns::op_c"]
@@ -89,8 +92,9 @@ def test_reload_module_list_env_override(monkeypatch):
     assert kernel_reload.default_reload_modules() == ("pkg.mod_a", "pkg.mod_b")
 
     monkeypatch.delenv("TPU_KERNEL_RELOAD_MODULES")
-    assert (kernel_reload.default_reload_modules() ==
-            kernel_reload._DEFAULT_RELOAD_MODULES)
+    assert (
+        kernel_reload.default_reload_modules() == kernel_reload._DEFAULT_RELOAD_MODULES
+    )
 
 
 def test_reload_skips_unimported_modules():
