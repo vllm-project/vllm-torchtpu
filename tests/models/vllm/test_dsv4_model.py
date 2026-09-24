@@ -20,21 +20,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from vllm.config import (CacheConfig, CompilationMode, SchedulerConfig,
-                         VllmConfig, set_current_vllm_config)
+from vllm.config import (
+    CacheConfig,
+    CompilationMode,
+    SchedulerConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
-    VllmDeepseekSparseSWABackend, VllmDeepseekV4SWACache)
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
-    VllmDeepseekV4Indexer
+    VllmDeepseekSparseSWABackend,
+    VllmDeepseekV4SWACache,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    VllmDeepseekV4Indexer,
+)
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v4 import DeepseekV4ForCausalLM
-from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
-    VllmDeepseekV4MLAAttention
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 
 
 def test_deepseek_v4_model_registration():
@@ -57,23 +64,28 @@ def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     # A rename that introduces the skipped substring distinguishes filtering
     # mapped names from filtering only raw checkpoint names.
     model.hf_to_vllm_mapper |= WeightsMapper(
-        orig_to_new_prefix={"draft.": "model.mtp."})
+        orig_to_new_prefix={"draft.": "model.mtp."}
+    )
     embedding = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     head = embedding + 10
     adapter = embedding + 20
     loaded = model.load_weights(
-        iter([
-            ("mtp.0.weight", head),
-            ("layers.0.mtp.weight", head),
-            ("layers.0.aux_mtp.weight", head),
-            ("draft.0.weight", head),
-            ("embed.weight", embedding),
-            ("head.weight", head),
-            ("model.mtp_adapter.weight", adapter),
-        ]))
+        iter(
+            [
+                ("mtp.0.weight", head),
+                ("layers.0.mtp.weight", head),
+                ("layers.0.aux_mtp.weight", head),
+                ("draft.0.weight", head),
+                ("embed.weight", embedding),
+                ("head.weight", head),
+                ("model.mtp_adapter.weight", adapter),
+            ]
+        )
+    )
     assert loaded == {
-        "model.embed_tokens.weight", "lm_head.weight",
-        "model.mtp_adapter.weight"
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.mtp_adapter.weight",
     }
     torch.testing.assert_close(model.model.embed_tokens.weight, embedding)
     torch.testing.assert_close(model.lm_head.weight, head)
@@ -96,23 +108,17 @@ TOKENS = 3
 class _StubDecoderLayer(nn.Module):
     """Stands in for DeepseekV4DecoderLayer; records what it returned."""
 
-    def __init__(self,
-                 vllm_config,
-                 prefix="",
-                 topk_indices_buffer=None,
-                 aux_stream_list=None):
+    def __init__(
+        self, vllm_config, prefix="", topk_indices_buffer=None, aux_stream_list=None
+    ):
         super().__init__()
         del vllm_config, topk_indices_buffer, aux_stream_list
         self.idx = int(prefix.rsplit(".", 1)[-1])
         self.outputs: list[tuple[torch.Tensor, ...]] = []
 
-    def forward(self,
-                x,
-                positions,
-                input_ids=None,
-                post_mix=None,
-                res_mix=None,
-                residual=None):
+    def forward(
+        self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
+    ):
         del positions, input_ids, post_mix, res_mix, residual
         residual = x
         x = x * (self.idx + 2) + 1.0
@@ -134,7 +140,6 @@ class _FakePostOp:
 
 
 class _TorchRMSNorm(nn.Module):
-
     def __init__(self, eps: float):
         super().__init__()
         self.eps = eps
@@ -143,8 +148,7 @@ class _TorchRMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
 
-def _fake_collapse_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps,
-                        hc_eps):
+def _fake_collapse_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps):
     del hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
     return hidden_states.mean(dim=1)
 
@@ -165,17 +169,22 @@ def _tiny_hf_config():
 @pytest.fixture(scope="module")
 def dist_ctx():
     import torch.distributed as dist
-    from vllm.distributed import (ensure_model_parallel_initialized,
-                                  init_distributed_environment)
+    from vllm.distributed import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
     if not dist.is_initialized():
         import portpicker
+
         port = portpicker.pick_unused_port()
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
             distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo")
+            backend="gloo",
+        )
     # GroupCoordinator construction consults the current vLLM config.
     with set_current_vllm_config(VllmConfig()):
         ensure_model_parallel_initialized(1, 1)
@@ -184,8 +193,7 @@ def dist_ctx():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
-def test_attention_constructs_tpu_swa_cache(monkeypatch, request,
-                                            compress_ratio):
+def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
     from vllm.platforms import current_platform
 
@@ -195,8 +203,7 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request,
     monkeypatch.setattr(current_platform, "device_type", "cpu")
     request.getfixturevalue("dist_ctx")
     # Only skip Pallas op registration, which needs the worker's TPU mesh.
-    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op",
-                        lambda self: None)
+    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op", lambda self: None)
     hf_config = DeepseekV4Config(
         hidden_size=128,
         num_attention_heads=2,
@@ -217,22 +224,25 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request,
         index_head_dim=128,
     )
     config = VllmConfig()
-    config.model_config = SimpleNamespace(hf_config=hf_config,
-                                          dtype=torch.bfloat16,
-                                          max_model_len=256)
+    config.model_config = SimpleNamespace(
+        hf_config=hf_config, dtype=torch.bfloat16, max_model_len=256
+    )
     config.cache_config = CacheConfig(block_size=1024, cache_dtype="fp8_e4m3")
-    config.scheduler_config = SchedulerConfig(max_model_len=256,
-                                              is_encoder_decoder=False,
-                                              max_num_seqs=1,
-                                              max_num_batched_tokens=128)
+    config.scheduler_config = SchedulerConfig(
+        max_model_len=256,
+        is_encoder_decoder=False,
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+    )
     prefix = "model.layers.0.self_attn"
     with set_current_vllm_config(config):
         attention = VllmDeepseekV4MLAAttention(config, prefix=prefix)
     cache = attention.swa_cache_layer
     assert isinstance(cache, VllmDeepseekV4SWACache)
     assert cache.get_attn_backend() is VllmDeepseekSparseSWABackend
-    assert config.compilation_config.static_forward_context[
-        f"{prefix}.swa_cache"] is cache
+    assert (
+        config.compilation_config.static_forward_context[f"{prefix}.swa_cache"] is cache
+    )
     spec = cache.get_kv_cache_spec(config)
     assert spec.block_size == 128
     assert spec.sliding_window == 128
@@ -246,14 +256,13 @@ def tiny_fc(dist_ctx, monkeypatch):
     monkeypatch.setattr(model_mod, "mhc_collapse_head", _fake_collapse_head)
     vllm_config = VllmConfig()
     # ``head_dtype`` is read by vLLM's LogitsProcessor at construction.
-    vllm_config.model_config = SimpleNamespace(hf_config=_tiny_hf_config(),
-                                               dtype=torch.float32,
-                                               head_dtype=None)
+    vllm_config.model_config = SimpleNamespace(
+        hf_config=_tiny_hf_config(), dtype=torch.float32, head_dtype=None
+    )
     # Run the decorated backbone eagerly.
     vllm_config.compilation_config.mode = CompilationMode.NONE
     with set_current_vllm_config(vllm_config):
-        fc = model_mod.DeepseekV4ForCausalLM(vllm_config=vllm_config,
-                                             prefix="")
+        fc = model_mod.DeepseekV4ForCausalLM(vllm_config=vllm_config, prefix="")
     # The post op is fetched lazily through ``mhc_post_op``; pre-seed the
     # instance slot it reads so no Pallas op is ever built.
     object.__setattr__(fc.model, "_mhc_post_op_instance", _FakePostOp())
@@ -292,7 +301,7 @@ def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
 
 
 def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
-    for bad in [(0, ), (N_LAYERS + 1, )]:
+    for bad in [(0,), (N_LAYERS + 1,)]:
         with pytest.raises(ValueError, match="aux hidden-state layers"):
             tiny_fc.set_aux_hidden_state_layers(bad)
 

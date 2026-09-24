@@ -24,16 +24,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (FusedMoeWeightScaleSupported,
-                                                  RoutedExperts)
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.linear import LinearBase
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
-    VllmNvfp4Config, VllmNvfp4LinearMethod, VllmNvfp4MoEMethod, _fresh,
-    _NullInputQuantKernel, _requant_moe_w4a8, _to_kernel_scale)
+    VllmNvfp4Config,
+    VllmNvfp4LinearMethod,
+    VllmNvfp4MoEMethod,
+    _fresh,
+    _NullInputQuantKernel,
+    _requant_moe_w4a8,
+    _to_kernel_scale,
+)
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-    VllmUnquantizedFusedMoEMethod, VllmUnquantizedLinearMethod)
+    VllmUnquantizedFusedMoEMethod,
+    VllmUnquantizedLinearMethod,
+)
 
 
 class FakeActivation:
@@ -67,8 +77,7 @@ class FakeRoutedExperts(RoutedExperts):
         self.use_grouped_topk = False
 
 
-def make_linear_layer(input_size: int = 64,
-                      output_size: int = 32) -> LinearBase:
+def make_linear_layer(input_size: int = 64, output_size: int = 32) -> LinearBase:
     """Create a bare LinearBase instance for testing without initializing TP groups."""
     layer = LinearBase.__new__(LinearBase)
     torch.nn.Module.__init__(layer)
@@ -115,7 +124,8 @@ class TestNvfp4Helpers:
         w2_scale_f = torch.rand(E, H, inter // 16, dtype=torch.float32) + 0.1
 
         w13_out, w13_s4, w2_out, w2_s4 = _requant_moe_w4a8(
-            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
+            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block
+        )
 
         assert w13_out.shape == (E, two_i, H // 2)
         assert w13_s4.shape == (E, H // block, 1, two_i)
@@ -133,7 +143,8 @@ class TestNvfp4Helpers:
         w2_scale_f = torch.rand(E, H, inter // 16, dtype=torch.float32) + 0.1
 
         w13_out, w13_s4, w2_out, w2_s4 = _requant_moe_w4a8(
-            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
+            w13_u8, w13_scale_f, w2_u8, w2_scale_f, block
+        )
 
         assert w13_out.shape == (E, 64, H // 2)
         assert w13_s4.shape == (E, H // block, 1, 64)
@@ -143,9 +154,7 @@ class TestNvfp4Helpers:
     def test_requant_moe_w4a8_unaligned_hidden_raises(self):
         # Contracting dim H must be divisible by block
         E, two_i, H_unaligned, block = 2, 32, 30, 16
-        w13_u8 = torch.randint(0,
-                               256, (E, two_i, H_unaligned // 2),
-                               dtype=torch.uint8)
+        w13_u8 = torch.randint(0, 256, (E, two_i, H_unaligned // 2), dtype=torch.uint8)
         w13_scale_f = torch.rand(E, two_i, 2, dtype=torch.float32)
         w2_u8 = torch.randint(0, 256, (E, H_unaligned, 8), dtype=torch.uint8)
         w2_scale_f = torch.rand(E, H_unaligned, 1, dtype=torch.float32)
@@ -219,14 +228,13 @@ class TestNvfp4LinearMethod:
         layer = make_linear_layer(64, 32)
 
         def mock_base_create_weights(self, lyr, *args, **kwargs):
-            lyr.input_scale = torch.nn.Parameter(torch.zeros(1),
-                                                 requires_grad=False)
-            lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1),
-                                                    requires_grad=False)
+            lyr.input_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
 
         with patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights",
-                mock_base_create_weights):
+            "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights",
+            mock_base_create_weights,
+        ):
             method.create_weights(layer, 64, [32], 64, 32, torch.bfloat16)
 
         assert hasattr(layer.input_scale, "weight_loader")
@@ -238,86 +246,84 @@ class TestNvfp4LinearMethod:
 
         # Test scalar_weight_loader raises when tensor has multiple elements
         with pytest.raises(AssertionError):
-            layer.input_scale.weight_loader(layer.input_scale,
-                                            torch.tensor([1.0, 2.0]))
+            layer.input_scale.weight_loader(layer.input_scale, torch.tensor([1.0, 2.0]))
 
     def test_process_weights_after_loading(self):
         N, K, group_size = 32, 64, 16
         layer = make_linear_layer(K, N)
-        layer.weight = torch.nn.Parameter(torch.randint(0,
-                                                        256, (N, K // 2),
-                                                        dtype=torch.uint8),
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.ones(
-            N, K // group_size, dtype=torch.float32),
-                                                requires_grad=False)
-        layer.weight_scale_2 = torch.nn.Parameter(torch.tensor(
-            [2.5], dtype=torch.float32),
-                                                  requires_grad=False)
-        layer.input_scale = torch.nn.Parameter(torch.tensor(
-            [1.0], dtype=torch.float32),
-                                               requires_grad=False)
+        layer.weight = torch.nn.Parameter(
+            torch.randint(0, 256, (N, K // 2), dtype=torch.uint8), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.ones(N, K // group_size, dtype=torch.float32), requires_grad=False
+        )
+        layer.weight_scale_2 = torch.nn.Parameter(
+            torch.tensor([2.5], dtype=torch.float32), requires_grad=False
+        )
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor([1.0], dtype=torch.float32), requires_grad=False
+        )
 
-        method = VllmNvfp4LinearMethod(MagicMock(group_size=group_size),
-                                       MagicMock())
+        method = VllmNvfp4LinearMethod(MagicMock(group_size=group_size), MagicMock())
 
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
         ) as mock_load:
-            mock_load.side_effect = lambda t: torch.zeros(
-                K, N, dtype=torch.uint8)
+            mock_load.side_effect = lambda t: torch.zeros(K, N, dtype=torch.uint8)
             method.process_weights_after_loading(layer)
 
         assert layer.weight.shape == (K, N)
         assert layer.weight_scale.shape == (1, K // group_size, 1, N)
         expected_scale = _to_kernel_scale(
-            torch.ones(N, K // group_size) * 2.5).unsqueeze(0)
+            torch.ones(N, K // group_size) * 2.5
+        ).unsqueeze(0)
         assert torch.allclose(layer.weight_scale, expected_scale)
         assert not hasattr(layer, "weight_scale_2")
         assert not hasattr(layer, "input_scale")
 
     def test_process_weights_mismatched_global_scale_raises(self):
         layer = make_linear_layer(64, 32)
-        layer.weight_scale_2 = torch.nn.Parameter(torch.tensor([1.0, 2.0]),
-                                                  requires_grad=False)
+        layer.weight_scale_2 = torch.nn.Parameter(
+            torch.tensor([1.0, 2.0]), requires_grad=False
+        )
         method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
 
         with pytest.raises(
-                AssertionError,
-                match="Fused NVFP4 projections must share one global scale"):
+            AssertionError, match="Fused NVFP4 projections must share one global scale"
+        ):
             method.process_weights_after_loading(layer)
 
     def test_apply_without_bias(self):
         layer = make_linear_layer(64, 32)
-        layer.weight = torch.nn.Parameter(torch.empty(64, 32),
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.empty(1, 4, 1, 32),
-                                                requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.empty(64, 32), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            torch.empty(1, 4, 1, 32), requires_grad=False
+        )
         x = torch.randn(4, 64)
         method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
 
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4"
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4"
         ) as mock_matmul:
             mock_matmul.return_value = torch.ones(4, 32)
             out = method.apply(layer, x)
             assert torch.equal(out, torch.ones(4, 32))
-            mock_matmul.assert_called_once_with(x, layer.weight,
-                                                layer.weight_scale)
+            mock_matmul.assert_called_once_with(x, layer.weight, layer.weight_scale)
 
     def test_apply_with_bias(self):
         layer = make_linear_layer(64, 32)
-        layer.weight = torch.nn.Parameter(torch.empty(64, 32),
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.empty(1, 4, 1, 32),
-                                                requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.empty(64, 32), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            torch.empty(1, 4, 1, 32), requires_grad=False
+        )
         x = torch.randn(4, 64)
-        bias = torch.full((32, ), 3.0)
+        bias = torch.full((32,), 3.0)
         method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
 
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4",
-                return_value=torch.ones(4, 32)):
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4",
+            return_value=torch.ones(4, 32),
+        ):
             out = method.apply(layer, x, bias=bias)
             assert torch.equal(out, torch.full((4, 32), 4.0))
 
@@ -334,13 +340,15 @@ class TestNvfp4MoEMethod:
         assert method.get_fused_moe_quant_config(None) is None
 
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
-                return_value=True):
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
+            return_value=True,
+        ):
             assert method.supports_internal_mk is True
 
         with patch(
-                "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
-                return_value=False):
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
+            return_value=False,
+        ):
             assert method.supports_internal_mk is False
 
     def test_moe_create_weights_sets_quant_method_attrs(self):
@@ -348,33 +356,46 @@ class TestNvfp4MoEMethod:
         method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
 
         def mock_moe_create_weights(self, lyr, *args, **kwargs):
-            lyr.w13_weight_scale = torch.nn.Parameter(torch.empty(0),
-                                                      requires_grad=False)
-            lyr.w2_weight_scale = torch.nn.Parameter(torch.empty(0),
-                                                     requires_grad=False)
-            lyr.w13_weight_scale_2 = torch.nn.Parameter(torch.empty(0),
-                                                        requires_grad=False)
-            lyr.w2_weight_scale_2 = torch.nn.Parameter(torch.empty(0),
-                                                       requires_grad=False)
+            lyr.w13_weight_scale = torch.nn.Parameter(
+                torch.empty(0), requires_grad=False
+            )
+            lyr.w2_weight_scale = torch.nn.Parameter(
+                torch.empty(0), requires_grad=False
+            )
+            lyr.w13_weight_scale_2 = torch.nn.Parameter(
+                torch.empty(0), requires_grad=False
+            )
+            lyr.w2_weight_scale_2 = torch.nn.Parameter(
+                torch.empty(0), requires_grad=False
+            )
 
         with patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4FusedMoE.create_weights",
-                mock_moe_create_weights):
+            "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4FusedMoE.create_weights",
+            mock_moe_create_weights,
+        ):
             method.create_weights(layer, 4, 128, 64, torch.bfloat16)
 
-        assert (layer.w13_weight_scale.quant_method ==
-                FusedMoeWeightScaleSupported.BLOCK.value)
-        assert (layer.w2_weight_scale.quant_method ==
-                FusedMoeWeightScaleSupported.BLOCK.value)
-        assert (layer.w13_weight_scale_2.quant_method ==
-                FusedMoeWeightScaleSupported.TENSOR.value)
-        assert (layer.w2_weight_scale_2.quant_method ==
-                FusedMoeWeightScaleSupported.TENSOR.value)
+        assert (
+            layer.w13_weight_scale.quant_method
+            == FusedMoeWeightScaleSupported.BLOCK.value
+        )
+        assert (
+            layer.w2_weight_scale.quant_method
+            == FusedMoeWeightScaleSupported.BLOCK.value
+        )
+        assert (
+            layer.w13_weight_scale_2.quant_method
+            == FusedMoeWeightScaleSupported.TENSOR.value
+        )
+        assert (
+            layer.w2_weight_scale_2.quant_method
+            == FusedMoeWeightScaleSupported.TENSOR.value
+        )
 
     def test_process_weights_validation_guards(self):
         method = VllmNvfp4MoEMethod(
-            MagicMock(group_size=16),
-            MagicMock(has_bias=False, is_act_and_mul=True))
+            MagicMock(group_size=16), MagicMock(has_bias=False, is_act_and_mul=True)
+        )
 
         # 1. Non-RoutedExperts layer
         with pytest.raises(AssertionError):
@@ -383,15 +404,15 @@ class TestNvfp4MoEMethod:
         # 2. Layer with bias
         layer = FakeRoutedExperts()
         method_bias = VllmNvfp4MoEMethod(
-            MagicMock(group_size=16),
-            MagicMock(has_bias=True, is_act_and_mul=True))
+            MagicMock(group_size=16), MagicMock(has_bias=True, is_act_and_mul=True)
+        )
         with pytest.raises(AssertionError, match="does not support bias"):
             method_bias.process_weights_after_loading(layer)
 
         # 3. Non act_and_mul activation
         method_non_gated = VllmNvfp4MoEMethod(
-            MagicMock(group_size=16),
-            MagicMock(has_bias=False, is_act_and_mul=False))
+            MagicMock(group_size=16), MagicMock(has_bias=False, is_act_and_mul=False)
+        )
         with pytest.raises(AssertionError, match="expects gated"):
             method_non_gated.process_weights_after_loading(layer)
 
@@ -404,59 +425,65 @@ class TestNvfp4MoEMethod:
         monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", None)
         E, two_i, H, group_size = 2, 32, 64, 16
         inter = two_i // 2
-        layer = FakeRoutedExperts(num_experts=E,
-                                  activation="silu",
-                                  use_ep=False)
+        layer = FakeRoutedExperts(num_experts=E, activation="silu", use_ep=False)
 
-        layer.w13_weight = torch.nn.Parameter(torch.randint(0,
-                                                            256,
-                                                            (E, two_i, H // 2),
-                                                            dtype=torch.uint8),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(torch.randint(0,
-                                                           256,
-                                                           (E, H, inter // 2),
-                                                           dtype=torch.uint8),
-                                             requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(torch.ones(
-            E, two_i, H // group_size, dtype=torch.float32),
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(torch.ones(
-            E, H, inter // group_size, dtype=torch.float32),
-                                                   requires_grad=False)
-        layer.w13_weight_scale_2 = torch.nn.Parameter(torch.tensor(
-            [[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32),
-                                                      requires_grad=False)
-        layer.w2_weight_scale_2 = torch.nn.Parameter(torch.tensor(
-            [2.0, 4.0], dtype=torch.float32),
-                                                     requires_grad=False)
-        layer.w13_input_scale = torch.nn.Parameter(torch.tensor([1.0]),
-                                                   requires_grad=False)
-        layer.w2_input_scale = torch.nn.Parameter(torch.tensor([1.0]),
-                                                  requires_grad=False)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, two_i, H // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(E, two_i, H // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(E, H, inter // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.tensor([2.0, 4.0], dtype=torch.float32), requires_grad=False
+        )
+        layer.w13_input_scale = torch.nn.Parameter(
+            torch.tensor([1.0]), requires_grad=False
+        )
+        layer.w2_input_scale = torch.nn.Parameter(
+            torch.tensor([1.0]), requires_grad=False
+        )
 
         method = VllmNvfp4MoEMethod(
             MagicMock(group_size=group_size),
-            MagicMock(has_bias=False, is_act_and_mul=True))
+            MagicMock(has_bias=False, is_act_and_mul=True),
+        )
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
-        ) as mock_load, patch(
+            ) as mock_load,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.moe_routing.register_experts_start_buffer"
-        ) as mock_reg, patch(
+            ) as mock_reg,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.prebuild_fused_moe_kernel"
-        ) as mock_prebuild:
+            ) as mock_prebuild,
+        ):
             # Load unpacks [E, N, K/2] -> [E, K, N]
             mock_load.side_effect = lambda t: torch.zeros(
-                t.shape[0], t.shape[-1] * 2, t.shape[1], dtype=torch.uint8)
+                t.shape[0], t.shape[-1] * 2, t.shape[1], dtype=torch.uint8
+            )
             method.process_weights_after_loading(layer)
 
             assert mock_load.call_count == 2
-            mock_reg.assert_called_once_with(layer,
-                                             device=layer.w13_weight.device)
-            mock_prebuild.assert_called_once_with(topk=2,
-                                                  activation="silu",
-                                                  use_ep=False)
+            mock_reg.assert_called_once_with(layer, device=layer.w13_weight.device)
+            mock_prebuild.assert_called_once_with(
+                topk=2, activation="silu", use_ep=False
+            )
 
         assert layer.w13_weight.shape == (E, H, two_i)
         assert layer.w2_weight.shape == (E, inter, H)
@@ -471,92 +498,95 @@ class TestNvfp4MoEMethod:
         monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", 32)
         E, two_i, H, group_size = 2, 64, 64, 16
         inter = two_i // 2  # 32; both H=64 and inter=32 are divisible by 32
-        layer = FakeRoutedExperts(num_experts=E,
-                                  activation="silu",
-                                  use_ep=False)
+        layer = FakeRoutedExperts(num_experts=E, activation="silu", use_ep=False)
 
-        layer.w13_weight = torch.nn.Parameter(torch.randint(0,
-                                                            256,
-                                                            (E, two_i, H // 2),
-                                                            dtype=torch.uint8),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(torch.randint(0,
-                                                           256,
-                                                           (E, H, inter // 2),
-                                                           dtype=torch.uint8),
-                                             requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(torch.ones(
-            E, two_i, H // group_size, dtype=torch.float32),
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(torch.ones(
-            E, H, inter // group_size, dtype=torch.float32),
-                                                   requires_grad=False)
-        layer.w13_weight_scale_2 = torch.nn.Parameter(torch.ones(
-            E, 2, dtype=torch.float32),
-                                                      requires_grad=False)
-        layer.w2_weight_scale_2 = torch.nn.Parameter(torch.ones(
-            E, dtype=torch.float32),
-                                                     requires_grad=False)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, two_i, H // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(E, two_i, H // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(E, H, inter // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(E, 2, dtype=torch.float32), requires_grad=False
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(E, dtype=torch.float32), requires_grad=False
+        )
 
         method = VllmNvfp4MoEMethod(
             MagicMock(group_size=group_size),
-            MagicMock(has_bias=False, is_act_and_mul=True))
+            MagicMock(has_bias=False, is_act_and_mul=True),
+        )
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.requant_load_kmajor_fp4"
-        ) as mock_requant, patch(
+            ) as mock_requant,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.prebuild_fused_moe_kernel"
+            ),
         ):
-            mock_requant.return_value = (torch.zeros(E,
-                                                     64,
-                                                     64,
-                                                     dtype=torch.uint8),
-                                         torch.zeros(E, 2, 1, 64))
+            mock_requant.return_value = (
+                torch.zeros(E, 64, 64, dtype=torch.uint8),
+                torch.zeros(E, 2, 1, 64),
+            )
             method.process_weights_after_loading(layer)
             assert mock_requant.call_count == 2
 
-    def test_process_weights_w4a8_torch_requant_with_padding(
-            self, monkeypatch):
+    def test_process_weights_w4a8_torch_requant_with_padding(self, monkeypatch):
         monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", 32)
         E, two_i, H, group_size = 2, 32, 64, 16
         inter = two_i // 2  # 16; H=64 divisible by 32, but inter=16 is NOT
-        layer = FakeRoutedExperts(num_experts=E,
-                                  activation="silu",
-                                  use_ep=False)
+        layer = FakeRoutedExperts(num_experts=E, activation="silu", use_ep=False)
 
-        layer.w13_weight = torch.nn.Parameter(torch.randint(0,
-                                                            256,
-                                                            (E, two_i, H // 2),
-                                                            dtype=torch.uint8),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(torch.randint(0,
-                                                           256,
-                                                           (E, H, inter // 2),
-                                                           dtype=torch.uint8),
-                                             requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(torch.ones(
-            E, two_i, H // group_size, dtype=torch.float32),
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(torch.ones(
-            E, H, inter // group_size, dtype=torch.float32),
-                                                   requires_grad=False)
-        layer.w13_weight_scale_2 = torch.nn.Parameter(torch.ones(
-            E, 2, dtype=torch.float32),
-                                                      requires_grad=False)
-        layer.w2_weight_scale_2 = torch.nn.Parameter(torch.ones(
-            E, dtype=torch.float32),
-                                                     requires_grad=False)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, two_i, H // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(E, two_i, H // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(E, H, inter // group_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(E, 2, dtype=torch.float32), requires_grad=False
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(E, dtype=torch.float32), requires_grad=False
+        )
 
         method = VllmNvfp4MoEMethod(
             MagicMock(group_size=group_size),
-            MagicMock(has_bias=False, is_act_and_mul=True))
+            MagicMock(has_bias=False, is_act_and_mul=True),
+        )
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4._requant_moe_w4a8"
-        ) as mock_torch_requant, patch(
+            ) as mock_torch_requant,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
-        ) as mock_load, patch(
+            ) as mock_load,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.prebuild_fused_moe_kernel"
+            ),
         ):
             mock_torch_requant.return_value = (
                 torch.zeros(E, 64, 32, dtype=torch.uint8),
@@ -573,38 +603,39 @@ class TestNvfp4MoEMethod:
         layer = FakeRoutedExperts(use_ep=True)
         E, two_i, H, group_size = 2, 32, 64, 16
         inter = two_i // 2
-        layer.w13_weight = torch.nn.Parameter(torch.empty(E,
-                                                          two_i,
-                                                          H // 2,
-                                                          dtype=torch.uint8),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(torch.empty(E,
-                                                         H,
-                                                         inter // 2,
-                                                         dtype=torch.uint8),
-                                             requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(torch.ones(
-            E, two_i, H // group_size),
-                                                    requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(torch.ones(
-            E, H, inter // group_size),
-                                                   requires_grad=False)
-        layer.w13_weight_scale_2 = torch.nn.Parameter(torch.ones(E, 2),
-                                                      requires_grad=False)
-        layer.w2_weight_scale_2 = torch.nn.Parameter(torch.ones(E),
-                                                     requires_grad=False)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.empty(E, two_i, H // 2, dtype=torch.uint8), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            torch.empty(E, H, inter // 2, dtype=torch.uint8), requires_grad=False
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(E, two_i, H // group_size), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(E, H, inter // group_size), requires_grad=False
+        )
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            torch.ones(E, 2), requires_grad=False
+        )
+        layer.w2_weight_scale_2 = torch.nn.Parameter(torch.ones(E), requires_grad=False)
 
         method = VllmNvfp4MoEMethod(
             MagicMock(group_size=group_size),
-            MagicMock(has_bias=False, is_act_and_mul=True))
+            MagicMock(has_bias=False, is_act_and_mul=True),
+        )
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4",
-                side_effect=lambda t: t
-        ), patch(
+                side_effect=lambda t: t,
+            ),
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.moe_routing.validate_linear_ep_placement"
-        ) as mock_ep, patch(
+            ) as mock_ep,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.prebuild_fused_moe_kernel"
+            ),
         ):
             method.process_weights_after_loading(layer)
             mock_ep.assert_called_once_with(layer)
@@ -622,20 +653,24 @@ class TestNvfp4MoEMethod:
         x = torch.randn(4, 64)
         router_logits = torch.randn(4, 4)
         topk_weights = torch.full((4, 2), 0.5)
-        topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]],
-                                dtype=torch.int32)
+        topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int32)
 
         method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
         method._tpu_activation_str = "silu"
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.moe_routing.route",
-                return_value=(topk_weights, topk_ids)
-        ), patch(
+                return_value=(topk_weights, topk_ids),
+            ),
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.fused_moe_gmm"
-        ) as mock_gmm, patch(
+            ) as mock_gmm,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
-                return_value=False):
+                return_value=False,
+            ),
+        ):
             mock_gmm.return_value = torch.ones(4, 64)
             out = method.apply_monolithic(layer, x, router_logits)
             assert torch.equal(out, torch.ones(4, 64))
@@ -658,15 +693,22 @@ class TestNvfp4MoEMethod:
         method = VllmNvfp4MoEMethod(MagicMock(group_size=16), layer.moe_config)
         method._tpu_activation_str = "silu"
 
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.moe_routing.route",
-                return_value=(torch.full(
-                    (4, 2), 0.5), torch.zeros((4, 2), dtype=torch.int32))
-        ), patch(
+                return_value=(
+                    torch.full((4, 2), 0.5),
+                    torch.zeros((4, 2), dtype=torch.int32),
+                ),
+            ),
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.pipelined_fused_moe_gmm"
-        ) as mock_pipe, patch(
+            ) as mock_pipe,
+            patch(
                 "vllm_torchtpu.layers.adapter.quantization.nvfp4.enable_pipelined_collective_and_compute",
-                return_value=True):
+                return_value=True,
+            ),
+        ):
             mock_pipe.return_value = torch.ones(4, 64)
             out = method.apply_monolithic(layer, x, router_logits)
             assert torch.equal(out, torch.ones(4, 64))

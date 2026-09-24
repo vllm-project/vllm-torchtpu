@@ -37,34 +37,40 @@ _ROW_BYTES = 512
 _DEVICE_BLOCK_SIZE = 16
 _FACTOR = 1
 
-_GEOMETRY = (_KERNEL_BLOCK_SIZE, _PER_BLOCK_SHAPE, torch.bfloat16,
-             _DEVICE_BLOCK_SIZE)
+_GEOMETRY = (_KERNEL_BLOCK_SIZE, _PER_BLOCK_SHAPE, torch.bfloat16, _DEVICE_BLOCK_SIZE)
 
 
 def _kv_cache_config(num_tensors=3, num_blocks=4, page_bytes=None):
     page_bytes = page_bytes or _FACTOR * _ROW_BYTES
     tensors = [
-        KVCacheTensor(size=num_blocks * page_bytes * num_tensors,
-                      layers=[f"layers.{i}"],
-                      layer_stride=page_bytes,
-                      block_stride=page_bytes * num_tensors,
-                      offset=i * page_bytes) for i in range(num_tensors)
+        KVCacheTensor(
+            size=num_blocks * page_bytes * num_tensors,
+            layers=[f"layers.{i}"],
+            layer_stride=page_bytes,
+            block_stride=page_bytes * num_tensors,
+            offset=i * page_bytes,
+        )
+        for i in range(num_tensors)
     ]
-    return SimpleNamespace(kv_cache_tensors=tensors,
-                           num_blocks=num_blocks,
-                           kv_cache_groups=[MagicMock()])
+    return SimpleNamespace(
+        kv_cache_tensors=tensors, num_blocks=num_blocks, kv_cache_groups=[MagicMock()]
+    )
 
 
 def _resolve(kv_cache_config, flag=True):
     from vllm_torchtpu.offload import block_major_layout as bml
-    with patch.object(bml.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", flag), \
-         patch("vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
-               return_value=_GEOMETRY):
+
+    with (
+        patch.object(bml.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", flag),
+        patch(
+            "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+            return_value=_GEOMETRY,
+        ),
+    ):
         return bml.resolve_block_major_contract(MagicMock(), kv_cache_config)
 
 
 class TestContractResolution(unittest.TestCase):
-
     def test_flag_off_returns_none(self):
         """Verifies that contract resolution returns None when VLLM_TPU_BLOCK_MAJOR_KV is disabled."""
         self.assertIsNone(_resolve(_kv_cache_config(), flag=False))
@@ -105,20 +111,29 @@ class TestContractResolution(unittest.TestCase):
     def test_factor_gt_one_fails_closed(self):
         """Verifies that device_block_size != kernel_block_size (factor > 1) fails closed."""
         from vllm_torchtpu.offload import block_major_layout as bml
-        geometry = (_KERNEL_BLOCK_SIZE, _PER_BLOCK_SHAPE, torch.bfloat16,
-                    2 * _KERNEL_BLOCK_SIZE)
+
+        geometry = (
+            _KERNEL_BLOCK_SIZE,
+            _PER_BLOCK_SHAPE,
+            torch.bfloat16,
+            2 * _KERNEL_BLOCK_SIZE,
+        )
         config = _kv_cache_config(page_bytes=2 * _ROW_BYTES)
-        with patch.object(bml.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", True), \
-             patch(
-                 "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
-                 return_value=geometry), self.assertRaisesRegex(ValueError, "factor"):
+        with (
+            patch.object(bml.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", True),
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+                return_value=geometry,
+            ),
+            self.assertRaisesRegex(ValueError, "factor"),
+        ):
             bml.resolve_block_major_contract(MagicMock(), config)
 
 
 class TestNamespaceIsolation(unittest.TestCase):
-
     def _namespace(self, contract):
         from vllm_torchtpu.offload.raiden_store import derive_offload_namespace
+
         vllm_config = MagicMock()
         vllm_config.model_config.model = "m"
         vllm_config.model_config.revision = None
@@ -149,14 +164,13 @@ class TestNamespaceIsolation(unittest.TestCase):
 
 
 class TestWorkerBundledView(unittest.TestCase):
-
     def _make_worker(self, kv_caches, contract):
-        from vllm_torchtpu.offload.raiden_store import \
-            RaidenStoreOffloadingWorker
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
         with patch(
-                "vllm_torchtpu.offload.raiden_store."
-                "resolve_kernel_geometry",
-                return_value=_GEOMETRY):
+            "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+            return_value=_GEOMETRY,
+        ):
             return RaidenStoreOffloadingWorker(
                 kv_caches,
                 vllm_config=MagicMock(),
@@ -169,20 +183,25 @@ class TestWorkerBundledView(unittest.TestCase):
             )
 
     def _canonical(self, num_tensors, num_blocks, page_bytes):
-        from vllm.v1.kv_offload.base import (CanonicalKVCacheRef,
-                                             CanonicalKVCaches,
-                                             CanonicalKVCacheTensor)
+        from vllm.v1.kv_offload.base import (
+            CanonicalKVCacheRef,
+            CanonicalKVCaches,
+            CanonicalKVCacheTensor,
+        )
+
         tensors = [
-            CanonicalKVCacheTensor(tensor=torch.zeros(num_blocks,
-                                                      page_bytes,
-                                                      dtype=torch.int8),
-                                   page_size_bytes=page_bytes)
+            CanonicalKVCacheTensor(
+                tensor=torch.zeros(num_blocks, page_bytes, dtype=torch.int8),
+                page_size_bytes=page_bytes,
+            )
             for _ in range(num_tensors)
         ]
-        refs = [[
-            CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_bytes)
-            for i in range(num_tensors)
-        ]]
+        refs = [
+            [
+                CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_bytes)
+                for i in range(num_tensors)
+            ]
+        ]
         return CanonicalKVCaches(tensors=tensors, group_data_refs=refs)
 
     def test_bundled_view_shape(self):
@@ -193,10 +212,11 @@ class TestWorkerBundledView(unittest.TestCase):
         kv_caches = self._canonical(1, num_blocks, bundle_page)
         worker = self._make_worker(kv_caches, contract)
         try:
-            (view, ) = worker._device_tensors[0]
-            self.assertEqual(tuple(view.shape),
-                             (num_blocks * _FACTOR, contract.fragment_count) +
-                             _PER_BLOCK_SHAPE)
+            (view,) = worker._device_tensors[0]
+            self.assertEqual(
+                tuple(view.shape),
+                (num_blocks * _FACTOR, contract.fragment_count) + _PER_BLOCK_SHAPE,
+            )
             self.assertEqual(view.dtype, torch.bfloat16)
         finally:
             worker.shutdown()
@@ -214,9 +234,8 @@ class TestWorkerBundledView(unittest.TestCase):
         worker = self._make_worker(kv_caches, None)
         try:
             self.assertEqual(len(worker._device_tensors), 3)
-            (view, ) = worker._device_tensors[0]
-            self.assertEqual(tuple(view.shape),
-                             (4 * _FACTOR, ) + _PER_BLOCK_SHAPE)
+            (view,) = worker._device_tensors[0]
+            self.assertEqual(tuple(view.shape), (4 * _FACTOR,) + _PER_BLOCK_SHAPE)
         finally:
             worker.shutdown()
 

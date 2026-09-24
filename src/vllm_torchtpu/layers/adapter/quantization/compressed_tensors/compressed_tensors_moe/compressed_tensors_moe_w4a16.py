@@ -81,6 +81,18 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    # Both of the following would otherwise be inherited, and upstream reads
+    # self.wna16_backend in each - set only by the __init__ skipped above. The
+    # TPU path never builds an upstream MoE kernel (apply_monolithic calls the
+    # GMM kernels directly), so it has no quant config to hand over and no
+    # backend that could rebalance experts. Same as the fp8 and nvfp4 methods.
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
+
+    @property
+    def supports_eplb(self) -> bool:
+        return False
+
     @property
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)

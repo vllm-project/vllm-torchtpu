@@ -20,16 +20,23 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig, VllmConfig)
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import (
-    AttentionMetadata, AttentionMetadataBuilder,
-    AttentionMetadataBuilderContext)
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    AttentionMetadataBuilderContext,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
@@ -39,7 +46,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
-        ["request-0", "request-1"], [7, 12])
+        ["request-0", "request-1"], [7, 12]
+    )
 
     assert all_token_ids == {
         "request-0": [0] * 8,
@@ -79,19 +87,24 @@ def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
         _warmup_one_pcp_mtp_prefill=attempts,
     )
 
-    expectation = (pytest.raises(
-        RuntimeError, match="PCP MTP prefill warmup failed after retry")
-                   if raises_after_retry else contextlib.nullcontext())
-    with patch.object(tpu_runner,
-                      "_suspend_kv_transfer_group",
-                      return_value=contextlib.nullcontext()), expectation:
+    expectation = (
+        pytest.raises(RuntimeError, match="PCP MTP prefill warmup failed after retry")
+        if raises_after_retry
+        else contextlib.nullcontext()
+    )
+    with (
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+        expectation,
+    ):
         TPUModelRunner._warmup_pcp_mtp_prefill(runner)
 
     assert attempts.call_args_list == [
-        ((4096, ), {
-            "quiet": True
-        }),
-        ((4096, ), {}),
+        ((4096,), {"quiet": True}),
+        ((4096,), {}),
     ]
 
 
@@ -126,8 +139,7 @@ def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
-    runner._warmup_spec_decode_cleanup.assert_called_once_with(
-        "__pcp_mtp_warmup__")
+    runner._warmup_spec_decode_cleanup.assert_called_once_with("__pcp_mtp_warmup__")
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -137,17 +149,20 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     fake = SimpleNamespace(
         _pre_async_results=SimpleNamespace(
             req_id_to_index_copy=req_id_to_index_copy,
-            spec_decode_num_rejected_tokens=(None
-                                             if spec_k is None else object())),
-        speculative_config=(None if spec_k is None else SimpleNamespace(
-            num_speculative_tokens=spec_k)),
+            spec_decode_num_rejected_tokens=(None if spec_k is None else object()),
+        ),
+        speculative_config=(
+            None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
+        ),
         _last_sequence_layout_plan=None,
-        input_batch=SimpleNamespace(req_ids=req_ids))
+        input_batch=SimpleNamespace(req_ids=req_ids),
+    )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
         start_index=0,
         num_reqs=len(req_ids),
-        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32))
+        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32),
+    )
     return cur.tolist(), src.tolist()
 
 
@@ -185,37 +200,41 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     runner = SimpleNamespace()
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
-    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
-               return_value=True), patch(
-                   "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
-                   return_value=connector):
-        result = TPUModelRunner.get_finished_kv_transfers(
-            runner, scheduler_output)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
     assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, None)
     connector.get_finished.assert_called_once_with({"finished"})
     connector.get_block_ids_with_load_errors.assert_called_once_with()
-    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with(
-    )
+    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
     connector.clear_connector_metadata.assert_called_once_with()
 
 
 def test_no_forward_output_preserves_invalid_block_ids():
     runner = SimpleNamespace(
         maybe_setup_kv_connector=MagicMock(),
-        get_finished_kv_transfers=MagicMock(return_value=(set(),
-                                                          {"failed-load"},
-                                                          None, {41, 43}, 2,
-                                                          None)),
+        get_finished_kv_transfers=MagicMock(
+            return_value=(set(), {"failed-load"}, None, {41, 43}, 2, None)
+        ),
     )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
 
     with patch(
-            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
-            return_value=False):
+        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+        return_value=False,
+    ):
         output = TPUModelRunner.kv_connector_no_forward(
-            runner, scheduler_output, vllm_config)
+            runner, scheduler_output, vllm_config
+        )
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
@@ -224,11 +243,14 @@ def test_no_forward_output_preserves_invalid_block_ids():
 
 
 def test_build_kv_connector_output_supports_vllm_023():
-    with patch.object(
+    with (
+        patch.object(
             tpu_runner,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
-    ), patch.object(tpu_runner, "KVConnectorOutput") as output_cls:
+        ),
+        patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
+    ):
         tpu_runner._build_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
@@ -246,12 +268,11 @@ def test_build_kv_connector_output_supports_vllm_023():
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery(
-):
+def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
-            tpu_runner,
-            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
-            False,
+        tpu_runner,
+        "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+        False,
     ):
         out = tpu_runner._build_kv_connector_output(
             finished_sending=None,
@@ -264,23 +285,29 @@ def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recover
         assert out.invalid_block_ids == {41, 43}
 
 
-def _fake_phased_runner(additional_config=None,
-                        torch_profiler_dir="/tmp/phased",
-                        max_iterations=0,
-                        delay_iterations=0,
-                        profiler_rank=2,
-                        profiler_world_size=4):
+def _fake_phased_runner(
+    additional_config=None,
+    torch_profiler_dir="/tmp/phased",
+    max_iterations=0,
+    delay_iterations=0,
+    profiler_rank=2,
+    profiler_world_size=4,
+):
     """A stand-in for TPUModelRunner carrying only what phased profiling reads.
 
     No parallel_config: the phased profiler must not reach for it.
     """
     return SimpleNamespace(
-        vllm_config=SimpleNamespace(additional_config=additional_config
-                                    if additional_config is not None else {},
-                                    profiler_config=SimpleNamespace(
-                                        torch_profiler_dir=torch_profiler_dir,
-                                        max_iterations=max_iterations,
-                                        delay_iterations=delay_iterations)),
+        vllm_config=SimpleNamespace(
+            additional_config=additional_config
+            if additional_config is not None
+            else {},
+            profiler_config=SimpleNamespace(
+                torch_profiler_dir=torch_profiler_dir,
+                max_iterations=max_iterations,
+                delay_iterations=delay_iterations,
+            ),
+        ),
         _profiler_rank=profiler_rank,
         _profiler_world_size=profiler_world_size,
     )
@@ -346,7 +373,7 @@ class TestStartStopPhasedProfiling:
         """Phased mode is on, but there is nowhere to write traces."""
         runner = _init_phased_runner(monkeypatch, torch_profiler_dir="")
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -364,7 +391,7 @@ class TestStartStopPhasedProfiling:
             delay_iterations=3,
         )
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -377,14 +404,14 @@ class TestStartStopPhasedProfiling:
             decode_kv_len_threshold=128,
             prefill_kv_len_threshold=4096,
             standard_opts={
-                'host_tracer_level': 2,
-                'device_tracer_level': 1,
-                'python_tracer_level': 1
+                "host_tracer_level": 2,
+                "device_tracer_level": 1,
+                "python_tracer_level": 1,
             },
             advanced_opts={
-                'tpu_trace_mode': 'TRACE_COMPUTE',
-                'tpu_num_sparse_cores_to_trace': 1,
-                'tpu_num_sparse_core_tiles_to_trace': 1
+                "tpu_trace_mode": "TRACE_COMPUTE",
+                "tpu_num_sparse_cores_to_trace": 1,
+                "tpu_num_sparse_core_tiles_to_trace": 1,
             },
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
@@ -394,7 +421,7 @@ class TestStartStopPhasedProfiling:
         it names the run, and the phase subdirectories sit beneath it."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner, "decode")
 
@@ -403,7 +430,7 @@ class TestStartStopPhasedProfiling:
     def test_profiler_kwargs_overrides_options(self, monkeypatch):
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(
                 runner,
@@ -415,17 +442,23 @@ class TestStartStopPhasedProfiling:
             )
 
         assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
-        assert mock_profiler_cls.call_args.kwargs["standard_opts"][
-            "host_tracer_level"] == 3
-        assert mock_profiler_cls.call_args.kwargs["advanced_opts"][
-            "e2e_enable_fw_throttle_event"] is True
+        assert (
+            mock_profiler_cls.call_args.kwargs["standard_opts"]["host_tracer_level"]
+            == 3
+        )
+        assert (
+            mock_profiler_cls.call_args.kwargs["advanced_opts"][
+                "e2e_enable_fw_throttle_event"
+            ]
+            is True
+        )
 
     def test_start_twice_is_a_noop(self, monkeypatch):
         """Already armed; a second /start_profile must not replace it and
         lose the phases it has already marked as seen."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             first_profiler = runner.phase_based_profiler
@@ -438,11 +471,11 @@ class TestStartStopPhasedProfiling:
         """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
         rank 0, so their traces would collide. The worker passes the
         slice-global rank instead, and it is the only source."""
-        runner = _init_phased_runner(monkeypatch,
-                                     profiler_rank=9,
-                                     profiler_world_size=16)
+        runner = _init_phased_runner(
+            monkeypatch, profiler_rank=9, profiler_world_size=16
+        )
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -450,26 +483,27 @@ class TestStartStopPhasedProfiling:
         assert mock_profiler_cls.call_args.kwargs["world_size"] == 16
 
     def test_falls_back_to_default_num_steps_when_max_iterations_unset(
-            self, monkeypatch):
-        runner = _init_phased_runner(monkeypatch,
-                                     max_iterations=0,
-                                     delay_iterations=0)
+        self, monkeypatch
+    ):
+        runner = _init_phased_runner(monkeypatch, max_iterations=0, delay_iterations=0)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
         assert (
-            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
-            runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"]
+            == runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
+        )
         assert (
-            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
-            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"]
+            == runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD
+        )
 
     def test_stop_finishes_and_clears_the_profiler(self, monkeypatch):
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             armed_profiler = mock_profiler_cls.return_value
@@ -488,9 +522,8 @@ class TestStartStopPhasedProfiling:
 
 
 class TestTPURunner:
-
     def setup_method(self):
-        self.mock_device = torch.device('cpu')
+        self.mock_device = torch.device("cpu")
 
         model_config = ModelConfig(
             tokenizer_mode="auto",
@@ -539,9 +572,8 @@ class TestTPURunner:
         self.runner.speculative_config = None
 
         self._find_non_ssm_backend_patcher = patch.object(
-            TpuPlatform,
-            '_find_non_ssm_backend',
-            return_value=PallasAttentionBackend)
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
+        )
         self._find_non_ssm_backend_patcher.start()
 
     def teardown_method(self):
@@ -553,23 +585,33 @@ class TestTPURunner:
         saves (OffloadingConnector jobs_to_flush) can fence in-flight
         stores before the forward overwrites their source blocks."""
         self.runner.maybe_setup_kv_connector = (
-            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner))
+            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner)
+        )
         connector = MagicMock()
         scheduler_output = MagicMock()
         meta = scheduler_output.kv_connector_metadata
 
-        with patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                   return_value=True), \
-                patch('vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group',
-                      return_value=connector):
+        with (
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
             self.runner.maybe_setup_kv_connector(scheduler_output)
 
         connector.handle_preemptions.assert_called_once_with(meta)
         connector.bind_connector_metadata.assert_called_once_with(meta)
         connector.start_load_kv.assert_called_once_with(None)
         names = [c[0] for c in connector.mock_calls]
-        assert names.index('handle_preemptions') < names.index(
-            'bind_connector_metadata') < names.index('start_load_kv')
+        assert (
+            names.index("handle_preemptions")
+            < names.index("bind_connector_metadata")
+            < names.index("start_load_kv")
+        )
 
     def test_mrope_positions_buffer_is_int32(self):
         """Run the real TPUModelRunner.__init__ (with parent's __init__ and
@@ -581,26 +623,32 @@ class TestTPURunner:
         self.runner.uses_mrope = True
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
-        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(
-            self.runner)
+        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
 
-        with patch.object(GPUModelRunner, '__init__', return_value=None), \
-             patch('vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper',
-                   side_effect=lambda: contextlib.nullcontext()), \
-             patch('vllm_torchtpu.runner.tpu_runner._validate_libtpu_version'
-                   ), \
-             patch.object(TPUModelRunner,
-                          '_create_mesh_for_parallelism',
-                          return_value=MagicMock()):
-            TPUModelRunner.__init__(self.runner,
-                                    self.runner.vllm_config,
-                                    self.mock_device,
-                                    profiler_rank=0,
-                                    profiler_world_size=1)
+        with (
+            patch.object(GPUModelRunner, "__init__", return_value=None),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper",
+                side_effect=lambda: contextlib.nullcontext(),
+            ),
+            patch("vllm_torchtpu.runner.tpu_runner._validate_libtpu_version"),
+            patch.object(
+                TPUModelRunner, "_create_mesh_for_parallelism", return_value=MagicMock()
+            ),
+        ):
+            TPUModelRunner.__init__(
+                self.runner,
+                self.runner.vllm_config,
+                self.mock_device,
+                profiler_rank=0,
+                profiler_world_size=1,
+            )
 
         assert self.runner.mrope_positions.cpu.dtype == torch.int32
         assert self.runner.mrope_positions.cpu.shape == (
-            3, self.runner.max_num_tokens + 1)
+            3,
+            self.runner.max_num_tokens + 1,
+        )
         assert self.runner.mrope_positions.np.dtype == np.int32
 
 
@@ -609,39 +657,44 @@ class TestAttentionMetadataBuilder:
     runner-state path used in _prepare_inputs and the position_ids_override
     path used in _dummy_run."""
 
-    def _make_runner_mock(self,
-                          most_model_len=None,
-                          num_groups=1,
-                          max_num_blocks_per_req=4,
-                          max_num_reqs=4):
+    def _make_runner_mock(
+        self,
+        most_model_len=None,
+        num_groups=1,
+        max_num_blocks_per_req=4,
+        max_num_reqs=4,
+    ):
         runner = MagicMock()
         runner.device = torch.device("cpu")
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
-        runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
+        runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
 
         block_tables = []
         for gid in range(num_groups):
             bt = MagicMock()
             bt.max_num_blocks_per_req = max_num_blocks_per_req
             bt.get_cpu_tensor.return_value = (
-                torch.arange(max_num_reqs * max_num_blocks_per_req,
-                             dtype=torch.int32).reshape(
-                                 max_num_reqs, max_num_blocks_per_req) +
-                gid * 100)
+                torch.arange(
+                    max_num_reqs * max_num_blocks_per_req, dtype=torch.int32
+                ).reshape(max_num_reqs, max_num_blocks_per_req)
+                + gid * 100
+            )
             block_tables.append(bt)
         runner.input_batch.block_table = block_tables
         return runner
 
     def _make_builder(self, runner, kv_cache_group_id=0, spec=None):
         if spec is None:
-            spec = FullAttentionSpec(block_size=16,
-                                     num_kv_heads=2,
-                                     head_size=128,
-                                     dtype=torch.bfloat16,
-                                     page_size_padded=16384)
+            spec = FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            )
         return AttentionMetadataBuilder(
             kv_cache_spec=spec,
             layer_names=["attn.0"],
@@ -682,8 +735,8 @@ class TestAttentionMetadataBuilder:
         )
 
         meta = builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=self._make_cm(target_num_reqs))
+            common_prefix_len=0, common_attn_metadata=self._make_cm(target_num_reqs)
+        )
 
         assert isinstance(meta, AttentionMetadata)
         assert meta.input_positions is runner.position_ids
@@ -697,17 +750,18 @@ class TestAttentionMetadataBuilder:
 
         # Flattened (target_num_reqs * max_num_blocks_per_req,); first
         # num_reqs rows from the source slice, rest zero-padded.
-        max_num_blocks = runner.input_batch.block_table[
-            1].max_num_blocks_per_req
-        block_tables_2d = meta.block_tables.reshape(target_num_reqs,
-                                                    max_num_blocks)
+        max_num_blocks = runner.input_batch.block_table[1].max_num_blocks_per_req
+        block_tables_2d = meta.block_tables.reshape(target_num_reqs, max_num_blocks)
         src = runner.input_batch.block_table[1].get_cpu_tensor.return_value
-        assert torch.equal(block_tables_2d[:num_reqs],
-                           src[start_index:start_index + num_reqs])
+        assert torch.equal(
+            block_tables_2d[:num_reqs], src[start_index : start_index + num_reqs]
+        )
         assert torch.equal(
             block_tables_2d[num_reqs:],
-            torch.zeros((target_num_reqs - num_reqs, max_num_blocks),
-                        dtype=torch.int32))
+            torch.zeros(
+                (target_num_reqs - num_reqs, max_num_blocks), dtype=torch.int32
+            ),
+        )
 
     def test_build_position_ids_override(self):
         """_dummy_run path: position_ids_override is forwarded as-is and the
@@ -720,26 +774,23 @@ class TestAttentionMetadataBuilder:
             num_reqs=4,
             start_index=0,
             use_max_model_len=True,
-            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            seq_lens=torch.ones((4,), dtype=torch.int32),
             query_start_loc=torch.arange(5, dtype=torch.int32),
             request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
             position_ids_override=override,
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         assert meta.input_positions is override
         runner.input_batch.block_table[0].get_cpu_tensor.assert_not_called()
-        assert torch.equal(meta.block_tables,
-                           torch.zeros((4 * 4, ), dtype=torch.int32))
+        assert torch.equal(meta.block_tables, torch.zeros((4 * 4,), dtype=torch.int32))
 
     def test_build_most_model_len_shrinks_block_table(self):
         """When use_max_model_len is False, target_num_blocks =
         cdiv(most_model_len, block_size) — smaller than the per-group
         max_num_blocks_per_req, so the H2D copy is shorter."""
-        runner = self._make_runner_mock(most_model_len=32,
-                                        max_num_blocks_per_req=8)
+        runner = self._make_runner_mock(most_model_len=32, max_num_blocks_per_req=8)
         builder = self._make_builder(runner)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -751,11 +802,10 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
-        assert meta.block_tables.shape == (4 * 2, )
+        assert meta.block_tables.shape == (4 * 2,)
 
     def test_unified_mamba_state_indices_derive_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
@@ -777,11 +827,11 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
-        assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 6, 0, 0], dtype=torch.int32))
+        assert torch.equal(
+            meta.mamba_state_indices, torch.tensor([0, 6, 0, 0], dtype=torch.int32)
+        )
 
     def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
@@ -792,11 +842,14 @@ class TestAttentionMetadataBuilder:
             dtypes=[torch.bfloat16],
             page_size_padded=256,
         )
-        with patch(
+        with (
+            patch(
                 "vllm_torchtpu.layers.core.attention_metadata.get_dcp_group"
-        ) as mock_dcp, patch(
+            ) as mock_dcp,
+            patch(
                 "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
-        ) as mock_pcp:
+            ) as mock_pcp,
+        ):
             mock_dcp.return_value.world_size = 4
             mock_pcp.return_value.world_size = 1
             builder = self._make_builder(runner, spec=mamba_spec)
@@ -810,12 +863,12 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         assert builder.target_block_size == 64
-        assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 5, 0, 0], dtype=torch.int32))
+        assert torch.equal(
+            meta.mamba_state_indices, torch.tensor([0, 5, 0, 0], dtype=torch.int32)
+        )
 
 
 class TestCompactMambaSlotPool:
@@ -829,32 +882,30 @@ class TestCompactMambaSlotPool:
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
-        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs,
-                                                     dtype=torch.int32)
+        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
         runner.input_batch = MagicMock()
         # Bind the real methods.
-        runner._init_mamba_slot_pool = (
-            TPUModelRunner._init_mamba_slot_pool.__get__(runner))
+        runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
+            runner
+        )
         runner._build_mamba_state_indices = (
-            TPUModelRunner._build_mamba_state_indices.__get__(runner))
+            TPUModelRunner._build_mamba_state_indices.__get__(runner)
+        )
         return runner
 
     def _set_batch(self, runner, req_ids):
         """Set the persistent batch to the given ordered req_ids."""
         runner.input_batch.req_ids = list(req_ids)
-        runner.input_batch.req_id_to_index = {
-            r: i
-            for i, r in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
     def test_unique_slots_and_null_tail(self):
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)  # usable slots 1..4, slot 0 = null
         self._set_batch(runner, ["a", "b"])
 
-        idx = runner._build_mamba_state_indices(start_index=0,
-                                                num_reqs=2,
-                                                target_num_reqs=4).cpu()
+        idx = runner._build_mamba_state_indices(
+            start_index=0, num_reqs=2, target_num_reqs=4
+        ).cpu()
         # Two active requests get distinct non-null slots.
         assert idx[0] != 0 and idx[1] != 0
         assert idx[0] != idx[1]
@@ -875,9 +926,9 @@ class TestCompactMambaSlotPool:
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, [])  # idle rank: nothing scheduled
 
-        idx = runner._build_mamba_state_indices(start_index=0,
-                                                num_reqs=4,
-                                                target_num_reqs=4).cpu()
+        idx = runner._build_mamba_state_indices(
+            start_index=0, num_reqs=4, target_num_reqs=4
+        ).cpu()
         # Every position is the null slot: no real request to address, and
         # the dummy forward must not touch a live request's state.
         assert [int(v) for v in idx] == [0, 0, 0, 0]
@@ -937,7 +988,7 @@ class TestCompactMambaSlotPool:
             int(idx_chunk0[0]),
             int(idx_chunk0[1]),
             int(idx_chunk1[0]),
-            int(idx_chunk1[1])
+            int(idx_chunk1[1]),
         }
         assert slots == {1, 2, 3, 4}
 
@@ -945,9 +996,7 @@ class TestCompactMambaSlotPool:
         """With speculative decoding each request owns a group of `stride`
         consecutive slots; the pool hands out only the group *bases*."""
         # num_spec = 2 -> stride 3; max_num_reqs = 3 -> 3*3 + 1 = 10 blocks.
-        runner = self._make_runner(max_num_reqs=3,
-                                   mamba_num_blocks=10,
-                                   slot_stride=3)
+        runner = self._make_runner(max_num_reqs=3, mamba_num_blocks=10, slot_stride=3)
         runner._init_mamba_slot_pool(10)
         # Group bases are 1, 4, 7 (slot 0 is the null block); the interior
         # checkpoint slots (2,3,5,6,8,9) are never handed out directly.
@@ -959,9 +1008,7 @@ class TestCompactMambaSlotPool:
 
     def test_spec_decode_stride_one_matches_plain_layout(self):
         """stride 1 (spec decode disabled) reproduces the dense layout."""
-        runner = self._make_runner(max_num_reqs=4,
-                                   mamba_num_blocks=5,
-                                   slot_stride=1)
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5, slot_stride=1)
         runner._init_mamba_slot_pool(5)
         assert sorted(runner._free_mamba_slots) == [1, 2, 3, 4]
 
@@ -975,8 +1022,9 @@ class TestReorderBatchForRpa:
     def _make_runner(self):
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
-        runner._reorder_batch_for_rpa = (
-            TPUModelRunner._reorder_batch_for_rpa.__get__(runner))
+        runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
+            runner
+        )
         return runner
 
     def _batch(self, runner, req_ids):
@@ -992,8 +1040,8 @@ class TestReorderBatchForRpa:
     def _sched(self, num_scheduled, spec_reqs=()):
         return SimpleNamespace(
             num_scheduled_tokens=num_scheduled,
-            scheduled_spec_decode_tokens={r: object()
-                                          for r in spec_reqs})
+            scheduled_spec_decode_tokens={r: object() for r in spec_reqs},
+        )
 
     def test_empty_batch(self):
         runner = self._make_runner()
@@ -1018,14 +1066,9 @@ class TestReorderBatchForRpa:
         runner = self._make_runner()
         self._batch(runner, ["pf", "vr", "dc", "vr2", "dc2"])
         # dc, dc2: 1-token decode; vr, vr2: multi-token spec verify; pf: prefill
-        sched = self._sched({
-            "pf": 16,
-            "vr": 3,
-            "dc": 1,
-            "vr2": 3,
-            "dc2": 1
-        },
-                            spec_reqs=("vr", "vr2"))
+        sched = self._sched(
+            {"pf": 16, "vr": 3, "dc": 1, "vr2": 3, "dc2": 1}, spec_reqs=("vr", "vr2")
+        )
         num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
         assert num_decode == 2
         assert num_windowed == 4
@@ -1039,12 +1082,7 @@ class TestReorderBatchForRpa:
         windowed segment covers all verify requests."""
         runner = self._make_runner()
         self._batch(runner, ["pf", "vr", "vr2"])
-        sched = self._sched({
-            "pf": 10,
-            "vr": 3,
-            "vr2": 3
-        },
-                            spec_reqs=("vr", "vr2"))
+        sched = self._sched({"pf": 10, "vr": 3, "vr2": 3}, spec_reqs=("vr", "vr2"))
         num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
         assert num_decode == 0
         assert num_windowed == 2
@@ -1057,20 +1095,19 @@ class TestInitializeAttentionKernelsThreshold:
     kernels `_initialize_attention_kernels` builds, draft layers included."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
-        from vllm_torchtpu.layers.adapter.attention import \
-            PallasAttentionBackendImpl
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
         runner = MagicMock(spec=TPUModelRunner)
         runner._attention_kernels_initialized = False
         runner.model = None
         runner.mesh = MagicMock()
         runner.vllm_config = MagicMock()
         runner.reorder_batch_threshold = 1
-        runner.drafter = SimpleNamespace(
-            _draft_attn_layer_names=set(draft_names))
-        runner.speculative_config = SimpleNamespace(
-            draft_tensor_parallel_size=draft_tp)
+        runner.drafter = SimpleNamespace(_draft_attn_layer_names=set(draft_names))
+        runner.speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
         runner._initialize_attention_kernels = (
-            TPUModelRunner._initialize_attention_kernels.__get__(runner))
+            TPUModelRunner._initialize_attention_kernels.__get__(runner)
+        )
         layers = {}
         for name, width in widths.items():
             impl = MagicMock(spec=PallasAttentionBackendImpl)
@@ -1079,9 +1116,13 @@ class TestInitializeAttentionKernelsThreshold:
         return runner, layers
 
     def _run(self, runner, layers):
-        with patch("vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
-                   return_value=layers), \
-             patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"):
+        with (
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+                return_value=layers,
+            ),
+            patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"),
+        ):
             runner._initialize_attention_kernels()
 
     def test_uniform_width(self):
@@ -1097,24 +1138,18 @@ class TestInitializeAttentionKernelsThreshold:
         assert runner.reorder_batch_threshold == 1
 
     def test_relocated_draft_forces_one_token_decode(self):
-        runner, layers = self._make_runner({
-            "target": 4,
-            "draft": 4
-        },
-                                           draft_names=("draft", ),
-                                           draft_tp=1)
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1
+        )
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 1
 
     def test_sharded_draft_keeps_width(self):
-        runner, layers = self._make_runner({
-            "target": 4,
-            "draft": 4
-        },
-                                           draft_names=("draft", ),
-                                           draft_tp=2)
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
+        )
         self._run(runner, layers)
         assert runner.reorder_batch_threshold == 4
 
@@ -1130,10 +1165,10 @@ class TestMambaSlotReadOffsets:
 
     def _make_runner(self, num_blocks=8):
         runner = MagicMock(spec=TPUModelRunner)
-        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
-                                                     dtype=torch.int32)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._update_mamba_slot_read_offsets = (
-            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner)
+        )
         return runner
 
     def test_noop_when_offsets_disabled(self):
@@ -1141,10 +1176,12 @@ class TestMambaSlotReadOffsets:
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = None
         runner._update_mamba_slot_read_offsets = (
-            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner)
+        )
         # Must not raise even with real-looking args.
-        runner._update_mamba_slot_read_offsets([torch.tensor([1, 4])],
-                                               torch.tensor([[10, -1]]), 2)
+        runner._update_mamba_slot_read_offsets(
+            [torch.tensor([1, 4])], torch.tensor([[10, -1]]), 2
+        )
 
     def test_verify_offsets_are_num_accepted_minus_one(self):
         """offset = (#valid tokens) - 1: full accept -> k, all-rejected -> 0."""
@@ -1152,8 +1189,9 @@ class TestMambaSlotReadOffsets:
         state_indices = torch.tensor([1, 4], dtype=torch.int32)
         # req at slot 1 accepted 3 tokens (2 drafts + bonus); req at slot 4
         # accepted only the bonus (both drafts rejected).
-        next_tokens = torch.tensor([[10, 11, 12],
-                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
         runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
         assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
         assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
@@ -1165,7 +1203,8 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         runner.mamba_slot_read_offsets[4] = 1
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4], dtype=torch.int32)], None, 2)
+            [torch.tensor([1, 4], dtype=torch.int32)], None, 2
+        )
         assert int(runner.mamba_slot_read_offsets[1]) == 0
         assert int(runner.mamba_slot_read_offsets[4]) == 0
 
@@ -1176,8 +1215,7 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
         state_indices = torch.tensor([1, 0], dtype=torch.int32)
-        next_tokens = torch.tensor([[10, 11],
-                                    [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        next_tokens = torch.tensor([[10, 11], [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
         runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
@@ -1189,10 +1227,10 @@ class TestMambaSlotReadOffsets:
         runner = self._make_runner(num_blocks=16)
         group0 = torch.tensor([3, 7], dtype=torch.int32)
         group1 = torch.tensor([11, 5], dtype=torch.int32)
-        next_tokens = torch.tensor([[10, 11, 12],
-                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens,
-                                               2)
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens, 2)
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
@@ -1215,15 +1253,16 @@ class TestReadOffsetsClearedOnReallocation:
 
     def _make_runner(self, num_blocks=8, width=2):
         runner = MagicMock(spec=TPUModelRunner)
-        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
-                                                     dtype=torch.int32)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
-            TPUModelRunner._mamba_state_index_groups.__get__(runner))
+            TPUModelRunner._mamba_state_index_groups.__get__(runner)
+        )
         runner._read_offset_reset_scratch = (
-            TPUModelRunner._read_offset_reset_scratch.__get__(runner))
+            TPUModelRunner._read_offset_reset_scratch.__get__(runner)
+        )
         runner._reset_read_offsets_for_new_requests = (
             TPUModelRunner._reset_read_offsets_for_new_requests.__get__(runner)
         )
@@ -1231,13 +1270,9 @@ class TestReadOffsetsClearedOnReallocation:
 
     def _set_batch(self, runner, req_ids, state_indices):
         runner.input_batch.req_ids = list(req_ids)
-        runner.input_batch.req_id_to_index = {
-            r: i
-            for i, r in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
         ctx = MagicMock()
-        ctx.mamba_state_indices = torch.tensor(state_indices,
-                                               dtype=torch.int32)
+        ctx.mamba_state_indices = torch.tensor(state_indices, dtype=torch.int32)
         ctx.unified_mamba_state_indices = None
         runner._attn_metadata_builder_ctx = ctx
 
@@ -1254,7 +1289,8 @@ class TestReadOffsetsClearedOnReallocation:
         runner._reset_read_offsets_for_new_requests(0, 1)
 
         assert int(runner.mamba_slot_read_offsets[5]) == 0, (
-            "new request inherited the previous request's checkpoint")
+            "new request inherited the previous request's checkpoint"
+        )
 
     def test_continuing_request_keeps_its_offset(self):
         """The reset must not clobber a request still mid-window."""
@@ -1293,23 +1329,17 @@ class TestUnifiedReadOffsetMigration:
     that is covered in tests/runner/test_mamba_state_seed_copies.py.
     """
 
-    def _make_runner(self,
-                     *,
-                     block_table,
-                     computed,
-                     scheduled,
-                     block_size=4,
-                     ckpt_window=1):
+    def _make_runner(
+        self, *, block_table, computed, scheduled, block_size=4, ckpt_window=1
+    ):
         runner = MagicMock(spec=TPUModelRunner)
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = block_size
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split",
-                     "_spec_seed_sources"):
-            setattr(runner, name,
-                    getattr(TPUModelRunner, name).__get__(runner))
+        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
         # size; with cp=1 the two coincide here.
@@ -1324,31 +1354,28 @@ class TestUnifiedReadOffsetMigration:
         runner.input_batch = MagicMock()
         req_ids = [f"r{i}" for i in range(len(computed))]
         runner.input_batch.req_ids = req_ids
-        runner.input_batch.req_id_to_index = {
-            rid: i
-            for i, rid in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         runner.input_batch.num_computed_tokens_cpu = np.array(computed)
         bt_obj = MagicMock()
-        bt_obj.get_cpu_tensor.return_value = torch.tensor(block_table,
-                                                          dtype=torch.int32)
+        bt_obj.get_cpu_tensor.return_value = torch.tensor(
+            block_table, dtype=torch.int32
+        )
         runner.input_batch.block_table = {0: bt_obj}
         runner._collect_mamba_state_seed_copies = (
-            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner))
+            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
+        )
         scheduler_output = MagicMock()
         scheduler_output.num_scheduled_tokens = {
-            rid: s
-            for rid, s in zip(req_ids, scheduled)
+            rid: s for rid, s in zip(req_ids, scheduled)
         }
         return runner, scheduler_output
 
     def test_offsets_follow_state_block_on_crossing(self):
         # block_size=4: req r0 computed=7 scheduled=2 -> state block moves
         # from position 1 (block id 5) to position 2 (block id 9).
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[7],
-                                                     scheduled=[2])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[7], scheduled=[2]
+        )
         runner.mamba_slot_read_offsets[5] = 3
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[9]) == 3
@@ -1358,10 +1385,9 @@ class TestUnifiedReadOffsetMigration:
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
 
     def test_no_crossing_leaves_offsets_alone(self):
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[5],
-                                                     scheduled=[2])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[5], scheduled=[2]
+        )
         runner.mamba_slot_read_offsets[5] = 3
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[5]) == 3
@@ -1375,10 +1401,8 @@ class TestUnifiedReadOffsetMigration:
         # resuming one checkpoint late. It lands as checkpoint 0, so the
         # offset resets.
         runner, scheduler_output = self._make_runner(
-            block_table=[[2, 5, 9, 11]],
-            computed=[7],
-            scheduled=[2],
-            ckpt_window=3)
+            block_table=[[2, 5, 9, 11]], computed=[7], scheduled=[2], ckpt_window=3
+        )
         # Pre-crossing group is columns 1..3 = blocks (5, 9, 11).
         runner.mamba_slot_read_offsets[5] = 2
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
@@ -1390,10 +1414,9 @@ class TestUnifiedReadOffsetMigration:
         # A rejected verify window can pull the state position back into the
         # previous block: prev tracked position 2 (block 9), current step
         # lands in position 1 (block 5) -> offsets follow backward.
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[6],
-                                                     scheduled=[1])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[6], scheduled=[1]
+        )
         runner._mamba_state_pos["r0"] = 2
         runner.mamba_slot_read_offsets[9] = 1
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
@@ -1424,11 +1447,10 @@ def _block_size_for(architecture, backend_page_size=256, preferred=None):
     backend_mock = MagicMock()
     backend_mock.get_min_page_size.return_value = 1
     backend_mock.get_page_size.return_value = backend_page_size
-    backend_mock.get_preferred_block_size.side_effect = ((
-        lambda d: preferred) if preferred is not None else (lambda d: d))
-    with patch.object(TpuPlatform,
-                      "_find_non_ssm_backend",
-                      return_value=backend_mock):
+    backend_mock.get_preferred_block_size.side_effect = (
+        (lambda d: preferred) if preferred is not None else (lambda d: d)
+    )
+    with patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend_mock):
         TpuPlatform.update_block_size_for_backend(vllm_config)
     return vllm_config.cache_config.block_size
 
@@ -1446,8 +1468,8 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     from vllm.config import CacheConfig
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-    from vllm_torchtpu.layers.adapter.attention import \
-        PallasBatchedRPAAttentionBackend
+    from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackend
+
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     vllm_config = SimpleNamespace(
         cache_config=CacheConfig(),
@@ -1463,9 +1485,11 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
         kv_transfer_config=None,
     )
     resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
-    with patch.object(TpuPlatform,
-                      "_find_non_ssm_backend",
-                      return_value=PallasBatchedRPAAttentionBackend):
+    with patch.object(
+        TpuPlatform,
+        "_find_non_ssm_backend",
+        return_value=PallasBatchedRPAAttentionBackend,
+    ):
         TpuPlatform.update_block_size_for_backend(vllm_config)
     assert vllm_config.cache_config.block_size in (128, 256)
 
@@ -1500,11 +1524,7 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         input_batch=SimpleNamespace(
             token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
             num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
-            req_id_to_index={
-                "roomy": 0,
-                "edge": 1,
-                "full": 2
-            },
+            req_id_to_index={"roomy": 0, "edge": 1, "full": 2},
             spec_token_ids=[[] for _ in range(4)],
         ),
         requests={},
@@ -1512,7 +1532,9 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     calls = []
     runner.input_batch.update_req_spec_token_ids = (
         lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))))
+            (request.req_id, list(scheduled[request.req_id]))
+        )
+    )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
     scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
@@ -1524,18 +1546,22 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
 
     # Only what fits is staged into token_ids_cpu.
-    assert [(r, len(ids)) for r, ids in calls] \
-        == [("roomy", 15), ("edge", 10), ("full", 0)]
+    assert [(r, len(ids)) for r, ids in calls] == [
+        ("roomy", 15),
+        ("edge", 10),
+        ("full", 0),
+    ]
     # ...and the clamped write keeps the first drafts, not the last.
     assert calls[1][1] == [2] * 10
     # The scheduler's counts are restored, so the verify window stays aligned
     # with num_scheduled_tokens.
-    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
-        == [15, 15, 15]
-    assert [requests[r].prev_num_draft_len
-            for r in ("roomy", "edge", "full")] == [0, 15, 15]
-    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] \
-        == [15, 15]
+    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] == [15, 15, 15]
+    assert [requests[r].prev_num_draft_len for r in ("roomy", "edge", "full")] == [
+        0,
+        15,
+        15,
+    ]
+    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
 
 
 class TestBuildAttentionMetadataForLayers:
@@ -1545,9 +1571,9 @@ class TestBuildAttentionMetadataForLayers:
     def _group(gid, layer_names):
         builder = MagicMock()
         builder.build.return_value = SimpleNamespace(tag=gid)
-        return SimpleNamespace(layer_names=layer_names,
-                               kv_cache_group_id=gid,
-                               metadata_builders=[builder])
+        return SimpleNamespace(
+            layer_names=layer_names, kv_cache_group_id=gid, metadata_builders=[builder]
+        )
 
     def _runner(self, groups):
         runner = MagicMock()
@@ -1560,7 +1586,8 @@ class TestBuildAttentionMetadataForLayers:
         runner = self._runner([wanted, other])
 
         out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0", "draft.1"}, 8)
+            runner, {"draft.0", "draft.1"}, 8
+        )
 
         assert set(out) == {"draft.0", "draft.1"}
         # One build per group, shared by that group's layers.
@@ -1573,8 +1600,7 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["draft.0"])
         runner = self._runner([group])
 
-        TPUModelRunner.build_attention_metadata_for_layers(
-            runner, ["draft.0"], 32)
+        TPUModelRunner.build_attention_metadata_for_layers(runner, ["draft.0"], 32)
 
         kwargs = group.metadata_builders[0].build.call_args.kwargs
         assert kwargs["common_attn_metadata"].num_reqs == 32
@@ -1586,8 +1612,7 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["draft.0", "draft.1"])
         runner = self._runner([group])
 
-        out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0"}, 8)
+        out = TPUModelRunner.build_attention_metadata_for_layers(runner, {"draft.0"}, 8)
 
         assert set(out) == {"draft.0"}
 
@@ -1595,8 +1620,7 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["target.0"])
         runner = self._runner([group])
 
-        out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0"}, 8)
+        out = TPUModelRunner.build_attention_metadata_for_layers(runner, {"draft.0"}, 8)
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
@@ -1623,10 +1647,9 @@ class TestInputStagingFence:
 
     def test_record_then_wait_synchronizes_once(self, monkeypatch):
         _FakeTpuEvent.instances.clear()
-        monkeypatch.setattr(torch,
-                            "tpu",
-                            SimpleNamespace(Event=_FakeTpuEvent),
-                            raising=False)
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
@@ -1639,10 +1662,9 @@ class TestInputStagingFence:
         assert fence.synchronized == 1
 
     def test_wait_without_fence_is_noop(self, monkeypatch):
-        monkeypatch.setattr(torch,
-                            "tpu",
-                            SimpleNamespace(Event=_FakeTpuEvent),
-                            raising=False)
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None

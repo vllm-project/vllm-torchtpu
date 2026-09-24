@@ -53,6 +53,106 @@ TPU_KV_DMA_ALIGNMENT = 128
 KVLayout = batched_rpa_configs.KVLayout
 
 
+def _copy_hnd_token_slice(
+    src_ref,
+    dst_ref,
+    source_start,
+    destination_start,
+    length,
+    sem,
+    *,
+    source_hbm,
+    destination_hbm,
+):
+    """Copy HND tokens using aligned DMA and bit-preserving VMEM stitching.
+
+    Both refs have [2*heads, packed_dim, packing, tokens] layout. Partial
+    destination tiles are read-modify-written sequentially: other segments
+    may share a tile, and bytes outside this slice must survive unchanged.
+    Only three 128-token scratch tiles are needed, independent of cache size.
+    """
+    alignment = TPU_KV_DMA_ALIGNMENT
+    aligned = (
+        (source_start % alignment == 0)
+        & (destination_start % alignment == 0)
+        & (length % alignment == 0)
+    )
+
+    @pl.when(aligned & (length > 0))
+    def _aligned_copy():
+        src = pl.multiple_of(source_start, alignment)
+        dst = pl.multiple_of(destination_start, alignment)
+        size = pl.multiple_of(length, alignment)
+        op = pltpu.make_async_copy(
+            src_ref.at[:, :, :, pl.ds(src, size)],
+            dst_ref.at[:, :, :, pl.ds(dst, size)],
+            sem,
+        )
+        op.start()
+        op.wait()
+
+    @pl.when(~aligned & (length > 0))
+    def _partial_copy():
+        shape = (*src_ref.shape[:-1], alignment)
+
+        def _stitch(src0, src1, dest):
+            first = (destination_start // alignment) * alignment
+            count = pl.cdiv(destination_start % alignment + length, alignment)
+
+            @pl.loop(0, count)
+            def _tile(i):
+                dst = pl.multiple_of(first + i * alignment, alignment)
+                begin = jnp.maximum(destination_start, dst)
+                end = jnp.minimum(destination_start + length, dst + alignment)
+                source = source_start + begin - destination_start
+                src = pl.multiple_of((source // alignment) * alignment, alignment)
+                next_src = pl.multiple_of(
+                    jnp.minimum(src + alignment, src_ref.shape[-1] - alignment),
+                    alignment,
+                )
+
+                def _read(ref, offset, scratch, hbm):
+                    if hbm:
+                        op = pltpu.make_async_copy(
+                            ref.at[:, :, :, pl.ds(offset, alignment)], scratch, sem
+                        )
+                        op.start()
+                        op.wait()
+                    else:
+                        scratch[...] = ref[:, :, :, pl.ds(offset, alignment)]
+
+                _read(src_ref, src, src0, source_hbm)
+                _read(src_ref, next_src, src1, source_hbm)
+                _read(dst_ref, dst, dest, destination_hbm)
+                # Operate on packed bits, without any FP8 conversion or
+                # arithmetic on possibly uninitialized neighbouring tokens.
+                a = src0.bitcast(jnp.uint32).reshape(-1, alignment)[...]
+                b = src1.bitcast(jnp.uint32).reshape(-1, alignment)[...]
+                old = dest.bitcast(jnp.uint32).reshape(-1, alignment)
+                lane = lax.broadcasted_iota(jnp.int32, a.shape, 1)
+                relative = source - src - (begin - dst)
+                a = pltpu.roll(a, -relative, axis=1)
+                b = pltpu.roll(b, -relative, axis=1)
+                incoming = jnp.where(lane + relative < alignment, a, b)
+                valid = (lane >= begin - dst) & (lane < end - dst)
+                old[...] = jnp.where(valid, incoming, old[...])
+                if destination_hbm:
+                    op = pltpu.make_async_copy(
+                        dest, dst_ref.at[:, :, :, pl.ds(dst, alignment)], sem
+                    )
+                    op.start()
+                    op.wait()
+                else:
+                    dst_ref[:, :, :, pl.ds(dst, alignment)] = dest[...]
+
+        pl.run_scoped(
+            _stitch,
+            pltpu.VMEM(shape, src_ref.dtype),
+            pltpu.VMEM(shape, src_ref.dtype),
+            pltpu.VMEM(shape, src_ref.dtype),
+        )
+
+
 def _pcp_write_captured_kv_kernel(
     num_segments_ref,
     segment_descriptors_ref,
@@ -98,47 +198,28 @@ def _pcp_write_captured_kv_seq_along_lane_kernel(
     kv_cache_out_ref,
     dma_sem,
 ):
-    """Scatter sequence-last captured KV into page-bounded cache slices."""
+    """Scatter HND segments, preserving partial tiles and earlier segments."""
     del kv_cache_in_ref
     num_segments = jnp.clip(num_segments_ref[0], 0, segment_descriptors_ref.shape[1])
     page_size = kv_cache_out_ref.shape[-1]
 
-    def _copy_op(segment_idx):
-        source_start = pl.multiple_of(
-            segment_descriptors_ref[0, segment_idx], TPU_KV_DMA_ALIGNMENT
-        )
+    @pl.loop(0, num_segments)
+    def _write_segment(segment_idx):
+        source_start = segment_descriptors_ref[0, segment_idx]
         destination_start = segment_descriptors_ref[1, segment_idx]
-        segment_len = pl.multiple_of(
-            segment_descriptors_ref[2, segment_idx], TPU_KV_DMA_ALIGNMENT
+        segment_len = segment_descriptors_ref[2, segment_idx]
+        page = destination_start // page_size
+        offset = destination_start % page_size
+        _copy_hnd_token_slice(
+            captured_kv_ref,
+            kv_cache_out_ref.at[page],
+            source_start,
+            offset,
+            segment_len,
+            dma_sem,
+            source_hbm=True,
+            destination_hbm=True,
         )
-        destination_page = destination_start // page_size
-        destination_offset = pl.multiple_of(
-            destination_start % page_size, TPU_KV_DMA_ALIGNMENT
-        )
-        return pltpu.make_async_copy(
-            src_ref=captured_kv_ref.at[
-                :,
-                :,
-                :,
-                pl.ds(source_start, segment_len),
-            ],
-            dst_ref=kv_cache_out_ref.at[
-                destination_page,
-                :,
-                :,
-                :,
-                pl.ds(destination_offset, segment_len),
-            ],
-            sem=dma_sem,
-        )
-
-    @pl.loop(0, num_segments)
-    def _start_segment(segment_idx):
-        _copy_op(segment_idx).start()
-
-    @pl.loop(0, num_segments)
-    def _wait_segment(segment_idx):
-        _copy_op(segment_idx).wait()
 
 
 def write_captured_kv_to_local_cache(
@@ -1207,27 +1288,16 @@ def _load_local_current_or_boundary_kv_all_heads_packed(
     @pl.when(jnp.logical_and(~load_history_boundary, kv_valid_len > 0))
     def _load_current_kv():
         if kv_layout == KVLayout.SEQ_ALONG_LANE:
-            seq_hbm_offset = pl.multiple_of(kv_hbm_offset, TPU_KV_DMA_ALIGNMENT)
-            seq_valid_len = pl.multiple_of(kv_valid_len, TPU_KV_DMA_ALIGNMENT)
-            load = pltpu.make_async_copy(
-                src_ref=current_kv_ref.at[
-                    :,
-                    :,
-                    :,
-                    pl.ds(seq_hbm_offset, seq_valid_len),
-                ],
-                dst_ref=kv_vmem_ref.at[
-                    0,
-                    0,
-                    :,
-                    :,
-                    :,
-                    pl.ds(0, seq_valid_len),
-                ],
-                sem=sem,
+            _copy_hnd_token_slice(
+                current_kv_ref,
+                kv_vmem_ref.at[0, 0],
+                kv_hbm_offset,
+                0,
+                kv_valid_len,
+                sem,
+                source_hbm=True,
+                destination_hbm=False,
             )
-            load.start()
-            load.wait()
             return
         load = pltpu.make_async_copy(
             src_ref=current_kv_ref.at[
@@ -1456,7 +1526,7 @@ def _run_pcp_page_groups_multi_head(
                     src_rank,
                     state_mode=state_mode,
                     pcp_size=pcp_size,
-                    page_size=kv_group_ref.shape[2],
+                    page_size=page_size,
                     interleave_size=interleave_size,
                     lane=lane,
                 )
@@ -1502,30 +1572,19 @@ def _run_pcp_page_groups_multi_head(
                 safe_capture_src_offset = jnp.maximum(capture_src_offset, 0)
                 safe_capture_dst_offset = jnp.maximum(capture_dst_offset, 0)
                 if kv_layout == KVLayout.SEQ_ALONG_LANE:
-                    seq_capture_src_offset = pl.multiple_of(
-                        safe_capture_src_offset, TPU_KV_DMA_ALIGNMENT
-                    )
-                    seq_capture_dst_offset = pl.multiple_of(
-                        safe_capture_dst_offset, TPU_KV_DMA_ALIGNMENT
-                    )
-                    seq_capture_len = pl.multiple_of(capture_len, TPU_KV_DMA_ALIGNMENT)
-                    capture_op = pltpu.make_async_copy(
-                        src_ref=kv_group_ref.at[
-                            curr_slot,
-                            0,
-                            :,
-                            :,
-                            :,
-                            pl.ds(seq_capture_src_offset, seq_capture_len),
-                        ],
-                        dst_ref=captured_kv_ref.at[
-                            :,
-                            :,
-                            :,
-                            pl.ds(seq_capture_dst_offset, seq_capture_len),
-                        ],
-                        sem=capture_dma_sem,
-                    )
+
+                    @pl.when(capture_active)
+                    def _capture_hnd():
+                        _copy_hnd_token_slice(
+                            kv_group_ref.at[curr_slot, 0],
+                            captured_kv_ref,
+                            safe_capture_src_offset,
+                            safe_capture_dst_offset,
+                            capture_len,
+                            capture_dma_sem,
+                            source_hbm=False,
+                            destination_hbm=True,
+                        )
                 else:
                     capture_op = pltpu.make_async_copy(
                         src_ref=kv_group_ref.at[
@@ -1545,9 +1604,9 @@ def _run_pcp_page_groups_multi_head(
                         sem=capture_dma_sem,
                     )
 
-                @pl.when(capture_active)
-                def _start_capture():
-                    capture_op.start()
+                    @pl.when(capture_active)
+                    def _start_capture():
+                        capture_op.start()
 
             _consume_scheduled_kv_page_multi_head(
                 q_vmem_ref,
@@ -1569,7 +1628,7 @@ def _run_pcp_page_groups_multi_head(
                 kv_layout=kv_layout,
             )
 
-            if state_mode == "current":
+            if state_mode == "current" and kv_layout != KVLayout.SEQ_ALONG_LANE:
 
                 @pl.when(capture_active)
                 def _finish_capture():

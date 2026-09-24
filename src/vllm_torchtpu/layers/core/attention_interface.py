@@ -7,10 +7,12 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
-from jax.experimental.pallas.ops.tpu.splash_attention import \
-    splash_attention_kernel as splash
-from jax.experimental.pallas.ops.tpu.splash_attention import \
-    splash_attention_mask as mask_lib
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_kernel as splash,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_mask as mask_lib,
+)
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -20,16 +22,18 @@ import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
-from vllm_torchtpu.kernels.experimental.batched_rpa import \
-    configs as batched_rpa_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache,
-    update_sparse_mla_kv_cache_dcp)
-from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+    SparseMLAKVCacheSpec,
+    update_sparse_mla_kv_cache,
+    update_sparse_mla_kv_cache_dcp,
+)
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -76,20 +80,25 @@ def sharded_flash_attention(
     out_specs = P(None, "model", None, None)
 
     def _flash_attention(q, k, v, segment_ids):
-        return flash_attention(q,
-                               k,
-                               v,
-                               segment_ids=segment_ids,
-                               sm_scale=sm_scale,
-                               causal=causal,
-                               vmem_limit_bytes=vmem_limit_bytes)
+        return flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            sm_scale=sm_scale,
+            causal=causal,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
 
     return jax.jit(
-        shard_map.shard_map(_flash_attention,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))
+        shard_map.shard_map(
+            _flash_attention,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )
+    )
 
 
 def sharded_paged_attention(
@@ -119,7 +128,8 @@ def sharded_paged_attention(
             page_indices,
             attn_logits_soft_cap=attn_logits_soft_cap,
             pages_per_compute_block=min(
-                16, page_indices.shape[1]),  # 512 / page_size:32,
+                16, page_indices.shape[1]
+            ),  # 512 / page_size:32,
             megacore_mode="kv_head" if get_megacore() else None,
         )
 
@@ -130,7 +140,8 @@ def sharded_paged_attention(
             in_specs=in_specs,
             out_specs=out_specs,
             check_rep=False,
-        ))
+        )
+    )
 
 
 # TODO(xiangxu): merge this with sharded_paged_attention
@@ -153,8 +164,7 @@ def paged_attention_with_guarded_smem(
     batch_size, blocks_per_seq = page_indices.shape
 
     if page_indices.size <= MAX_ALLOWED_PAGE_INDICES_N:
-        return paged_attention_kernel(q, k_pages, v_pages, lengths,
-                                      page_indices)
+        return paged_attention_kernel(q, k_pages, v_pages, lengths, page_indices)
 
     mini_batch_size = MAX_ALLOWED_PAGE_INDICES_N // blocks_per_seq
 
@@ -167,16 +177,20 @@ def paged_attention_with_guarded_smem(
     num_kernel_launches = batch_size // mini_batch_size
 
     outputs = jnp.zeros_like(q).reshape(
-        (num_kernel_launches, mini_batch_size, *q.shape[1:]))
+        (num_kernel_launches, mini_batch_size, *q.shape[1:])
+    )
     q = q.reshape((num_kernel_launches, mini_batch_size, *q.shape[1:]))
     seq_lens = lengths.reshape((num_kernel_launches, mini_batch_size))
     block_indices = page_indices.reshape(
-        (num_kernel_launches, mini_batch_size, page_indices.shape[1]))
+        (num_kernel_launches, mini_batch_size, page_indices.shape[1])
+    )
 
     for i in range(num_kernel_launches):
         outputs = outputs.at[i].set(
-            paged_attention_kernel(q[i], k_pages, v_pages, seq_lens[i],
-                                   block_indices[i]))
+            paged_attention_kernel(
+                q[i], k_pages, v_pages, seq_lens[i], block_indices[i]
+            )
+        )
 
     outputs = outputs.reshape((batch_size, *outputs.shape[2:]))
 
@@ -192,7 +206,6 @@ def update_cache(
     prefill_seq_len=None,
     sliding_window=None,
 ) -> jax.Array:
-
     # (8, 55640, 32, 128) (1, 8, 256, 128) -> K (8, 8, 32, 128)
     # I = B * T // S
     # k cache, operand
@@ -217,8 +230,8 @@ def update_cache(
             assert B == 1
             start_index = jax.lax.max(0, prefill_seq_len - sliding_window)
             operand = jax.lax.dynamic_slice_in_dim(
-                operand, start_index, sliding_window,
-                axis=2)  # TODO: @pooyam Perf check this.
+                operand, start_index, sliding_window, axis=2
+            )  # TODO: @pooyam Perf check this.
             T = sliding_window
 
         I = B * T // S
@@ -242,9 +255,9 @@ def update_cache(
 
 
 @functools.partial(
-    jax.jit, static_argnames=["window_size", "attn_logits_soft_cap", "is_mqa"])
-def apply_splash(q, k, v, window_size, attn_logits_soft_cap,
-                 is_mqa) -> jax.Array:
+    jax.jit, static_argnames=["window_size", "attn_logits_soft_cap", "is_mqa"]
+)
+def apply_splash(q, k, v, window_size, attn_logits_soft_cap, is_mqa) -> jax.Array:
     # q: (batch_size, num_heads, seq_len, head_dim)
     num_heads = q.shape[1]
     q_seq_len = q.shape[2]
@@ -252,22 +265,22 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap,
     assert kv_seq_len >= q_seq_len
 
     masks = [
-        mask_lib.LocalMask((q_seq_len, kv_seq_len), (window_size, 0),
-                           kv_seq_len - q_seq_len) for _ in range(num_heads)
+        mask_lib.LocalMask(
+            (q_seq_len, kv_seq_len), (window_size, 0), kv_seq_len - q_seq_len
+        )
+        for _ in range(num_heads)
     ]
     mask = mask_lib.MultiHeadMask(tuple(m for m in masks))
     block_sizes = splash.BlockSizes.get_default()
 
     if is_mqa:
         attn = splash.make_splash_mqa_single_device(
-            mask,
-            block_sizes=block_sizes,
-            attn_logits_soft_cap=attn_logits_soft_cap)
+            mask, block_sizes=block_sizes, attn_logits_soft_cap=attn_logits_soft_cap
+        )
     else:
         attn = splash.make_splash_mha_single_device(
-            mask,
-            block_sizes=block_sizes,
-            attn_logits_soft_cap=attn_logits_soft_cap)
+            mask, block_sizes=block_sizes, attn_logits_soft_cap=attn_logits_soft_cap
+        )
     attn = jax.vmap(attn)
     outputs = attn(q, k, v, None)
 
@@ -298,7 +311,8 @@ def sharded_splash_attention(
             in_specs=in_specs,
             out_specs=out_specs,
             check_rep=False,
-        ))
+        )
+    )
 
 
 def sharded_ragged_paged_attention(
@@ -353,18 +367,20 @@ def sharded_ragged_paged_attention(
 
     if use_hd64:
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
-        func = functools.partial(ragged_paged_attention_hd64,
-                                 strict_sliding_window=True)
+        func = functools.partial(
+            ragged_paged_attention_hd64, strict_sliding_window=True
+        )
     else:
         func = rpa_func
 
     if attention_sink is not None:
         if not use_hd64:
             raise NotImplementedError(
-                "Attention sink support is only available when head_dim==64")
+                "Attention sink support is only available when head_dim==64"
+            )
 
-        in_specs += (P("model"), )
-        args += (attention_sink, )
+        in_specs += (P("model"),)
+        args += (attention_sink,)
 
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
     block_kwargs: dict[str, Any] = {}
@@ -394,8 +410,7 @@ def sharded_ragged_paged_attention(
         block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
         block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
         if attention_chunk_size is not None:
-            block_kwargs["p_block_sizes"] = _capped(
-                rpa_default.RpaCase.PREFILL)
+            block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
 
     def _ragged_paged_attention(*args):
         return func(
@@ -465,8 +480,9 @@ def attention_bundled(
         A tuple of (new_bundle, output), where new_bundle aliases the input bundle in-place
         and output is the computed attention result tensor.
     """
-    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import \
-        ragged_paged_attention_bundled
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
+        ragged_paged_attention_bundled,
+    )
 
     if head_dim_original is None:
         head_dim_original = q.shape[-1]
@@ -474,8 +490,17 @@ def attention_bundled(
     if sm_scale is None:
         sm_scale = head_dim_original**-0.5
 
-    def _run(q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
-             query_start_loc, request_distribution):
+    def _run(
+        q,
+        k,
+        v,
+        kv_cache_bundle,
+        layer_idx,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ):
         output, new_bundle = ragged_paged_attention_bundled(
             q,
             k,
@@ -492,7 +517,8 @@ def attention_bundled(
             use_causal_mask=use_causal_mask,
             q_scale=q_scale,
             k_scale=k_scale,
-            v_scale=v_scale)
+            v_scale=v_scale,
+        )
         return new_bundle, output
 
     # Shard across KV heads along the TPU "model" axis (Tensor Parallelism):
@@ -513,8 +539,17 @@ def attention_bundled(
         data_spec,  # query_start_loc
         data_spec,  # request_distribution
     )
-    args = (q, k, v, kv_cache_bundle, layer_idx, md.seq_lens, md.block_tables,
-            md.query_start_loc, md.request_distribution)
+    args = (
+        q,
+        k,
+        v,
+        kv_cache_bundle,
+        layer_idx,
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+    )
 
     # Output partition specs mirror (new_bundle, output).
     out_specs = (bundle_spec, qkv_spec)
@@ -598,20 +633,22 @@ def attention(
     return kv_cache, output
 
 
-def mla_attention(q_TNA: jax.Array,
-                  q_rope_TNH: jax.Array,
-                  k_SA: jax.Array,
-                  k_rope_SH: jax.Array,
-                  kv_cache: jax.Array,
-                  md: AttentionMetadata,
-                  mesh: Mesh,
-                  num_attention_heads: int,
-                  qk_nope_head_dim: int,
-                  q_scale: float | None = None,
-                  k_scale: float | None = None,
-                  v_scale: float | None = None,
-                  sm_scale: float | None = None,
-                  use_causal_mask: bool = True) -> tuple[jax.Array, jax.Array]:
+def mla_attention(
+    q_TNA: jax.Array,
+    q_rope_TNH: jax.Array,
+    k_SA: jax.Array,
+    k_rope_SH: jax.Array,
+    kv_cache: jax.Array,
+    md: AttentionMetadata,
+    mesh: Mesh,
+    num_attention_heads: int,
+    qk_nope_head_dim: int,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    sm_scale: float | None = None,
+    use_causal_mask: bool = True,
+) -> tuple[jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
     Computes sharded MLA paged attention and applies in-place KV cache updates across
@@ -647,20 +684,28 @@ def mla_attention(q_TNA: jax.Array,
         P(None),  # md.distribution
     )
     out_specs = (
-        P(None, "model",
-          None),  # attn output in token-major sequence format (T, N, D)
+        P(None, "model", None),  # attn output in token-major sequence format (T, N, D)
         P(None),  # kv cache
     )
 
-    def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, seq_lens,
-                                    block_tables, query_start_loc,
-                                    request_distribution):
-        max_num_tokens = q.shape[
-            0]  # q is in token-major sequence format (T, N, A)
+    def _mla_ragged_paged_attention(
+        q,
+        q_rope,
+        k,
+        k_rope,
+        cache,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ):
+        max_num_tokens = q.shape[0]  # q is in token-major sequence format (T, N, A)
         actual_r_dim = q_rope.shape[2]
-        kv_dtype_str = "float8_e4m3fn" if any(
-            x in str(cache.dtype).lower()
-            for x in ("fp8", "e4m3")) else "bfloat16"
+        kv_dtype_str = (
+            "float8_e4m3fn"
+            if any(x in str(cache.dtype).lower() for x in ("fp8", "e4m3"))
+            else "bfloat16"
+        )
 
         decode_key = TuningKey(
             case="batched_decode",
@@ -693,14 +738,12 @@ def mla_attention(q_TNA: jax.Array,
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
             1,
-            envs.MIXED_NUM_KV_PAGES_PER_BLOCK
-            or mixed_tuned.num_kv_pages_per_block,
+            envs.MIXED_NUM_KV_PAGES_PER_BLOCK or mixed_tuned.num_kv_pages_per_block,
         )
         num_queries_per_blocks = (
             decode_tuned.num_queries_per_block,
             16,
-            envs.MIXED_NUM_QUERIES_PER_BLOCK
-            or mixed_tuned.num_queries_per_block,
+            envs.MIXED_NUM_QUERIES_PER_BLOCK or mixed_tuned.num_queries_per_block,
         )
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
@@ -719,14 +762,16 @@ def mla_attention(q_TNA: jax.Array,
             sm_scale=sm_scale or 1.0,
             num_kv_pages_per_block=num_kv_pages_per_blocks,
             num_queries_per_block=num_queries_per_blocks,
-            vmem_limit_bytes=min(decode_tuned.vmem_limit_bytes,
-                                 mixed_tuned.vmem_limit_bytes),
+            vmem_limit_bytes=min(
+                decode_tuned.vmem_limit_bytes, mixed_tuned.vmem_limit_bytes
+            ),
             decode_batch_size=decode_tuned.decode_batch_size,
             mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            use_causal_mask=use_causal_mask)
+            use_causal_mask=use_causal_mask,
+        )
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))
@@ -734,35 +779,44 @@ def mla_attention(q_TNA: jax.Array,
         return out, new_cache
 
     output_TNA, kv_cache = jax.jit(
-        shard_map.shard_map(_mla_ragged_paged_attention,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
-                                              k_rope_SH, kv_cache, md.seq_lens,
-                                              md.block_tables,
-                                              md.query_start_loc,
-                                              md.request_distribution)
+        shard_map.shard_map(
+            _mla_ragged_paged_attention,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )
+    )(
+        q_TNA,
+        q_rope_TNH,
+        k_SA,
+        k_rope_SH,
+        kv_cache,
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+    )
     return kv_cache, output_TNA
 
 
 def sparse_mla_attention(
-        ql_nope: jax.Array,
-        q_pe: jax.Array,
-        kv_c_normed: jax.Array,
-        k_pe: jax.Array,
-        kv_cache_nope: jax.Array,
-        kv_cache_rope: jax.Array,
-        topk_indices: jax.Array,
-        seq_lens: jax.Array,
-        block_tables: jax.Array,
-        query_start_loc: jax.Array,
-        request_distribution: jax.Array,
-        mesh: Mesh,
-        nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec,
-        sm_scale: float | None = None,
-        k_scale: float | None = None
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -807,12 +861,12 @@ def sparse_mla_attention(
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
     word_bytes = kv_cache_utils.WORD_BYTES
     lane_bytes = kv_cache_utils.TILE_LANE_BYTES
-    assert (lkv_dim == word_bytes * lane_bytes
-            and rope_dim * 2 == lane_bytes), (
-                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
-                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-                f"{rope_dim}")
+    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
+        "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+        f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+        f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+        f"{rope_dim}"
+    )
 
     in_specs = (
         P(None, None, None),  # ql_nope
@@ -837,14 +891,23 @@ def sparse_mla_attention(
     if nope_spec.layout is not rope_spec.layout:
         raise ValueError(
             "sparse MLA attention requires matching NoPE and RoPE layouts; "
-            f"got {nope_spec.layout.value} and {rope_spec.layout.value}")
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
+        )
     cache_layout = nope_spec.layout.value
 
-    def _sparse_mla_ragged_paged_attention(ql_nope, q_pe, kv_c_normed, k_pe,
-                                           kv_cache_nope, kv_cache_rope,
-                                           topk_idx, seq_lens_, block_tables_,
-                                           query_start_loc_,
-                                           request_distribution_):
+    def _sparse_mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        seq_lens_,
+        block_tables_,
+        query_start_loc_,
+        request_distribution_,
+    ):
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
             kv_cache_nope,
             kv_cache_rope,
@@ -854,7 +917,8 @@ def sparse_mla_attention(
             block_tables_,
             query_start_loc_,
             nope_spec=nope_spec,
-            rope_spec=rope_spec)
+            rope_spec=rope_spec,
+        )
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         output = mla_dispatch.ragged_paged_attention(
@@ -878,15 +942,26 @@ def sparse_mla_attention(
         return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
-        shard_map.shard_map(_sparse_mla_ragged_paged_attention,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache_nope, kv_cache_rope,
-                                              topk_indices, seq_lens,
-                                              block_tables, query_start_loc,
-                                              request_distribution)
+        shard_map.shard_map(
+            _sparse_mla_ragged_paged_attention,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )
+    )(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_indices,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
@@ -940,30 +1015,35 @@ def sparse_mla_attention_dcp(
     if dcp_size <= 1:
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
-            "use sparse_mla_attention for the unsharded case.")
+            "use sparse_mla_attention for the unsharded case."
+        )
     if dcp_axis_name not in mesh.axis_names:
-        raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
-                         f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
+        raise ValueError(
+            f"dcp_size={dcp_size} requires a mesh with a "
+            f"{dcp_axis_name!r} axis, got {mesh.axis_names}."
+        )
     if mesh.shape[dcp_axis_name] != dcp_size:
         raise ValueError(
             f"dcp_size={dcp_size} does not match mesh axis "
-            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}."
+        )
     num_tokens = ql_nope.shape[0]
     if local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
             "local_topk_indices must carry one row per (rank, token): "
             f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
-            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
+            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}."
+        )
 
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
     word_bytes = kv_cache_utils.WORD_BYTES
     lane_bytes = kv_cache_utils.TILE_LANE_BYTES
-    assert (lkv_dim == word_bytes * lane_bytes
-            and rope_dim * 2 == lane_bytes), (
-                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
-                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-                f"{rope_dim}")
+    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
+        "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+        f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+        f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+        f"{rope_dim}"
+    )
 
     replicated_3d = P(None, None, None)
     in_specs = (
@@ -990,12 +1070,23 @@ def sparse_mla_attention_dcp(
     if nope_spec.layout is not rope_spec.layout:
         raise ValueError(
             "sparse MLA attention requires matching NoPE and RoPE layouts; "
-            f"got {nope_spec.layout.value} and {rope_spec.layout.value}")
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
+        )
     cache_layout = nope_spec.layout.value
 
-    def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
-               topk_idx, seq_lens_, block_tables_, query_start_loc_,
-               request_distribution_):
+    def _local(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        seq_lens_,
+        block_tables_,
+        query_start_loc_,
+        request_distribution_,
+    ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
@@ -1009,7 +1100,8 @@ def sparse_mla_attention_dcp(
             nope_spec=nope_spec,
             rope_spec=rope_spec,
             dcp_size=dcp_size,
-            interleave_size=interleave_size)
+            interleave_size=interleave_size,
+        )
 
         # A rank owning none of a token's top-k still has to be handed one
         # valid entry: the kernel derives `kv_len` from the `-1` tail and
@@ -1017,14 +1109,12 @@ def sparse_mla_attention_dcp(
         # cheapest dummy; the softmax it produces is real but meaningless, and
         # `owns` below is what keeps it out of the merge.
         owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(
-            jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
-        local_block_tables = jnp.mod(block_tables_,
-                                     jnp.int32(nope_spec.num_pages))
+        local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1041,16 +1131,22 @@ def sparse_mla_attention_dcp(
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
-        return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]],
-                lse)
+        return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
     return jax.jit(
-        shard_map.shard_map(_local,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache_nope, kv_cache_rope,
-                                              local_topk_indices, seq_lens,
-                                              block_tables, query_start_loc,
-                                              request_distribution)
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        local_topk_indices,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )

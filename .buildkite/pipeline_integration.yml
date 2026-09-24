@@ -90,6 +90,30 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: k3-pruned75-apc-offload-correctness"
+        key: "integration_k3_pruned75_apc_offload_correctness"
+        # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
+        # boot: HBM hits, multi-turn hits, and recall from the Raiden host
+        # store after both a cache reset and a real HBM eviction, each gated on
+        # token equality with the uncached run. ~17 min on a v7x-8 agent: ~13
+        # of GCS weight stream + compile, under 3 of smokes.
+        timeout_in_minutes: 45
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "/perf_eval_results/k3_pruned75_apc_offload_ci"
+          SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+        commands:
+          # Not staged with stage_model_snapshot.sh: at ~443 GiB the
+          # checkpoint does not fit a tpu7x-8 agent's disk (see the GLM-5.2
+          # step below). The rig's default MODEL is the gs:// copy of
+          # mgoin/Kimi-K3-pruned75, which it streams with runai_streamer and
+          # --enable-ep-weight-filter.
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
         key: "vllm_torchtpu_multihost_presubmit"
         agents:

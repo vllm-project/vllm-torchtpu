@@ -79,7 +79,8 @@ def main_kernel(
                 sub_in = lax.rem(idx_sub[k], in_packing)
                 data = gather_ref[pl.ds(k, 1), :]
                 val = jnp.bitwise_and(
-                    jnp.bitwise_right_shift(data, 8 * sub_in), in_mask)
+                    jnp.bitwise_right_shift(data, 8 * sub_in), in_mask
+                )
                 packed = jnp.bitwise_or(packed, jnp.left_shift(val, 8 * sub))
             out_ref[pl.ds(out_row_base + rg, 1), :] = packed
 
@@ -95,13 +96,12 @@ def main_kernel(
             return r * num_streams + s
 
         def idx_window(r, s):
-            return idx_ref[pl.ds(
-                subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
+            return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
 
         def _body(nope_sem, nope_out_i32, *refs):
             r = pl.program_id(0)
-            nope_g = refs[0 * num_streams:1 * num_streams]
-            rope_g = refs[1 * num_streams:2 * num_streams]
+            nope_g = refs[0 * num_streams : 1 * num_streams]
+            rope_g = refs[1 * num_streams : 2 * num_streams]
             rope_o = refs[2 * num_streams]
 
             # nope needs no vector work at all. The nope output keeps the cache's raw
@@ -141,13 +141,17 @@ def main_kernel(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), nope_in_cols),
                 lambda r, s=s: (idx_window(r, s), 0),
-            ) for s in range(num_streams))
+            )
+            for s in range(num_streams)
+        )
         # rope: gather int32 row == index (1 int32 row per entry).
         rope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), rope_in_cols),
                 lambda r, s=s: (lax.div(idx_window(r, s), in_packing), 0),
-            ) for s in range(num_streams))
+            )
+            for s in range(num_streams)
+        )
 
         # One merged rope output block, covering all `num_streams` subchunks.
         #
@@ -164,9 +168,9 @@ def main_kernel(
         def _run_gather():
             pltpu.emit_pipeline(
                 functools.partial(_body, nope_sem, nope_out_i32),
-                grid=(num_row_subchunks // num_streams, ),
+                grid=(num_row_subchunks // num_streams,),
                 in_specs=nope_in_specs + rope_in_specs,
-                out_specs=(rope_out_spec, ),
+                out_specs=(rope_out_spec,),
             )(
                 *([nope_in_i32] * num_streams),
                 *([rope_in_i32] * num_streams),
@@ -175,15 +179,15 @@ def main_kernel(
 
     pltpu.emit_pipeline(
         outer_pipeline,
-        grid=(num_blocks, ),
+        grid=(num_blocks,),
         in_specs=(
             pl.BlockSpec(
-                (row_chunk_size, ),
-                lambda b: (b * num_cores + core_index, ),
+                (row_chunk_size,),
+                lambda b: (b * num_cores + core_index,),
             ),
             pl.BlockSpec(
-                (row_subchunk_size, ),
-                lambda b: (0, ),
+                (row_subchunk_size,),
+                lambda b: (0,),
             ),
         ),
     )(indices_hbm_ref, valid_indices_ref)
@@ -198,24 +202,24 @@ def dsa_gather(
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
-  Args:
-    nope_cache: (total_pages, page_size, WORD_BYTES, TILE_LANE_BYTES) uint8.
-      Each (WORD_BYTES, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
-      fp8 values (per-tensor k_scale applied by the attention kernel; no inline
-      scales).
-    rope_cache: (total_pages, page_size // WORD_BYTES, WORD_BYTES,
-      TILE_LANE_BYTES) uint8. Each (1, TILE_LANE_BYTES) uint8 is token's rope.
-      It encodes 128 (rope_out_cols) fp8 values.
-    indices: (N,) int32. Token indices into the caches.
-    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
-      to gather. Subcores assigned to indices beyond this count skip gathering.
+    Args:
+      nope_cache: (total_pages, page_size, WORD_BYTES, TILE_LANE_BYTES) uint8.
+        Each (WORD_BYTES, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
+        fp8 values (per-tensor k_scale applied by the attention kernel; no inline
+        scales).
+      rope_cache: (total_pages, page_size // WORD_BYTES, WORD_BYTES,
+        TILE_LANE_BYTES) uint8. Each (1, TILE_LANE_BYTES) uint8 is token's rope.
+        It encodes 128 (rope_out_cols) fp8 values.
+      indices: (N,) int32. Token indices into the caches.
+      num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
+        to gather. Subcores assigned to indices beyond this count skip gathering.
 
-  Returns:
-    nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
-      is copied out in the cache's raw layout.
-    rope_out: (N, 128) fp8.
-      (64) fp8 is token's rope, the rest 64 are padding.
-  """
+    Returns:
+      nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
+        is copied out in the cache's raw layout.
+      rope_out: (N, 128) fp8.
+        (64) fp8 is token's rope, the rest 64 are padding.
+    """
     word_bytes = kv_cache_utils.WORD_BYTES
     tile_lane_bytes = kv_cache_utils.TILE_LANE_BYTES
     assert indices.ndim == 1, "Indices must be 1D."
@@ -223,10 +227,12 @@ def dsa_gather(
     assert nope_cache.dtype == jnp.uint8, "Caches must be uint8."
     assert nope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
         f"nope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
-        f"got {nope_cache.shape}")
+        f"got {nope_cache.shape}"
+    )
     assert rope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
         f"rope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
-        f"got {rope_cache.shape}")
+        f"got {rope_cache.shape}"
+    )
     rope_out_cols = rope_cache.shape[3]
 
     # Flatten both caches to 128-wide rows and view as raw bytes.
@@ -240,26 +246,23 @@ def dsa_gather(
     row_subchunk_size = num_simd_lanes
 
     if num_valid_indices is None:
-        valid_indices = jnp.full((row_subchunk_size, ),
-                                 out_size,
-                                 dtype=jnp.int32)
+        valid_indices = jnp.full((row_subchunk_size,), out_size, dtype=jnp.int32)
     else:
-        valid_indices = jnp.full((row_subchunk_size, ),
-                                 num_valid_indices,
-                                 dtype=jnp.int32)
+        valid_indices = jnp.full(
+            (row_subchunk_size,), num_valid_indices, dtype=jnp.int32
+        )
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
     num_row_subchunks = 32
-    assert (
-        num_row_subchunks %
-        num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
+    assert num_row_subchunks % num_streams == 0, (
+        f"{num_streams=} must divide {num_row_subchunks=}."
+    )
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
-    out_pad_size = (
-        (out_size + block_size - 1) // block_size) * block_size - out_size
+    out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     indices = jnp.pad(indices, ((0, out_pad_size)))
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -280,12 +283,11 @@ def dsa_gather(
                 ((out_size + out_pad_size) * word_bytes, tile_lane_bytes),
                 jnp.uint8,
             ),
-            jax.ShapeDtypeStruct((out_size + out_pad_size, rope_out_cols),
-                                 jnp.uint8),
+            jax.ShapeDtypeStruct((out_size + out_pad_size, rope_out_cols), jnp.uint8),
         ),
         # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
         # copies issued in `main_kernel`.
-        scratch_types=(pltpu.SemaphoreType.DMA((num_streams, )), ),
+        scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,

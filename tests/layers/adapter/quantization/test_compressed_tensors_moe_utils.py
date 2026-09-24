@@ -3,16 +3,18 @@ from unittest.mock import MagicMock
 
 import torch
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import \
-    get_cpu_weight_loader_hook
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    get_cpu_weight_loader_hook,
+)
 
 
 class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
-
     def test_hook_creation_and_execution(self):
         # Mock layer
         layer = MagicMock()
-        layer._map_global_expert_id_to_local_expert_id = lambda x: x  # Identity map for testing
+        layer._map_global_expert_id_to_local_expert_id = (
+            lambda x: x
+        )  # Identity map for testing
 
         orig_loader = MagicMock()
         tp_size = 2
@@ -42,11 +44,7 @@ class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
         loaded_weight = torch.ones((16, 16), dtype=torch.float16) * 2.0
 
         # Call hook for w1
-        res = hook(param,
-                   loaded_weight,
-                   weight_name,
-                   shard_id="w1",
-                   expert_id=1)
+        res = hook(param, loaded_weight, weight_name, shard_id="w1", expert_id=1)
         self.assertTrue(res)
         self.assertFalse(orig_loader.called)
         self.assertTrue(hasattr(param, "_cpu_scratch"))
@@ -63,11 +61,7 @@ class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
 
         # Call hook for w3
         loaded_weight = torch.ones((16, 16), dtype=torch.float16) * 3.0
-        res = hook(param,
-                   loaded_weight,
-                   weight_name,
-                   shard_id="w3",
-                   expert_id=1)
+        res = hook(param, loaded_weight, weight_name, shard_id="w3", expert_id=1)
         self.assertTrue(res)
         self.assertFalse(orig_loader.called)
 
