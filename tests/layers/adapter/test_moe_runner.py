@@ -29,9 +29,9 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 class _QuantMethod:
     """Stands in for a TPU MoE method whose inherited hook reads unset state.
 
-    Before the W4A16 fix, VllmCompressedTensorsW4A16MoEMethod inherited an
-    upstream get_fused_moe_quant_config that read self.wna16_backend, which
-    only the skipped upstream __init__ sets.
+    VllmCompressedTensorsW4A16MoEMethod inherits an upstream
+    get_fused_moe_quant_config that reads self.wna16_backend, which only the
+    upstream __init__ it skips sets.
     """
 
     moe_quant_config = None
