@@ -37,18 +37,19 @@ Two meta-principles organize this document set:
   for everything the repo tooling does not decide: naming, docstrings
   (Google-style `Args:`/`Returns:`/`Raises:`), comments, exception style,
   default-argument rules, comprehension complexity limits.
-- **R-1.2** Formatting is decided by the repo's `pre-commit` config — `yapf`,
-  `isort`, `ruff` — and the CI pre-commit check gates every PR. If
+- **R-1.2** Formatting is decided by the repo's `pre-commit` config, where
+  `ruff` both formats code and sorts imports, and the CI pre-commit check
+  gates every PR. If
   `pre-commit install` was run in the clone, the hooks fire automatically on
   each commit — but only on that commit's staged files, and fresh
   clones/worktrees usually lack the install. So before every push, run
-  `pre-commit run --all-files` (or at minimum `yapf -i` / `isort` / `ruff
-  check --fix` on changed files). Never use `--no-verify` to push code the
+  `pre-commit run --all-files` (or at minimum `ruff format` and `ruff check
+  --fix` on changed files). Never use `--no-verify` to push code the
   formatters haven't actually been run on; if hooks can't run locally, run
-  yapf/isort/ruff manually first.
-- **R-1.3** 80-column limit. When a multi-line call or literal keeps getting
-  re-wrapped, add a trailing comma after the last element so yapf pins
-  one-element-per-line.
+  ruff manually first.
+- **R-1.3** `ruff format` wraps code at 88 columns. When a multi-line call or
+  literal keeps getting re-wrapped, add a trailing comma after the last
+  element so ruff keeps one element per line.
 - **R-1.4** Explicit imports only — no `from x import *`. Import modules or
   names directly; no aliasing to obscure single letters.
 - **R-1.5** Use modern typing: PEP 604 unions (`int | None`, not
@@ -480,7 +481,7 @@ Background material for the rules above.
    hardware. (R-8.x)
 9. **Thresholds** — CI perf thresholds updated in the same PR if performance
    moved. (PR-1, optimization doc)
-10. **Hygiene** — `pre-commit run --all-files` clean; 80 columns; license
+10. **Hygiene** — `pre-commit run --all-files` clean; 88 columns; license
     headers; explicit imports; no internal links. (R-1.x, R-7.12)
 11. **Lifecycle** — WIP as Draft; branch updated by rebase, never merge;
     nothing merges until CI is green on the current head; every changed line
