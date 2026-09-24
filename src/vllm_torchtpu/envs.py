@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
+    TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -76,7 +78,6 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
-    USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -406,6 +407,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify requantization block size for MoE weights. When unset, NVFP4
     # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
+    # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
@@ -507,6 +509,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
                      "off", ["off", "on"],
                      case_sensitive=False),
+    # Maximum hidden-state row count (after any EP all-gather) for dense
+    # expert MoE. 0 disables it; larger shapes and unsupported layouts use
+    # the original GMM path. This counts tokens, not tokens * topk.
+    "TPU_MOE_DENSE_EXPERT_THRESHOLD":
+    env_nonnegative_int("TPU_MOE_DENSE_EXPERT_THRESHOLD", 0),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -584,7 +591,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
-    env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    lambda: (environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]
+             () is not None or env_bool("USE_MOE_FUSED_EP_KERNEL")()),
+    # Explicit implementation selection also enables fused EP. When unset,
+    # preserve the legacy enable flag and v2 behavior. Adaptive owns its
+    # admission, automatically supports FP4 and never falls back to GMM.
+    "MOE_FUSED_EP_KERNEL_IMPL":
+    env_with_choices("MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8":
@@ -658,9 +671,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_TOPOLOGY_AWARE_MESH":
     lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower(
     ) not in ("0", "false", "off", "no"),
-    # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
-    "USE_BATCHED_RPA_LONGCTX":
-    env_bool("USE_BATCHED_RPA_LONGCTX"),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING":

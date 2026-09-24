@@ -23,12 +23,12 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.utils import (
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
     align_to,
     get_dtype_packing,
 )
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper import (
+from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import (
     ragged_paged_attention,
 )
 

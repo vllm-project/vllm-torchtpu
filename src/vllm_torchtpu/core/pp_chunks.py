@@ -35,6 +35,7 @@ import math
 from dataclasses import dataclass
 from statistics import median
 
+import numpy as np
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -73,6 +74,25 @@ def chunk_pairs(schedule: tuple[int, int, int] | None, chunk: int,
     for start in range(0, chunk, bq):
         total += -(-(prefix + min(start + bq, chunk)) // bkv)
     return total
+
+
+def schedule_pairs(q_lens, kv_lens, bq: int, bkv: int) -> int:
+    """(query block, KV block) pairs the attention kernel schedules for
+    sequences with ``q_lens`` new tokens at the end of ``kv_lens`` tokens of
+    context, with query tile ``bq`` and KV tile ``bkv``: every query block
+    attends to the KV blocks up to its own last token. The multi-sequence
+    form of `chunk_pairs`."""
+    q = np.asarray(q_lens, dtype=np.int64)
+    kv = np.asarray(kv_lens, dtype=np.int64)
+    keep = q > 0
+    q, kv = q[keep], kv[keep]
+    if q.size == 0:
+        return 0
+    blocks = -(-q // bq)
+    i = np.arange(int(blocks.max()))
+    q_end = np.minimum((i[None, :] + 1) * bq, q[:, None])
+    k_end = -(-(kv[:, None] - q[:, None] + q_end) // bkv)
+    return int(np.where(i[None, :] < blocks[:, None], k_end, 0).sum())
 
 
 def profile_points(

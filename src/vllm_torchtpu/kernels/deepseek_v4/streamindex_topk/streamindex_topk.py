@@ -1237,6 +1237,7 @@ def _select_owned_winners(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "chunk_tokens",
         "dcp_axis_name",
     ),
 )
@@ -1259,6 +1260,7 @@ def streamindex_topk_dcp(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
@@ -1309,6 +1311,10 @@ def streamindex_topk_dcp(
       buffer_count: buffer count for pallas kernel.
       vmem_limit_bytes: vmem limit for pallas kernel.
       decode_req_batch_size: maximum decode batch size per iteration.
+      chunk_tokens: forwarded to `streamindex_topk` for the per-rank local
+        scoring pass; see there for the semantics. Chunking cuts the replicated
+        query-token axis, which is orthogonal to the KV axis DCP shards, so the
+        two compose.
       dcp_axis_name: name of the DCP mesh axis.
 
     Returns:
@@ -1368,6 +1374,7 @@ def streamindex_topk_dcp(
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
             enable_early_exit=False,
+            chunk_tokens=chunk_tokens,
             cp_size=dcp_size,
             cp_rank=dcp_rank,
             interleave_size=interleave_size,

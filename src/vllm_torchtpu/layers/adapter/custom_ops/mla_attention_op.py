@@ -270,6 +270,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         """
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+        # Chunking cuts the replicated query-token axis, which is orthogonal to
+        # the KV axis DCP shards, so the same knob applies here unchanged.
+        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -311,6 +314,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                chunk_tokens=chunk_tokens,
             )
             return cache_kv, local_topk
 

@@ -63,6 +63,9 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+    vllm_adapter as adaptive_moe,
+)
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -731,6 +734,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     CUDA-only router.select_experts() path.
     """
 
+    _use_adaptive_fused_moe: bool = False
+    _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
@@ -768,7 +774,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         """
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return (
+            enable_pipelined_collective_and_compute()
+            or fused_moe_ep_supported(self)
+            or adaptive_moe.adaptive_fused_moe_supported(self)
+        )
 
     def maybe_roundup_sizes(
         self,
@@ -903,6 +913,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
+        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
@@ -967,6 +978,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        if self._use_adaptive_fused_moe:
+            self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            return
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -1019,7 +1038,17 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
-        #
+        if self._use_adaptive_fused_moe:
+            return adaptive_moe.run_adaptive_fused_moe(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                router_logits,
+            )
+
         # `score_bias_operand` is not optional, and omitting it is silent on
         # every model that does not have one. `prebuild_fused_moe_ep` builds
         # the op with an eighth operand exactly when the layer carries an

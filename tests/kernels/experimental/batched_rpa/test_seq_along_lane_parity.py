@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 _DECODE_BLOCKS = configs.BlockSizes(
     bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3

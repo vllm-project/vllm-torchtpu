@@ -39,6 +39,7 @@ def _vllm_config(
 ):
     return SimpleNamespace(
         model_config=None,
+        additional_config={},
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
@@ -67,7 +68,7 @@ def _vllm_config(
     )
 
 
-def test_from_vllm_config_records_kv_role():
+def test_from_vllm_config_without_speculation():
     config = PcpStaticSupportValidator.from_vllm_config(
         _vllm_config(kv_role="kv_consumer")
     )
@@ -75,17 +76,13 @@ def test_from_vllm_config_records_kv_role():
     assert config.enabled
     assert config.pcp_size == 4
     assert config.interleave_size == 16
-    assert config.is_kv_producer is False
-    assert config.kv_role == "kv_consumer"
     assert config.speculative_method is None
     assert config.num_speculative_tokens == 0
-    assert config.pcp_mtp_k1_enabled is False
 
 
 @pytest.mark.parametrize(
     ("config", "error_type", "message"),
     [
-        (_vllm_config(kv_role="kv_consumer"), NotImplementedError, "KV consumer"),
         (_vllm_config(dcp_size=2), NotImplementedError, "DCP"),
         (
             _vllm_config(pipeline_parallel_size=2),
@@ -111,9 +108,11 @@ def test_from_vllm_config_records_kv_role():
             "num_speculative_tokens=1",
         ),
         (
-            _vllm_config(speculative_method="mtp", num_speculative_tokens=1),
+            _vllm_config(
+                speculative_method="mtp", num_speculative_tokens=3, kv_role="kv_both"
+            ),
             NotImplementedError,
-            "kv_role=kv_producer",
+            "num_speculative_tokens=1",
         ),
         (
             _vllm_config(interleave_size=0),
@@ -227,40 +226,23 @@ def test_hnd_without_pcp_remains_valid():
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_static_validator_accepts_pcp_mtp_k1_producer(async_scheduling):
+@pytest.mark.parametrize("kv_role", [None, "kv_producer", "kv_consumer", "kv_both"])
+def test_static_validator_accepts_pcp_mtp_k1_for_any_kv_role(async_scheduling, kv_role):
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(
             speculative_method="mtp",
             num_speculative_tokens=1,
-            kv_role="kv_producer",
+            kv_role=kv_role,
             async_scheduling=async_scheduling,
         ),
         kv_cache_layout="NHD",
     )
 
-    assert config.pcp_mtp_k1_enabled is True
+    assert config.enabled is True
     assert config.speculative_enabled is True
     assert config.speculative_method == "mtp"
     assert config.num_speculative_tokens == 1
-    assert config.kv_role == "kv_producer"
     assert config.async_scheduling is async_scheduling
-
-
-def test_static_validator_rejects_pcp_mtp_k1_kv_both():
-    vllm_config = _vllm_config(
-        speculative_method="mtp",
-        num_speculative_tokens=1,
-        kv_role="kv_both",
-    )
-
-    config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-    assert config.pcp_mtp_k1_enabled is False
-
-    with pytest.raises(NotImplementedError, match="kv_role=kv_producer"):
-        PcpStaticSupportValidator.validate_platform_config(
-            vllm_config,
-            kv_cache_layout="NHD",
-        )
 
 
 def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
@@ -275,4 +257,3 @@ def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
     )
 
     assert config.enabled is False
-    assert config.pcp_mtp_k1_enabled is False

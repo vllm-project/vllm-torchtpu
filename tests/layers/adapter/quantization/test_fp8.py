@@ -645,7 +645,7 @@ class TestOnlineFp8Quantization:
         assert w2_s.shape == (E, 1, 1, H)
         assert w13_s.dtype == torch.float32
 
-    def test_custom_routing_called(self, device):
+    def test_custom_routing_called(self):
         """FP8 apply_monolithic should use custom_routing_function when present."""
         from unittest.mock import MagicMock, patch
 
@@ -663,6 +663,8 @@ class TestOnlineFp8Quantization:
         layer.custom_routing_function = mock_routing
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
+        # MagicMock does not inherit the class attribute's False value.
+        method._use_adaptive_fused_moe = False
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)

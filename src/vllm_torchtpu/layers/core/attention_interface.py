@@ -16,6 +16,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
@@ -47,12 +48,6 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Default and experimental batched RPA kernels are loaded unconditionally.
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
-
-# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
-if envs.USE_BATCHED_RPA_LONGCTX:
-    import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched
-else:
-    import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 
 ragged_paged_attention = rpa_default.ragged_paged_attention
 ragged_paged_attention_batched = rpa_batched.ragged_paged_attention

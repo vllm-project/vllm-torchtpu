@@ -44,7 +44,6 @@ def _eligibility(
     dcp_size=1,
     pipeline_parallel_size=1,
     async_scheduling=False,
-    is_kv_producer=None,
 ):
     return PcpSequenceLayoutEligibility(
         pcp_size=pcp_size,
@@ -52,7 +51,6 @@ def _eligibility(
         dcp_size=dcp_size,
         pipeline_parallel_size=pipeline_parallel_size,
         async_scheduling=async_scheduling,
-        is_kv_producer=is_kv_producer,
     )
 
 
@@ -96,7 +94,8 @@ def _evaluate(
     )
 
 
-def test_from_vllm_config_normalizes_and_records_kv_role():
+@pytest.mark.parametrize("kv_role", [None, "kv_producer", "kv_consumer", "kv_both"])
+def test_prefill_layout_is_independent_of_kv_role(kv_role):
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=4,
@@ -106,7 +105,14 @@ def test_from_vllm_config_normalizes_and_records_kv_role():
         ),
         scheduler_config=SimpleNamespace(async_scheduling=False),
         speculative_config=None,
-        kv_transfer_config=SimpleNamespace(is_kv_producer=False),
+        kv_transfer_config=(
+            None
+            if kv_role is None
+            else SimpleNamespace(
+                kv_role=kv_role,
+                is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+            )
+        ),
     )
 
     eligibility = PcpSequenceLayoutEligibility.from_vllm_config(vllm_config)
@@ -114,7 +120,11 @@ def test_from_vllm_config_normalizes_and_records_kv_role():
     assert eligibility.enabled
     assert eligibility.pcp_size == 4
     assert eligibility.interleave_size == 16
-    assert eligibility.is_kv_producer is False
+    decision = _evaluate(
+        eligibility=eligibility, computed=[0], prompt=[64], scheduled=[64]
+    )
+    assert decision.mode is PcpSequenceLayoutMode.STREAMING
+    assert decision.local_required_tokens == 16
 
 
 def test_evaluate_runner_chunk_classifies_streaming_prefill():
@@ -545,7 +555,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
             NotImplementedError,
             "pipeline parallelism",
         ),
-        (_eligibility(is_kv_producer=False), NotImplementedError, "KV consumer"),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
     ],
 )

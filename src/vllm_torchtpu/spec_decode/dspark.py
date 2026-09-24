@@ -18,6 +18,7 @@ DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
 Gumbel-coupled sampling is not implemented.
 """
+
 from __future__ import annotations
 
 import torch
@@ -30,10 +31,8 @@ logger = init_logger(__name__)
 
 
 class DSparkProposer(DFlashProposer):
-
     def __init__(self, runner, vllm_config: VllmConfig):
-        hf_config = (
-            vllm_config.speculative_config.draft_model_config.hf_config)
+        hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
         super().__init__(runner, vllm_config)
@@ -42,7 +41,8 @@ class DSparkProposer(DFlashProposer):
             raise ValueError(
                 "DSpark requires target layer ids in the draft config (one of "
                 "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
-                "target_layer_ids, or dflash_config.target_layer_ids).")
+                "target_layer_ids, or dflash_config.target_layer_ids)."
+            )
 
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
@@ -53,9 +53,9 @@ class DSparkProposer(DFlashProposer):
             raise ValueError(
                 f"num_speculative_tokens={K} does not match the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length.")
-        logger.info("DSpark: sample_from_anchor=%s, K=%d.",
-                    self.sample_from_anchor, K)
+                "machinery is trained for exactly that block length."
+            )
+        logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own
@@ -72,13 +72,19 @@ class DSparkProposer(DFlashProposer):
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
-        for attr in ("compute_draft_logits", "markov_embed", "markov_bias",
-                     "map_draft_to_target", "has_own_lm_head",
-                     "has_own_embed_tokens"):
+        for attr in (
+            "compute_draft_logits",
+            "markov_embed",
+            "markov_bias",
+            "map_draft_to_target",
+            "has_own_lm_head",
+            "has_own_embed_tokens",
+        ):
             if not hasattr(self.draft_model, attr):
                 raise RuntimeError(
                     f"DSpark draft model lacks {attr}(); expected a "
-                    "Qwen3DSpark/Gemma4DSpark-family model.")
+                    "Qwen3DSpark/Gemma4DSpark-family model."
+                )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
@@ -102,23 +108,24 @@ class DSparkProposer(DFlashProposer):
         )
 
         padded_num_reqs = hidden.shape[0] // block_size
-        valid_hidden = hidden[:padded_num_reqs * block_size]
+        valid_hidden = hidden[: padded_num_reqs * block_size]
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
-        ids_3d = input_ids[:padded_num_reqs * block_size].view(
-            padded_num_reqs, block_size)
+        ids_3d = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )
         prev = ids_3d[:, 0]
         draft_tokens = []
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(
-                self.draft_model.markov_embed(prev))
+            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1))
+                (logits_3d[:, i] + bias).argmax(dim=-1)
+            )
             draft_tokens.append(step)
             prev = step
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)

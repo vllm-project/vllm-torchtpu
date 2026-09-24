@@ -42,7 +42,7 @@ import pytest
 import torch
 from vllm.config import get_current_vllm_config
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 from vllm_torchtpu.layers.adapter import attention, cp_attention
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,

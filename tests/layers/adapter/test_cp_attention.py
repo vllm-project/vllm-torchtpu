@@ -30,7 +30,7 @@ from vllm.config import (
 )
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.configs import (
+from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
     AttentionScope,
     KVLayout,
 )

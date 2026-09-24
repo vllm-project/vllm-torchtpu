@@ -25,8 +25,7 @@ def _runner_with_raw_tensors(raw_tensors):
     return runner
 
 
-def test_update_states_routes_pooled_copies_away_from_generic_path(
-        monkeypatch):
+def test_update_states_routes_pooled_copies_away_from_generic_path(monkeypatch):
     """Verify that CoW block copies in a unified pool bypass generic GPU copy.
 
     When unified KV pool is active (`kv_cache_raw_tensors` present),
@@ -83,8 +82,10 @@ def test_update_states_keeps_generic_copy_for_non_pooled_layout(monkeypatch):
     """
     base_outputs = []
     monkeypatch.setattr(
-        GPUModelRunner, "_update_states", lambda _runner, scheduler_output:
-        base_outputs.append(scheduler_output))
+        GPUModelRunner,
+        "_update_states",
+        lambda _runner, scheduler_output: base_outputs.append(scheduler_output),
+    )
     runner = _runner_with_raw_tensors([])
     local_copies = []
     runner._apply_kv_cache_block_copies = local_copies.append
@@ -135,7 +136,8 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
     monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks", cpu_page_copy)
 
     TPUModelRunner._apply_kv_cache_block_copies(
-        fake, [KVCacheBlockCopy(src_block_id=6, dst_block_id=7)])
+        fake, [KVCacheBlockCopy(src_block_id=6, dst_block_id=7)]
+    )
 
     assert len(calls) == 1
     assert calls[0][0] == id(raw_tensors)
@@ -202,8 +204,7 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         read_offsets[dst_t] = read_offsets[src_t]
 
     monkeypatch.setattr(runner_mod, "_rollback_offsets_migrate", mock_migrate)
-    monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks",
-                        lambda *args: None)
+    monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks", lambda *args: None)
 
     copies = [KVCacheBlockCopy(src_block_id=3, dst_block_id=5)]
     TPUModelRunner._apply_kv_cache_block_copies(fake, copies)
@@ -215,7 +216,8 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
 
 
 def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
-        monkeypatch):
+    monkeypatch,
+):
     """Verify precompilation includes raw_tensors and scales limit to all kv groups."""
     raw1 = torch.zeros(16, 4)
     raw2 = torch.zeros(16, 4)
@@ -229,8 +231,7 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
     fake = SimpleNamespace(
         _mamba_copy_plan=copy_plan,
         kv_cache_raw_tensors=kv_raw,
-        kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[object(), object()]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
         max_num_reqs=3,
         _pool_block_split=2,
         _bucket_len=TPUModelRunner._bucket_len,

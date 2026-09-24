@@ -280,8 +280,11 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         # Asked of the layer's own quant method, because arming is per layer:
         # a model whose layers do not all qualify must not have one armed layer
         # answer for the rest.
-        return (fused_moe_ep_supported(getattr(self, "_quant_method", None))
-                or original.fget(self))
+        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import \
+            adaptive_fused_moe_supported
+        owner = getattr(self, "_quant_method", None)
+        return (fused_moe_ep_supported(owner)
+                or adaptive_fused_moe_supported(owner) or original.fget(self))
 
     _mr.MoERunner._fused_output_is_reduced = patched
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
@@ -333,9 +336,13 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
+            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import \
+                adaptive_fused_moe_supported
             from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
-            return fused_moe_ep_supported(getattr(self, "_quant_method", None))
+            owner = getattr(self, "_quant_method", None)
+            return (fused_moe_ep_supported(owner)
+                    or adaptive_fused_moe_supported(owner))
 
         def maybe_dispatch(self, hidden_states, router_logits):
             if fused_ep_owns_pcp_collectives(self):

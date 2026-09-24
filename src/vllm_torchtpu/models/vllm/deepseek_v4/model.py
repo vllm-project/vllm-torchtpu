@@ -23,31 +23,42 @@ import torch
 import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import (get_dp_group, get_pp_group,
-                              get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
-from vllm.model_executor.layers.fused_moe import \
-    fused_moe_make_expert_params_mapping
+from vllm.distributed import (
+    get_dp_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
-from vllm.model_executor.models.utils import (AutoWeightsLoader,
-                                              PPMissingLayer, WeightsMapper,
-                                              is_pp_missing_parameter,
-                                              make_layers, maybe_prefix)
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    WeightsMapper,
+    is_pp_missing_parameter,
+    make_layers,
+    maybe_prefix,
+)
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
-    VllmDeepseekCompressor  # noqa: E501
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    VllmDeepseekCompressor,  # noqa: E501
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
-    MHCOps, get_mhc_ops, get_mhc_post_op)
+    MHCOps,
+    get_mhc_ops,
+    get_mhc_post_op,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
-    VllmDeepseekV4MLAAttention
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 
@@ -123,8 +134,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         """
         ops = self.__dict__.get("_mhc_ops_instance")
         if ops is None:
-            ops = get_mhc_ops(self.rms_norm_eps, self.hc_eps, self.hc_eps,
-                              self.hc_post_alpha, self.hc_sinkhorn_iters)
+            ops = get_mhc_ops(
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+            )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
 
@@ -140,8 +156,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(
-            x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -163,20 +178,32 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
-            x, post_mix, res_mix = self.hc_pre(x, self.hc_attn_fn,
-                                               self.hc_attn_scale,
-                                               self.hc_attn_base)
+            x, post_mix, res_mix = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
-                x, residual, post_mix, res_mix, self.hc_attn_fn,
-                self.hc_attn_scale, self.hc_attn_base)
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
 
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
-            x, residual, post_mix, res_mix, self.hc_ffn_fn, self.hc_ffn_scale,
-            self.hc_ffn_base)
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+        )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
@@ -202,8 +229,7 @@ class _HostStagedParams:
         # name -> (parameter, its real device tensor).
         self._staged: dict[str, tuple[torch.nn.Parameter, torch.Tensor]] = {}
 
-    def stage(self, name: str,
-              param: torch.nn.Parameter) -> torch.nn.Parameter:
+    def stage(self, name: str, param: torch.nn.Parameter) -> torch.nn.Parameter:
         """Return a host-backed stand-in for `param` for loaders to write."""
         if name not in self._staged:
             # ``_make_subclass`` is how nn.Parameter builds itself from a
@@ -214,8 +240,7 @@ class _HostStagedParams:
             # ``param.data`` cannot simply be re-pointed at host storage:
             # this backend's tensors carry their own TensorImpl and set_data
             # rejects the dispatch-key change.
-            host = torch.Tensor._make_subclass(type(param),
-                                               param.data.to("cpu"), False)
+            host = torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False)
             host.__dict__.update(param.__dict__)
             self._staged[name] = (param, host)
         return self._staged[name][1]
@@ -229,20 +254,25 @@ class _HostStagedParams:
 
     def flush_all(self) -> None:
         """Flush every staged parameter and release all host buffers."""
-        staged_bytes = sum(h.numel() * h.element_size()
-                           for _, h in self._staged.values())
+        staged_bytes = sum(
+            h.numel() * h.element_size() for _, h in self._staged.values()
+        )
         logger.info(
-            "Writing %d staged parameters (%.1f GiB of host memory) to the "
-            "device.", len(self._staged), staged_bytes / 2**30)
+            "Writing %d staged parameters (%.1f GiB of host memory) to the device.",
+            len(self._staged),
+            staged_bytes / 2**30,
+        )
         for name in list(self._staged):
             self._flush(name)
 
 
-@support_torch_compile(dynamic_arg_dims={
-    "input_ids": 0,
-    "positions": 0,
-    "inputs_embeds": 0,
-})
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+    }
+)
 class DeepseekV4Model(nn.Module):
     """DeepSeek-V4 backbone model containing token embedding, layers, and head."""
 
@@ -333,8 +363,7 @@ class DeepseekV4Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _dp_gather_hash_moe_input_ids(self,
-                                      input_ids: torch.Tensor) -> torch.Tensor:
+    def _dp_gather_hash_moe_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """All-gather input_ids over the DP group for hash-MoE routing.
 
         Hash layers route on hash_indices_table[input_ids], and the MoE runner
@@ -352,13 +381,14 @@ class DeepseekV4Model(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros(
-                (batch_size, self.hc_mult, self.config.hidden_size),
-                dtype=dtype,
-            ),
-        })
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.hc_mult, self.config.hidden_size),
+                    dtype=dtype,
+                ),
+            }
+        )
 
     def forward(
         self,
@@ -372,8 +402,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(
-                1, self.hc_mult, 1)
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -381,16 +410,16 @@ class DeepseekV4Model(nn.Module):
         # Hash routing is confined to the first `num_hash_layers`; only those
         # layers need ids gathered across DP.
         moe_input_ids = input_ids
-        if (input_ids is not None
-                and self.start_layer < self.config.num_hash_layers):
+        if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
-        for idx, layer in enumerate(islice(self.layers, self.start_layer,
-                                           self.end_layer),
-                                    start=self.start_layer):
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -403,19 +432,21 @@ class DeepseekV4Model(nn.Module):
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
-                aux_recon = self.mhc_post_op(hidden_states, residual, post_mix,
-                                             res_mix)
+                aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
-            if (final_aux_recon is not None
-                    and self.end_layer in self.aux_hidden_state_layers):
+            if (
+                final_aux_recon is not None
+                and self.end_layer in self.aux_hidden_state_layers
+            ):
                 hidden_states = final_aux_recon
             else:
                 # Fused path: settle the post the last layer deferred.
-                hidden_states = self.mhc_post_op(hidden_states, residual,
-                                                 post_mix, res_mix)
+                hidden_states = self.mhc_post_op(
+                    hidden_states, residual, post_mix, res_mix
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -433,8 +464,7 @@ class DeepseekV4Model(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load checkpoint tensors into stacked, expert, sink and plain params."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -489,11 +519,15 @@ class DeepseekV4Model(nn.Module):
                         # checkpoints but the MoE param is uint8. copy_()
                         # would do a numeric conversion (e.g. 2^-7 → 0),
                         # destroying the raw exponent bytes.
-                        if ("weight_scale" in name and loaded_weight.dtype
-                                == torch.float8_e8m0fnu):
+                        if (
+                            "weight_scale" in name
+                            and loaded_weight.dtype == torch.float8_e8m0fnu
+                        ):
                             loaded_weight = loaded_weight.view(torch.uint8)
                         for mapping in expert_mapping:
-                            param_name, weight_name, expert_id, expert_shard_id = mapping
+                            param_name, weight_name, expert_id, expert_shard_id = (
+                                mapping
+                            )
                             if weight_name not in name:
                                 continue
                             name_mapped = name.replace(weight_name, param_name)
@@ -501,10 +535,10 @@ class DeepseekV4Model(nn.Module):
                                 continue
                             if name_mapped not in params_dict:
                                 continue
-                            param = staged.stage(name_mapped,
-                                                 params_dict[name_mapped])
+                            param = staged.stage(name_mapped, params_dict[name_mapped])
                             weight_loader = typing.cast(
-                                Callable[..., bool], param.weight_loader)
+                                Callable[..., bool], param.weight_loader
+                            )
                             success = weight_loader(
                                 param,
                                 loaded_weight,
@@ -522,8 +556,7 @@ class DeepseekV4Model(nn.Module):
                             continue
                         if name not in params_dict:
                             continue
-                        narrow_weight = loaded_weight[
-                            head_rank_start:head_rank_end]
+                        narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                         n = narrow_weight.shape[0]
                         param = staged.stage(name, params_dict[name])
                         param.data[:n].copy_(narrow_weight)
@@ -535,8 +568,9 @@ class DeepseekV4Model(nn.Module):
                         if name not in params_dict:
                             continue
                         param = staged.stage(name, params_dict[name])
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
                         continue
@@ -560,8 +594,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     """Weights mapper adapting checkpoint naming to vllm-torchtpu layer names."""
     if expert_dtype == "fp4":
         scale_regex = {
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"):
-            r"\1.weight_scale",
+            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
@@ -590,6 +623,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
 
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     """DeepSeek-V4 causal language model registered for TPU inference."""
+
     model_cls = DeepseekV4Model
     hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
 
@@ -602,11 +636,11 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
-                expert_dtype)
+            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
-        self.model = self.model_cls(vllm_config=vllm_config,
-                                    prefix=maybe_prefix(prefix, "model"))
+        self.model = self.model_cls(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -617,7 +651,8 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -635,8 +670,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(input_ids, positions, intermediate_tensors,
-                          inputs_embeds)
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
@@ -647,19 +681,19 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         """
         invalid = [i for i in layers if i < 1 or i > len(self.model.layers)]
         if invalid:
-            raise ValueError(
-                f"Invalid DeepseekV4 aux hidden-state layers: {invalid}")
+            raise ValueError(f"Invalid DeepseekV4 aux hidden-state layers: {invalid}")
         self.model.aux_hidden_state_layers = tuple(layers)
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         import safetensors.torch  # pyrefly: ignore
+
         safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(
             self.hf_to_vllm_mapper.apply(weights),
-            mapper=WeightsMapper(orig_to_new_substr={"mtp.": None}))
+            mapper=WeightsMapper(orig_to_new_substr={"mtp.": None}),
+        )
 
         # Post-load weight surgery goes here.
         # `fused_wkv_wgate` is built with `quant_config=None`, so it never

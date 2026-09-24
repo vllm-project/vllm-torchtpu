@@ -37,17 +37,7 @@ repos:
 
 
 
-      # runner
-      |src/vllm_torchtpu/runner/
-      |tests/runner/
 
-      # models, spec_decode, offload
-      |src/vllm_torchtpu/models/
-      |src/vllm_torchtpu/offload/
-      |src/vllm_torchtpu/spec_decode/
-      |tests/models/
-      |tests/offload/
-      |tests/spec_decode/
 
 
       # core, tracing, omni, tools, loose modules

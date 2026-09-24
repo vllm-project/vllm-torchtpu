@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from vllm.model_executor.layers.activation import (SiluAndMul,
-                                                   SiluAndMulWithClamp)
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 
@@ -37,11 +38,13 @@ def mhc_collapse_head(
     """Collapse multi-stream residual manifold into a single vector before LM head."""
     residual_flat = hidden_states.flatten(-2).float()
     residual_norm = residual_flat * torch.rsqrt(
-        residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps)
+        residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps
+    )
     pre_mix = torch.nn.functional.linear(residual_norm, hc_fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
-    return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(),
-                     dim=-2).to(hidden_states.dtype)
+    return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(), dim=-2).to(
+        hidden_states.dtype
+    )
 
 
 class DeepseekV4MLP(nn.Module):

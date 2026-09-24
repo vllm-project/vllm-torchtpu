@@ -57,6 +57,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+    vllm_adapter as adaptive_moe,
+)
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -284,6 +287,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     with `maybe_quantize_lhs=False`; only admitted fused EP layers use W4A8.
     """
 
+    _use_adaptive_fused_moe: bool = False
+    _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+
     def __init__(self, quant_config: VllmNvfp4Config, moe_config):
         # Skip ModelOptNvFp4FusedMoE.__init__ (it selects a GPU experts backend).
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -303,7 +309,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # to pipeline them with MoE computation when chunking is enabled.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return (
+            enable_pipelined_collective_and_compute()
+            or fused_moe_ep_supported(self)
+            or adaptive_moe.adaptive_fused_moe_supported(self)
+        )
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -360,6 +370,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2]."
         )
+        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
@@ -385,12 +396,22 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # Preserve main's explicit requantization recipe for the GMM path.
         # Automatic requantization is committed only for an admitted W4A8 op.
         configured_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        if self._use_adaptive_fused_moe:
+            op, requant_block = adaptive_moe.prebuild_adaptive_nvfp4(
+                layer, activation_str, configured_block
+            )
+        else:
+            op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
         weights, mode = _prepare_moe_weights(
             layer, w13_scale_f, w2_scale_f, requant_block
         )
         if op is not None:
-            reason = fused_moe_ep_unsupported_reason(
+            validate_prepared = (
+                adaptive_moe.fused_moe_ep_unsupported_reason
+                if self._use_adaptive_fused_moe
+                else fused_moe_ep_unsupported_reason
+            )
+            reason = validate_prepared(
                 layer,
                 weights,
                 activation_str,
@@ -399,6 +420,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
             # Admission already accepted the proposed layout. A mismatch in
             # the actual tensors is a preparation bug, not a fallback case.
+            if self._use_adaptive_fused_moe and reason is not None:
+                raise ValueError(f"adaptive NVFP4 prepared weights: {reason}")
             assert reason is None, (
                 f"NVFP4 fused EP prepared weights violate the admitted layout: {reason}"
             )
@@ -439,13 +462,17 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
-        prebuild_fused_moe_kernel(
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-        )
+        if not self._use_adaptive_fused_moe:
+            prebuild_fused_moe_kernel(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            )
 
-        setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        if self._use_adaptive_fused_moe:
+            self._adaptive_fused_moe_op = op
+        else:
+            setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
             register_score_bias_buffer(layer)
             # Do the scale layout conversion once, outside compiled forward.
@@ -476,6 +503,16 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        if self._use_adaptive_fused_moe:
+            return adaptive_moe.run_adaptive_fused_moe(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer._tpu_fused_w13_scale,
+                layer._tpu_fused_w2_scale,
+                router_logits,
+            )
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,

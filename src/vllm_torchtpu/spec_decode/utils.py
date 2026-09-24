@@ -10,22 +10,24 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from vllm_torchtpu.layers.core.sequence_layout import (
-    AllSequenceLayoutPlanner, SequenceLayoutPlan)
+    AllSequenceLayoutPlanner,
+    SequenceLayoutPlan,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.core.attention_metadata import \
-        AttentionMetadataBuilderContext
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadataBuilderContext,
+    )
 
-_DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = (
-    AllSequenceLayoutPlanner().prepare_dummy(
-        num_tokens=0,
-        num_reqs=0,
-        kv_cache_initialized=False,
-    ))
+_DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
+    num_tokens=0,
+    num_reqs=0,
+    kv_cache_initialized=False,
+)
 
 
 @dataclass
@@ -51,8 +53,7 @@ class DraftChunkInputs:
     aux_hidden_states: list[torch.Tensor]
     # Production supplies the exact chunk-local plan. Dummy/default consumers
     # share this immutable ALL-layout no-op plan and PCP callers override it.
-    sequence_layout_plan: SequenceLayoutPlan = \
-        _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN
+    sequence_layout_plan: SequenceLayoutPlan = _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN
     # Chunk-local per-request draft count (device tensor, padded), a snapshot
     # of the chunk's spec_decode_metadata.draft_lengths. Lets the async draft
     # path read num_draft on-device instead of re-scanning the scheduler dict
@@ -81,6 +82,7 @@ def _force_draft_tp1():
     load path instead of mutating the shared singleton; deferred to future work.
     """
     from vllm.distributed.parallel_state import get_tp_group
+
     tp = get_tp_group()
     saved_ws, saved_rank = tp.world_size, tp.rank_in_group
     tp.world_size = 1
@@ -93,7 +95,7 @@ def _force_draft_tp1():
 
 
 def gather_sharded_weight(
-    sharded_module: torch.nn.Module
+    sharded_module: torch.nn.Module,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
     """Gathers a sharded weight tensor across TP into a full replicated tensor."""
     tp_group = get_tp_group().cpu_group
@@ -110,7 +112,7 @@ def gather_sharded_weight(
     num_org = si.org_vocab_end_index - si.org_vocab_start_index
     full = torch.zeros(org_vocab, dim, dtype=torch.float32)
     my_rows = sharded_module.weight.data[:num_org].to(torch.float32).cpu()
-    full[si.org_vocab_start_index:si.org_vocab_end_index] = my_rows
+    full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
     dist.all_reduce(full, group=tp_group)
 
     draft_dtype = sharded_module.weight.dtype
@@ -119,18 +121,19 @@ def gather_sharded_weight(
     return full_dev, org_vocab, dim, draft_device
 
 
-def populate_draft_embed_from_target(draft_model: torch.nn.Module,
-                                     target_embed: torch.nn.Module) -> None:
+def populate_draft_embed_from_target(
+    draft_model: torch.nn.Module, target_embed: torch.nn.Module
+) -> None:
     """Fill the draft's own (tp=1, full-vocab) embed_tokens with the
     target's embedding, assembled on the host.
     """
     draft_embed = draft_model.model.embed_tokens
     assert draft_embed.org_vocab_size == target_embed.org_vocab_size, (
         f"draft embed org_vocab {draft_embed.org_vocab_size} != target "
-        f"{target_embed.org_vocab_size}; cannot populate")
+        f"{target_embed.org_vocab_size}; cannot populate"
+    )
 
-    full_dev, org_vocab, dim, draft_device = gather_sharded_weight(
-        target_embed)
+    full_dev, org_vocab, dim, draft_device = gather_sharded_weight(target_embed)
 
     new_embed = torch.nn.Embedding(org_vocab, dim, _weight=full_dev)
     new_embed.weight.requires_grad_(False)
@@ -141,26 +144,39 @@ def populate_draft_embed_from_target(draft_model: torch.nn.Module,
         synchronize_tensors(new_embed.weight)
     logger.info(
         "Draft embed_tokens replaced with full replicated nn.Embedding: "
-        "%d x %d per worker.", org_vocab, dim)
+        "%d x %d per worker.",
+        org_vocab,
+        dim,
+    )
 
 
-def maybe_share_embeddings(draft_model: torch.nn.Module,
-                           target_model: torch.nn.Module,
-                           tp_layout_matches: bool,
-                           force_share: bool = False) -> None:
-    target_lm = target_model.get_language_model() if hasattr(
-        target_model, "get_language_model") else target_model
+def maybe_share_embeddings(
+    draft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    tp_layout_matches: bool,
+    force_share: bool = False,
+) -> None:
+    target_lm = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
     target_lm_model = getattr(target_lm, "model", None)
-    target_embed = getattr(target_lm_model, "embed_tokens",
-                           None) if target_lm_model is not None else None
+    target_embed = (
+        getattr(target_lm_model, "embed_tokens", None)
+        if target_lm_model is not None
+        else None
+    )
 
     if force_share:
         share_embed = True
     elif hasattr(draft_model, "has_own_embed_tokens"):
         share_embed = not draft_model.has_own_embed_tokens
     else:
-        logger.info("Draft model does not declare `has_own_embed_tokens`; "
-                    "defaulting to share embed_tokens with the target.")
+        logger.info(
+            "Draft model does not declare `has_own_embed_tokens`; "
+            "defaulting to share embed_tokens with the target."
+        )
         share_embed = True
 
     if share_embed:
@@ -193,8 +209,7 @@ def iter_mtp_shared_heads(draft_model: torch.nn.Module):
     layers = getattr(inner, "layers", None)
     if layers is None:
         return
-    items = (layers.values()
-             if isinstance(layers, torch.nn.ModuleDict) else layers)
+    items = layers.values() if isinstance(layers, torch.nn.ModuleDict) else layers
     for layer in items:
         shared_head = getattr(layer, "shared_head", None)
         if shared_head is not None and hasattr(shared_head, "head"):
@@ -216,11 +231,11 @@ def resolve_draft_logits_processor(draft_model: torch.nn.Module):
 
 
 def populate_draft_lm_head_from_target(
-        draft_model: torch.nn.Module, target_lm_head: torch.nn.Module) -> None:
+    draft_model: torch.nn.Module, target_lm_head: torch.nn.Module
+) -> None:
     shared_heads = list(iter_mtp_shared_heads(draft_model))
     if shared_heads:
-        full_dev, org_vocab, dim, draft_device = gather_sharded_weight(
-            target_lm_head)
+        full_dev, org_vocab, dim, draft_device = gather_sharded_weight(target_lm_head)
         for shared_head in shared_heads:
             shared_head.head.weight = Parameter(full_dev, requires_grad=False)
             if draft_device.type == "tpu":
@@ -228,51 +243,63 @@ def populate_draft_lm_head_from_target(
         logger.info(
             "Populated %d MTP shared_head.head module(s) with a full "
             "replicated copy of the target lm_head: %d x %d per worker.",
-            len(shared_heads), org_vocab, dim)
+            len(shared_heads),
+            org_vocab,
+            dim,
+        )
         return
 
-    draft_lm_head = draft_model.model.lm_head if hasattr(
-        draft_model, "model") and hasattr(draft_model.model,
-                                          "lm_head") else getattr(
-                                              draft_model, "lm_head", None)
+    draft_lm_head = (
+        draft_model.model.lm_head
+        if hasattr(draft_model, "model") and hasattr(draft_model.model, "lm_head")
+        else getattr(draft_model, "lm_head", None)
+    )
     if draft_lm_head is None:
-        draft_lm_head = ParallelLMHead(target_lm_head.org_vocab_size,
-                                       target_lm_head.embedding_dim)
+        draft_lm_head = ParallelLMHead(
+            target_lm_head.org_vocab_size, target_lm_head.embedding_dim
+        )
         draft_model.lm_head = draft_lm_head
 
-    full_dev, org_vocab, dim, draft_device = gather_sharded_weight(
-        target_lm_head)
+    full_dev, org_vocab, dim, draft_device = gather_sharded_weight(target_lm_head)
 
     draft_lm_head.weight = Parameter(full_dev, requires_grad=False)
 
     if draft_device.type == "tpu":
         synchronize_tensors(draft_lm_head.weight)
     logger.info(
-        "Draft lm_head replaced with full replicated nn.Linear: "
-        "%d x %d per worker.", org_vocab, dim)
+        "Draft lm_head replaced with full replicated nn.Linear: %d x %d per worker.",
+        org_vocab,
+        dim,
+    )
 
 
-def maybe_share_lm_head(draft_model: torch.nn.Module,
-                        target_model: torch.nn.Module,
-                        draft_replicated: bool,
-                        tp_layout_matches: bool,
-                        force_share: bool = False,
-                        materialize_if_mismatched: bool = True) -> None:
-    target_lm = target_model.get_language_model() if hasattr(
-        target_model, "get_language_model") else target_model
+def maybe_share_lm_head(
+    draft_model: torch.nn.Module,
+    target_model: torch.nn.Module,
+    draft_replicated: bool,
+    tp_layout_matches: bool,
+    force_share: bool = False,
+    materialize_if_mismatched: bool = True,
+) -> None:
+    target_lm = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
     target_lm_head = getattr(target_lm, "lm_head", None)
 
     if target_lm_head is None:
-        raise RuntimeError(
-            "Draft expects the target model to have an lm_head.")
+        raise RuntimeError("Draft expects the target model to have an lm_head.")
 
     if force_share:
         share_lm_head = True
     elif hasattr(draft_model, "has_own_lm_head"):
         share_lm_head = not draft_model.has_own_lm_head
     else:
-        logger.info("Draft model does not declare `has_own_lm_head`; "
-                    "defaulting to share lm_head with the target.")
+        logger.info(
+            "Draft model does not declare `has_own_lm_head`; "
+            "defaulting to share lm_head with the target."
+        )
         share_lm_head = True
 
     if share_lm_head:
@@ -292,18 +319,23 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
             if shared_heads:
                 logger.info(
                     "Shared the target's lm_head with %d MTP "
-                    "shared_head.head module(s).", len(shared_heads))
+                    "shared_head.head module(s).",
+                    len(shared_heads),
+                )
 
             if hasattr(draft_model, "lm_head"):
                 draft_model.lm_head = target_lm_head
             elif hasattr(draft_model, "model") and hasattr(
-                    draft_model.model, "lm_head"):
+                draft_model.model, "lm_head"
+            ):
                 draft_model.model.lm_head = target_lm_head
             elif not shared_heads:
                 draft_model.lm_head = target_lm_head
         elif materialize_if_mismatched:
-            logger.info("Populating draft's own lm_head with a host-gathered, "
-                        "per-worker replicated copy of the target lm_head.")
+            logger.info(
+                "Populating draft's own lm_head with a host-gathered, "
+                "per-worker replicated copy of the target lm_head."
+            )
             populate_draft_lm_head_from_target(draft_model, target_lm_head)
 
     # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
@@ -317,17 +349,23 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
                 f"{type(draft_model).__name__} exposes none at "
                 "`logits_processor` or `model.logits_processor`. Without the "
                 "override the draft would gather over a TP group it is not "
-                "sharded across.")
+                "sharded across."
+            )
         assert hasattr(lp, "_gather_logits"), (
             "draft logits_processor has no _gather_logits to override; "
-            "vLLM may have renamed it.")
+            "vLLM may have renamed it."
+        )
         lp._gather_logits = lambda logits: logits
 
 
 # Noise-token id resolution order, mirroring upstream
 # vllm/v1/worker/gpu/spec_decode/utils.py.
-_NOISE_TOKEN_KEYS = ("mask_token_id", "dspark_noise_token_id", "pard_token",
-                     "ptd_token_id")
+_NOISE_TOKEN_KEYS = (
+    "mask_token_id",
+    "dspark_noise_token_id",
+    "pard_token",
+    "ptd_token_id",
+)
 
 
 def _resolve_target_layer_ids(hf_dict: dict) -> list[int] | None:
@@ -370,7 +408,8 @@ def normalize_draft_config(hf_config) -> dict:
     if noise_id is None:
         raise ValueError(
             "Parallel drafter requires a noise/mask token id in the draft config "
-            f"(one of dflash_config.mask_token_id, {_NOISE_TOKEN_KEYS}).")
+            f"(one of dflash_config.mask_token_id, {_NOISE_TOKEN_KEYS})."
+        )
     dflash_config = dict(hf_dict.get("dflash_config", {}))
     dflash_config["mask_token_id"] = noise_id
     if not dflash_config.get("target_layer_ids"):

@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 
 @pytest.mark.parametrize(

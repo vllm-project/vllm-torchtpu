@@ -108,14 +108,12 @@ class PcpSequenceLayoutEligibility:
         dcp_size: int = 1,
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
-        is_kv_producer: bool | None = None,
     ):
         self.pcp_size = pcp_size
         self.interleave_size = interleave_size
         self.dcp_size = dcp_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
-        self.is_kv_producer = is_kv_producer
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutEligibility":
@@ -124,11 +122,6 @@ class PcpSequenceLayoutEligibility:
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        kv_transfer_config = vllm_config.kv_transfer_config
-
-        is_kv_producer = None
-        if kv_transfer_config is not None:
-            is_kv_producer = kv_transfer_config.is_kv_producer
 
         return cls(
             pcp_size=parallel_config.prefill_context_parallel_size,
@@ -136,7 +129,6 @@ class PcpSequenceLayoutEligibility:
             dcp_size=parallel_config.decode_context_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
-            is_kv_producer=is_kv_producer,
         )
 
     @property
@@ -251,11 +243,6 @@ class PcpSequenceLayoutEligibility:
         return tuple(spans)
 
     def _validate_execution_support(self) -> None:
-        if self.is_kv_producer is False:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support KV "
-                "consumer/decode workers yet. Disable PCP on decode workers."
-            )
         if self.dcp_size > 1:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support DCP yet."

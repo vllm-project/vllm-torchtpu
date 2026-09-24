@@ -34,7 +34,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# shellcheck source=.buildkite/scripts/ci_image.sh
+# shellcheck source=/dev/null
 source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
@@ -141,8 +141,30 @@ mkdir -p "${PERSIST_ROOT}/perf_eval_results" "${HOST_HF_HOME}"
 chmod 777 "${PERSIST_ROOT}/perf_eval_results" 2>/dev/null || true
 bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 
-ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true; sudo -n rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* >/dev/null 2>&1 || true"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "mkdir -p ~/persist/perf_eval_results ~/hf_home; docker rm -f disagg-worker >/dev/null 2>&1 || true; sudo -n rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* ~/'\${HOME}' >/dev/null 2>&1 || rm -rf ~/persist/perf_eval_results/* ~/hf_home/hub/* ~/'\${HOME}' >/dev/null 2>&1 || true"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "bash -s" < "${SCRIPT_DIR}/cleanup_docker.sh" || true
+
+# ---------------------------------------------------------------------------
+# Resolve model checkpoint: stream from GCS snapshot via runai_streamer
+# ---------------------------------------------------------------------------
+MODEL_GCS_PATH="${MODEL_GCS_PATH:-gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/}"
+MODEL_PATH="${MODEL_PATH:-}"
+if [ -z "${MODEL_PATH}" ] && [ -n "${MODEL_GCS_PATH}" ]; then
+  MODEL_PATH="$(gcloud storage ls "${MODEL_GCS_PATH%/}/snapshots/" | sed -n '1p')"
+  MODEL_PATH="${MODEL_PATH%/}"
+fi
+if [ -z "${MODEL_PATH}" ] \
+    || ! gcloud storage ls "${MODEL_PATH}/config.json" >/dev/null; then
+  echo "ERROR: no servable snapshot under ${MODEL_GCS_PATH} (resolved" \
+    "MODEL_PATH=${MODEL_PATH:-<empty>}); expected a snapshot directory" \
+    "holding config.json."
+  exit 1
+fi
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B-FP8}"
+LOAD_FORMAT="${LOAD_FORMAT:-runai_streamer}"
+echo "Model Path: ${MODEL_PATH}"
+echo "Served Model Name: ${SERVED_MODEL_NAME}"
+echo "Load Format: ${LOAD_FORMAT}"
 
 # ---------------------------------------------------------------------------
 # Environment variables for Docker containers
@@ -193,6 +215,7 @@ CONTAINER_ENV_COMMON=(
   -e RUN_ROOT="/perf_eval_results/qwen35_p8d8_disagg_ci"
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"}
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"}
+  ${LOAD_FORMAT:+-e LOAD_FORMAT="${LOAD_FORMAT}"}
   ${GPU_MEMORY_UTILIZATION:+-e GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}"}
   ${MAX_MODEL_LEN:+-e MAX_MODEL_LEN="${MAX_MODEL_LEN}"}
   ${MAX_NUM_BATCHED_TOKENS:+-e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS}"}

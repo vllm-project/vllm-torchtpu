@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
@@ -80,12 +81,6 @@ from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
-
-# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
-if envs.USE_BATCHED_RPA_LONGCTX:
-    import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched_wrapper
-else:
-    import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -729,22 +724,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        # Needs a current vLLM config: the layout falls through to the KV
-        # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
-        if envs.USE_BATCHED_RPA_LONGCTX:
-            return [128, 256, 512, 1024, 2048, 4096]
-        # SEQ_ALONG_LANE maps a page onto one 128-lane tile; `RpaConfigs`
-        # rejects any other page size in non-PCP mode. PCP streaming supports
-        # each 128-aligned page size listed below.
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
+            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
+            > 1
         ):
-            parallel_config = get_current_vllm_config().parallel_config
-            if parallel_config.prefill_context_parallel_size > 1:
-                return [128, 256, 512, 1024, 2048, 4096]
-            return [128]
-        return [256]
+            return [128, 256, 512, 1024, 2048, 4096]
+        return [128, 256]
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
@@ -1296,20 +1283,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
 
     def runs_batched_rpa_schedule(self) -> bool:
-        """Whether forward runs the batched RPA kernel, which keeps a whole
-        step's (query block, KV block) schedule in SMEM. The PCP streaming
-        kernel, the DCP kernels, the long-context fork, the head-dim-64
-        kernel and the bundled kernel keep no such table."""
-        # TODO(#1015): remove, with the runner's schedule check, once the
-        # batched RPA kernel enforces its own schedule bound.
-        other_kernel = (
-            self._pcp_streaming  # PCP: the streaming kernel
-            or self.dcp_world_size > 1  # DCP: the long-context kernels
-            or self.rpa_kernel_bundled is not None  # block-major KV: bundled
-            or envs.USE_BATCHED_RPA_LONGCTX  # the long-context fork
-            or self.head_size == 64  # the head-dim-64 kernel (see use_hd64)
-        )
-        return self._kernel_entry is _pallas_rpa_kernel_batched and not other_kernel
+        return False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -1536,7 +1510,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         spec = vllm_config.speculative_config if vllm_config else None
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
-        if spec is not None and envs.USE_BATCHED_RPA_LONGCTX and self.head_size != 64:
+        if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
 
 

@@ -255,10 +255,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        local_reader_ranks = [
+            a["rank"] for a in bundle_assignments if a["node_id"] == driver_node
+        ]
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
-            n_local,
+            len(local_reader_ranks),
+            local_reader_ranks=local_reader_ranks,
             max_chunk_bytes=max_chunk_bytes,
             connect_ip=ray.util.get_node_ip_address(),
         )
@@ -595,11 +598,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 set_node_kv_ip_port(item)
 
     def _initialize_ray_cluster(self) -> None:
-        """Initialize the distributed cluster with Ray.
-
-        Creates a TPU-optimized placement group where all chips on a node
-        are packed into a single bundle, instead of 1 GPU per bundle.
-        """
+        """Initialize Ray and select this engine's placement group."""
         # Check if placement group is already provided (e.g., by ray.serve.llm)
         if self.parallel_config.placement_group is not None:
             logger.info(
@@ -634,12 +633,41 @@ class RayDistributedExecutorV2(RayExecutorV2):
             f"(filtered from {len(ray_nodes)} total nodes)"
         )
 
-        if pp_size == 1:
+        dp_size, dp_rank, _ = self._get_dp_geometry()
+        if pp_size == 1 and dp_size > 1:
+            # Pin each worker to a host in this engine's aligned block while
+            # preserving one bundle per worker for VLLM_RAY_BUNDLE_INDICES.
+            # The aligned-block check still covers chip assignment on a host.
+            host_order, chips_per_host = self._slice_host_layout(device_str)
+            block_start = dp_rank * self.parallel_config.world_size
+            block_end = block_start + self.parallel_config.world_size
+            offset = 0
+            assigned = 0
+            for node_ip in host_order:
+                host_end = offset + chips_per_host[node_ip]
+                overlap = max(
+                    0,
+                    min(block_end, host_end) - max(block_start, offset),
+                )
+                if overlap:
+                    placement_group_specs.extend(
+                        {
+                            device_str: 1.0,
+                            f"node:{node_ip}": 0.001,
+                        }
+                        for _ in range(overlap)
+                    )
+                    assigned += overlap
+                offset = host_end
+            if assigned != self.parallel_config.world_size:
+                raise ValueError(
+                    f"DP rank {dp_rank} could reserve only {assigned} of "
+                    f"{self.parallel_config.world_size} devices from the "
+                    f"slice host layout {chips_per_host}."
+                )
+        elif pp_size == 1:
             # One bundle per device of *this engine*, as upstream
-            # initialize_ray_cluster() does. Sizing this by the cluster's
-            # devices instead only coincides with world_size when a single
-            # engine spans the whole slice; under DP every engine would ask
-            # for every chip and none but the first could ever be scheduled.
+            # initialize_ray_cluster() does.
             placement_group_specs = [
                 {device_str: 1.0} for _ in range(self.parallel_config.world_size)
             ]
@@ -652,7 +680,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 {device_str: num_devices_per_pp_rank} for _ in range(pp_size)
             ]
 
-        dp_size, _, _ = self._get_dp_geometry()
         if dp_size == 1:
             # Bind the first bundle to the current node (vLLM engine node).
             # Under DP every engine runs on the head node, so pinning would

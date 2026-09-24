@@ -184,6 +184,22 @@ steps:
             env MODEL=gs://tpu-commons-ci/glm/GLM-5.2-NVFP4
             bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
 
+      # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
+      # boot. Not staged: the rig's default MODEL is the gs:// copy, streamed
+      # with runai_streamer, since ~443 GiB does not fit an agent's disk.
+      - label: ":kubernetes: Integration: k3-pruned75-apc-offload-correctness"
+        key: "integration_k3_pruned75_apc_offload_correctness"
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "perf_eval_results/k3_pruned75_apc_offload_ci"
+          SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
+
   # A two-host slice, so it goes through run_multihost.sh and the JobSet in
   # manifests/. Not in the tpu/v7x concurrency group: a group counts steps, not
   # chips, so no slot can say "the whole fleet" - the dependency below is what
