@@ -54,7 +54,7 @@ def gemma4_sequential(model, dataloader, dev, args):
     print("=" * 85)
     print(">>> [SPARSITY ENGINE] Starting Gemma 4 Sequential Pruning")
     print(
-        f"    • Structured Sparsity: {sparsity_ratio} ({args.prunen} pruned / {args.prunem} block)"
+        f"    • Structured Sparsity: {sparsity_ratio} ({args.prunen} kept / {args.prunem} block)"
     )
     print(
         f"    • Total Layers:        {total_layers} (pruning layers [{args.minlayer} .. {args.maxlayer}-1])"

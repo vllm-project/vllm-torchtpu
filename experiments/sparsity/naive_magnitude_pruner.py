@@ -20,7 +20,7 @@ def prune_tensor_magnitude_nm(w: torch.Tensor,
                               prunem: int = 4) -> torch.Tensor:
     """
     Applies naive N:M structured magnitude pruning along the contracting dimension (dim=-1).
-    Keeps the (M - N) weights with largest absolute magnitude in every M block.
+    Keeps the N weights with largest absolute magnitude in every M block.
     For 2:4: keeps top 2, zeros out 2 smallest.
     """
     orig_shape = w.shape
@@ -38,8 +38,8 @@ def prune_tensor_magnitude_nm(w: torch.Tensor,
     # stable=True makes tie-breaks deterministic and portable across backends.
     ranks = torch.argsort(torch.argsort(w_abs, dim=-1, stable=True), dim=-1)
 
-    # Keep weights whose rank >= prunen (e.g. for 2:4: ranks >= 2 keeps top 2)
-    mask = ranks >= prunen
+    # Keep the N largest: ranks >= M - N (2:4 keeps top 2, 1:4 keeps top 1)
+    mask = ranks >= prunem - prunen
 
     # Apply mask and restore original tensor shape and dtype
     w_pruned = (w_flat * mask).view(orig_shape).to(orig_dtype)

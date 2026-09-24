@@ -58,8 +58,8 @@ class TestNaiveMagnitudePruner(unittest.TestCase):
 
     def test_1of4_structured_sparsity_math(self):
         """
-        Arrange-Act-Assert: Verify 1:4 structured sparsity (25% sparse) mathematical properties.
-        Rule: In every group of 4 elements, exactly 1 element (the smallest in magnitude) is zeroed.
+        Arrange-Act-Assert: Verify 1:4 structured sparsity (75% sparse) mathematical properties.
+        Rule: In every group of 4 elements, exactly 1 element (the largest in magnitude) is kept.
         """
         # Arrange: Construct tensor
         tensor = torch.tensor([[1.0, 4.0, 2.0, 3.0, 10.0, 5.0, 8.0, 2.0]],
@@ -68,9 +68,9 @@ class TestNaiveMagnitudePruner(unittest.TestCase):
         # Act: Apply 1:4 pruning
         pruned = prune_tensor_magnitude_nm(tensor, prunen=1, prunem=4)
 
-        # Assert: 1 of 4 means exactly 25% zeros (2 out of 8 elements)
-        zero_count = (pruned == 0).sum().item()
-        self.assertEqual(zero_count, 2)
+        # Assert: 1 of 4 kept means 75% zeros; the survivors are the block maxima
+        expected = torch.tensor([[0.0, 4.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0]])
+        self.assertTrue(torch.equal(pruned, expected))
 
     def test_edge_cases(self):
         """
