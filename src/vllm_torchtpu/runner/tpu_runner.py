@@ -4736,6 +4736,7 @@ class TPUModelRunner(GPUModelRunner):
         if capacity is None or num_reqs <= 0:
             return
         from vllm_torchtpu.core.pp_chunks import schedule_pairs
+
         kv_lens = self.seq_lens_np[:num_reqs]
         for mode, lo, hi in (
             ("decode", 0, num_decode),

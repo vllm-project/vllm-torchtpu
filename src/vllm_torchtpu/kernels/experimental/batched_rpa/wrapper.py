@@ -665,6 +665,7 @@ def ragged_paged_attention(
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
         return_lse=return_lse,
+        skip_kv_update=skip_kv_update,
     )
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,

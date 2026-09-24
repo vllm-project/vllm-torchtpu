@@ -346,10 +346,9 @@ def _attention_layers(monkeypatch, batched, capacity=None):
             return capacity[mode.name.lower()]
         return (100 + kwargs["num_seqs"], 256, 256)
 
-    monkeypatch.setattr(rpa_batched,
-                        "schedule_capacity",
-                        schedule_capacity,
-                        raising=False)
+    monkeypatch.setattr(
+        rpa_batched, "schedule_capacity", schedule_capacity, raising=False
+    )
     return sized
 
 

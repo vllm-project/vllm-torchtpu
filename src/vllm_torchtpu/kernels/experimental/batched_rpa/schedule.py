@@ -586,7 +586,10 @@ class BaseMetadataComputer:
         kv_p_start = k_idx * cfgs.bkv_p
         k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
+        if cfgs.serve.skip_kv_update:
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
