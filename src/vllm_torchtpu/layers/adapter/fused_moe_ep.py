@@ -51,11 +51,18 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order,
-                                               ep_token_replica_groups)
-from vllm_torchtpu.kernels.fused_moe.v2.host import (PACK4, U32_SUBLANE_TILE,
-                                                     token_gather_smem_bytes)
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    ep_rank_order,
+    ep_token_replica_groups,
+)
+from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    PACK4,
+    U32_SUBLANE_TILE,
+    token_gather_smem_bytes,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -554,9 +561,9 @@ def prebuild_fused_moe_ep(
     global _RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which since
     # #3522 is ordered by rank, so the position is the EP rank.
-    _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
-                                dtype=torch.int32,
-                                device=layer.w13_weight.device)
+    _RANK_BUFFER = torch.tensor(
+        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+    )
     mesh_expert_order = _mesh_expert_order(ep)
 
     if weights is None:

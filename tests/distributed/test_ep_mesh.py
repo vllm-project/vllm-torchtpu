@@ -103,22 +103,23 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_ids(monkeypatch):
     from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(
-        jax, "devices",
-        Mock(side_effect=AssertionError("build_ep_mesh must not read "
-                                        "jax.devices()")))
+        jax,
+        "devices",
+        Mock(side_effect=AssertionError("build_ep_mesh must not read jax.devices()")),
+    )
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
     made = Mock(side_effect=lambda **kwargs: object())
     monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
 
     first = ep.build_ep_mesh()
-    assert made.call_args.kwargs == {"axis_names": ("d", )}
+    assert made.call_args.kwargs == {"axis_names": ("d",)}
     assert ep.build_ep_mesh() is first
     # Same devices in a different order is the same mesh: the key sorts them.
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20, 30, 40))
     assert ep.build_ep_mesh() is first
     assert ep.build_ep_mesh("experts") is not first
-    assert made.call_args.kwargs == {"axis_names": ("experts", )}
+    assert made.call_args.kwargs == {"axis_names": ("experts",)}
     assert made.call_count == 2
 
 

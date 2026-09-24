@@ -14,12 +14,16 @@ from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
-from vllm_torchtpu.kernels.experimental.batched_rpa import \
-    configs as batched_rpa_configs
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
-    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
-    PCP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
+    PCP_AXIS_NAME,
+    sharded_pcp_ragged_paged_attention,
+)
 
 _PCP_STREAMING_RPA_TENSOR_ARG_COUNT = 9
 
@@ -75,15 +79,16 @@ def build_pcp_streaming_callable(
     static_argnums = pallas_impl._infer_static_argnums(signature)
     donate_argnums_tuple = tuple(donate_argnums or ())
     output_partition_specs_tuple = tuple(
-        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
     # No out_shardings on the jit, because pallas.jax_op does not set it
     # either and this has to build the same callable it does. The shard_map
     # body already declares its out_specs, so pinning them again only added an
     # advisory sdy.sharding result attribute to the exported module -- and the
     # partitioner is a no-op here because shard_map is already manual.
-    jit_fn = jax.jit(fn,
-                     static_argnums=static_argnums,
-                     donate_argnums=donate_argnums_tuple)
+    jit_fn = jax.jit(
+        fn, static_argnums=static_argnums, donate_argnums=donate_argnums_tuple
+    )
     trace_key = pallas_impl._get_kernel_invocation_key(
         f"{name}_{id(fn)}",
         [],
@@ -134,6 +139,7 @@ def pcp_streaming_jax_op(
     # so hot-reload can swap the callable without re-registering the op.
     if envs.TPU_KERNEL_ITER_MODE:
         from vllm_torchtpu.compilation import kernel_reload
+
         kernel_reload.set_live(name, wrapped_fn)
         op_target = kernel_reload.make_dispatcher(name, wrapped_fn)
     else:
@@ -141,8 +147,9 @@ def pcp_streaming_jax_op(
 
     result = torch.library.custom_op(name, op_target, mutates_args=())
 
-    output_specs = tuple(output_partition_specs
-                         or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS)
+    output_specs = tuple(
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
 
     def fake_fn(*args, **kwargs):
         # Mirrors stock's fake kernel: size the outputs from the specs the
@@ -157,7 +164,8 @@ def pcp_streaming_jax_op(
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
         return lowered.out_tree.unflatten(
             pallas_impl.torch_placeholder(aval, mesh=mesh, partition_spec=spec)
-            for aval, spec in zip(lowered.out_avals, output_specs))
+            for aval, spec in zip(lowered.out_avals, output_specs)
+        )
 
     result.register_fake(fake_fn)
     return result
@@ -181,15 +189,14 @@ def make_pcp_streaming_rpa_kernel(
     q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     q_compute_size: int | None = None,
     kv_layout: batched_rpa_configs.KVLayout = (
-        batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE),
+        batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
     """Build a PCP streaming RPA entry with only tensor args in its signature."""
     if soft_cap is not None:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support logits soft cap.")
+        raise NotImplementedError("PCP streaming RPA does not support logits soft cap.")
     if skip_kv_update:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support skip_kv_update.")
+        raise NotImplementedError("PCP streaming RPA does not support skip_kv_update.")
 
     def _pcp_streaming_rpa_kernel(
         kv_cache: jax.Array,
@@ -233,15 +240,16 @@ def invoke_pcp_streaming_op(rpa_kernel_op, kv_cache, args, kwargs):
     if kwargs:
         raise ValueError(
             "PCP streaming RPA kernel does not accept keyword tensor args: "
-            f"{tuple(kwargs)}.")
+            f"{tuple(kwargs)}."
+        )
     if len(args) != _PCP_STREAMING_RPA_TENSOR_ARG_COUNT - 1:
         raise ValueError(
             "PCP streaming RPA kernel expects "
             f"{_PCP_STREAMING_RPA_TENSOR_ARG_COUNT - 1} tensor args "
-            f"after kv_cache, got {len(args)}.")
+            f"after kv_cache, got {len(args)}."
+        )
     if args[7] is not None:
-        raise NotImplementedError(
-            "PCP streaming RPA does not support attention sinks.")
+        raise NotImplementedError("PCP streaming RPA does not support attention sinks.")
     pcp_streaming_args = (
         args[0],  # query
         args[1],  # key

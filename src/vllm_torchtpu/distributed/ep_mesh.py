@@ -213,12 +213,14 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
             f"torch.distributed world of {world_size}. get_pallas_mesh builds "
             "a mesh over the whole world, so EP alongside another parallelism "
             "axis needs a mesh_shape factorisation that has not been worked "
-            "out.")
+            "out."
+        )
 
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    mesh = get_pallas_mesh(axis_names=(axis_name, ))
-    logger.info("Built EP mesh | axis=%s | size=%d | rank-ordered", axis_name,
-                world_size)
+    mesh = get_pallas_mesh(axis_names=(axis_name,))
+    logger.info(
+        "Built EP mesh | axis=%s | size=%d | rank-ordered", axis_name, world_size
+    )
     _MESH_CACHE[cache_key] = mesh
     return mesh

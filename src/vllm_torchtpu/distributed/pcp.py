@@ -6,8 +6,7 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
-                                                  get_cp_group_layout)
+from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -42,8 +41,7 @@ def get_pcp_world_size() -> int:
     return 1 if group is None else int(group.world_size)
 
 
-def all_gather_equal_tokens(tensor: torch.Tensor,
-                            dim: int = 0) -> torch.Tensor:
+def all_gather_equal_tokens(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """Gather equal-shaped tensors across the native PCP group."""
     group = get_pcp_group()
     if group is None or int(group.world_size) == 1:
@@ -105,8 +103,7 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
         import numpy as np
         from jax.sharding import Mesh
 
-        mesh = Mesh(np.asarray(jax.local_devices()[:1]),
-                    axis_names=(axis_name, ))
+        mesh = Mesh(np.asarray(jax.local_devices()[:1]), axis_names=(axis_name,))
         _MESH_CACHE[cache_key] = mesh
         return mesh
 
@@ -123,11 +120,12 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
             f"torch.distributed world of {world_size}. get_pallas_mesh builds "
             "a mesh over the whole world, so PCP alongside another "
             "parallelism axis needs a mesh_shape factorisation that has not "
-            "been worked out.")
+            "been worked out."
+        )
 
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    mesh = get_pallas_mesh(axis_names=(axis_name, ))
+    mesh = get_pallas_mesh(axis_names=(axis_name,))
 
     # The mesh holds abstract _PallasDevice objects numbered by rank, not TPU
     # devices, so there is no device order here to check: position i is rank i
@@ -139,16 +137,22 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
             "The PCP group is not made of ranks 0..N-1 in order "
             f"({layout.ranks}), so rank_in_group is not the PyTorch rank that "
             "torch_tpu#3522 binds partition indices to, and the host's token "
-            "split would not match the kernel's view.")
+            "split would not match the kernel's view."
+        )
 
     # Log rank and device id for each position in the mesh. Logs once per
     # worker.
     rank_and_device = zip(layout.ranks, layout.device_ids)
-    positions = ", ".join(f"pos{i}=rank{rank}/dev{dev}"
-                          for i, (rank, dev) in enumerate(rank_and_device))
+    positions = ", ".join(
+        f"pos{i}=rank{rank}/dev{dev}" for i, (rank, dev) in enumerate(rank_and_device)
+    )
     logger.info(
         "PCP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
-        axis_name, layout.world_size, layout.rank_in_group, positions)
+        axis_name,
+        layout.world_size,
+        layout.rank_in_group,
+        positions,
+    )
 
     _MESH_CACHE[cache_key] = mesh
     return mesh

@@ -229,20 +229,25 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     ``mesh_utils.get_or_create_cp_mesh``, so the name that gets called is the
     one bound in ``pcp``'s namespace by its ``from ... import``.
     """
-    monkeypatch.setattr(pcp, "get_cp_group_layout",
-                        lambda group: layout_holder[0])
+    monkeypatch.setattr(pcp, "get_cp_group_layout", lambda group: layout_holder[0])
     monkeypatch.setattr(
-        parallel_state, "get_pcp_group",
-        lambda: SimpleNamespace(world_size=world_size, rank_in_group=0))
-    monkeypatch.setattr(torch.distributed, "get_world_size",
-                        lambda *a, **k: world_size)
+        parallel_state,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=world_size, rank_in_group=0),
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: world_size)
     # A mesh ordered by device id would disagree with the host's
     # rank_in_group split on any machine where the two orders differ, so the
     # point of the change is that this list is never consulted.
     monkeypatch.setattr(
-        jax, "devices",
-        Mock(side_effect=AssertionError(
-            "get_or_create_pcp_mesh must not look at jax.devices()")))
+        jax,
+        "devices",
+        Mock(
+            side_effect=AssertionError(
+                "get_or_create_pcp_mesh must not look at jax.devices()"
+            )
+        ),
+    )
     from torch_tpu._internal import pallas as pallas_module
 
     get_pallas_mesh = Mock(side_effect=lambda **kwargs: object())
@@ -258,7 +263,7 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     # Only the axis name: get_pallas_mesh numbers positions by PyTorch rank,
     # which is the binding torch_tpu#3522 guarantees, so there is no device
     # array to hand it.
-    assert get_pallas_mesh.call_args.kwargs == {"axis_names": ("pcp", )}
+    assert get_pallas_mesh.call_args.kwargs == {"axis_names": ("pcp",)}
     assert pcp.get_or_create_pcp_mesh() is first
     assert pcp.get_or_create_pcp_mesh("ring") is not first
     holder[0] = pcp.PcpGroupLayout((0, 1), (10, 30), 1, 2)

@@ -241,10 +241,14 @@ def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
     index i holds EP rank i's experts and the op must be handed nothing.
     """
     seen = []
-    assert _prebuild(
-        _layer(),
-        ep_order=tuple(range(_STUB_EP)),
-        build_op=lambda *args, **kwargs: seen.append(args) or "op") == "op"
+    assert (
+        _prebuild(
+            _layer(),
+            ep_order=tuple(range(_STUB_EP)),
+            build_op=lambda *args, **kwargs: seen.append(args) or "op",
+        )
+        == "op"
+    )
     assert seen and seen[0][_MESH_ORDER_ARG] is None
 
 
@@ -477,9 +481,10 @@ def test_ep_rank_order_does_not_depend_on_where_the_devices_sit():
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
     orders = []
     for device_ids in ((0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 2, 3, 4, 5, 6, 7)):
-        with patch.object(ep_mesh, "get_ep_group", return_value=group), \
-                patch.object(ep_mesh, "ep_device_ids",
-                             return_value=device_ids):
+        with (
+            patch.object(ep_mesh, "get_ep_group", return_value=group),
+            patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
+        ):
             orders.append(ep_mesh.ep_rank_order())
 
     assert orders[0] == orders[1] == tuple(range(8))
