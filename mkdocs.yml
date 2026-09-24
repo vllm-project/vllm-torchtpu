@@ -47,11 +47,18 @@ theme:
 
 nav:
   - 'Home': README.md
+  - 'Getting Started':
+    - 'TPU Setup': getting_started/tpu_setup.md
   - 'Features & Usage':
     - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
     - 'Docker': docker.md
+    - 'Code Examples':
+      - 'Offline Inference': api_and_code_examples/offline_inference.md
+      - 'Multi Modal Inference': api_and_code_examples/multi_modal_inference.md
+      - 'Offline LoRA': api_and_code_examples/offline_lora_inference.md
   - 'Developers Guides':
     - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
+    - 'Buildkite Pipelines': developers_guide/buildkite.md
     - 'TPU Patch Mechanism': tpu_patch_mechanism.md
     - 'Profiling': developers_guide/profiling.md
 

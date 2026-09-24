@@ -20,7 +20,9 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-rocket-launch:{ .lg .middle } __I'm New__
 
-    Install the plugin, start a server, and send your first request.
+    Provision a TPU, install the plugin, start a server, and send your first request.
+
+    [:octicons-arrow-right-24: TPU Setup](getting_started/tpu_setup.md)
 
     [:octicons-arrow-right-24: Installation and Quickstart](https://github.com/vllm-project/vllm-torchtpu#readme)
 
@@ -34,9 +36,13 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-code-tags:{ .lg .middle } __I Want to Build__
 
-    Contribute code and follow the submission flow.
+    Contribute code, dive into inference examples, and follow the submission flow.
+
+    [:octicons-arrow-right-24: Inference Examples](api_and_code_examples/offline_inference.md)
 
     [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
+
+    [:octicons-arrow-right-24: Buildkite Pipelines](developers_guide/buildkite.md)
 
 </div>
 
