@@ -35,9 +35,11 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
-                                                      KVCacheType,
-                                                      SparseMLAKVCacheSpec)
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout,
+    KVCacheType,
+    SparseMLAKVCacheSpec,
+)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.core import attention_interface
 
@@ -49,15 +51,15 @@ ROPE_DIM = 64
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
 # Two cache specs in the TensorCore layout and one in the SparseCore layout,
 # so a test can hand `sparse_mla_attention` a mismatched pair.
-NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                        KVCacheLayout.TENSORCORE, 16, 32,
-                                        LKV_DIM, KV_PACKING)
-ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
-                                        KVCacheLayout.TENSORCORE, 16, 32,
-                                        ROPE_DIM, KV_PACKING)
-ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
-                                           KVCacheLayout.SPARSECORE, 16, 32,
-                                           ROPE_DIM, KV_PACKING)
+NOPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE, KVCacheLayout.TENSORCORE, 16, 32, LKV_DIM, KV_PACKING
+)
+ROPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE, KVCacheLayout.TENSORCORE, 16, 32, ROPE_DIM, KV_PACKING
+)
+ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE, KVCacheLayout.SPARSECORE, 16, 32, ROPE_DIM, KV_PACKING
+)
 
 
 class UpdateCacheTest(parameterized.TestCase):
@@ -81,16 +83,14 @@ class UpdateCacheTest(parameterized.TestCase):
         operand = jnp.arange(2 * K * H, dtype=jnp.float32).reshape(2, K, 1, H)
         indices = jnp.array([1, 5], dtype=jnp.int32)
 
-        updated = attention_interface.update_cache(False, cache, indices,
-                                                   operand)
+        updated = attention_interface.update_cache(False, cache, indices, operand)
 
         flat = updated.reshape(K, L * S, H)
         for b in range(2):
             for k in range(K):
-                np.testing.assert_array_equal(flat[k, indices[b]],
-                                              operand[b, k, 0])
+                np.testing.assert_array_equal(flat[k, indices[b]], operand[b, k, 0])
         # Everything else stays zero.
-        mask = jnp.ones((L * S, ), dtype=bool).at[indices].set(False)
+        mask = jnp.ones((L * S,), dtype=bool).at[indices].set(False)
         for k in range(K):
             np.testing.assert_array_equal(flat[k, mask], 0)
 
@@ -102,15 +102,14 @@ class UpdateCacheTest(parameterized.TestCase):
         S = 2
         L = 4
         cache = jnp.zeros((K, L, S, H))
-        operand = jnp.arange(B * K * T * H,
-                             dtype=jnp.float32).reshape(B, K, T, H)
+        operand = jnp.arange(B * K * T * H, dtype=jnp.float32).reshape(B, K, T, H)
         indices = jnp.array([0, 1], dtype=jnp.int32)
 
-        updated = attention_interface.update_cache(True, cache, indices,
-                                                   operand)
+        updated = attention_interface.update_cache(True, cache, indices, operand)
 
         expected = cache.at[:, indices, :, :].set(
-            jnp.swapaxes(operand, 0, 1).reshape(K, B * T // S, S, H))
+            jnp.swapaxes(operand, 0, 1).reshape(K, B * T // S, S, H)
+        )
         np.testing.assert_array_equal(updated, expected)
 
     def test_prefill_sliding_window_keeps_only_the_tail(self):
@@ -122,8 +121,7 @@ class UpdateCacheTest(parameterized.TestCase):
         S = 2
         L = 4
         cache = jnp.zeros((K, L, S, H))
-        operand = jnp.arange(B * K * T * H,
-                             dtype=jnp.float32).reshape(B, K, T, H)
+        operand = jnp.arange(B * K * T * H, dtype=jnp.float32).reshape(B, K, T, H)
         indices = jnp.array([0, 1], dtype=jnp.int32)
 
         updated = attention_interface.update_cache(
@@ -132,13 +130,15 @@ class UpdateCacheTest(parameterized.TestCase):
             indices,
             operand,
             prefill_seq_len=jnp.array(T),
-            sliding_window=sliding_window)
+            sliding_window=sliding_window,
+        )
 
         # start = max(0, T - sliding_window) = 2: only the last 4 tokens land
         # in the cache, not the first two.
-        tail = operand[:, :, T - sliding_window:, :]
+        tail = operand[:, :, T - sliding_window :, :]
         expected = cache.at[:, indices, :, :].set(
-            jnp.swapaxes(tail, 0, 1).reshape(K, sliding_window // S, S, H))
+            jnp.swapaxes(tail, 0, 1).reshape(K, sliding_window // S, S, H)
+        )
         np.testing.assert_array_equal(updated, expected)
 
 
@@ -168,11 +168,12 @@ class PagedAttentionGuardedSmemTest(parameterized.TestCase):
             return q + 1.0
 
         q = jnp.zeros((4, 2, 8))
-        lengths = jnp.zeros((4, ), jnp.int32)
+        lengths = jnp.zeros((4,), jnp.int32)
         page_indices = jnp.zeros((4, 2), jnp.int32)
 
         out = attention_interface.paged_attention_with_guarded_smem(
-            fake_kernel, q, q, q, lengths, page_indices)
+            fake_kernel, q, q, q, lengths, page_indices
+        )
 
         self.assertEqual(calls, [(4, 2)])
         np.testing.assert_array_equal(out, jnp.ones_like(q))
@@ -200,12 +201,13 @@ class PagedAttentionGuardedSmemTest(parameterized.TestCase):
         self.assertGreater(batch_size * blocks_per_seq, max_n)
 
         q = jnp.zeros((batch_size, 1, 1))
-        lengths = jnp.zeros((batch_size, ), jnp.int32)
+        lengths = jnp.zeros((batch_size,), jnp.int32)
         page_indices = jnp.zeros((batch_size, blocks_per_seq), jnp.int32)
 
         with jax.disable_jit():
             out = attention_interface.paged_attention_with_guarded_smem(
-                fake_kernel, q, q, q, lengths, page_indices)
+                fake_kernel, q, q, q, lengths, page_indices
+            )
 
         self.assertGreater(len(calls), 1)
         self.assertEqual(out.shape, q.shape)
@@ -224,11 +226,11 @@ class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
         placeholders here."""
         head_dim = 32  # != 64, so use_hd64 is False
         q = jnp.zeros((4, 2, head_dim))
-        kv_lens = jnp.zeros((1, ), jnp.int32)
-        page_indices = jnp.zeros((1, ), jnp.int32)
-        cu_q_lens = jnp.zeros((1, ), jnp.int32)
-        distribution = jnp.zeros((3, ), jnp.int32)
-        attention_sink = jnp.zeros((2, ))
+        kv_lens = jnp.zeros((1,), jnp.int32)
+        page_indices = jnp.zeros((1,), jnp.int32)
+        cu_q_lens = jnp.zeros((1,), jnp.int32)
+        distribution = jnp.zeros((3,), jnp.int32)
+        attention_sink = jnp.zeros((2,))
 
         with self.assertRaisesRegex(NotImplementedError, "head_dim==64"):
             attention_interface.sharded_ragged_paged_attention(
@@ -236,13 +238,14 @@ class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
                 q,
                 q,
                 q,
-                jnp.zeros((1, )),  # kv_cache: unused before the raise
+                jnp.zeros((1,)),  # kv_cache: unused before the raise
                 kv_lens,
                 page_indices,
                 cu_q_lens,
                 distribution,
                 attention_sink,
-                sm_scale=1.0)
+                sm_scale=1.0,
+            )
 
 
 class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
@@ -255,10 +258,9 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
         must raise a `ValueError` naming both layouts. All the array
         arguments here are zeros of the right shape; only the two layout
         specs matter for this check."""
-        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
 
-        with self.assertRaisesRegex(ValueError,
-                                    "matching NoPE and RoPE layouts"):
+        with self.assertRaisesRegex(ValueError, "matching NoPE and RoPE layouts"):
             attention_interface.sparse_mla_attention(
                 jnp.zeros((1, 2, LKV_DIM), jnp.bfloat16),
                 jnp.zeros((1, 2, ROPE_DIM), jnp.bfloat16),
@@ -267,10 +269,10 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
                 jnp.zeros(ROPE_SC_SPEC.shape, ROPE_SC_SPEC.jax_dtype),
                 jnp.zeros((1, 1), jnp.int32),
-                jnp.zeros((1, ), jnp.int32),
-                jnp.zeros((4, ), jnp.int32),
-                jnp.zeros((2, ), jnp.int32),
-                jnp.zeros((3, ), jnp.int32),
+                jnp.zeros((1,), jnp.int32),
+                jnp.zeros((4,), jnp.int32),
+                jnp.zeros((2,), jnp.int32),
+                jnp.zeros((3,), jnp.int32),
                 mesh,
                 NOPE_SPEC,
                 ROPE_SC_SPEC,

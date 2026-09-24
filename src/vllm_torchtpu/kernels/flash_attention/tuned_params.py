@@ -47,8 +47,7 @@ class TunableParams:
     block_b: int
 
 
-def _vision_tuning_key(*, num_heads: int, seq_len: int,
-                       head_dim: int) -> TuningKey:
+def _vision_tuning_key(*, num_heads: int, seq_len: int, head_dim: int) -> TuningKey:
     return TuningKey(
         device_kind="TPU7x",
         batch_size=1,
@@ -70,45 +69,64 @@ def _vision_tuning_key(*, num_heads: int, seq_len: int,
 # a 64 MiB VMEM limit. Missing shapes use the generic kernel fallback.
 tuned_params_mapping: dict[TuningKey, TunableParams] = {
     # Kimi-K3.
-    _vision_tuning_key(num_heads=12, seq_len=256, head_dim=128):
-    TunableParams(256, 256, 256, 1),
-    _vision_tuning_key(num_heads=12, seq_len=512, head_dim=128):
-    TunableParams(512, 512, 256, 1),
-    _vision_tuning_key(num_heads=12, seq_len=1_024, head_dim=128):
-    TunableParams(1_024, 1_024, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=2_048, head_dim=128):
-    TunableParams(1_024, 2_048, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=4_096, head_dim=128):
-    TunableParams(1_024, 4_096, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=8_192, head_dim=128):
-    TunableParams(1_024, 8_192, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=16_384, head_dim=128):
-    TunableParams(1_024, 8_192, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=32_768, head_dim=128):
-    TunableParams(512, 16_384, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=65_536, head_dim=128):
-    TunableParams(512, 16_384, 512, 1),
-    _vision_tuning_key(num_heads=12, seq_len=67_328, head_dim=128):
-    TunableParams(8_192, 256, 256, 1),
+    _vision_tuning_key(num_heads=12, seq_len=256, head_dim=128): TunableParams(
+        256, 256, 256, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=512, head_dim=128): TunableParams(
+        512, 512, 256, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=1_024, head_dim=128): TunableParams(
+        1_024, 1_024, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=2_048, head_dim=128): TunableParams(
+        1_024, 2_048, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=4_096, head_dim=128): TunableParams(
+        1_024, 4_096, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=8_192, head_dim=128): TunableParams(
+        1_024, 8_192, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=16_384, head_dim=128): TunableParams(
+        1_024, 8_192, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=32_768, head_dim=128): TunableParams(
+        512, 16_384, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=65_536, head_dim=128): TunableParams(
+        512, 16_384, 512, 1
+    ),
+    _vision_tuning_key(num_heads=12, seq_len=67_328, head_dim=128): TunableParams(
+        8_192, 256, 256, 1
+    ),
     # Qwen2.5-VL.
-    _vision_tuning_key(num_heads=16, seq_len=256, head_dim=80):
-    TunableParams(256, 256, 256, 1),
-    _vision_tuning_key(num_heads=16, seq_len=512, head_dim=80):
-    TunableParams(512, 512, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=1_024, head_dim=80):
-    TunableParams(1_024, 1_024, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=2_048, head_dim=80):
-    TunableParams(2_048, 2_048, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=4_096, head_dim=80):
-    TunableParams(1_024, 4_096, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=8_192, head_dim=80):
-    TunableParams(1_024, 8_192, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=16_384, head_dim=80):
-    TunableParams(512, 16_384, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=32_768, head_dim=80):
-    TunableParams(512, 16_384, 512, 1),
-    _vision_tuning_key(num_heads=16, seq_len=65_536, head_dim=80):
-    TunableParams(512, 16_384, 512, 1),
+    _vision_tuning_key(num_heads=16, seq_len=256, head_dim=80): TunableParams(
+        256, 256, 256, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=512, head_dim=80): TunableParams(
+        512, 512, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=1_024, head_dim=80): TunableParams(
+        1_024, 1_024, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=2_048, head_dim=80): TunableParams(
+        2_048, 2_048, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=4_096, head_dim=80): TunableParams(
+        1_024, 4_096, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=8_192, head_dim=80): TunableParams(
+        1_024, 8_192, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=16_384, head_dim=80): TunableParams(
+        512, 16_384, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=32_768, head_dim=80): TunableParams(
+        512, 16_384, 512, 1
+    ),
+    _vision_tuning_key(num_heads=16, seq_len=65_536, head_dim=80): TunableParams(
+        512, 16_384, 512, 1
+    ),
 }
 
 

@@ -1,0 +1,179 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The PCP8/DP8 disaggregation correctness test as a Kueue workload.
+#
+# Two single-host slices, not one two-host slice: each engine is eight devices,
+# which is one whole tpu7x-standard-4t host, and they reach each other over the
+# network rather than over the interconnect. So this is shaped like the 1P1D
+# benchmark beside it - a role per engine, both 2x2x1 - and not like
+# ray-multihost-slice.yaml, where the pods are the hosts of one slice.
+#
+# Each role addresses the other by pod name and itself by the downward API,
+# which is the whole of the difference from the bare-metal job: there an
+# orchestrator discovers both VMs from GCP metadata and ssh's to the second to
+# start ROLE=decode. The test script is the one the VMs run, unchanged.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
+# dollar is $$. Every container is named `workload`: the launcher forwards step
+# environment into that name and reads its logs.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    # The fleet's pod setup - caches, tolerations, retries. See
+    # manifests/README.md.
+    tpu-ci.google.com/defaults: standard
+spec:
+  # Each pod gets a DNS name of its own - <jobset>-<role>-0-0 under a headless
+  # service named for the JobSet - which is how the roles find each other.
+  network:
+    enableDNSHostnames: true
+  # The decode engine serves until told to stop, so the head finishing is what
+  # finishes the run; JobSet then tears decode down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - head
+  replicatedJobs:
+    # Started alongside the head, not before it: the head's own wait for both
+    # /health endpoints is what orders the two. Neither role may carry a
+    # readiness probe to order them instead - a pod with one is absent from the
+    # headless service's DNS until it serves, and two peers that each need the
+    # other's address in order to serve would wait on each other forever.
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Indexed because enableDNSHostnames requires it.
+          completionMode: Indexed
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    exec bash .buildkite/kubernetes/single_host_engine.sh \
+                      bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+                env:
+                - name: ROLE
+                  value: decode
+                # Named here because STREAM_LOG has to resolve to the same
+                # path the script writes; the script only defaults it internally.
+                - name: RUN_DIR
+                  value: /tmp/qwen35_p8d8_disagg_ci/run
+                # The only engine this role starts; see single_host_engine.sh.
+                - name: STREAM_LOG
+                  value: $$(RUN_DIR)/logs/decode.log
+                # Where the peer answers. Only ever dialled - the script curls
+                # it for /health - so the pod's name is as good as its address
+                # and does not have to be discovered first.
+                - name: PREFILL_HOST
+                  value: ${WORKLOAD_NAME}-head-0-0.${WORKLOAD_NAME}
+                # This engine's own address, which the downward API is the only
+                # source of.
+                - name: DECODE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # What this engine publishes as the address its KV can be
+                # pulled from. The script would otherwise infer it from the
+                # host's routing table, which is a guess a pod does not need to
+                # make.
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # Both caches on the fleet's compilation bucket, mounted at
+                # /cache/jax. The default for VLLM_CACHE_ROOT is under the home
+                # directory, on the node's boot disk, which it does not fit on.
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm
+                resources:
+                  # Only the chips: this pod holds every chip on the node,
+                  # memory comes from the shape's profile, and a cpu request
+                  # here can stop the pool scaling up at all.
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"
+
+    - name: head
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          completionMode: Indexed
+          # The run is one attempt: a retry would re-enter a pair whose other
+          # half has been serving throughout, and a correctness test that
+          # asserts on cache state cannot read a polluted engine.
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    exec bash .buildkite/kubernetes/single_host_engine.sh \
+                      bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+                env:
+                # head, not prefill: this role serves the prefill engine and
+                # also drives the proxy and the correctness smoke.
+                - name: ROLE
+                  value: head
+                - name: RUN_DIR
+                  value: /tmp/qwen35_p8d8_disagg_ci/run
+                # The only engine this role starts; see single_host_engine.sh.
+                - name: STREAM_LOG
+                  value: $$(RUN_DIR)/logs/prefill.log
+                - name: DECODE_HOST
+                  value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                - name: PREFILL_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # Over the script's own fifteen minutes, which is a wait for a
+                # warm engine. Both boot from cold here and the head would give
+                # up on the pair before either had compiled.
+                - name: STARTUP_TIMEOUT_S
+                  value: "5400"
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"

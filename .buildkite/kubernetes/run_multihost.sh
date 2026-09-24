@@ -13,15 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs a command on a Ray cluster spanning a TPU slice.
+# Runs work across the hosts of a TPU slice.
 #
-#   .buildkite/kubernetes/run_multihost.sh <command> [args...]
+#   .buildkite/kubernetes/run_multihost.sh [--backend ray|mp] <args...>
+#
+# ray, the default, forms a Ray cluster and runs the given command on its head.
+# mp uses vLLM's own multi-node data parallelism instead and takes a benchmark
+# config rather than a command - the same split, and the same flag, as the
+# bare-metal script of this name.
 #
 # The slice shape comes from the manifest's nodeSelector, not from a flag.
 set -euo pipefail
 
+backend="ray"
+if [[ "${1:-}" == "--backend" ]]; then
+  backend="${2:?--backend needs a value}"
+  shift 2
+fi
+
+case "${backend}" in
+  ray) manifest="ray-multihost-slice.yaml" ;;
+  mp)  manifest="mp-multihost-slice.yaml" ;;
+  *)   echo "$0: unknown backend '${backend}', expected ray or mp" >&2; exit 2 ;;
+esac
+
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <command> [args...]" >&2
+  echo "usage: $0 [--backend ray|mp] <args...>" >&2
   exit 2
 fi
 
@@ -38,5 +55,5 @@ export MULTIHOST_ARGS_B64
 
 # shellcheck disable=SC2154  # env_args comes from common.sh
 exec /opt/launcher/launch \
-  --manifest "${HERE}/manifests/workloads/ray-multihost-slice.yaml" \
+  --manifest "${HERE}/manifests/workloads/${manifest}" \
   "${env_args[@]}"

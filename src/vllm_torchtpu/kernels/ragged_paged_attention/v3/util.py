@@ -1,4 +1,5 @@
 """Utility functions for ragged paged attention."""
+
 import jax
 from jax._src import dtypes
 
@@ -24,12 +25,12 @@ def get_dtype_packing(dtype):
 def next_power_of_2(x: int):
     """Finds the smallest power of 2 >= x using bit manipulation.
 
-  Args:
-    x: The input number (should be an integer).
+    Args:
+      x: The input number (should be an integer).
 
-  Returns:
-    The smallest integer power of 2 that is >= x.
-  """
+    Returns:
+      The smallest integer power of 2 that is >= x.
+    """
     assert x > 0
     if x == 1:
         return 1
@@ -39,13 +40,13 @@ def next_power_of_2(x: int):
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
     kind = jax.devices()[0].device_kind
-    if 'TPU' not in kind:
+    if "TPU" not in kind:
         return -1
-    if kind.endswith(' lite'):
-        kind = kind[:-len(' lite')]
-    if kind.endswith('p') or kind.endswith('e'):
+    if kind.endswith(" lite"):
+        kind = kind[: -len(" lite")]
+    if kind.endswith("p") or kind.endswith("e"):
         kind = kind[:-1]
-    if kind == 'TPU7x':
+    if kind == "TPU7x":
         return 7
-    assert kind[:-1] == 'TPU v', kind
+    assert kind[:-1] == "TPU v", kind
     return int(kind[-1])

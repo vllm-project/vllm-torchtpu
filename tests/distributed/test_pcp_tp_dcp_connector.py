@@ -153,6 +153,7 @@ def test_consumer_allocations_use_dcp_logical_block_size(monkeypatch, dcp):
     scheduler.vllm_config.parallel_config.decode_context_parallel_size = dcp
     request = MagicMock(
         request_id="request",
+        num_prompt_tokens=8193,
         kv_transfer_params={
             "req_id": "producer-request",
             "uuid": 123,
@@ -181,6 +182,9 @@ def test_consumer_allocations_use_dcp_logical_block_size(monkeypatch, dcp):
         ("dst_tp_size", 4),
         ("dst_tp_size", None),
         ("dst_dcp_size", None),
+        ("dst_tp_size", "invalid"),
+        ("dst_dcp_size", True),
+        ("dst_dcp_size", 8.5),
     ],
 )
 def test_consumer_rejects_invalid_geometry_before_transfer(monkeypatch, field, value):
@@ -189,6 +193,7 @@ def test_consumer_rejects_invalid_geometry_before_transfer(monkeypatch, field, v
     scheduler.vllm_config.parallel_config.decode_context_parallel_size = 8
     request = MagicMock(
         request_id="request",
+        num_prompt_tokens=1024,
         kv_transfer_params={
             "req_id": "p",
             "uuid": 1,
@@ -207,10 +212,12 @@ def test_consumer_rejects_invalid_geometry_before_transfer(monkeypatch, field, v
     else:
         request.kv_transfer_params[field] = value
     blocks = MagicMock()
-    with pytest.raises(ValueError, match="destination.*geometry"):
-        scheduler.update_state_after_alloc(request, blocks, 1024)
+    scheduler.update_state_after_alloc(request, blocks, 1024)
     blocks.get_block_ids.assert_not_called()
-    assert not scheduler.reqs_to_load
+    assert "destination" in request.kv_transfer_params[tc._KV_PARAMS_REJECTED]
+    assert "geometry" in request.kv_transfer_params[tc._KV_PARAMS_REJECTED]
+    assert scheduler.reqs_to_load["request"].release_only
+    assert not scheduler._stage3_active_source_req_ids
 
 
 @pytest.mark.parametrize("tp,dcp", [(8, 8), (8, 2), (2, 1)])

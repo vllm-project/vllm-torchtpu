@@ -4,6 +4,7 @@
 
 Moved verbatim out of `TPUModelRunner`; see vllm-project/vllm-torchtpu#713.
 """
+
 from __future__ import annotations
 
 import math
@@ -11,8 +12,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheSpec,
-                                        MLAAttentionSpec, SlidingWindowMLASpec)
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 from vllm_torchtpu.logger import init_logger
 
@@ -51,8 +56,9 @@ class DsV4KVCacheAllocator:
             raise ValueError(
                 "DeepSeek-V4 compressor state cache has an unexpected layer "
                 f"name {state_cache_name!r}; expected it to end with "
-                f"{suffix!r} so the compressed-KV layer can be derived.")
-        base = state_cache_name[:-len(suffix)]
+                f"{suffix!r} so the compressed-KV layer can be derived."
+            )
+        base = state_cache_name[: -len(suffix)]
         return base + ".k_cache" if base.endswith(".indexer") else base
 
     @staticmethod
@@ -61,8 +67,7 @@ class DsV4KVCacheAllocator:
 
         Both declare `SlidingWindowMLASpec`, so the name separates them.
         """
-        return isinstance(spec,
-                          SlidingWindowMLASpec) and "swa_cache" in layer_name
+        return isinstance(spec, SlidingWindowMLASpec) and "swa_cache" in layer_name
 
     def _classify_ds_v4_layers(
         self,
@@ -98,7 +103,8 @@ class DsV4KVCacheAllocator:
                         "DeepSeek-V4 layer has no known role (expected an "
                         "MLAAttentionSpec cache, a `*.compressor.state_cache` "
                         f"or a `*swa_cache*` layer): layer={layer_name}, "
-                        f"spec={spec}")
+                        f"spec={spec}"
+                    )
             if swa_in_group:
                 swa_layer_groups.append(swa_in_group)
 
@@ -106,7 +112,8 @@ class DsV4KVCacheAllocator:
             raise ValueError(
                 "DeepSeek-V4 model has no MLAAttentionSpec layers to anchor "
                 "the KV cache overlays. groups="
-                f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]}")
+                f"{[g.layer_names for g in kv_cache_config.kv_cache_groups]}"
+            )
         return mla_layer_names, swa_layer_groups, state_layer_names
 
     def _initialize_ds_v4_kv_cache(
@@ -150,13 +157,13 @@ class DsV4KVCacheAllocator:
         aliasing it afterwards still counts against peak HBM.
         """
         mla_layer_names, swa_layer_groups, state_layer_names = (
-            self._classify_ds_v4_layers(kv_cache_config, per_layer_spec))
+            self._classify_ds_v4_layers(kv_cache_config, per_layer_spec)
+        )
 
         packing = self._DS_V4_KV_PACKING
 
         def _create_cache(shape: tuple[int, ...], tag: str) -> torch.Tensor:
-            cache = torch.zeros(shape,
-                                dtype=torch.uint8).to(self.runner.device)
+            cache = torch.zeros(shape, dtype=torch.uint8).to(self.runner.device)
             logger.debug("DeepSeek-V4 KV array for %s: shape=%s", tag, shape)
             return cache
 
@@ -177,11 +184,11 @@ class DsV4KVCacheAllocator:
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.
-                nope = _create_cache((num_blocks, page_size, packing, 128),
-                                     layer_name)
+                nope = _create_cache((num_blocks, page_size, packing, 128), layer_name)
                 rope = _create_cache(
                     (num_blocks, page_size // packing, packing, 128),
-                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}")
+                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}",
+                )
                 kv_caches[layer_name] = (nope, rope)
                 csa_nope_hosts.append(nope)
             else:
@@ -195,7 +202,8 @@ class DsV4KVCacheAllocator:
             raise ValueError(
                 "DeepSeek-V4 model has no CSA layer (compress_ratio "
                 f"{self._DS_V4_CSA_COMPRESS_RATIO}) to host the SWA and HCA "
-                f"state caches. MLA layers={mla_layer_names}")
+                f"state caches. MLA layers={mla_layer_names}"
+            )
 
         def _host_at(hosts: list[torch.Tensor], position: int) -> torch.Tensor:
             """`hosts[position]`, growing the list with standalone arrays.
@@ -206,8 +214,10 @@ class DsV4KVCacheAllocator:
             """
             while position >= len(hosts):
                 hosts.append(
-                    _create_cache(tuple(csa_nope_hosts[0].shape),
-                                  f"ds_v4_overflow.{len(hosts)}"))
+                    _create_cache(
+                        tuple(csa_nope_hosts[0].shape), f"ds_v4_overflow.{len(hosts)}"
+                    )
+                )
             return hosts[position]
 
         # SWA caches overlay the CSA NoPE arrays; so do the HCA states, and
@@ -225,7 +235,8 @@ class DsV4KVCacheAllocator:
                     "DeepSeek-V4 compressor state cache has no compressed-KV "
                     "layer (its compressed records are written there): "
                     f"state_cache={layer_name}, expected KV layer "
-                    f"{kv_layer_name}, known MLA layers={mla_layer_names}")
+                    f"{kv_layer_name}, known MLA layers={mla_layer_names}"
+                )
             if kv_layer_name in hca_layer_names:
                 hca_state_layers.append(layer_name)
             else:
@@ -245,18 +256,27 @@ class DsV4KVCacheAllocator:
             "DeepSeek-V4 KV cache: %d arrays for %d layers (mla=%d of which "
             "csa=%d, swa=%d in %d group(s) "
             "sized %s, state=%d), num_blocks=%d, largest array=%s",
-            len({
-                id(t)
-                for e in kv_caches.values()
-                for t in self._ds_v4_cache_arrays(e)
-            }), len(kv_caches), len(mla_layer_names), len(csa_nope_hosts),
+            len(
+                {id(t) for e in kv_caches.values() for t in self._ds_v4_cache_arrays(e)}
+            ),
+            len(kv_caches),
+            len(mla_layer_names),
+            len(csa_nope_hosts),
             sum(len(g) for g in swa_layer_groups),
-            len(swa_layer_groups), [len(g) for g in swa_layer_groups],
-            len(state_layer_names), num_blocks,
-            max((tuple(t.shape) for e in kv_caches.values()
-                 for t in self._ds_v4_cache_arrays(e)),
+            len(swa_layer_groups),
+            [len(g) for g in swa_layer_groups],
+            len(state_layer_names),
+            num_blocks,
+            max(
+                (
+                    tuple(t.shape)
+                    for e in kv_caches.values()
+                    for t in self._ds_v4_cache_arrays(e)
+                ),
                 key=lambda shp: math.prod(shp),
-                default=()))
+                default=(),
+            ),
+        )
 
     @staticmethod
     def _ds_v4_cache_arrays(entry) -> tuple[torch.Tensor, ...]:
@@ -268,11 +288,12 @@ class DsV4KVCacheAllocator:
         pair (the compressor's `k_cache` and the attention layer's own entry)
         unpack it inline.
         """
-        return tuple(entry) if isinstance(entry, tuple) else (entry, )
+        return tuple(entry) if isinstance(entry, tuple) else (entry,)
 
     @classmethod
-    def _validate_ds_v4_overlay(cls, kv_cache_config: KVCacheConfig,
-                                kv_caches: dict[str, torch.Tensor]) -> None:
+    def _validate_ds_v4_overlay(
+        cls, kv_cache_config: KVCacheConfig, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
         """No two layers of one cache group may share an array.
 
         Layers of a group share a block table, so a shared array means they
@@ -293,5 +314,6 @@ class DsV4KVCacheAllocator:
                         f"table, so they would corrupt each other: "
                         f"{layer_name} and {hosts[ptr]} both map to the array "
                         f"of shape {tuple(cache.shape)}. Group "
-                        f"layers={group.layer_names}")
+                        f"layers={group.layer_names}"
+                    )
                 hosts[ptr] = layer_name

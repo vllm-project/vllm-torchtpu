@@ -20,7 +20,9 @@ import torch
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.runner.speculative_decoding_manager import (
-    SpecDecodeMetadata, SpeculativeDecodingManager)
+    SpecDecodeMetadata,
+    SpeculativeDecodingManager,
+)
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
@@ -34,8 +36,7 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # Mock CPU input IDs tensor
     # Total length is logits indices size
     # E.g., 10 scheduled tokens
-    input_ids_cpu = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-                                 dtype=torch.int32)
+    input_ids_cpu = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
     mock_runner.input_ids_cpu = input_ids_cpu
 
     # Instantiate manager
@@ -51,7 +52,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
     metadata = manager.get_spec_decode_metadata(
         num_draft_tokens=num_draft_tokens,
         cu_num_scheduled_tokens=cu_num_scheduled_tokens,
-        padded_num_reqs=padded_num_reqs)
+        padded_num_reqs=padded_num_reqs,
+    )
 
     # Verify shapes and properties of the returned SpecDecodeMetadata
     assert isinstance(metadata, SpecDecodeMetadata)
@@ -69,29 +71,29 @@ def test_speculative_decoding_manager_metadata_indices(device):
     assert metadata.group_indices.device.type == device.type
 
     # 1. Draft Lengths: num_draft_tokens padded to padded_num_reqs (4) -> [3, 2, 0, 0]
-    expected_draft_lengths = torch.tensor([3, 2, 0, 0],
-                                          dtype=torch.int32,
-                                          device=device)
+    expected_draft_lengths = torch.tensor(
+        [3, 2, 0, 0], dtype=torch.int32, device=device
+    )
     assert torch.equal(metadata.draft_lengths, expected_draft_lengths)
 
     # 2. Bonus Logits Indices: [3, 6] (cu_num_sampled_tokens - 1) padded to padded_num_reqs (4) -> [3, 6, 0, 0]
-    expected_bonus_indices = torch.tensor([3, 6, 0, 0],
-                                          dtype=torch.int32,
-                                          device=device)
+    expected_bonus_indices = torch.tensor(
+        [3, 6, 0, 0], dtype=torch.int32, device=device
+    )
     assert torch.equal(metadata.bonus_logits_indices, expected_bonus_indices)
 
     # 3. Segment IDs: repeat request indices [0, 0, 0, 1, 1] padded to nearest static token bucket (8)
     # Unpadded size: 3 + 2 = 5 tokens. Nearest static padding is 8.
     # Padded with total request count (2) -> [0, 0, 0, 1, 1, 2, 2, 2]
-    expected_segment_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2],
-                                        dtype=torch.int64,
-                                        device=device)
+    expected_segment_ids = torch.tensor(
+        [0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int64, device=device
+    )
     assert torch.equal(metadata.segment_ids, expected_segment_ids)
 
     # 4. Group Indices: range per segment [0, 1, 2, 0, 1] padded to static bucket (8) with 0 -> [0, 1, 2, 0, 1, 0, 0, 0]
-    expected_group_indices = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0],
-                                          dtype=torch.int32,
-                                          device=device)
+    expected_group_indices = torch.tensor(
+        [0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32, device=device
+    )
     assert torch.equal(metadata.group_indices, expected_group_indices)
 
 
@@ -225,8 +227,7 @@ def test_stage_draft_token_ids_rejects_row_mismatch():
     manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
     mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
     with pytest.raises(AssertionError):
-        manager.stage_draft_token_ids_for_host(
-            torch.zeros((3, 2), dtype=torch.int32))
+        manager.stage_draft_token_ids_for_host(torch.zeros((3, 2), dtype=torch.int32))
 
 
 def test_propose_draft_token_ids_ngram_dispatches_correctly():
@@ -242,8 +243,9 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     scheduler_output = MagicMock()
     scheduler_output.num_spec_tokens_to_schedule = 4
 
-    result = manager.propose_draft_token_ids(sampled_token_ids=[[1], [2], [3]],
-                                             scheduler_output=scheduler_output)
+    result = manager.propose_draft_token_ids(
+        sampled_token_ids=[[1], [2], [3]], scheduler_output=scheduler_output
+    )
 
     assert result is None
     assert manager._draft_token_ids == [[5], [6]]
@@ -263,8 +265,7 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     # Same (num_draft_tokens, cu_num_scheduled_tokens, padded_num_reqs) ->
     # the 7 index tensors are reused (same device objects, no re-transfer),
     # while draft_token_ids is re-extracted from the CURRENT input_ids_cpu.
-    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-                             dtype=torch.int32)
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
     manager = _fresh_metadata_manager(device, input_ids)
     nd = np.array([3, 2], dtype=np.int32)
     cu = np.array([4, 7], dtype=np.int32)
@@ -274,14 +275,20 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     manager.runner.input_ids_cpu = input_ids + 100
     m2 = manager.get_spec_decode_metadata(nd.copy(), cu.copy(), 4)
 
-    for f in ("draft_lengths", "target_logits_indices", "bonus_logits_indices",
-              "final_logits_indices", "segment_ids", "group_indices"):
+    for f in (
+        "draft_lengths",
+        "target_logits_indices",
+        "bonus_logits_indices",
+        "final_logits_indices",
+        "segment_ids",
+        "group_indices",
+    ):
         assert getattr(m2, f) is getattr(m1, f), f"{f} not reused"
     assert m2.draft_token_ids is not m1.draft_token_ids
     # Values must equal an uncached build on the same inputs.
-    ref = _fresh_metadata_manager(device,
-                                  input_ids + 100).get_spec_decode_metadata(
-                                      nd, cu, 4)
+    ref = _fresh_metadata_manager(device, input_ids + 100).get_spec_decode_metadata(
+        nd, cu, 4
+    )
     assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
 
 
@@ -290,18 +297,26 @@ def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
     # uncached build.
     input_ids = torch.arange(1, 21, dtype=torch.int32)
     manager = _fresh_metadata_manager(device, input_ids)
-    m1 = manager.get_spec_decode_metadata(np.array([3, 2], dtype=np.int32),
-                                          np.array([4, 7], dtype=np.int32), 4)
+    m1 = manager.get_spec_decode_metadata(
+        np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), 4
+    )
     nd2 = np.array([2, 2], dtype=np.int32)
     cu2 = np.array([3, 6], dtype=np.int32)
     m2 = manager.get_spec_decode_metadata(nd2, cu2, 4)
     assert m2.final_logits_indices is not m1.final_logits_indices
     ref = _fresh_metadata_manager(device, input_ids).get_spec_decode_metadata(
-        nd2, cu2, 4)
-    for f in ("draft_token_ids", "draft_lengths", "target_logits_indices",
-              "bonus_logits_indices", "final_logits_indices", "segment_ids",
-              "group_indices"):
-        assert torch.equal(
-            getattr(m2, f).cpu(),
-            getattr(ref, f).cpu()), f"{f} differs from uncached build"
+        nd2, cu2, 4
+    )
+    for f in (
+        "draft_token_ids",
+        "draft_lengths",
+        "target_logits_indices",
+        "bonus_logits_indices",
+        "final_logits_indices",
+        "segment_ids",
+        "group_indices",
+    ):
+        assert torch.equal(getattr(m2, f).cpu(), getattr(ref, f).cpu()), (
+            f"{f} differs from uncached build"
+        )
     assert np.array_equal(m2.draft_lengths_cpu, nd2)

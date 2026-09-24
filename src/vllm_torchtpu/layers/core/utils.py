@@ -16,9 +16,9 @@ import jax
 import jax.numpy as jnp
 
 
-def reorder_concatenated_tensor_for_sharding(concatenated_tensor: jax.Array,
-                                             split_sizes: list[int],
-                                             n_shards: int, dim: int):
+def reorder_concatenated_tensor_for_sharding(
+    concatenated_tensor: jax.Array, split_sizes: list[int], n_shards: int, dim: int
+):
     """
     Reorder a replicated concatenated tensor such that when sharded on multiple chips, each shard is a concatenation of the shards of the individual tensors.
     For example, let the concatenated_tensor be:
@@ -41,12 +41,11 @@ def reorder_concatenated_tensor_for_sharding(concatenated_tensor: jax.Array,
     start_offset = 0
     old_shape = concatenated_tensor.shape
     # New shape ensures each split_tensor[i] maps to a tensor in ith shards
-    new_shape = old_shape[:dim] + (n_shards, -1) + old_shape[dim + 1:]
+    new_shape = old_shape[:dim] + (n_shards, -1) + old_shape[dim + 1 :]
     for split_size in split_sizes:
-        split_tensor = jax.lax.slice_in_dim(concatenated_tensor,
-                                            start_offset,
-                                            start_offset + split_size,
-                                            axis=dim)
+        split_tensor = jax.lax.slice_in_dim(
+            concatenated_tensor, start_offset, start_offset + split_size, axis=dim
+        )
         split_tensors.append(split_tensor.reshape(new_shape))
         start_offset += split_size
     # While maintaining 0th dim as a shard dim, we concatenate along 1th dim to
@@ -55,9 +54,9 @@ def reorder_concatenated_tensor_for_sharding(concatenated_tensor: jax.Array,
     return reordered_tensor.reshape(old_shape)
 
 
-def inverse_reorder_for_sharding(reordered_tensor: jax.Array,
-                                 split_sizes: list[int], n_shards: int,
-                                 dim: int):
+def inverse_reorder_for_sharding(
+    reordered_tensor: jax.Array, split_sizes: list[int], n_shards: int, dim: int
+):
     """Inverse of reorder_concatenated_tensor_for_sharding."""
     if dim < 0:
         dim += reordered_tensor.ndim
@@ -69,27 +68,27 @@ def inverse_reorder_for_sharding(reordered_tensor: jax.Array,
         shard_split_sizes.append(split_size // n_shards)
 
     shard_size = sum(shard_split_sizes)
-    new_shape = old_shape[:dim] + (n_shards, shard_size) + old_shape[dim + 1:]
+    new_shape = old_shape[:dim] + (n_shards, shard_size) + old_shape[dim + 1 :]
     reshaped = reordered_tensor.reshape(new_shape)
 
     split_tensors = []
     start_offset = 0
     for shard_split_size in shard_split_sizes:
-        split_tensor = jax.lax.slice_in_dim(reshaped,
-                                            start_offset,
-                                            start_offset + shard_split_size,
-                                            axis=dim + 1)
-        split_shape = (old_shape[:dim] + (n_shards * shard_split_size, ) +
-                       old_shape[dim + 1:])
+        split_tensor = jax.lax.slice_in_dim(
+            reshaped, start_offset, start_offset + shard_split_size, axis=dim + 1
+        )
+        split_shape = (
+            old_shape[:dim] + (n_shards * shard_split_size,) + old_shape[dim + 1 :]
+        )
         split_tensors.append(split_tensor.reshape(split_shape))
         start_offset += shard_split_size
 
     return jnp.concatenate(split_tensors, axis=dim)
 
 
-def slice_sharded_tensor_for_concatenation(sharded_tensor: jax.Array,
-                                           split_sizes: list[int],
-                                           n_shards: int):
+def slice_sharded_tensor_for_concatenation(
+    sharded_tensor: jax.Array, split_sizes: list[int], n_shards: int
+):
     """
     Slice the input tensor which is sharded on multiple chips (on the last dim) into individual tensors with the same sharding.
     For example, let the sharded_tensor be:
@@ -120,7 +119,7 @@ def slice_sharded_tensor_for_concatenation(sharded_tensor: jax.Array,
         # Because we are slicing over last dim, sharding dim remains intact.
         # Therefore, splitting happens locally.
         split_tensor = sharded_tensor[..., start_offset:end_offset]
-        split_tensors.append(split_tensor.reshape(new_shape[:-2] + (-1, )))
+        split_tensors.append(split_tensor.reshape(new_shape[:-2] + (-1,)))
         start_offset = end_offset
 
     return split_tensors

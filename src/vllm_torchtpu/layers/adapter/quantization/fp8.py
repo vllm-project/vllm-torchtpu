@@ -980,18 +980,28 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             prebuild_fused_moe_ep,
+            register_score_bias_buffer,
         )
 
-        setattr(
-            self,
-            FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep(
-                layer,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                activation=activation_str,
-            ),
+        _ep_op = prebuild_fused_moe_ep(
+            layer,
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=activation_str,
         )
+        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+        if _ep_op is not None:
+            # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
+            # is the other half of the arity contract: `_routing_config`
+            # decides the op's operand count from
+            # `layer.e_score_correction_bias`, while the call site reads the
+            # STAGED buffer via `score_bias_operand`. Register nothing and the
+            # two disagree -- the op is built with eight operands and
+            # `fused_moe_ep` takes its `score_bias is None` branch and passes
+            # seven, which Dynamo rejects with `missing value for argument
+            # 'score_bias'`. Passing the operand at the call site is not
+            # sufficient on its own; it has to exist.
+            register_score_bias_buffer(layer)
 
     def apply_monolithic(
         self,
@@ -1009,9 +1019,22 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
+        #
+        # `score_bias_operand` is not optional, and omitting it is silent on
+        # every model that does not have one. `prebuild_fused_moe_ep` builds
+        # the op with an eighth operand exactly when the layer carries an
+        # `e_score_correction_bias`, so a layer that has one and a call site
+        # that does not pass it disagree on the op's arity and Dynamo refuses
+        # the trace with `pallas::fused_moe_ep() is missing value for argument
+        # 'score_bias'`. A biasless router -- plain softmax or sigmoid top-k --
+        # takes the seven-argument call and matches, which is why the omission
+        # survived here for as long as this path served only such models; a
+        # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
+        # methods already pass it.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
+            score_bias_operand,
         )
 
         if fused_moe_ep_supported(self):
@@ -1023,6 +1046,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 router_logits,
+                score_bias_operand(layer),
             )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->

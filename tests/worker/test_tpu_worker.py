@@ -389,7 +389,6 @@ def _check_engine_patches():
         core.resolve_kv_cache_block_sizes is kv_cache_utils.resolve_kv_cache_block_sizes
     )
     assert Scheduler._mamba_block_aligned_split._tpu_scheduler_block_size_patch
-    assert Scheduler._tpu_hybrid_producer_prefix_hit_patch
     assert EngineCoreProc.run_engine_core is plugin._run_engine_core_with_tpu_patches
     assert EngineCoreProc._tpu_original_run_engine_core is _original_engine_run
     wrapper = Scheduler.__init__

@@ -14,9 +14,11 @@ from torch import nn
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
@@ -28,15 +30,12 @@ from .collective_ops import TokenShardCollectives
 def _build_attention_residual_op(eps: float):
     from torch_tpu._internal import pallas
 
-    from vllm_torchtpu.kernels.kimi_k3.attention_residual import \
-        attention_residual
+    from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
 
-    def core(prefix: jax.Array, history: jax.Array,
-             weight: jax.Array) -> jax.Array:
+    def core(prefix: jax.Array, history: jax.Array, weight: jax.Array) -> jax.Array:
         return attention_residual(prefix, history, weight, eps=eps)
 
-    suffix = float(eps).hex().replace(".", "_").replace("-",
-                                                        "m").replace("+", "p")
+    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
     op = pallas.jax_op(f"pallas::kimi_attention_residual_{suffix}", core)
     op.register_fake(lambda prefix, history, weight: torch.empty_like(prefix))
     return op
@@ -56,7 +55,7 @@ class SituAndMul(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = x.chunk(2, dim=-1)
-        gate = (self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate))
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
         if self.linear_beta is not None:
             up = self.linear_beta * torch.tanh(up / self.linear_beta)
         return gate * up
@@ -80,19 +79,28 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
-        self.sp_group = (TokenShardCollectives(tp_group or get_tp_group())
-                         if envs.TPU_K3_SP_PREFILL else None)
+        self.sp_group = (
+            TokenShardCollectives(tp_group or get_tp_group())
+            if envs.TPU_K3_SP_PREFILL
+            else None
+        )
         # Reuse the existing merged/row weight loaders with chip-local rank
         # metadata. Scope the override to construction of these two layers.
         with ExitStack() as stack:
             if tp_group is not None:
                 module = "vllm.model_executor.layers.linear"
                 stack.enter_context(
-                    patch(f"{module}.get_tensor_model_parallel_rank",
-                          return_value=tp_group.rank_in_group))
+                    patch(
+                        f"{module}.get_tensor_model_parallel_rank",
+                        return_value=tp_group.rank_in_group,
+                    )
+                )
                 stack.enter_context(
-                    patch(f"{module}.get_tensor_model_parallel_world_size",
-                          return_value=tp_group.world_size))
+                    patch(
+                        f"{module}.get_tensor_model_parallel_world_size",
+                        return_value=tp_group.world_size,
+                    )
+                )
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size, intermediate_size],
@@ -118,9 +126,9 @@ class KimiMLP(nn.Module):
         else:
             raise ValueError(f"Unsupported Kimi activation {hidden_act!r}")
 
-    def forward(self,
-                hidden_states: torch.Tensor,
-                sequence_parallel: bool = False) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, sequence_parallel: bool = False
+    ) -> torch.Tensor:
         group = self.tp_group
         if sequence_parallel:
             group = self.sp_group or group or get_tp_group()
@@ -131,9 +139,13 @@ class KimiMLP(nn.Module):
         if sequence_parallel or self.tp_group is not None:
             # Input features already match this rank's row-parallel shard.
             hidden_states = self.down_proj.quant_method.apply(
-                self.down_proj, hidden_states, None)
-            return (group.reduce_scatter(hidden_states, dim=0)
-                    if sequence_parallel else group.all_reduce(hidden_states))
+                self.down_proj, hidden_states, None
+            )
+            return (
+                group.reduce_scatter(hidden_states, dim=0)
+                if sequence_parallel
+                else group.all_reduce(hidden_states)
+            )
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
@@ -164,8 +176,9 @@ class AttentionResidual(nn.Module):
         out = torch.empty_like(folded)
         out.copy_(folded)
         self.folded_weight = out
-        self._prefill_op = (_build_attention_residual_op(self.eps)
-                            if out.device.type == "tpu" else None)
+        self._prefill_op = (
+            _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None
+        )
 
     def forward(
         self,
@@ -175,16 +188,16 @@ class AttentionResidual(nn.Module):
         if block_residuals.shape[1] == 0:
             return prefix_sum
         if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
-            return self._prefill_op(prefix_sum, block_residuals,
-                                    self.folded_weight)
+            return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
             # With one token the per-slot statistics below are scalars that
             # XLA leaves unfused; reducing over the concatenated slots keeps
             # them one vector. A shape branch, so bucket 1 gets its own trace
             # (see compilation.shape_variants).
-            values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)),
-                               dim=-2).float()  # [1, K, hidden]
+            values = torch.cat(
+                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
+            ).float()  # [1, K, hidden]
             inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
             probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
             out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
@@ -194,9 +207,12 @@ class AttentionResidual(nn.Module):
         inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
         inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
         scores = torch.cat(
-            ((v_blocks * w).sum(-1) * inv_blocks,
-             ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(-1)),
-            dim=-1)  # [T, K]
+            (
+                (v_blocks * w).sum(-1) * inv_blocks,
+                ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(-1),
+            ),
+            dim=-1,
+        )  # [T, K]
         probabilities = scores.softmax(dim=-1)
         out = (probabilities[..., :-1].unsqueeze(-1) * v_blocks).sum(dim=-2)
         out = out + probabilities[..., -1].unsqueeze(-1) * v_prefix

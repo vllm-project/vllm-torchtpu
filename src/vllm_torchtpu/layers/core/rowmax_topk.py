@@ -25,8 +25,7 @@ import torch
 NEG = -3.0e38
 
 
-def rowmax_topk(scores: torch.Tensor,
-                k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """``torch.topk(scores, k, dim=-1)`` without the sort.
 
     Returns ``(values, indices)``, values descending and indices int32. Ties
@@ -49,9 +48,7 @@ def rowmax_topk(scores: torch.Tensor,
         m = torch.amax(cur, dim=-1, keepdim=True)
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
-        idx = torch.amin(torch.where(cur == m, iota, n - 1),
-                         dim=-1,
-                         keepdim=True)
+        idx = torch.amin(torch.where(cur == m, iota, n - 1), dim=-1, keepdim=True)
         values.append(m)
         indices.append(idx)
         cur = torch.where(iota == idx, masked, cur)

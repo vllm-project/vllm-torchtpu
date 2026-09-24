@@ -24,8 +24,11 @@ import pytest
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.core import fused_moe_gmm
-from vllm_torchtpu.layers.core.fused_moe_gmm import (fused_moe_func, moe_gmm,
-                                                     prepare_routed_gmm_inputs)
+from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    fused_moe_func,
+    moe_gmm,
+    prepare_routed_gmm_inputs,
+)
 
 
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
@@ -49,7 +52,8 @@ def test_ragged_gather_reduce_version_accepts_v3(monkeypatch):
 
 def test_ragged_gather_reduce_uses_configured_version():
     expected = fused_moe_gmm._select_ragged_gather_reduce(
-        envs.RAGGED_GATHER_REDUCE_VERSION)
+        envs.RAGGED_GATHER_REDUCE_VERSION
+    )
     assert fused_moe_gmm.ragged_gather_reduce is expected
 
 
@@ -116,11 +120,9 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
         (False, True, 0, jnp.bfloat16, 4096, 8, 2048, None, 16, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, None, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 8, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, "no-tpu-info",
-         None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, "no-tpu-info", None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, 1 << 20, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048,
-         (1 << 20) + 1, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, (1 << 20) + 1, 16, None),
     ],
     ids=[
         "ep-selected",
@@ -168,27 +170,39 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
     ],
 )
 def test_moe_gmm_uses_selected_ragged_gather_reduce(
-        monkeypatch, configured_version, use_ep, use_sparse_core, threshold,
-        dtype, hidden, topk, num_tokens, source_rows, sc_lanes, expected_path):
+    monkeypatch,
+    configured_version,
+    use_ep,
+    use_sparse_core,
+    threshold,
+    dtype,
+    hidden,
+    topk,
+    num_tokens,
+    source_rows,
+    sc_lanes,
+    expected_path,
+):
     routes = num_tokens * topk
     source_rows = routes if source_rows is None else source_rows
     indices = jnp.arange(routes, dtype=jnp.int32)
-    weights = jnp.full((routes, ), 0.125, dtype=jnp.bfloat16)
-    valid = jnp.ones((routes, ), dtype=jnp.bool_)
-    sc_info = (None
-               if sc_lanes in (None, "no-tpu-info") else types.SimpleNamespace(
-                   num_lanes=sc_lanes, num_cores=2, num_subcores=16))
+    weights = jnp.full((routes,), 0.125, dtype=jnp.bfloat16)
+    valid = jnp.ones((routes,), dtype=jnp.bool_)
+    sc_info = (
+        None
+        if sc_lanes in (None, "no-tpu-info")
+        else types.SimpleNamespace(num_lanes=sc_lanes, num_cores=2, num_subcores=16)
+    )
 
     def get_tpu_info():
         if sc_lanes == "no-tpu-info":
             raise ValueError("unsupported device kind")
-        return types.SimpleNamespace(sparse_core=sc_info,
-                                     num_lanes=128,
-                                     vmem_capacity_bytes=64 << 20)
+        return types.SimpleNamespace(
+            sparse_core=sc_info, num_lanes=128, vmem_capacity_bytes=64 << 20
+        )
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
-    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
-                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
     def fake_combine(path, *args, **kwargs):
@@ -196,19 +210,26 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         return jnp.full((num_tokens, hidden), 7, dtype=dtype)
 
     monkeypatch.setattr(
-        fused_moe_gmm, f"ragged_gather_reduce_{configured_version}",
-        lambda *args, **kwargs: fake_combine("ep", *args, **kwargs))
+        fused_moe_gmm,
+        f"ragged_gather_reduce_{configured_version}",
+        lambda *args, **kwargs: fake_combine("ep", *args, **kwargs),
+    )
     monkeypatch.setattr(
-        fused_moe_gmm, "ragged_gather_reduce",
-        fused_moe_gmm._select_ragged_gather_reduce(configured_version))
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce(configured_version),
+    )
     monkeypatch.setattr(
-        fused_moe_gmm, "ragged_gather_reduce_v3",
-        lambda *args, **kwargs: fake_combine("v3", *args, **kwargs))
+        fused_moe_gmm,
+        "ragged_gather_reduce_v3",
+        lambda *args, **kwargs: fake_combine("v3", *args, **kwargs),
+    )
 
     def run(source):
         gmm_outputs = iter([jnp.ones((routes, 4), dtype=dtype), source])
-        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                            lambda *args, **kwargs: next(gmm_outputs))
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+        )
         return fused_moe_gmm.moe_gmm(
             x=jnp.ones((routes, 4), dtype=dtype),
             w1=jnp.ones((1, 4, 4), dtype=dtype),
@@ -232,8 +253,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
 
     # Abstract source shapes exercise the 20-bit boundary without allocating
     # a multi-gigabyte route tensor.
-    actual = jax.eval_shape(run,
-                            jax.ShapeDtypeStruct((source_rows, hidden), dtype))
+    actual = jax.eval_shape(run, jax.ShapeDtypeStruct((source_rows, hidden), dtype))
     assert actual.shape == (num_tokens, hidden)
     assert actual.dtype == dtype
     if expected_path is None:
@@ -261,43 +281,69 @@ def _require_tpu() -> None:
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,topk,hidden,uses_v3",
-    [(64, 10, 4096, False), (256, 3, 4096, False), (512, 8, 4096, False),
-     (511, 10, 4096, False), (512, 10, 4096, True), (544, 10, 4096, False),
-     (704, 10, 4096, True), (1024, 2, 4096, False), (1024, 3, 4096, True),
-     (2047, 2, 4096, True), (2047, 3, 4096, True), (2048, 10, 4096, True),
-     (1023, 10, 2048, False), (1024, 10, 2048, True), (256, 10, 5120, True),
-     (300, 10, 5120, False)],
+    [
+        (64, 10, 4096, False),
+        (256, 3, 4096, False),
+        (512, 8, 4096, False),
+        (511, 10, 4096, False),
+        (512, 10, 4096, True),
+        (544, 10, 4096, False),
+        (704, 10, 4096, True),
+        (1024, 2, 4096, False),
+        (1024, 3, 4096, True),
+        (2047, 2, 4096, True),
+        (2047, 3, 4096, True),
+        (2048, 10, 4096, True),
+        (1023, 10, 2048, False),
+        (1024, 10, 2048, True),
+        (256, 10, 5120, True),
+        (300, 10, 5120, False),
+    ],
     ids=[
-        "t64-k10", "t256-k3", "t512-k8", "t511-k10", "t512-k10", "t544-k10",
-        "t704-k10", "t1024-k2", "t1024-k3", "t2047-k2", "t2047-k3",
-        "t2048-k10", "t1023-k10-h2048", "t1024-k10-h2048", "t256-k10-h5120",
-        "t300-k10-h5120"
+        "t64-k10",
+        "t256-k3",
+        "t512-k8",
+        "t511-k10",
+        "t512-k10",
+        "t544-k10",
+        "t704-k10",
+        "t1024-k2",
+        "t1024-k3",
+        "t2047-k2",
+        "t2047-k3",
+        "t2048-k10",
+        "t1023-k10-h2048",
+        "t1024-k10-h2048",
+        "t256-k10-h5120",
+        "t300-k10-h5120",
     ],
 )
 def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
-        monkeypatch, masked, num_tokens, topk, hidden, uses_v3):
+    monkeypatch, masked, num_tokens, topk, hidden, uses_v3
+):
     _require_tpu()
     num_routes = num_tokens * topk
     # These route counts are coprime with 37, so the mapping is a permutation.
     rows = jnp.arange(num_routes, dtype=jnp.int32)
     indices = (rows * 37 + 11) % num_routes
-    weights = jnp.full((num_routes, ), 0.125, dtype=jnp.bfloat16)
-    valid = jnp.ones((num_routes, ), dtype=jnp.bool_)
+    weights = jnp.full((num_routes,), 0.125, dtype=jnp.bfloat16)
+    valid = jnp.ones((num_routes,), dtype=jnp.bool_)
     if masked:
         valid = (rows % 17 != 0) & (rows < num_routes - topk)
     source_valid = valid[jnp.argsort(indices)]
-    source = ((rows[:, None] % 17) + (jnp.arange(hidden)[None, :] % 7) -
-              11).astype(jnp.bfloat16)
+    source = ((rows[:, None] % 17) + (jnp.arange(hidden)[None, :] % 7) - 11).astype(
+        jnp.bfloat16
+    )
     source = jnp.where(source_valid[:, None], source, jnp.nan)
     gathered = source[indices]
     weighted = jnp.where(valid[:, None], gathered * weights[:, None], 0)
     expected = weighted.reshape(num_tokens, topk, hidden).sum(axis=1)
 
     gmm_outputs = iter([jnp.zeros((num_routes, 1), jnp.bfloat16), source])
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                        lambda *args, **kwargs: next(gmm_outputs))
-    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
-                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+    )
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
     combine_v3 = fused_moe_gmm.ragged_gather_reduce_v3
@@ -309,10 +355,8 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     def unexpected_ep_combine(*args, **kwargs):
         pytest.fail("Non-EP prefill used the EP-configured combine")
 
-    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
-                        checked_combine)
-    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce",
-                        unexpected_ep_combine)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", checked_combine)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce", unexpected_ep_combine)
     actual = moe_gmm(
         x=jnp.zeros((num_routes, 1), jnp.bfloat16),
         w1=jnp.zeros((1, 1, 1), jnp.bfloat16),
@@ -339,37 +383,44 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     np.testing.assert_array_equal(actual, expected)
 
 
-def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
-                         topk_ids, activation):
+def _reference_fused_moe(
+    hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, topk_ids, activation
+):
     num_tokens, hidden_size = hidden_states.shape
     padded_hidden_size = w1.shape[1]
 
-    hidden_states = jnp.pad(hidden_states,
-                            ((0, 0), (0, padded_hidden_size - hidden_size)))
+    hidden_states = jnp.pad(
+        hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size))
+    )
     out = jnp.zeros((num_tokens, padded_hidden_size), dtype=jnp.float32)
 
     for token_id in range(num_tokens):
-        token_out = jnp.zeros((padded_hidden_size, ), dtype=jnp.float32)
+        token_out = jnp.zeros((padded_hidden_size,), dtype=jnp.float32)
         for expert_slot in range(topk_ids.shape[1]):
             expert_id = int(topk_ids[token_id, expert_slot])
             if expert_id < 0:
                 continue
 
-            gate_up = jnp.matmul(hidden_states[token_id].astype(jnp.float32),
-                                 w1[expert_id].astype(jnp.float32))
+            gate_up = jnp.matmul(
+                hidden_states[token_id].astype(jnp.float32),
+                w1[expert_id].astype(jnp.float32),
+            )
             if w1_bias is not None:
                 gate_up = gate_up + w1_bias[expert_id, 0].astype(jnp.float32)
 
             gate, up = jnp.split(gate_up, 2, axis=-1)
             interleaved = interleave_lane(gate, up)
             activated = apply_act_fn(interleaved, activation)
-            proj = jnp.matmul(activated.astype(jnp.float32),
-                              w2[expert_id].astype(jnp.float32))
+            proj = jnp.matmul(
+                activated.astype(jnp.float32), w2[expert_id].astype(jnp.float32)
+            )
             if w2_bias is not None:
                 proj = proj + w2_bias[expert_id, 0].astype(jnp.float32)
 
-            token_out = token_out + topk_weights[token_id, expert_slot].astype(
-                jnp.float32) * proj
+            token_out = (
+                token_out
+                + topk_weights[token_id, expert_slot].astype(jnp.float32) * proj
+            )
         out = out.at[token_id].set(token_out)
 
     return out[:, :hidden_size].astype(hidden_states.dtype)
@@ -378,39 +429,44 @@ def _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias, topk_weights,
 def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     hidden_states = jnp.arange(6, dtype=jnp.bfloat16).reshape(3, 2)
     topk_indices = jnp.array([[1, 0], [0, -1], [1, 0]], dtype=jnp.int32)
-    topk_weights = jnp.array([[0.1, 0.2], [0.3, 0.0], [0.4, 0.5]],
-                             dtype=jnp.bfloat16)
+    topk_weights = jnp.array([[0.1, 0.2], [0.3, 0.0], [0.4, 0.5]], dtype=jnp.bfloat16)
     flat_indices = np.asarray(topk_indices).reshape(-1)
     valid = flat_indices >= 0
-    sorted_indices_expected = np.argsort(np.where(valid, flat_indices, 2),
-                                         kind="stable")
+    sorted_indices_expected = np.argsort(
+        np.where(valid, flat_indices, 2), kind="stable"
+    )
 
-    (_, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
-     token_indices_sorted) = prepare_routed_gmm_inputs(
-         hidden_states,
-         topk_indices,
-         topk_weights,
-         local_num_experts=2,
-         topk=2,
-         use_ep=True,
-         use_sparse_core=True,
-         onehot_moe_permute_threshold=6,
-     )
+    (
+        _,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask,
+        token_indices_sorted,
+    ) = prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_num_experts=2,
+        topk=2,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=6,
+    )
 
     np.testing.assert_array_equal(
         argsort_revert_indices,
         np.argsort(sorted_indices_expected, kind="stable"),
     )
-    np.testing.assert_array_equal(topk_weights_flat,
-                                  np.asarray(topk_weights).reshape(-1))
+    np.testing.assert_array_equal(
+        topk_weights_flat, np.asarray(topk_weights).reshape(-1)
+    )
     np.testing.assert_array_equal(valid_mask, valid)
-    np.testing.assert_array_equal(token_indices_sorted,
-                                  sorted_indices_expected // 2)
+    np.testing.assert_array_equal(token_indices_sorted, sorted_indices_expected // 2)
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
 
 
-@pytest.mark.parametrize(("mode", "owner_called"), [("on", True),
-                                                    ("off", False)])
+@pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
 def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     x = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     w1 = jnp.zeros((2, 2, 4), dtype=jnp.bfloat16)
@@ -418,30 +474,35 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     group_sizes = jnp.array([2, 2], dtype=jnp.int32)
     argsort_revert_indices = jnp.array([2, 0, 1, 3], dtype=jnp.int32)
     topk_weights_flat = jnp.array([0.1, 0.2, 0.3, 0.4], dtype=jnp.bfloat16)
-    valid_mask = jnp.ones((4, ), dtype=jnp.bool_)
+    valid_mask = jnp.ones((4,), dtype=jnp.bool_)
     sorted_indices = jnp.array([1, 2, 0, 3], dtype=jnp.int32)
     token_indices_sorted = sorted_indices // 2
     gmm1_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     gmm2_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     expected = jnp.ones((2, 2), dtype=jnp.bfloat16)
 
-    with patch.object(
+    with (
+        patch.object(
             envs,
             "TPU_MOE_OWNER_OUTPUT_MODE",
             mode,
-    ), patch.object(
+        ),
+        patch.object(
             fused_moe_gmm,
             "gmm_wrapper",
             side_effect=[gmm1_res, gmm2_res],
-    ), patch.object(
+        ),
+        patch.object(
             fused_moe_gmm,
             "can_use_blockwise_onehot_unpermute",
             return_value=True,
-    ) as support_check, patch.object(
+        ) as support_check,
+        patch.object(
             fused_moe_gmm,
             "blockwise_onehot_unpermute",
             return_value=expected,
-    ) as owner_kernel:
+        ) as owner_kernel,
+    ):
         actual = moe_gmm(
             x,
             w1,
@@ -475,8 +536,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     call = owner_kernel.call_args
     np.testing.assert_array_equal(call.args[0], gmm2_res)
     np.testing.assert_array_equal(call.args[1], sorted_indices // 2)
-    np.testing.assert_array_equal(call.args[2],
-                                  topk_weights_flat[sorted_indices])
+    np.testing.assert_array_equal(call.args[2], topk_weights_flat[sorted_indices])
     np.testing.assert_array_equal(call.args[3], np.array([4], dtype=np.int32))
     assert call.kwargs == {"num_tokens": 2}
 
@@ -495,25 +555,39 @@ def test_fused_moe_local_routing_matches_reference():
     num_experts = 16
     topk = 8
     key = jax.random.key(0)
-    hidden_key, w1_key, w2_key, w1_bias_key, w2_bias_key = jax.random.split(
-        key, 5)
+    hidden_key, w1_key, w2_key, w1_bias_key, w2_bias_key = jax.random.split(key, 5)
 
-    hidden_states = (jax.random.normal(hidden_key, (num_tokens, hidden_size),
-                                       dtype=jnp.float32) / 10).astype(
-                                           jnp.bfloat16)
-    w1 = (jax.random.normal(
-        w1_key, (num_experts, padded_hidden_size, intermediate_size * 2),
-        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    hidden_states = (
+        jax.random.normal(hidden_key, (num_tokens, hidden_size), dtype=jnp.float32) / 10
+    ).astype(jnp.bfloat16)
+    w1 = (
+        jax.random.normal(
+            w1_key,
+            (num_experts, padded_hidden_size, intermediate_size * 2),
+            dtype=jnp.float32,
+        )
+        / 10
+    ).astype(jnp.bfloat16)
     w2 = (
-        jax.random.normal(w2_key,
-                          (num_experts, intermediate_size, padded_hidden_size),
-                          dtype=jnp.float32) / 10).astype(jnp.bfloat16)
-    w1_bias = (jax.random.normal(w1_bias_key,
-                                 (num_experts, 1, intermediate_size * 2),
-                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
-    w2_bias = (jax.random.normal(w2_bias_key,
-                                 (num_experts, 1, padded_hidden_size),
-                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+        jax.random.normal(
+            w2_key,
+            (num_experts, intermediate_size, padded_hidden_size),
+            dtype=jnp.float32,
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    w1_bias = (
+        jax.random.normal(
+            w1_bias_key, (num_experts, 1, intermediate_size * 2), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    w2_bias = (
+        jax.random.normal(
+            w2_bias_key, (num_experts, 1, padded_hidden_size), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
 
     topk_weights = jnp.array(
         [
@@ -534,8 +608,9 @@ def test_fused_moe_local_routing_matches_reference():
         dtype=jnp.int32,
     )
 
-    expected = _reference_fused_moe(hidden_states, w1, w2, w1_bias, w2_bias,
-                                    topk_weights, topk_ids, "silu")
+    expected = _reference_fused_moe(
+        hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, topk_ids, "silu"
+    )
     actual = fused_moe_func(
         hidden_states=hidden_states,
         w1=w1,
@@ -551,10 +626,9 @@ def test_fused_moe_local_routing_matches_reference():
     )
 
     assert actual.dtype == hidden_states.dtype
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=1e-1,
-                               rtol=1e-1)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=1e-1, rtol=1e-1
+    )
 
 
 def _make_ep_inputs(num_local_experts, seed=0):
@@ -571,20 +645,32 @@ def _make_ep_inputs(num_local_experts, seed=0):
     key = jax.random.key(seed)
     hk, w1k, w2k, b1k, b2k = jax.random.split(key, 5)
     hidden_states = (
-        jax.random.normal(hk, (num_tokens, hidden_size), dtype=jnp.float32) /
-        10).astype(jnp.bfloat16)
-    w1 = (jax.random.normal(
-        w1k, (num_local_experts, hidden_size, intermediate_size * 2),
-        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+        jax.random.normal(hk, (num_tokens, hidden_size), dtype=jnp.float32) / 10
+    ).astype(jnp.bfloat16)
+    w1 = (
+        jax.random.normal(
+            w1k,
+            (num_local_experts, hidden_size, intermediate_size * 2),
+            dtype=jnp.float32,
+        )
+        / 10
+    ).astype(jnp.bfloat16)
     w2 = (
-        jax.random.normal(w2k,
-                          (num_local_experts, intermediate_size, hidden_size),
-                          dtype=jnp.float32) / 10).astype(jnp.bfloat16)
-    w1_bias = (jax.random.normal(b1k,
-                                 (num_local_experts, 1, intermediate_size * 2),
-                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
-    w2_bias = (jax.random.normal(b2k, (num_local_experts, 1, hidden_size),
-                                 dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+        jax.random.normal(
+            w2k, (num_local_experts, intermediate_size, hidden_size), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    w1_bias = (
+        jax.random.normal(
+            b1k, (num_local_experts, 1, intermediate_size * 2), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    w2_bias = (
+        jax.random.normal(b2k, (num_local_experts, 1, hidden_size), dtype=jnp.float32)
+        / 10
+    ).astype(jnp.bfloat16)
     topk_weights = jnp.array(
         [
             [0.30, 0.18, 0.14, 0.12, 0.10, 0.07, 0.05, 0.04],
@@ -597,14 +683,18 @@ def _make_ep_inputs(num_local_experts, seed=0):
     # Local ids stay in [0, num_local_experts); distinct per slot to exercise
     # the full local shard.
     base = jnp.array([0, 2, 4, 6, 8, 10, 12, 14], dtype=jnp.int32)
-    local_ids = jnp.stack([
-        base,
-        base + 1,
-        (base + 1)[::-1],
-        base[::-1],
-    ]) % num_local_experts
-    return (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
-            topk)
+    local_ids = (
+        jnp.stack(
+            [
+                base,
+                base + 1,
+                (base + 1)[::-1],
+                base[::-1],
+            ]
+        )
+        % num_local_experts
+    )
+    return (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk)
 
 
 @pytest.mark.parametrize(
@@ -612,88 +702,95 @@ def _make_ep_inputs(num_local_experts, seed=0):
     [
         (16, 0),  # rank 0: experts_start == 0 must behave like the legacy path
         (16, 32),  # rank 2 of 8-way EP (Qwen3-30B shape: 128 / 8 = 16 local)
-        (20,
-         60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
-    ])
-def test_fused_moe_global_id_remap_matches_local(num_local_experts,
-                                                 experts_start):
+        (20, 60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
+    ],
+)
+def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_start):
     """Global ids + experts_start must produce the same output as local ids."""
     _require_tpu()
-    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
-     topk) = _make_ep_inputs(num_local_experts)
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk) = (
+        _make_ep_inputs(num_local_experts)
+    )
     global_ids = local_ids + experts_start
-    expected = fused_moe_func(hidden_states=hidden_states,
-                              w1=w1,
-                              w2=w2,
-                              w1_scale=None,
-                              w2_scale=None,
-                              w1_bias=w1_bias,
-                              w2_bias=w2_bias,
-                              topk_weights=topk_weights,
-                              topk_ids=local_ids,
-                              topk=topk,
-                              activation="silu",
-                              use_ep=True)
-    actual = fused_moe_func(hidden_states=hidden_states,
-                            w1=w1,
-                            w2=w2,
-                            w1_scale=None,
-                            w2_scale=None,
-                            w1_bias=w1_bias,
-                            w2_bias=w2_bias,
-                            topk_weights=topk_weights,
-                            topk_ids=global_ids,
-                            experts_start=experts_start,
-                            topk=topk,
-                            activation="silu",
-                            use_ep=True)
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=1e-1,
-                               rtol=1e-1)
+    expected = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_weights=topk_weights,
+        topk_ids=local_ids,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+    )
+    actual = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_weights=topk_weights,
+        topk_ids=global_ids,
+        experts_start=experts_start,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=1e-1, rtol=1e-1
+    )
 
 
 def test_fused_moe_global_id_remap_masks_out_of_range():
     """Non-local global ids must contribute zero (range check + jnp.where)."""
     _require_tpu()
     num_local_experts, experts_start = 16, 32
-    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
-     topk) = _make_ep_inputs(num_local_experts)
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk) = (
+        _make_ep_inputs(num_local_experts)
+    )
     global_ids = local_ids + experts_start
     # Token 0 slot 0: below shard (-> masked). Token 1 slot 1: above shard.
     global_ids = global_ids.at[0, 0].set(experts_start - 1)
     global_ids = global_ids.at[1, 1].set(experts_start + num_local_experts)
     # Reference: same call but with the offending weights pre-zeroed.
     masked_weights = topk_weights.at[0, 0].set(0.0).at[1, 1].set(0.0)
-    expected = fused_moe_func(hidden_states=hidden_states,
-                              w1=w1,
-                              w2=w2,
-                              w1_scale=None,
-                              w2_scale=None,
-                              w1_bias=w1_bias,
-                              w2_bias=w2_bias,
-                              topk_weights=masked_weights,
-                              topk_ids=local_ids,
-                              topk=topk,
-                              activation="silu",
-                              use_ep=True)
-    actual = fused_moe_func(hidden_states=hidden_states,
-                            w1=w1,
-                            w2=w2,
-                            w1_scale=None,
-                            w2_scale=None,
-                            w1_bias=w1_bias,
-                            w2_bias=w2_bias,
-                            topk_weights=topk_weights,
-                            topk_ids=global_ids,
-                            experts_start=experts_start,
-                            topk=topk,
-                            activation="silu",
-                            use_ep=True)
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=1e-1,
-                               rtol=1e-1)
+    expected = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_weights=masked_weights,
+        topk_ids=local_ids,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+    )
+    actual = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_weights=topk_weights,
+        topk_ids=global_ids,
+        experts_start=experts_start,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=1e-1, rtol=1e-1
+    )
 
 
 def test_fused_moe_func_int4_packed_matches_reference():
@@ -709,18 +806,14 @@ def test_fused_moe_func_int4_packed_matches_reference():
     topk = 2
     key = jax.random.key(0)
 
-    hidden_states = jax.random.uniform(key, (num_tokens, hidden_size),
-                                       dtype=jnp.bfloat16,
-                                       minval=-1,
-                                       maxval=1)
-    topk_weights = jax.random.uniform(key, (num_tokens, topk),
-                                      dtype=jnp.float32,
-                                      minval=0.1,
-                                      maxval=0.9)
+    hidden_states = jax.random.uniform(
+        key, (num_tokens, hidden_size), dtype=jnp.bfloat16, minval=-1, maxval=1
+    )
+    topk_weights = jax.random.uniform(
+        key, (num_tokens, topk), dtype=jnp.float32, minval=0.1, maxval=0.9
+    )
     topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
-    topk_ids = jax.random.randint(key, (num_tokens, topk),
-                                  minval=0,
-                                  maxval=num_experts)
+    topk_ids = jax.random.randint(key, (num_tokens, topk), minval=0, maxval=num_experts)
 
     w1_key, w2_key = jax.random.split(key)
     w1_raw = jax.random.uniform(
@@ -742,15 +835,11 @@ def test_fused_moe_func_int4_packed_matches_reference():
         max_val = 7
         min_val = -8
         orig_shape = x.shape
-        blocked_shape = (orig_shape[:axis] + (-1, block_size) +
-                         orig_shape[axis + 1:])
+        blocked_shape = orig_shape[:axis] + (-1, block_size) + orig_shape[axis + 1 :]
         x_blocked = x.reshape(blocked_shape)
-        x_blocked_abs_max = jnp.max(jnp.abs(x_blocked),
-                                    axis=axis + 1,
-                                    keepdims=True)
+        x_blocked_abs_max = jnp.max(jnp.abs(x_blocked), axis=axis + 1, keepdims=True)
         scale = x_blocked_abs_max / max_val
-        x_blocked_q = jnp.clip(x_blocked / scale, min_val,
-                               max_val).astype(jnp.int32)
+        x_blocked_q = jnp.clip(x_blocked / scale, min_val, max_val).astype(jnp.int32)
         x_q = x_blocked_q.reshape(orig_shape)
         scale = scale.squeeze(axis=axis + 1).astype(jnp.bfloat16)
         return x_q, scale
@@ -787,10 +876,8 @@ def test_fused_moe_func_int4_packed_matches_reference():
         INT4_SIGN_XOR = -2004318072
         return x_packed ^ INT4_SIGN_XOR
 
-    w1_packed = pack_int4(w1_int4, num_experts, storage_k,
-                          intermediate_size * 2)
-    w2_packed = pack_int4(w2_int4, num_experts, intermediate_size_storage,
-                          hidden_size)
+    w1_packed = pack_int4(w1_int4, num_experts, storage_k, intermediate_size * 2)
+    w2_packed = pack_int4(w2_int4, num_experts, intermediate_size_storage, hidden_size)
 
     actual = fused_moe_func(
         hidden_states=hidden_states,
@@ -807,10 +894,9 @@ def test_fused_moe_func_int4_packed_matches_reference():
         rhs_quant_dtype=jnp.int4,
     )
 
-    np.testing.assert_allclose(np.asarray(actual),
-                               np.asarray(expected),
-                               atol=8.0,
-                               rtol=3e-1)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=8.0, rtol=3e-1
+    )
 
 
 def _fake_tpu_info(sparse_core):
@@ -818,9 +904,9 @@ def _fake_tpu_info(sparse_core):
 
 
 def _fake_sc_info(num_lanes, num_cores, num_subcores):
-    return types.SimpleNamespace(num_lanes=num_lanes,
-                                 num_cores=num_cores,
-                                 num_subcores=num_subcores)
+    return types.SimpleNamespace(
+        num_lanes=num_lanes, num_cores=num_cores, num_subcores=num_subcores
+    )
 
 
 def test_onehot_threshold_env_parsing(monkeypatch):
@@ -834,7 +920,6 @@ def test_onehot_threshold_env_parsing(monkeypatch):
 
 
 def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
-
     def _fail():
         raise AssertionError("get_tpu_info must not be called")
 
@@ -845,48 +930,44 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
 
 @pytest.mark.parametrize("explicit", [None, -1])
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
-    monkeypatch.setattr(envs,
-                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
-                        explicit,
-                        raising=False)
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
     # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) and a
     # 256-row block (v6e) both sit at or below the cap, so block - 1 wins:
     # a full block stays on the SparseCore path. None and -1 both select
     # auto.
-    for sc_info, expected in ((_fake_sc_info(16, 2, 16), 511),
-                              (_fake_sc_info(8, 2, 16), 255)):
-        monkeypatch.setattr(fused_moe_gmm.pltpu,
-                            "get_tpu_info",
-                            lambda info=sc_info: _fake_tpu_info(info))
+    for sc_info, expected in (
+        (_fake_sc_info(16, 2, 16), 511),
+        (_fake_sc_info(8, 2, 16), 255),
+    ):
+        monkeypatch.setattr(
+            fused_moe_gmm.pltpu,
+            "get_tpu_info",
+            lambda info=sc_info: _fake_tpu_info(info),
+        )
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected
 
 
 def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
-    monkeypatch.setattr(envs,
-                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
-                        None,
-                        raising=False)
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
     # A hypothetical 1024-row block exceeds the cap, so the cap wins.
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
-                        lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)))
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu,
+        "get_tpu_info",
+        lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
+    )
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
-    monkeypatch.setattr(envs,
-                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
-                        None,
-                        raising=False)
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info",
-                        lambda: _fake_tpu_info(None))
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
+    )
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
-    monkeypatch.setattr(envs,
-                        "ONEHOT_MOE_PERMUTE_THRESHOLD",
-                        None,
-                        raising=False)
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
 
     def _raise():
         raise ValueError("Unsupported TPU device kind: cpu")
@@ -897,11 +978,13 @@ def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
 
 def test_prepare_routed_onehot_permute_matches_plain_gather():
     num_tokens, topk, hidden = 4, 2, 8
-    hidden_states = (jnp.arange(num_tokens * hidden, dtype=jnp.float32) /
-                     7).reshape(num_tokens, hidden).astype(jnp.bfloat16)
+    hidden_states = (
+        (jnp.arange(num_tokens * hidden, dtype=jnp.float32) / 7)
+        .reshape(num_tokens, hidden)
+        .astype(jnp.bfloat16)
+    )
     # -1 marks non-local experts (EP mask path).
-    topk_indices = jnp.array([[0, 1], [1, -1], [2, 0], [-1, 3]],
-                             dtype=jnp.int32)
+    topk_indices = jnp.array([[0, 1], [1, -1], [2, 0], [-1, 3]], dtype=jnp.int32)
     topk_weights = jnp.full((num_tokens, topk), 0.5, dtype=jnp.float32)
 
     common = dict(local_num_experts=4, topk=topk, use_ep=True)
@@ -911,14 +994,16 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
         topk_weights,
         use_sparse_core=True,
         onehot_moe_permute_threshold=num_tokens * topk,
-        **common)
+        **common,
+    )
     plain_out = fused_moe_gmm.prepare_routed_gmm_inputs(
         hidden_states,
         topk_indices,
         topk_weights,
         use_sparse_core=False,
         onehot_moe_permute_threshold=0,
-        **common)
+        **common,
+    )
 
     # Each one-hot row selects exactly one token, so the permuted activations
     # match the plain gather bit-for-bit and the routing metadata is shared.
@@ -930,17 +1015,19 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk
     k1, k2 = jax.random.split(jax.random.key(1))
-    gmm1 = (jax.random.normal(k1, (rows, hidden), dtype=jnp.float32) /
-            10).astype(jnp.bfloat16)
-    gmm2 = (jax.random.normal(k2, (rows, hidden), dtype=jnp.float32) /
-            10).astype(jnp.bfloat16)
-    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
-                        lambda *args, **kwargs: 1)
+    gmm1 = (jax.random.normal(k1, (rows, hidden), dtype=jnp.float32) / 10).astype(
+        jnp.bfloat16
+    )
+    gmm2 = (jax.random.normal(k2, (rows, hidden), dtype=jnp.float32) / 10).astype(
+        jnp.bfloat16
+    )
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
 
     def run(**overrides):
         outputs = iter([gmm1, gmm2])
-        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                            lambda *args, **kwargs: next(outputs))
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
+        )
         kwargs = dict(
             x=jnp.ones((rows, hidden), dtype=jnp.bfloat16),
             w1=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
@@ -950,13 +1037,13 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
             w2_scale=None,
             w2_bias=None,
             group_sizes=jnp.array([rows], dtype=jnp.int32),
-            argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
-                                             dtype=jnp.int32),
-            token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
-                                           dtype=jnp.int32) // topk,
+            argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4], dtype=jnp.int32),
+            token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3], dtype=jnp.int32)
+            // topk,
             topk_weights_flat=jnp.linspace(0.1, 0.8, rows, dtype=jnp.float32),
             valid_mask_flat=jnp.array(
-                [True, True, False, True, True, False, True, True]),
+                [True, True, False, True, True, False, True, True]
+            ),
             activation="silu",
             num_tokens=num_tokens,
             topk=topk,
@@ -975,10 +1062,12 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     # weighted sums up to reduction order, so the bf16 results agree to
     # final-rounding tolerance. The dot's output dtype is asserted
     # separately in test_moe_gmm_onehot_combine_keeps_operand_dtype.
-    np.testing.assert_allclose(np.asarray(onehot_res, dtype=np.float32),
-                               np.asarray(plain_res, dtype=np.float32),
-                               rtol=2e-2,
-                               atol=1e-3)
+    np.testing.assert_allclose(
+        np.asarray(onehot_res, dtype=np.float32),
+        np.asarray(plain_res, dtype=np.float32),
+        rtol=2e-2,
+        atol=1e-3,
+    )
 
 
 def _small_moe_gmm_kwargs(num_tokens=4, topk=2, hidden=8):
@@ -993,12 +1082,11 @@ def _small_moe_gmm_kwargs(num_tokens=4, topk=2, hidden=8):
         w2_scale=None,
         w2_bias=None,
         group_sizes=jnp.array([rows], dtype=jnp.int32),
-        argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4],
-                                         dtype=jnp.int32),
-        token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3],
-                                       dtype=jnp.int32) // topk,
-        topk_weights_flat=jnp.full((rows, ), 0.5, dtype=jnp.bfloat16),
-        valid_mask_flat=jnp.ones((rows, ), dtype=bool),
+        argsort_revert_indices=jnp.array([3, 6, 1, 7, 0, 5, 2, 4], dtype=jnp.int32),
+        token_indices_sorted=jnp.array([4, 2, 6, 0, 7, 5, 1, 3], dtype=jnp.int32)
+        // topk,
+        topk_weights_flat=jnp.full((rows,), 0.5, dtype=jnp.bfloat16),
+        valid_mask_flat=jnp.ones((rows,), dtype=bool),
         activation="silu",
         num_tokens=num_tokens,
         topk=topk,
@@ -1016,27 +1104,20 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
     # comparison.
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
-    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
-                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     # Identity gmm keeps the combine matmul a function of the traced input,
     # so it cannot constant-fold out of the jaxpr.
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                        lambda lhs, *args, **kwargs: lhs)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", lambda lhs, *args, **kwargs: lhs)
 
     def run(x):
-        return fused_moe_gmm.moe_gmm(**{
-            **kwargs, "x": x,
-            "onehot_moe_permute_threshold": rows
-        })
+        return fused_moe_gmm.moe_gmm(
+            **{**kwargs, "x": x, "onehot_moe_permute_threshold": rows}
+        )
 
     jaxpr = jax.make_jaxpr(run)(kwargs["x"])
-    dots = [
-        eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "dot_general"
-    ]
+    dots = [eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "dot_general"]
     assert dots, "one-hot combine must lower to a dot_general"
-    assert all(
-        eqn.params.get("preferred_element_type") != jnp.float32
-        for eqn in dots)
+    assert all(eqn.params.get("preferred_element_type") != jnp.float32 for eqn in dots)
 
 
 def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
@@ -1047,22 +1128,24 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     valid_rows = rows - 2
-    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
-                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
     gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
     outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
-                        lambda *args, **kwargs: next(outputs))
+    monkeypatch.setattr(
+        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
+    )
     # Mark the slots whose routed rows fall in the NaN tail as invalid, as
     # prepare_routed_gmm_inputs does for padded tokens.
     revert = kwargs["argsort_revert_indices"]
     kwargs["valid_mask_flat"] = revert < valid_rows
     kwargs["group_sizes"] = jnp.array([valid_rows], dtype=jnp.int32)
 
-    out = fused_moe_gmm.moe_gmm(**{
-        **kwargs,
-        "onehot_moe_permute_threshold": rows,
-    })
+    out = fused_moe_gmm.moe_gmm(
+        **{
+            **kwargs,
+            "onehot_moe_permute_threshold": rows,
+        }
+    )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))

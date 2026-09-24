@@ -3,12 +3,12 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
-    VllmCompressedTensorsW4ANMxfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+    VllmCompressedTensorsW4ANMxfp4MoEMethod,
+)
 
 
 class FakeRoutedExperts(RoutedExperts):
-
     def __init__(self, experts_per_token=2):
         torch.nn.Module.__init__(self)
         # Gated MoE metadata consumed by native checkpoint allocation.
@@ -78,30 +78,43 @@ def test_mxfp4_create_weights_and_process():
     w2_scale_val = torch.ones(128, 2, dtype=torch.uint8)
 
     for expert_id in range(num_experts):
-        weight_loader(layer.w13_weight_packed, w13_packed_val,
-                      "w13_weight_packed", "w1", expert_id)
-        weight_loader(layer.w13_weight_packed, w13_packed_val,
-                      "w13_weight_packed", "w3", expert_id)
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed_val,
+            "w13_weight_packed",
+            "w1",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed_val,
+            "w13_weight_packed",
+            "w3",
+            expert_id,
+        )
 
-        weight_loader(layer.w13_weight_scale, w13_scale_val,
-                      "w13_weight_scale", "w1", expert_id)
-        weight_loader(layer.w13_weight_scale, w13_scale_val,
-                      "w13_weight_scale", "w3", expert_id)
+        weight_loader(
+            layer.w13_weight_scale, w13_scale_val, "w13_weight_scale", "w1", expert_id
+        )
+        weight_loader(
+            layer.w13_weight_scale, w13_scale_val, "w13_weight_scale", "w3", expert_id
+        )
 
-        weight_loader(layer.w2_weight_packed, w2_packed_val,
-                      "w2_weight_packed", "", expert_id)
-        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
-                      "", expert_id)
+        weight_loader(
+            layer.w2_weight_packed, w2_packed_val, "w2_weight_packed", "", expert_id
+        )
+        weight_loader(
+            layer.w2_weight_scale, w2_scale_val, "w2_weight_scale", "", expert_id
+        )
 
     # 2. process_weights_after_loading
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
     ) as mock_prebuild:
         method.process_weights_after_loading(layer)
-    mock_prebuild.assert_called_once_with(topk=2,
-                                          activation="silu",
-                                          use_ep=False,
-                                          skip_padded_tokens=True)
+    mock_prebuild.assert_called_once_with(
+        topk=2, activation="silu", use_ep=False, skip_padded_tokens=True
+    )
 
     # Validate output
     assert hasattr(layer, "w13_weight")
@@ -120,17 +133,19 @@ def test_mxfp4_create_weights_and_process():
     # w2_scale_4d: [E, num_blocks, 1, N] -> [4, 2, 1, 128]
     assert layer.w2_weight_scale.shape == (4, 2, 1, 128)
 
-    assert layer.w13_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
-                                             layer.w13_weight.dtype)
-    assert layer.w2_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
-                                            layer.w2_weight.dtype)
+    assert layer.w13_weight.dtype == getattr(
+        torch, "float4_e2m1fn_x2", layer.w13_weight.dtype
+    )
+    assert layer.w2_weight.dtype == getattr(
+        torch, "float4_e2m1fn_x2", layer.w2_weight.dtype
+    )
 
     # 3. _forward_monolithic_tpu
     x = torch.randn(2, 128, dtype=torch.bfloat16)
     router_logits = torch.randn(2, num_experts, dtype=torch.float32)
 
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm"
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm"
     ) as mock_gmm:
         mock_gmm.return_value = torch.zeros_like(x)
         out = method.apply_monolithic(layer, x, router_logits)
@@ -155,27 +170,30 @@ def test_mxfp4_apply_masks_padded_token_routes():
 
     x = torch.randn(4, 8, dtype=torch.bfloat16)
     router_logits = torch.randn(4, 4, dtype=torch.float32)
-    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]],
-                            dtype=torch.int64)
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int64)
     topk_weights = torch.full((4, 2), 0.5)
     masked_weights = topk_weights.clone()
     masked_weights[1:] = 0
 
-    with patch(
+    with (
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.moe_routing.select_experts",
-            return_value=(topk_weights, topk_ids)
-    ), patch(
+            return_value=(topk_weights, topk_ids),
+        ),
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
-            return_value=(topk_ids.to(torch.int32), masked_weights)
-    ) as mock_mask, patch(
+            return_value=(topk_ids.to(torch.int32), masked_weights),
+        ) as mock_mask,
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.fused_moe_gmm",
-            return_value=torch.zeros_like(x)) as mock_gmm:
+            return_value=torch.zeros_like(x),
+        ) as mock_gmm,
+    ):
         method.apply_monolithic(layer, x, router_logits)
 
     mock_mask.assert_called_once()
     assert mock_gmm.call_args.kwargs["topk_ids"].dtype == torch.int32
-    assert torch.equal(mock_gmm.call_args.kwargs["topk_weights"],
-                       masked_weights)
+    assert torch.equal(mock_gmm.call_args.kwargs["topk_weights"], masked_weights)
     assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
@@ -211,14 +229,12 @@ def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     w13_scale = torch.full((128, 4), 127, dtype=torch.uint8)
     w2_scale = torch.full((128, 4), 127, dtype=torch.uint8)
     for expert_id in range(num_experts):
-        w13_packed = torch.randint(0,
-                                   256, (128, 64),
-                                   dtype=torch.uint8,
-                                   generator=generator)
-        w2_packed = torch.randint(0,
-                                  256, (128, 64),
-                                  dtype=torch.uint8,
-                                  generator=generator)
+        w13_packed = torch.randint(
+            0, 256, (128, 64), dtype=torch.uint8, generator=generator
+        )
+        w2_packed = torch.randint(
+            0, 256, (128, 64), dtype=torch.uint8, generator=generator
+        )
         weight_loader(
             layer.w13_weight_packed,
             w13_packed,
@@ -262,19 +278,21 @@ def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
             expert_id,
         )
 
-    with patch("vllm_torchtpu.layers.adapter.quantization.compressed_tensors."
-               "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
-               "prebuild_fused_moe_kernel"):
+    with patch(
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
+        "prebuild_fused_moe_kernel"
+    ):
         method.process_weights_after_loading(layer)
 
     active = torch.randn(1, hidden_size, dtype=torch.bfloat16)
     hidden_states = torch.cat(
-        (active.expand(8, -1), torch.zeros(8,
-                                           hidden_size,
-                                           dtype=torch.bfloat16))).to("tpu")
+        (active.expand(8, -1), torch.zeros(8, hidden_size, dtype=torch.bfloat16))
+    ).to("tpu")
     active_router = torch.randn(1, num_experts, dtype=torch.float32)
     router_logits = torch.cat(
-        (active_router.expand(8, -1), torch.zeros(8, num_experts))).to("tpu")
+        (active_router.expand(8, -1), torch.zeros(8, num_experts))
+    ).to("tpu")
 
     output = method.apply_monolithic(layer, hidden_states, router_logits)
     active_output = output[:8].cpu()
@@ -293,8 +311,7 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
     layer = FakeRoutedExperts()
 
-    with patch("torch.zeros",
-               side_effect=AssertionError("must use torch.empty")):
+    with patch("torch.zeros", side_effect=AssertionError("must use torch.empty")):
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -303,8 +320,12 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
             params_dtype=torch.bfloat16,
         )
 
-    for name in ("w13_weight_packed", "w2_weight_packed", "w13_weight_scale",
-                 "w2_weight_scale"):
+    for name in (
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
         assert hasattr(layer, name)
 
 
@@ -331,13 +352,17 @@ def test_mxfp4_processes_directly_materialized_dummy_weights():
 
     # vLLM's dummy loader initializes materialized parameters without calling
     # the checkpoint weight-loader hook, so no CPU scratchpads are created.
-    for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
-                      layer.w2_weight_packed, layer.w2_weight_scale):
+    for parameter in (
+        layer.w13_weight_packed,
+        layer.w13_weight_scale,
+        layer.w2_weight_packed,
+        layer.w2_weight_scale,
+    ):
         assert not hasattr(parameter, "_cpu_scratch")
         parameter.data.zero_()
 
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
     ):
         method.process_weights_after_loading(layer)
 
@@ -364,16 +389,21 @@ def test_mxfp4_initializes_integer_dummy_weights():
         params_dtype=torch.bfloat16,
     )
 
-    parameters = (layer.w13_weight_packed, layer.w13_weight_scale,
-                  layer.w2_weight_packed, layer.w2_weight_scale)
+    parameters = (
+        layer.w13_weight_packed,
+        layer.w13_weight_scale,
+        layer.w2_weight_packed,
+        layer.w2_weight_scale,
+    )
     for parameter in parameters:
         parameter.data.fill_(255)
 
     vllm_config = MagicMock()
     vllm_config.load_config.load_format = "dummy"
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
-            return_value=vllm_config):
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
+        return_value=vllm_config,
+    ):
         method._initialize_dummy_quantized_weights(layer)
 
     for packed in (layer.w13_weight_packed, layer.w2_weight_packed):
@@ -401,16 +431,21 @@ def test_mxfp4_preserves_integer_checkpoint_weights():
         params_dtype=torch.bfloat16,
     )
 
-    parameters = (layer.w13_weight_packed, layer.w13_weight_scale,
-                  layer.w2_weight_packed, layer.w2_weight_scale)
+    parameters = (
+        layer.w13_weight_packed,
+        layer.w13_weight_scale,
+        layer.w2_weight_packed,
+        layer.w2_weight_scale,
+    )
     for parameter in parameters:
         parameter.data.fill_(255)
 
     vllm_config = MagicMock()
     vllm_config.load_config.load_format = "safetensors"
     with patch(
-            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
-            return_value=vllm_config):
+        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.get_current_vllm_config_or_none",
+        return_value=vllm_config,
+    ):
         method._initialize_dummy_quantized_weights(layer)
 
     for parameter in parameters:
@@ -434,26 +469,30 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     )
 
     for parameter in (layer.w13_weight_scale, layer.w2_weight_scale):
-        parameter._cpu_scratch = torch.nn.Parameter(torch.empty_like(
-            parameter, device="cpu"),
-                                                    requires_grad=False)
-        parameter._cpu_scratch.data.fill_(0xff)
+        parameter._cpu_scratch = torch.nn.Parameter(
+            torch.empty_like(parameter, device="cpu"), requires_grad=False
+        )
+        parameter._cpu_scratch.data.fill_(0xFF)
 
     method._neutralize_padded_scales(layer)
 
     w13_scale = layer.w13_weight_scale._cpu_scratch
     w2_scale = layer.w2_weight_scale._cpu_scratch
-    assert torch.all(w13_scale[:, :32, :] == 0xff)
+    assert torch.all(w13_scale[:, :32, :] == 0xFF)
     assert not w13_scale[:, 32:64, :].any()
-    assert torch.all(w13_scale[:, 64:96, :] == 0xff)
+    assert torch.all(w13_scale[:, 64:96, :] == 0xFF)
     assert not w13_scale[:, 96:, :].any()
-    assert torch.all(w2_scale[:, :, :1] == 0xff)
+    assert torch.all(w2_scale[:, :, :1] == 0xFF)
     assert not w2_scale[:, :, 1:].any()
 
 
 def test_mxfp4_requantize_block():
     from vllm_torchtpu.layers.core.quantization import (
-        dequantize_mxfp4_packed, fp4_indices_to_float, quantize_tensor_to_fp4)
+        dequantize_mxfp4_packed,
+        fp4_indices_to_float,
+        quantize_tensor_to_fp4,
+    )
+
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
@@ -485,27 +524,44 @@ def test_mxfp4_requantize_block():
     w2_scale_val = torch.randint(100, 150, (128, 2), dtype=torch.uint8)
 
     for expert_id in range(num_experts):
-        weight_loader(layer.w13_weight_packed, w13_packed_val,
-                      "w13_weight_packed", "w1", expert_id)
-        weight_loader(layer.w13_weight_packed, w13_packed_val,
-                      "w13_weight_packed", "w3", expert_id)
-        weight_loader(layer.w13_weight_scale, w13_scale_val,
-                      "w13_weight_scale", "w1", expert_id)
-        weight_loader(layer.w13_weight_scale, w13_scale_val,
-                      "w13_weight_scale", "w3", expert_id)
-        weight_loader(layer.w2_weight_packed, w2_packed_val,
-                      "w2_weight_packed", "", expert_id)
-        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
-                      "", expert_id)
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed_val,
+            "w13_weight_packed",
+            "w1",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_packed,
+            w13_packed_val,
+            "w13_weight_packed",
+            "w3",
+            expert_id,
+        )
+        weight_loader(
+            layer.w13_weight_scale, w13_scale_val, "w13_weight_scale", "w1", expert_id
+        )
+        weight_loader(
+            layer.w13_weight_scale, w13_scale_val, "w13_weight_scale", "w3", expert_id
+        )
+        weight_loader(
+            layer.w2_weight_packed, w2_packed_val, "w2_weight_packed", "", expert_id
+        )
+        weight_loader(
+            layer.w2_weight_scale, w2_scale_val, "w2_weight_scale", "", expert_id
+        )
 
     w13_packed_orig = layer.w13_weight_packed._cpu_scratch.data.clone()
     w13_scale_orig = layer.w13_weight_scale._cpu_scratch.data.clone()
 
-    with patch(
+    with (
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.MOE_REQUANTIZE_BLOCK_SIZE",
-            "64"
-    ), patch(
+            "64",
+        ),
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        ),
     ):
         method.process_weights_after_loading(layer)
 
@@ -515,9 +571,9 @@ def test_mxfp4_requantize_block():
     assert layer.w2_weight_scale.shape == (4, 1, 1, 128)
 
     w13_f32 = dequantize_mxfp4_packed(w13_packed_orig, w13_scale_orig)
-    w13_fp4_idx, w13_fp32_scale = quantize_tensor_to_fp4(w13_f32,
-                                                         axis=-1,
-                                                         block_size=64)
+    w13_fp4_idx, w13_fp32_scale = quantize_tensor_to_fp4(
+        w13_f32, axis=-1, block_size=64
+    )
     w13_fp4_f32_expected = fp4_indices_to_float(w13_fp4_idx)
 
     # 3. K-major layout for GMM: [E, K, N]
@@ -525,8 +581,8 @@ def test_mxfp4_requantize_block():
 
     # Check that the native K-major fp4 tensor matches
     from vllm_torchtpu.layers.core.quantization import unpack_uint8_to_fp4
-    actual_w13_f32 = unpack_uint8_to_fp4(layer.w13_weight.data.cpu().view(
-        torch.uint8))
+
+    actual_w13_f32 = unpack_uint8_to_fp4(layer.w13_weight.data.cpu().view(torch.uint8))
 
     # XLA and PyTorch round quantization ties slightly differently (1% of values shift by 1 bin).
     # Since the spacing in FP4 e2m1 is at most 1.0 around the low values, we permit a max diff of 1.0.
@@ -536,34 +592,37 @@ def test_mxfp4_requantize_block():
     # Check the scale (gmm_v2 scale layout: [E, num_blocks, 1, N])
     w13_fp32_scale_4d = w13_fp32_scale.movedim(-1, 1).unsqueeze(-2)
     actual_scale = layer.w13_weight_scale.data.cpu()
-    torch.testing.assert_close(actual_scale,
-                               w13_fp32_scale_4d,
-                               rtol=1e-3,
-                               atol=1e-3)
+    torch.testing.assert_close(actual_scale, w13_fp32_scale_4d, rtol=1e-3, atol=1e-3)
 
 
 def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import \
-        compressed_tensors_moe_w4an_mxfp4 as module
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (
+        compressed_tensors_moe_w4an_mxfp4 as module,
+    )
 
     method = VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
-        VllmCompressedTensorsW4ANMxfp4MoEMethod)
-    method._tpu_activation_str = 'situ'
-    layer = SimpleNamespace(w13_weight=None,
-                            w2_weight=None,
-                            w13_weight_scale=None,
-                            w2_weight_scale=None,
-                            _experts_start=28,
-                            moe_config=SimpleNamespace(experts_per_token=2))
+        VllmCompressedTensorsW4ANMxfp4MoEMethod
+    )
+    method._tpu_activation_str = "situ"
+    layer = SimpleNamespace(
+        w13_weight=None,
+        w2_weight=None,
+        w13_weight_scale=None,
+        w2_weight_scale=None,
+        _experts_start=28,
+        moe_config=SimpleNamespace(experts_per_token=2),
+    )
     x = torch.ones(4, 128, dtype=torch.bfloat16)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
     weights = torch.full((4, 2), 0.5)
     calls = []
     monkeypatch.setattr(
-        module.moe_routing, 'route', lambda *args:
-        (calls.append('router') or (weights, ids)))
+        module.moe_routing,
+        "route",
+        lambda *args: (calls.append("router") or (weights, ids)),
+    )
 
     def mask(ids, weights, is_local_tensor):
         assert not is_local_tensor
@@ -571,18 +630,17 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
         weights[-1] = 0
         return ids, weights
 
-    monkeypatch.setattr(module.token_padding,
-                        'zero_routing_weights_for_padding', mask)
-    monkeypatch.setattr(module, 'enable_pipelined_collective_and_compute',
-                        lambda: False)
-    monkeypatch.setattr(module, 'fused_moe_gmm', lambda **kwargs: kwargs)
+    monkeypatch.setattr(module.token_padding, "zero_routing_weights_for_padding", mask)
+    monkeypatch.setattr(
+        module, "enable_pipelined_collective_and_compute", lambda: False
+    )
+    monkeypatch.setattr(module, "fused_moe_gmm", lambda **kwargs: kwargs)
     regular = method.apply_monolithic(layer, x, torch.zeros(4, 896))
     selected = method.apply_with_routing(layer, x, weights, ids)
-    assert calls == ['router']
-    assert selected['topk_ids'].dtype == torch.int32
-    assert selected['topk_weights'].dtype == torch.bfloat16
-    assert selected['experts_start'] == 28
-    torch.testing.assert_close(selected['topk_weights'],
-                               regular['topk_weights'])
-    torch.testing.assert_close(selected['topk_ids'], regular['topk_ids'])
-    assert selected['topk_weights'][-1].count_nonzero() == 0
+    assert calls == ["router"]
+    assert selected["topk_ids"].dtype == torch.int32
+    assert selected["topk_weights"].dtype == torch.bfloat16
+    assert selected["experts_start"] == 28
+    torch.testing.assert_close(selected["topk_weights"], regular["topk_weights"])
+    torch.testing.assert_close(selected["topk_ids"], regular["topk_ids"])
+    assert selected["topk_weights"][-1].count_nonzero() == 0

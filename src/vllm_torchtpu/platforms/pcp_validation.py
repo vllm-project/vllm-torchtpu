@@ -14,23 +14,12 @@ class PcpStaticConfig:
     speculative_enabled: bool
     speculative_method: str | None
     num_speculative_tokens: int
-    is_kv_producer: bool | None
-    kv_role: str | None
     is_moe: bool
     expert_parallel: bool
 
     @property
     def enabled(self) -> bool:
         return self.pcp_size > 1
-
-    @property
-    def pcp_mtp_k1_enabled(self) -> bool:
-        return (
-            self.enabled
-            and self.speculative_method == "mtp"
-            and self.num_speculative_tokens == 1
-            and self.kv_role == "kv_producer"
-        )
 
 
 class PcpStaticSupportValidator:
@@ -46,22 +35,13 @@ class PcpStaticSupportValidator:
                 speculative_enabled=False,
                 speculative_method=None,
                 num_speculative_tokens=0,
-                is_kv_producer=None,
-                kv_role=None,
                 is_moe=False,
                 expert_parallel=False,
             )
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        kv_transfer_config = vllm_config.kv_transfer_config
         speculative_config = vllm_config.speculative_config
-
-        is_kv_producer = None
-        kv_role = None
-        if kv_transfer_config is not None:
-            is_kv_producer = kv_transfer_config.is_kv_producer
-            kv_role = kv_transfer_config.kv_role
 
         speculative_method = None
         num_speculative_tokens = 0
@@ -78,8 +58,6 @@ class PcpStaticSupportValidator:
             speculative_enabled=speculative_config is not None,
             speculative_method=speculative_method,
             num_speculative_tokens=num_speculative_tokens,
-            is_kv_producer=is_kv_producer,
-            kv_role=kv_role,
             is_moe=parallel_config.is_moe_model is True,
             expert_parallel=bool(parallel_config.enable_expert_parallel),
         )
@@ -104,11 +82,6 @@ class PcpStaticSupportValidator:
         if not config.enabled:
             return config
 
-        if config.is_kv_producer is False:
-            raise NotImplementedError(
-                "PCP runner path does not support KV consumer/decode workers "
-                "yet. Disable PCP on decode workers."
-            )
         if config.dcp_size > 1:
             raise NotImplementedError("PCP runner path does not support DCP yet.")
         if config.pipeline_parallel_size != 1:
@@ -131,11 +104,6 @@ class PcpStaticSupportValidator:
             if config.num_speculative_tokens != 1:
                 raise NotImplementedError(
                     "PCP MTP currently requires num_speculative_tokens=1."
-                )
-            if config.kv_role != "kv_producer":
-                raise NotImplementedError(
-                    "PCP MTP currently requires kv_role=kv_producer, got "
-                    f"{config.kv_role!r}."
                 )
         if config.interleave_size <= 0:
             raise ValueError(

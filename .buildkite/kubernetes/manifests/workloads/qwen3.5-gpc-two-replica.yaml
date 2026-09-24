@@ -1,0 +1,186 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Global prefix caching across two serving replicas, as a Kueue workload.
+#
+# Two single-host slices, not one two-host slice. The test's own invariant is
+# one replica per whole host - a replica at a nonzero chip offset enumerates
+# devices in physical rather than rank order and generates corrupt output - and
+# the replicas share prefixes over the network, not over the interconnect. So
+# each is its own replicatedJob on 2x2x1, the same shaping the 1P1D benchmark
+# uses, rather than the one-slice shaping of ray-multihost-slice.yaml.
+#
+# Each role addresses the other by pod name and itself by the downward API,
+# which is the whole of the difference from the bare-metal job: there an
+# orchestrator discovers both VMs from GCP metadata and ssh's to the second to
+# start GPC_ROLE=worker. The test script is the one the VMs run, unchanged.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
+# dollar is $$. Every container is named `workload`: the launcher forwards step
+# environment into that name and reads its logs.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    # The fleet's pod setup - caches, tolerations, retries. See
+    # manifests/README.md.
+    tpu-ci.google.com/defaults: standard
+spec:
+  # Each pod gets a DNS name of its own - <jobset>-<role>-0-0 under a headless
+  # service named for the JobSet - which is how the roles find each other.
+  network:
+    enableDNSHostnames: true
+  # Replica B serves until told to stop, so the head finishing is what finishes
+  # the run; JobSet then tears the worker down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - head
+  replicatedJobs:
+    # Started alongside the head, not before it: the worker's own poll for the
+    # registry is what orders the two. Neither role may carry a readiness probe
+    # to order them instead - a pod with one is absent from the headless
+    # service's DNS until it serves, and two peers that each need the other's
+    # address in order to serve would wait on each other forever.
+    - name: worker
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Indexed because enableDNSHostnames requires it.
+          completionMode: Indexed
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -euo pipefail
+                    exec bash .buildkite/kubernetes/single_host_engine.sh \
+                      bash ./scripts/vllm/integration/run_qwen35_gpc_correctness.sh
+                env:
+                - name: GPC_ROLE
+                  value: worker
+                # Where the registry answers. Only ever dialled - a /dev/tcp
+                # probe and a gRPC address - so the head's pod name serves,
+                # and does not have to be resolved to an address first.
+                - name: GPC_HEAD_IP
+                  value: ${WORKLOAD_NAME}-head-0-0.${WORKLOAD_NAME}
+                # Not dialled but published: this becomes the store_server_ip
+                # the other replica reads this one's cached prefixes from, so
+                # it has to be an address, and the downward API is where a pod
+                # learns its own.
+                - name: GPC_MY_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: REGISTRY_PORT
+                  value: "28500"
+                # Both caches on the fleet's compilation bucket, mounted at
+                # /cache/jax. The default for VLLM_CACHE_ROOT is under the home
+                # directory, on the node's boot disk, which it does not fit on.
+                # Per replica, not shared. The two replicas are identical -
+                # same model, same PCP8 geometry - so they derive the same
+                # compile-cache key and would write one path on a claim backed
+                # by a network filesystem at the same moment; the one that lost
+                # the race got ESTALE out of vllm/compilation/backends.py. The
+                # 1P1D manifest isolates this subtree too, for staleness rather
+                # than for collision. A path per replica keeps the cache warm
+                # across builds, which shadowing it with an emptyDir would not.
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla/gpc-b
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm/gpc-b
+                resources:
+                  # Only the chips: this pod holds every chip on the node,
+                  # memory comes from the shape's profile, and a cpu request
+                  # here can stop the pool scaling up at all.
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"
+
+    - name: head
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          completionMode: Indexed
+          # The run is one attempt: a retry would re-enter a pair whose other
+          # half has been serving throughout, and a test that asserts on which
+          # prefixes were cached cannot read a polluted store.
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -euo pipefail
+                    # Beside the test rather than in a container of its own.
+                    # On bare metal the registry is separate only to get a
+                    # wildcard bind past Docker's bridge; a pod has one
+                    # routable address and no such problem, and the
+                    # single-host GPC test already starts it this way.
+                    global_registry_server --port="$${REGISTRY_PORT}" &
+                    exec bash .buildkite/kubernetes/single_host_engine.sh \
+                      bash ./scripts/vllm/integration/run_qwen35_gpc_correctness.sh
+                env:
+                - name: GPC_ROLE
+                  value: head
+                # Named here because STREAM_LOG has to resolve to the same
+                # path the script writes; the script only defaults it internally.
+                - name: RUN_ROOT
+                  value: /tmp/qwen35_gpc_ci
+                # Replica A. The worker streams replica B itself, at line 229 of
+                # the test; this is the half that had no reader.
+                - name: STREAM_LOG
+                  value: $$(RUN_ROOT)/logs/server_a.log
+                # Replica B's HTTP base, dialled by the smoke.
+                - name: GPC_PEER_IP
+                  value: ${WORKLOAD_NAME}-worker-0-0.${WORKLOAD_NAME}
+                # The head is the registry's host, so this names its own pod -
+                # and is also what it publishes its store under.
+                - name: GPC_HEAD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: GPC_MY_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: REGISTRY_PORT
+                  value: "28500"
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla/gpc-a
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm/gpc-a
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                  requests:
+                    google.com/tpu: "4"

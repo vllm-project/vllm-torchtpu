@@ -112,22 +112,20 @@ run_mp_multihost() {
     ${extra_args}
   )
 
-  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --host 0.0.0.0 --port "${PORT}")
-
-  WORKER_SERVE_ARGS_ARR=()
-  for arg in "${COMMON_SERVE_ARGS_ARR[@]}"; do
-    case "$arg" in
-      --api-server-count=*) continue ;;
-    esac
-    WORKER_SERVE_ARGS_ARR+=("$arg")
-  done
+  # One API frontend on the head; see run_benchmarks.sh. The workers are
+  # --headless and start none, so they must not be given the flag at all.
+  HEAD_EXTRA_ARGS=()
+  if [ "${DATA_PARALLELISM}" -gt 1 ]; then
+    HEAD_EXTRA_ARGS+=(--api-server-count=1)
+  fi
+  HEAD_SERVE_CMD=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" "${HEAD_EXTRA_ARGS[@]}" --host 0.0.0.0 --port "${PORT}")
 
   # Start worker containers over ssh
   worker_idx=0
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     worker_idx=$((worker_idx + 1))
     start_rank=$((worker_idx * DATA_PARALLELISM_LOCAL))
-    worker_serve_cmd=$(printf '%q ' vllm serve "${WORKER_SERVE_ARGS_ARR[@]}" --headless --data-parallel-start-rank="${start_rank}")
+    worker_serve_cmd=$(printf '%q ' vllm serve "${COMMON_SERVE_ARGS_ARR[@]}" --headless --data-parallel-start-rank="${start_rank}")
     echo "--- Starting mp worker ${worker_idx} on ${worker_ip} (data-parallel-start-rank=${start_rank})"
     ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home" || return 1
     base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64 || return 1
