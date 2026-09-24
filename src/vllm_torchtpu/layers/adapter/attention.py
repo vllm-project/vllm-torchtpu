@@ -55,7 +55,13 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
+    build_pcp_kernels as _build_pcp_kernels,
+)
+from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
+)
+from vllm_torchtpu.layers.adapter.cp_attention import (
+    forward_with_pcp as _forward_with_pcp,
 )
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
@@ -1057,6 +1063,38 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_layout=self.kv_layout,
         )
 
+    def _run_pcp_forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        from vllm_torchtpu.distributed.pcp import (
+            get_pcp_rank,
+            get_pcp_world_size,
+        )
+
+        pcp_world_size = get_pcp_world_size()
+        pcp_rank = get_pcp_rank()
+        return _forward_with_pcp(
+            layer=layer,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            logits_soft_cap=self.logits_soft_cap,
+            kv_cache_quantized_dtype=self.kv_cache_quantized_dtype,
+            pcp_world_size=pcp_world_size,
+            pcp_rank=pcp_rank,
+            kv_layout=self.kv_layout,
+        )
+
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
         if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
@@ -1418,6 +1456,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
+        if attn_metadata.pcp is not None or (
+            pcp_configured
+            and not use_pcp_streaming
+            and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+        ):
+            if sink is not None or ctx.kv_cache_bundle is not None:
+                raise NotImplementedError(
+                    "PCP attention does not support attention sinks or "
+                    "the bundled KV cache path."
+                )
+            outputs = self._run_pcp_forward(
+                layer, query, key, value, kv_cache, attn_metadata
+            )
+            if outputs.shape[-1] > self.head_size:
+                outputs = outputs[..., : self.head_size]
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
+
         if pcp_configured and not use_pcp_streaming:
             raise RuntimeError(
                 "PCP is configured, but attention metadata does not use "

@@ -103,9 +103,37 @@ class ServingConfigs:
     max_schedule_size_multiplier: int = 16
     decode_query_size: int = 1
     cp_group_size: int | None = None
+    pcp_ring_axis_name: str | None = None
+    pcp_ring_mesh_axis_names: tuple[str, ...] | None = None
+    paged_new_kv: bool = False
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+
+    @property
+    def is_sharding_kv_cache(self) -> bool:
+        """Whether this kernel attends partial kv cache.
+
+        Only true under DCP cache phase.
+        """
+        return (
+            self.cp_group_size is not None
+            and self.attention_scope == AttentionScope.CACHE_ONLY
+            and self.pcp_ring_axis_name is None
+        )
+
+    @property
+    def write_last_q_block(self) -> bool:
+        """Whether the new-KV write is owned by a sequence's last Q block.
+
+        By default the first Q block that attends a new-KV block writes it.
+        In CP new_token_only phase, the write is owned by the last Q block,
+        whose KV loop `q_loop` extends to cover the full new KV.
+        """
+        return (
+            self.cp_group_size is not None
+            and self.attention_scope == AttentionScope.NEW_TOKENS_ONLY
+        )
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -443,6 +471,31 @@ class RpaConfigs:
     def max_schedule_size_multiplier(self) -> int:
         # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
         return self.serve.max_schedule_size_multiplier
+
+    @property
+    def ring_enabled(self) -> bool:
+        """Whether this kernel rotates KV around the PCP ring."""
+        return (
+            self.serve.pcp_ring_axis_name is not None
+            and self.serve.attention_scope == AttentionScope.CACHE_ONLY
+            and self.mode != RpaCase.DECODE
+        )
+
+    def local_kv_cache_len(self, global_kv_cache_len, rank):
+        """This call's cache length in its own KV index space. CP only.
+
+        The cache is page-striped across the CP group, so a cache-phase call walks
+        only one rank's stripe.
+        """
+        assert self.serve.cp_group_size is not None
+        if self.serve.attention_scope == AttentionScope.NEW_TOKENS_ONLY:
+            return global_kv_cache_len
+        return utils.cp_local_cache_len(
+            global_kv_cache_len,
+            self.serve.cp_group_size,
+            rank,
+            self.serve.page_size,
+        )
 
     def validate_inputs(
         self,

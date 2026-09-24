@@ -724,10 +724,12 @@ class BaseMetadataComputer:
         s_idx,
         q_start,
         q_end,
-        q_offset,
-        kv_cache_len,
+        q_position,
+        global_kv_cache_len,
         kv_new_len,
         num_k,
+        num_q,
+        update_kv_cache,
     ) -> LoopCarry:
         cfgs = self.cfgs
         q_src = q_start + q_idx * cfgs.bq_sz
@@ -735,15 +737,17 @@ class BaseMetadataComputer:
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
+            sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
         end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+            q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
         ) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
-            start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
+            start_k_idx = jnp.maximum(
+                start_k_idx, global_kv_cache_len // cfgs.bkv_sz
+            )
         k_loop_fn = functools.partial(
             self.k_loop,
             s_idx=s_idx,
@@ -751,7 +755,7 @@ class BaseMetadataComputer:
             q_end=q_end,
             q_src=q_src,
             q_sz_task=q_sz_task,
-            kv_cache_len=kv_cache_len,
+            kv_cache_len=global_kv_cache_len,
             kv_new_len=kv_new_len,
             end_k_idx=end_k_idx,
         )
@@ -764,17 +768,19 @@ class BaseMetadataComputer:
         carry: LoopCarry,
         *,
         cu_q_lens_ref,
-        q_offsets_ref,
-        kv_cache_lens_ref,
+        q_positions_ref,
+        global_kv_cache_lens_ref,
         kv_new_lens_ref,
+        update_kv_cache_ref,
     ) -> LoopCarry:
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
         q_len = q_end - q_start
-        q_offset = q_offsets_ref[s_idx]
-        kv_cache_len = kv_cache_lens_ref[s_idx]
+        q_position = q_positions_ref[s_idx]
+        global_kv_cache_len = global_kv_cache_lens_ref[s_idx]
         kv_new_len = kv_new_lens_ref[s_idx]
-        k_len = kv_cache_len + kv_new_len
+        k_len = global_kv_cache_len + kv_new_len
+        update_kv_cache = update_kv_cache_ref[s_idx]
         num_q = pl.cdiv(q_len, self.cfgs.bq_sz)
         num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
         q_loop_fn = functools.partial(
@@ -782,10 +788,12 @@ class BaseMetadataComputer:
             s_idx=s_idx,
             q_start=q_start,
             q_end=q_end,
-            q_offset=q_offset,
-            kv_cache_len=kv_cache_len,
+            q_position=q_position,
+            global_kv_cache_len=global_kv_cache_len,
             kv_new_len=kv_new_len,
             num_k=num_k,
+            num_q=num_q,
+            update_kv_cache=update_kv_cache,
         )
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
@@ -793,18 +801,20 @@ class BaseMetadataComputer:
     def compute(
         self,
         cu_q_lens_ref: jax.Ref,
-        q_offsets_ref: jax.Ref,
-        kv_cache_lens_ref: jax.Ref,
+        q_positions_ref: jax.Ref,
+        global_kv_cache_lens_ref: jax.Ref,
         kv_new_lens_ref: jax.Ref,
+        update_kv_cache_ref: jax.Ref,
         distribution_ref: jax.Ref,
     ) -> LoopCarry:
         """Generates the metadata schedule across all sequences."""
         seq_loop_fn = functools.partial(
             self.seq_loop,
             cu_q_lens_ref=cu_q_lens_ref,
-            q_offsets_ref=q_offsets_ref,
-            kv_cache_lens_ref=kv_cache_lens_ref,
+            q_positions_ref=q_positions_ref,
+            global_kv_cache_lens_ref=global_kv_cache_lens_ref,
             kv_new_lens_ref=kv_new_lens_ref,
+            update_kv_cache_ref=update_kv_cache_ref,
         )
         start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
             distribution_ref
@@ -816,9 +826,10 @@ class BaseMetadataComputer:
 def rpa_metadata_schedule_kernel(
     ## Scalar prefetch.
     cu_q_lens_ref: jax.Ref,
-    q_offsets_ref: jax.Ref,
-    kv_cache_lens_ref: jax.Ref,
+    q_positions_ref: jax.Ref,
+    global_kv_cache_lens_ref: jax.Ref,
     kv_new_lens_ref: jax.Ref,
+    update_kv_cache_ref: jax.Ref,
     distribution_ref: jax.Ref,
     extra_scalars_ref: Sequence[jax.Ref],
     # Outputs.
@@ -848,10 +859,15 @@ def rpa_metadata_schedule_kernel(
         cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        q_offsets_ref: [max_num_seqs]. Starting Q index for each sequence.
-        kv_cache_lens_ref: [max_num_seqs]. Existing kv cache length of each
-            sequence.
+        q_positions_ref: [max_num_seqs]. Position of each sequence's first query
+            token in the sequence's KV index space (cache tokens followed by new
+            tokens); the causal mask is relative to it.
+        global_kv_cache_lens_ref: [max_num_seqs]. Cache length of each sequence
+            before CP sharding; `RpaConfigs.local_kv_cache_len` narrows it to this
+            call's share.
         kv_new_lens_ref: [max_num_seqs]. New kv length of each sequence.
+        update_kv_cache_ref: [max_num_seqs]. 1 if this sequence writes its new KV
+            back to the paged cache.
         distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
             mixed
         extra_scalars_ref: Additional scalar refs for custom metadata computers.
@@ -872,9 +888,10 @@ def rpa_metadata_schedule_kernel(
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
-        q_offsets_ref=q_offsets_ref,
-        kv_cache_lens_ref=kv_cache_lens_ref,
+        q_positions_ref=q_positions_ref,
+        global_kv_cache_lens_ref=global_kv_cache_lens_ref,
         kv_new_lens_ref=kv_new_lens_ref,
+        update_kv_cache_ref=update_kv_cache_ref,
         distribution_ref=distribution_ref,
     )
     count = loop_carry.count
@@ -894,9 +911,10 @@ def rpa_metadata_schedule_kernel(
 
 def generate_rpa_metadata(
     cu_q_lens: jax.Array,
-    q_offsets: jax.Array,
-    kv_cache_lens: jax.Array,
+    q_positions: jax.Array,
+    global_kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
+    update_kv_cache: jax.Array,
     distribution: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
@@ -917,7 +935,7 @@ def generate_rpa_metadata(
         ),
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
+            num_scalar_prefetch=7,
             in_specs=[],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
@@ -929,9 +947,10 @@ def generate_rpa_metadata(
         name="rpa_metadata_schedule",
     )(
         cu_q_lens,
-        q_offsets,
-        kv_cache_lens,
+        q_positions,
+        global_kv_cache_lens,
         kv_new_lens,
+        update_kv_cache,
         distribution,
         extra_scalars,
     )

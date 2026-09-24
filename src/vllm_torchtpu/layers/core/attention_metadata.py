@@ -25,6 +25,36 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=[
+        "query_start_loc",
+        "kv_cache_lens",
+        "q_pos_offsets",
+        "new_kv_page_indices",
+        "update_kv_cache",
+    ],
+    meta_fields=["cache_pages"],
+)
+@dataclass
+class PCPMetadata:
+    """Prefill Context Parallelism metadata, passed via AttentionMetadata.pcp."""
+
+    # (pcp_size, max_num_reqs+1) int32 — per-rank cumulative query lengths.
+    query_start_loc: jax.Array
+    # (max_num_reqs,) int32 — num_computed tokens per virtual seq (cache boundary).
+    kv_cache_lens: jax.Array
+    # (pcp_size, max_num_reqs) int32 — per-rank, per-seq Q position offsets.
+    q_pos_offsets: jax.Array
+    # STATIC (meta field): UPPER bound on the KV pages this request's cached tokens occupy.
+    # 0 means nothing is cached, in which case the cache phase is elided entirely.
+    cache_pages: int
+    # (max_num_reqs * pages_per_seq,) int32 — page table for the all-gathered current KV.
+    new_kv_page_indices: jax.Array | None = None
+    # (pcp_size, max_num_reqs) bool / int32 — which virtual sequence writes its share of the current KV back, per rank.
+    update_kv_cache: jax.Array | None = None
+
+
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=[
         "input_positions",
         "block_tables",
         "seq_lens",
@@ -34,6 +64,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "pcp",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -88,6 +119,7 @@ class AttentionMetadata:
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
+    pcp: PCPMetadata | None = None
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -150,6 +182,7 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    pcp: PCPMetadata | None = None
 
 
 def _staged_walk_products(
@@ -433,6 +466,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            pcp=ctx.pcp,
         )
 
 
