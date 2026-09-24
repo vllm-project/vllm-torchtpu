@@ -38,7 +38,10 @@ if [ "$trace_count" -eq 0 ]; then
   exit 1
 fi
 
-dest=$(jq -r '.profile_gcs_dir // ""' "$results_dir/config.json")
+# python3 rather than jq: the kube lane runs this inside the workload pod,
+# whose image has no jq, and every other reader of config.json here is python.
+dest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("profile_gcs_dir") or "")' \
+  "$results_dir/config.json")
 if [ -z "$dest" ]; then
   echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
   exit 1

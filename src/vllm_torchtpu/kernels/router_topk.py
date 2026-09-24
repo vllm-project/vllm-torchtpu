@@ -63,9 +63,9 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
-def select(scores: jax.Array,
-           topk: int,
-           interpret: bool = False) -> tuple[jax.Array, jax.Array]:
+def select(
+    scores: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
     """Top-k over ``[rows, experts]`` f32 scores, values descending.
 
     Returns ``(weights f32, indices int32)`` of shape ``[rows, topk]``, values
@@ -81,7 +81,7 @@ def select(scores: jax.Array,
     block = min(MAX_BLOCK_ROWS, rows)
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
-        grid=(pl.cdiv(rows, block), ),
+        grid=(pl.cdiv(rows, block),),
         in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
         out_specs=[
             pl.BlockSpec((block, topk), lambda i: (i, 0)),

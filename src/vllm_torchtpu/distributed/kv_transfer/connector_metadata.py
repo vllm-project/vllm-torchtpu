@@ -43,6 +43,8 @@ class LoadMeta:
     # report would trip the scheduler's assert or prematurely resume the
     # request.
     report_completion: bool = True
+    # The scheduler rejected this load after allocation.
+    fail_only: bool = False
 
 
 @dataclass

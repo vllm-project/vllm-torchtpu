@@ -38,6 +38,7 @@ The contract feeds three primary consumers:
 - Connector startup gate: Verifies layout compatibility and rejects unsupported
   model topologies early.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -70,6 +71,7 @@ class BlockMajorContract:
         bundle_row_bytes: Total contiguous byte length of one bundled kernel block across all fragments (= F * fragment_row_bytes).
         logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must match across all serving peers.
     """
+
     fragment_count: int
     fragment_row_bytes: int
     bundle_row_bytes: int
@@ -78,10 +80,9 @@ class BlockMajorContract:
 
 def _canonical_layout_fingerprint(value: Mapping[str, Any]) -> str:
     """Computes a deterministic SHA-256 fingerprint from a canonical JSON layout payload."""
-    encoded = json.dumps(dict(value),
-                         sort_keys=True,
-                         separators=(",", ":"),
-                         ensure_ascii=True).encode("ascii")
+    encoded = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -93,25 +94,25 @@ def block_major_layer_indices(
     tensors = kv_cache_config.kv_cache_tensors
     sizes = {tensor.size for tensor in tensors}
     if len(sizes) != 1:
-        raise ValueError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: backing sizes are not uniform")
+        raise ValueError("VLLM_TPU_BLOCK_MAJOR_KV=1: backing sizes are not uniform")
     size = sizes.pop()
     row_bytes, remainder = divmod(size, kv_cache_config.num_blocks)
     if remainder or row_bytes % fragment_row_bytes:
         raise ValueError(
             "VLLM_TPU_BLOCK_MAJOR_KV=1: backing allocation does not "
-            "tile whole scheduler blocks and fragment pages")
+            "tile whole scheduler blocks and fragment pages"
+        )
     result = {}
     for tensor in tensors:
         if tensor.block_stride != row_bytes:
-            raise ValueError(
-                "VLLM_TPU_BLOCK_MAJOR_KV=1: placement is not block-major")
+            raise ValueError("VLLM_TPU_BLOCK_MAJOR_KV=1: placement is not block-major")
         for index, name in enumerate(tensor.layers):
             offset = tensor.offset + index * tensor.layer_stride
             if offset % fragment_row_bytes or not 0 <= offset < row_bytes:
                 raise ValueError(
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: fragment page offset "
-                    f"does not match kernel-row bytes: {name}={offset}")
+                    f"does not match kernel-row bytes: {name}={offset}"
+                )
             result[name] = offset // fragment_row_bytes
     if set(result.values()) != set(range(row_bytes // fragment_row_bytes)):
         raise ValueError(
@@ -143,11 +144,14 @@ def resolve_block_major_contract(
         return None
 
     # Deferred import to avoid circular dependency with raiden_store.
-    from vllm_torchtpu.offload.raiden_store import (is_multi_shapes_geometry,
-                                                    resolve_kernel_geometry)
+    from vllm_torchtpu.offload.raiden_store import (
+        is_multi_shapes_geometry,
+        resolve_kernel_geometry,
+    )
 
-    (kernel_block_size, per_block_shape, kv_dtype,
-     device_block_size) = resolve_kernel_geometry(vllm_config, kv_cache_config)
+    (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
+        resolve_kernel_geometry(vllm_config, kv_cache_config)
+    )
     if is_multi_shapes_geometry(per_block_shape):
         raise ValueError(
             "VLLM_TPU_BLOCK_MAJOR_KV=1 not yet supported for multi-shapes KV cache."
@@ -162,42 +166,40 @@ def resolve_block_major_contract(
             "VLLM_TPU_BLOCK_MAJOR_KV=1: device_block_size "
             f"{device_block_size} != kernel_block_size {kernel_block_size} "
             f"(factor {factor}); the block-major bundle requires them to "
-            "match")
+            "match"
+        )
 
     # Compute the physical byte size of a single fragment row for one kernel block.
     import numpy as np
     import torch
-    fragment_row_bytes = (int(np.prod(per_block_shape)) *
-                          torch.empty(0, dtype=kv_dtype).element_size())
+
+    fragment_row_bytes = (
+        int(np.prod(per_block_shape)) * torch.empty(0, dtype=kv_dtype).element_size()
+    )
 
     indices = block_major_layer_indices(kv_cache_config, fragment_row_bytes)
     fragment_count = len(set(indices.values()))
     fragment_layers = [[] for _ in range(fragment_count)]
     for name, index in indices.items():
         fragment_layers[index].append(name)
-    fragment_order = tuple(f"{index}:{names[0]}(+{len(names) - 1})"
-                           for index, names in enumerate(fragment_layers))
+    fragment_order = tuple(
+        f"{index}:{names[0]}(+{len(names) - 1})"
+        for index, names in enumerate(fragment_layers)
+    )
 
-    logical_fingerprint = _canonical_layout_fingerprint({
-        "layout":
-        "block-major",
-        "layout_version":
-        BLOCK_MAJOR_LAYOUT_VERSION,
-        "fragment_count":
-        fragment_count,
-        "fragment_order":
-        list(fragment_order),
-        "fragment_row_bytes":
-        fragment_row_bytes,
-        "kernel_block_size":
-        kernel_block_size,
-        "device_block_size":
-        device_block_size,
-        "dtype":
-        str(kv_dtype),
-        "per_block_shape":
-        list(per_block_shape),
-    })
+    logical_fingerprint = _canonical_layout_fingerprint(
+        {
+            "layout": "block-major",
+            "layout_version": BLOCK_MAJOR_LAYOUT_VERSION,
+            "fragment_count": fragment_count,
+            "fragment_order": list(fragment_order),
+            "fragment_row_bytes": fragment_row_bytes,
+            "kernel_block_size": kernel_block_size,
+            "device_block_size": device_block_size,
+            "dtype": str(kv_dtype),
+            "per_block_shape": list(per_block_shape),
+        }
+    )
 
     contract = BlockMajorContract(
         fragment_count=fragment_count,
@@ -208,7 +210,12 @@ def resolve_block_major_contract(
     logger.info(
         "Block-major contract: F=%d fragments x %d B kernel rows "
         "(bundle row %d B, kernel_block_size=%d, factor=%d), "
-        "logical_fingerprint=%s", contract.fragment_count,
-        contract.fragment_row_bytes, contract.bundle_row_bytes,
-        kernel_block_size, factor, contract.logical_fingerprint)
+        "logical_fingerprint=%s",
+        contract.fragment_count,
+        contract.fragment_row_bytes,
+        contract.bundle_row_bytes,
+        kernel_block_size,
+        factor,
+        contract.logical_fingerprint,
+    )
     return contract

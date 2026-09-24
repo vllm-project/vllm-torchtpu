@@ -2,14 +2,16 @@ import os
 import re
 from typing import Any
 
-_STANDARD_KEYS = frozenset({
-    "host_tracer_level",
-    "device_tracer_level",
-    "python_tracer_level",
-})
+_STANDARD_KEYS = frozenset(
+    {
+        "host_tracer_level",
+        "device_tracer_level",
+        "python_tracer_level",
+    }
+)
 
-_ALLOWED_VALUE_CHARS = re.compile(r'^[a-zA-Z0-9_./,:\-\s]*$')
-_OPTION_PATTERN = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$')
+_ALLOWED_VALUE_CHARS = re.compile(r"^[a-zA-Z0-9_./,:\-\s]*$")
+_OPTION_PATTERN = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$")
 
 
 def _parse_option_value(key: str, val: str) -> Any:
@@ -22,13 +24,15 @@ def _parse_option_value(key: str, val: str) -> Any:
         return int(val)
     except ValueError:
         if not _ALLOWED_VALUE_CHARS.match(val):
-            raise ValueError(f"Invalid characters in option value '{val}' "
-                             f"for key '{key}'")
+            raise ValueError(
+                f"Invalid characters in option value '{val}' for key '{key}'"
+            )
         return val
 
 
 def parse_profile_options(
-        profile_prefix: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile_prefix: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not profile_prefix or not profile_prefix.strip():
         return {}, {}
 
@@ -38,7 +42,7 @@ def parse_profile_options(
     standard_opts = {}
     advanced_opts = {}
 
-    parts = profile_prefix.split(';')
+    parts = profile_prefix.split(";")
 
     for part in parts:
         part = part.strip()
@@ -46,8 +50,10 @@ def parse_profile_options(
             continue
         match = _OPTION_PATTERN.match(part)
         if not match:
-            raise ValueError(f"Invalid profile option format in '{part}'. "
-                             "Expected 'key:value' format.")
+            raise ValueError(
+                f"Invalid profile option format in '{part}'. "
+                "Expected 'key:value' format."
+            )
         key = match.group(1)
         val = match.group(2)
 
@@ -75,7 +81,9 @@ _DEFAULT_ADVANCED_OPTS = {
 
 
 def resolve_profile_dir_and_opts(
-        base_dir: str, profile_prefix: str | None
+    base_dir: str,
+    profile_prefix: str | None = None,
+    profiler_kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """
     Resolves the target profiling directory and parses dynamic tracing options.
@@ -85,23 +93,46 @@ def resolve_profile_dir_and_opts(
         profile_prefix: A string. If it contains a semicolon or colon, it's
             parsed as structured configuration (e.g., "host_tracer_level:1;").
             Otherwise, it acts solely as a subdirectory name appending to base_dir.
+        profiler_kwargs: Optional dictionary of profiler options passed via
+            start_profile (e.g., {"host_tracer_level": 3,
+            "e2e_enable_fw_throttle": True}).
 
     Returns:
         A tuple of (profile_dir, standard_opts, advanced_opts) where the opts
         dictionaries are pre-populated with baseline defaults and merged with
-        any overrides specified in the profile_prefix.
+        any overrides specified in profile_prefix and profiler_kwargs.
     """
     standard_opts = _DEFAULT_STANDARD_OPTS.copy()
     advanced_opts = _DEFAULT_ADVANCED_OPTS.copy()
     profile_dir = base_dir
 
-    if profile_prefix:
-        if ":" in profile_prefix or ";" in profile_prefix:
-            parsed_standard, parsed_advanced = parse_profile_options(
-                profile_prefix)
+    effective_prefix = profile_prefix
+    if (
+        not effective_prefix
+        and profiler_kwargs
+        and isinstance(profiler_kwargs.get("profile_prefix"), str)
+    ):
+        effective_prefix = profiler_kwargs["profile_prefix"]
+
+    if effective_prefix:
+        if ":" in effective_prefix or ";" in effective_prefix:
+            parsed_standard, parsed_advanced = parse_profile_options(effective_prefix)
             standard_opts.update(parsed_standard)
             advanced_opts.update(parsed_advanced)
         else:
-            profile_dir = os.path.join(base_dir, profile_prefix)
+            profile_dir = os.path.join(base_dir, effective_prefix)
+
+    if profiler_kwargs:
+        for key, val in profiler_kwargs.items():
+            if key == "profile_prefix":
+                continue
+            if isinstance(val, (bool, int)):
+                parsed_val: Any = val
+            else:
+                parsed_val = _parse_option_value(str(key), str(val))
+            if key in _STANDARD_KEYS:
+                standard_opts[key] = parsed_val
+            else:
+                advanced_opts[key] = parsed_val
 
     return profile_dir, standard_opts, advanced_opts

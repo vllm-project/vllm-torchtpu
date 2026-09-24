@@ -22,21 +22,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 import vllm.model_executor.layers.linear as linear_mod
-from vllm.model_executor.custom_op import (maybe_get_oot_by_class,
-                                           op_registry_oot)
+from vllm.model_executor.custom_op import maybe_get_oot_by_class, op_registry_oot
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 import vllm_torchtpu.layers.adapter.linear as tpu_linear_mod
 from vllm_torchtpu.layers.adapter.linear import TpuRowParallelLinear
 
 
-def _make_layer(tp_rank,
-                tp_size,
-                bias,
-                weight_block,
-                skip_bias_add,
-                reduce_results=True,
-                return_bias=False):
+def _make_layer(
+    tp_rank,
+    tp_size,
+    bias,
+    weight_block,
+    skip_bias_add,
+    reduce_results=True,
+    return_bias=False,
+):
     """A RowParallelLinear stand-in: ``__new__`` without ``__init__``, which
     would need an initialised distributed group."""
 
@@ -69,13 +70,15 @@ def _run_tp_group(monkeypatch, forward, w_blocks, x_blocks, **layer_kwargs):
 
     def run_all_ranks(all_reduce):
         # Upstream reads all_reduce from vLLM's module globals, ours from ours.
-        monkeypatch.setattr(linear_mod, "tensor_model_parallel_all_reduce",
-                            all_reduce)
-        monkeypatch.setattr(tpu_linear_mod, "tensor_model_parallel_all_reduce",
-                            all_reduce)
+        monkeypatch.setattr(linear_mod, "tensor_model_parallel_all_reduce", all_reduce)
+        monkeypatch.setattr(
+            tpu_linear_mod, "tensor_model_parallel_all_reduce", all_reduce
+        )
         return [
-            forward(_make_layer(r, tp_size, weight_block=w, **layer_kwargs),
-                    x_blocks[r]) for r, w in enumerate(w_blocks)
+            forward(
+                _make_layer(r, tp_size, weight_block=w, **layer_kwargs), x_blocks[r]
+            )
+            for r, w in enumerate(w_blocks)
         ]
 
     pre_reduce = []
@@ -108,8 +111,9 @@ def test_registered_under_the_upstream_class_name():
     # The lookup LoRA uses.
     assert maybe_get_oot_by_class(RowParallelLinear) is TpuRowParallelLinear
     # The lookup every RowParallelLinear() call site goes through.
-    assert isinstance(RowParallelLinear.__new__(RowParallelLinear),
-                      TpuRowParallelLinear)
+    assert isinstance(
+        RowParallelLinear.__new__(RowParallelLinear), TpuRowParallelLinear
+    )
     # Guard against a vacuous equivalence check below.
     assert TpuRowParallelLinear.forward is not RowParallelLinear.forward
 
@@ -118,8 +122,9 @@ def test_registered_under_the_upstream_class_name():
 @pytest.mark.parametrize("skip_bias_add", [False, True])
 @pytest.mark.parametrize("return_bias", [False, True])
 @pytest.mark.parametrize("reduce_results", [True, False])
-def test_matches_upstream_tp2(monkeypatch, bias_present, skip_bias_add,
-                              return_bias, reduce_results):
+def test_matches_upstream_tp2(
+    monkeypatch, bias_present, skip_bias_add, return_bias, reduce_results
+):
     """Our forward == upstream's, rank by rank, on a simulated TP=2 group."""
     rng = torch.Generator().manual_seed(0)
     out_f, in_f, tokens = 6, 8, 3
@@ -132,15 +137,19 @@ def test_matches_upstream_tp2(monkeypatch, bias_present, skip_bias_add,
     half = in_f // 2
     w_blocks = [W[:, :half], W[:, half:]]
     x_blocks = [x[:, :half], x[:, half:]]
-    kwargs = dict(bias=b,
-                  skip_bias_add=skip_bias_add,
-                  return_bias=return_bias,
-                  reduce_results=reduce_results)
+    kwargs = dict(
+        bias=b,
+        skip_bias_add=skip_bias_add,
+        return_bias=return_bias,
+        reduce_results=reduce_results,
+    )
 
-    ours = _run_tp_group(monkeypatch, TpuRowParallelLinear.forward, w_blocks,
-                         x_blocks, **kwargs)
-    upstream = _run_tp_group(monkeypatch, RowParallelLinear.forward, w_blocks,
-                             x_blocks, **kwargs)
+    ours = _run_tp_group(
+        monkeypatch, TpuRowParallelLinear.forward, w_blocks, x_blocks, **kwargs
+    )
+    upstream = _run_tp_group(
+        monkeypatch, RowParallelLinear.forward, w_blocks, x_blocks, **kwargs
+    )
     for rank, (mine, theirs) in enumerate(zip(ours, upstream)):
         _assert_same(mine, theirs, f"rank {rank}")
 
@@ -152,9 +161,7 @@ def test_matches_upstream_tp2(monkeypatch, bias_present, skip_bias_add,
     if b is not None and not skip_bias_add:
         expected = expected + b
     for rank, mine in enumerate(ours):
-        torch.testing.assert_close(_as_pair(mine)[0],
-                                   expected,
-                                   msg=f"rank {rank}")
+        torch.testing.assert_close(_as_pair(mine)[0], expected, msg=f"rank {rank}")
 
 
 def test_delegates_to_upstream_at_tp1(monkeypatch):
@@ -166,10 +173,8 @@ def test_delegates_to_upstream_at_tp1(monkeypatch):
     b = torch.randn(out_f, generator=rng)
 
     kwargs = dict(bias=b, skip_bias_add=False)
-    ours = _run_tp_group(monkeypatch, TpuRowParallelLinear.forward, [W], [x],
-                         **kwargs)
-    upstream = _run_tp_group(monkeypatch, RowParallelLinear.forward, [W], [x],
-                             **kwargs)
+    ours = _run_tp_group(monkeypatch, TpuRowParallelLinear.forward, [W], [x], **kwargs)
+    upstream = _run_tp_group(monkeypatch, RowParallelLinear.forward, [W], [x], **kwargs)
 
     _assert_same(ours[0], upstream[0], "tp1")
     torch.testing.assert_close(_as_pair(ours[0])[0], x @ W.T + b)

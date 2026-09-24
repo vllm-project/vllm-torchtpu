@@ -40,7 +40,14 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_v2
+from vllm_torchtpu.kernels.fused_moe.v2 import (
+    AXIS,
+    WeightFormat,
+    fused_ep_moe_v2,
+    host,
+    kernel,
+    layer,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -159,6 +166,35 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
         )
     )(jnp.zeros((EP,), jnp.float32))
     return built if quantized else (built[0], built[1], None, None)
+
+
+def _make_fp4_weights(mesh, seed, *, hidden, inter, e_total, rhs_qb):
+    """((w1, w2), (w1_scale, w2_scale), decoded) as fp4 e2m1 with block scales.
+
+    One scale per `rhs_qb` rows of each matmul's contraction axis, which is
+    the layout the kernel takes: w1_scale [E, hidden / qb, 2 * inter] and
+    w2_scale [E, inter / qb, hidden]. `decoded` is what those two decode to,
+    and is what the dense reference is computed over, so the band between
+    them is the kernel's transport rather than the four-bit rounding.
+    """
+    shard = NamedSharding(mesh, P(AXIS))
+    rng = np.random.default_rng(seed)
+    weights, scales, decoded = [], [], []
+    for shape in ((e_total, hidden, 2 * inter), (e_total, inter, hidden)):
+        raw = rng.normal(0, 0.1, shape).astype(np.float32)
+        grouped = raw.reshape(shape[0], shape[1] // rhs_qb, rhs_qb, shape[2])
+        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
+        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
+        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
+        s = jax.device_put(scale, shard)
+        weights.append(w)
+        scales.append(s)
+        decoded.append(
+            (w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]).reshape(
+                shape
+            )
+        )
+    return weights, scales, decoded
 
 
 def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
@@ -505,22 +541,9 @@ def test_any_mesh_axis_name_works():
 def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     """FP4 block scales and FP8 transport, including a single-block W2."""
     mesh = _mesh()
-    shard = NamedSharding(mesh, P(AXIS))
-    rng = np.random.default_rng(42)
-    weights, scales, decoded = [], [], []
-    for shape in ((32, 1024, 1024), (32, 512, 1024)):
-        raw = rng.normal(0, 0.1, shape).astype(np.float32)
-        grouped = raw.reshape(shape[0], shape[1] // 512, 512, shape[2])
-        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
-        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
-        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
-        s = jax.device_put(scale, shard)
-        dequant = (
-            w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]
-        ).reshape(shape)
-        weights.append(w)
-        scales.append(s)
-        decoded.append(dequant)
+    weights, scales, decoded = _make_fp4_weights(
+        mesh, 42, hidden=1024, inter=512, e_total=32, rhs_qb=512
+    )
     x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
     common = dict(
         topk=4,
@@ -552,3 +575,130 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
         topk=4,
     )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
+# --------------------------------------------------------------------------- #
+# The weight-DMA schedule.
+#
+# How far ahead of the computing expert a weight refill goes out is not an
+# argument to the layer: the build asks `host.fit_weight_slots` for the
+# deepest runway this shape's VMEM affords, and every shape small enough to
+# test here affords the ceiling. So the schedules below are reached by
+# capping the fitter, which is the one line of the build that reads it.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def at_prefetch_depth(monkeypatch):
+    """Build at a named weight-prefetch depth, and report what was built.
+
+    Yields `depth -> observed`, where `observed` fills with the schedule each
+    build resolved to. Reporting it is not decoration: a cap that stopped
+    biting would leave every case running one schedule and agreeing trivially.
+
+    BOTH caches have to go, and the second one is the trap. `_BUILD_CACHE`
+    holds the kernel; `_LAYER_SM_CACHE` holds a shard_map over a `local_fn`
+    that CLOSES OVER the kernel built on the call that filled it, and its key
+    is the layer's arguments -- which the schedule is not one of, because the
+    build derives it from the device. Clearing only the first rebuilds the
+    kernel, logs it and fills `observed`, and then runs the cached shard_map's
+    older kernel: every depth passes, and a depth-zero-only fault is invisible.
+    """
+    observed = []
+    # Captured once, before the first cap: taken inside `at` it would be the
+    # PREVIOUS cap on the second use, and the two depths would compose.
+    real = host.fit_weight_slots
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+
+    def at(depth):
+        def capped(*args, **kwargs):
+            slots = real(*args, **{**kwargs, "max_distance": depth})
+            observed.append(slots)
+            return slots
+
+        monkeypatch.setattr(host, "fit_weight_slots", capped)
+        observed.clear()
+        clear()
+        return observed
+
+    yield at
+    clear()
+
+
+# An fp4 shape built for the streamed schedule: hidden and inter each span
+# several `rhs_qb` contraction blocks, so a slab's wait lands in a block that
+# is not also the one that retires it; and the batch puts 2048 * 4 / 32 = 256
+# rows on an expert against a tile of CAPACITY, so a visit runs more than one
+# tile and the wait has to be the first tile's alone.
+STREAM = dict(hidden=1024, inter=512, e_total=32, topk=4, tokens=2048)
+STREAM_QB = 256
+STREAM_DEPTHS = (2, 1, 0)
+
+
+def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
+    """The three fp4 weight schedules compute the same thing, bit for bit.
+
+    The depth changes only WHERE a weight DMA is started and waited. Depth two
+    starts an expert's slabs two visits ahead into a slot of its own; depth
+    zero has a single slot, streams the slabs into the blocks that read them,
+    and starts the next expert's where this expert's reads of the slot retire.
+    Same weights, same order, so the outputs have to agree exactly -- a refill
+    landing on a slot still being read is not a small numeric drift, it is
+    another expert's weights in the matmul.
+
+    The band against the dense reference is what stops that agreement from
+    being vacuous: three identically broken schedules would still match.
+    """
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        45,
+        tokens=STREAM["tokens"],
+        hidden=STREAM["hidden"],
+        e_total=STREAM["e_total"],
+    )
+    common = dict(
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+
+    outs = {}
+    for depth in STREAM_DEPTHS:
+        observed = at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert observed, "the build never asked for a weight schedule"
+        assert [(s.distance, s.nbuf) for s in observed] == [
+            (depth, host.nbuf_for(depth))
+        ] * len(observed)
+
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=STREAM["topk"])
+    for depth, out in outs.items():
+        error = _relative_l2(out, ref)
+        worst = _worst_token_relative_l2(out, ref)
+        assert error < FP8_RELATIVE_BOUND, f"depth {depth}: relative L2 {error}"
+        assert worst < FP8_TOKEN_BOUND, f"depth {depth}: worst token {worst}"
+    deepest = outs[max(STREAM_DEPTHS)]
+    for depth in STREAM_DEPTHS:
+        np.testing.assert_array_equal(
+            outs[depth],
+            deepest,
+            err_msg=f"depth {depth} disagrees with the deepest schedule",
+        )

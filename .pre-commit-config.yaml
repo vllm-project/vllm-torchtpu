@@ -31,82 +31,15 @@ repos:
 
 
 
-      # kernels: attention and the rest
-      |src/vllm_torchtpu/kernels/causal_conv1d/
-      |src/vllm_torchtpu/kernels/collectives/
-      |src/vllm_torchtpu/kernels/flash_attention/
-      |src/vllm_torchtpu/kernels/megablox/
-      |src/vllm_torchtpu/kernels/mla/
-      |src/vllm_torchtpu/kernels/quantized_matmul/
-      |src/vllm_torchtpu/kernels/ragged_paged_attention/
-      |src/vllm_torchtpu/kernels/sparse_core/
-      |src/vllm_torchtpu/kernels/__init__\.py$
-      |src/vllm_torchtpu/kernels/partial_kv_update\.py$
-      |src/vllm_torchtpu/kernels/pool_adapters\.py$
-      |src/vllm_torchtpu/kernels/router_topk\.py$
-      |src/vllm_torchtpu/kernels/typed_ldst\.py$
 
 
-      # layers/adapter (src)
-      |src/vllm_torchtpu/layers/adapter/
-
-      # tests/layers
-      |tests/layers/
-
-      # layers/core
-      |src/vllm_torchtpu/layers/core/
-      |src/vllm_torchtpu/layers/__init__\.py$
 
 
-      # runner
-      |src/vllm_torchtpu/runner/
-      |tests/runner/
-
-      # models, spec_decode, offload
-      |src/vllm_torchtpu/models/
-      |src/vllm_torchtpu/offload/
-      |src/vllm_torchtpu/spec_decode/
-      |tests/models/
-      |tests/offload/
-      |tests/spec_decode/
 
 
-      # core, tracing, omni, tools, loose modules
-      |src/vllm_torchtpu/core/
-      |src/vllm_torchtpu/omni/
-      |src/vllm_torchtpu/tools/
-      |src/vllm_torchtpu/tracing/
-      |tests/model_loader/
-      |tests/omni/
-      |tests/scripts/
-      |tests/tools/
-      |tests/tracing/
-      |src/sitecustomize\.py$
-      |src/vllm_torchtpu/__init__\.py$
-      |src/vllm_torchtpu/env_override\.py$
-      |src/vllm_torchtpu/envs\.py$
-      |src/vllm_torchtpu/gdn_pool_layout\.py$
-      |src/vllm_torchtpu/kv_cache_materializer\.py$
-      |src/vllm_torchtpu/kv_cache_spec_normalizer\.py$
-      |src/vllm_torchtpu/logger\.py$
-      |src/vllm_torchtpu/model_loader_patches\.py$
-      |src/vllm_torchtpu/patch_registry\.py$
-      |src/vllm_torchtpu/profiler_trace\.py$
-      |src/vllm_torchtpu/tokenizers\.py$
-      |src/vllm_torchtpu/tpu_info\.py$
-      |src/vllm_torchtpu/utils\.py$
-      |tests/conftest\.py$
-      |tests/test_envs\.py$
-      |tests/test_envs_builders\.py$
-      |tests/test_package_import\.py$
-      |tests/test_pp_chunk_scheduler\.py$
-      |tests/test_pp_chunks\.py$
-      |tests/test_profiler_trace\.py$
-      |tests/test_token_padding\.py$
-      |tests/test_tokenizers\.py$
-      |tests/test_tpu_release\.py$
-      |tests/test_tpu_scheduler\.py$
-      |tests/tpu_release\.py$
+
+
+
       )
     # protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting
     # it would make every regeneration produce a spurious diff.

@@ -6,6 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
+from typing import Any
 from urllib.parse import urlparse
 
 import torch
@@ -552,14 +553,21 @@ class TPUWorker(WorkerBase):
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
+    ):
         if envs.USE_PHASED_PROFILER:
             # A phased run captures one trace per inference phase rather than
             # a single continuous one, driven from TPUModelRunner since phase
             # detection needs per-step batch composition. profile() still owns
             # arming/disarming it, so both profilers share one trigger.
             if is_start:
-                self.model_runner.start_phased_profiling(profile_prefix)
+                self.model_runner.start_phased_profiling(
+                    profile_prefix, profiler_kwargs=profiler_kwargs
+                )
             else:
                 self.model_runner.stop_phased_profiling()
             return
@@ -575,7 +583,7 @@ class TPUWorker(WorkerBase):
             from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 
             profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
-                self.profile_dir, profile_prefix
+                self.profile_dir, profile_prefix, profiler_kwargs=profiler_kwargs
             )
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own

@@ -72,7 +72,9 @@ def wait_for_tpu_release(timeout: float = _DEFAULT_TIMEOUT_S) -> None:
         if not owners:
             return
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"TPU still held after {timeout:.0f}s by "
-                               f"{owners}; the holding process never released "
-                               "its chip")
+            raise RuntimeError(
+                f"TPU still held after {timeout:.0f}s by "
+                f"{owners}; the holding process never released "
+                "its chip"
+            )
         time.sleep(_POLL_INTERVAL_S)

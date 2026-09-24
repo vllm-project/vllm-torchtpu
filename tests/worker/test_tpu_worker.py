@@ -125,7 +125,9 @@ class TestProfileDispatchesToPhasedProfiler:
 
         worker.profile(is_start=True)
 
-        worker.model_runner.start_phased_profiling.assert_called_once_with(None)
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            None, profiler_kwargs=None
+        )
         worker.model_runner.stop_phased_profiling.assert_not_called()
         assert worker.profile_context is None
 
@@ -138,7 +140,23 @@ class TestProfileDispatchesToPhasedProfiler:
 
         worker.profile(is_start=True, profile_prefix="decode")
 
-        worker.model_runner.start_phased_profiling.assert_called_once_with("decode")
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            "decode", profiler_kwargs=None
+        )
+
+    def test_start_forwards_profiler_kwargs(self, monkeypatch):
+        """profiler_kwargs must be forwarded to start_phased_profiling."""
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+        cfg = _make_vllm_config(profiler_torch_dir="/config/profiler/dir")
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+        kwargs = {"host_tracer_level": 2}
+
+        worker.profile(is_start=True, profile_prefix="decode", profiler_kwargs=kwargs)
+
+        worker.model_runner.start_phased_profiling.assert_called_once_with(
+            "decode", profiler_kwargs=kwargs
+        )
 
     def test_stop_disarms_the_model_runners_phased_profiler(self, monkeypatch):
         monkeypatch.setenv("USE_PHASED_PROFILER", "true")
@@ -371,7 +389,6 @@ def _check_engine_patches():
         core.resolve_kv_cache_block_sizes is kv_cache_utils.resolve_kv_cache_block_sizes
     )
     assert Scheduler._mamba_block_aligned_split._tpu_scheduler_block_size_patch
-    assert Scheduler._tpu_hybrid_producer_prefix_hit_patch
     assert EngineCoreProc.run_engine_core is plugin._run_engine_core_with_tpu_patches
     assert EngineCoreProc._tpu_original_run_engine_core is _original_engine_run
     wrapper = Scheduler.__init__

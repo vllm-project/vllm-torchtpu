@@ -14,7 +14,9 @@ from collections.abc import Sequence
 
 from .tags import TAG_GDN_CONV, TAG_GDN_SSM
 
-# Physical granule of the admitted raw TPU FP8 pool layout: byte ranges
+# Default physical granule of the admitted NHD raw TPU FP8 pool layout:
+# the HND state carrier can supply its measured word-row width instead.
+# Byte ranges
 # whose offsets and sizes are whole multiples of this are placement-exact
 # under the tiled physical layout, so raw span lowering fails closed on
 # anything finer.
@@ -160,6 +162,7 @@ def lower_gdn_state_shard_spans(
     transfer_rank: int,
     parallelism: int,
     regions: Sequence[object],
+    physical_granule_bytes: int = _TPU_PHYSICAL_TOKEN_BYTES,
 ) -> PoolSpanRegistration:
     """Lower one rank's GDN head shard into a full destination state.
 
@@ -179,9 +182,15 @@ def lower_gdn_state_shard_spans(
     ``regions`` comes from the admitted source pool manifest.  The legacy
     ``gdn_conv_q``/``gdn_conv_k`` vocabulary is rejected: its half-token
     Q/K extents are not placement-exact under the raw tiled layout.
+
+    ``physical_granule_bytes`` describes the common source/destination
+    carrier layout. It must be derived from that layout, not from conv or
+    SSM dtype: a BF16 typed row can share a physical word with another row.
     """
     if not tag:
         raise ValueError("state pool tag must not be empty")
+    if physical_granule_bytes <= 0:
+        raise ValueError("physical granule must be positive")
     if block_id < 0:
         raise ValueError("state block id must be non-negative")
     if parallelism <= 0:
@@ -229,12 +238,12 @@ def lower_gdn_state_shard_spans(
                 f"head_bytes={packed_head_bytes}"
             )
         local_live = heads * packed_head_bytes
-        if local_live % _TPU_PHYSICAL_TOKEN_BYTES:
+        if local_live % physical_granule_bytes:
             raise ValueError(
                 "raw TPU GDN SSM shard must contain whole physical tokens: "
                 f"bytes={local_live}"
             )
-        if (transfer_rank * local_live) % _TPU_PHYSICAL_TOKEN_BYTES:
+        if (transfer_rank * local_live) % physical_granule_bytes:
             raise ValueError("raw TPU GDN SSM destination must be token aligned")
         return PoolSpanRegistration(
             tag=tag,
@@ -302,7 +311,7 @@ def lower_gdn_state_shard_spans(
         ("row", local_row_bytes),
         ("dst_row", dst_row_bytes),
     ]:
-        if value % _TPU_PHYSICAL_TOKEN_BYTES:
+        if value % physical_granule_bytes:
             raise ValueError(
                 "raw TPU GDN conv extents must be whole physical tokens "
                 "(sub-token Q/K segments need the QK pair-blocked layout): "

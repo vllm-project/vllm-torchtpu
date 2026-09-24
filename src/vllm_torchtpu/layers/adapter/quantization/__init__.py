@@ -28,21 +28,20 @@ Flow:
 import copy
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.quantization.base_config import \
-    QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import \
-    VllmCompressedTensorsConfig
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+    VllmCompressedTensorsConfig,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
-from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import \
-    VllmDeepseekV4Fp8Config
+from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
+    VllmDeepseekV4Fp8Config,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
-from vllm_torchtpu.layers.adapter.quantization.online_fp8 import \
-    attach_online_fp8
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedConfig
+from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
+from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.layers.core import quant_methods
 from vllm_torchtpu.logger import init_logger
 
@@ -50,7 +49,8 @@ logger = init_logger(__name__)
 
 
 def get_tpu_quantization_config(
-    vllm_config: VllmConfig, ) -> QuantizationConfig:
+    vllm_config: VllmConfig,
+) -> QuantizationConfig:
     """
     Get TPU-specific quantization configuration.
 
@@ -83,7 +83,8 @@ def get_tpu_quantization_config(
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
             f"{model_config.quantization} quantization method not supported on TPU. "
-            f"Supported methods are: {list(method_to_config.keys())}")
+            f"Supported methods are: {list(method_to_config.keys())}"
+        )
 
     quant_config_cls = method_to_config[model_config.quantization]
     assert issubclass(quant_config_cls, VllmQuantConfig)
@@ -93,7 +94,7 @@ def get_tpu_quantization_config(
 
     # Register the TPU quant method name so vLLM uses our custom config
     model_config.quantization = quant_methods.get_tpu_quant_method(
-        quant_config_cls.get_name())
-    config = VllmConfig.get_quantization_config(model_config,
-                                                vllm_config.load_config)
+        quant_config_cls.get_name()
+    )
+    config = VllmConfig.get_quantization_config(model_config, vllm_config.load_config)
     return attach_online_fp8(config, vllm_config)

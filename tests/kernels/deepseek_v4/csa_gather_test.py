@@ -26,19 +26,19 @@ def gather_nope_ref_impl(cache, indices):
     return cache[indices // page_size, indices % page_size, :, :]
 
 
-def gather_rope_ref_impl(cache, indices, rope_period=1024):
+def gather_rope_ref_impl(cache, indices, top_k=1024):
     gathered = cache.reshape(-1, 128)[indices]
     hi = gathered[:, 0:64].astype(jnp.uint16)
     lo = gathered[:, 64:128].astype(jnp.uint16)
     rope = ((hi << 8) | lo).view(jnp.bfloat16)
-    rope = rope.reshape(-1, 2, rope_period // 2, 64)
+    rope = rope.reshape(-1, 2, top_k // 2, 64)
     return jnp.concatenate([rope[:, 0], rope[:, 1]], axis=-1).reshape(-1, 128)
 
 
-@functools.partial(jax.jit, static_argnames=("rope_period",))
-def gather_ref_impl(nope_cache, rope_cache, indices, rope_period=1024):
+@functools.partial(jax.jit, static_argnames=("top_k",))
+def gather_ref_impl(nope_cache, rope_cache, indices, top_k=1024):
     nope_out = gather_nope_ref_impl(nope_cache, indices)
-    rope_out = gather_rope_ref_impl(rope_cache, indices, rope_period=rope_period)
+    rope_out = gather_rope_ref_impl(rope_cache, indices, top_k=top_k)
     return nope_out, rope_out
 
 
@@ -76,7 +76,7 @@ class GatherTest(parameterized.TestCase):
         (128 * 1024, 1024),
         (128 * 1024, 2048),
     )
-    def test_correctness(self, n, rope_period):
+    def test_correctness(self, n, top_k):
         nope_cache, perm_key = create_nope_cache()
         rope_cache, _ = create_rope_cache()
 
@@ -84,11 +84,9 @@ class GatherTest(parameterized.TestCase):
         indices = jax.random.randint(perm_key, (n,), 0, max_index, dtype=jnp.int32)
 
         nope_ref, rope_ref = gather_ref_impl(
-            nope_cache, rope_cache, indices, rope_period=rope_period
+            nope_cache, rope_cache, indices, top_k=top_k
         )
-        nope_sc, rope_sc = csa_gather(
-            nope_cache, rope_cache, indices, rope_period=rope_period
-        )
+        nope_sc, rope_sc = csa_gather(nope_cache, rope_cache, indices, top_k=top_k)
 
         np.testing.assert_array_equal(nope_ref.view(jnp.uint8), nope_sc.view(jnp.uint8))
         np.testing.assert_array_equal(

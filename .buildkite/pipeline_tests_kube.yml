@@ -20,6 +20,13 @@
 # bktec runs in the pod, and run.sh forwards that configuration across - see
 # common.sh for what happens to the credentials.
 
+env:
+  # The image is built into the fleet's own registry, which its nodes can pull
+  # from; the project default (inferact-vllm-tpu, see ci_image.sh) is outside
+  # it. The mirror is emptied because it is this same repository.
+  CI_IMAGE_REPO: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+  CI_IMAGE_MIRROR_REPOS: ""
+
 # Carries the launcher and the service account that may submit a workload.
 # Repeated per step rather than merged in, because a step's `plugins:` is a list
 # and a YAML merge key replaces it wholesale.
@@ -43,14 +50,20 @@ x-tpu-step-defaults: &tpu_step
 
 x-cpu-unit-test-defaults: &cpu_unit_test_defaults
   depends_on: "build_docker"
-  # Docker on a bare-metal agent, not the launcher: these exercise nothing
-  # about the fleet.
-  commands:
-    - bash .buildkite/scripts/run_in_docker.sh bktec run
+  # The fleet's cpu queue: a pod with no chip on an autoscaled CPU node, through
+  # the same launcher as the TPU steps, so this lane needs no bare-metal agent
+  # to run its tests.
+  timeout_in_minutes: 120
   agents:
-    queue: "cpu_64_core"
+    queue: "kube"
+  # Plain bktec, as on bare metal: these steps set fail-on-no-tests, so an
+  # empty collection is a failure here rather than a shard emptied by a marker.
+  commands:
+    - .buildkite/kubernetes/run.sh bktec run
   env:
-    CPU_ONLY: "1"
+    SHAPE: "cpu"
+    # What run_in_docker.sh's CPU_ONLY sets; without it JAX looks for a TPU.
+    JAX_PLATFORMS: "cpu"
 
 x-tests-plugin-defaults: &tests_plugin_defaults
   suite-slug: tpu-ci
@@ -82,20 +95,22 @@ steps:
           "${VLLM_COMMIT_HASH_OVERRIDE:-$(get_vllm_commit_hash)}"
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "Unit Tests - CPU (PR)"
+  - label: ":kubernetes: Unit Tests - CPU (PR)"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
     plugins:
+      - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
-  - label: "Unit Tests - CPU (Nightly)"
+  - label: ":kubernetes: Unit Tests - CPU (Nightly)"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") == "1"'
     plugins:
+      - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"

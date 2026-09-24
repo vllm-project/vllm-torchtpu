@@ -93,8 +93,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     bl_x2_ref,  # [2, bq_sz, num_l_heads]
     bm_x2_ref,  # [2, bq_sz, num_l_heads]
     sems,  # [6, 2]
-    l_ref,  # [bq_sz * num_q_heads, 128],
-    m_ref,  # [bq_sz * num_q_heads, 128],
+    l_ref,  # [bq_sz * num_q_heads],
+    m_ref,  # [bq_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
     *,
     static_q_len: int,
@@ -207,35 +207,41 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # When int32 -> uint32, negative values become large positive values.
             # So we only need to check the upper bound.
             keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
+
             if non_causal_block:
-                # DSpark draft block mode: the last q_len positions
-                # of the sequence are one parallel-drafting block attending
-                # bidirectionally within itself. The upper bound is NOT free
-                # here: the causal uint32 trick excluded the final page's
-                # tail garbage (k_span >= kv_len), so the block clause must
-                # re-impose it.
+                # DSpark draft block mode: the last q_len positions of the sequence
+                # are one parallel-drafting block attending bidirectionally within
+                # itself. The upper bound is NOT free here: the causal uint32 trick
+                # excluded the final page's tail garbage (k_span >= kv_len), so the
+                # block clause must re-impose it.
                 keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
 
             s = jnp.einsum("nd,md->nm", qc, kv, preferred_element_type=jnp.float32)
             s *= sm_scale
 
             s = jnp.where(keep, s, jnp.finfo(s.dtype).min)
-            s_rowmax = jnp.max(s, axis=1, keepdims=True)
-            m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
-            m_curr = jnp.maximum(m_prev, s_rowmax)
-            cm_ref[...] = m_curr
-            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
-
-            pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
-
-            p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-            exp_m_diff = jnp.exp(m_prev - m_curr)
-            l_prev = load_with_init(cl_ref, 0.0)
-            l_curr = exp_m_diff * l_prev + p_rowsum
-            cl_ref[...] = l_curr
-            o_prev = load_with_init(cacc_ref, 0.0)
-            o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
-            cacc_ref[...] = o_curr
+            s_rowmax = jnp.max(s, axis=1)
+            if single_bkv_block:
+                m_curr = s_rowmax
+                cm_ref[...] = m_curr
+                p = jnp.exp(s - m_curr[:, None])
+                pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+                cl_ref[...] = jnp.sum(p, axis=1)
+                cacc_ref[...] = pv
+            else:
+                m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
+                m_curr = jnp.maximum(m_prev, s_rowmax)
+                cm_ref[...] = m_curr
+                p = jnp.exp(s - m_curr[:, None])
+                pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+                p_rowsum = jnp.sum(p, axis=1)
+                exp_m_diff = jnp.exp(m_prev - m_curr)
+                l_prev = load_with_init(cl_ref, 0.0)
+                l_curr = exp_m_diff * l_prev + p_rowsum
+                cl_ref[...] = l_curr
+                o_prev = load_with_init(cacc_ref, 0.0)
+                o_curr = exp_m_diff[:, None] * o_prev + pv
+                cacc_ref[...] = o_curr
 
     def _async_copy(src, dst, sem, wait):
         cp = pltpu.make_async_copy(src, dst, sem)
@@ -560,17 +566,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bkv = pltpu.bitcast(bkv_u8, jnp.bfloat16).reshape(bkv_sz, head_dim)
         return bkv
 
-    def broadcast_minor(src, shape):
-        if src.shape == shape:
-            return src
-        assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = align_to(shape[-1], src.shape[-1])
-        # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
-
     def process():
         if static_q_len is None:
             num_bq = jnp.maximum(1, cdiv(q_len, bq_sz))
@@ -599,13 +594,13 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 end_bkv_idx = 1
             else:
                 if non_causal_block:
-                    # Draft block mode: every query in the block may attend
-                    # to the whole block, which ends at kv_len, not at this
-                    # bq block's last query.
+                    # Draft block mode: every query in the block may attend to the
+                    # whole block, which ends at kv_len, not at this bq block's last
+                    # query.
                     q_pos_end = kv_len
                 else:
-                    # Causal: no query sees past its own position, so the
-                    # last query of this bq block bounds the keys needed.
+                    # Causal: no query sees past its own position, so the last query
+                    # of this bq block bounds the keys needed.
                     q_pos_end = jnp.minimum(
                         kv_len - q_len + (bq_idx + 1) * bq_sz, kv_len
                     )
@@ -717,19 +712,17 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             acc = acc_ref[...]
 
             if unnormalized_output:
-                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
                 out = acc.astype(q_dtype)
             else:
                 attention_sinks = jnp.concat(
                     [attention_sinks_ref[...] for _ in range(bq_sz)]
-                )[..., None]
+                )
                 exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
                 l = l_ref[...] + exp_attention_sinks  # noqa: E741
-                l = broadcast_minor(l, acc.shape)  # noqa: E741
                 out = (
-                    lax.div(acc, l)
+                    lax.div(acc, l[:, None])
                     if q_dtype == jnp.float32
-                    else (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
+                    else (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
                 )
 
             # Wait for previous bo to be fully sent before storing new bo.
@@ -739,12 +732,17 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
-            bl_x2_ref.at[bo_sem_idx][:bq_sz, :num_q_heads] = l_ref[..., 0].reshape(
-                bq_sz, num_q_heads
-            )
-            bm_x2_ref.at[bo_sem_idx][:bq_sz, :num_q_heads] = m_ref[..., 0].reshape(
-                bq_sz, num_q_heads
-            )
+            if num_q_heads % 128 == 0:
+                bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
+                bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
+            else:
+                # if num_q_heads can't be divided by 128, the reshape can't compile,
+                # so we need to loop through and copy row by row.
+                for i in range(bq_sz):
+                    start = i * num_q_heads
+                    end = start + num_q_heads
+                    bl_x2_ref.at[bo_sem_idx, i][:num_q_heads] = l_ref[start:end]
+                    bm_x2_ref.at[bo_sem_idx, i][:num_q_heads] = m_ref[start:end]
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -1417,8 +1415,8 @@ def mla_sliding_window_ragged_paged_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     unnormalized_output: bool = False,
     # Draft (DSpark/DFlash) block mode: the last q_len positions of each
-    # sequence attend bidirectionally within themselves (window still
-    # bounds context keys). Requires q_len <= sliding_window.
+    # sequence attend bidirectionally within themselves (window still bounds
+    # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
 ) -> tuple[
@@ -1573,7 +1571,7 @@ def mla_sliding_window_ragged_paged_attention(
         bm_double_buf = bl_double_buf
 
         l_scratch = pltpu.VMEM(
-            (bq_sz * num_q_heads, 128),
+            (bq_sz * num_q_heads,),
             jnp.float32,
         )
         m_scratch = l_scratch

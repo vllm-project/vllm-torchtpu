@@ -10,14 +10,14 @@ from jax.experimental.pallas import tpu as pltpu
 def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
     """Performs a barrier with neighbors on the global barrier semaphore.
 
-  Optionally performs a second barrier, which prevents a potential race
-  when reusing the same collective_id across kernel invocations.
+    Optionally performs a second barrier, which prevents a potential race
+    when reusing the same collective_id across kernel invocations.
 
-  Args:
-    left_neighbor: Left neighbor device id.
-    right_neighbor: Right neighbor device id.
-    double_barrier: Whether to perform a second barrier.
-  """
+    Args:
+      left_neighbor: Left neighbor device id.
+      right_neighbor: Right neighbor device id.
+      double_barrier: Whether to perform a second barrier.
+    """
     barrier_sem = pltpu.get_barrier_semaphore()
     for neighbor in [left_neighbor, right_neighbor]:
         pl.semaphore_signal(
@@ -34,8 +34,7 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
         # even if the other neighbor is not ready yet.
         # To implement a double-barrier, we stack-allocate a second REGULAR
         # semaphore using run_scoped.
-        @functools.partial(pl.run_scoped,
-                           second_barrier=pltpu.SemaphoreType.REGULAR)
+        @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
         def _(second_barrier):
             for neighbor in [left_neighbor, right_neighbor]:
                 pl.semaphore_signal(

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for quantized matmul kernel."""
+
 from collections.abc import Callable
 from typing import Any
 
@@ -19,24 +20,21 @@ def unfold_args(
     if conditions:
         arg = conditions[0]
         if isinstance(arg, bool):
-            unfold_args(conditions[1:], fn_conditions + (arg, ), fn)
+            unfold_args(conditions[1:], fn_conditions + (arg,), fn)
         else:
             assert arg.dtype == jnp.bool and arg.size == 1
             jax.lax.cond(
                 arg,
-                lambda: unfold_args(conditions[1:], fn_conditions +
-                                    (True, ), fn),
-                lambda: unfold_args(conditions[1:], fn_conditions +
-                                    (False, ), fn),
+                lambda: unfold_args(conditions[1:], fn_conditions + (True,), fn),
+                lambda: unfold_args(conditions[1:], fn_conditions + (False,), fn),
             )
     else:
         fn(*fn_conditions)
 
 
-def quantize_tensor(x: jax.Array,
-                    dtype: jnp.dtype,
-                    dim: int = -1,
-                    block_size: int | None = None):
+def quantize_tensor(
+    x: jax.Array, dtype: jnp.dtype, dim: int = -1, block_size: int | None = None
+):
     if block_size is not None:
         # Flatten all leading dims into a single batch dim for block
         # quantization, then restore the original shape.
@@ -99,7 +97,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x_q,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=(((1,), (0,)), ((), ())),
             preferred_element_type=acc_dtype,
         ).astype(jnp.float32)
         out *= x_scale
@@ -107,7 +105,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=(((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
     out *= jnp.expand_dims(w_scale, 0)
@@ -159,8 +157,7 @@ def xla_quantized_batched_matmul(
         contract_set = set(contract_dims[0])
         batch_set = set(batch_dims[0])
         lhs_free = [
-            i for i in range(x.ndim)
-            if i not in contract_set and i not in batch_set
+            i for i in range(x.ndim) if i not in contract_set and i not in batch_set
         ]
         perm = list(batch_dims[0]) + lhs_free + list(contract_dims[0])
         if perm != list(range(x.ndim)):
@@ -219,13 +216,11 @@ def get_vmem_limit(
     """Calculate VMEM limit for the kernel."""
 
     # Calculate in/out VMEM size.
-    x_size = (batch_block_size * in_block_size * dtypes.itemsize_bits(x_dtype))
+    x_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_dtype)
     x_abs_max_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
-    w_q_size = (out_block_size * in_block_size *
-                dtypes.itemsize_bits(w_q_dtype))
+    w_q_size = out_block_size * in_block_size * dtypes.itemsize_bits(w_q_dtype)
     w_scale_size = out_block_size * dtypes.itemsize_bits(scale_dtype)
-    out_size = (batch_block_size * out_block_size *
-                dtypes.itemsize_bits(out_dtype))
+    out_size = batch_block_size * out_block_size * dtypes.itemsize_bits(out_dtype)
 
     vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
     vmem_in_out *= 2  # Account for compute and vreg spills.
@@ -239,10 +234,8 @@ def get_vmem_limit(
     vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
 
     # Calculate scratch VMEM size.
-    acc_size = (batch_block_size * out_block_size *
-                dtypes.itemsize_bits(acc_dtype))
-    x_q_size = (batch_block_size * in_block_size *
-                dtypes.itemsize_bits(x_q_dtype))
+    acc_size = batch_block_size * out_block_size * dtypes.itemsize_bits(acc_dtype)
+    x_q_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_q_dtype)
     x_scale_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
 
     vmem_scratch = acc_size if save_acc else 0
@@ -271,29 +264,26 @@ def validate_inputs(
 
     # Verify input shapes.
     if x.shape[1] != w_q.shape[1]:
-        raise ValueError(f'{x.shape[1]=} must be equal to {w_q.shape[1]=}')
-    if w_q.shape[0] != w_scale.shape[1] and (w_scale.ndim == 3 and w_q.shape[0]
-                                             != w_scale.shape[2]):
-        raise ValueError(
-            f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
+        raise ValueError(f"{x.shape[1]=} must be equal to {w_q.shape[1]=}")
+    if w_q.shape[0] != w_scale.shape[1] and (
+        w_scale.ndim == 3 and w_q.shape[0] != w_scale.shape[2]
+    ):
+        raise ValueError(f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
     if x_abs_max is not None and x_abs_max.shape != (1, x.shape[0]):
-        raise ValueError(
-            f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
+        raise ValueError(f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
     if x.shape[0] % batch_block_size != 0:
-        raise ValueError(
-            f"{x.shape[0]=} must be a multiple of {batch_block_size=}")
+        raise ValueError(f"{x.shape[0]=} must be a multiple of {batch_block_size=}")
     if w_q.shape[0] % out_block_size != 0:
-        raise ValueError(
-            f"{w_q.shape[0]=} must be a multiple of {out_block_size=}")
+        raise ValueError(f"{w_q.shape[0]=} must be a multiple of {out_block_size=}")
     if x.shape[1] % in_block_size != 0:
-        raise ValueError(
-            f"{x.shape[1]=} must be a multiple of {in_block_size=}")
+        raise ValueError(f"{x.shape[1]=} must be a multiple of {in_block_size=}")
 
 
 def get_max_min(target_dtype):
     if jnp.issubdtype(target_dtype, jnp.floating):
-        return jnp.finfo(target_dtype).max.astype(
-            jnp.float32), jnp.finfo(target_dtype).min.astype(jnp.float32)
+        return jnp.finfo(target_dtype).max.astype(jnp.float32), jnp.finfo(
+            target_dtype
+        ).min.astype(jnp.float32)
     else:
         return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
 

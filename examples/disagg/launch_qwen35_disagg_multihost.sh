@@ -147,6 +147,7 @@ TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
+LOAD_FORMAT="${LOAD_FORMAT:-}"
 
 mkdir -p "${RUN_DIR}/logs"
 
@@ -261,6 +262,13 @@ common_args=(
 
 if [[ "${SERVED_MODEL_NAME}" != "${MODEL_PATH}" ]]; then
   common_args+=(--served-model-name "${SERVED_MODEL_NAME}")
+fi
+
+if [[ -z "${LOAD_FORMAT}" && "${MODEL_PATH}" == gs://* ]]; then
+  LOAD_FORMAT="runai_streamer"
+fi
+if [[ -n "${LOAD_FORMAT}" ]]; then
+  common_args+=(--load-format "${LOAD_FORMAT}")
 fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then

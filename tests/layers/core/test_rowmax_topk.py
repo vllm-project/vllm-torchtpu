@@ -49,18 +49,19 @@ def _assert_matches_reference(scores: torch.Tensor, k: int = TOPK):
         their_scores = sorted(scores[row, list(only_theirs)].tolist())
         assert our_scores == their_scores, (
             f"row {row}: swapped experts have different scores "
-            f"{our_scores} vs {their_scores}")
+            f"{our_scores} vs {their_scores}"
+        )
         # And ours must be the lowest-indexed of the tied candidates.
         for e in only_ours:
             tied = [
                 int(i)
-                for i in (scores[row] == scores[row,
-                                                e]).nonzero(as_tuple=True)[0]
+                for i in (scores[row] == scores[row, e]).nonzero(as_tuple=True)[0]
             ]
             picked = [i for i in tied if i in ours]
             assert picked and min(picked) == min(tied), (
                 f"row {row}: tie at score {scores[row, e]} not resolved to "
-                f"the lowest expert id")
+                f"the lowest expert id"
+            )
 
 
 def test_descending_and_shapes():
@@ -106,8 +107,12 @@ def test_expert_set_identical_where_the_top_k_is_unique(seed):
     assert unique.float().mean() > 0.5, "sanity: most rows are unambiguous"
 
     ours = rowmax_topk(scores, TOPK)[1][unique].sort(dim=-1).values
-    ref = torch.topk(scores, TOPK, dim=-1).indices.to(
-        torch.int32)[unique].sort(dim=-1).values
+    ref = (
+        torch.topk(scores, TOPK, dim=-1)
+        .indices.to(torch.int32)[unique]
+        .sort(dim=-1)
+        .values
+    )
     assert torch.equal(ours, ref)
 
 
@@ -143,8 +148,9 @@ def test_adversarial_ties_straddling_the_boundary():
     _assert_matches_reference(scores)
     _, i = rowmax_topk(scores, TOPK)
     assert i[0, :5].tolist() == [100, 101, 102, 103, 104]
-    assert i[0, 5:].tolist() == list(range(200, 205)), \
+    assert i[0, 5:].tolist() == list(range(200, 205)), (
         "tied block must be taken lowest-id first"
+    )
 
 
 def test_duplicate_of_the_maximum_is_not_collapsed():
@@ -224,11 +230,14 @@ def test_partial_nan_row_selects_k_distinct_finite_experts():
 # value. Only NaN was covered before; ``-inf`` and ``-FLT_MAX`` collapsed the
 # same way, and ``-inf`` is reachable through an ``-inf``
 # ``e_score_correction_bias``, the standard idiom for masking an expert out.
-SENTINELS = pytest.mark.parametrize("bad", [
-    pytest.param(float("nan"), id="nan"),
-    pytest.param(float("-inf"), id="neg_inf"),
-    pytest.param(torch.finfo(torch.float32).min, id="neg_flt_max"),
-])
+SENTINELS = pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("-inf"), id="neg_inf"),
+        pytest.param(torch.finfo(torch.float32).min, id="neg_flt_max"),
+    ],
+)
 
 
 @SENTINELS
@@ -246,7 +255,7 @@ def test_partial_row_at_or_below_the_sentinel_keeps_k_distinct(bad):
     """Nine finite scores and the rest unusable still names ten experts."""
     torch.manual_seed(11)
     scores = torch.rand(2, EXPERTS)
-    scores[:, :EXPERTS - 9] = bad
+    scores[:, : EXPERTS - 9] = bad
     v, i = rowmax_topk(scores, TOPK)
     for row in i:
         assert len(set(row.tolist())) == TOPK
@@ -283,7 +292,8 @@ def test_renormalized_weights_match_the_sort_path():
 
     def renorm(w):
         return (w / torch.clamp(w.sum(dim=-1, keepdim=True), min=1e-20)).to(
-            torch.bfloat16)
+            torch.bfloat16
+        )
 
     ref_v, _ = torch.topk(scores, TOPK, dim=-1)
     got_v, _ = rowmax_topk(scores, TOPK)

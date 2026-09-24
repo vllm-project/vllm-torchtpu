@@ -25,6 +25,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
 from vllm_torchtpu.kernels.fused_moe.v2 import host
@@ -33,12 +35,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP8,
     FP8_MAX,
     HIDDEN_LANE_BLOCK,
-    NBUF,
     OUT_PARITIES,
     PACK4,
     QB4,
     ROWBLK,
-    WEIGHT_PREFETCH_DISTANCE,
 )
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
@@ -59,7 +59,8 @@ QCHUNK = 512
 # an expert's short tail tile stops computing a full tile_m of rows nothing
 # will commit. Every rung is another copy of the body in the program text --
 # which is why this is a handful of heights and not one per ROWBLK -- and the
-# top rung is always tile_m, so a full tile is unchanged.
+# top rung is always tile_m, so a full tile is unchanged. Overridable per
+# process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
@@ -144,18 +145,20 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     ROWBLK steps keeps the single full height it had.
 
     Only a TAIL tile is short, so the rungs pay in proportion to the share of
-    tiles that are tails, while their cost -- HEIGHT_RUNGS copies of the FFN
-    body in the program text -- is paid by every tile. A build gets them only
+    tiles that are tails, while their cost -- a copy of the FFN body in the
+    program text per rung -- is paid by every tile. A build gets them only
     where a routed expert is expected to fit inside one tile, which is where
     every tile is the tail: `rows_alloc` bounds the shard slab for the case
     of every routed row landing on one shard, so `ep` shards' worth of it is
     what a shard's `g_local` experts actually expect to hold.
+
     """
-    step = tile_m // HEIGHT_RUNGS
+    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    step = tile_m // rungs
     if (
-        HEIGHT_RUNGS < 2
+        rungs < 2
         or step % ROWBLK
-        or step * HEIGHT_RUNGS != tile_m
+        or step * rungs != tile_m
         or rows_alloc > ep * g_local * tile_m
     ):
         return (tile_m,)
@@ -538,16 +541,16 @@ def _build_fused_ep_moe_kernel(
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
-    assert 0 < WEIGHT_PREFETCH_DISTANCE < NBUF, (
-        f"weight prefetch distance {WEIGHT_PREFETCH_DISTANCE} must satisfy "
-        f"0 < distance < NBUF={NBUF}, so that distance + 1 consecutive "
-        "experts occupy distinct weight slots"
-    )
+    # The weight prefetch distance and the slot count it needs are chosen
+    # below, once the shapes they are sized against have been checked: they
+    # are a property of THIS build and not of the process, so everything
+    # here reads the two locals and nothing reads a module constant.
+    #
     # Everything from here to the ragged-stride check below tests a value
     # that came IN from the caller -- a model shape, a mesh width, a serving
     # config -- so each one refuses rather than asserts. An assert is the
-    # right tool for this function's own arithmetic, like the prefetch
-    # distance above, and the wrong tool for the caller's operands: `python
+    # right tool for this function's own arithmetic, like the slot relation
+    # below, and the wrong tool for the caller's operands: `python
     # -O` and PYTHONOPTIMIZE are ordinary things to find in a container
     # image, and under them an assert lets the illegal configuration build
     # and be cached.
@@ -619,18 +622,53 @@ def _build_fused_ep_moe_kernel(
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
-    est = host.vmem_estimate_bytes(
+    # The prefetch schedule this build can afford: the deepest runway whose
+    # nbuf copies of one expert still leave the rest of the buffers inside
+    # the budget, walked down from the ceiling one slot at a time. Every
+    # operand it is sized against has been checked above, which is why the
+    # choice is made here and not at the head of the function.
+    slots = host.fit_weight_slots(
         g_local,
         capacity,
         hidden,
         inter,
-        nbuf=NBUF,
         weight_format=weight_format,
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
     )
-    limit = host.vmem_limit()
+    prefetch_distance = slots.distance
+    nbuf = slots.nbuf
+    # The relation the whole schedule rests on: a refill writes its slot
+    # while the readers of `distance` earlier experts are still live, so
+    # distance + 1 consecutive experts have to occupy distinct slots. This
+    # function's own arithmetic, hence an assert.
+    assert 0 <= prefetch_distance < nbuf, (
+        f"weight prefetch distance {prefetch_distance} must satisfy "
+        f"0 <= distance < nbuf={nbuf}, so that distance + 1 consecutive "
+        "experts occupy distinct weight slots"
+    )
+    # Distance zero has no runway: one slot, and a visit starts its own
+    # weights and then waits on them. Every prefetch site below is switched
+    # on this rather than deleted, because the two schedules differ only in
+    # WHERE the start happens -- a visit ahead, or at the visit's own head.
+    prefetches = prefetch_distance > 0
+
+    # Whether each expert's weights are waited by the block that first reads
+    # it rather than waiting at the beginning of each expert's visit.
+    # fp4, fp8 expert FFN are running different code paths. This flag can
+    # be activated only for fp4 expert FFN now. But the idea should be
+    # applicable to fp8 expert FFN as well.
+    streams_weights = rhs_packed4
+    # Whether issue async copy the NEXT expert's weights as soon as we finish
+    # reading the current expert's weights, instead of at the beginning of the
+    # next expert's visit.
+    #
+    # The overlap is free in VMEM, because the next start writes the slot its
+    # reader has just finished with: for example gate/up is dead from the
+    # last gate/up block of an expert's last tile, which is overlapped with
+    # a whole down matmul plus an epilogue.
+    starts_next_weights = streams_weights and not prefetches
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
         # four-bit layout is the one place a written-down device fact and a
@@ -639,12 +677,35 @@ def _build_fused_ep_moe_kernel(
         # record.
         host.check_u32_sublane_tile()
     # The only thing standing between an over-budget model and a kernel that
-    # will not fit. It must not be strippable.
-    if est > limit:
+    # will not fit. It must not be strippable. What it refuses is now only
+    # what the descent above could not rescue: the figures it quotes are the
+    # ones at distance zero, where the weight slabs are a single expert and
+    # there is no runway left to give back.
+    if not slots.fits:
         raise ValueError(
-            f"the kernel's VMEM buffers need {est / 2**20:.1f}MiB, over the "
-            f"{limit / 2**20:.1f}MiB budget, for {g_local} local experts of "
-            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}"
+            f"the kernel's VMEM buffers need "
+            f"{slots.vmem_bytes / 2**20:.1f}MiB, over the "
+            f"{slots.limit / 2**20:.1f}MiB budget, for {g_local} local experts "
+            f"of {hidden}x{inter} at capacity={capacity} with the weight "
+            f"prefetch already given up (nbuf={nbuf}, one expert of weight "
+            f"slabs). Nothing further is bought by shortening the runway; "
+            f"the remaining levers are the tile height, the expert shape and "
+            f"the number of local experts"
+        )
+    if prefetch_distance < host.MAX_WEIGHT_PREFETCH_DISTANCE:
+        logger.info(
+            "fused EP MoE: %d local experts of %dx%d at capacity=%d fit at "
+            "prefetch distance %d (%d weight slots, %.1fMiB of a %.1fMiB "
+            "budget), below the ceiling of %d",
+            g_local,
+            hidden,
+            inter,
+            capacity,
+            prefetch_distance,
+            nbuf,
+            slots.vmem_bytes / 2**20,
+            slots.limit / 2**20,
+            host.MAX_WEIGHT_PREFETCH_DISTANCE,
         )
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
@@ -795,7 +856,10 @@ def _build_fused_ep_moe_kernel(
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
-        lhs_sems, w1_sems, w2_sems, cp_sem = (next(it) for _ in range(4))
+        lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
+        w1s_sems = next(it) if has_scales else None
+        w2s_sems = next(it) if has_scales else None
+        cp_sem = next(it)
         # One send sem per out_vm parity: with a shared sem the other parity's
         # bytes could satisfy a wait, and order is not promised. Where the
         # tile ships itself, the parity's own sem is what says the wire has
@@ -833,11 +897,44 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        def w1s_copy(expert, slot):
+            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+
+        def w2s_copy(expert, slot):
+            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+
+        def weight_starts(expert, slot):
+            """Start every buffer slot `slot` holds for `expert`.
+
+            In the order the body consumes them, which is also the order a
+            single DMA queue will retire them -- WEIGHT_DMA_PRIORITY selects
+            a queue, it does not reorder within one. The scale tables go
+            first: they are half a megabyte and the first contraction block
+            needs them, so they are all a streamed visit's head waits for.
+            """
+            if has_scales:
+                w1s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                w2s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+            w1_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+            w2_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def weight_waits(expert, slot):
+            """Wait for what the expert's first block needs.
+
+            A streamed slab is not waited for here: its wait sits in the block
+            that first reads it, where the wire has had longest to deliver, so
+            this head waits for the scale tables alone. Every other format
+            takes the slab in one matmul and keeps the whole-slab head wait.
+            """
+            if not streams_weights:
+                w1_copy(expert, slot).wait()
+                w2_copy(expert, slot).wait()
+            if has_scales:
+                w1s_copy(expert, slot).wait()
+                w2s_copy(expert, slot).wait()
+
         def prologue():
             """Land the resident tables and start the first weight refills."""
-            if has_scales:
-                sync(w1s_hbm, w1s_vm)
-                sync(w2s_hbm, w2s_vm)
             if has_w1_bias:
                 sync(w1b_hbm, w1b_vm)
             if has_w2_bias:
@@ -846,33 +943,87 @@ def _build_fused_ep_moe_kernel(
             # clamped to the visit-list length: at one local expert,
             # visit_sm[1] would be a statically out-of-bounds read before
             # the predicate could save it.
-            for b in range(min(WEIGHT_PREFETCH_DISTANCE, g_local)):
+            for b in range(min(prefetch_distance, g_local)):
 
                 @pl.when(jnp.int32(b) < n_visit)
                 def _(b=b):
-                    w1_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
-                    w2_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
+                    weight_starts(visit_sm[b], b)
 
         prologue()
         _all_pairs_barrier(ep)
 
-        def _fp4_block_readers(slot):
+        def _start_next_gate_up(visit_i, slot, last_tile):
+            """`() -> ()`: start the NEXT expert's gate/up slab, called from
+            the reader of the block that retires this expert's.
+
+            The reader is where the start belongs for the same reason the
+            wait is: it is the only place that knows which block is being
+            read. A later tile of this expert would still be reading the
+            slab, so only the last tile starts the next one.
+            """
+
+            def start():
+                @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
+                def _():
+                    w1_copy(visit_sm[visit_i + 1], slot).start(
+                        priority=WEIGHT_DMA_PRIORITY
+                    )
+
+            return start
+
+        def _slab_waiter(expert, slot, first_tile):
+            """`(copy, block) -> ()`: land the slab that block `block` opens,
+            on the expert's first tile.
+
+            A streamed visit owes each slab exactly one wait, and block 0 --
+            the first block of its matmul group -- is both where the wire has
+            had the longest to deliver it and the only place in the group
+            where no accumulation is in flight. Only the first tile owes
+            anything: a later tile of the same expert reads a slab that is
+            already whole, which is why the wait is predicated rather than
+            issued per tile.
+            """
+
+            def wait(copy, block):
+                if block:
+                    return
+
+                @pl.when(first_tile)
+                def _():
+                    copy(expert, slot).wait()
+
+            return wait
+
+        def _fp4_block_readers(slot, wait_slab=None, slab_retired=None):
             """(w1_block, w2_block) fp4 block readers at weight slot `slot`.
 
             The one genuinely fp4 place in the kernel: everything around it
             is four-bit generic, and these two lines are where the packed
             words are read as fp4 (e2m1) rather than as some other four-bit
             element type.
+
+            `wait_slab` is where a streamed slab is landed and
+            `slab_retired` fires at the last read of the gate/up one: the
+            reader is the one place that knows which block is about to be
+            contracted, so it is the one place either can sit without
+            costing a block of runway.
             """
             # Each widens one k-block: u32 [qb/8, N] -> fp4 [qb, N] -> fp8.
             packed_rows = rhs_qb // PACK4
 
             def w1_block(b):
-                return pltpu.bitcast(
+                if wait_slab is not None:
+                    wait_slab(w1_copy, b)
+                block = pltpu.bitcast(
                     w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
                 ).astype(FP8)
+                if slab_retired is not None and b == hidden // rhs_qb - 1:
+                    slab_retired()
+                return block
 
             def w2_block(b):
+                if wait_slab is not None:
+                    wait_slab(w2_copy, b)
                 return pltpu.bitcast(
                     w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
                 ).astype(FP8)
@@ -1094,23 +1245,39 @@ def _build_fused_ep_moe_kernel(
             # this expert's first index window is in.
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
-            slot = lax.rem(visit_i, jnp.int32(NBUF))
-            w1_copy(e, slot).wait()
-            w2_copy(e, slot).wait()
+            slot = lax.rem(visit_i, jnp.int32(nbuf))
+            if not prefetches and not starts_next_weights:
+                # No runway: nobody started this visit's weights, so it
+                # starts them itself and waits on the two lines below.
+                # Refilling the one slot cannot race the previous visit's
+                # reads of it, because those reads feed accumulators whose
+                # results are stored into out_vm inside the tile loop -- so
+                # they have all retired by the loop's back edge, which is
+                # before this.
+                weight_starts(e, slot)
+            if starts_next_weights:
+                # Every later visit had its weights started by the one before,
+                # which is the whole point; the first has nobody to start them
+                # for it.
+
+                @pl.when(visit_i == 0)
+                def _():
+                    weight_starts(e, slot)
+
+            weight_waits(e, slot)
 
             # Refill the slot for the expert DISTANCE ahead: the previous
-            # expert last read it, and DISTANCE < NBUF keeps it off both live
+            # expert last read it, and DISTANCE < nbuf keeps it off both live
             # readers, so no wait is needed.
-            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
-            def _():
-                refill_slot = lax.rem(
-                    visit_i + WEIGHT_PREFETCH_DISTANCE, jnp.int32(NBUF)
-                )
-                ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
-                # Weight refills take their own DMA priority to stay off the
-                # in-order token-gather queue.
-                w1_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
-                w2_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
+            if prefetches:
+
+                @pl.when(visit_i + prefetch_distance < n_visit)
+                def _():
+                    refill_slot = lax.rem(visit_i + prefetch_distance, jnp.int32(nbuf))
+                    ahead = visit_sm[visit_i + prefetch_distance]
+                    # Weight refills take their own DMA priority to stay off
+                    # the in-order token-gather queue.
+                    weight_starts(ahead, refill_slot)
 
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
@@ -1358,9 +1525,22 @@ def _build_fused_ep_moe_kernel(
                         # The block scales apply inside
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
-                        w1s_blocks = w1s_vm[e]  # [nb1, 2*inter] f32
-                        w2s_blocks = w2s_vm[e]  # [nb2, hidden] f32
-                        w1_block, w2_block = _fp4_block_readers(slot)
+                        w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
+                        w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        w1_block, w2_block = _fp4_block_readers(
+                            slot,
+                            wait_slab=(
+                                _slab_waiter(e, slot, first_tile)
+                                if streams_weights
+                                else None
+                            ),
+                            slab_retired=(
+                                _start_next_gate_up(visit_i, slot, last_tile)
+                                if starts_next_weights
+                                else None
+                            ),
+                        )
                         acc2, mid_scale = expert_ffn_blockscale(
                             act_rows,
                             act_scales,
@@ -1378,7 +1558,7 @@ def _build_fused_ep_moe_kernel(
                             act_rows,
                             w1_chunk,
                             w2_chunk,
-                            w1s_vm[pl.ds(e, 1), :],
+                            w1s_vm[pl.ds(slot, 1), :],
                             n_chunks1=hidden // host.WIDEN_KCHUNK,
                             n_chunks2=inter // host.WIDEN_KCHUNK,
                             act_fn=act_fn,
@@ -1398,7 +1578,7 @@ def _build_fused_ep_moe_kernel(
                             act_scales,
                             w1_vm[slot],
                             w2_vm[slot],
-                            w1s_vm[pl.ds(e, 1), :],
+                            w1s_vm[pl.ds(slot, 1), :],
                             act_fn=act_fn,
                             w1b=w1b_row,
                         )
@@ -1415,7 +1595,7 @@ def _build_fused_ep_moe_kernel(
                         acc2,
                         mid_scale,
                         w2s=(
-                            w2s_vm[pl.ds(e, 1), :]
+                            w2s_vm[pl.ds(slot, 1), :]
                             if (has_scales and not rhs_packed4)
                             else None
                         ),
@@ -1485,6 +1665,23 @@ def _build_fused_ep_moe_kernel(
                 )
 
             carry = lax.fori_loop(0, n_tiles, tile_body, carry)
+
+            if starts_next_weights:
+                # What the tile loop was still reading to its last block: the
+                # down slab, and the scale tables, which are read a block at a
+                # time beside the weights they scale.
+
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    # Scales first: they are all the next visit's head waits
+                    # for, and the down slab behind them is a megabyte-scale
+                    # queue they would otherwise sit out.
+                    if has_scales:
+                        w1s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                        w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+
             # Cross-expert lookahead: prime the next visited expert's first
             # activation tile before this expert's commit drain and push. Its
             # index window went out on the last tile, so this is the wait and
@@ -1659,7 +1856,7 @@ def _build_fused_ep_moe_kernel(
                 capacity,
                 hidden,
                 inter,
-                nbuf=NBUF,
+                nbuf=nbuf,
                 weight_format=weight_format,
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
@@ -1669,11 +1866,23 @@ def _build_fused_ep_moe_kernel(
         + [
             pltpu.SemaphoreType.DMA,  # token_gather_sem0
             pltpu.SemaphoreType.DMA,  # token_gather_sem1
-            # lhs_sems. Parity-deep, not NBUF-deep: every index into it, and into
+            # lhs_sems. Parity-deep, not nbuf-deep: every index into it, and into
             # the lhs_vm and ls_vm buffers it guards, is an out-parity.
             pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
-            pltpu.SemaphoreType.DMA((NBUF,)),  # w1_sems
-            pltpu.SemaphoreType.DMA((NBUF,)),  # w2_sems
+            pltpu.SemaphoreType.DMA((nbuf,)),  # w1_sems
+            pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
+        ]
+        + (
+            [
+                # The scale tables travel with the slabs they scale, so they are
+                # slot-deep and need their own sems: a wait is per-buffer.
+                pltpu.SemaphoreType.DMA((nbuf,)),  # w1s_sems
+                pltpu.SemaphoreType.DMA((nbuf,)),  # w2s_sems
+            ]
+            if has_scales
+            else []
+        )
+        + [
             pltpu.SemaphoreType.DMA,  # cp_sem
         ]
         + (
@@ -1753,7 +1962,7 @@ def _build_fused_ep_moe_kernel(
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
-            f"_g{g_local}_c{capacity}_nb{NBUF}"
+            f"_g{g_local}_c{capacity}_nb{nbuf}"
         )
         return pl.pallas_call(
             kernel,

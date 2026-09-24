@@ -58,10 +58,19 @@ export SKIP_SPANNER_UPLOAD="1"
 # Names the launcher cannot guess. A name the step has not set is skipped
 # rather than injected empty, which several of these depend on.
 FORWARD=(
+  # cpu on the cpu queue; unset on a TPU host, where JAX finds the chips.
+  JAX_PLATFORMS
   FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
   UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
-  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_TYPE MODEL_PATH MODEL_URI
+  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_TYPE MODEL_PATH MODEL_URI EVAL_SOFT_FAIL
+  # Lets a one-off build force an xprof capture; unset leaves the day rule in
+  # benchmark_with_profile.sh to decide.
+  CAPTURE_PROFILE
+  # run_in_docker.sh turns CONTAINER_TMPDIR into these two. A DSv4 compile
+  # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
+  # JSON, which is an evicted pod if it lands on ephemeral storage.
+  TMPDIR RAY_TMPDIR
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT

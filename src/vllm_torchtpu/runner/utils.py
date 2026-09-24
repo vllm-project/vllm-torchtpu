@@ -10,8 +10,7 @@ from typing import Any
 import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.model_executor.layers.rotary_embedding.base import \
-    RotaryEmbeddingBase
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -32,17 +31,21 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD = -1
 # Tuning knobs with no `profiler_config` equivalent, so they stay in
 # `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
-    "phased_profiler_decode_only_kv_len_threshold")
+    "phased_profiler_decode_only_kv_len_threshold"
+)
 PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
-    "phased_profiler_prefill_only_kv_len_threshold")
+    "phased_profiler_prefill_only_kv_len_threshold"
+)
 
 # Diagnostics-only knob: it steers profiling and never changes the compiled
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
 # TPU compile cache key.
-HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
-    PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
-})
+HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
+    {
+        PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+        PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    }
+)
 
 
 class InferencePhase(Enum):
@@ -55,11 +58,11 @@ class InferencePhase(Enum):
 
 
 def determine_phase_from_batch_composition_stats(
-    batch_composition_stats: dict[str, Any], ) -> InferencePhase:
+    batch_composition_stats: dict[str, Any],
+) -> InferencePhase:
     """Determines the inference phase based on the batch composition stats."""
     num_prefill_tokens = batch_composition_stats["num_prefill_tokens"]
-    total_num_scheduled_tokens = batch_composition_stats[
-        "total_num_scheduled_tokens"]
+    total_num_scheduled_tokens = batch_composition_stats["total_num_scheduled_tokens"]
     prefill_ratio_for_batch = num_prefill_tokens / total_num_scheduled_tokens
     if prefill_ratio_for_batch == 1.0:
         return InferencePhase.PREFILL_ONLY
@@ -69,8 +72,10 @@ def determine_phase_from_batch_composition_stats(
         return InferencePhase.PREFILL_HEAVY
     if prefill_ratio_for_batch <= DECODE_HEAVY_RATIO_THRESHOLD:
         return InferencePhase.DECODE_HEAVY
-    if (prefill_ratio_for_batch >= BALANCED_RATIO_THRESHOLD[0]
-            and prefill_ratio_for_batch <= BALANCED_RATIO_THRESHOLD[1]):
+    if (
+        prefill_ratio_for_batch >= BALANCED_RATIO_THRESHOLD[0]
+        and prefill_ratio_for_batch <= BALANCED_RATIO_THRESHOLD[1]
+    ):
         return InferencePhase.BALANCED
 
     return InferencePhase.AMBIGUOUS
@@ -78,8 +83,7 @@ def determine_phase_from_batch_composition_stats(
 
 def get_batch_composition_stats(
     batch_id: int,
-    input_batch:
-    Any,  # Use Any to avoid circular dependency or import issues for now
+    input_batch: Any,  # Use Any to avoid circular dependency or import issues for now
     total_num_scheduled_tokens: int,
     num_reqs: int,
     padded_total_num_scheduled_tokens: int,
@@ -92,8 +96,7 @@ def get_batch_composition_stats(
     # Get the number of scheduled tokens for each request.
     num_scheduled_tokens_per_req_list = []
     # Get the number of tokens already processed for each request.
-    num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:
-                                                                      num_reqs]
+    num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:num_reqs]
 
     scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
     min_kv_len = float("inf") if num_reqs > 0 else 0
@@ -105,8 +108,7 @@ def get_batch_composition_stats(
         num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
 
         # This is the number of tokens already processed for this request (before this step)
-        num_already_computed = int(
-            num_computed_tokens_per_req[i])  # Cast from np.int32
+        num_already_computed = int(num_computed_tokens_per_req[i])  # Cast from np.int32
         min_kv_len = min(min_kv_len, num_already_computed)
 
         # When speculative decoding is enabled for this request, the extra
@@ -150,14 +152,10 @@ class PhaseBasedProfiler:
         profile_dir: str,
         worker_rank: int = 0,
         world_size: int = 1,
-        num_steps_to_profile_for:
-        int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
-        num_decode_steps_to_skip:
-        int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
-        decode_kv_len_threshold:
-        int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
-        prefill_kv_len_threshold:
-        int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
+        num_steps_to_profile_for: int = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+        num_decode_steps_to_skip: int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
+        decode_kv_len_threshold: int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         standard_opts: dict[str, Any] | None = None,
         advanced_opts: dict[str, Any] | None = None,
     ):
@@ -210,7 +208,8 @@ class PhaseBasedProfiler:
             )
 
     def _write_batch_composition_stats_to_file_helper(
-            self, batch_composition_stats: dict) -> None:
+        self, batch_composition_stats: dict
+    ) -> None:
         """Writes the batch composition stats to a file."""
         if not self.profile_dir_with_phase_suffix:
             return
@@ -229,19 +228,21 @@ class PhaseBasedProfiler:
 
     def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
         """Resolve the canonical destination timestamp for this phase."""
-        return profiler_trace.resolve_canonical_dst_ts(phase_dir,
-                                                       self.worker_rank)
+        return profiler_trace.resolve_canonical_dst_ts(phase_dir, self.worker_rank)
 
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """Starts profiling if the current phase is unseen."""
         current_determined_phase = determine_phase_from_batch_composition_stats(
-            batch_composition_stats)
+            batch_composition_stats
+        )
         for phase, has_been_seen in self.inference_phase_seen.items():
             if has_been_seen or phase != current_determined_phase:
                 continue
 
-            if (phase == InferencePhase.DECODE_HEAVY and
-                    self.decode_steps_skipped < self.num_decode_steps_to_skip):
+            if (
+                phase == InferencePhase.DECODE_HEAVY
+                and self.decode_steps_skipped < self.num_decode_steps_to_skip
+            ):
                 self.decode_steps_skipped += 1
                 logger.debug(
                     "Skipping decode-heavy step %d/%d before profiling.",
@@ -280,15 +281,16 @@ class PhaseBasedProfiler:
 
             self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
             self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
-                phase_dir, self.worker_rank)
+                phase_dir, self.worker_rank
+            )
             os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
 
-            self._write_batch_composition_stats_to_file_helper(
-                batch_composition_stats)
+            self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
 
             # Start PyTorch/XLA profiler
             handler = torch.profiler.tensorboard_trace_handler(
-                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
+                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True
+            )
 
             config = TpuProfilerConfig(
                 run_dir=self.profile_dir_with_phase_suffix,
@@ -317,8 +319,7 @@ class PhaseBasedProfiler:
     def _step_or_stop_profiling(self, batch_composition_stats: dict) -> None:
         """Steps or stops the profiler."""
         if self.current_phase != "":
-            self._write_batch_composition_stats_to_file_helper(
-                batch_composition_stats)
+            self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
                 self._finish_current_phase()
@@ -381,10 +382,10 @@ class PhaseBasedProfiler:
         # capturing never counted down. That left the capture open until
         # /stop_profile, ignoring max_iterations and filing every later step
         # under the phase that opened it.
-        has_scheduled_work = (
-            batch_composition_stats["total_num_scheduled_tokens"] > 0)
-        if has_scheduled_work and (not have_seen_all_phases
-                                   or self.current_phase != ""):
+        has_scheduled_work = batch_composition_stats["total_num_scheduled_tokens"] > 0
+        if has_scheduled_work and (
+            not have_seen_all_phases or self.current_phase != ""
+        ):
             if self.profiling_n_steps_left <= 0:
                 self._start_profiling(batch_composition_stats)
             else:
@@ -393,8 +394,7 @@ class PhaseBasedProfiler:
 
 # (dtype, shape) -> minor_to_major, for buffers whose device layout is not
 # XLA's default-for-shape and so must be pinned on the compiled entry too.
-_PINNED_ENTRY_LAYOUTS: dict[tuple[torch.dtype, tuple[int, ...]],
-                            list[int]] = {}
+_PINNED_ENTRY_LAYOUTS: dict[tuple[torch.dtype, tuple[int, ...]], list[int]] = {}
 _entry_pin_installed = False
 
 
@@ -407,14 +407,13 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
     unchanged; only the physical layout differs.
     """
     from torch_tpu._internal.compile import tpu_torch_compile as ttc
-    from torch_tpu._internal.device_utils.annotations import (LayoutContext,
-                                                              TpuLayout)
+    from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
     # Keep the dtype's own tiling; only the dimension order changes.
     _, tiles, elem_bits = ttc.get_default_layout(tensor.dtype, tensor.shape)
-    row_major = TpuLayout(minor_to_major=[1, 0],
-                          tiles=tiles,
-                          element_size_in_bits=elem_bits)
+    row_major = TpuLayout(
+        minor_to_major=[1, 0], tiles=tiles, element_size_in_bits=elem_bits
+    )
     host = tensor.cpu()
     with LayoutContext(row_major):
         device_tensor = host.to(tensor.device)
@@ -423,14 +422,16 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def relayout_rope_caches(model: torch.nn.Module):
-    """Re-materialize every rope cache with a row-major device layout. """
+    """Re-materialize every rope cache with a row-major device layout."""
     num_changed = 0
     for name, module in model.named_modules():
         if not isinstance(module, RotaryEmbeddingBase):
             continue
         # The buffers on a rotary module that are indexed by position.
-        caches = [(buf_name, getattr(module, buf_name, None))
-                  for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")]
+        caches = [
+            (buf_name, getattr(module, buf_name, None))
+            for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
+        ]
         caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
         if not caches:
             continue
@@ -439,8 +440,11 @@ def relayout_rope_caches(model: torch.nn.Module):
         for buf_name, buf in caches:
             setattr(module, buf_name, _to_row_major(buf))
         num_changed += 1
-        logger.info("Relayouted rope cache %s to {1,0} (shape %s)", name,
-                    tuple(caches[0][1].shape))
+        logger.info(
+            "Relayouted rope cache %s to {1,0} (shape %s)",
+            name,
+            tuple(caches[0][1].shape),
+        )
 
     if num_changed:
         _install_entry_layout_pin()
@@ -448,7 +452,7 @@ def relayout_rope_caches(model: torch.nn.Module):
 
 
 def relayout_hash_tables(model: torch.nn.Module):
-    """Re-materialize every MOE hash-routing table row-major. """
+    """Re-materialize every MOE hash-routing table row-major."""
     seen: set[int] = set()
     num_changed = 0
     for name, module in model.named_modules():
@@ -463,8 +467,12 @@ def relayout_hash_tables(model: torch.nn.Module):
                 continue
             table.data = _to_row_major(table.data)
             num_changed += 1
-            logger.info("Relayouted hash table %s.%s to {1,0} (shape %s)",
-                        name, attr, tuple(table.shape))
+            logger.info(
+                "Relayouted hash table %s.%s to {1,0} (shape %s)",
+                name,
+                attr,
+                tuple(table.shape),
+            )
 
     if num_changed:
         _install_entry_layout_pin()
@@ -472,7 +480,7 @@ def relayout_hash_tables(model: torch.nn.Module):
 
 
 def _install_entry_layout_pin() -> None:
-    """Make the compiler pin entry layouts for buffers in the registry. """
+    """Make the compiler pin entry layouts for buffers in the registry."""
     global _entry_pin_installed
     if _entry_pin_installed:
         return
@@ -480,12 +488,14 @@ def _install_entry_layout_pin() -> None:
 
     original_call = tt_compiler.StaticCompiler.__call__
 
-    def _call_with_pinned_layouts(self, graph_module, example_inputs, *args,
-                                  **kwargs):
+    def _call_with_pinned_layouts(self, graph_module, example_inputs, *args, **kwargs):
         # `argument_layouts` is the 5th positional parameter; len(args) < 3
         # means the caller did not pass it positionally.
-        if (_PINNED_ENTRY_LAYOUTS and len(args) < 3
-                and kwargs.get("argument_layouts") is None):
+        if (
+            _PINNED_ENTRY_LAYOUTS
+            and len(args) < 3
+            and kwargs.get("argument_layouts") is None
+        ):
             # One entry per *tensor* argument: `fx_to_mlir` filters the
             # non-tensors (generators, symints) out before length-checking.
             layouts: list[list[int]] = []
@@ -498,10 +508,12 @@ def _install_entry_layout_pin() -> None:
                 pinned_any = pinned_any or pin is not None
             if pinned_any:
                 kwargs["argument_layouts"] = layouts
-                logger.info("Pinned %d of %d entry layouts for this graph",
-                            sum(1 for entry in layouts if entry), len(layouts))
-        return original_call(self, graph_module, example_inputs, *args,
-                             **kwargs)
+                logger.info(
+                    "Pinned %d of %d entry layouts for this graph",
+                    sum(1 for entry in layouts if entry),
+                    len(layouts),
+                )
+        return original_call(self, graph_module, example_inputs, *args, **kwargs)
 
     tt_compiler.StaticCompiler.__call__ = _call_with_pinned_layouts
     _entry_pin_installed = True

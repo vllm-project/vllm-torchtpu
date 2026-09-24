@@ -17,20 +17,25 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import \
-    CompressedTensorsMoEMethod
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsMoEMethod,
+)
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
-    VllmCompressedTensorsW4A16MoEMethod
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
-    VllmCompressedTensorsW4ANMxfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+    VllmCompressedTensorsW4A16MoEMethod,
+)
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+    VllmCompressedTensorsW4ANMxfp4MoEMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedFusedMoEMethod
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedFusedMoEMethod,
+)
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import \
-        VllmCompressedTensorsConfig
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+        VllmCompressedTensorsConfig,
+    )
 
 
 class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
@@ -59,19 +64,23 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
 
         # multiple schemes found
         if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
-            raise ValueError("All MoE projections need to have same "
-                             "quantization scheme but found multiple")
+            raise ValueError(
+                "All MoE projections need to have same "
+                "quantization scheme but found multiple"
+            )
 
         if scheme_dict is None:  # ignored layer
-            return VllmUnquantizedFusedMoEMethod(
-                quant_config.get_moe_config(layer))
+            return VllmUnquantizedFusedMoEMethod(quant_config.get_moe_config(layer))
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
         # Have to keep the imports here to prevent circular import
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
-            _build_fp8_config, _is_int4_w4aN, _is_weight_fp8)
+            _build_fp8_config,
+            _is_int4_w4aN,
+            _is_weight_fp8,
+        )
 
         # 1. Dispatch W4A16 MoE
         if _is_int4_w4aN(weight_quant):
@@ -81,18 +90,20 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
             # will automatically fallback to dequantize-before-matmul (running as W4A16).
             # If group_size >= 128, it will dynamically quantize activations (running as W4A8).
             return VllmCompressedTensorsW4A16MoEMethod(
-                weight_quant, input_quant, quant_config.get_moe_config(layer))
+                weight_quant, input_quant, quant_config.get_moe_config(layer)
+            )
 
         # 2. Dispatch MXFP4 W4 MoE
         if quant_config._is_mxfp4(weight_quant):
             return VllmCompressedTensorsW4ANMxfp4MoEMethod(
-                quant_config.get_moe_config(layer))
+                quant_config.get_moe_config(layer)
+            )
 
         # 3. Dispatch FP8 MoE
         if _is_weight_fp8(weight_quant):
             fp8_config = _build_fp8_config(weight_quant, input_quant)
-            return VllmFp8MoEMethodTPU(fp8_config,
-                                       fp8_config.get_moe_config(layer))
+            return VllmFp8MoEMethodTPU(fp8_config, fp8_config.get_moe_config(layer))
         # Fallback
         raise RuntimeError(
-            f"Unsupported TPU FusedMoe scheme: {weight_quant}, {input_quant}")
+            f"Unsupported TPU FusedMoe scheme: {weight_quant}, {input_quant}"
+        )

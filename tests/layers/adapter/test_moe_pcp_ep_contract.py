@@ -18,8 +18,7 @@ from unittest.mock import patch
 
 import torch
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
-from vllm.model_executor.layers.fused_moe.runner import \
-    moe_runner as moe_runner_mod
+from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner_mod
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
@@ -70,8 +69,7 @@ class _FusedPcpExperts:
     def forward_monolithic(self, *, x, router_logits, input_ids=None):
         del input_ids
         expert_weights = torch.softmax(router_logits, dim=-1)
-        return x * (expert_weights[:, 0:1] * 2.0 +
-                    expert_weights[:, 1:2] * 3.0)
+        return x * (expert_weights[:, 0:1] * 2.0 + expert_weights[:, 1:2] * 3.0)
 
 
 class _ForbiddenPcpGroup:
@@ -120,8 +118,7 @@ class _TwoRankPcpGroup:
         assert self._gathered_router_logits is not None
 
         expert_weights = torch.softmax(self._gathered_router_logits, dim=-1)
-        rank_one_output = (self._gathered_hidden_states *
-                           expert_weights[:, 1:2] * 3.0)
+        rank_one_output = self._gathered_hidden_states * expert_weights[:, 1:2] * 3.0
         combined = rank_zero_output + rank_one_output
         return combined.chunk(self.world_size, dim=dim)[self.rank_in_group]
 
@@ -223,14 +220,16 @@ def test_vllm_moe_pcp_ep_combines_remote_expert_contributions(monkeypatch):
     monkeypatch.setattr(moe_runner_mod, "get_pcp_group", lambda: pcp_group)
 
     runner = _make_rank_zero_runner()
-    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
-                        lambda _layer_name: runner)
+    monkeypatch.setattr(
+        moe_runner_mod, "get_layer_from_name", lambda _layer_name: runner
+    )
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         actual = runner(local_hidden_states, local_router_logits)
 
     local_weights = torch.softmax(local_router_logits, dim=-1)
-    expected = local_hidden_states * (local_weights[:, 0:1] * 2.0 +
-                                      local_weights[:, 1:2] * 3.0)
+    expected = local_hidden_states * (
+        local_weights[:, 0:1] * 2.0 + local_weights[:, 1:2] * 3.0
+    )
     torch.testing.assert_close(actual, expected)
 
 
@@ -239,13 +238,13 @@ def test_armed_fused_ep_owns_pcp_dispatch_combine(monkeypatch):
     from vllm_torchtpu import _patch_moe_explicit_pcp_collectives
 
     _patch_moe_explicit_pcp_collectives()
-    monkeypatch.setattr(moe_runner_mod, "get_pcp_group",
-                        lambda: _ForbiddenPcpGroup())
+    monkeypatch.setattr(moe_runner_mod, "get_pcp_group", lambda: _ForbiddenPcpGroup())
 
     runner = _make_rank_zero_runner()
     runner.routed_experts = _FusedPcpExperts()
-    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
-                        lambda _layer_name: runner)
+    monkeypatch.setattr(
+        moe_runner_mod, "get_layer_from_name", lambda _layer_name: runner
+    )
 
     local_hidden_states = torch.tensor([[1.0, 2.0, 4.0]])
     local_router_logits = torch.log(torch.tensor([[0.25, 0.75]]))
@@ -256,6 +255,7 @@ def test_armed_fused_ep_owns_pcp_dispatch_combine(monkeypatch):
         actual = runner(local_hidden_states, local_router_logits)
 
     local_weights = torch.softmax(local_router_logits, dim=-1)
-    expected = local_hidden_states * (local_weights[:, 0:1] * 2.0 +
-                                      local_weights[:, 1:2] * 3.0)
+    expected = local_hidden_states * (
+        local_weights[:, 0:1] * 2.0 + local_weights[:, 1:2] * 3.0
+    )
     torch.testing.assert_close(actual, expected)

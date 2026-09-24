@@ -17,6 +17,7 @@ class AsyncTPUCopyState:
     happen lazily on `wait()` and produce a single contiguous CPU tensor
     matching the real (unpadded) request count.
     """
+
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
     copy_ready_event: Any
@@ -25,8 +26,9 @@ class AsyncTPUCopyState:
     _sampled_token_ids_cpu: torch.Tensor | None = None
 
     @classmethod
-    def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
-                           chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+    def from_device_chunks(
+        cls, chunks_tpu: list[torch.Tensor], chunk_real_lens: list[int]
+    ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         copy_ready_event = torch.tpu.Event()
@@ -53,9 +55,7 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [
-                t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
-            ]
+            trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
             if len(trimmed) == 1:
                 self._sampled_token_ids_cpu = trimmed[0]
             else:
@@ -122,8 +122,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             valid_mask = selected_token_ids != INVALID_TOKEN_ID
             gen_lens = valid_mask.sum(dim=1).tolist()
             valid_sampled_token_ids = [
-                seq.tolist()
-                for seq in selected_token_ids[valid_mask].split(gen_lens)
+                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
@@ -132,8 +131,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
-def assemble_spec_next_tokens(next_tokens: torch.Tensor, drafts: torch.Tensor,
-                              num_reqs: int) -> torch.Tensor:
+def assemble_spec_next_tokens(
+    next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int
+) -> torch.Tensor:
     """Async substitution source for speculative decoding.
 
     Per request the next verify step consumes ``[bonus, draft_1, ..., draft_K]``:
@@ -184,12 +184,16 @@ def subtract_num_rejected_tokens(
     zero = num_rejected.new_zeros(())
     seq_subtract = torch.where(
         seq_lens_subtract_indices >= 0,
-        num_rejected[seq_lens_subtract_indices.clamp(min=0)], zero)
+        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
+        zero,
+    )
     seq_lens = seq_lens - seq_subtract
 
     pos_subtract = torch.where(
         positions_subtract_indices >= 0,
-        num_rejected[positions_subtract_indices.clamp(min=0)], zero)
+        num_rejected[positions_subtract_indices.clamp(min=0)],
+        zero,
+    )
     if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
         pos_subtract = pos_subtract.unsqueeze(0)
     positions = positions - pos_subtract
@@ -197,16 +201,19 @@ def subtract_num_rejected_tokens(
 
 
 def extract_draft_token_ids(
-        input_ids: torch.Tensor, logits_indices: torch.Tensor,
-        target_logits_indices: torch.Tensor) -> torch.Tensor:
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
     return input_ids[logits_indices][target_logits_indices + 1]
 
 
-def compute_num_rejected(next_tokens: torch.Tensor,
-                         num_draft: torch.Tensor) -> torch.Tensor:
+def compute_num_rejected(
+    next_tokens: torch.Tensor, num_draft: torch.Tensor
+) -> torch.Tensor:
     """Per-request rejected-draft count from the rejection output, on-device.
 
     Args:

@@ -1,0 +1,235 @@
+# Example GKE Deployment and Service for Prefill in Raiden3 P/D Disaggregation
+# Topology: TPU v6e 2x2 (4 chips), Prefill Context Parallelism (PCP=4), TP=1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  namespace: disagg-1-1
+  labels:
+    app: vllm-prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-prefill
+  template:
+    metadata:
+      labels:
+        app: vllm-prefill
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x2
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: default
+      initContainers:
+      - name: tpu-node-setup
+        image: busybox
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            sysctl -w vm.max_map_count=8388608
+            if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+              echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+              echo "Successfully increased dma_entry_limit to 2000000"
+            else
+              echo "Warning: vfio_iommu_type1 module parameter not found."
+            fi
+      containers:
+      - name: vllm-tpu
+        # Replace with your vllm-torchtpu container image
+        image: vllm/vllm-tpu:latest
+        imagePullPolicy: Always
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            echo "--- raiden native preflight (fail fast on ABI mismatch) ---"
+            python3 - <<'PY'
+            from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+            impl = _torch_impl()
+            print("raiden native extension OK:", impl.__file__, flush=True)
+            PY
+
+            echo "--- starting raiden controller on :28000 ---"
+            cat > /tmp/raiden_controller.py <<'PY'
+            import sys
+            import time
+            from tpu_sync.rpc.raiden_controller import RaidenController, RaidenControllerServer
+            controller = RaidenController(port=int(sys.argv[1]), request_registry_ttl_s=600.0)
+            server = RaidenControllerServer(controller)
+            server.start()
+            print(f"raiden controller ready on port {server.port}", flush=True)
+            while True:
+              time.sleep(1)
+            PY
+            python3 /tmp/raiden_controller.py 28000 &
+            sleep 3
+
+            python3 -c "import pathlib, vllm_torchtpu.worker.tpu_rank_binding as m; p = pathlib.Path(m.__file__); p.write_text(p.read_text().replace('def probe_pcp_local_rank_remap(', 'def _orig_probe_pcp_local_rank_remap(') + '\ndef probe_pcp_local_rank_remap(world_size, *a, **k):\n  return tuple(range(world_size))\n')"
+
+            exec vllm serve --seed=42 \
+              --model=Qwen/Qwen3.5-35B-A3B-FP8 \
+              --tensor-parallel-size=1 \
+              --prefill-context-parallel-size=4 \
+              --max-model-len=81920 \
+              --max-num-batched-tokens=16384 \
+              --long-prefill-token-threshold=16384 \
+              --max-num-seqs=1 \
+              --num-gpu-blocks-override 64 \
+              --port 8000 \
+              --no-async-scheduling \
+              --no-enable-prefix-caching \
+              --gpu-memory-utilization=0.85 \
+              --kv-cache-dtype=fp8 \
+              --enable-expert-parallel \
+              --quantization fp8 \
+              --attention-backend CUSTOM \
+              --block-size 8192 \
+              --mamba-cache-mode align \
+              --cp-kv-cache-interleave-size 256 \
+              --language-model-only \
+              --profiler-config='{"profiler": "torch", "torch_profiler_dir": "/usr/vllm/vllm_profile", "ignore_frontend": true}' \
+              --disable-custom-all-reduce \
+              --no-disable-hybrid-kv-cache-manager \
+              --return-tokens-as-token-ids \
+              --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096], "inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' \
+              --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        - name: HF_HOME
+          value: /usr/vllm
+        - name: VLLM_LOGGING_LEVEL
+          value: DEBUG
+        - name: USE_PHASED_PROFILER
+          value: "true"
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "14400"
+        - name: VLLM_XLA_CACHE_PATH
+          value: /usr/vllm/xla_cache
+        - name: MODEL_IMPL_TYPE
+          value: vllm
+        - name: TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG
+          value: "1"
+        - name: VLLM_XLA_CHECK_RECOMPILATION
+          value: "0"
+        - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+          value: "0"
+        - name: TPU_PREMAPPED_BUFFER_SIZE
+          value: "4294967296"
+        - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+          value: "1"
+        - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+          value: "1"
+        - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+          value: "1"
+        - name: TPU_KV_RESHARD_TRANSPORT
+          value: raiden
+        - name: TPU_RAIDEN_RESHARD_IMPL
+          value: store
+        - name: TPU_RAIDEN_ADVERTISE_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: TPU_RAIDEN_QWEN35_ADMISSION
+          value: "1"
+        - name: TPU_KV_RESHARD_DST_PAGE_TOKENS
+          value: "4096"
+        - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+          value: "4"
+        - name: TPU_RAIDEN_CONTROLLER_ADDRESS
+          value: vllm-service-prefill:28000
+        - name: TPU_RAIDEN_JOB_NAME
+          value: prefill
+        - name: TPU_RAIDEN_ENGINE_ID
+          value: prefill-engine
+        - name: TPU_KV_TRANSFER_NAMESPACE
+          value: prefill
+        - name: TPU_GDN_CONV_STATE_TILE_PAD
+          value: "1"
+        - name: XLA_PYTHON_CLIENT_PREALLOCATE
+          value: "false"
+        - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+          value: "1"
+        - name: USE_BATCHED_RPA_KERNEL
+          value: "1"
+        - name: RAGGED_GATED_DELTA_RULE_IMPL
+          value: chunked_kernel_v3_pd
+        - name: DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH
+          value: "0"
+        - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+          value: disabled
+        - name: TPU_ENABLE_D2H_TRANSFER
+          value: "1"
+        - name: TPU_HMA_D2H_COPY_IMPL
+          value: device_put
+        - name: TPU_HMA_MIN_DONE_RECVING_BATCH
+          value: "1"
+        - name: TPU_HMA_MAX_DONE_RECVING_BATCH
+          value: "1"
+        - name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS
+          value: "1"
+        - name: TPU_HMA_MAX_INFLIGHT_PULLS
+          value: "8"
+        - name: TPU_MAX_HOST_KV_BUFFER_SIZE
+          value: "64"
+        - name: TPU_P2P_WAIT_PULL_TIMEOUT
+          value: "600"
+        - name: TPU_KV_SHM_POOL_GB
+          value: "8"
+        - name: TPU_KV_TRANSFER_PORT
+          value: "9100"
+        - name: TPU_SIDE_CHANNEL_PORT
+          value: "9600"
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            cpu: "175"
+            ephemeral-storage: 40Gi
+            google.com/tpu: "4"
+            memory: 600Gi
+          requests:
+            cpu: "175"
+            ephemeral-storage: 40Gi
+            google.com/tpu: "4"
+            memory: 600Gi
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: pvc-vllm-vol
+          mountPath: /usr/vllm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      - name: pvc-vllm-vol
+        persistentVolumeClaim:
+          claimName: pvc-prefill
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-prefill
+  namespace: disagg-1-1
+  labels:
+    app: vllm-prefill
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-prefill
+  ports:
+  - name: http
+    port: 8000
+    protocol: TCP
+    targetPort: 8000
+  - name: raiden-controller
+    port: 28000
+    targetPort: 28000

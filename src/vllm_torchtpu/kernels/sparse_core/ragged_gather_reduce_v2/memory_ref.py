@@ -44,27 +44,24 @@ class ScratchRef:
     @classmethod
     def create_scratch_types(cls, cfg: config.Config) -> Any:
         num_simd_lanes = cfg.sc_info.num_lanes
-        indices_vmem = pltpu.VMEM((cfg.row_chunk_size, ), jnp.int32)
+        indices_vmem = pltpu.VMEM((cfg.row_chunk_size,), jnp.int32)
         return cls(
-            num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes, ),
-                                                       jnp.int32),
-            next_window_first_row_vmem=pltpu.VMEM((num_simd_lanes, ),
-                                                  jnp.int32),
+            num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            next_window_first_row_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (cfg.col_size // cfg.col_chunk_size, cfg.col_chunk_size),
                 jnp.float32,
             ),
-            prev_dst_row_smem=pltpu.SMEM((1, ), jnp.int32),
-            sorted_by_validity_vmem=pltpu.VMEM((cfg.window_size, ), jnp.int32),
+            prev_dst_row_smem=pltpu.SMEM((1,), jnp.int32),
+            sorted_by_validity_vmem=pltpu.VMEM((cfg.window_size,), jnp.int32),
             src_indices_vmem=indices_vmem,
             dst_indices_vmem=indices_vmem,
             dma_src_row_vmem=indices_vmem,
             dma_dst_row_vmem=indices_vmem,
             prev_dst_val_vmem=indices_vmem,
-            tw_f32_vmem=pltpu.VMEM((cfg.row_chunk_size, ), jnp.float32),
-            out_vmem=pltpu.VMEM((num_simd_lanes, cfg.col_chunk_size),
-                                jnp.float32),
-            sem=pltpu.SemaphoreType.DMA((2, )),
+            tw_f32_vmem=pltpu.VMEM((cfg.row_chunk_size,), jnp.float32),
+            out_vmem=pltpu.VMEM((num_simd_lanes, cfg.col_chunk_size), jnp.float32),
+            sem=pltpu.SemaphoreType.DMA((2,)),
         )
 
 

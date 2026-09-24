@@ -592,9 +592,16 @@ class TestPooledCallerV3:
         conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
         pool = jnp.zeros((NUM_MGR * SPLIT, KBS, 1, 4, LANES), dtype=jnp.float8_e4m3fn)
         ssm_ntok = N_V * D_K * D_V * 2 // (4 * LANES)
+        # load/store_state_region pack bf16 pairs into uint32 in VMEM, which
+        # differs from gather/scatter_region, so we manually pack/unpack bf16
+        # into uint32 outside rather than passing the bf16 array directly.
+        rec_u16 = (
+            recurrent_bf16.reshape(n, -1, 2, D_V).view(jnp.uint16).astype(jnp.uint32)
+        )
+        recurrent_u32 = rec_u16[:, :, 0, :] | (rec_u16[:, :, 1, :] << 16)
         pool = pool_adapters.scatter_region(
             pool,
-            recurrent_bf16.reshape(n, -1, LANES),
+            recurrent_u32,
             pool_idx,
             tok0=0,
             ntok=ssm_ntok,
@@ -633,15 +640,23 @@ class TestPooledCallerV3:
             pool_block_tokens=SPLIT * KBS,
             recurrent_state_dtype=jnp.bfloat16,
         )
-        pooled_ssm = pool_adapters.gather_region(
+        pooled_ssm_u32 = pool_adapters.gather_region(
             new_pool,
             pool_idx,
             tok0=0,
             ntok=ssm_ntok,
             split=SPLIT,
-            out_dtype=jnp.bfloat16,
-            out_lanes=LANES,
-        ).reshape(n, N_V, D_K, D_V)
+            out_dtype=jnp.uint32,
+            out_lanes=D_V,
+        )
+        pooled_u16 = jnp.stack(
+            [
+                (pooled_ssm_u32 & 0xFFFF).astype(jnp.uint16),
+                (pooled_ssm_u32 >> 16).astype(jnp.uint16),
+            ],
+            axis=-2,
+        )
+        pooled_ssm = pooled_u16.view(jnp.bfloat16).reshape(n, N_V, D_K, D_V)
 
         np.testing.assert_allclose(
             np.asarray(pooled_out), np.asarray(dense_out), rtol=5e-2, atol=5e-2
@@ -703,7 +718,6 @@ class TestPooledCallerV3:
     def test_caller_matches_dense_with_native_seq_along_lane_pool(
         self, monkeypatch, page_size
     ):
-        monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
         n = 4

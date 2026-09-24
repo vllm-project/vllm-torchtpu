@@ -15,8 +15,10 @@
 
 import torch
 
-from vllm_torchtpu.layers.core.quantization import (quantize_tensor,
-                                                    quantize_tensor_to_fp4)
+from vllm_torchtpu.layers.core.quantization import (
+    quantize_tensor,
+    quantize_tensor_to_fp4,
+)
 
 
 def test_quantize_tensor_keeps_zero_rows_finite(device):
@@ -26,30 +28,26 @@ def test_quantize_tensor_keeps_zero_rows_finite(device):
         dtype=torch.float32,
     )
 
-    quantized, scale = quantize_tensor(tensor,
-                                       quant_dtype=torch.float8_e4m3fn,
-                                       axis=-1,
-                                       block_size=None)
+    quantized, scale = quantize_tensor(
+        tensor, quant_dtype=torch.float8_e4m3fn, axis=-1, block_size=None
+    )
 
     assert not torch.isnan(quantized.float()).any()
     assert not torch.isinf(quantized.float()).any()
-    assert torch.equal(quantized[0].float(),
-                       torch.zeros_like(quantized[0].float()))
+    assert torch.equal(quantized[0].float(), torch.zeros_like(quantized[0].float()))
     assert scale[0].item() == 0.0
 
 
 def test_quantize_tensor_uses_reciprocal_multiply_scale_rounding():
-    tensor = torch.tensor([[0.0010000200709328055]],
-                          device="cpu",
-                          dtype=torch.float32)
+    tensor = torch.tensor([[0.0010000200709328055]], device="cpu", dtype=torch.float32)
     dtype_max = float(torch.finfo(torch.float8_e4m3fn).max)
     expected_scale = tensor.abs().amax(dim=-1, keepdim=True) * torch.tensor(
-        1.0 / dtype_max, dtype=torch.float32)
+        1.0 / dtype_max, dtype=torch.float32
+    )
 
-    _, scale = quantize_tensor(tensor,
-                               quant_dtype=torch.float8_e4m3fn,
-                               axis=-1,
-                               block_size=None)
+    _, scale = quantize_tensor(
+        tensor, quant_dtype=torch.float8_e4m3fn, axis=-1, block_size=None
+    )
 
     torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
 
@@ -70,7 +68,7 @@ def test_quantize_tensor_to_fp4_keeps_zero_blocks_finite(device):
     assert torch.equal(indices[1, 2:], torch.zeros_like(indices[1, 2:]))
     assert torch.allclose(
         scale,
-        torch.tensor([[0.0, 1.0 / 6.0], [2.0 / 6.0, 0.0]],
-                     device=device,
-                     dtype=torch.float32),
+        torch.tensor(
+            [[0.0, 1.0 / 6.0], [2.0 / 6.0, 0.0]], device=device, dtype=torch.float32
+        ),
     )

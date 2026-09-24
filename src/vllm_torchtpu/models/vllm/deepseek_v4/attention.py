@@ -23,8 +23,10 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v4 import attention as dsv4_attention
@@ -37,18 +39,26 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import \
-    fused_reverse_rope_wo_a_projection
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    fused_reverse_rope_wo_a_projection,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
-    BATCH_AXIS, VllmDeepseekV4SWACache, _attention_csa, _attention_hca,
-    get_packed_mla_head_size)
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import \
-    VllmDeepseekCompressor
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import \
-    VllmDeepseekV4Indexer
+    BATCH_AXIS,
+    VllmDeepseekV4SWACache,
+    _attention_csa,
+    _attention_hca,
+    get_packed_mla_head_size,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    VllmDeepseekCompressor,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    VllmDeepseekV4Indexer,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 logger = init_logger(__name__)
 
@@ -56,10 +66,9 @@ _pallas_op_cache: dict[str, Any] = {}
 
 
 class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
-
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.BLHNC, )
+        return (KVCacheLayout.BLHNC,)
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -110,12 +119,9 @@ def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     return torch.empty_like(x)
 
 
-def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args,
-                 **kwargs):
+def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
-    return torch.empty((x.shape[0], wo_a.shape[-1]),
-                       dtype=x.dtype,
-                       device=x.device)
+    return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
 
 
 def _name_float(value: float) -> str:
@@ -129,12 +135,12 @@ def _live_cache(entry: object) -> torch.Tensor | None:
     vLLM binds a numel==0 placeholder until `initialize_kv_cache` runs, so an
     empty array is reported as absent rather than handed to a kernel.
     """
-    return entry if isinstance(entry,
-                               torch.Tensor) and entry.numel() > 0 else None
+    return entry if isinstance(entry, torch.Tensor) and entry.numel() > 0 else None
 
 
-class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
-                                 AttentionLayerBase):
+class VllmDeepseekV4MLAAttention(
+    dsv4_attention.DeepseekV4Attention, AttentionLayerBase
+):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
     def __init__(
@@ -178,8 +184,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         # Bind compressor key-cache reference to SWA or main layer depending on compression ratio.
         if hasattr(self, "compressor") and self.compressor is not None:
             if self.compress_ratio <= 1:
-                object.__setattr__(self.compressor, "k_cache",
-                                   self.swa_cache_layer)
+                object.__setattr__(self.compressor, "k_cache", self.swa_cache_layer)
             else:
                 object.__setattr__(self.compressor, "k_cache", self)
 
@@ -190,15 +195,15 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                 tp_size = get_tensor_model_parallel_world_size()
                 tp_rank = get_tensor_model_parallel_rank()
                 n_local = loaded_weight.shape[0] // tp_size
-                narrow = loaded_weight[tp_rank * n_local:(tp_rank + 1) *
-                                       n_local]
-                param[:narrow.shape[0]].copy_(narrow)
+                narrow = loaded_weight[tp_rank * n_local : (tp_rank + 1) * n_local]
+                param[: narrow.shape[0]].copy_(narrow)
 
             self.attn_sink.weight_loader = _attn_sink_loader
 
         hf_config = vllm_config.model_config.hf_config
-        object.__setattr__(self, "attn_out_dim",
-                           hf_config.num_attention_heads * hf_config.head_dim)
+        object.__setattr__(
+            self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim
+        )
         self.num_layers = hf_config.num_hidden_layers
 
         # Register submodules into static forward context for torch.compile tracking.
@@ -207,18 +212,20 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             compilation_config.static_forward_context[prefix] = self
             if hasattr(self.mla_attn, "swa_cache_layer"):
                 compilation_config.static_forward_context[
-                    self.mla_attn.swa_cache_layer.
-                    prefix] = self.mla_attn.swa_cache_layer
+                    self.mla_attn.swa_cache_layer.prefix
+                ] = self.mla_attn.swa_cache_layer
             if hasattr(self.mla_attn, "indexer") and hasattr(
-                    self.mla_attn.indexer, "k_cache"):
+                self.mla_attn.indexer, "k_cache"
+            ):
                 compilation_config.static_forward_context[
-                    self.mla_attn.indexer.k_cache.
-                    prefix] = self.mla_attn.indexer.k_cache
+                    self.mla_attn.indexer.k_cache.prefix
+                ] = self.mla_attn.indexer.k_cache
             if hasattr(self.mla_attn, "compressor") and hasattr(
-                    self.mla_attn.compressor, "state_cache"):
+                self.mla_attn.compressor, "state_cache"
+            ):
                 compilation_config.static_forward_context[
-                    self.mla_attn.compressor.state_cache.
-                    prefix] = self.mla_attn.compressor.state_cache
+                    self.mla_attn.compressor.state_cache.prefix
+                ] = self.mla_attn.compressor.state_cache
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -262,8 +269,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             return op
 
         swa_tensor = _live_cache(
-            getattr(getattr(self.mla_attn, "swa_cache_layer", None),
-                    "kv_cache", None))
+            getattr(getattr(self.mla_attn, "swa_cache_layer", None), "kv_cache", None)
+        )
         if swa_tensor is None:
             prof = self.__dict__.get("_attn_op_prof_instance")
             if prof is not None:
@@ -271,8 +278,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         op, built_from_real_caches = self._build_attn_op()
         object.__setattr__(
-            self, "_attn_op_instance"
-            if built_from_real_caches else "_attn_op_prof_instance", op)
+            self,
+            "_attn_op_instance" if built_from_real_caches else "_attn_op_prof_instance",
+            op,
+        )
         return op
 
     def _build_attn_op(self):
@@ -286,45 +295,54 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         if swa_cache is None:
             raise RuntimeError(
                 f"{self.custom_prefix}: swa_cache_layer unavailable at "
-                "attention-op build time.")
+                "attention-op build time."
+            )
 
         logical_page_size = swa_cache.block_size
         if logical_page_size <= 0:
             raise RuntimeError(
                 f"{self.custom_prefix}: SWA logical page size is "
-                f"{logical_page_size}; expected positive block size.")
+                f"{logical_page_size}; expected positive block size."
+            )
 
         # Detect whether SWA and main KV caches share the same underlying memory buffer.
         # A CSA layer binds a `(nope, rope)` pair; the SWA cache overlays the
         # NoPE array, so that is the one to compare.
         main_entry = getattr(self.mla_attn, "kv_cache", None)
         main_cache = _live_cache(
-            main_entry[0] if isinstance(main_entry, tuple) else main_entry)
+            main_entry[0] if isinstance(main_entry, tuple) else main_entry
+        )
         swa_tensor = _live_cache(getattr(swa_cache, "kv_cache", None))
         # `_live_cache` already reports numel==0 placeholders as absent, so
         # a non-None tensor here is a real allocation.
         two_caches_same_buffer = bool(
-            not swa_only and main_cache is not None and swa_tensor is not None
-            and main_cache.data_ptr() == swa_tensor.data_ptr())
+            not swa_only
+            and main_cache is not None
+            and swa_tensor is not None
+            and main_cache.data_ptr() == swa_tensor.data_ptr()
+        )
 
         built_from_real_caches = swa_tensor is not None
 
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size)
+            vllm_context.vllm_config.cache_config.block_size, self.window_size
+        )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
         hf_config = vllm_context.vllm_config.model_config.hf_config
-        sm_scale = (getattr(self.mla_attn, "scale", None)
-                    or getattr(self.mla_attn, "softmax_scale", None)
-                    or getattr(self, "softmax_scale", None)
-                    or getattr(self, "scale", None)
-                    or (hf_config.head_dim**-0.5 if hasattr(
-                        hf_config, "head_dim") else None))
+        sm_scale = (
+            getattr(self.mla_attn, "scale", None)
+            or getattr(self.mla_attn, "softmax_scale", None)
+            or getattr(self, "softmax_scale", None)
+            or getattr(self, "scale", None)
+            or (hf_config.head_dim**-0.5 if hasattr(hf_config, "head_dim") else None)
+        )
         if sm_scale is None:
             raise RuntimeError(
                 f"{self.custom_prefix}: attention scale unavailable at "
-                "attention-op build time.")
+                "attention-op build time."
+            )
 
         # Draft (DSpark/DFlash) layers attend bidirectionally within their
         # query block on the SWA path; set by the draft model at construction.
@@ -332,8 +350,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         # `non_causal_multi_token_decode = True` on each of their attention
         # layers -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark). Absent the
         # attribute a layer stays causal, so target layers are unaffected.
-        non_causal = bool(getattr(self, "non_causal_multi_token_decode",
-                                  False))
+        non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
 
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
@@ -348,20 +365,27 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, block
         # causality, and profiling stage.
-        op_name = (f"pallas::deepseek_v4_attention_{op_type}"
-                   f"_p{logical_page_size}"
-                   f"{'_aliased' if two_caches_same_buffer else ''}"
-                   f"{'_ncb' if non_causal else ''}"
-                   f"{'' if built_from_real_caches else '_prof'}")
+        op_name = (
+            f"pallas::deepseek_v4_attention_{op_type}"
+            f"_p{logical_page_size}"
+            f"{'_aliased' if two_caches_same_buffer else ''}"
+            f"{'_ncb' if non_causal else ''}"
+            f"{'' if built_from_real_caches else '_prof'}"
+        )
 
         if op_name in _pallas_op_cache:
             return _pallas_op_cache[op_name], built_from_real_caches
 
         logger.info(
             "[ATTN_BUILD] %s: building %s logical_page_size=%s window=%s "
-            "two_caches_same_buffer=%s real_caches=%s", self.custom_prefix,
-            op_name, logical_page_size, self.window_size,
-            two_caches_same_buffer, built_from_real_caches)
+            "two_caches_same_buffer=%s real_caches=%s",
+            self.custom_prefix,
+            op_name,
+            logical_page_size,
+            self.window_size,
+            two_caches_same_buffer,
+            built_from_real_caches,
+        )
 
         attn_data_axis = None
         attn_head_axis = "model"
@@ -385,24 +409,25 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             P(attn_head_axis),  # attention_sinks
         )
         if is_csa:
-            input_partition_specs += (P(), )  # main_cache_rope
+            input_partition_specs += (P(),)  # main_cache_rope
 
         # Donate sw_cache to permit in-place updates by the Pallas sliding-window kernel.
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
-            donate_argnums=(2, ),
+            donate_argnums=(2,),
             input_partition_specs=input_partition_specs,
         )
 
         def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
             """Abstract fake tensor implementation for PyTorch Dynamo graph tracing."""
             num_tokens = q.shape[0]
-            out_tensor = torch.empty((num_tokens, self.mla_attn.n_local_heads,
-                                      self.mla_attn.head_dim),
-                                     dtype=q.dtype,
-                                     device=q.device)
+            out_tensor = torch.empty(
+                (num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
             return out_tensor, torch.empty_like(sw_cache)
 
         attn_jax_op.register_fake(_fake_attn)
@@ -478,8 +503,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply RMSNorm and scaling RoPE to query head states."""
-        return self.qnorm_rope_op(q, positions,
-                                  self.mla_attn.rotary_emb.cos_sin_cache)
+        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def kv_rope(
         self,
@@ -487,8 +511,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply scaling RoPE to decoupled key states."""
-        return self.kv_rope_op(kv, positions,
-                               self.mla_attn.rotary_emb.cos_sin_cache)
+        return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def attention_impl(
         self,
@@ -500,18 +523,23 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads,
-                               self.mla_attn.head_dim)
+        q = self.wq_b(qr).view(
+            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        )
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
         if self.indexer is not None:
-            indexer_emb = getattr(self.mla_attn, "indexer_rotary_emb",
-                                  getattr(self.mla_attn, "rotary_emb", None))
-            topk_indices = self.indexer(hidden_states, qr, indexer_weights,
-                                        positions, indexer_emb)
+            indexer_emb = getattr(
+                self.mla_attn,
+                "indexer_rotary_emb",
+                getattr(self.mla_attn, "rotary_emb", None),
+            )
+            topk_indices = self.indexer(
+                hidden_states, qr, indexer_weights, positions, indexer_emb
+            )
         if compressor is not None:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 
@@ -525,8 +553,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         return res
 
     @staticmethod
-    def _as_kernel_cache_view(
-            cache: torch.Tensor | None) -> torch.Tensor | None:
+    def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
         """Bitcast 1-byte cache allocations to uint8 required by Pallas kernels."""
         if cache is None:
             return None
@@ -538,10 +565,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         """Retrieve active sliding-window cache buffer if allocated."""
         swa_cache_layer = getattr(self.mla_attn, "swa_cache_layer", None)
         if swa_cache_layer is None:
-            raise RuntimeError(
-                f"{self.custom_prefix}: swa_cache_layer unavailable.")
+            raise RuntimeError(f"{self.custom_prefix}: swa_cache_layer unavailable.")
         return self._as_kernel_cache_view(
-            _live_cache(getattr(swa_cache_layer, "kv_cache", None)))
+            _live_cache(getattr(swa_cache_layer, "kv_cache", None))
+        )
 
     def forward_mqa(
         self,
@@ -554,8 +581,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
     ) -> torch.Tensor:
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
-        main_prefix = getattr(self.mla_attn, "prefix",
-                              getattr(self, "custom_prefix", ""))
+        main_prefix = getattr(
+            self.mla_attn, "prefix", getattr(self, "custom_prefix", "")
+        )
 
         def _get_field(meta, field_name):
             if meta is None:
@@ -570,7 +598,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             if swa_layer_name not in attn_ctx:
                 raise RuntimeError(
                     f"{self.custom_prefix}: no attention metadata for SWA "
-                    f"layer {swa_layer_name!r}.")
+                    f"layer {swa_layer_name!r}."
+                )
             swa_attn_metadata = attn_ctx[swa_layer_name]
             main_attn_metadata = attn_ctx.get(main_prefix)
         else:
@@ -581,25 +610,26 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         sw_cache = orig_sw_cache
         if sw_cache is None:
             # 0-token placeholder cache used during profiling forward passes.
-            sw_cache = torch.zeros((0, 1, 1, self.mla_attn.head_dim),
-                                   dtype=torch.uint8,
-                                   device=q.device)
+            sw_cache = torch.zeros(
+                (0, 1, 1, self.mla_attn.head_dim), dtype=torch.uint8, device=q.device
+            )
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
 
         # A CSA layer's KV entry is a `(nope, rope)` pair.
         kv_entry = getattr(self, "kv_cache", None)
-        nope_entry, rope_entry = (kv_entry if isinstance(kv_entry, tuple) else
-                                  (kv_entry, None))
+        nope_entry, rope_entry = (
+            kv_entry if isinstance(kv_entry, tuple) else (kv_entry, None)
+        )
 
         if swa_attn_metadata is not None:
             swa_seq_lens = _get_field(swa_attn_metadata, "seq_lens")
             swa_block_tables = _get_field(swa_attn_metadata, "block_tables")
-            swa_query_start_loc = _get_field(swa_attn_metadata,
-                                             "query_start_loc")
-            swa_request_distribution = _get_field(swa_attn_metadata,
-                                                  "request_distribution")
+            swa_query_start_loc = _get_field(swa_attn_metadata, "query_start_loc")
+            swa_request_distribution = _get_field(
+                swa_attn_metadata, "request_distribution"
+            )
         else:
             swa_seq_lens = None
             swa_block_tables = None
@@ -612,21 +642,26 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                 # Clone tensor handle so XLA traces distinct operands for signature matching.
                 main_cache_kv = sw_cache.clone()
             m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
-            main_kv_lens = m_seq_lens // self.compress_ratio if m_seq_lens is not None else None
+            main_kv_lens = (
+                m_seq_lens // self.compress_ratio if m_seq_lens is not None else None
+            )
             main_page_indices = _get_field(main_attn_metadata, "block_tables")
             main_cu_q_lens = _get_field(main_attn_metadata, "query_start_loc")
-            main_distribution = _get_field(main_attn_metadata,
-                                           "request_distribution")
+            main_distribution = _get_field(main_attn_metadata, "request_distribution")
         else:
             main_cache_kv = sw_cache.clone()
-            main_kv_lens = swa_seq_lens.clone(
-            ) if swa_seq_lens is not None else None
-            main_page_indices = swa_block_tables.clone(
-            ) if swa_block_tables is not None else None
-            main_cu_q_lens = swa_query_start_loc.clone(
-            ) if swa_query_start_loc is not None else None
-            main_distribution = swa_request_distribution.clone(
-            ) if swa_request_distribution is not None else None
+            main_kv_lens = swa_seq_lens.clone() if swa_seq_lens is not None else None
+            main_page_indices = (
+                swa_block_tables.clone() if swa_block_tables is not None else None
+            )
+            main_cu_q_lens = (
+                swa_query_start_loc.clone() if swa_query_start_loc is not None else None
+            )
+            main_distribution = (
+                swa_request_distribution.clone()
+                if swa_request_distribution is not None
+                else None
+            )
 
         if is_csa:
             assert topk_indices is not None
@@ -651,8 +686,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             self.attn_sink,
         )
         if is_csa:
-            main_cache_rope = self._as_kernel_cache_view(
-                _live_cache(rope_entry))
+            main_cache_rope = self._as_kernel_cache_view(_live_cache(rope_entry))
             if main_cache_rope is None:
                 if _live_cache(nope_entry) is not None:
                     # Not the profiling pass -- the compressed-KV array is
@@ -664,17 +698,21 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                         "compressed-KV array but no companion RoPE array. "
                         "The runner binds them as a (nope, rope) pair on this "
                         "layer's `kv_cache`; got "
-                        f"{type(kv_entry).__name__}.")
+                        f"{type(kv_entry).__name__}."
+                    )
                 # Profiling pass: shapes are placeholders and the kernel is
                 # skipped. Clone rather than alias -- XLA dedupes identical
                 # inputs into one operand and desyncs the declared signature.
                 main_cache_rope = main_cache_kv.clone()
-            operands += (main_cache_rope, )
+            operands += (main_cache_rope,)
 
         output, new_sw_cache = self.attn_op(*operands)
 
-        if orig_sw_cache is not None and new_sw_cache is not None and new_sw_cache.numel(
-        ) > 0:
+        if (
+            orig_sw_cache is not None
+            and new_sw_cache is not None
+            and new_sw_cache.numel() > 0
+        ):
             orig_sw_cache.copy_(new_sw_cache)
 
         return output
@@ -715,15 +753,17 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         """
         del act_dtype
         weight = self.wo_a.weight
-        transposed = (self.n_local_heads * self.head_dim //
-                      self.n_local_groups,
-                      self.n_local_groups * self.o_lora_rank)
+        transposed = (
+            self.n_local_heads * self.head_dim // self.n_local_groups,
+            self.n_local_groups * self.o_lora_rank,
+        )
         if tuple(weight.shape) == transposed:
             # Already done -- a reload path can run this hook twice.
             return
         assert tuple(weight.shape) == transposed[::-1], (
             f"{self.prefix}.wo_a: expected the linear to hold "
-            f"{list(transposed[::-1])}, got {list(weight.shape)}.")
+            f"{list(transposed[::-1])}, got {list(weight.shape)}."
+        )
 
         out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
         out.copy_(weight.data.t())
@@ -744,17 +784,22 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         assert weight.dtype == torch.float8_e4m3fn, (
             f"{self.prefix}.wo_a: the fused o-projection kernel needs an "
             f"fp8_e4m3fn weight, got {weight.dtype}. Check "
-            "REQUANTIZE_WEIGHT_DTYPE and that the checkpoint is fp8.")
+            "REQUANTIZE_WEIGHT_DTYPE and that the checkpoint is fp8."
+        )
 
         # Per-output-channel scales only. The blockwise requantization path
         # (ENABLE_QUANTIZED_MATMUL_KERNEL + REQUANTIZE_BLOCK_SIZE) reshapes
         # this to [n_in_blocks, 1, n_out], which the kernel cannot consume.
-        assert scale is not None and scale.ndim == 1 and scale.shape[0] == (
-            weight.shape[-1]), (
-                f"{self.prefix}.wo_a: the fused o-projection kernel needs a "
-                f"per-channel weight_scale of shape [{weight.shape[-1]}], got "
-                f"{None if scale is None else list(scale.shape)}. Unset "
-                "REQUANTIZE_BLOCK_SIZE.")
+        assert (
+            scale is not None
+            and scale.ndim == 1
+            and scale.shape[0] == (weight.shape[-1])
+        ), (
+            f"{self.prefix}.wo_a: the fused o-projection kernel needs a "
+            f"per-channel weight_scale of shape [{weight.shape[-1]}], got "
+            f"{None if scale is None else list(scale.shape)}. Unset "
+            "REQUANTIZE_BLOCK_SIZE."
+        )
 
         # `wo_a` is applied per group, and the kernel assumes one group's
         # heads fill exactly one sublane.
@@ -762,29 +807,32 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         heads_per_group = self.n_local_heads // self.n_local_groups
         assert heads_per_group == 8, (
             f"{self.prefix}.wo_a: the fused o-projection kernel assumes 8 "
-            f"heads per group, got {heads_per_group}.")
+            f"heads per group, got {heads_per_group}."
+        )
 
         # Lane/rotation constraints of the kernel and its cos/sin gather.
         assert self.head_dim % 128 == 0, (
             f"{self.prefix}.wo_a: head_dim {self.head_dim} is not a multiple "
-            "of the 128-lane width.")
+            "of the 128-lane width."
+        )
         rotary_dim = self.rotary_emb.cos_sin_cache.shape[-1]
         assert rotary_dim % 2 == 0 and rotary_dim <= 128, (
-            f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at "
-            "most 128.")
+            f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
+        )
 
-    def _o_proj(self, o: torch.Tensor,
-                positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.
         assert o.dtype == torch.bfloat16, (
             f"{self.prefix}: the fused o-projection kernel needs bf16 "
-            f"activations, got {o.dtype}.")
+            f"activations, got {o.dtype}."
+        )
         assert o.shape[1:] == (self.n_local_heads, self.head_dim), (
             f"{self.prefix}: the fused o-projection kernel consumes the heads "
             f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
-            f"got {list(o.shape)}.")
+            f"got {list(o.shape)}."
+        )
         z = self.o_proj_op(
             o,
             positions,
@@ -810,7 +858,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         qr_kv, indexer_weights = self.attn_gemm(hidden_states)
 
         qr, kv = qr_kv.split(
-            [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1)
+            [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
+        )
         qr = self.q_norm(qr)
         kv = self.kv_norm(kv)
 

@@ -25,10 +25,14 @@ import torch
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    cp_global_to_local, cp_owner_rank)
-from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
-                                                      KVCacheType,
-                                                      SparseMLAKVCacheSpec)
+    cp_global_to_local,
+    cp_owner_rank,
+)
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout,
+    KVCacheType,
+    SparseMLAKVCacheSpec,
+)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
 from vllm_torchtpu.layers.core import attention_interface
@@ -51,8 +55,7 @@ class _FakeGroup:
         total = None
         for rank in range(self.world_size):
             peer = _FakeGroup(self._outputs, self._lses, rank)
-            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank],
-                                         peer)
+            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank], peer)
             total = term if total is None else total + term
         return total.to(dtype)
 
@@ -71,11 +74,13 @@ def _merge_as_rank(outputs, lses, rank, monkeypatch):
 
 def _merge_whole(outputs, lses, monkeypatch):
     """The full merged tensor, reassembled from every rank's scatter block"""
-    return torch.cat([
-        _merge_as_rank(outputs, lses, rank, monkeypatch)
-        for rank in range(outputs.shape[0])
-    ],
-                     dim=1)
+    return torch.cat(
+        [
+            _merge_as_rank(outputs, lses, rank, monkeypatch)
+            for rank in range(outputs.shape[0])
+        ],
+        dim=1,
+    )
 
 
 def _reference_merge(outputs, lses):
@@ -94,10 +99,11 @@ def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
     """Per-rank partials"""
     heads = dcp_size * local_heads
     outputs = torch.from_numpy(
-        rng.standard_normal(
-            (dcp_size, tokens, heads, vdim)).astype(np.float32))
-    lses = torch.from_numpy((rng.standard_normal(
-        (dcp_size, tokens, heads)) * 4).astype(np.float32))
+        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
+    )
+    lses = torch.from_numpy(
+        (rng.standard_normal((dcp_size, tokens, heads)) * 4).astype(np.float32)
+    )
     for rank, token in empty:
         lses[rank, token] = float("-inf")
     return outputs, lses
@@ -107,10 +113,9 @@ def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
 def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
     outputs, lses = _partials(np.random.default_rng(20260907), dcp_size)
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
-    np.testing.assert_allclose(got,
-                               _reference_merge(outputs, lses),
-                               rtol=1e-5,
-                               atol=1e-5)
+    np.testing.assert_allclose(
+        got, _reference_merge(outputs, lses), rtol=1e-5, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
@@ -118,16 +123,15 @@ def test_each_rank_gets_its_own_block_of_one_answer(rank, monkeypatch):
     """The rank index must only select which head block comes back -- never
     change the arithmetic that produced it."""
     local_heads = 3
-    outputs, lses = _partials(np.random.default_rng(11),
-                              4,
-                              local_heads=local_heads)
+    outputs, lses = _partials(np.random.default_rng(11), 4, local_heads=local_heads)
     got = _merge_as_rank(outputs, lses, rank, monkeypatch).numpy()
     reference = _reference_merge(outputs, lses)
-    np.testing.assert_allclose(got,
-                               reference[:, rank * local_heads:(rank + 1) *
-                                         local_heads],
-                               rtol=1e-5,
-                               atol=1e-5)
+    np.testing.assert_allclose(
+        got,
+        reference[:, rank * local_heads : (rank + 1) * local_heads],
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_ranks_owning_nothing_are_excluded(monkeypatch):
@@ -137,10 +141,7 @@ def test_ranks_owning_nothing_are_excluded(monkeypatch):
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
     # Token 3 is owned by rank 0 alone, so the merge must return rank 0's
     # output there verbatim.
-    np.testing.assert_allclose(got[3],
-                               outputs[0, 3].numpy(),
-                               rtol=1e-6,
-                               atol=1e-6)
+    np.testing.assert_allclose(got[3], outputs[0, 3].numpy(), rtol=1e-6, atol=1e-6)
 
 
 def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
@@ -175,15 +176,16 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
     applies the wrong up-projection.
     """
     rng = np.random.default_rng(31)
-    per_rank = torch.from_numpy(
-        rng.standard_normal((4, 6, 3, 8)).astype(np.float32))
-    monkeypatch.setattr(cp_mla, "get_dcp_group",
-                        lambda: _HeadGatherGroup(per_rank, rank))
+    per_rank = torch.from_numpy(rng.standard_normal((4, 6, 3, 8)).astype(np.float32))
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: _HeadGatherGroup(per_rank, rank)
+    )
 
     got = cp_mla.all_gather_heads(per_rank[rank])
     assert got.shape == (6, 12, 8)
-    np.testing.assert_array_equal(got[:, rank * 3:(rank + 1) * 3].numpy(),
-                                  per_rank[rank].numpy())
+    np.testing.assert_array_equal(
+        got[:, rank * 3 : (rank + 1) * 3].numpy(), per_rank[rank].numpy()
+    )
 
 
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
@@ -195,8 +197,7 @@ def test_head_gather_is_a_noop_without_a_group(monkeypatch):
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     out = torch.ones(2, 3, 4)
-    assert cp_mla.merge_lse_partials_scatter_heads(out, torch.zeros(2,
-                                                                    3)) is out
+    assert cp_mla.merge_lse_partials_scatter_heads(out, torch.zeros(2, 3)) is out
 
 
 def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
@@ -219,12 +220,11 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
         m = s.max(-1)
         e = np.exp(s - m[..., None])
         lses[r] = m + np.log(e.sum(-1))
-        outs[r] = np.einsum("tnk,kd->tnd", e / e.sum(-1, keepdims=True),
-                            v[r::dcp_size])
+        outs[r] = np.einsum("tnk,kd->tnd", e / e.sum(-1, keepdims=True), v[r::dcp_size])
 
     got = _merge_whole(
-        torch.from_numpy(outs).float(),
-        torch.from_numpy(lses).float(), monkeypatch).numpy()
+        torch.from_numpy(outs).float(), torch.from_numpy(lses).float(), monkeypatch
+    ).numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -241,7 +241,8 @@ def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     """Every position has exactly one owner, and every rank is an owner."""
     n = 5 * dcp_size * interleave_c + 3
     owners = np.asarray(
-        cp_owner_rank(jnp.arange(n, dtype=jnp.int32), dcp_size, interleave_c))
+        cp_owner_rank(jnp.arange(n, dtype=jnp.int32), dcp_size, interleave_c)
+    )
     assert owners.min() >= 0 and owners.max() < dcp_size
     assert set(owners.tolist()) == set(range(dcp_size))
 
@@ -257,8 +258,8 @@ def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     """
     cycle = dcp_size * interleave_c
     owners = np.asarray(
-        cp_owner_rank(jnp.arange(3 * cycle, dtype=jnp.int32), dcp_size,
-                      interleave_c))
+        cp_owner_rank(jnp.arange(3 * cycle, dtype=jnp.int32), dcp_size, interleave_c)
+    )
     counts = np.bincount(owners, minlength=dcp_size)
     assert (counts == 3 * interleave_c).all()
 
@@ -287,12 +288,22 @@ PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
 
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
-NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
-                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
-                                        PAGE_SIZE, LKV_DIM, KV_PACKING)
-ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
-                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
-                                        PAGE_SIZE, ROPE_DIM, KV_PACKING)
+NOPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE,
+    KVCacheLayout.TENSORCORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    LKV_DIM,
+    KV_PACKING,
+)
+ROPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE,
+    KVCacheLayout.TENSORCORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    ROPE_DIM,
+    KV_PACKING,
+)
 
 DCP_TOKENS = 64  # multiple of TOKEN_PAD, fits PAGES_PER_SEQ * PAGE_SIZE
 DCP_TOPK = 64
@@ -304,8 +315,10 @@ DCP_INTERLEAVE_C = 4
 
 def _empty_pair():
     """Zeroed (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
-            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype))
+    return (
+        jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
+        jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype),
+    )
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -321,12 +334,11 @@ def _causal_topk(positions: list[int], topk: int) -> np.ndarray:
     rows = np.full((len(positions), topk), -1, np.int32)
     for i, pos in enumerate(positions):
         assert pos + 1 <= topk
-        rows[i, :pos + 1] = np.arange(pos + 1)
+        rows[i, : pos + 1] = np.arange(pos + 1)
     return rows
 
 
-def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int,
-                         interleave_c: int):
+def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int, interleave_c: int):
     """Partition each token's top-k list by the position's owning DCP rank"""
     num_tokens, topk = topk_rows.shape
     shards = np.full((dcp_size, num_tokens, topk), -1, np.int32)
@@ -336,15 +348,16 @@ def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int,
         for r in range(dcp_size):
             sel = row[(row // interleave_c) % dcp_size == r]
             counts[r, t] = sel.size
-            shards[r, t, :sel.size] = sel
+            shards[r, t, : sel.size] = sel
             if sel.size == 0:
                 shards[r, t, 0] = 0  # dummy; masked by `counts` at merge time
     return shards, counts
 
 
-def _merge_partials(outs: np.ndarray, lses: np.ndarray,
-                    counts: np.ndarray) -> np.ndarray:
-    """`o = sum_r softmax_r(lse) * o_r` over the DCP axis, in f32 """
+def _merge_partials(
+    outs: np.ndarray, lses: np.ndarray, counts: np.ndarray
+) -> np.ndarray:
+    """`o = sum_r softmax_r(lse) * o_r` over the DCP axis, in f32"""
     lses = np.where(counts[:, :, None] > 0, lses, -np.inf)
     shift = lses.max(0, keepdims=True)
     # A token no shard owns would give 0/0; it cannot occur for a real top-k
@@ -353,8 +366,9 @@ def _merge_partials(outs: np.ndarray, lses: np.ndarray,
     shift = np.where(all_empty, 0.0, shift)
     weights = np.exp(lses - shift[0])  # [D, T, N]
     denom = weights.sum(0)
-    weights = np.where(denom[None] > 0,
-                       weights / np.where(denom == 0, 1, denom)[None], 0.0)
+    weights = np.where(
+        denom[None] > 0, weights / np.where(denom == 0, 1, denom)[None], 0.0
+    )
     return (weights[..., None] * outs).sum(0)
 
 
@@ -372,22 +386,27 @@ class SparseMlaLseTest(parameterized.TestCase):
 
     def _prefilled(self):
         """One prefilled sequence: populated caches plus kernel-ready inputs."""
-        kv_c = self.rng.standard_normal(
-            (DCP_TOKENS, LKV_DIM)).astype(np.float32)
-        k_pe = self.rng.standard_normal(
-            (DCP_TOKENS, ROPE_DIM)).astype(np.float32)
+        kv_c = self.rng.standard_normal((DCP_TOKENS, LKV_DIM)).astype(np.float32)
+        k_pe = self.rng.standard_normal((DCP_TOKENS, ROPE_DIM)).astype(np.float32)
         kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
         k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
-        ql_nope = jnp.asarray(self.rng.standard_normal(
-            (DCP_TOKENS, NUM_HEADS, LKV_DIM)).astype(np.float32),
-                              dtype=jnp.bfloat16)
-        q_pe = jnp.asarray(self.rng.standard_normal(
-            (DCP_TOKENS, NUM_HEADS, ROPE_DIM)).astype(np.float32),
-                           dtype=jnp.bfloat16)
+        ql_nope = jnp.asarray(
+            self.rng.standard_normal((DCP_TOKENS, NUM_HEADS, LKV_DIM)).astype(
+                np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
+        q_pe = jnp.asarray(
+            self.rng.standard_normal((DCP_TOKENS, NUM_HEADS, ROPE_DIM)).astype(
+                np.float32
+            ),
+            dtype=jnp.bfloat16,
+        )
         topk_rows = _causal_topk(list(range(DCP_TOKENS)), DCP_TOPK)
         block_tables = jnp.asarray(
-            self.rng.permutation(TOTAL_PAGES)[:PAGES_PER_SEQ], dtype=jnp.int32)
-        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+            self.rng.permutation(TOTAL_PAGES)[:PAGES_PER_SEQ], dtype=jnp.int32
+        )
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
 
         # Run the layer once purely to insert this step's rows into the caches;
         # every assertion below then drives the kernel directly, because
@@ -407,7 +426,8 @@ class SparseMlaLseTest(parameterized.TestCase):
             NOPE_SPEC,
             ROPE_SPEC,
             sm_scale=self.sm_scale,
-            k_scale=self.k_scale)
+            k_scale=self.k_scale,
+        )
 
         return dict(
             q=jnp.concatenate([ql_nope, q_pe], axis=-1),
@@ -457,18 +477,14 @@ class SparseMlaLseTest(parameterized.TestCase):
             m = scores.max(-1)
             expected[t] = m + np.log(np.exp(scores - m[:, None]).sum(-1))
 
-        np.testing.assert_allclose(np.asarray(lse),
-                                   expected,
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(np.asarray(lse), expected, rtol=2e-2, atol=2e-2)
 
     @parameterized.named_parameters(
         dict(testcase_name="d2", dcp_size=2),
         dict(testcase_name="d4", dcp_size=4),
         dict(testcase_name="d8", dcp_size=8),
     )
-    def test_merging_position_sharded_partials_reproduces_the_whole(
-            self, dcp_size):
+    def test_merging_position_sharded_partials_reproduces_the_whole(self, dcp_size):
         """The core DCP claim, at the kernel boundary.
 
         Splitting a token's top-k across ranks by KV *position* and merging the
@@ -478,13 +494,16 @@ class SparseMlaLseTest(parameterized.TestCase):
         """
         inp = self._prefilled()
         whole = np.asarray(
-            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32)
+        )
 
-        shards, counts = _shard_topk_by_owner(inp["topk_rows"], dcp_size,
-                                              DCP_INTERLEAVE_C)
+        shards, counts = _shard_topk_by_owner(
+            inp["topk_rows"], dcp_size, DCP_INTERLEAVE_C
+        )
         self.assertTrue(
             (counts.sum(0) == (inp["topk_rows"] >= 0).sum(-1)).all(),
-            "the shard split must partition the top-k list exactly")
+            "the shard split must partition the top-k list exactly",
+        )
 
         outs, lses = [], []
         for r in range(dcp_size):
@@ -503,19 +522,26 @@ class SparseMlaLseTest(parameterized.TestCase):
         """
         inp = self._prefilled()
         whole = np.asarray(
-            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32)
+        )
         out, lse = self._attend(inp, inp["topk_rows"], True)
 
         # Two shards: one holds the entire list, the other holds nothing.
         empty_rows = np.full_like(inp["topk_rows"], -1)
         empty_rows[:, 0] = 0
         out_e, lse_e = self._attend(inp, empty_rows, True)
-        counts = np.stack([(inp["topk_rows"] >= 0).sum(-1),
-                           np.zeros(DCP_TOKENS, np.int32)])
+        counts = np.stack(
+            [(inp["topk_rows"] >= 0).sum(-1), np.zeros(DCP_TOKENS, np.int32)]
+        )
 
         merged = _merge_partials(
-            np.stack([
-                np.asarray(out.astype(jnp.float32)),
-                np.asarray(out_e.astype(jnp.float32))
-            ]), np.stack([np.asarray(lse), np.asarray(lse_e)]), counts)
+            np.stack(
+                [
+                    np.asarray(out.astype(jnp.float32)),
+                    np.asarray(out_e.astype(jnp.float32)),
+                ]
+            ),
+            np.stack([np.asarray(lse), np.asarray(lse_e)]),
+            counts,
+        )
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)

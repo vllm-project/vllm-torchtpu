@@ -48,12 +48,37 @@ WIDEN_KCHUNK = 512
 # How far ahead of the expert being computed the next weight refill goes
 # out: at expert e's head the kernel issues the refill for expert e + 2.
 # Two is a schedule choice -- one refill in flight per weight buffer, one
-# expert of slack -- not a hardware fact.
-WEIGHT_PREFETCH_DISTANCE = 2
-# Weight buffer slots. A refill writes its slot while the readers of the
-# prefetch distance's worth of earlier experts are still live, so the slot
-# count has to exceed the distance for all of them to stay distinct.
-NBUF = WEIGHT_PREFETCH_DISTANCE + 1
+# expert of slack -- not a hardware fact, which is why it is tunable.
+#
+# It is the CEILING a build starts from, not the distance a build runs at.
+# Every slot of runway is a whole expert's weights held in VMEM, so whether
+# a shape can afford the distance is a property of THAT SHAPE and not of the
+# schedule: `fit_weight_slots` starts here and steps the distance down one
+# at a time until the build's buffers fit under the budget.
+#
+# Zero is the useful other end: no runway at all, one weight slot, an expert
+# starting its own weights at its head and waiting on them.
+MAX_WEIGHT_PREFETCH_DISTANCE = 2
+
+
+def nbuf_for(distance):
+    """Weight buffer slots a prefetch distance needs.
+
+    A refill writes its slot while the readers of the prefetch distance's
+    worth of earlier experts are still live, so the slot count has to exceed
+    the distance for all of them to stay distinct. At distance zero there are
+    no earlier readers to stay clear of and the one slot is the expert's own.
+
+    This relation IS what a distance costs, and it is written once here
+    rather than at each build, because the two numbers travel together
+    everywhere: a build that lowered one and kept the other would either
+    overwrite a slab a live reader is still contracting against or pay VMEM
+    for a slot nothing addresses.
+    """
+    return distance + 1
+
+
+MAX_NBUF = nbuf_for(MAX_WEIGHT_PREFETCH_DISTANCE)
 # Every transport moves whole blocks of this many rows; dynamic DMA offsets
 # are block-aligned. It is also the padding each (expert, dest) run rounds up
 # to, so it sets how many rows the gather fetches, the FFN computes and the
@@ -76,7 +101,7 @@ TOKEN_GATHER_TILES_PER_WINDOW = 1
 # and needs one extra HBM tile of overfetch.
 TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
 # The most of those blocks the kernel's row staging holds.
-HIDDEN_MAX_BLOCKS = 32
+HIDDEN_MAX_BLOCKS = 64
 # The share of the chip's VMEM the kernel may claim.
 VMEM_FRACTION = 0.98
 # The routing tables pack an arrival position and an alignment slot into
@@ -1232,9 +1257,16 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
     ).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
-def vmem_limit():
-    """VMEM budget for the kernel, read from this generation's capacity."""
-    return int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_FRACTION)
+def vmem_limit(info=None):
+    """VMEM budget for the kernel, read from this generation's capacity.
+
+    Takes the device record the rest of the accounting already holds, so a
+    caller sizing several candidate builds against one budget reads the
+    device once rather than once per candidate.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
 # The oldest chip generation this kernel has been built and measured on.
@@ -1318,7 +1350,7 @@ def vmem_scratch_arrays(
     hidden,
     inter,
     *,
-    nbuf=NBUF,
+    nbuf,
     weight_format=WeightFormat.FP8,
     rhs_qb=QB4,
     has_w1_bias=False,
@@ -1347,16 +1379,17 @@ def vmem_scratch_arrays(
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
-    # Every local expert's scale table is resident. At four-bit block scales
-    # that makes the two scale tables some of the largest buffers here.
+    # A scale table rides the weight slots, not the expert list: it is read
+    # only alongside the slab it scales, so it is staged with that slab and
+    # is nbuf deep.
     if weight_format == WeightFormat.FP4:
         # Four-bit weights stream as PACKED u32 words ([K/8, N]), so the
         # transfer moves half the bytes an eight-bit slab would.
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (g_local, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (g_local, inter // rhs_qb, hidden), jnp.float32),
+            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
+            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
         weights = [
@@ -1365,8 +1398,8 @@ def vmem_scratch_arrays(
         ]
         if form.has_scales:
             weights += [
-                ("w1s_vm", (g_local, 2 * inter), jnp.float32),
-                ("w2s_vm", (g_local, hidden), jnp.float32),
+                ("w1s_vm", (nbuf, 2 * inter), jnp.float32),
+                ("w2s_vm", (nbuf, hidden), jnp.float32),
             ]
     # The optional expert biases are resident for every local expert, one
     # row per expert on each matmul's output channels. They carry no block
@@ -1486,7 +1519,7 @@ def vmem_estimate_bytes(
     capacity,
     hidden,
     inter,
-    nbuf=NBUF,
+    nbuf,
     weight_format=WeightFormat.FP8,
     rhs_qb=QB4,
     has_w1_bias=False,
@@ -1522,3 +1555,87 @@ def vmem_estimate_bytes(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
+
+
+class WeightSlots(NamedTuple):
+    """The weight-slot schedule one build runs at, and what it costs.
+
+    `distance` is how far ahead of the computing expert a refill goes out,
+    `nbuf` the slots that distance needs, `vmem_bytes` what the whole build
+    comes to at that depth and `limit` the budget it was measured against.
+    """
+
+    distance: int
+    nbuf: int
+    vmem_bytes: int
+    limit: int
+
+    @property
+    def fits(self):
+        """Whether the build at this depth is inside the budget."""
+        return self.vmem_bytes <= self.limit
+
+
+def fit_weight_slots(
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    *,
+    max_distance=MAX_WEIGHT_PREFETCH_DISTANCE,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    info=None,
+    limit=None,
+):
+    """The deepest prefetch schedule this shape's VMEM leaves room for.
+
+    The weight slabs are the only buffer sized by the schedule rather than
+    by the model: they are `nbuf` copies of one expert, and `nbuf` is ours
+    to pick. So a shape that misses at the ceiling often fits one slot
+    shallower. Walk down a slot at a time rather than dropping to zero --
+    even distance one keeps a refill in flight, which is most of the win.
+
+    Distance zero has nothing left to give back. A shape still over budget
+    there is returned NOT FITTING rather than raised on, carrying the
+    distance-zero figures for the builder to quote in its refusal.
+
+    Queries the device record once and reuses it for every candidate.
+    """
+    if max_distance < 0:
+        raise ValueError(
+            f"the maximum prefetch distance is {max_distance}; a negative "
+            "distance is not a schedule, and zero already means no "
+            "prefetching"
+        )
+    if info is None:
+        info = pltpu.get_tpu_info()
+    if limit is None:
+        limit = vmem_limit(info)
+    slots = None
+    for distance in range(max_distance, -1, -1):
+        nbuf = nbuf_for(distance)
+        slots = WeightSlots(
+            distance,
+            nbuf,
+            vmem_estimate_bytes(
+                g_local,
+                capacity,
+                hidden,
+                inter,
+                nbuf=nbuf,
+                weight_format=weight_format,
+                rhs_qb=rhs_qb,
+                has_w1_bias=has_w1_bias,
+                has_w2_bias=has_w2_bias,
+                info=info,
+            ),
+            limit,
+        )
+        if slots.fits:
+            break
+    # The first depth that fits, or distance zero over budget for the
+    # caller to refuse by name.
+    return slots

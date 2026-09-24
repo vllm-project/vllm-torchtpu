@@ -67,7 +67,7 @@ def main_kernel(
     # A `bf16[n, 64]` output is tiled T(8,128), so XLA pads it to 128 lanes and
     # it costs twice its own bytes -- on this kernel's write and on the
     # consumer's read. The output is 128 lanes wide instead, pairing entry `i`
-    # of each `rope_period` with entry `i + rope_period // 2`, which the
+    # of each `top_k` with entry `i + top_k // 2`, which the
     # consumer splits apart with a lane slice and a row concatenate.
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
     half_streams = num_streams // 2
@@ -220,14 +220,14 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("rope_period",))
+@functools.partial(jax.jit, static_argnames=("top_k",))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
     num_valid_indices: jax.Array | None = None,
     *,
-    rope_period: int = 1024,
+    top_k: int = 1024,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -239,18 +239,18 @@ def csa_gather(
       indices: (N,) int32. Token indices into the caches.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
         gather. Subcores assigned to indices beyond this count skip gathering.
-      rope_period: the consumer's row block (the attention kernel's top-k).
-        `rope_out` pairs entry i of a period with entry i + rope_period // 2.
+      top_k: the consumer's row block (the attention kernel's top-k). `rope_out`
+        pairs entry i of a period with entry i + top_k // 2.
 
     Returns:
       nope_out: (N, 4, 128) uint8.
         Each (4, 128) uint8 is token's nope. It will be flattened to (1, 512)
         downstream.
       rope_out: (N // 2, 128) bf16.
-        Row `period * (rope_period // 2) + i` holds entry i of that period in
-        lanes 0:64 and entry i + rope_period // 2 in lanes 64:128 -- 128 lanes
+        Row `period * (top_k // 2) + i` holds entry i of that period in
+        lanes 0:64 and entry i + top_k // 2 in lanes 64:128 -- 128 lanes
         so XLA does not pad the buffer to twice its size. The consumer restores
-        (rope_period, 64) with
+        (top_k, 64) with
         `jnp.concatenate([row[:, :64], row[:, 64:]], axis=0)`.
     """
     assert indices.ndim == 1, "Indices must be 1D."
@@ -283,10 +283,10 @@ def csa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    assert rope_period % row_subchunk_size == 0, (
-        f"{rope_period=} must be a multiple of {row_subchunk_size=}."
+    assert top_k % row_subchunk_size == 0, (
+        f"{top_k=} must be a multiple of {row_subchunk_size=}."
     )
-    num_row_subchunks = rope_period // row_subchunk_size
+    num_row_subchunks = top_k // row_subchunk_size
     assert num_row_subchunks % num_streams == 0, (
         f"{num_streams=} must divide {num_row_subchunks=}."
     )

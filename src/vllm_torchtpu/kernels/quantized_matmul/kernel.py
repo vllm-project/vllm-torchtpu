@@ -10,10 +10,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
-    TunedValue, get_device_vmem_limit, get_tuned_block_sizes)
-from vllm_torchtpu.kernels.quantized_matmul.util import (get_kernel_name,
-                                                         next_multiple,
-                                                         unfold_args)
+    TunedValue,
+    get_device_vmem_limit,
+    get_tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    get_kernel_name,
+    next_multiple,
+    unfold_args,
+)
 
 
 def quantize_array(
@@ -54,8 +59,7 @@ def get_vmem_limit(
     x_abs_max_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
     w_q_size = out_block_size * in_block_size * dtypes.itemsize_bits(w_q_dtype)
     w_scale_size = out_block_size * dtypes.itemsize_bits(scale_dtype)
-    out_size = batch_block_size * out_block_size * dtypes.itemsize_bits(
-        out_dtype)
+    out_size = batch_block_size * out_block_size * dtypes.itemsize_bits(out_dtype)
 
     vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
     vmem_in_out *= 2  # Account for compute and vreg spills.
@@ -69,10 +73,8 @@ def get_vmem_limit(
     vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
 
     # Calculate scratch VMEM size.
-    acc_size = batch_block_size * out_block_size * dtypes.itemsize_bits(
-        acc_dtype)
-    x_q_size = batch_block_size * in_block_size * dtypes.itemsize_bits(
-        x_q_dtype)
+    acc_size = batch_block_size * out_block_size * dtypes.itemsize_bits(acc_dtype)
+    x_q_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_q_dtype)
     x_scale_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
 
     vmem_scratch = acc_size if save_acc else 0
@@ -103,29 +105,25 @@ def validate_inputs(
     if x.dtype != x_q_dtype:
         # If the input is quantized, then it should be the same subdtype as w_q
         if jnp.issubdtype(x_q_dtype, jnp.integer) != jnp.issubdtype(
-                w_q.dtype, jnp.integer):
+            w_q.dtype, jnp.integer
+        ):
             raise ValueError(
-                f'{x_q_dtype=} and {w_q.dtype=} must be the same int or float type.'
+                f"{x_q_dtype=} and {w_q.dtype=} must be the same int or float type."
             )
 
     # Verify input shapes.
     if x.shape[1] != w_q.shape[1]:
-        raise ValueError(f'{x.shape[1]=} must be equal to {w_q.shape[1]=}')
+        raise ValueError(f"{x.shape[1]=} must be equal to {w_q.shape[1]=}")
     if w_q.shape[0] != w_scale.shape[1]:
-        raise ValueError(
-            f'{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}')
+        raise ValueError(f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
     if x_abs_max.shape != (1, x.shape[0]):
-        raise ValueError(
-            f'{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})')
+        raise ValueError(f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
     if x.shape[0] % batch_block_size != 0:
-        raise ValueError(
-            f'{x.shape[0]=} must be a multiple of {batch_block_size=}')
+        raise ValueError(f"{x.shape[0]=} must be a multiple of {batch_block_size=}")
     if w_q.shape[0] % out_block_size != 0:
-        raise ValueError(
-            f'{w_q.shape[0]=} must be a multiple of {out_block_size=}')
+        raise ValueError(f"{w_q.shape[0]=} must be a multiple of {out_block_size=}")
     if x.shape[1] % in_block_size != 0:
-        raise ValueError(
-            f'{x.shape[1]=} must be a multiple of {in_block_size=}')
+        raise ValueError(f"{x.shape[1]=} must be a multiple of {in_block_size=}")
 
 
 def matmul_kernel(
@@ -195,14 +193,14 @@ def matmul_kernel(
             acc = jax.lax.dot_general(
                 x_q_tmp,
                 w_q_ref[...],
-                (((1, ), (1, )), ((), ())),
+                (((1,), (1,)), ((), ())),
                 preferred_element_type=acc_dtype,
             )
         else:
             acc = jax.lax.dot_general(
                 x_ref[...],
                 w_q_ref[...],
-                (((1, ), (1, )), ((), ())),
+                (((1,), (1,)), ((), ())),
                 preferred_element_type=acc_dtype,
             )
 
@@ -225,8 +223,8 @@ def matmul_kernel(
 @functools.partial(
     jax.jit,
     static_argnames=[
-        'x_q_dtype',
-        'tuned_value',
+        "x_q_dtype",
+        "tuned_value",
     ],
 )
 def quantized_matmul_kernel(
@@ -241,24 +239,24 @@ def quantized_matmul_kernel(
 ) -> jax.Array:
     """Quantized matmul kernel.
 
-  Args:
-    x: Input unquantized array.
-    w_q: Weight quantized array. [n_output_features, n_input_features]
-    w_scale: Weight quantization scale. [n_output_features]
-    w_zp: Weight zero point for asymmetric quantization.
-    block_size: Block size for subchannel quantization.
-    x_q_dtype: Quantization type of the input. If None or if the value is the
-      same as x.dtype, then no quantization is applied.
-    tuned_value: Kernel tuned values for optimal performance.
+    Args:
+      x: Input unquantized array.
+      w_q: Weight quantized array. [n_output_features, n_input_features]
+      w_scale: Weight quantization scale. [n_output_features]
+      w_zp: Weight zero point for asymmetric quantization.
+      block_size: Block size for subchannel quantization.
+      x_q_dtype: Quantization type of the input. If None or if the value is the
+        same as x.dtype, then no quantization is applied.
+      tuned_value: Kernel tuned values for optimal performance.
 
-  Returns:
-    Quantized matmul result.
-  """
+    Returns:
+      Quantized matmul result.
+    """
 
     if w_zp is not None:
-        raise NotImplementedError('zero_point is not supported.')
+        raise NotImplementedError("zero_point is not supported.")
     if block_size is not None:
-        raise NotImplementedError('block_size is not supported.')
+        raise NotImplementedError("block_size is not supported.")
 
     if x_q_dtype is None:
         x_q_dtype = x.dtype
@@ -292,8 +290,7 @@ def quantized_matmul_kernel(
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
     if orig_n_batch < padded_n_batch:
         x = jnp.pad(x, ((0, padded_n_batch - orig_n_batch), (0, 0)))
-        x_abs_max = jnp.pad(x_abs_max,
-                            ((0, 0), (0, padded_n_batch - orig_n_batch)))
+        x_abs_max = jnp.pad(x_abs_max, ((0, 0), (0, padded_n_batch - orig_n_batch)))
     padded_n_out = next_multiple(orig_n_out, out_block_size)
     if orig_n_out < padded_n_out:
         w_q = jnp.pad(w_q, ((0, padded_n_out - orig_n_out), (0, 0)))
@@ -349,32 +346,36 @@ def quantized_matmul_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((batch_block_size, in_block_size), lambda b, o, i:
-                             (b, i)),  # x
-                pl.BlockSpec((out_block_size, in_block_size), lambda b, o, i:
-                             (o, i)),  # w_q
-                pl.BlockSpec((1, out_block_size), lambda b, o, i:
-                             (0, o)),  # w_scale
-                pl.BlockSpec((1, batch_block_size), lambda b, o, i:
-                             (0, b)),  # x_abs_max
+                pl.BlockSpec(
+                    (batch_block_size, in_block_size), lambda b, o, i: (b, i)
+                ),  # x
+                pl.BlockSpec(
+                    (out_block_size, in_block_size), lambda b, o, i: (o, i)
+                ),  # w_q
+                pl.BlockSpec((1, out_block_size), lambda b, o, i: (0, o)),  # w_scale
+                pl.BlockSpec(
+                    (1, batch_block_size), lambda b, o, i: (0, b)
+                ),  # x_abs_max
             ],
-            out_specs=pl.BlockSpec((batch_block_size, out_block_size),
-                                   lambda b, o, i: (b, o)),
+            out_specs=pl.BlockSpec(
+                (batch_block_size, out_block_size), lambda b, o, i: (b, o)
+            ),
             scratch_shapes=[
                 pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
-                if save_acc else None,  # acc_scratch
+                if save_acc
+                else None,  # acc_scratch
                 pltpu.VMEM((batch_block_size, in_block_size), x_q_dtype)
-                if save_x_q else None,  # x_q_scratch
-                pltpu.VMEM(
-                    (batch_block_size,
-                     1), jnp.float32) if save_x_q else None,  # x_scale_scratch
+                if save_x_q
+                else None,  # x_q_scratch
+                pltpu.VMEM((batch_block_size, 1), jnp.float32)
+                if save_x_q
+                else None,  # x_scale_scratch
             ],
             grid=(n_batch, n_out, n_in),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out),
-                                       x.dtype),
+        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=('parallel', 'arbitrary', 'arbitrary'),
+            dimension_semantics=("parallel", "arbitrary", "arbitrary"),
             vmem_limit_bytes=vmem_limit_bytes,
         ),
     )

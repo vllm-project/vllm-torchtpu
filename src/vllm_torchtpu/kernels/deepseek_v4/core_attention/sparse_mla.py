@@ -879,7 +879,7 @@ def sparse_ragged_paged_attention(
             cache_kv_rope,
             indices,
             num_valid_indices=num_valid_indices,
-            rope_period=topk,
+            top_k=topk,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, -1, 128)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 2, -1)

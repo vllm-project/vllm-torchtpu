@@ -24,34 +24,46 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
-    QwenGatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_utils import \
-    is_conv_state_dim_first
-from vllm.model_executor.layers.quantization.base_config import \
-    QuantizationConfig
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
-                                           get_pcp_rank, get_pcp_world_size)
+from vllm_torchtpu.distributed.pcp import (
+    get_or_create_pcp_mesh,
+    get_pcp_rank,
+    get_pcp_world_size,
+)
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
-    unified_kv_layout_enabled_for_architecture)
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
-    pcp_streaming_jax_op
-from vllm_torchtpu.kernels.gdn.head_geometry import (GdnHeadGeometry,
-                                                     derive_gdn_head_geometry)
+    unified_kv_layout_enabled_for_architecture,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+    pcp_streaming_jax_op,
+)
+from vllm_torchtpu.kernels.gdn.head_geometry import (
+    GdnHeadGeometry,
+    derive_gdn_head_geometry,
+)
 from vllm_torchtpu.layers.adapter.gdn_linear import (
-    GdnColumnParallelLinear, GdnInterleavedColumnParallelLinear)
+    GdnColumnParallelLinear,
+    GdnInterleavedColumnParallelLinear,
+)
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.core.gdn_attention import (
-    run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
+    run_jax_gdn_attention,
+    run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
-    run_jax_gdn_attention_pooled_pcp_prefill_projection)
-from vllm_torchtpu.layers.core.sequence_layout import \
-    is_pcp_streaming_attention_metadata
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    get_vllm_model_wrapper_context
+    run_jax_gdn_attention_pooled_pcp_prefill_projection,
+)
+from vllm_torchtpu.layers.core.sequence_layout import (
+    is_pcp_streaming_attention_metadata,
+)
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -59,8 +71,10 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
         return jnp.dtype(jnp.float32)
     if dtype == torch.bfloat16:
         return jnp.dtype(jnp.bfloat16)
-    raise ValueError(f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
-                     f"{dtype}; expected float32 or bfloat16")
+    raise ValueError(
+        f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
+        f"{dtype}; expected float32 or bfloat16"
+    )
 
 
 def gdn_attention_core_tpu(
@@ -95,7 +109,7 @@ def gdn_attention_core_tpu(
     # (donated) buffer afterwards.
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
+        conv_state_in = conv_state[:, : kernel_size - 1, :]
     else:
         conv_state_in = conv_state
 
@@ -129,8 +143,7 @@ def gdn_attention_core_tpu(
         # longer derives from the donated buffer, defeating the conv-cache
         # input_output_alias (a full-width alloc + copy per GDN layer per step);
         # the dynamic-update-slice keeps the write inside the donated buffer.
-        new_conv_state = conv_state.at[:, :kernel_size -
-                                       1, :].set(new_conv_state)
+        new_conv_state = conv_state.at[:, : kernel_size - 1, :].set(new_conv_state)
 
     return new_conv_state, new_recurrent_state, output
 
@@ -214,37 +227,37 @@ def gdn_attention_core_tpu_pcp_prefill(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
+        conv_state_in = conv_state[:, : kernel_size - 1, :]
     else:
         conv_state_in = conv_state
 
-    (new_conv_state,
-     new_recurrent_state), output = run_jax_gdn_attention_pcp_tp_prefill(
-         mixed_qkv,
-         b,
-         a,
-         conv_state_in,
-         recurrent_state,
-         conv_weight,
-         conv_bias,
-         A_log,
-         dt_bias,
-         state_indices,
-         query_start_loc,
-         distribution,
-         seq_lens,
-         n_kq=n_kq,
-         n_v=n_v,
-         d_k=d_k,
-         d_v=d_v,
-         kernel_size=kernel_size,
-         pcp_size=pcp_size,
-         interleave_size=interleave_size,
-         mesh=mesh,
-     )
+    (new_conv_state, new_recurrent_state), output = (
+        run_jax_gdn_attention_pcp_tp_prefill(
+            mixed_qkv,
+            b,
+            a,
+            conv_state_in,
+            recurrent_state,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            state_indices,
+            query_start_loc,
+            distribution,
+            seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            mesh=mesh,
+        )
+    )
     if state_len > kernel_size - 1:
-        new_conv_state = conv_state.at[:, :kernel_size -
-                                       1, :].set(new_conv_state)
+        new_conv_state = conv_state.at[:, : kernel_size - 1, :].set(new_conv_state)
     return new_conv_state, new_recurrent_state, output
 
 
@@ -265,8 +278,9 @@ def _localize_gdn_mamba_spec_for_pcp(
     if pcp_size <= 1 or len(spec.shapes) != 2:
         return spec
     if is_conv_state_dim_first():
-        raise NotImplementedError("TPU GDN PCP state sharding requires "
-                                  "VLLM_SSM_CONV_STATE_LAYOUT=SD.")
+        raise NotImplementedError(
+            "TPU GDN PCP state sharding requires VLLM_SSM_CONV_STATE_LAYOUT=SD."
+        )
 
     conv_shape = tuple(spec.shapes[0])
     recurrent_shape = tuple(spec.shapes[1])
@@ -278,14 +292,18 @@ def _localize_gdn_mamba_spec_for_pcp(
     if conv_shape[-1] != expected_conv_dim:
         raise ValueError(
             "GDN MambaSpec conv width does not match its TP-local heads: "
-            f"shape={conv_shape}, expected_width={expected_conv_dim}.")
+            f"shape={conv_shape}, expected_width={expected_conv_dim}."
+        )
     if recurrent_shape[0] != num_v_heads:
-        raise ValueError("GDN MambaSpec recurrent heads do not match its "
-                         f"TP-local V heads: shape={recurrent_shape}, "
-                         f"expected_heads={num_v_heads}.")
+        raise ValueError(
+            "GDN MambaSpec recurrent heads do not match its "
+            f"TP-local V heads: shape={recurrent_shape}, "
+            f"expected_heads={num_v_heads}."
+        )
 
     unpadded_page_size = dataclasses.replace(
-        spec, page_size_padded=None).page_size_bytes
+        spec, page_size_padded=None
+    ).page_size_bytes
     page_size_padded = spec.page_size_padded
     if page_size_padded == unpadded_page_size:
         page_size_padded = None
@@ -299,7 +317,6 @@ def _localize_gdn_mamba_spec_for_pcp(
 
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
@@ -314,30 +331,37 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
-        self.gdn_pcp_op = (self._build_gdn_op(
-            pcp_streaming=True) if pcp_enabled else None)
-        self.gdn_pooled_pcp_op = (self._build_pooled_pcp_gdn_op()
-                                  if pcp_enabled else None)
+        self.gdn_pcp_op = (
+            self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
+        )
+        self.gdn_pooled_pcp_op = (
+            self._build_pooled_pcp_gdn_op() if pcp_enabled else None
+        )
 
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
-        return derive_gdn_head_geometry(self.num_k_heads, self.num_v_heads,
-                                        self.tp_size)
+        return derive_gdn_head_geometry(
+            self.num_k_heads, self.num_v_heads, self.tp_size
+        )
 
-    def create_qkvz_proj(self, hidden_size: int, key_dim: int, value_dim: int,
-                         quant_config: QuantizationConfig | None,
-                         prefix: str) -> MergedColumnParallelLinear:
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
         if self.gqa_interleaved_layout:
             group_v = self.num_v_heads // self.num_k_heads * self.head_v_dim
             return GdnInterleavedColumnParallelLinear(
                 input_size=hidden_size,
                 geometry=self.tp_head_geometry,
-                group_sizes=[
-                    self.head_k_dim, self.head_k_dim, group_v, group_v
-                ],
+                group_sizes=[self.head_k_dim, self.head_k_dim, group_v, group_v],
                 replicated_segments=[True, True, False, False],
                 quant_config=quant_config,
-                prefix=prefix)
+                prefix=prefix,
+            )
         return GdnColumnParallelLinear(
             input_size=hidden_size,
             geometry=self.tp_head_geometry,
@@ -348,9 +372,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             prefix=prefix,
         )
 
-    def create_ba_proj(self, hidden_size: int, num_v_heads: int,
-                       quant_config: QuantizationConfig | None,
-                       prefix: str) -> MergedColumnParallelLinear:
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
         if self.gqa_interleaved_layout:
             group_v = num_v_heads // self.num_k_heads
             return GdnInterleavedColumnParallelLinear(
@@ -359,9 +387,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 group_sizes=[group_v, group_v],
                 replicated_segments=[False, False],
                 quant_config=quant_config,
-                prefix=prefix)
-        return super().create_ba_proj(hidden_size, num_v_heads, quant_config,
-                                      prefix)
+                prefix=prefix,
+            )
+        return super().create_ba_proj(hidden_size, num_v_heads, quant_config, prefix)
 
     def _create_conv1d(self) -> None:
         # Upstream constructs conv1d directly and installs its Mamba loader
@@ -394,8 +422,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(
-                self.model_config.architecture):
+        if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
             # Declare exactly what the pool physically stores. vLLM sizes the
             # mamba page from the dtype declared HERE and asserts the padded
             # page covers it, while the block-slot derivation budgets the page
@@ -404,8 +431,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # disagreed once and every hybrid GDN engine failed to start on
             # that assert.
             conv_state_dtype = getattr(
-                torch,
-                DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
+                torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
+            )
         else:
             # TODO: Support bf16 conv state.
             # Per-layer cache: unlike the pool, the declared dtype IS the
@@ -428,17 +455,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         """
         del act_dtype
         w = self.conv1d.weight
-        self.conv1d.weight.data = torch.empty(w.shape,
-                                              dtype=w.dtype,
-                                              device=w.device).copy_(w)
+        self.conv1d.weight.data = torch.empty(
+            w.shape, dtype=w.dtype, device=w.device
+        ).copy_(w)
 
-    def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def get_state_shape(
+        self,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         geometry = self.tp_head_geometry
-        conv_state_shape, temporal_state_shape = (geometry.local_state_shapes(
+        conv_state_shape, temporal_state_shape = geometry.local_state_shapes(
             super().get_state_shape(),
             self.head_k_dim,
             self.head_v_dim,
-            conv_dim_axis=0 if is_conv_state_dim_first() else -1))
+            conv_dim_axis=0 if is_conv_state_dim_first() else -1,
+        )
         conv_state_shape = conv_state_shape[:-1] + (1, conv_state_shape[-1])
         return conv_state_shape, temporal_state_shape
 
@@ -460,31 +490,31 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
         num_spec_tokens = self.num_spec
 
-        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args,
-                      **kwargs):
+        def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-            return torch.empty_like(conv_state), torch.empty_like(
-                recurrent_state), torch.empty(out_shape,
-                                              dtype=mixed_qkv.dtype,
-                                              device=mixed_qkv.device)
+            return (
+                torch.empty_like(conv_state),
+                torch.empty_like(recurrent_state),
+                torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device),
+            )
 
         if pcp_streaming:
             parallel_config = vllm_context.vllm_config.parallel_config
             interleave_size = parallel_config.cp_kv_cache_interleave_size
             if not isinstance(interleave_size, int) or interleave_size <= 0:
-                raise ValueError("GDN PCP streaming requires "
-                                 "cp_kv_cache_interleave_size > 0.")
+                raise ValueError(
+                    "GDN PCP streaming requires cp_kv_cache_interleave_size > 0."
+                )
             pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
             pcp_size = get_pcp_world_size()
             if pcp_size != pcp_mesh.shape["pcp"]:
                 raise ValueError(
                     f"PCP world size {pcp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape['pcp']}.")
-            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                     pcp_size)
-            op_name = ("pallas::gdn_attention_pcp_"
-                       f"{self.prefix.replace('.', '_')}")
+                    f"{pcp_mesh.shape['pcp']}."
+                )
+            derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
+            op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu_pcp_prefill,
                 mesh=pcp_mesh,
@@ -536,9 +566,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size=self.conv_kernel_size,
                 num_spec_tokens=num_spec_tokens,
             )
-            gdn_jax_op = pallas.jax_op(op_name,
-                                       wrapped_fn,
-                                       donate_argnums=(3, 4))
+            gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 
         gdn_jax_op.register_fake(_fake_gdn)
 
@@ -560,11 +588,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         ) -> torch.Tensor:
             # The PCP prefill op keeps its original 13-arg signature. Its
             # speculative state tail is not a rollback operand.
-            extra_args = (() if pcp_streaming else (slot_read_offsets, ))
+            extra_args = () if pcp_streaming else (slot_read_offsets,)
             new_conv, new_rec, outputs = gdn_jax_op(
-                mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
-                conv_bias, A_log, dt_bias, state_indices, query_start_loc,
-                request_distribution, seq_lens, *extra_args)
+                mixed_qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                request_distribution,
+                seq_lens,
+                *extra_args,
+            )
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
@@ -582,8 +622,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(
-            self.get_state_dtype()[1])
+        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -647,38 +686,48 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # adapters, so it is the only donated input. inplace-donation
         # aliases its program-level output to the input buffer so the
         # ~pool-sized update is not double-counted at compile.
-        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, ))
+        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3,))
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-            out = torch.empty(out_shape,
-                              dtype=mixed_qkv.dtype,
-                              device=mixed_qkv.device)
+            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
             return torch.empty_like(recurrent_state), out
 
         gdn_jax_op.register_fake(_fake_gdn)
 
-        def gdn_impl(mixed_qkv: torch.Tensor,
-                     b: torch.Tensor,
-                     a: torch.Tensor,
-                     recurrent_state: torch.Tensor,
-                     conv_weight: torch.Tensor,
-                     conv_bias: torch.Tensor | None,
-                     A_log: torch.Tensor,
-                     dt_bias: torch.Tensor,
-                     state_indices: torch.Tensor,
-                     query_start_loc: torch.Tensor,
-                     request_distribution: torch.Tensor,
-                     seq_lens: torch.Tensor,
-                     slot_read_offsets: torch.Tensor | None = None,
-                     ckpt_indices: torch.Tensor | None = None) -> torch.Tensor:
-            new_rec, outputs = gdn_jax_op(mixed_qkv, b, a, recurrent_state,
-                                          conv_weight, conv_bias, A_log,
-                                          dt_bias, state_indices,
-                                          query_start_loc,
-                                          request_distribution, seq_lens,
-                                          slot_read_offsets, ckpt_indices)
+        def gdn_impl(
+            mixed_qkv: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            conv_bias: torch.Tensor | None,
+            A_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            state_indices: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            seq_lens: torch.Tensor,
+            slot_read_offsets: torch.Tensor | None = None,
+            ckpt_indices: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            new_rec, outputs = gdn_jax_op(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                request_distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+            )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
@@ -695,23 +744,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         parallel_config = vllm_context.vllm_config.parallel_config
         interleave_size = parallel_config.cp_kv_cache_interleave_size
         if not isinstance(interleave_size, int) or interleave_size <= 0:
-            raise ValueError("GDN pooled PCP prefill requires "
-                             "cp_kv_cache_interleave_size > 0.")
+            raise ValueError(
+                "GDN pooled PCP prefill requires cp_kv_cache_interleave_size > 0."
+            )
         pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
         pcp_size = get_pcp_world_size()
         if pcp_size != pcp_mesh.shape["pcp"]:
             raise ValueError(
                 f"PCP world size {pcp_size} does not match mesh shape "
-                f"{pcp_mesh.shape['pcp']}.")
-        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                 pcp_size)
+                f"{pcp_mesh.shape['pcp']}."
+            )
+        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(
-            self.get_state_dtype()[1])
+        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
 
         def wrapped_fn(
             hidden_states: jax.Array,
@@ -756,8 +805,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype=recurrent_state_dtype,
             )
 
-        op_name = ("pallas::gdn_attention_pooled_pcp_fused_"
-                   f"{self.prefix.replace('.', '_')}")
+        op_name = (
+            f"pallas::gdn_attention_pooled_pcp_fused_{self.prefix.replace('.', '_')}"
+        )
         input_partition_specs = (
             PartitionSpec("pcp"),  # hidden states
             PartitionSpec(),  # QKVZ weight
@@ -784,39 +834,54 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             wrapped_fn,
             # Keep optional operands after the pool so filtering None at the
             # TorchTPU boundary cannot change the donated tensor's index.
-            donate_argnums=(4, ),
+            donate_argnums=(4,),
             mesh=pcp_mesh,
             input_partition_specs=input_partition_specs,
             output_partition_specs=output_partition_specs,
         )
 
-        def _fake_gdn(hidden_states, _weight, _b, _a, recurrent_state, *args,
-                      **kwargs):
+        def _fake_gdn(hidden_states, _weight, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = hidden_states.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-            output = torch.empty(out_shape,
-                                 dtype=hidden_states.dtype,
-                                 device=hidden_states.device)
-            return torch.empty_like(recurrent_state), output, torch.empty_like(
-                output)
+            output = torch.empty(
+                out_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            return torch.empty_like(recurrent_state), output, torch.empty_like(output)
 
         gdn_jax_op.register_fake(_fake_gdn)
 
         def gdn_impl(
-                hidden_states: torch.Tensor, qkvz_weight: torch.Tensor,
-                qkvz_weight_scale: torch.Tensor | None, b: torch.Tensor,
-                a: torch.Tensor, recurrent_state: torch.Tensor,
-                conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
-                A_log: torch.Tensor, dt_bias: torch.Tensor,
-                state_indices: torch.Tensor, query_start_loc: torch.Tensor,
-                request_distribution: torch.Tensor,
-                seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            new_rec, outputs, z = gdn_jax_op(hidden_states, qkvz_weight, b, a,
-                                             recurrent_state, conv_weight,
-                                             conv_bias, A_log, dt_bias,
-                                             state_indices, query_start_loc,
-                                             request_distribution, seq_lens,
-                                             qkvz_weight_scale)
+            hidden_states: torch.Tensor,
+            qkvz_weight: torch.Tensor,
+            qkvz_weight_scale: torch.Tensor | None,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            conv_bias: torch.Tensor | None,
+            A_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            state_indices: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            seq_lens: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            new_rec, outputs, z = gdn_jax_op(
+                hidden_states,
+                qkvz_weight,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                request_distribution,
+                seq_lens,
+                qkvz_weight_scale,
+            )
             # Match the non-PCP pooled path: donation aliases the Pallas
             # result to the input pool, while copy_ exposes the mutation to
             # the surrounding compiled graph without rebinding its storage.
@@ -826,11 +891,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return gdn_impl
 
     def _require_pcp_projection_parameters(
-            self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return BF16/FP8 QKVZ parameters in canonical runtime layout."""
         if hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz"):
-            raise RuntimeError("GDN pooled PCP prefill requires a combined "
-                               "QKVZ projection.")
+            raise RuntimeError(
+                "GDN pooled PCP prefill requires a combined QKVZ projection."
+            )
 
         projection = self.in_proj_qkvz
         weight = getattr(projection, "weight", None)
@@ -846,46 +913,54 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         elif weight.dtype == torch.float8_e4m3fn:
             if weight_scale is None or weight_scale.dtype != torch.float32:
                 raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
-            from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
-                projection_scale_layout
+            from vllm_torchtpu.kernels.gdn.v3.projection_scale import (
+                projection_scale_layout,
+            )
+
             try:
                 projection_scale_layout(weight.shape, weight_scale.shape)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
         else:
-            raise RuntimeError("GDN pooled PCP prefill requires BF16 or "
-                               "float8_e4m3fn QKVZ weights.")
+            raise RuntimeError(
+                "GDN pooled PCP prefill requires BF16 or float8_e4m3fn QKVZ weights."
+            )
         return weight, weight_scale
 
     def _has_active_pooled_pcp_state(self, kv_cache) -> bool:
         """Whether a PCP-configured worker owns an allocated unified pool."""
-        return (kv_cache is not None and len(kv_cache) == 1
-                and kv_cache[0].numel() > 0 and self._pcp_streaming_configured)
+        return (
+            kv_cache is not None
+            and len(kv_cache) == 1
+            and kv_cache[0].numel() > 0
+            and self._pcp_streaming_configured
+        )
 
-    def _apply_output_projection(self, core_attn_out: torch.Tensor,
-                                 z: torch.Tensor,
-                                 num_tokens: int) -> torch.Tensor:
+    def _apply_output_projection(
+        self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
         local_num_v_heads = self.num_v_heads // self.tp_size
-        core_attn_out = core_attn_out.view(num_tokens, local_num_v_heads,
-                                           self.head_v_dim)
+        core_attn_out = core_attn_out.view(
+            num_tokens, local_num_v_heads, self.head_v_dim
+        )
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
         return output
 
-    def _forward_fused_pooled_pcp(self, hidden_states: torch.Tensor,
-                                  state_pool: torch.Tensor,
-                                  attn_metadata) -> torch.Tensor:
+    def _forward_fused_pooled_pcp(
+        self, hidden_states: torch.Tensor, state_pool: torch.Tensor, attn_metadata
+    ) -> torch.Tensor:
         """Run the mandatory fused path for an allocated pooled PCP call."""
         if not is_pcp_streaming_attention_metadata(attn_metadata):
             raise RuntimeError(
                 "PCP is configured with a unified pool, but attention "
-                "metadata does not use the PCP streaming sequence layout.")
+                "metadata does not use the PCP streaming sequence layout."
+            )
 
         gdn_pooled_pcp_op = self.gdn_pooled_pcp_op
         assert gdn_pooled_pcp_op is not None
-        qkvz_weight, qkvz_weight_scale = (
-            self._require_pcp_projection_parameters())
+        qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
         b, a = ba.chunk(2, dim=-1)
         b = b.contiguous()
@@ -945,7 +1020,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
-                self.head_k_dim, self.head_v_dim)
+                self.head_k_dim, self.head_v_dim
+            )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -973,36 +1049,47 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # Unified block pool: the attention-shaped pool carries the
                 # ssm and conv byte-regions; state ids come from the pool
                 # metadata builder.
-                (recurrent_state, ) = kv_cache
+                (recurrent_state,) = kv_cache
                 assert attn_metadata.mamba_state_indices is not None
-                state_indices = attn_metadata.mamba_state_indices.to(
-                    torch.int32)
+                state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);
                 # ragged paged attention keeps `request_distribution` with
                 # its 1-token decode front segment.
                 request_distribution = attn_metadata.request_distribution
-                slot_read_offsets = getattr(attn_metadata,
-                                            "mamba_slot_read_offsets", None)
+                slot_read_offsets = getattr(
+                    attn_metadata, "mamba_slot_read_offsets", None
+                )
                 mamba_request_distribution = getattr(
-                    attn_metadata, "mamba_request_distribution", None)
+                    attn_metadata, "mamba_request_distribution", None
+                )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
                 if self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
-                        "mamba_slot_read_offsets in the attention metadata.")
-                ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices",
-                                       None)
+                        "mamba_slot_read_offsets in the attention metadata."
+                    )
+                ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
                 core_attn_out = self.gdn_pooled_op(
-                    mixed_qkv, b, a, recurrent_state, self.conv1d.weight,
-                    self.conv1d.bias, self.A_log, self.dt_bias, state_indices,
-                    attn_metadata.query_start_loc, request_distribution,
-                    attn_metadata.seq_lens, slot_read_offsets, ckpt_indices)
+                    mixed_qkv,
+                    b,
+                    a,
+                    recurrent_state,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    self.A_log,
+                    self.dt_bias,
+                    state_indices,
+                    attn_metadata.query_start_loc,
+                    request_distribution,
+                    attn_metadata.seq_lens,
+                    slot_read_offsets,
+                    ckpt_indices,
+                )
                 if core_attn_out.shape[0] != num_tokens:
-                    raise RuntimeError(
-                        "GDN op returned an incompatible output shape.")
+                    raise RuntimeError("GDN op returned an incompatible output shape.")
             else:
                 conv_state, recurrent_state = kv_cache
                 # Recurrent-state slot id per persistent-batch position.
@@ -1013,12 +1100,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # `block_tables[:, 0]` only when compact sizing was skipped and
                 # mamba shares the attention block pool (uniform layout).
                 if attn_metadata.mamba_state_indices is not None:
-                    state_indices = attn_metadata.mamba_state_indices.to(
-                        torch.int32)
+                    state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
                 else:
                     max_reqs = attn_metadata.seq_lens.shape[0]
-                    max_blocks_per_req = (
-                        attn_metadata.block_tables.shape[0] // max_reqs)
+                    max_blocks_per_req = attn_metadata.block_tables.shape[0] // max_reqs
                     block_tables_2d = torch.reshape(
                         attn_metadata.block_tables,
                         (max_reqs, max_blocks_per_req),
@@ -1031,46 +1116,68 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # ragged paged attention keeps using `request_distribution`
                 # with its 1-token decode front segment.
                 request_distribution = attn_metadata.request_distribution
-                slot_read_offsets = getattr(attn_metadata,
-                                            "mamba_slot_read_offsets", None)
+                slot_read_offsets = getattr(
+                    attn_metadata, "mamba_slot_read_offsets", None
+                )
                 mamba_request_distribution = getattr(
-                    attn_metadata, "mamba_request_distribution", None)
+                    attn_metadata, "mamba_request_distribution", None
+                )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(
-                    attn_metadata)
+                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
-                        "mamba_slot_read_offsets in the attention metadata.")
+                        "mamba_slot_read_offsets in the attention metadata."
+                    )
 
                 # Execute the TorchTPU custom op
                 if not use_pcp_streaming:
                     core_attn_out = self.gdn_op(
-                        mixed_qkv, b, a, conv_state, recurrent_state,
-                        self.conv1d.weight, self.conv1d.bias, self.A_log,
-                        self.dt_bias, state_indices,
-                        attn_metadata.query_start_loc, request_distribution,
-                        attn_metadata.seq_lens, slot_read_offsets)
+                        mixed_qkv,
+                        b,
+                        a,
+                        conv_state,
+                        recurrent_state,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        self.A_log,
+                        self.dt_bias,
+                        state_indices,
+                        attn_metadata.query_start_loc,
+                        request_distribution,
+                        attn_metadata.seq_lens,
+                        slot_read_offsets,
+                    )
                 else:
                     gdn_pcp_op = self.gdn_pcp_op
                     if gdn_pcp_op is None:
                         raise RuntimeError(
                             "GDN PCP prefill op was not initialized during model "
-                            "loading.")
+                            "loading."
+                        )
                     core_attn_out = gdn_pcp_op(
-                        mixed_qkv, b, a, conv_state, recurrent_state,
-                        self.conv1d.weight, self.conv1d.bias, self.A_log,
-                        self.dt_bias, state_indices,
+                        mixed_qkv,
+                        b,
+                        a,
+                        conv_state,
+                        recurrent_state,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        self.A_log,
+                        self.dt_bias,
+                        state_indices,
                         attn_metadata.query_start_loc,
                         attn_metadata.request_distribution,
-                        attn_metadata.seq_lens)
+                        attn_metadata.seq_lens,
+                    )
                 if core_attn_out.shape[0] != num_tokens:
                     if not use_pcp_streaming:
                         raise RuntimeError(
-                            "GDN op returned an incompatible output shape.")
+                            "GDN op returned an incompatible output shape."
+                        )
                     start = get_pcp_rank() * num_tokens
-                    core_attn_out = core_attn_out[start:start + num_tokens]
+                    core_attn_out = core_attn_out[start : start + num_tokens]
 
         # ============================================================
         # Part 3: Output Projection

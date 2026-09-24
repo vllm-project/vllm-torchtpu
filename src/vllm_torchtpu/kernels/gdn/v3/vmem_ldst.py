@@ -115,13 +115,10 @@ def load_state_region(
             region.nrows, *source payload dims, source lanes] in the
             source dtype.
         region: The region's copy-plan (typed view parameters).
-        shape: Logical state shape; its element count must equal
-            ``region.rows_used`` times the typed view's lane count. The FP32
-            path narrows the ref to the logical minor dimension; BF16 keeps
-            the full carrier width and reshapes the loaded array here.
+        shape: Logical state shape.
 
     Returns:
-        The logical state of ``shape`` in ``region.view_dtype``.
+        The logical state of ``shape``.
     """
     parts = [
         typed_ldst.load_typed(
@@ -131,6 +128,11 @@ def load_state_region(
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
     arr = arr[: region.rows_used]
+    # When a bfloat16 state uses a uint32 VMEM view (2 bf16 elements per
+    # uint32 word), unpack back to bfloat16 before reshaping to `shape`.
+    if region.view_dtype == jnp.uint32 and math.prod(shape) == arr.size * 2:
+        assert region.rows_perm is None
+        arr = pltpu.bitcast(arr, jnp.bfloat16)
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
@@ -147,7 +149,11 @@ def store_state_region(
     region has deterministic bytes when copied out.
     """
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
-    arr = values.astype(region.view_dtype)
+    if region.view_dtype == jnp.uint32 and values.dtype == jnp.float32:
+        assert region.rows_perm is None
+        arr = pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+    else:
+        arr = values.astype(region.view_dtype)
     arr = arr.reshape(-1, out_lanes)
     if region.rows_perm is not None:
         # Inverse of the load-side gather: logical row i is stored at

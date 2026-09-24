@@ -162,8 +162,9 @@ def _mla_ragged_paged_attention_kernel(
         shape = (bq_sz, 1, bkv_sz)
         # Absolute position of the query token in row `t` of this bq block:
         # the sequence's KV minus this step's chunk, plus the row's offset.
-        q_pos = (kv_len - q_len + bq_idx * bq_sz +
-                 lax.broadcasted_iota(jnp.int32, shape, 0))
+        q_pos = (
+            kv_len - q_len + bq_idx * bq_sz + lax.broadcasted_iota(jnp.int32, shape, 0)
+        )
         k_pos = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, shape, 2)
         return k_pos > q_pos
 
@@ -180,9 +181,9 @@ def _mla_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
-        head_l_ref = l_ref.at[:q.shape[0]]
-        head_m_ref = m_ref.at[:q.shape[0]]
-        head_acc_ref = acc_ref.at[:q.shape[0]]
+        head_l_ref = l_ref.at[: q.shape[0]]
+        head_m_ref = m_ref.at[: q.shape[0]]
+        head_acc_ref = acc_ref.at[: q.shape[0]]
 
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
@@ -193,8 +194,7 @@ def _mla_ragged_paged_attention_kernel(
         if analytic_mask:
             mask = causal_mask(bq_idx, bkv_idx)  # (bq_sz, 1, bkv_sz)
         else:
-            mask = ~(bq_mask_in[:, None, :].astype(jnp.bool_)
-                     )  # (bq_sz, 1, bkv_sz)
+            mask = ~(bq_mask_in[:, None, :].astype(jnp.bool_))  # (bq_sz, 1, bkv_sz)
         s_3d = s.reshape(bq_sz, num_q_heads, bkv_sz)
         s_3d = jnp.where(mask, mask_value, s_3d)
         s = s_3d.reshape(s.shape)
@@ -258,8 +258,7 @@ def _mla_ragged_paged_attention_kernel(
                 # If the page index is out of bound, we clamp page_idx to the
                 # last valid page. This forces a safe static-sized DMA copy of
                 # garbage data, which is safely masked out later by bq_mask_in.
-                page_idx = jnp.minimum(page_indices_offset + i,
-                                       num_page_indices - 1)
+                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
 
                 _async_copy(
                     reshaped_cache_nope_hbm_ref.at[
@@ -287,15 +286,9 @@ def _mla_ragged_paged_attention_kernel(
             # When we wait, we can use a dummy copy to wait for DMAs to complete
             # where src == dst. However, the dma size must be correct.
             dst_nope_kv = bkv_nope_vmem_ref.at[pl.ds(0, bkv_sz_per_kv_packing)]
-            _async_copy(src=dst_nope_kv,
-                        dst=dst_nope_kv,
-                        sem=sem_nope,
-                        wait=True)
+            _async_copy(src=dst_nope_kv, dst=dst_nope_kv, sem=sem_nope, wait=True)
             dst_rope_kv = bkv_rope_vmem_ref.at[pl.ds(0, bkv_sz_per_kv_packing)]
-            _async_copy(src=dst_rope_kv,
-                        dst=dst_rope_kv,
-                        sem=sem_rope,
-                        wait=True)
+            _async_copy(src=dst_rope_kv, dst=dst_rope_kv, sem=sem_rope, wait=True)
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -341,8 +334,7 @@ def _mla_ragged_paged_attention_kernel(
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
         _async_copy(
-            mask_hbm_ref.at[pl.ds(q_len_start, sz), bkv_idx,
-                            pl.ds(0, bkv_sz)],
+            mask_hbm_ref.at[pl.ds(q_len_start, sz), bkv_idx, pl.ds(0, bkv_sz)],
             vmem_ref.at[pl.ds(0, sz), 0, pl.ds(0, bkv_sz)],
             sem,
             wait,
@@ -376,10 +368,13 @@ def _mla_ragged_paged_attention_kernel(
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     def load_bq(bq_sem_idx):
-        q_ref = (bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx].reshape(
-            bq_sz * num_q_heads_per_q_packing, head_dim))
+        q_ref = (
+            bq_x2_ref.bitcast(jnp.uint32)
+            .at[bq_sem_idx]
+            .reshape(bq_sz * num_q_heads_per_q_packing, head_dim)
+        )
         q = pltpu.bitcast(
-            q_ref[:bq_sz * num_q_heads_per_q_packing],
+            q_ref[: bq_sz * num_q_heads_per_q_packing],
             q_dtype,
         ).reshape(bq_sz * num_q_heads, head_dim)
         return q
@@ -403,8 +398,7 @@ def _mla_ragged_paged_attention_kernel(
         # float8_e8m0fnu byte 0xFF decodes to NaN.
         # We need to mask out the data by the actual kv_len to avoid NaN
         # propagting to the downstream computation.
-        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-            jnp.int32, bkv.shape, 0)
+        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
         bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
@@ -416,8 +410,8 @@ def _mla_ragged_paged_attention_kernel(
         target_minor = align_to(shape[-1], src.shape[-1])
         # no-op concatenation.
         return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])],
-            axis=-1)[..., :shape[-1]]
+            [src for _ in range(target_minor // src.shape[-1])], axis=-1
+        )[..., : shape[-1]]
 
     def process():
         # Force at least one bkv block and one bq block per sequence: the
@@ -452,7 +446,8 @@ def _mla_ragged_paged_attention_kernel(
         def compute_with_bq(bq_idx, _):
             bq_sem_idx = sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
-                seq_idx, bq_idx, bq_sem_idx)
+                seq_idx, bq_idx, bq_sem_idx
+            )
 
             # Prefetch next bq
             @pl.when(next_seq_idx < end_seq_idx)
@@ -467,21 +462,25 @@ def _mla_ragged_paged_attention_kernel(
             def compute_with_bkv(bkv_idx, _):
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
-                (next_seq_idx, next_bq_idx, next_bkv_idx,
-                 next_bkv_sem_idx) = get_next_bkv_ids(seq_idx, bq_idx, bkv_idx,
-                                                      bkv_sem_idx)
+                (next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx) = (
+                    get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
+                )
 
                 # Prefetch next bkv
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bq_idx, next_bkv_idx,
-                                    next_bkv_sem_idx)
+                    start_fetch_bkv(
+                        next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
+                    )
 
                 # Wait for cur bkv
                 wait_fetch_bkv(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
-                bq_mask_in = (None if analytic_mask else
-                              mask_hbm_x2_ref[bkv_sem_idx, ...][:bq_sz, 0, :])
+                bq_mask_in = (
+                    None
+                    if analytic_mask
+                    else mask_hbm_x2_ref[bkv_sem_idx, ...][:bq_sz, 0, :]
+                )
 
                 # `load_bkv` zeroes rows past `kv_len` so that bytes belonging
                 # to another cache overlaid on the same tensor cannot decode to
@@ -512,8 +511,11 @@ def _mla_ragged_paged_attention_kernel(
             # Load acc and calculate final output.
             acc = acc_ref[...]
             denom = broadcast_minor(l_ref[...], acc.shape)
-            out = (lax.div(acc, denom) if q_dtype == jnp.float32 else
-                   (acc * pl.reciprocal(denom, approx=True)).astype(q_dtype))
+            out = (
+                lax.div(acc, denom)
+                if q_dtype == jnp.float32
+                else (acc * pl.reciprocal(denom, approx=True)).astype(q_dtype)
+            )
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -549,7 +551,7 @@ def _mla_ragged_paged_attention_kernel(
 
 
 def prepare_q_inputs(
-        q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
@@ -698,7 +700,8 @@ def masked_dense_ragged_paged_attention(
     # `kv_lens`. Feeding that one in would silently mis-derive `pages_per_seq`.
     assert kv_lens.shape[0] == max_num_seqs, (
         f"kv_lens must be per-sequence: got {kv_lens.shape[0]} entries for "
-        f"{max_num_seqs} sequences")
+        f"{max_num_seqs} sequences"
+    )
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
@@ -707,18 +710,19 @@ def masked_dense_ragged_paged_attention(
         max_kv_len = page_table_span
     assert 0 < max_kv_len <= page_table_span, (
         f"max_kv_len={max_kv_len} must be within the page-table stride "
-        f"{page_table_span}")
+        f"{page_table_span}"
+    )
 
     assert topk_indices is not None, (
-        "topk_indices must be provided for masked dense CSA")
+        "topk_indices must be provided for masked dense CSA"
+    )
     analytic_mask = max_kv_len <= topk_indices.shape[-1]
     if analytic_mask:
         # Nothing reads it; a minimal operand keeps the pallas_call's operand
         # layout identical in both modes.
         mask_hbm = jnp.zeros((1, 1, 1), jnp.int32)
     else:
-        mask_hbm = csa_mask.generate_mask_sc(topk_indices, max_kv_len)[:,
-                                                                       None, :]
+        mask_hbm = csa_mask.generate_mask_sc(topk_indices, max_kv_len)[:, None, :]
 
     _, num_q_heads, _ = q.shape
 
@@ -744,15 +748,17 @@ def masked_dense_ragged_paged_attention(
         else:
             assert mask_hbm.shape[-1] % bkv_sz == 0, (
                 f"mask width {mask_hbm.shape[-1]} must be a multiple of the "
-                f"streamed block size {bkv_sz}")
+                f"streamed block size {bkv_sz}"
+            )
             mask_hbm_reshaped = mask_hbm.reshape(
-                (mask_hbm.shape[0], mask_hbm.shape[-1] // bkv_sz, bkv_sz))
+                (mask_hbm.shape[0], mask_hbm.shape[-1] // bkv_sz, bkv_sz)
+            )
         if static_q_len is not None:
             bq_sz = min(num_queries_per_block, static_q_len)
         else:
             bq_sz = num_queries_per_block
 
-        grid = (end_seq_idx - start_seq_idx, )
+        grid = (end_seq_idx - start_seq_idx,)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
@@ -816,10 +822,10 @@ def masked_dense_ragged_paged_attention(
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-            jnp.zeros((3, ), jnp.int32),
+            jnp.zeros((3,), jnp.int32),
             # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx,
             #  bo_sem_1_bo_idx)
-            jnp.full((4, ), -1, jnp.int32),
+            jnp.full((4,), -1, jnp.int32),
         )
 
         scope_name = f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
@@ -843,7 +849,7 @@ def masked_dense_ragged_paged_attention(
                     scratch_shapes=scratch_shapes,
                 ),
                 compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("arbitrary", ),
+                    dimension_semantics=("arbitrary",),
                     vmem_limit_bytes=vmem_limit_bytes,
                     disable_bounds_checks=True,
                 ),
@@ -851,11 +857,11 @@ def masked_dense_ragged_paged_attention(
                 input_output_aliases={
                     # Alias the output activation with q. Operand indices count
                     # the scalar prefetches, so q is the first one after them.
-                    len(scalar_prefetches):
-                    0,
+                    len(scalar_prefetches): 0,
                 },
                 name=scope_name,
-            ))
+            )
+        )
         return kernel(
             *scalar_prefetches,
             q,
