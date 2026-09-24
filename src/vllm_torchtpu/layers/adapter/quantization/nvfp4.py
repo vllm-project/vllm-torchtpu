@@ -52,8 +52,16 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
-    ModelOptNvFp4LinearMethod,
 )
+
+try:
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4LinearMethod,
+    )
+except ImportError:
+    from vllm.model_executor.layers.quantization.modelopt import (  # type: ignore[no-redef]
+        ModelOptLinearMethod as ModelOptNvFp4LinearMethod,
+    )
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
