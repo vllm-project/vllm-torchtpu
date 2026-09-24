@@ -23,12 +23,14 @@ steps:
      commands:
        - bash .buildkite/scripts/upload_models_and_features.sh
 
-   - wait: ~
-     continue_on_failure: true  # ensure we still generate support matrices even if some tests fail
-
    - label: "Check Metadata Health"
      key: "check_metadata_health"
      <<: *run-on-nightly-or-tag
+     depends_on:
+       - step: "v6e-group"
+         allow_failure: true
+       - step: "v7x-group"
+         allow_failure: true
      agents: 
        queue: cpu 
      commands: |
