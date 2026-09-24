@@ -92,14 +92,19 @@ The original v2 kernel and its adapter are unchanged by this port.
 
 ## FP4 scale memory
 
-The original v2 keeps both FP4 scale tables resident for all local experts.
+The v2 snapshot this experiment was derived from (`0a05f11d9a77`) kept
+both FP4 scale tables resident for all local experts.
 At hidden 8192 / intermediate 2048 / block 64, the two scale tables cost
 3 MiB per expert: 24 / 192 / 768 MiB for 8 / 64 / 256 local experts.
-The experimental implementation already streams both tables with the W1
-prefetch ring: 2+1 uses 6 MiB for scales at all three expert counts. W1/W2
+Production v2 now also streams scales with its weight slots (PR #1137), so
+the current v2 implementation is no longer a resident-scale baseline.
+The experimental implementation streams both tables with the W1
+prefetch ring: 2+1 uses 6 MiB and 3+2 uses 9 MiB for scales at all three
+expert counts. W1/W2
 scales have their own DMA semaphores, and both remain valid through every
-token tile of the current expert. The scale-memory test compares actual
-scratch declarations using TPU7x padding; these are allocation estimates.
+token tile of the current expert. The scale-memory test checks actual scratch
+declarations against these fixed budgets using TPU7x padding, independently
+of production v2; these are allocation estimates.
 
 ## Validation
 
@@ -117,7 +122,7 @@ use synthetic packed checkpoint weights, the existing block-16 to block-64
 requantizer, and a dense reference with unchanged accuracy thresholds.
 Additional FP4 tests exercise sparse noncontiguous expert IDs, scale-ring wrap,
 multiple tiles per expert, and entirely empty ranks. These DMA stress cases
-require bit-exact equality with original v2's resident-scale implementation.
+require bit-exact equality with the production v2 implementation.
 Their dense-reference errors are reported separately: strongly unequal scales
 can exceed the 0.075 worst-token bound in both kernels (observed 0.0770), so
 that bound is not asserted for these stress inputs. The dedicated numerical
