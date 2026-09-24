@@ -45,6 +45,8 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# `--extra vllm` installs vLLM in the same resolve, so torch / torch-tpu pins
+# can't be downgraded by a separate vLLM install.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -57,7 +59,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      -r pyproject.toml \
+      --extra vllm
 
 
 # Variant 2: The CI Environment (CI/CD Variant)

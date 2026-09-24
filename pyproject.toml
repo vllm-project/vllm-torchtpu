@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm_torchtpu"
+name = "vllm-torchtpu-core"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
@@ -12,7 +12,7 @@ readme = "README.md"
 # unsatisfiable-requirements failure partway through a Docker build.
 requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm_torchtpu Contributors" }
+    { name = "vllm-torchtpu-core Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,9 +27,19 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    # NOTE: `vllm` is deliberately NOT a dependency here.
+    #
+    # The combined `vllm-torchtpu` wheel IS vLLM with its distribution renamed,
+    # so it already owns site-packages/vllm/. If this package also pulled the
+    # real `vllm` distribution, two distributions would own that same directory:
+    # pip does not detect the conflict, the later install silently overwrites
+    # the earlier one's files, and uninstalling either corrupts the other.
+    # tpu-inference avoids this the same way -- its requirements.txt has no
+    # `vllm` entry either.
+    #
+    # The vLLM revision this plugin targets now lives in [tool.vllm-torchtpu]
+    # at the bottom of this file, and is installed explicitly by
+    # docker/Dockerfile rather than resolved as a dependency.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -42,18 +52,22 @@ dependencies = [
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
-    # installed torch at import time. Published to PyPI as nightly .dev
-    # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    # installed torch at import time.
+    "tpu-sync-torch==0.0.1.dev20260917080754",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
-    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
-    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
-    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
-    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
-    "transformers>=5.10.4,<5.15",
+    # Capped below 5.11. vLLM 0.29.0 only sets a floor (>=5.10.4), and letting
+    # transformers float to 5.17.0 fails
+    # test_structured_output_spec_decode_correctness_greedy[single_chunk] with
+    # assert 1 == 0 -- a wrong answer under grammar-constrained decoding, not an
+    # import or API error, so nothing catches it before the test.
+    #
+    # 5.10.4 is vLLM's floor and the closest available release to 5.8.0, which
+    # was the last version this suite was green on. It is NOT a bisected ceiling:
+    # the break is somewhere in 5.11.0-5.17.0 and could be much later than 5.11.
+    # Widen it by bisecting against that test, not by bumping and hoping.
+    "transformers>=5.10.4,<5.11",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -110,7 +124,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.29.0rc1",
+    "vllm-omni==0.27.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -124,6 +138,18 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+
+[project.optional-dependencies]
+# Single source of truth for the vLLM revision this plugin is developed and
+# tested against. This is NOT a dependency -- see the note in [project]
+# dependencies above for why vLLM must not be resolved as one.
+#
+# The value keeps the exact `vllm @ git+<url>@<ref>` shape a PEP 508 direct
+# reference would have, on purpose: docker/Dockerfile rewrites the `@<ref>`
+# suffix in place when VLLM_COMMIT_HASH is supplied, and several CI scripts
+# sed the ref back out of this file. Keeping the shape means those keep
+# working unchanged now that the dependency itself is gone.
+vllm-source = "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0"
 
 [tool.pytest.ini_options]
 markers = [
@@ -184,17 +210,72 @@ ignore = [
 # .pre-commit-config.yaml. All three move together, otherwise two tools format
 # the same file. Use `dir/**` or a full path: in a `*` pattern the star also
 # matches `/`, so `dir/*.py` silently covers the whole subtree.
+# kernels/experimental
+"src/vllm_torchtpu/kernels/experimental/**" = ["I"]
 
+# kernels/deepseek_v4
+"src/vllm_torchtpu/kernels/deepseek_v4/**" = ["I"]
 
+# kernels: fused_moe, gdn, kimi_k3
+"src/vllm_torchtpu/kernels/fused_moe/**" = ["I"]
+"src/vllm_torchtpu/kernels/gdn/**" = ["I"]
+"src/vllm_torchtpu/kernels/kimi_k3/**" = ["I"]
 
+# kernels: attention and the rest
+"src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
+"src/vllm_torchtpu/kernels/collectives/**" = ["I"]
+"src/vllm_torchtpu/kernels/flash_attention/**" = ["I"]
+"src/vllm_torchtpu/kernels/megablox/**" = ["I"]
+"src/vllm_torchtpu/kernels/mla/**" = ["I"]
+"src/vllm_torchtpu/kernels/quantized_matmul/**" = ["I"]
+"src/vllm_torchtpu/kernels/ragged_paged_attention/**" = ["I"]
+"src/vllm_torchtpu/kernels/sparse_core/**" = ["I"]
+"src/vllm_torchtpu/kernels/__init__.py" = ["I"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["I"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["I"]
+"src/vllm_torchtpu/kernels/router_topk.py" = ["I"]
+"src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
 
+# tests/kernels
+"tests/kernels/**" = ["I"]
 
+# layers/adapter (src)
+"src/vllm_torchtpu/layers/adapter/**" = ["I"]
 
+# tests/layers
+"tests/layers/**" = ["I"]
 
+# layers/core
+"src/vllm_torchtpu/layers/core/**" = ["I"]
+"src/vllm_torchtpu/layers/__init__.py" = ["I"]
 
+# distributed
+"src/vllm_torchtpu/distributed/**" = ["I"]
+"tests/distributed/**" = ["I"]
+"tests/disagg/**" = ["I"]
 
+# runner
+"src/vllm_torchtpu/runner/**" = ["I"]
+"tests/runner/**" = ["I"]
 
+# models, spec_decode, offload
+"src/vllm_torchtpu/models/**" = ["I"]
+"src/vllm_torchtpu/offload/**" = ["I"]
+"src/vllm_torchtpu/spec_decode/**" = ["I"]
+"tests/models/**" = ["I"]
+"tests/offload/**" = ["I"]
+"tests/spec_decode/**" = ["I"]
 
+# platforms, executors, worker, compilation, entrypoints
+"src/vllm_torchtpu/compilation/**" = ["I"]
+"src/vllm_torchtpu/executors/**" = ["I"]
+"src/vllm_torchtpu/platforms/**" = ["I"]
+"src/vllm_torchtpu/worker/**" = ["I"]
+"tests/compilation/**" = ["I"]
+"tests/entrypoints/**" = ["I"]
+"tests/executors/**" = ["I"]
+"tests/platforms/**" = ["I"]
+"tests/worker/**" = ["I"]
 
 # core, tracing, omni, tools, loose modules
 "src/vllm_torchtpu/core/**" = ["I"]
@@ -249,17 +330,72 @@ docstring-code-format = true
 
 # Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
 exclude = [
+    # kernels/experimental
+    "src/vllm_torchtpu/kernels/experimental/**",
 
+    # kernels/deepseek_v4
+    "src/vllm_torchtpu/kernels/deepseek_v4/**",
 
+    # kernels: fused_moe, gdn, kimi_k3
+    "src/vllm_torchtpu/kernels/fused_moe/**",
+    "src/vllm_torchtpu/kernels/gdn/**",
+    "src/vllm_torchtpu/kernels/kimi_k3/**",
 
+    # kernels: attention and the rest
+    "src/vllm_torchtpu/kernels/causal_conv1d/**",
+    "src/vllm_torchtpu/kernels/collectives/**",
+    "src/vllm_torchtpu/kernels/flash_attention/**",
+    "src/vllm_torchtpu/kernels/megablox/**",
+    "src/vllm_torchtpu/kernels/mla/**",
+    "src/vllm_torchtpu/kernels/quantized_matmul/**",
+    "src/vllm_torchtpu/kernels/ragged_paged_attention/**",
+    "src/vllm_torchtpu/kernels/sparse_core/**",
+    "src/vllm_torchtpu/kernels/__init__.py",
+    "src/vllm_torchtpu/kernels/partial_kv_update.py",
+    "src/vllm_torchtpu/kernels/pool_adapters.py",
+    "src/vllm_torchtpu/kernels/router_topk.py",
+    "src/vllm_torchtpu/kernels/typed_ldst.py",
 
+    # tests/kernels
+    "tests/kernels/**",
 
+    # layers/adapter (src)
+    "src/vllm_torchtpu/layers/adapter/**",
 
+    # tests/layers
+    "tests/layers/**",
 
+    # layers/core
+    "src/vllm_torchtpu/layers/core/**",
+    "src/vllm_torchtpu/layers/__init__.py",
 
+    # distributed
+    "src/vllm_torchtpu/distributed/**",
+    "tests/distributed/**",
+    "tests/disagg/**",
 
+    # runner
+    "src/vllm_torchtpu/runner/**",
+    "tests/runner/**",
 
+    # models, spec_decode, offload
+    "src/vllm_torchtpu/models/**",
+    "src/vllm_torchtpu/offload/**",
+    "src/vllm_torchtpu/spec_decode/**",
+    "tests/models/**",
+    "tests/offload/**",
+    "tests/spec_decode/**",
 
+    # platforms, executors, worker, compilation, entrypoints
+    "src/vllm_torchtpu/compilation/**",
+    "src/vllm_torchtpu/executors/**",
+    "src/vllm_torchtpu/platforms/**",
+    "src/vllm_torchtpu/worker/**",
+    "tests/compilation/**",
+    "tests/entrypoints/**",
+    "tests/executors/**",
+    "tests/platforms/**",
+    "tests/worker/**",
 
     # core, tracing, omni, tools, loose modules
     "src/vllm_torchtpu/core/**",
@@ -363,3 +499,4 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
+tpu-sync-torch = { index = "torch-tpu-registry" }
