@@ -76,6 +76,49 @@ def test_candidate_all_gather_is_rank_major(dcp_size):
         )
 
 
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_all_to_all_round_trip_preserves_token_order(dcp_size):
+    """The a2a scatter and the all-gather restore must agree on block order;
+    if they do not, every rank merges a full, plausible, wrong token."""
+    devices = jax.devices()
+    if len(devices) < dcp_size:
+        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
+
+    rows, width = 4 * dcp_size, 8
+    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME,))
+
+    def _local(token_ids):
+        # Every rank starts with the same [rows, width] of token ids.
+        scattered = jax.lax.all_to_all(
+            token_ids, DCP_AXIS_NAME, split_axis=0, concat_axis=1, tiled=True
+        )
+        # [rows/dcp, dcp * width]: every peer sent this rank the same block.
+        blocks = scattered.reshape(-1, dcp_size, width)
+        return jax.lax.all_gather(blocks[:, 0, :], DCP_AXIS_NAME, axis=0, tiled=True)
+
+    token_ids = jnp.broadcast_to(
+        jnp.arange(rows, dtype=jnp.int32)[:, None], (rows, width)
+    )
+    out = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(DCP_AXIS_NAME),
+            check_vma=False,
+        )
+    )(token_ids)
+
+    got = np.asarray(out).reshape(dcp_size, rows, width)
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            got[r],
+            np.asarray(token_ids),
+            err_msg=f"rank {r} came back with the token axis permuted",
+        )
+
+
 def _filter_all_ranks(merged, dcp_size, interleave_c):
     """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
     return np.stack(
@@ -192,8 +235,11 @@ def _dcp_case(dcp_size, seed):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
-    """Union the per-rank lists back together; it must be the global top-k"""
+@pytest.mark.parametrize("a2a_merge", [False, True])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge, monkeypatch):
+    """Union the per-rank lists back together; it must be the global top-k.
+    Both merge paths; the unsharded reference is all they must agree on."""
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1" if a2a_merge else "0")
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
     q, weights = args[0], args[1]

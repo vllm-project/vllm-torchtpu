@@ -23,6 +23,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     sparsecore_topk,
@@ -1181,6 +1182,80 @@ def streamindex_topk(
     )
 
 
+def _topk_over_candidate_axis(scores: jax.Array, k: int) -> jax.Array:
+    """Exact top-k over the full candidate row; `-inf` slots never win."""
+    return sparsecore_topk(
+        scores,
+        k,
+        row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
+        write_empty_rows=True,
+    )
+
+
+def _merge_by_all_gather(
+    idxs: jax.Array,
+    scores: jax.Array,
+    k: int,
+    dcp_size: int,
+    dcp_rank: jax.Array,
+    dcp_axis_name: str,
+) -> jax.Array:
+    """Merge on the candidate axis; `[T, k]` global positions, `-1` in the
+    slots this rank did not produce."""
+    rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
+    payload = lax.all_gather(
+        jnp.concatenate([scores, rank_col], axis=1),
+        dcp_axis_name,
+        axis=1,
+        tiled=True,
+    )
+    # [T, dcp * (k+1)] -> [T, dcp, k+1]: column k is the chunk's source rank.
+    payload = payload.reshape(payload.shape[0], dcp_size, k + 1)
+    src = payload[:, :, k].astype(jnp.int32)
+
+    slots = _topk_over_candidate_axis(
+        payload[:, :, :k].reshape(payload.shape[0], dcp_size * k), k
+    )
+    # Keep only winners this rank produced.
+    safe = jnp.maximum(slots, 0)
+    ours = (slots >= 0) & (
+        jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
+    )
+    return jnp.where(ours, jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1), -1)
+
+
+def _merge_by_all_to_all(
+    idxs: jax.Array,
+    scores: jax.Array,
+    k: int,
+    dcp_size: int,
+    dcp_axis_name: str,
+) -> jax.Array:
+    """Merge on the token axis; `[T, k]` global positions, the whole global
+    top-k on every rank, so the caller still has to narrow it."""
+    # Stage 1. Rank `j` collects every rank's candidates for token block `j`.
+    # The indices ride along: the resolving rank did not produce them.
+    payload = lax.all_to_all(
+        jnp.concatenate([scores, idxs], axis=1),
+        dcp_axis_name,
+        split_axis=0,
+        concat_axis=1,
+        tiled=True,
+    )
+    # [T/dcp, dcp * 2k] -> [T/dcp, dcp, 2k], rank-major along axis 1.
+    payload = payload.reshape(-1, dcp_size, 2 * k)
+    rows = payload.shape[0]
+
+    # Stage 2. This rank's token block, merged into the exact global top-k.
+    slots = _topk_over_candidate_axis(payload[:, :, :k].reshape(rows, dcp_size * k), k)
+    block_idxs = payload[:, :, k:].reshape(rows, dcp_size * k)
+    merged = jnp.take_along_axis(block_idxs, jnp.maximum(slots, 0), axis=1)
+    merged = jnp.where(slots >= 0, merged, -1)
+
+    # Stage 3. Rank-major blocks back on every rank, restoring token order.
+    return lax.all_gather(merged, dcp_axis_name, axis=0, tiled=True)
+
+
 def _select_owned_winners(
     merged: jax.Array,
     dcp_size: int,
@@ -1294,6 +1369,9 @@ def streamindex_topk_dcp(
     collective phase, avoiding the barrier latency of a multi-phase pipeline and
     preserving the token axis `T` unpartitioned.
 
+    `TPU_DCP_INDEXER_A2A_MERGE=1` swaps steps 2-3 for an `all_to_all` that
+    partitions the token axis, then an `all_gather(axis=0)` restoring it.
+
     Args:
       q: replicated query tokens, in natural request-major order
         `[padded_num_tokens, num_q_heads, head_dim]`.
@@ -1385,34 +1463,12 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        # Stage 1. All-gather the scores; the indices stay home.
-        rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
-        payload = lax.all_gather(
-            jnp.concatenate([scores, rank_col], axis=1),
-            dcp_axis_name,
-            axis=1,
-            tiled=True,
-        )
-        # [T, dcp * (k+1)] -> [T, dcp, k+1]: column k is the chunk's source rank.
-        payload = payload.reshape(payload.shape[0], dcp_size, k + 1)
-        src = payload[:, :, k].astype(jnp.int32)
-        scores = payload[:, :, :k].reshape(payload.shape[0], dcp_size * k)
-
-        # Stage 2. Full width as the row length: -inf entries (unfilled local
-        # slots, padding tokens) are never selected, so they need no masking.
-        slots = sparsecore_topk(
-            scores,
-            k,
-            row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
-            write_empty_rows=True,
-        )
-        # Keep only winners this rank produced.
-        safe = jnp.maximum(slots, 0)
-        ours = (slots >= 0) & (
-            jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
-        )
-        merged = jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1)
-        merged = jnp.where(ours, merged, -1)
+        if envs.TPU_DCP_INDEXER_A2A_MERGE:
+            merged = _merge_by_all_to_all(idxs, scores, k, dcp_size, dcp_axis_name)
+        else:
+            merged = _merge_by_all_gather(
+                idxs, scores, k, dcp_size, dcp_rank, dcp_axis_name
+            )
 
         return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
 

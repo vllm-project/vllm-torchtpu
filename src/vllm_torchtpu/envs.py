@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -358,6 +359,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
     ),
+    # Merge the DCP indexer candidates with an all-to-all over the token axis
+    # instead of an all-gather over the candidate axis.
+    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
