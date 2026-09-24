@@ -118,8 +118,8 @@ class SparseGPT:
                     tmp = W1[:, i:(i + prunem)]**2 / (torch.diag(Hinv1)[i:(
                         i + prunem)].reshape((1, -1)))**2
                     mask1.scatter_(
-                        1,
-                        i + torch.topk(tmp, prunen, dim=1, largest=False)[1],
+                        1, i + torch.topk(
+                            tmp, prunem - prunen, dim=1, largest=False)[1],
                         True)
 
                 q = w.clone()
@@ -244,8 +244,8 @@ class SparseGPT:
                         tmp = W1[:, i:(i + prunem)]**2 / (torch.diag(Hinv1)[i:(
                             i + prunem)].reshape((1, -1)))**2
                         mask1.scatter_(
-                            1, i +
-                            torch.topk(tmp, prunen, dim=1, largest=False)[1],
+                            1, i + torch.topk(
+                                tmp, prunem - prunen, dim=1, largest=False)[1],
                             True)
 
                     q = w.clone()
