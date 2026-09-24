@@ -23,7 +23,7 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
         pl.semaphore_signal(
             barrier_sem,
             inc=1,
-            device_id=(neighbor, ),
+            device_id=(neighbor,),
             device_id_type=pl.DeviceIdType.MESH,
         )
     pl.semaphore_wait(barrier_sem, 2)
@@ -40,7 +40,7 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
                 pl.semaphore_signal(
                     second_barrier,
                     inc=1,
-                    device_id=(neighbor, ),
+                    device_id=(neighbor,),
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             pl.semaphore_wait(second_barrier, 2)

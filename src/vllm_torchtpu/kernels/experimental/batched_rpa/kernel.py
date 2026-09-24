@@ -738,24 +738,6 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
-            # Transfer schedule from HBM to SMEM --- we only copy what we need. Since
-            # we almost always over-allocate schedule size, we only want to copy a
-            # small portion of it from HBM to SMEM.
-            flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-            flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-            dma_list = []
-            for h, s in zip(flat_hbm, flat_smem):
-                if jax.typeof(h).memory_space == pltpu.HBM:
-                    read_size = (h.shape[0] // cfgs.max_steps_ub) * safe_steps
-                    read_size = utils.align_to(read_size, 1024)
-
-                    copy = pltpu.make_async_copy(
-                        h.at[pl.ds(0, read_size)],
-                        s.at[pl.ds(0, read_size)],
-                        dma_sem.at[0],
-                    )
-                    copy.start()
-                    dma_list.append(copy)
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
