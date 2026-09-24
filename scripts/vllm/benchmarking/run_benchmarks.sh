@@ -99,13 +99,17 @@ while [[ $# -gt 0 ]]; do
             START_SERVER=0
             shift 2
             ;;
+        --mode)
+            BENCHMARK_MODE_CLI="$2"
+            shift 2
+            ;;
         --port)
             PORT="$2"
             shift 2
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -201,6 +205,10 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
+    BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
+fi
 
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
