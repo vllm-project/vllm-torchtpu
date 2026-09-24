@@ -1750,7 +1750,8 @@ def test_chip_shared_expert_matches_full_projection(sequence_parallel):
         contributions.append(
             (torch.nn.functional.silu(g) * u) @ down.chunk(2, dim=1)[rank].T)
     reference = (torch.nn.functional.silu(x @ gate.T) * (x @ up.T)) @ down.T
-    for rank in range(2):
+
+    def check_rank(rank):
 
         class Group:
 
@@ -1787,6 +1788,9 @@ def test_chip_shared_expert_matches_full_projection(sequence_parallel):
                         sequence_parallel=sequence_parallel)
         expected = reference.chunk(2)[rank] if sequence_parallel else reference
         torch.testing.assert_close(actual, expected)
+
+    for rank in range(2):
+        check_rank(rank)
 
 
 @pytest.mark.parametrize('gather_mode', ['plain', 'joint', 'wide_ids'])

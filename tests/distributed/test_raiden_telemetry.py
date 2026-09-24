@@ -20,10 +20,11 @@ from unittest.mock import MagicMock, patch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from vllm_torchtpu.distributed import utils as dist_utils
-from vllm_torchtpu.distributed.kv_transfer.tpu_connector import \
-    TPURaidenConnectorWorker
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnectorWorker
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
-    TpuKVConnectorPromMetrics, TpuKVConnectorStats)
+    TpuKVConnectorPromMetrics,
+    TpuKVConnectorStats,
+)
 
 
 class TestRaidenTelemetryUtils:
@@ -31,8 +32,7 @@ class TestRaidenTelemetryUtils:
 
     def test_get_raiden_telemetry_module_cached(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_MODULE", None)
-        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_IMPORT_ATTEMPTED",
-                            False)
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_IMPORT_ATTEMPTED", False)
         mock_impl = MagicMock()
         mock_kcm = MagicMock()
         mock_kcm._torch_impl.return_value = mock_impl
@@ -44,7 +44,7 @@ class TestRaidenTelemetryUtils:
         mock_tpu_sync.api = mock_api
 
         with patch.dict(
-                "sys.modules",
+            "sys.modules",
             {
                 "tpu_sync": mock_tpu_sync,
                 "tpu_sync.api": mock_api,
@@ -64,11 +64,8 @@ class TestRaidenTelemetryUtils:
     def test_get_raiden_telemetry_module_import_error(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_MODULE", None)
         with patch.dict(
-                "sys.modules",
-            {
-                "tpu_sync": None,
-                "tpu_sync.api.torch.kv_cache_manager": None
-            },
+            "sys.modules",
+            {"tpu_sync": None, "tpu_sync.api.torch.kv_cache_manager": None},
         ):
             assert dist_utils.get_raiden_telemetry_module() is None
 
@@ -76,7 +73,8 @@ class TestRaidenTelemetryUtils:
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_MODULE", None)
         mock_kcm = MagicMock()
         mock_kcm._torch_impl.side_effect = RuntimeError(
-            "Extension initialization error")
+            "Extension initialization error"
+        )
         mock_torch = MagicMock()
         mock_torch.kv_cache_manager = mock_kcm
         mock_api = MagicMock()
@@ -85,7 +83,7 @@ class TestRaidenTelemetryUtils:
         mock_tpu_sync.api = mock_api
 
         with patch.dict(
-                "sys.modules",
+            "sys.modules",
             {
                 "tpu_sync": mock_tpu_sync,
                 "tpu_sync.api": mock_api,
@@ -98,8 +96,9 @@ class TestRaidenTelemetryUtils:
     def test_configure_raiden_telemetry_default_backends(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
         mock_telemetry = MagicMock()
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: mock_telemetry)
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
 
         dist_utils.configure_raiden_telemetry()
         mock_telemetry.configure_telemetry.assert_called_once_with(None)
@@ -108,30 +107,28 @@ class TestRaidenTelemetryUtils:
     def test_configure_raiden_telemetry_explicit_backends(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
         mock_telemetry = MagicMock()
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: mock_telemetry)
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
 
-        dist_utils.configure_raiden_telemetry(
-            backends=["buffered", "custom_exporter"])
+        dist_utils.configure_raiden_telemetry(backends=["buffered", "custom_exporter"])
         mock_telemetry.configure_telemetry.assert_called_with(
-            ["buffered", "custom_exporter"])
+            ["buffered", "custom_exporter"]
+        )
 
         dist_utils.configure_raiden_telemetry(backends={"single_backend"})
-        mock_telemetry.configure_telemetry.assert_called_with(
-            {"single_backend"})
+        mock_telemetry.configure_telemetry.assert_called_with({"single_backend"})
 
     def test_configure_raiden_telemetry_telemetry_none(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: None)
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module", lambda: None)
 
         dist_utils.configure_raiden_telemetry()
         assert dist_utils._RAIDEN_TELEMETRY_CONFIGURED is False
 
     def test_configure_raiden_telemetry_no_configure_method(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: object())
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module", lambda: object())
 
         dist_utils.configure_raiden_telemetry()
         assert dist_utils._RAIDEN_TELEMETRY_CONFIGURED is False
@@ -140,9 +137,11 @@ class TestRaidenTelemetryUtils:
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
         mock_telemetry = MagicMock()
         mock_telemetry.configure_telemetry.side_effect = RuntimeError(
-            "Failed to configure")
-        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
-                            lambda: mock_telemetry)
+            "Failed to configure"
+        )
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
 
         # Should not raise exception
         dist_utils.configure_raiden_telemetry()
@@ -184,9 +183,7 @@ class TestTpuKVConnectorStatsDynamicMetrics:
         stats2.data["tpu_raiden_sent_bytes_total"] = [100]
 
         stats1.aggregate(stats2)
-        assert stats1.data["tpu_raiden_transfer_duration_ms"] == [
-            1.0, 2.0, 3.0
-        ]
+        assert stats1.data["tpu_raiden_transfer_duration_ms"] == [1.0, 2.0, 3.0]
         assert stats1.data["tpu_raiden_sent_bytes_total"] == [100]
 
     def test_clone_and_reset_dynamic_metrics(self):
@@ -218,8 +215,15 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         mock_telemetry = MagicMock()
         mock_telemetry.get_metric_metadata.return_value = descriptors
 
-        with patch("vllm_torchtpu.distributed.utils.get_raiden_telemetry_module", return_value=mock_telemetry), \
-             patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry") as mock_conf:
+        with (
+            patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry,
+            ),
+            patch(
+                "vllm_torchtpu.distributed.utils.configure_raiden_telemetry"
+            ) as mock_conf,
+        ):
             metrics = TpuKVConnectorPromMetrics(
                 vllm_config=MagicMock(),
                 metric_types=metric_types,
@@ -262,12 +266,13 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         assert "tpu_raiden_unsupported_summary" not in metrics.dynamic_metrics
 
         # Verify metric types
-        assert metrics.dynamic_metrics["tpu_raiden_transfer_duration_ms"][
-            0] == "histogram"
-        assert metrics.dynamic_metrics["tpu_raiden_sent_bytes_total"][
-            0] == "counter"
-        assert metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][
-            0] == "gauge"
+        assert (
+            metrics.dynamic_metrics["tpu_raiden_transfer_duration_ms"][0] == "histogram"
+        )
+        assert metrics.dynamic_metrics["tpu_raiden_sent_bytes_total"][0] == "counter"
+        assert (
+            metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][0] == "gauge"
+        )
 
     def test_dynamic_metric_observe(self):
         descriptors = [
@@ -316,8 +321,7 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         assert counter._value.get() == 30.0
 
         # Verify gauge observation (last value wins: set(4) then set(7))
-        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][
-            1][0]
+        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1][0]
         assert gauge._value.get() == 7.0
 
     def test_dynamic_metric_telemetry_exception_handled(self):
@@ -332,11 +336,13 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
 
         mock_telemetry = MagicMock()
         mock_telemetry.get_metric_metadata.side_effect = RuntimeError(
-            "Failed to read metadata")
+            "Failed to read metadata"
+        )
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             metrics = TpuKVConnectorPromMetrics(
                 vllm_config=MagicMock(),
                 metric_types=metric_types,
@@ -346,13 +352,15 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
 
         assert metrics.dynamic_metrics == {}
         # Observe should still succeed without crashing
-        metrics.observe({
-            "d2h_transfer_time": [],
-            "h2d_transfer_time": [],
-            "kv_pull_time": [],
-            "mb_transferred": [],
-            "num_failed_transfers": []
-        })
+        metrics.observe(
+            {
+                "d2h_transfer_time": [],
+                "h2d_transfer_time": [],
+                "kv_pull_time": [],
+                "mb_transferred": [],
+                "num_failed_transfers": [],
+            }
+        )
 
 
 class TestTPURaidenConnectorWorkerTelemetry:
@@ -361,7 +369,8 @@ class TestTPURaidenConnectorWorkerTelemetry:
     def _create_mock_worker(self, is_producer=True, tp_rank=0):
         worker = MagicMock(spec=TPURaidenConnectorWorker)
         worker._get_raiden_stats = TPURaidenConnectorWorker._get_raiden_stats.__get__(
-            worker)
+            worker
+        )
         worker.tp_rank = tp_rank
         worker.tp_size = 1
         worker.dp_rank = 0
@@ -374,7 +383,7 @@ class TestTPURaidenConnectorWorkerTelemetry:
         worker._stage3_submitted_loads = {
             1: MagicMock(),
             2: MagicMock(),
-            3: MagicMock()
+            3: MagicMock(),
         }
         worker._stage3_terminal_loads = {1: MagicMock()}
         worker.transfer_stats = TpuKVConnectorStats()
@@ -391,8 +400,9 @@ class TestTPURaidenConnectorWorkerTelemetry:
         }
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is not None
@@ -413,8 +423,9 @@ class TestTPURaidenConnectorWorkerTelemetry:
         }
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is not None
@@ -431,25 +442,30 @@ class TestTPURaidenConnectorWorkerTelemetry:
         }
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is not None
         assert stats.data["tpu_raiden_transfer_duration_ms"] == [2.0]
-        assert "prefill_queue_length" not in stats.data or stats.data[
-            "prefill_queue_length"] == []
+        assert (
+            "prefill_queue_length" not in stats.data
+            or stats.data["prefill_queue_length"] == []
+        )
 
     def test_worker_get_kv_connector_stats_telemetry_exception_graceful(self):
         worker = self._create_mock_worker(is_producer=True, tp_rank=0)
 
         mock_telemetry = MagicMock()
         mock_telemetry.get_and_reset_metric_samples.side_effect = RuntimeError(
-            "Sampling error")
+            "Sampling error"
+        )
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         # Should still record queue lengths on tp_rank 0 without crashing
@@ -463,8 +479,9 @@ class TestTPURaidenConnectorWorkerTelemetry:
         mock_telemetry.get_and_reset_metric_samples.return_value = {}
 
         with patch(
-                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
-                return_value=mock_telemetry):
+            "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+            return_value=mock_telemetry,
+        ):
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is None

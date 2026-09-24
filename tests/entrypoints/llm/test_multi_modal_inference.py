@@ -54,17 +54,18 @@ EXPECTED_TEXTS = (
 
 def _get_tensor_parallel_size() -> int:
     tpu_type = tpu_info.get_tpu_type() or ""
-    if tpu_type.startswith("tpu7x") or os.environ.get(
-            "TPU_VERSION") == "tpu7x":
+    if tpu_type.startswith("tpu7x") or os.environ.get("TPU_VERSION") == "tpu7x":
         return 2
     return 1
 
 
 def _build_qwen2_5_vl_prompt(question: str) -> str:
-    return ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-            f"{question}<|im_end|>\n"
-            "<|im_start|>assistant\n")
+    return (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
 
 
 def _run_mm_generation_worker(
@@ -96,10 +97,7 @@ def _run_mm_generation_worker(
             max_num_seqs=max_num_seqs,
             compilation_config=compilation_config,
             mm_processor_kwargs={
-                "size": {
-                    "longest_edge": 1003520,
-                    "shortest_edge": 3136
-                },
+                "size": {"longest_edge": 1003520, "shortest_edge": 3136},
                 "fps": 1,
             },
             limit_mm_per_prompt={"image": 1},
@@ -110,11 +108,9 @@ def _run_mm_generation_worker(
         args_dict = asdict(engine_args)
         args_dict.pop("fault_tolerance_config", None)
 
-        pass_config = args_dict.get("compilation_config",
-                                    {}).get("pass_config") or {}
+        pass_config = args_dict.get("compilation_config", {}).get("pass_config") or {}
         args_dict["compilation_config"]["pass_config"] = {
-            k: v
-            for k, v in pass_config.items() if v is not None
+            k: v for k, v in pass_config.items() if v is not None
         }
 
         llm = LLM(**args_dict)
@@ -127,17 +123,16 @@ def _run_mm_generation_worker(
         if len(prompts) == 1:
             inputs = {
                 "prompt": prompts[0],
-                "multi_modal_data": {
-                    "image": images[0]
-                },
+                "multi_modal_data": {"image": images[0]},
             }
         else:
-            inputs = [{
-                "prompt": p,
-                "multi_modal_data": {
-                    "image": img
-                },
-            } for p, img in zip(prompts, images)]
+            inputs = [
+                {
+                    "prompt": p,
+                    "multi_modal_data": {"image": img},
+                }
+                for p, img in zip(prompts, images)
+            ]
 
         outputs = llm.generate(inputs, sampling_params=sampling_params)
         generated_texts = [o.outputs[0].text.strip() for o in outputs]
@@ -158,8 +153,7 @@ def run_mm_generation_in_isolated_process(
     queue = ctx.Queue()
     p = ctx.Process(
         target=_run_mm_generation_worker,
-        args=(prompts, images, cudagraph_mm_encoder, max_tokens, max_num_seqs,
-              queue),
+        args=(prompts, images, cudagraph_mm_encoder, max_tokens, max_num_seqs, queue),
     )
     p.start()
     p.join()
@@ -186,15 +180,16 @@ def test_multi_modal_inference(cudagraph_mm_encoder: bool):
 
     generated_text = generated_texts[0]
     similarity_score = max(
-        difflib.SequenceMatcher(None, generated_text, expected,
-                                autojunk=False).ratio()
-        for expected in EXPECTED_TEXTS)
+        difflib.SequenceMatcher(None, generated_text, expected, autojunk=False).ratio()
+        for expected in EXPECTED_TEXTS
+    )
 
     assert similarity_score >= 0.85, (
         f"Multi-modal text similarity too low ({similarity_score:.2f}) "
         f"with cudagraph_mm_encoder={cudagraph_mm_encoder}.\n"
         f"Expected one of: {EXPECTED_TEXTS}\n"
-        f"Actual: {generated_text}")
+        f"Actual: {generated_text}"
+    )
 
 
 @pytest.mark.timeout(1200)

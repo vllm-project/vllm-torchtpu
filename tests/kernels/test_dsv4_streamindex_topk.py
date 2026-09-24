@@ -23,15 +23,21 @@ import pytest
 
 try:
     from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (
-        KVLayout, convert_cache_to_seq_along_lane, streamindex_topk)
+        KVLayout,
+        convert_cache_to_seq_along_lane,
+        streamindex_topk,
+    )
 except ImportError:
     # `convert_cache_to_seq_along_lane` is not re-exported by the package's
     # `__init__`, and the package attribute `streamindex_topk` is the jitted
     # function rather than the submodule, so it is imported by name here.
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        KVLayout, streamindex_topk)
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import \
-        convert_cache_to_seq_along_lane
+        KVLayout,
+        streamindex_topk,
+    )
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        convert_cache_to_seq_along_lane,
+    )
 
 
 # =====================================================================
@@ -50,8 +56,7 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     *lead, dim = x.shape
     blocked = x.reshape(*lead, dim // block_size, block_size)
-    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4,
-                    None)
+    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4, None)
     scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
     q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
     scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
@@ -93,9 +98,7 @@ def streamindex_topk_ref(
         seq_blocks = block_table[b]
         seq_kv = np.concatenate([kv[p] for p in seq_blocks], axis=0)
 
-        naive_scores = np.full((T_seq, max(S_valid, k)),
-                               -np.inf,
-                               dtype=np.float32)
+        naive_scores = np.full((T_seq, max(S_valid, k)), -np.inf, dtype=np.float32)
 
         for t_idx in range(T_seq):
             global_t = q_start + t_idx
@@ -178,9 +181,9 @@ def test_streamindex_topk_shape(
 ):
     """Tests the shape and basic execution bounds of streamindex_topk."""
     _ = H_KV
-    print(f"\n{'-'*60}")
+    print(f"\n{'-' * 60}")
     print(f"SHAPE TEST: B={B}, Tokens={num_tokens}, k={k}")
-    print(f"{'-'*60}")
+    print(f"{'-' * 60}")
 
     query_projection = jnp.zeros((num_tokens, H_I, D), dtype=jnp.float32)
     indexer_weights = jnp.zeros((num_tokens, H_I), dtype=jnp.float32)
@@ -189,8 +192,7 @@ def test_streamindex_topk_shape(
     q_lkv_dim = ((D + 127) // 128) * 128
     record_width = q_lkv_dim + (q_lkv_dim // 128)
     width = ((record_width + 127) // 128) * 128
-    kv_cache = jnp.zeros((num_pages, page_size // 4, 4, width),
-                         dtype=jnp.uint8)
+    kv_cache = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=jnp.uint8)
 
     block_table = jnp.zeros((B, max_blocks), dtype=jnp.int32)
     page_indices = block_table.flatten()
@@ -204,9 +206,10 @@ def test_streamindex_topk_shape(
 
     # Count number of decode sequences (T == 1) at the beginning of the batch
     num_decodes = 0
-    while (num_decodes < B
-           and (cu_q_lens_list[num_decodes + 1] - cu_q_lens_list[num_decodes])
-           == 1):
+    while (
+        num_decodes < B
+        and (cu_q_lens_list[num_decodes + 1] - cu_q_lens_list[num_decodes]) == 1
+    ):
         num_decodes += 1
     distribution = (num_decodes, num_decodes, B)
     expected_shape = (num_tokens, k)
@@ -230,8 +233,7 @@ def test_streamindex_topk_shape(
 
     print("\nOutputs:")
     print(f"  - Expected shape: {expected_shape}, dtype: int32")
-    print(f"  - Actual shape:   {out_shape_idxs.shape}, dtype:"
-          f" {out_shape_idxs.dtype}")
+    print(f"  - Actual shape:   {out_shape_idxs.shape}, dtype: {out_shape_idxs.dtype}")
 
     assert out_shape_idxs.shape == expected_shape
     assert out_shape_idxs.dtype == jnp.int32
@@ -281,10 +283,34 @@ def test_streamindex_topk_shape(
             1,
             8,
             8,
-            [[
-                13, 2, 21, 7, 0, 18, 5, 11, 23, 1, 9, 16, 3, 20, 6, 14, 22, 4,
-                10, 17, 8, 15, 19, 12
-            ]],
+            [
+                [
+                    13,
+                    2,
+                    21,
+                    7,
+                    0,
+                    18,
+                    5,
+                    11,
+                    23,
+                    1,
+                    9,
+                    16,
+                    3,
+                    20,
+                    6,
+                    14,
+                    22,
+                    4,
+                    10,
+                    17,
+                    8,
+                    15,
+                    19,
+                    12,
+                ]
+            ],
         ),
     ],
 )
@@ -303,30 +329,31 @@ def test_streamindex_topk_numerical_correctness(
     block_table_list,
 ):
     """Executes randomized input data against a naive NumPy ground truth."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"BATCHED NUMERICAL TEST (B={B})")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     np.random.seed(42)
 
     # 1. Setup Random Tensors
     num_tokens = sum(T_list)
     q = np.random.randn(num_tokens, H_I, D).astype(np.float32)
-    weights = np.random.uniform(-1.5, 1.5,
-                                size=(num_tokens, H_I)).astype(np.float32)
+    weights = np.random.uniform(-1.5, 1.5, size=(num_tokens, H_I)).astype(np.float32)
 
     # Create a unified physical KV Cache pool large enough for all block indices
     max_physical_page = np.max(block_table_list)
-    float32_kv = np.random.randn(max_physical_page + 1, page_size, H_KV,
-                                 D).astype(np.float32)
+    float32_kv = np.random.randn(max_physical_page + 1, page_size, H_KV, D).astype(
+        np.float32
+    )
 
     # Pack cache using compressor's quantize_fp8_ue8m0 and _to_byte_lane
     q_lkv_dim = ((D + 127) // 128) * 128
     record_width = q_lkv_dim + (q_lkv_dim // 128)
     width = ((record_width + 127) // 128) * 128
 
-    cache_kv = np.zeros((max_physical_page + 1, page_size // 4, 4, width),
-                        dtype=np.uint8)
+    cache_kv = np.zeros(
+        (max_physical_page + 1, page_size // 4, 4, width), dtype=np.uint8
+    )
     dequantized_kv = np.zeros_like(float32_kv)
 
     for p in range(max_physical_page + 1):
@@ -385,8 +412,7 @@ def test_streamindex_topk_numerical_correctness(
     # =====================================================================
     # 3. Pallas KERNEL COMPUTATION
     # =====================================================================
-    print(
-        "\n[2/3] Executing optimized JAX Kernel (streamindex_pallas_topk)...")
+    print("\n[2/3] Executing optimized JAX Kernel (streamindex_pallas_topk)...")
     # Count number of decode sequences (T == 1) at the beginning of the batch
     num_decodes = 0
     while num_decodes < B and T_list[num_decodes] == 1:
@@ -423,7 +449,8 @@ def test_streamindex_topk_numerical_correctness(
     )
     print(
         "MATCH VERIFIED! JAX kernel handles batches, fragmentation, and dummy"
-        " padding.\n")
+        " padding.\n"
+    )
 
 
 def test_streamindex_topk_quantized():
@@ -447,8 +474,7 @@ def test_streamindex_topk_quantized():
     S_valid = S_seq // comp_ratio
     # We need enough pages to hold S_valid compressed tokens.
     num_pages = (S_valid + page_size - 1) // page_size
-    float32_kv = np.random.randn(num_pages, page_size, H_KV,
-                                 D).astype(np.float32)
+    float32_kv = np.random.randn(num_pages, page_size, H_KV, D).astype(np.float32)
 
     # Pack cache using compressor's quantize_fp8_ue8m0 and _to_byte_lane
     width = 256
@@ -483,8 +509,7 @@ def test_streamindex_topk_quantized():
                 cache_kv[p, w_idx, lane_idx] = record
 
     # Compute expected top-k using exact dequantized keys
-    seq_kv = np.concatenate([dequantized_kv[p] for p in range(num_pages)],
-                            axis=0)
+    seq_kv = np.concatenate([dequantized_kv[p] for p in range(num_pages)], axis=0)
 
     naive_scores = np.full((T_seq, max(S_valid, k)), -np.inf, dtype=np.float32)
 
@@ -555,8 +580,7 @@ def _ee_pack_cache(keys):
     """
     num_pages, page_size, head_dim = keys.shape
     fp8, scale = quantize_fp8_ue8m0(jnp.asarray(keys), head_dim)
-    record = jnp.concatenate(
-        [_to_byte_lane(fp8), _to_byte_lane(scale)], axis=-1)
+    record = jnp.concatenate([_to_byte_lane(fp8), _to_byte_lane(scale)], axis=-1)
     width = -(-record.shape[-1] // 128) * 128
     record = jnp.pad(record, ((0, 0), (0, 0), (0, width - record.shape[-1])))
     return np.asarray(record).reshape(num_pages, page_size // 4, 4, width)
@@ -573,10 +597,10 @@ def _ee_inputs(q_lens, seq_lens, seed):
     num_tokens = int(sum(q_lens))
     num_pages = num_seqs * _EE_PAGES_PER_SEQ
 
-    block_table = rng.permutation(num_pages).astype(np.int32).reshape(
-        num_seqs, _EE_PAGES_PER_SEQ)
-    keys = rng.standard_normal((num_pages, _EE_PAGE_SIZE, _EE_D),
-                               dtype=np.float32)
+    block_table = (
+        rng.permutation(num_pages).astype(np.int32).reshape(num_seqs, _EE_PAGES_PER_SEQ)
+    )
+    keys = rng.standard_normal((num_pages, _EE_PAGE_SIZE, _EE_D), dtype=np.float32)
 
     # `distribution` requires the decode-only sequences to lead the batch.
     num_decodes = 0
@@ -584,20 +608,15 @@ def _ee_inputs(q_lens, seq_lens, seed):
         num_decodes += 1
 
     return {
-        "q":
-        rng.standard_normal((num_tokens, _EE_H_I, _EE_D), dtype=np.float32),
-        "indexer_weights":
-        rng.uniform(0.25, 1.75, (num_tokens, _EE_H_I)).astype(np.float32),
-        "cache_kv":
-        _ee_pack_cache(keys),
-        "seq_lens":
-        np.asarray(seq_lens, np.int32),
-        "page_indices":
-        block_table.reshape(-1),
-        "cu_q_lens":
-        np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32),
-        "distribution":
-        np.array([num_decodes, num_decodes, num_seqs], np.int32),
+        "q": rng.standard_normal((num_tokens, _EE_H_I, _EE_D), dtype=np.float32),
+        "indexer_weights": rng.uniform(0.25, 1.75, (num_tokens, _EE_H_I)).astype(
+            np.float32
+        ),
+        "cache_kv": _ee_pack_cache(keys),
+        "seq_lens": np.asarray(seq_lens, np.int32),
+        "page_indices": block_table.reshape(-1),
+        "cu_q_lens": np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32),
+        "distribution": np.array([num_decodes, num_decodes, num_seqs], np.int32),
     }
 
 
@@ -607,15 +626,15 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
 
     def run(enable_early_exit):
         return np.asarray(
-            streamindex_topk(**{
-                name: jnp.asarray(value)
-                for name, value in inputs.items()
-            },
-                             k=k,
-                             compression_ratio=1,
-                             num_kv_pages_per_block=_EE_BKV_P,
-                             num_queries_per_block=_EE_BQ_SZ,
-                             enable_early_exit=enable_early_exit))
+            streamindex_topk(
+                **{name: jnp.asarray(value) for name, value in inputs.items()},
+                k=k,
+                compression_ratio=1,
+                num_kv_pages_per_block=_EE_BKV_P,
+                num_queries_per_block=_EE_BQ_SZ,
+                enable_early_exit=enable_early_exit,
+            )
+        )
 
     return run(False), run(True)
 
@@ -646,10 +665,14 @@ def _ee_assert_same_selection(early, baseline):
         kept_e = np.sort(row_e[row_e >= 0])
         kept_b = np.sort(row_b[row_b >= 0])
         np.testing.assert_array_equal(
-            kept_e, kept_b, f"token {token}: early exit selected a different "
-            "set of positions than the scoring path")
-        assert np.all(row_e[len(kept_e):] < 0), (
-            f"token {token}: -1 padding is not a suffix: {row_e}")
+            kept_e,
+            kept_b,
+            f"token {token}: early exit selected a different "
+            "set of positions than the scoring path",
+        )
+        assert np.all(row_e[len(kept_e) :] < 0), (
+            f"token {token}: -1 padding is not a suffix: {row_e}"
+        )
 
 
 def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k):
@@ -662,10 +685,13 @@ def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k):
         assert n_visible <= k, "test setup: sequence is not short"
         row = actual[token]
         np.testing.assert_array_equal(
-            np.sort(row[row >= 0]), np.arange(n_visible),
-            f"token {token}: not every visible position was reported")
+            np.sort(row[row >= 0]),
+            np.arange(n_visible),
+            f"token {token}: not every visible position was reported",
+        )
         assert np.all(row[n_visible:] < 0), (
-            f"token {token}: -1 padding is not a suffix: {row}")
+            f"token {token}: -1 padding is not a suffix: {row}"
+        )
 
 
 def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
@@ -684,7 +710,8 @@ def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
         row = actual[token]
         assert np.all(row >= 0), f"token {token}: padded a full-length row"
         assert row.max() < limit, (
-            f"token {token}: index {row.max()} past seq_len {limit}")
+            f"token {token}: index {row.max()} past seq_len {limit}"
+        )
 
 
 def test_streamindex_topk_early_exit_all_short():
@@ -728,7 +755,7 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     The whole sequence fits in k, so a bug that returned `[0, k)` instead of
     `[0, position]` would still look plausible -- this is what catches it.
     """
-    q_lens, seq_lens, k = (4, ), (64, ), 256
+    q_lens, seq_lens, k = (4,), (64,), 256
     _, early = _ee_both_paths(q_lens, seq_lens, k)
 
     _ee_assert_every_visible_position(early, q_lens, seq_lens, k)
@@ -750,9 +777,9 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
         # In Pallas, 100,000 steps require ~2.4 MB of SMEM.
         return metadata.MetadataRef.create(
             num_steps=res.num_steps,
-            batch_tile_idx=jnp.zeros((100000, ), dtype=jnp.int32),
-            bq_idx=jnp.zeros((100000, ), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+            batch_tile_idx=jnp.zeros((100000,), dtype=jnp.int32),
+            bq_idx=jnp.zeros((100000,), dtype=jnp.int32),
+            bkv_idx=jnp.zeros((100000,), dtype=jnp.int32),
         )
 
     monkeypatch.setattr(metadata, "compute_metadata", _mock_compute_metadata)
@@ -767,11 +794,9 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
     q = jnp.zeros((num_seqs * seq_len, 1, head_dim), dtype=jnp.float32)
     weights = jnp.ones((num_seqs * seq_len, 1), dtype=jnp.float32)
     cache_kv = jnp.zeros((total_pages, 32, 4, width), dtype=np.uint8)
-    seq_lens = jnp.full((num_seqs, ), seq_len, dtype=jnp.int32)
+    seq_lens = jnp.full((num_seqs,), seq_len, dtype=jnp.int32)
     page_indices = jnp.arange(total_pages, dtype=jnp.int32)
-    cu_q_lens = jnp.arange(0, (num_seqs + 1) * seq_len,
-                           seq_len,
-                           dtype=jnp.int32)
+    cu_q_lens = jnp.arange(0, (num_seqs + 1) * seq_len, seq_len, dtype=jnp.int32)
     distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
 
     with pytest.raises(Exception) as exc_info:
@@ -813,12 +838,9 @@ def test_streamindex_topk_buffer_count():
     width = ((record_width + 127) // 128) * 128
 
     rng = np.random.default_rng(42)
-    q = jnp.array(rng.standard_normal((total_tokens, H_I, D)),
-                  dtype=jnp.float32)
-    weights = jnp.array(rng.standard_normal((total_tokens, H_I)),
-                        dtype=jnp.float32)
-    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width),
-                         dtype=jnp.uint8)
+    q = jnp.array(rng.standard_normal((total_tokens, H_I, D)), dtype=jnp.float32)
+    weights = jnp.array(rng.standard_normal((total_tokens, H_I)), dtype=jnp.float32)
+    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=jnp.uint8)
     seq_lens = jnp.array([S] * B, dtype=jnp.int32)
     page_indices = jnp.arange(num_pages, dtype=jnp.int32)
     cu_q_lens = jnp.array([0, T, 2 * T], dtype=jnp.int32)
@@ -938,8 +960,7 @@ def test_streamindex_topk_return_scores_and_validation():
         )
 
     # 3. interleave_size not multiple of compression_ratio
-    with pytest.raises(ValueError,
-                       match="must be a multiple of compression_ratio"):
+    with pytest.raises(ValueError, match="must be a multiple of compression_ratio"):
         streamindex_topk(
             q=q,
             indexer_weights=weights,
@@ -958,8 +979,8 @@ def test_streamindex_topk_return_scores_and_validation():
 
     # 4. enable_early_exit with cp_size > 1
     with pytest.raises(
-            NotImplementedError,
-            match="enable_early_exit is not supported with cp_size > 1",
+        NotImplementedError,
+        match="enable_early_exit is not supported with cp_size > 1",
     ):
         streamindex_topk(
             q=q,
@@ -979,8 +1000,8 @@ def test_streamindex_topk_return_scores_and_validation():
 
     # 5. return_scores with enable_early_exit
     with pytest.raises(
-            NotImplementedError,
-            match="return_scores is not supported with enable_early_exit",
+        NotImplementedError,
+        match="return_scores is not supported with enable_early_exit",
     ):
         streamindex_topk(
             q=q,
@@ -1013,7 +1034,8 @@ def _verify_padding_at_end(actual_topk_np):
     is_minus_one = (actual_topk_np == -1).astype(np.int32)
     violations = np.diff(is_minus_one, axis=-1) < 0
     assert not np.any(violations), (
-        "Padding (-1) is not at the end of the innermost dimension")
+        "Padding (-1) is not at the end of the innermost dimension"
+    )
 
 
 # `streamindex_topk`'s default `decode_req_batch_size`. `chunk_tokens` must be
@@ -1046,8 +1068,9 @@ def _fragmented_pages(num_seqs, pages_per_seq=4):
     pages = list(range(num_seqs * pages_per_seq))
     np.random.default_rng(0).shuffle(pages)
     return tuple(
-        tuple(pages[i * pages_per_seq:(i + 1) * pages_per_seq])
-        for i in range(num_seqs))
+        tuple(pages[i * pages_per_seq : (i + 1) * pages_per_seq])
+        for i in range(num_seqs)
+    )
 
 
 @functools.cache
@@ -1063,8 +1086,7 @@ def _chunk_inputs(T_list, block_table_list, page_size, H_I, D) -> _ChunkInputs:
     np.random.seed(42)
     num_tokens = sum(T_list)
     q = np.random.randn(num_tokens, H_I, D).astype(np.float32)
-    weights = np.random.uniform(-1.5, 1.5,
-                                size=(num_tokens, H_I)).astype(np.float32)
+    weights = np.random.uniform(-1.5, 1.5, size=(num_tokens, H_I)).astype(np.float32)
 
     num_pages = max(p for row in block_table_list for p in row) + 1
     float32_kv = np.random.randn(num_pages, page_size, D).astype(np.float32)
@@ -1075,13 +1097,16 @@ def _chunk_inputs(T_list, block_table_list, page_size, H_I, D) -> _ChunkInputs:
     dequantized_kv = np.zeros((num_pages, page_size, 1, D), dtype=np.float32)
     for p in range(num_pages):
         quant, scale = quantize_fp8_ue8m0(jnp.array(float32_kv[p]), D)
-        dequantized_kv[p, :, 0] = (np.array(quant).astype(np.float32) *
-                                   np.array(scale).astype(np.float32))
-        record = np.concatenate([
-            np.array(_to_byte_lane(quant)),
-            np.array(_to_byte_lane(scale)),
-        ],
-                                axis=-1)
+        dequantized_kv[p, :, 0] = np.array(quant).astype(np.float32) * np.array(
+            scale
+        ).astype(np.float32)
+        record = np.concatenate(
+            [
+                np.array(_to_byte_lane(quant)),
+                np.array(_to_byte_lane(scale)),
+            ],
+            axis=-1,
+        )
         record = np.pad(record, ((0, 0), (0, width - record.shape[-1])))
         # Token `s` of a page lives at [s // 4, s % 4], the same layout the
         # packing loop in the numerical test above builds element by element.
@@ -1091,13 +1116,16 @@ def _chunk_inputs(T_list, block_table_list, page_size, H_I, D) -> _ChunkInputs:
         q=q,
         weights=weights,
         cache_kv=cache_kv,
-        cache_kv_lane=(np.array(
-            convert_cache_to_seq_along_lane(jnp.array(cache_kv), D))
-                       if page_size % 128 == 0 else None),
+        cache_kv_lane=(
+            np.array(convert_cache_to_seq_along_lane(jnp.array(cache_kv), D))
+            if page_size % 128 == 0
+            else None
+        ),
         dequantized_kv=dequantized_kv,
         block_table=np.array(block_table_list, dtype=np.int32),
-        page_indices=np.array([p for row in block_table_list for p in row],
-                              dtype=np.int32),
+        page_indices=np.array(
+            [p for row in block_table_list for p in row], dtype=np.int32
+        ),
     )
 
 
@@ -1120,7 +1148,7 @@ def _chunk_call_kwargs(
     while num_decodes < len(T_list) and T_list[num_decodes] == 1:
         num_decodes += 1
 
-    cache_kv = (inputs.cache_kv_lane if kv_layout == _SAL else inputs.cache_kv)
+    cache_kv = inputs.cache_kv_lane if kv_layout == _SAL else inputs.cache_kv
     assert cache_kv is not None, "SEQ_ALONG_LANE needs page_size % 128 == 0"
     return dict(
         q=jnp.array(inputs.q),
@@ -1128,8 +1156,7 @@ def _chunk_call_kwargs(
         cache_kv=jnp.array(cache_kv),
         seq_lens=jnp.array(np.array(S_list, dtype=np.int32)),
         page_indices=jnp.array(inputs.page_indices),
-        cu_q_lens=jnp.array(
-            np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32)),
+        cu_q_lens=jnp.array(np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32)),
         distribution=(num_decodes, num_decodes, len(T_list)),
         k=k,
         compression_ratio=comp_ratio,
@@ -1168,14 +1195,16 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     k = 512
 
     inputs = _chunk_inputs(T_list, _fragmented_pages(2), page_size, H_I, D)
-    kwargs = _chunk_call_kwargs(inputs, T_list, S_list, k, comp_ratio, bq_sz,
-                                bkv_p, _HAS, chunk_tokens)
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, comp_ratio, bq_sz, bkv_p, _HAS, chunk_tokens
+    )
 
     hlo = streamindex_topk.lower(**kwargs).as_text()
     assert "_scheduling_group_id" in hlo, (
         f"chunk_tokens={chunk_tokens} did not chunk: no scheduling group id "
         "reached the HLO, so the kernel took the single-pass fallback and "
-        "this test would prove nothing")
+        "this test would prove nothing"
+    )
 
     actual = np.array(streamindex_topk(**kwargs))
     expected = streamindex_topk_ref(

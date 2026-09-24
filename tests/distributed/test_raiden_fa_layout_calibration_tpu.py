@@ -22,8 +22,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from vllm_torchtpu.distributed.kv_transfer.raiden import \
-    layout_fingerprint as rlf
+from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
 from .tpu_test_utils import run_in_isolated_process
@@ -31,7 +30,8 @@ from .tpu_test_utils import run_in_isolated_process
 _TOKEN_BYTES = 1024
 _NUM_BLOCKS = 16
 _EXPECTED_TOKEN_PERMUTATION_SHA256 = (
-    "5099414140678a1cdda205a7f97b6106d554de04b4fd60b238aa3d78e9e2a6e4")
+    "5099414140678a1cdda205a7f97b6106d554de04b4fd60b238aa3d78e9e2a6e4"
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,8 @@ def _require_e0_runtime() -> tuple[Any, Any, Any, Any]:
         "import torch, torch_tpu\n"
         "from torch_tpu._internal import sync\n"
         "x=torch.empty((1,1,1,4,256),dtype=torch.float8_e4m3fn,device='tpu')\n"
-        "sync.synchronize([x],wait=True)\n")
+        "sync.synchronize([x],wait=True)\n"
+    )
     try:
         result = subprocess.run(
             [sys.executable, "-c", probe],
@@ -75,8 +76,10 @@ def _require_e0_runtime() -> tuple[Any, Any, Any, Any]:
         pytest.skip(f"TPU tensor probe timed out: {exc}")
     if result.returncode:
         detail = result.stderr.strip().splitlines()
-        pytest.skip("real TPU tensor allocation is unavailable: " + (
-            detail[-1] if detail else f"probe exited {result.returncode}"))
+        pytest.skip(
+            "real TPU tensor allocation is unavailable: "
+            + (detail[-1] if detail else f"probe exited {result.returncode}")
+        )
 
     import torch
     import torch_tpu  # noqa: F401
@@ -102,8 +105,9 @@ def _apply_xla_tiled_layout(
         if not tile or any(dim <= 0 for dim in tile):
             raise ValueError(f"invalid XLA tile: {tile}")
         if len(tile) > physical.ndim:
-            physical = physical.reshape((1, ) * (len(tile) - physical.ndim) +
-                                        physical.shape)
+            physical = physical.reshape(
+                (1,) * (len(tile) - physical.ndim) + physical.shape
+            )
         suffix_start = physical.ndim - len(tile)
         pads = [(0, 0)] * physical.ndim
         for offset, tile_dim in enumerate(tile):
@@ -118,9 +122,11 @@ def _apply_xla_tiled_layout(
         physical = physical.reshape(prefix + tuple(interleaved))
         prefix_rank = len(prefix)
         tile_rank = len(tile)
-        axes = (tuple(range(prefix_rank)) + tuple(prefix_rank + 2 * i
-                                                  for i in range(tile_rank)) +
-                tuple(prefix_rank + 2 * i + 1 for i in range(tile_rank)))
+        axes = (
+            tuple(range(prefix_rank))
+            + tuple(prefix_rank + 2 * i for i in range(tile_rank))
+            + tuple(prefix_rank + 2 * i + 1 for i in range(tile_rank))
+        )
         physical = np.transpose(physical, axes)
     return np.ascontiguousarray(physical).reshape(-1)
 
@@ -129,8 +135,7 @@ def _logical_probe(shape: Sequence[int]) -> np.ndarray:
     numel = math.prod(shape)
     assert numel % _TOKEN_BYTES == 0
     tokens = np.arange(numel // _TOKEN_BYTES, dtype=np.uint32)
-    token_codes = ((tokens * 73) ^ (tokens >> 3) ^ (tokens >> 11)).astype(
-        np.uint8)
+    token_codes = ((tokens * 73) ^ (tokens >> 3) ^ (tokens >> 11)).astype(np.uint8)
     columns = np.arange(_TOKEN_BYTES, dtype=np.uint16)
     column_codes = ((columns * 29) ^ (columns >> 2)).astype(np.uint8)
     logical = np.add.outer(token_codes, column_codes, dtype=np.uint8)
@@ -140,23 +145,27 @@ def _logical_probe(shape: Sequence[int]) -> np.ndarray:
     return logical.reshape(tuple(shape))
 
 
-def _manifest_for_tensor(tensor: Any,
-                         case: _CalibrationCase) -> rpm.PoolManifest:
+def _manifest_for_tensor(tensor: Any, case: _CalibrationCase) -> rpm.PoolManifest:
     layer_name = "model.layers.3.self_attn.attn"
     group = type(
-        "Group", (), {
-            "layer_names": (layer_name, ),
-            "kv_cache_spec":
-            type(
-                "Spec", (), {
+        "Group",
+        (),
+        {
+            "layer_names": (layer_name,),
+            "kv_cache_spec": type(
+                "Spec",
+                (),
+                {
                     "block_size": case.block_tokens,
                     "num_kv_heads": 2,
                     "head_size": 256,
-                })(),
-        })()
+                },
+            )(),
+        },
+    )()
     return rpm.build_qwen35_pool_manifest(
         named_kv_caches={layer_name: tensor},
-        kv_cache_groups=(group, ),
+        kv_cache_groups=(group,),
         raw_tensors=(),
         gdn_geometry=rpm.GdnHeadGeometry(
             local_key_heads=1,
@@ -170,19 +179,18 @@ def _manifest_for_tensor(tensor: Any,
 def _one_token_permutation() -> np.ndarray:
     logical = np.arange(_TOKEN_BYTES, dtype="<i4").reshape(1, 1, 1, 4, 256)
     physical_to_logical = _apply_xla_tiled_layout(
-        logical, rlf.EXPECTED_FA_MINOR_TO_MAJOR, rlf.EXPECTED_FA_TILES)
+        logical, rlf.EXPECTED_FA_MINOR_TO_MAJOR, rlf.EXPECTED_FA_TILES
+    )
     logical_to_physical = np.empty_like(physical_to_logical)
-    logical_to_physical[physical_to_logical] = np.arange(_TOKEN_BYTES,
-                                                         dtype="<i4")
+    logical_to_physical[physical_to_logical] = np.arange(_TOKEN_BYTES, dtype="<i4")
     return logical_to_physical
 
 
 def test_xla_nested_tiling_reference_examples():
     logical_2d = np.arange(32, dtype=np.int64).reshape(8, 4)
-    assert _apply_xla_tiled_layout(logical_2d, (1, 0), ((2, 2), ))[11] == 13
+    assert _apply_xla_tiled_layout(logical_2d, (1, 0), ((2, 2),))[11] == 13
     logical_1d = np.arange(2048, dtype=np.int64)
-    physical_1d = _apply_xla_tiled_layout(logical_1d, (0, ),
-                                          ((1024, ), (128, ), (2, 1)))
+    physical_1d = _apply_xla_tiled_layout(logical_1d, (0,), ((1024,), (128,), (2, 1)))
     assert physical_1d[1] == 128
     assert physical_1d[2] == 1
 
@@ -196,8 +204,12 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
 
     for case in (_PREFILL, _DECODE):
         logical = _logical_probe(case.shape)
-        tensor = (torch.from_numpy(logical.reshape(-1)).view(
-            torch.float8_e4m3fn).reshape(case.shape).to("tpu"))
+        tensor = (
+            torch.from_numpy(logical.reshape(-1))
+            .view(torch.float8_e4m3fn)
+            .reshape(case.shape)
+            .to("tpu")
+        )
         sync.synchronize([tensor], wait=True)
         manifest = _manifest_for_tensor(tensor, case)
         assert rlf.fa_page_tokens(manifest) == case.block_tokens
@@ -209,8 +221,9 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
         fingerprint, payload = rlf.measured_fa_layout_fingerprint(manifest)
         fingerprints.add(fingerprint)
         fingerprint_payload = payload
-        minor_to_major, tiles, raw_bits = (
-            layout_api.get_device_layout_if_materialized(tensor))
+        minor_to_major, tiles, raw_bits = layout_api.get_device_layout_if_materialized(
+            tensor
+        )
         element_bits = int(raw_bits or 8)
         host = torch.empty(tensor.nbytes, dtype=torch.uint8)
         batch_transfer_d2h_sync([tensor], [host])
@@ -218,32 +231,27 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
         expected = _apply_xla_tiled_layout(logical, minor_to_major, tiles)
         assert np.array_equal(raw, expected)
 
-        labels = np.repeat(np.arange(_NUM_BLOCKS, dtype=np.uint8),
-                           case.block_stride_bytes).reshape(case.shape)
-        physical_labels = _apply_xla_tiled_layout(labels, minor_to_major,
-                                                  tiles)
+        labels = np.repeat(
+            np.arange(_NUM_BLOCKS, dtype=np.uint8), case.block_stride_bytes
+        ).reshape(case.shape)
+        physical_labels = _apply_xla_tiled_layout(labels, minor_to_major, tiles)
         assert np.array_equal(
             physical_labels,
-            np.repeat(np.arange(_NUM_BLOCKS, dtype=np.uint8),
-                      case.block_stride_bytes),
+            np.repeat(np.arange(_NUM_BLOCKS, dtype=np.uint8), case.block_stride_bytes),
         )
         raw_by_topology[case.topology] = raw
-        measurements.append({
-            "topology":
-            case.topology,
-            "shape":
-            list(case.shape),
-            "block_tokens":
-            case.block_tokens,
-            "block_stride_bytes":
-            case.block_stride_bytes,
-            "minor_to_major": [int(dim) for dim in minor_to_major],
-            "tiles": [[int(dim) for dim in tile] for tile in tiles],
-            "element_size_in_bits":
-            element_bits,
-            "block_contained":
-            True,
-        })
+        measurements.append(
+            {
+                "topology": case.topology,
+                "shape": list(case.shape),
+                "block_tokens": case.block_tokens,
+                "block_stride_bytes": case.block_stride_bytes,
+                "minor_to_major": [int(dim) for dim in minor_to_major],
+                "tiles": [[int(dim) for dim in tile] for tile in tiles],
+                "element_size_in_bits": element_bits,
+                "block_contained": True,
+            }
+        )
 
     assert len(fingerprints) == 1
     page_ratio = _PREFILL.block_tokens // _DECODE.block_tokens
@@ -252,23 +260,28 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
     ranges = []
     for decode_page in range(_NUM_BLOCKS):
         prefill_page, subpage = divmod(decode_page, page_ratio)
-        src = (prefill_page * _PREFILL.block_stride_bytes +
-               subpage * _DECODE.block_stride_bytes)
+        src = (
+            prefill_page * _PREFILL.block_stride_bytes
+            + subpage * _DECODE.block_stride_bytes
+        )
         dst = decode_page * _DECODE.block_stride_bytes
         assert np.array_equal(
-            prefill[src:src + _DECODE.block_stride_bytes],
-            decode[dst:dst + _DECODE.block_stride_bytes],
+            prefill[src : src + _DECODE.block_stride_bytes],
+            decode[dst : dst + _DECODE.block_stride_bytes],
         )
-        ranges.append({
-            "prefill_page": prefill_page,
-            "decode_page": decode_page,
-            "prefill_offset_bytes": src,
-            "size_bytes": _DECODE.block_stride_bytes,
-        })
+        ranges.append(
+            {
+                "prefill_page": prefill_page,
+                "decode_page": decode_page,
+                "prefill_offset_bytes": src,
+                "size_bytes": _DECODE.block_stride_bytes,
+            }
+        )
 
     permutation = _one_token_permutation()
     permutation_sha = hashlib.sha256(
-        permutation.astype("<i4", copy=False).tobytes()).hexdigest()
+        permutation.astype("<i4", copy=False).tobytes()
+    ).hexdigest()
     assert permutation_sha == _EXPECTED_TOKEN_PERMUTATION_SHA256
     fingerprint = next(iter(fingerprints))
     record = {
@@ -285,8 +298,10 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
         "cases": measurements,
         "ranges": ranges,
     }
-    print("RAIDEN_STAGE3_E0_PRIME=" +
-          json.dumps(record, sort_keys=True, separators=(",", ":")))
+    print(
+        "RAIDEN_STAGE3_E0_PRIME="
+        + json.dumps(record, sort_keys=True, separators=(",", ":"))
+    )
 
 
 def test_qwen35_fa_raw_token_range_identity_tpu():

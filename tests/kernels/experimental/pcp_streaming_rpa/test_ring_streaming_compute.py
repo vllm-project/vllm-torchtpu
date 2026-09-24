@@ -24,8 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.collectives import util
-from vllm_torchtpu.kernels.experimental.batched_rpa.utils import \
-    broadcast_minor
+from vllm_torchtpu.kernels.experimental.batched_rpa.utils import broadcast_minor
 
 pytestmark = pytest.mark.multichip
 
@@ -37,8 +36,7 @@ PAGE_SIZE = 128
 HEAD_DIM = 128
 
 
-def _consume_kv_page(q_vmem_ref, kv_vmem_ref, slot, m, l_state, acc, *,
-                     sm_scale):
+def _consume_kv_page(q_vmem_ref, kv_vmem_ref, slot, m, l_state, acc, *, sm_scale):
     q = q_vmem_ref[...].astype(jnp.float32)
     k = kv_vmem_ref.at[slot, :, 0, :][...].astype(jnp.float32)
     v = kv_vmem_ref.at[slot, :, 1, :][...].astype(jnp.float32)
@@ -103,7 +101,7 @@ def _ring_streaming_attention_kernel(
                 dst_ref=kv_vmem_ref.at[next_slot],
                 send_sem=remote_send_sems.at[round_idx],
                 recv_sem=remote_recv_sems.at[round_idx],
-                device_id=(next_rank, ),
+                device_id=(next_rank,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
             remote_op.start()
@@ -122,7 +120,8 @@ def _ring_streaming_attention_kernel(
             remote_op.wait()
 
     o_vmem_ref[...] = (acc / broadcast_minor(l_state, acc.shape)).astype(
-        o_vmem_ref.dtype)
+        o_vmem_ref.dtype
+    )
     o_store = pltpu.make_async_copy(
         src_ref=o_vmem_ref.at[:, :],
         dst_ref=o_ref.at[0, :, :],
@@ -149,13 +148,13 @@ def _ring_streaming_attention_call(q, kv, *, pcp_size, sm_scale):
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
                 pltpu.VMEM((Q_TILE, HEAD_DIM), q.dtype),
                 pltpu.VMEM((2, PAGE_SIZE, 2, HEAD_DIM), kv.dtype),
                 pltpu.VMEM((Q_TILE, HEAD_DIM), jnp.float32),
             ),
-            grid=(1, ),
+            grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=12,
@@ -166,7 +165,7 @@ def _ring_streaming_attention_call(q, kv, *, pcp_size, sm_scale):
 
 
 def _run_ring_streaming_attention(q, kv, *, sm_scale):
-    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS,))
     fn = jax.jit(
         jax.shard_map(
             functools.partial(
@@ -178,7 +177,8 @@ def _run_ring_streaming_attention(q, kv, *, sm_scale):
             in_specs=(P(AXIS, None, None), P(AXIS, None, None, None)),
             out_specs=P(AXIS, None, None),
             check_vma=False,
-        ))
+        )
+    )
     return fn(q, kv)
 
 
@@ -204,27 +204,26 @@ def _require_tpu_devices(min_count, reason):
     return devices
 
 
-def test_ring_circulated_kv_can_be_consumed_with_online_softmax(
-        release_jax_backend):
+def test_ring_circulated_kv_can_be_consumed_with_online_softmax(release_jax_backend):
     _require_tpu_devices(
         PCP_SIZE,
         "PCP ring streaming compute smoke test requires four TPU devices.",
     )
     rng = np.random.default_rng(123)
     q = jnp.asarray(
-        rng.normal(size=(PCP_SIZE, Q_TILE, HEAD_DIM)).astype(np.float32) * 0.1)
+        rng.normal(size=(PCP_SIZE, Q_TILE, HEAD_DIM)).astype(np.float32) * 0.1
+    )
     kv = jnp.asarray(
-        rng.normal(size=(PCP_SIZE, PAGE_SIZE, 2, HEAD_DIM)).astype(np.float32)
-        * 0.1)
+        rng.normal(size=(PCP_SIZE, PAGE_SIZE, 2, HEAD_DIM)).astype(np.float32) * 0.1
+    )
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
     out = _run_ring_streaming_attention(q, kv, sm_scale=sm_scale)
     out.block_until_ready()
 
-    expected = _naive_attention(jax.device_get(q),
-                                jax.device_get(kv),
-                                sm_scale=sm_scale)
-    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
-                               expected,
-                               rtol=5e-4,
-                               atol=5e-5)
+    expected = _naive_attention(
+        jax.device_get(q), jax.device_get(kv), sm_scale=sm_scale
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(out)), expected, rtol=5e-4, atol=5e-5
+    )

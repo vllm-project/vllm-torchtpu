@@ -16,8 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs, utils
 
 
 def flash_attention_qk_softmax(

@@ -72,6 +72,7 @@ def _dtype_bytes(dtype: torch.dtype) -> int:
 @dataclass(frozen=True)
 class PoolSpec:
     """Describes the per-host pool. Must match byte-for-byte across ranks."""
+
     num_slots: int
     tp_size: int
     num_layers: int
@@ -104,8 +105,7 @@ class PoolSpec:
 class HostKVShmPool:
     """Per-host shared-memory pool. Rank 0 `create()`s, others `attach()`."""
 
-    def __init__(self, spec: PoolSpec, shm: shared_memory.SharedMemory,
-                 owner: bool):
+    def __init__(self, spec: PoolSpec, shm: shared_memory.SharedMemory, owner: bool):
         self.spec = spec
         self._shm = shm
         self._owner = owner
@@ -141,13 +141,9 @@ class HostKVShmPool:
         if self._mlock_thread is not None and self._mlock_thread.is_alive():
             return self._mlock_thread
         target = self._mlock_blocking
-        name = (f"shm-mlock-r{my_rank}"
-                if my_rank is not None else "shm-mlock-all")
+        name = f"shm-mlock-r{my_rank}" if my_rank is not None else "shm-mlock-all"
         self._mlock_done.clear()
-        t = threading.Thread(target=target,
-                             args=(my_rank, ),
-                             name=name,
-                             daemon=True)
+        t = threading.Thread(target=target, args=(my_rank,), name=name, daemon=True)
         t.start()
         self._mlock_thread = t
         return t
@@ -185,14 +181,18 @@ class HostKVShmPool:
         t0 = time.perf_counter()
         locked_bytes = 0
         for addr, size in regions:
-            rc = _libc_for_mlock.mlock(ctypes.c_void_p(addr),
-                                       ctypes.c_size_t(size))
+            rc = _libc_for_mlock.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(size))
             if rc != 0:
                 err = ctypes.get_errno()
                 logger.warning(
                     "HostKVShmPool: mlock(addr=0x%x size=%d) failed "
                     "errno=%d (%s); raise RLIMIT_MEMLOCK or grant "
-                    "CAP_IPC_LOCK to use", addr, size, err, os.strerror(err))
+                    "CAP_IPC_LOCK to use",
+                    addr,
+                    size,
+                    err,
+                    os.strerror(err),
+                )
                 # Don't bail: keep the regions we did manage to lock so
                 # munlock() balances. Just stop trying further regions.
                 break
@@ -203,15 +203,17 @@ class HostKVShmPool:
             "HostKVShmPool: mlock done | rank=%s | locked=%.2fGB across "
             "%d regions | elapsed=%.2fs",
             "all" if my_rank is None else str(my_rank),
-            locked_bytes / (1024**3), len(self._mlocked_regions), elapsed)
+            locked_bytes / (1024**3),
+            len(self._mlocked_regions),
+            elapsed,
+        )
         self._mlock_done.set()
 
     def _munlock_pool(self) -> None:
         if _libc_for_mlock is None or not self._mlocked_regions:
             return
         for addr, size in self._mlocked_regions:
-            _libc_for_mlock.munlock(ctypes.c_void_p(addr),
-                                    ctypes.c_size_t(size))
+            _libc_for_mlock.munlock(ctypes.c_void_p(addr), ctypes.c_size_t(size))
         self._mlocked_regions.clear()
 
     @classmethod
@@ -229,9 +231,14 @@ class HostKVShmPool:
         shm = shared_memory.SharedMemory(name=name, create=True, size=size)
         logger.info(
             "%s --> created name=%s size=%.2fGB "
-            "(num_slots=%d, tp_size=%d, per_slot=%.2fMB)", cls.__name__, name,
-            size / (1024**3), spec.num_slots, spec.tp_size,
-            spec.per_slot_bytes / (1024**2))
+            "(num_slots=%d, tp_size=%d, per_slot=%.2fMB)",
+            cls.__name__,
+            name,
+            size / (1024**3),
+            spec.num_slots,
+            spec.tp_size,
+            spec.per_slot_bytes / (1024**2),
+        )
         return cls(spec, shm, owner=True)
 
     @classmethod
@@ -240,9 +247,14 @@ class HostKVShmPool:
         if shm.size < spec.total_bytes:
             raise RuntimeError(
                 f"{cls.__name__} attach: shm size {shm.size} < expected "
-                f"{spec.total_bytes}. Spec mismatch between ranks?")
-        logger.info("%s --> attached name=%s size=%.2fGB", cls.__name__, name,
-                    shm.size / (1024**3))
+                f"{spec.total_bytes}. Spec mismatch between ranks?"
+            )
+        logger.info(
+            "%s --> attached name=%s size=%.2fGB",
+            cls.__name__,
+            name,
+            shm.size / (1024**3),
+        )
         return cls(spec, shm, owner=False)
 
     # ---- Free-list (rank 0 only) ---------------------------------------
@@ -260,26 +272,29 @@ class HostKVShmPool:
             self._free.put_nowait(slot_idx)
 
     # ---- Tensor views ---------------------------------------------------
-    def layer_view(self, slot_idx: int, rank: int, layer_idx: int,
-                   num_blocks: int) -> torch.Tensor:
+    def layer_view(
+        self, slot_idx: int, rank: int, layer_idx: int, num_blocks: int
+    ) -> torch.Tensor:
         """Return a CPU tensor view over the (slot, rank, layer) region.
 
         Shape is (num_blocks,) + layer_shard_shape[1:], so callers can copy
         the exact request-sized slice in/out without touching the padding.
         """
         spec = self.spec
-        offset = (slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes +
-                  layer_idx * spec.per_layer_bytes)
+        offset = (
+            slot_idx * spec.per_slot_bytes
+            + rank * spec.per_rank_bytes
+            + layer_idx * spec.per_layer_bytes
+        )
         count = num_blocks
         for d in spec.layer_shard_shape[1:]:
             count *= d
         # frombuffer returns a flat tensor; reshape to the layer shard shape
         # with the actual block count on dim 0.
-        flat = torch.frombuffer(self._shm.buf,
-                                dtype=spec.dtype,
-                                count=count,
-                                offset=offset)
-        view_shape = (num_blocks, ) + tuple(spec.layer_shard_shape[1:])
+        flat = torch.frombuffer(
+            self._shm.buf, dtype=spec.dtype, count=count, offset=offset
+        )
+        view_shape = (num_blocks,) + tuple(spec.layer_shard_shape[1:])
         return flat.view(view_shape)
 
     def _used_per_layer(self, num_blocks: int) -> int:
@@ -294,19 +309,19 @@ class HostKVShmPool:
         contiguous bytes buffer (strips per-layer padding). Suitable as a ZMQ
         payload frame."""
         spec = self.spec
-        rank_start = (slot_idx * spec.per_slot_bytes +
-                      rank * spec.per_rank_bytes)
+        rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         out = bytearray(used * spec.num_layers)
         pos = 0
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
-            out[pos:pos + used] = self._shm.buf[layer_off:layer_off + used]
+            out[pos : pos + used] = self._shm.buf[layer_off : layer_off + used]
             pos += used
         return bytes(out)
 
-    def rank_layer_views(self, slot_idx: int, rank: int,
-                         num_blocks: int) -> list[memoryview]:
+    def rank_layer_views(
+        self, slot_idx: int, rank: int, num_blocks: int
+    ) -> list[memoryview]:
         """Return one memoryview per layer over the (slot, rank, layer)
         'used' slice of shm. No copy -- ZeroMQ can send these directly
         with copy=False, which turns the 4-copy path
@@ -314,18 +329,18 @@ class HostKVShmPool:
         sendmsg from shm straight to the NIC buffer. The returned views
         alias live shm and must not outlive the current slot."""
         spec = self.spec
-        rank_start = (slot_idx * spec.per_slot_bytes +
-                      rank * spec.per_rank_bytes)
+        rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         base = memoryview(self._shm.buf)
         out: list[memoryview] = []
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
-            out.append(base[layer_off:layer_off + used])
+            out.append(base[layer_off : layer_off + used])
         return out
 
-    def unpack_rank_layers(self, slot_idx: int, rank: int, num_blocks: int,
-                           layer_buffers: list) -> None:
+    def unpack_rank_layers(
+        self, slot_idx: int, rank: int, num_blocks: int, layer_buffers: list
+    ) -> None:
         """Inverse of rank_layer_views. `layer_buffers` is a list of
         buffer-protocol objects (zmq.Frame.buffer, memoryview, bytes)
         sized per-layer `used` bytes, one per layer. Each is memcpy'd into
@@ -334,21 +349,21 @@ class HostKVShmPool:
         if len(layer_buffers) != spec.num_layers:
             raise RuntimeError(
                 f"unpack_rank_layers: got {len(layer_buffers)} layers, "
-                f"expected {spec.num_layers}")
-        rank_start = (slot_idx * spec.per_slot_bytes +
-                      rank * spec.per_rank_bytes)
+                f"expected {spec.num_layers}"
+            )
+        rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         for li, buf in enumerate(layer_buffers):
             src = memoryview(buf)
             if src.nbytes != used:
                 raise RuntimeError(
                     f"unpack_rank_layers: layer {li} size {src.nbytes} != "
-                    f"expected {used} (num_blocks={num_blocks})")
+                    f"expected {used} (num_blocks={num_blocks})"
+                )
             layer_off = rank_start + li * spec.per_layer_bytes
             self._copy_into_shm(layer_off, src, used)
 
-    def _copy_into_shm(self, offset: int, src: memoryview,
-                       nbytes: int) -> None:
+    def _copy_into_shm(self, offset: int, src: memoryview, nbytes: int) -> None:
         """Copy a contiguous source buffer into shm.
 
         ctypes CDLL calls release the GIL around the native call, so the large
@@ -356,37 +371,34 @@ class HostKVShmPool:
         Keep fallbacks for unusual environments without NumPy/libc memmove.
         """
         if np is None:
-            self._shm.buf[offset:offset + nbytes] = src
+            self._shm.buf[offset : offset + nbytes] = src
             return
 
-        dst = np.ndarray((nbytes, ),
-                         dtype=np.uint8,
-                         buffer=self._shm.buf,
-                         offset=offset)
+        dst = np.ndarray((nbytes,), dtype=np.uint8, buffer=self._shm.buf, offset=offset)
         src_arr = np.frombuffer(src, dtype=np.uint8, count=nbytes)
         if _memmove is not None:
             _memmove(dst.ctypes.data, src_arr.ctypes.data, nbytes)
         else:
             np.copyto(dst, src_arr, casting="no")
 
-    def unpack_rank(self, slot_idx: int, rank: int, num_blocks: int,
-                    payload) -> None:
+    def unpack_rank(self, slot_idx: int, rank: int, num_blocks: int, payload) -> None:
         """Inverse of pack_rank: scatter a received contiguous payload into
         the per-layer regions of this slot/rank."""
         spec = self.spec
-        rank_start = (slot_idx * spec.per_slot_bytes +
-                      rank * spec.per_rank_bytes)
+        rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         expected = used * spec.num_layers
         if len(payload) != expected:
             raise RuntimeError(
                 f"unpack_rank: payload size {len(payload)} != expected "
-                f"{expected} (num_blocks={num_blocks})")
+                f"{expected} (num_blocks={num_blocks})"
+            )
         mv = memoryview(payload)
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
-            self._shm.buf[layer_off:layer_off +
-                          used] = (mv[li * used:(li + 1) * used])
+            self._shm.buf[layer_off : layer_off + used] = mv[
+                li * used : (li + 1) * used
+            ]
 
     # ---- Lifecycle ------------------------------------------------------
     def close(self) -> None:
@@ -396,8 +408,9 @@ class HostKVShmPool:
         try:
             self._shm.close()
         except Exception:
-            logger.exception("HostKVShmPool close: error closing shm %s",
-                             self._shm.name)
+            logger.exception(
+                "HostKVShmPool close: error closing shm %s", self._shm.name
+            )
         if self._owner:
             try:
                 self._shm.unlink()

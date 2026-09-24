@@ -1,0 +1,276 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The perf/eval suite on the Kueue fleet. Keys and labels match
+# pipeline_perf.yml so the two read side by side.
+
+# Every step here writes its results under this directory and the pod uploads
+# whatever it finds there. Declared once for the pipeline rather than per step:
+# it is a property of this lane, not of any one benchmark.
+env:
+  ARTIFACTS_DIR: "perf_eval_results"
+
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+# Under the workload's step budget: the workload's deadline starts at admission
+# and the step's at the agent pod, so a workload given the whole step budget is
+# killed by Buildkite mid-report and loses its artifacts.
+x-eval-runtime: &eval_runtime "18000"
+
+x-perf-step-defaults: &perf_step
+  depends_on:
+    - "build_docker"
+  # Matches the quota: eight v7x chips, four to a step. More would stage faster
+  # but every pod loading a model rewrites refs/<rev> in the shared bucket, and
+  # a pod holding a handle across another's rewrite gets
+  # OSError: [Errno 116] Stale file handle.
+  concurrency_group: "tpu/v7x"
+  concurrency: 2
+  # Covers queueing as well as running, so it cannot be set from how long the
+  # work takes. The sum of the launcher's two limits, so a step is stopped by
+  # whichever of those it exceeded and not by this.
+  timeout_in_minutes: 1440
+  agents:
+    queue: "kube"
+
+# Eight TensorCores, which is four v7x chips on one host. Machine type names
+# chips, the queue names cores, so the two numbers differ for one shape.
+x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
+x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
+
+steps:
+  # Repeated from pipeline_build.yml because this pipeline is uploaded on its
+  # own rather than beside that one.
+  - label: ":docker: Build and Push CI Image"
+    key: "build_docker"
+    timeout_in_minutes: 120
+    agents:
+      queue: cpu_64_core
+    commands:
+      # setup_docker_env.sh reads the pinned vLLM commit from build metadata,
+      # which bootstrap.sh publishes only for the bare-metal pipeline slugs, so
+      # this lane resolves it from the same pyproject.toml pin itself.
+      - |
+        source .buildkite/scripts/configs/pipeline_config.sh
+        buildkite-agent meta-data set VLLM_COMMIT_HASH \
+          "${VLLM_COMMIT_HASH_OVERRIDE:-$(get_vllm_commit_hash)}"
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  # Keyed so the v7x-16 step below can depend on the whole group. A `wait`
+  # barrier cannot order it: Buildkite exempts any step with its own depends_on
+  # from wait, and that step needs one for the image.
+  - group: ":kubernetes: Perf and Eval on TPU"
+    key: "perf_tpu"
+    steps:
+      - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
+        <<: *perf_step
+        parallelism: 3
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-coder-30b-fp8-tp8-ep \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
+              qwen3.5-35b-fp8-tp4-ep \
+              deepseek-v2-tp8-ep \
+              gemma-4-31b-fp8-dp4-tp2-multimodal \
+              gemma-4-26b-fp8-dp4-tp2-multimodal
+
+      - label: ":kubernetes: Perf/Eval: qwen3-0.6b-tp1"
+        <<: *perf_step
+        env:
+          SHAPE: *shape_2_core
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-0.6b-tp1 --run-lm-eval
+
+      # Nightly runs
+      - label: ":kubernetes: Perf/Eval: Nightly general suite (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-coder-30b-tp8-ep \
+              qwen3.5-35b-fp8-dp8-ep \
+              qwen3.5-35b-fp8-dp4-tp2-ep
+
+      - label: ":kubernetes: Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+          TPU_MAX_RUNTIME_SECONDS: *eval_runtime
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-code-eval
+
+      # Perf-only: quality does not depend on max-model-len, so the evals for
+      # this model run once, on the -ep (short) config above.
+      - label: ":kubernetes: Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep-full
+
+      # Qwen3.5-397B parallelism sweep: three layouts. Quality is independent
+      # of parallelism, so the evals run only on the tp1-dp8 layout.
+      - label: ":kubernetes: Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+          TPU_MAX_RUNTIME_SECONDS: *eval_runtime
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp1-dp8-ep --run-lm-eval --run-code-eval
+
+      - label: ":kubernetes: Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp2-dp4-ep
+
+      - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-flash-dp8-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          TPU_MAX_RUNTIME_SECONDS: *eval_runtime
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval
+
+      - label: ":kubernetes: Perf: Nightly deepseek-v4-flash xprof capture (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          RUN_TYPE: "PROFILE"
+        plugins:
+          - *kube_plugin
+        commands:
+          # The trace check and the copy to GCS run in the pod because the
+          # traces are written there and the agent never sees them. Being part
+          # of this command also puts the removal before run.sh uploads what is
+          # left, which keeps the traces out of the artifacts.
+          - |
+            .buildkite/kubernetes/run.sh bash -c '
+              set -e
+              results_dir=$$ARTIFACTS_DIR/deepseek-v4-flash-dp8-ep-profile
+              bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile
+              profile_dir=$$results_dir/profile
+              for phase in "$$profile_dir"/*/; do
+                [ -d "$$phase" ] || continue
+                echo "phase $$(basename "$$phase"): $$(find "$$phase" -name "*.xplane.pb" | wc -l) xplane files"
+              done
+              if ! find "$$profile_dir" -name "*.xplane.pb" -print -quit | grep -q .; then
+                echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
+                exit 1
+              fi
+              dest=$$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(\"profile_gcs_dir\") or \"\")" "$$results_dir/config.json")
+              if [ -z "$$dest" ]; then
+                echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
+                exit 1
+              fi
+              gcloud storage cp -r "$$profile_dir"/* "$$dest/"
+              rm -rf "$$profile_dir"'
+
+      - label: ":kubernetes: Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-dp1-ep
+
+  # A two-host slice, so it goes through run_multihost.sh and the JobSet in
+  # manifests/. Not in the tpu/v7x concurrency group: a group counts steps, not
+  # chips, so no slot can say "the whole fleet" - the dependency below is what
+  # reserves the hardware instead.
+  - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
+    # Without build_docker this submits a sixteen-chip workload against a tag
+    # that was never pushed and holds the fleet in ImagePullBackOff.
+    #
+    # TODO: drop the perf_tpu edge once the reservation has room for this
+    # alongside the group. Chips come free only when the two-at-a-time group
+    # drains, and it backfills the moment a slot opens, so a step wanting the
+    # whole fleet never sees it. allow_failure because what this needs from
+    # those steps is their chips, not their results.
+    depends_on:
+      - "build_docker"
+      - step: "perf_tpu"
+        allow_failure: true
+    if: 'build.env("NIGHTLY") == "1"'
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+      BENCHMARK_WARMUP_RUNS: "1"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval

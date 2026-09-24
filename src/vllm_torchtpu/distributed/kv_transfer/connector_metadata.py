@@ -9,8 +9,7 @@ live here rather than inside either transport module.
 
 from dataclasses import dataclass, field
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import \
-    KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 ReqId = str
 

@@ -264,7 +264,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor],
+    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
@@ -282,7 +282,11 @@ def tpu_bind_kv_cache(
 
     for layer_index in sorted(index2name.keys()):
         for layer_name in sorted(index2name[layer_index]):
-            runner_kv_caches.append(kv_caches[layer_name])
+            cache = kv_caches[layer_name]
+            if isinstance(cache, (list, tuple)):
+                runner_kv_caches.extend(cache)
+            else:
+                runner_kv_caches.append(cache)
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache

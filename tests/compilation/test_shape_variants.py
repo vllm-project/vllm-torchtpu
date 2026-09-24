@@ -28,8 +28,14 @@ import vllm
 from torch import fx, nn
 from torch.utils._sympy.value_ranges import ValueRanges
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import (CompilationConfig, CompilationMode, DeviceConfig,
-                         SchedulerConfig, VllmConfig, set_current_vllm_config)
+from vllm.config import (
+    CompilationConfig,
+    CompilationMode,
+    DeviceConfig,
+    SchedulerConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.forward_context import set_forward_context
 
 import vllm_torchtpu
@@ -37,9 +43,9 @@ import vllm_torchtpu.env_override
 from vllm_torchtpu.compilation import shape_variants, tpu_compiler
 from vllm_torchtpu.compilation.shape_variants import unsupported_reason
 
-if not hasattr(vllm,
-               "__version__"):  # namespace-package quirk in the CPU image
+if not hasattr(vllm, "__version__"):  # namespace-package quirk in the CPU image
     import importlib.metadata
+
     vllm.__version__ = importlib.metadata.version("vllm")
 
 HIDDEN = 8
@@ -49,8 +55,9 @@ BUCKETS = [16, 2048, 4096]
 _lib = torch.library.Library("tpu_shape_variants_test", "FRAGMENT")
 _lib.define("wave(Tensor x) -> Tensor")
 _lib.impl("wave", lambda x: x + 1.0, "CPU")
-torch.library.register_fake("tpu_shape_variants_test::wave",
-                            lambda x: torch.empty_like(x))
+torch.library.register_fake(
+    "tpu_shape_variants_test::wave", lambda x: torch.empty_like(x)
+)
 WAVE = torch.ops.tpu_shape_variants_test.wave
 
 
@@ -103,7 +110,7 @@ class FakeExecutable:
 
     def __call__(self, *args):
         CALLS.append((self.rows, self.waves))
-        return (torch.zeros(self.rows, HIDDEN), )
+        return (torch.zeros(self.rows, HIDDEN),)
 
     def serialize(self):
         """Stand in for the bundled AOTAutograd entry.
@@ -133,10 +140,8 @@ class FakeTpuBackend:
         self.compiled: list[tuple[int, int]] = []  # (bucket, waves)
 
     def __call__(self, graph: fx.GraphModule, example_inputs):
-        rows = max(t.shape[0] for t in example_inputs
-                   if isinstance(t, torch.Tensor))
-        waves = sum(1 for node in graph.graph.nodes
-                    if "wave" in str(node.target))
+        rows = max(t.shape[0] for t in example_inputs if isinstance(t, torch.Tensor))
+        waves = sum(1 for node in graph.graph.nodes if "wave" in str(node.target))
         self.compiled.append((rows, waves))
         return FakeExecutable(rows, waves)
 
@@ -159,8 +164,10 @@ def count_starts() -> Starts:
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
     counts = Starts()
-    load, compile_ = (decorators._try_load_aot_compiled_fn,
-                      TorchCompileWithNoGuardsWrapper.aot_compile)
+    load, compile_ = (
+        decorators._try_load_aot_compiled_fn,
+        TorchCompileWithNoGuardsWrapper.aot_compile,
+    )
 
     def counted_load(model, path):
         found = load(model, path)
@@ -183,13 +190,16 @@ def make_config(splitting_ops=None) -> VllmConfig:
     # the cache-key hash reads it; this test only needs the compile pipeline.
     original = type(current_platform).check_and_update_config
     type(current_platform).check_and_update_config = classmethod(
-        lambda cls, config: None)
+        lambda cls, config: None
+    )
     try:
         config = VllmConfig(
             device_config=DeviceConfig(device="cpu"),
-            scheduler_config=SchedulerConfig(max_num_batched_tokens=MAX_TOKENS,
-                                             max_model_len=MAX_TOKENS,
-                                             is_encoder_decoder=False),
+            scheduler_config=SchedulerConfig(
+                max_num_batched_tokens=MAX_TOKENS,
+                max_model_len=MAX_TOKENS,
+                is_encoder_decoder=False,
+            ),
             compilation_config=CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE,
                 backend="",  # defers to TpuPlatform.get_compile_backend()
@@ -201,9 +211,7 @@ def make_config(splitting_ops=None) -> VllmConfig:
     finally:
         type(current_platform).check_and_update_config = original
     for field in dataclasses.fields(config.compilation_config.pass_config):
-        if isinstance(
-                getattr(config.compilation_config.pass_config, field.name),
-                bool):
+        if isinstance(getattr(config.compilation_config.pass_config, field.name), bool):
             setattr(config.compilation_config.pass_config, field.name, False)
     # The TPU platform patches this away: torch_tpu rejects SymInt shapes, so
     # only the exact buckets are ever compiled (vllm_torchtpu/__init__.py).
@@ -213,10 +221,12 @@ def make_config(splitting_ops=None) -> VllmConfig:
 
 def prepare(cache_root: str, splitting_ops=None):
     """What the pipeline needs, set up inside the child process."""
-    os.environ.update(VLLM_CACHE_ROOT=cache_root,
-                      VLLM_DISABLE_COMPILE_CACHE="0",
-                      VLLM_USE_AOT_COMPILE="1",
-                      VLLM_USE_MEGA_AOT_ARTIFACT="0")
+    os.environ.update(
+        VLLM_CACHE_ROOT=cache_root,
+        VLLM_DISABLE_COMPILE_CACHE="0",
+        VLLM_USE_AOT_COMPILE="1",
+        VLLM_USE_MEGA_AOT_ARTIFACT="0",
+    )
     # The cache keys hash a ModelConfig these tests do not build.
     tpu_compiler.compute_tpu_compilation_hash = lambda config: "test"
     # TpuPlatform.check_and_update_config() installs this, and these tests skip
@@ -263,8 +273,7 @@ def in_child(target) -> None:
         if process.is_alive():
             raise AssertionError("isolated test timed out")
         if result.empty():
-            raise AssertionError(
-                f"isolated test crashed (exit {process.exitcode})")
+            raise AssertionError(f"isolated test crashed (exit {process.exitcode})")
         failure = result.get()
     finally:
         if process.is_alive():
@@ -327,8 +336,7 @@ def _guards_say_which_buckets_a_trace_serves(cache_root):
         tpu_compiler.TpuCompilerAdaptor.compile = original
     env = shape_variants.trace_shape_env(graphs[0])
     assert [
-        s for s in (16, 512, 2048, 2049, 4096)
-        if unsupported_reason(env, s) is None
+        s for s in (16, 512, 2048, 2049, 4096) if unsupported_reason(env, s) is None
     ] == [16, 512, 2048]
 
 
@@ -394,8 +402,7 @@ def test_three_tiers_each_keep_their_own_structure(tmp_path):
 
 
 def _split_graph_is_refused(cache_root):
-    config, _ = prepare(cache_root,
-                        splitting_ops=["tpu_shape_variants_test::wave"])
+    config, _ = prepare(cache_root, splitting_ops=["tpu_shape_variants_test::wave"])
     model = build(WaveModel, config)
     try:
         warm(model, config)
@@ -452,8 +459,7 @@ def _refused_bucket_never_retraced_raises(cache_root):
     config, _ = prepare(cache_root)
     model = build(WaveModel, config)
     warm(model, config, buckets=[BUCKETS[0]])  # ladder stops before 4096
-    with pytest.raises(shape_variants.ShapeSpecializationError,
-                       match="never compiled"):
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="never compiled"):
         run(model, config, BUCKETS[-1])  # the poisoned runnable is invoked
 
 
@@ -478,7 +484,8 @@ def test_a_guard_the_range_cannot_express_still_refuses():
     symbol = sympy.Symbol("s0", positive=True, integer=True)
     env = SimpleNamespace(
         var_to_range={symbol: ValueRanges(2, 8192)},
-        guards=[SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))])
+        guards=[SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))],
+    )
 
     assert unsupported_reason(env, 2049) is None  # 2049 % 3 == 0, holds
     assert unsupported_reason(env, 2048) is not None  # provably violated
@@ -500,8 +507,7 @@ def test_env_override_keeps_the_mega_artifact_off():
 def test_missing_guard_field_cannot_accept_a_bucket(field):
     symbol = sympy.Symbol("s0", integer=True)
     guard = SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))
-    env = SimpleNamespace(var_to_range={symbol: ValueRanges(2, 8192)},
-                          guards=[guard])
+    env = SimpleNamespace(var_to_range={symbol: ValueRanges(2, 8192)}, guards=[guard])
     delattr(env if field == "guards" else guard, field)
     with pytest.raises(AttributeError, match=field):
         unsupported_reason(env, 2048)

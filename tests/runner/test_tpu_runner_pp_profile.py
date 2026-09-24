@@ -76,6 +76,10 @@ def _runner(max_model_len=4096):
                                    scheduled_tokens=[32],
                                    token_paddings=[256])
     runner.max_model_len = max_model_len
+    # A dense model: no shared sparse index table rides the hand-off.
+    runner._pp_topk_buffer = None
+    runner._pp_take_topk_indices = (
+        TPUModelRunner._pp_take_topk_indices.__get__(runner))
     return runner
 
 

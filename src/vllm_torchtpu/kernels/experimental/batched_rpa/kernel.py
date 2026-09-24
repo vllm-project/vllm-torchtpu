@@ -22,12 +22,14 @@ import jax.numpy as jnp
 from jax import lax
 
 # yapf: disable
-from vllm_torchtpu.kernels.experimental.batched_rpa import (bref_override,
-                                                            configs,
-                                                            flash_attention,
-                                                            schedule,
-                                                            stitch_utils,
-                                                            utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    bref_override,
+    configs,
+    flash_attention,
+    schedule,
+    stitch_utils,
+    utils,
+)
 
 # yapf: enable
 
@@ -63,13 +65,14 @@ def strided_load_bkv(
         )
         return [(k, v)]
 
-    kv = utils.strided_load(kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride,
-                            cfgs.bkv_stride)
+    kv = utils.strided_load(
+        kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride, cfgs.bkv_stride
+    )
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
-    return utils.convert_to_target_bitwidth(kv,
-                                            target_bitwidth=bitwidth,
-                                            kv_dtype=cfgs.serve.dtype_kv)
+    return utils.convert_to_target_bitwidth(
+        kv, target_bitwidth=bitwidth, kv_dtype=cfgs.serve.dtype_kv
+    )
 
 
 def calculate_and_store_out(
@@ -81,14 +84,15 @@ def calculate_and_store_out(
     *,
     cfgs: configs.RpaConfigs,
 ):
-
     def _accum(b_idx: int):
         batch_acc = acc_scratch_ref[b_idx]
         batch_l = l_scratch_ref[b_idx]
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
-        if (cfgs.serve.dtype_out == jnp.float32
-                or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16):
+        if (
+            cfgs.serve.dtype_out == jnp.float32
+            or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
+        ):
             result = lax.div(batch_acc, batch_l)
         else:
             result = batch_acc * pl.reciprocal(batch_l, approx=True)
@@ -117,8 +121,9 @@ def calculate_and_store_out(
         # tune `fuse_accum` for your use case.
         if not cfgs.fuse_accum:
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
-            jax.lax.cond(is_last_k, jax.named_call(_accum, name="accum"),
-                         lambda _: None, b)
+            jax.lax.cond(
+                is_last_k, jax.named_call(_accum, name="accum"), lambda _: None, b
+            )
         else:
             _accum(b)
 
@@ -190,11 +195,9 @@ def rpa_body(
 
         is_first_k_block = k_idx == start_k_idx
         reset_cond = jnp.logical_and(is_valid, is_first_k_block)
-        m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf,
-                                         m_scratch_ref[b_idx])
+        m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf, m_scratch_ref[b_idx])
         l_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, l_scratch_ref[b_idx])
-        acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0,
-                                           acc_scratch_ref[b_idx])
+        acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, acc_scratch_ref[b_idx])
 
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
@@ -213,7 +216,7 @@ def rpa_body(
         cfgs.aligned_q_head_dim,
     )
     if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
-        q = q[..., :cfgs.aligned_kv_head_dim]
+        q = q[..., : cfgs.aligned_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -244,13 +247,10 @@ def rpa_body(
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                k_head = kv_in_vref[b_idx, kv_head * 2, :, :, 0:cfgs.bkv_sz]
-                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, :,
-                                    0:cfgs.bkv_sz]
-                ks.append(k_head.reshape(cfgs.aligned_kv_head_dim,
-                                         cfgs.bkv_sz))
-                vs.append(v_head.reshape(cfgs.aligned_kv_head_dim,
-                                         cfgs.bkv_sz))
+                k_head = kv_in_vref[b_idx, kv_head * 2, :, :, 0 : cfgs.bkv_sz]
+                v_head = kv_in_vref[b_idx, kv_head * 2 + 1, :, :, 0 : cfgs.bkv_sz]
+                ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+                vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
@@ -258,8 +258,7 @@ def rpa_body(
             heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
             ks = []
             vs = []
-            for kv_head_start in range(0, cfgs.model.num_kv_heads,
-                                       heads_per_load):
+            for kv_head_start in range(0, cfgs.model.num_kv_heads, heads_per_load):
                 bkv_lst = strided_load_bkv(
                     kv_in_vref,
                     b_idx,
@@ -272,8 +271,8 @@ def rpa_body(
             k = k.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
             v = v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
 
-            k = k[:cfgs.model.num_kv_heads]
-            v = v[:cfgs.model.num_kv_heads]
+            k = k[: cfgs.model.num_kv_heads]
+            v = v[: cfgs.model.num_kv_heads]
             k_b.append(k)
             v_b.append(v)
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
@@ -347,29 +346,27 @@ def rpa_body(
 def create_allocs(
     kv_cache_hbm_ref: jax.Ref, o_hbm_ref: jax.Ref, cfgs: configs.RpaConfigs
 ) -> tuple[
-        bref_override.BatchingQRef,
-        bref_override.KVBufferedRefSeqAlongLane
-        | bref_override.KVBufferedRefHeadAlongSublane,
-        bref_override.BatchingORef,
+    bref_override.BatchingQRef,
+    bref_override.KVBufferedRefSeqAlongLane
+    | bref_override.KVBufferedRefHeadAlongSublane,
+    bref_override.BatchingORef,
 ]:
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer,
-                                  use_lookahead=True),
+        index_map=lambda i: (i,),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
     q_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer,
-                                  use_lookahead=True),
+        index_map=lambda i: (i,),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
     o_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
     )
 
@@ -412,7 +409,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
 
 
 def get_kernel_metadata(
-    cfgs: configs.RpaConfigs, ) -> dict[str, str | int | float]:
+    cfgs: configs.RpaConfigs,
+) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(cfgs)
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
@@ -477,11 +475,11 @@ def rpa_kernel(
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
     ):
-
         del o_kv_cache_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, cfgs)
+            kv_cache_hbm_ref, q_hbm_ref, cfgs
+        )
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
         safe_steps = jnp.minimum(actual_steps, cfgs.max_steps_ub)
@@ -492,15 +490,15 @@ def rpa_kernel(
                 cu_q_lens_ref=cu_q_lens_ref,
                 kv_lens_ref=kv_lens_ref,
             ),
-            grid=(safe_steps, ),
+            grid=(safe_steps,),
             in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-            out_specs=(o_alloc.spec, ),
+            out_specs=(o_alloc.spec,),
         )
 
         @pl.with_scoped(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc),
             schedule_ref=schedule_hbm_ref.scratch_shapes(),
-            dma_sem=pltpu.SemaphoreType.DMA((1, )),
+            dma_sem=pltpu.SemaphoreType.DMA((1,)),
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
@@ -517,7 +515,6 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
-
             # Transfer schedule from HBM to SMEM --- we only copy what we need. Since
             # we almost always over-allocate schedule size, we only want to copy a
             # small portion of it from HBM to SMEM.
@@ -548,18 +545,16 @@ def rpa_kernel(
             # not NaNs, there will be no numeric concerns.
             num_lanes = pltpu.get_tpu_info().num_lanes
             kv_alloc = final_allocs[1]
-            kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes)
+            kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
             kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
 
             jax.tree.map(lambda x: x.wait(), dma_list)
 
             pipeline_func(
                 (q_hbm_ref, schedule_ref),
-                (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
-                 page_indices_ref),
+                (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_indices_ref),
                 (o_hbm_ref, schedule_ref),
-                scratches=(schedule_ref, ) + scratches,
+                scratches=(schedule_ref,) + scratches,
                 allocations=final_allocs,
             )
 
@@ -578,18 +573,14 @@ def rpa_kernel(
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
-                pl.BlockSpec(
-                    memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
+                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        input_output_aliases={
-            12: 0,
-            14: 1
-        },
+        input_output_aliases={12: 0, 14: 1},
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )(

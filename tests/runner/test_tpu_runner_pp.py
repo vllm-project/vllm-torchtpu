@@ -3,6 +3,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -16,7 +17,9 @@ def _runner(**attrs):
     runner.model_config = MagicMock()
     runner.model_config.dtype = torch.bfloat16
     runner._pp_intermediate_template = None
+    runner._pp_topk_buffer = None
     for name in ("forward_model", "_pp_intermediate_tensors",
+                 "_pp_take_topk_indices", "_pp_outgoing_tensors",
                  "_sample_tokens_pp_intermediate_stage", "sample_tokens"):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     for name, value in attrs.items():
@@ -83,6 +86,37 @@ class TestIntermediateBuffers:
         assert all(t.shape == (32, 8) for t in empties.tensors.values())
         runner.model.make_empty_intermediate_tensors.assert_called_once_with(
             batch_size=1, dtype=torch.bfloat16, device=runner.device)
+
+
+class TestTopkHandoff:
+
+    def _runner_with_buffer(self):
+        buffer = torch.zeros(64, 4, dtype=torch.int32)
+        return _runner(_pp_topk_buffer=buffer), buffer
+
+    def test_incoming_indices_land_in_the_buffer_and_leave_the_arguments(self):
+        runner, buffer = self._runner_with_buffer()
+        received = torch.full((16, 4), 7, dtype=torch.int32)
+        tensors = IntermediateTensors({
+            "hidden_states": torch.zeros(16, 8),
+            "residual": torch.zeros(16, 8),
+            "topk_indices": received,
+        })
+
+        runner._pp_take_topk_indices(tensors, 16)
+
+        # the model's forward never sees it
+        assert set(tensors.tensors) == {"hidden_states", "residual"}
+        assert torch.equal(buffer[:16], received)
+        # rows this forward does not cover are untouched
+        assert torch.equal(buffer[16:], torch.zeros(48, 4, dtype=torch.int32))
+
+    def test_a_stage_handed_no_indices_is_refused(self):
+        runner, _ = self._runner_with_buffer()
+        tensors = IntermediateTensors({"hidden_states": torch.zeros(16, 8)})
+
+        with pytest.raises(RuntimeError, match="no top-k indices"):
+            runner._pp_take_topk_indices(tensors, 16)
 
 
 class TestIntermediateStageSampleTokens:

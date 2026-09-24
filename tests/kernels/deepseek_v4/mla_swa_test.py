@@ -56,20 +56,20 @@ def get_dtype_packing(dtype):
 
 @jax.jit(donate_argnames="cache_kv")
 def update_kv_cache(
-        new_kv: jax.Array,  # [num_tokens, actual_lkv_dim]
-        cache_kv: jax.
-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
-        kv_lens: jax.Array,  # i32[max_num_seqs]
-        page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-        cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-        distribution: jax.Array,  # i32[3]
+    new_kv: jax.Array,  # [num_tokens, actual_lkv_dim]
+    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
 ) -> tuple[jax.Array, jax.Array]:
     """Update KV cache with new tokens."""
     actual_lkv_dim = new_kv.shape[-1]
     lkv_dim = align_to(actual_lkv_dim, 128)
     if actual_lkv_dim != lkv_dim:
-        new_kv = jnp.pad(new_kv, ((0, 0), (0, lkv_dim - actual_lkv_dim)),
-                         constant_values=0)
+        new_kv = jnp.pad(
+            new_kv, ((0, 0), (0, lkv_dim - actual_lkv_dim)), constant_values=0
+        )
     kv_dim = lkv_dim
     _, page_size_per_kv_packing, kv_packing, cache_kv_dim = cache_kv.shape
     assert kv_dim == cache_kv_dim
@@ -92,8 +92,9 @@ def update_kv_cache(
             row = (token_idx_in_seq % page_size) // kv_packing
             col = (token_idx_in_seq % page_size) % kv_packing
 
-            cache_kv_ = cache_kv_.at[page_idx, row, col,
-                                     ..., :lkv_dim].set(new_kv[q_start + j])
+            cache_kv_ = cache_kv_.at[page_idx, row, col, ..., :lkv_dim].set(
+                new_kv[q_start + j]
+            )
             return cache_kv_
 
         return jax.lax.fori_loop(0, q_len, token_loop_body, cache_kv)
@@ -115,8 +116,7 @@ def reformat_swc_cache(swc_cache):
     row = row.reshape(total_num_pages, tokens, nb, 2, 128)
     swc_cache_lo = row[..., 0, :]
     swc_cache_hi = row[..., 1, :]
-    swc_cache = (swc_cache_hi.astype(jnp.uint16) << 8) | swc_cache_lo.astype(
-        jnp.uint16)
+    swc_cache = (swc_cache_hi.astype(jnp.uint16) << 8) | swc_cache_lo.astype(jnp.uint16)
     swc_cache = swc_cache.reshape(total_num_pages, tokens, nb * 128)
     return jax.lax.bitcast_convert_type(swc_cache, jnp.bfloat16)
 
@@ -124,8 +124,7 @@ def reformat_swc_cache(swc_cache):
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
     new_kv: jax.Array,  # [num_tokens, actual_lkv_dim]
-    cache_kv: jax.
-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -137,7 +136,6 @@ def ref_implementation(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     non_causal_block: bool = False,
 ):
-
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
@@ -164,8 +162,7 @@ def ref_implementation(
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
 
-    total_num_pages, page_size_per_kv_packing, kv_packing, _ = (
-        updated_cache_kv.shape)
+    total_num_pages, page_size_per_kv_packing, kv_packing, _ = updated_cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
     assert lkv_dim == q.shape[-1]
 
@@ -191,12 +188,12 @@ def ref_implementation(
         indices = page_indices[indices_start:indices_end]
 
         # Gather paged kv_c and k_pe
-        gathered_kv_c = kv_c_cache[
-            indices]  # [num_pages_i, page_size, lkv_dim]
+        gathered_kv_c = kv_c_cache[indices]  # [num_pages_i, page_size, lkv_dim]
 
         # Flatten pages to sequence
         flat_kv_c = gathered_kv_c.reshape(
-            -1, lkv_dim)  # [num_pages_i * page_size, lkv_dim]
+            -1, lkv_dim
+        )  # [num_pages_i * page_size, lkv_dim]
 
         # Prepare k and v for attention
         k_i = flat_kv_c[:kv_len]  # [kv_len, lkv_dim]
@@ -207,15 +204,11 @@ def ref_implementation(
         # k:[kv_len, lkv_dim+r_dim]
         # v:[kv_len, lkv_dim]
         # attn: [actual_num_q_heads, q_len, kv_len]
-        attn = jnp.einsum("qnh,kh->nqk",
-                          q_i,
-                          k_i,
-                          preferred_element_type=jnp.float32)
+        attn = jnp.einsum("qnh,kh->nqk", q_i, k_i, preferred_element_type=jnp.float32)
         attn *= sm_scale
 
         # Causal mask
-        q_span = kv_len - q_len + jax.lax.broadcasted_iota(
-            jnp.int32, attn.shape, 1)
+        q_span = kv_len - q_len + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         mask = q_span < kv_span
         if sliding_window is not None:
@@ -248,7 +241,6 @@ def ref_implementation(
 
 
 class CorrectnessTest(parameterized.TestCase):
-
     def setUp(self):
         super().setUp()
         self.rng = np.random.default_rng(1234)
@@ -266,12 +258,13 @@ class CorrectnessTest(parameterized.TestCase):
         self.sliding_window = 16
         self.page_size = 16
         self.attention_sinks = jnp.array(
-            self.rng.random(size=(self.num_heads, ), dtype=np.float32))
+            self.rng.random(size=(self.num_heads,), dtype=np.float32)
+        )
 
         self.ref_pages_per_seq = cdiv(self.sliding_window * 10, self.page_size)
-        self.ref_page_indices = jnp.arange(self.batch_size *
-                                           self.ref_pages_per_seq,
-                                           dtype=jnp.int32)
+        self.ref_page_indices = jnp.arange(
+            self.batch_size * self.ref_pages_per_seq, dtype=jnp.int32
+        )
         head_dim = self.head_dim
         self.ref_cache = jnp.zeros(
             (
@@ -297,7 +290,7 @@ class CorrectnessTest(parameterized.TestCase):
             dtype=jnp.uint8,
         )
         self.swc_page_indices = self.ref_page_indices
-        self.kv_lens = jnp.zeros((self.batch_size, ), dtype=jnp.int32)
+        self.kv_lens = jnp.zeros((self.batch_size,), dtype=jnp.int32)
 
     def compare_cache(self, kv_lens):
         print("Comparing output cache...")
@@ -316,31 +309,34 @@ class CorrectnessTest(parameterized.TestCase):
         # kv_lens shape is (batch_size,). Reshape for broadcasting
         kv_lens_np = np.array(kv_lens)[:, None, None, None]
         valid_mask = token_indices[None, ...] < kv_lens_np
-        valid_mask = valid_mask.reshape(batch_size * pages_per_seq,
-                                        page_size // kv_packing, kv_packing, 1)
+        valid_mask = valid_mask.reshape(
+            batch_size * pages_per_seq, page_size // kv_packing, kv_packing, 1
+        )
 
         ref_cache_masked = np.where(valid_mask, self.ref_cache, 0)
-        swa_cache = reformat_swc_cache(self.swc_cache[:, :page_size * 2, :, :])
-        swa_cache = swa_cache.reshape(batch_size * pages_per_seq,
-                                      page_size // kv_packing, kv_packing, 512)
+        swa_cache = reformat_swc_cache(self.swc_cache[:, : page_size * 2, :, :])
+        swa_cache = swa_cache.reshape(
+            batch_size * pages_per_seq, page_size // kv_packing, kv_packing, 512
+        )
         swa_cache_masked = np.where(valid_mask, swa_cache, 0)
 
         diff_cache = np.abs(ref_cache_masked - swa_cache_masked)
         print(f"Max Diff Cache: {np.max(diff_cache)}")
-        np.testing.assert_allclose(ref_cache_masked,
-                                   swa_cache_masked,
-                                   rtol=0.1,
-                                   atol=0.1)
+        np.testing.assert_allclose(
+            ref_cache_masked, swa_cache_masked, rtol=0.1, atol=0.1
+        )
 
-    def run_and_compare_outputs(self,
-                                q,
-                                new_kv,
-                                kv_lens,
-                                cu_q_lens,
-                                distribution,
-                                non_causal_block=False,
-                                num_queries_per_block=8,
-                                num_kv_pages_per_block=2):
+    def run_and_compare_outputs(
+        self,
+        q,
+        new_kv,
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        non_causal_block=False,
+        num_queries_per_block=8,
+        num_kv_pages_per_block=2,
+    ):
         total_tokens = q.shape[0]
         out_base, self.ref_cache, l_base, m_base = ref_implementation(
             q,
@@ -373,7 +369,8 @@ class CorrectnessTest(parameterized.TestCase):
                 q_compute_block_size=2,
                 logical_page_size=self.page_size,
                 non_causal_block=non_causal_block,
-            ))
+            )
+        )
 
         # Compare output
         print("Comparing output attention...")
@@ -398,78 +395,71 @@ class CorrectnessTest(parameterized.TestCase):
         self.compare_cache(kv_lens)
 
     def gen_random(self, shape, dtype):
-        return jnp.array(self.rng.random(size=shape,
-                                         dtype=np.float32)).astype(dtype)
+        return jnp.array(self.rng.random(size=shape, dtype=np.float32)).astype(dtype)
 
     def gen_random_int(self, shape, low, high):
         self.rng_key, subkey = jax.random.split(self.rng_key)
-        return jax.random.randint(subkey,
-                                  shape=shape,
-                                  minval=low,
-                                  maxval=high,
-                                  dtype=jnp.int32)
+        return jax.random.randint(
+            subkey, shape=shape, minval=low, maxval=high, dtype=jnp.int32
+        )
 
     def test_correctness_rng(self):
         print(f"JAX Backend: {jax.default_backend()}")
 
         # First step, contains variable length prefill
-        new_kv_lens = self.gen_random_int((self.batch_size, ),
-                                          self.sliding_window // 2,
-                                          self.sliding_window * 2)
+        new_kv_lens = self.gen_random_int(
+            (self.batch_size,), self.sliding_window // 2, self.sliding_window * 2
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
         self.kv_lens += new_kv_lens
         total_tokens = jnp.sum(new_kv_lens)
-        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
-                            self.q_dtype)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
 
-        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
-                                     distribution)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
 
         # Second step, contains half decode and half prefill
         num_decode_seqs = self.batch_size // 2
         new_kv_lens = self.gen_random_int(
-            (self.batch_size - num_decode_seqs, ),
+            (self.batch_size - num_decode_seqs,),
             self.sliding_window // 2,
             self.sliding_window * 2,
         )
-        new_kv_lens = jnp.concatenate([
-            jnp.ones((num_decode_seqs, ), dtype=jnp.int32),
-            new_kv_lens,
-        ])
+        new_kv_lens = jnp.concatenate(
+            [
+                jnp.ones((num_decode_seqs,), dtype=jnp.int32),
+                new_kv_lens,
+            ]
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
         self.kv_lens += new_kv_lens
         total_tokens = jnp.sum(new_kv_lens)
-        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
-                            self.q_dtype)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array(
-            [num_decode_seqs, num_decode_seqs, self.batch_size],
-            dtype=jnp.int32)
+            [num_decode_seqs, num_decode_seqs, self.batch_size], dtype=jnp.int32
+        )
 
-        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
-                                     distribution)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
 
         # Third step, contains full decode
-        new_kv_lens = jnp.ones((self.batch_size, ), dtype=jnp.int32)
+        new_kv_lens = jnp.ones((self.batch_size,), dtype=jnp.int32)
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
         self.kv_lens += new_kv_lens
         total_tokens = jnp.sum(new_kv_lens)
-        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
-                            self.q_dtype)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array(
-            [self.batch_size, self.batch_size, self.batch_size],
-            dtype=jnp.int32)
-        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
-                                     distribution)
+            [self.batch_size, self.batch_size, self.batch_size], dtype=jnp.int32
+        )
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
 
     @parameterized.named_parameters(
         # bq >= block: the block sits in one query block.
@@ -480,8 +470,7 @@ class CorrectnessTest(parameterized.TestCase):
         # last query.
         ("spans_bq_blocks", 2, 1),
     )
-    def test_non_causal_block(self, num_queries_per_block,
-                              num_kv_pages_per_block):
+    def test_non_causal_block(self, num_queries_per_block, num_kv_pages_per_block):
         """Draft (DSpark/DFlash) block mode: bidirectional in-block attention.
 
         Step 1 builds per-sequence context causally (also revalidating the
@@ -495,32 +484,29 @@ class CorrectnessTest(parameterized.TestCase):
         # window (W=16): nearly-pure-block, sub-window, and beyond-window.
         ctx_pattern = [1, 8, 40]
         new_kv_lens = jnp.array(
-            [ctx_pattern[i % 3] for i in range(self.batch_size)],
-            dtype=jnp.int32)
+            [ctx_pattern[i % 3] for i in range(self.batch_size)], dtype=jnp.int32
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
         self.kv_lens += new_kv_lens
         total_tokens = jnp.sum(new_kv_lens)
-        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
-                            self.q_dtype)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
-        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens,
-                                     distribution)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
 
         # Step 2: one non-causal draft block per sequence (K=5 and K+1=6,
         # the DSpark dense and bonus-anchor block sizes; both <= W).
         block_lens = jnp.array(
-            [5 if i % 2 == 0 else 6 for i in range(self.batch_size)],
-            dtype=jnp.int32)
+            [5 if i % 2 == 0 else 6 for i in range(self.batch_size)], dtype=jnp.int32
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(block_lens, dtype=jnp.int32)])
+            [jnp.array([0]), jnp.cumulative_sum(block_lens, dtype=jnp.int32)]
+        )
         self.kv_lens += block_lens
         total_tokens = jnp.sum(block_lens)
-        q = self.gen_random((total_tokens, self.num_heads, self.head_dim),
-                            self.q_dtype)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
         distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
         self.run_and_compare_outputs(
@@ -531,7 +517,8 @@ class CorrectnessTest(parameterized.TestCase):
             distribution,
             non_causal_block=True,
             num_queries_per_block=num_queries_per_block,
-            num_kv_pages_per_block=num_kv_pages_per_block)
+            num_kv_pages_per_block=num_kv_pages_per_block,
+        )
 
 
 if __name__ == "__main__":

@@ -56,23 +56,20 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
-    cache_kv: jax.
-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
     topk_indices: jax.Array,  # i32[max_num_tokens, topk]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     attention_sinks: jax.Array,  # float32[actual_num_q_heads]
-    swa_accumution: jax.
-    Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    swa_accumution: jax.Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
     swa_l: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     swa_m: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     *,
     sm_scale: float = 1.0,
     mask_value: float | None = DEFAULT_MASK_VALUE,
 ):
-
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
@@ -94,17 +91,16 @@ def ref_implementation(
     page_size = page_size_per_kv_packing * kv_packing
     assert lkv_dim == q.shape[-1]
 
-    kv_c_cache = cache_kv[..., :lkv_dim].reshape(total_num_pages, page_size,
-                                                 lkv_dim)
+    kv_c_cache = cache_kv[..., :lkv_dim].reshape(total_num_pages, page_size, lkv_dim)
 
     # Quantize and dequantize kv_c_cache to simulate the loss of quantization
     fp8_part = kv_c_cache[..., :448]
     bf16_part = kv_c_cache[..., 448:512]
 
     fp8_quant, scales_quant = _quantize_lane_periodic(fp8_part)
-    fp8_dequant = (fp8_quant.astype(jnp.bfloat16) *
-                   scales_quant[..., None, :].astype(jnp.bfloat16)).reshape(
-                       total_num_pages, page_size, 448)
+    fp8_dequant = (
+        fp8_quant.astype(jnp.bfloat16) * scales_quant[..., None, :].astype(jnp.bfloat16)
+    ).reshape(total_num_pages, page_size, 448)
     kv_c_cache = jnp.concatenate([fp8_dequant, bf16_part], axis=-1)
 
     outputs = []
@@ -123,12 +119,12 @@ def ref_implementation(
         indices = page_indices[indices_start:indices_end]
 
         # Gather paged kv_c and k_pe
-        gathered_kv_c = kv_c_cache[
-            indices]  # [num_pages_i, page_size, lkv_dim]
+        gathered_kv_c = kv_c_cache[indices]  # [num_pages_i, page_size, lkv_dim]
 
         # Flatten pages to sequence
         flat_kv_c = gathered_kv_c.reshape(
-            -1, lkv_dim)  # [num_pages_i * page_size, lkv_dim]
+            -1, lkv_dim
+        )  # [num_pages_i * page_size, lkv_dim]
 
         # Prepare k and v for attention
         k_i = flat_kv_c[:kv_len]  # [kv_len, lkv_dim]
@@ -139,19 +135,15 @@ def ref_implementation(
         # k:[kv_len, lkv_dim+r_dim]
         # v:[kv_len, lkv_dim]
         # attn: [actual_num_q_heads, q_len, kv_len]
-        attn = jnp.einsum("qnh,kh->nqk",
-                          q_i,
-                          k_i,
-                          preferred_element_type=jnp.float32)
+        attn = jnp.einsum("qnh,kh->nqk", q_i, k_i, preferred_element_type=jnp.float32)
         attn *= sm_scale
 
         # Causal/CSA mask
 
         topk_indices_i = topk_indices[q_start:q_end]
-        csa_mask = (topk_indices_i[:, :,
-                                   None] == jnp.arange(kv_len)[None,
-                                                               None, :]).any(
-                                                                   axis=1)
+        csa_mask = (
+            topk_indices_i[:, :, None] == jnp.arange(kv_len)[None, None, :]
+        ).any(axis=1)
         mask = ~csa_mask[None, :, :]
         attn = jnp.where(mask, mask_value, attn)
 
@@ -178,7 +170,7 @@ def ref_implementation(
 
 
 def generate_attention_sinks(rng, num_heads):
-    return jnp.array(rng.random(size=(num_heads, ), dtype=np.float32))
+    return jnp.array(rng.random(size=(num_heads,), dtype=np.float32))
 
 
 def gen_random(rng, shape, dtype):
@@ -192,11 +184,11 @@ NOPE_SCALE_PERIOD = 64
 
 def _quantize_lane_periodic(x):
     """[..., 448] -> e4m3 [..., 7, 64] values and e8m0 [..., 64] scales."""
-    blocked = x.reshape(*x.shape[:-1], x.shape[-1] // NOPE_SCALE_PERIOD,
-                        NOPE_SCALE_PERIOD)
+    blocked = x.reshape(
+        *x.shape[:-1], x.shape[-1] // NOPE_SCALE_PERIOD, NOPE_SCALE_PERIOD
+    )
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-2, keepdims=True), 1e-4,
-                    None)
+    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-2, keepdims=True), 1e-4, None)
     sf = jnp.power(2.0, jnp.ceil(jnp.log2(amax / fp8_max)))
     q = (blocked * (1.0 / sf)).astype(jnp.float8_e4m3fn)
     return q, jnp.squeeze(sf, -2).astype(jnp.float8_e8m0fnu)
@@ -207,11 +199,13 @@ def gen_random_int(rng, shape, low, high):
 
 
 def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
-    cache_kv_base = (gen_random(
-        rng,
-        get_kv_cache_shape(total_pages, page_size, head_dim, kv_dtype),
-        jnp.float32,
-    )).astype(kv_dtype)
+    cache_kv_base = (
+        gen_random(
+            rng,
+            get_kv_cache_shape(total_pages, page_size, head_dim, kv_dtype),
+            jnp.float32,
+        )
+    ).astype(kv_dtype)
 
     # Quantize cache_kv_base to create cache_kv_agent in DSV4 FP8 format.
     kv_c_flat = cache_kv_base.reshape(total_pages, page_size, head_dim)
@@ -221,7 +215,8 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     fp8_quant, scales_quant = _quantize_lane_periodic(fp8_part)
 
     fp8_uint8 = jax.lax.bitcast_convert_type(
-        fp8_quant.reshape(total_pages, page_size, 448), jnp.uint8)
+        fp8_quant.reshape(total_pages, page_size, 448), jnp.uint8
+    )
     # De-interleave ROPE cache to High and Low bytes
     bf16_u16 = jax.lax.bitcast_convert_type(bf16_part, jnp.uint16)
     hi = (bf16_u16 >> 8).astype(jnp.uint8)
@@ -231,9 +226,9 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
     scales_uint8 = jax.lax.bitcast_convert_type(scales_quant, jnp.uint8)
 
     # NOPE cache: fp8_uint8 (448) + scales_uint8 (64) = 512
-    cache_kv_nope = jnp.concatenate([fp8_uint8, scales_uint8],
-                                    axis=-1).reshape(total_pages, page_size, 4,
-                                                     128)
+    cache_kv_nope = jnp.concatenate([fp8_uint8, scales_uint8], axis=-1).reshape(
+        total_pages, page_size, 4, 128
+    )
 
     # ROPE cache: rope_uint8 has shape (total_pages, page_size, 128)
     cache_kv_rope = rope_uint8.reshape(total_pages, page_size // 4, 4, 128)
@@ -242,7 +237,6 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
-
     def test_correctness(self):
         topk = 1024
         rng = np.random.default_rng()
@@ -258,18 +252,20 @@ class CorrectnessTest(parameterized.TestCase):
         num_decode_seqs = batch_size // 2
         new_kv_lens = gen_random_int(
             rng,
-            (batch_size - num_decode_seqs, ),
+            (batch_size - num_decode_seqs,),
             8,
             60,
         )
-        new_kv_lens = jnp.concatenate([
-            jnp.ones((num_decode_seqs, ), dtype=jnp.int32),
-            new_kv_lens,
-        ])
+        new_kv_lens = jnp.concatenate(
+            [
+                jnp.ones((num_decode_seqs,), dtype=jnp.int32),
+                new_kv_lens,
+            ]
+        )
         cu_q_lens = jnp.concatenate(
-            [jnp.array([0]),
-             jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)])
-        kv_lens = new_kv_lens + gen_random_int(rng, (batch_size, ), 30, 200)
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        kv_lens = new_kv_lens + gen_random_int(rng, (batch_size,), 30, 200)
         total_tokens = jnp.sum(new_kv_lens)
 
         # Deterministic Inputs for debugging
@@ -299,15 +295,16 @@ class CorrectnessTest(parameterized.TestCase):
         total_pages = batch_size * pages_per_seq
 
         cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
-            rng, total_pages, page_size, head_dim, kv_dtype)
+            rng, total_pages, page_size, head_dim, kv_dtype
+        )
 
         distribution = jnp.array(
-            [num_decode_seqs, num_decode_seqs, batch_size], dtype=jnp.int32)
+            [num_decode_seqs, num_decode_seqs, batch_size], dtype=jnp.int32
+        )
 
         attention_sinks = generate_attention_sinks(rng, num_heads)
 
-        swa_accumution = gen_random(rng, (total_tokens, num_heads, head_dim),
-                                    q_dtype)
+        swa_accumution = gen_random(rng, (total_tokens, num_heads, head_dim), q_dtype)
         swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
         swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
 

@@ -17,6 +17,7 @@ import torch
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
@@ -499,6 +500,7 @@ def _pooled_kda_core(
     lower_bound: float | None,
     eps: float,
     pool_block_tokens: int,
+    conv_shard_heads: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     num_heads = a_log.shape[0]
@@ -546,17 +548,35 @@ def _pooled_kda_core(
     ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(num_reqs, num_heads,
                                                       head_dim, head_dim)
 
-    # Conv region [ssm_tokens, ssm_tokens + conv_tokens): the layer's
-    # (taps, qkv, heads, head_dim) slot order, stored in the pool dtype.
+    # Stage-3 stores whole, padded prefill-head shards in rank order. Each
+    # shard keeps the source's BF16 lane packing, so Raiden can concatenate
+    # aligned byte ranges without half-word scatter/gather. Restore logical
+    # (taps, qkv, heads, dim) order in the existing pooled adapter, just as
+    # Qwen's pair-blocked layout does. Ordinary serving has one shard.
+    shard_heads = num_heads if conv_shard_heads is None else conv_shard_heads
+    if shard_heads <= 0 or num_heads % shard_heads:
+        raise ValueError("KDA conv layout requires whole source head shards")
+    conv_shards = num_heads // shard_heads
+    if layout.conv_tokens % conv_shards:
+        raise ValueError("KDA conv shards must occupy whole packed pool rows")
+    shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
+    padded_shard_elems = (layout.conv_tokens // conv_shards * tok_bytes //
+                          elem_bytes)
+    if shard_elems > padded_shard_elems:
+        raise ValueError("KDA conv shard exceeds its padded pool region")
     conv_gathered = pool_adapters.gather_region(pool,
                                                 state_indices,
                                                 tok0=layout.ssm_tokens,
                                                 ntok=layout.conv_tokens,
                                                 out_dtype=pool.dtype,
                                                 split=split)
-    conv_elems = (kernel_size - 1) * 3 * num_heads * head_dim
-    conv_local = conv_gathered.reshape(num_reqs, -1)[:, :conv_elems].reshape(
-        num_reqs, kernel_size - 1, 3, num_heads, head_dim)
+    conv_local = conv_gathered.reshape(num_reqs, conv_shards,
+                                       padded_shard_elems)[:, :, :shard_elems]
+    conv_local = conv_local.reshape(num_reqs, conv_shards, kernel_size - 1, 3,
+                                    shard_heads, head_dim)
+    conv_local = conv_local.transpose(0, 2, 3, 1, 4,
+                                      5).reshape(num_reqs, kernel_size - 1, 3,
+                                                 num_heads, head_dim)
 
     # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local],
@@ -604,9 +624,13 @@ def _pooled_kda_core(
                                         ntok=layout.ssm_tokens,
                                         split=split)
 
-    conv_region_elems = layout.conv_tokens * tok_bytes // elem_bytes
-    new_conv = new_conv_buf[1:].reshape(num_reqs, conv_elems)
-    new_conv = jnp.pad(new_conv, ((0, 0), (0, conv_region_elems - conv_elems)))
+    new_conv = new_conv_buf[1:].reshape(num_reqs, kernel_size - 1, 3,
+                                        conv_shards, shard_heads, head_dim)
+    new_conv = new_conv.transpose(0, 3, 1, 2, 4,
+                                  5).reshape(num_reqs, conv_shards,
+                                             shard_elems)
+    new_conv = jnp.pad(new_conv,
+                       ((0, 0), (0, 0), (0, padded_shard_elems - shard_elems)))
     new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
     pool = pool_adapters.scatter_region(pool,
                                         new_conv,
@@ -643,6 +667,16 @@ def build_kimi_pooled_kda_op(
     wrong manager block.
     """
 
+    conv_shard_heads = None
+    if (tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+            and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION):
+        total_heads = int(vllm_config.model_config.hf_text_config.
+                          linear_attn_config["num_heads"])
+        source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+        if source_tp <= 0 or total_heads % source_tp:
+            raise ValueError("KDA conv source TP must divide num_heads")
+        conv_shard_heads = total_heads // source_tp
+
     def pooled_core(
         mixed_qkv: jax.Array,
         raw_gate: jax.Array,
@@ -676,13 +710,18 @@ def build_kimi_pooled_kda_op(
             distribution,
             lower_bound=lower_bound,
             eps=eps,
-            pool_block_tokens=vllm_config.cache_config.block_size)
+            pool_block_tokens=vllm_config.cache_config.block_size,
+            conv_shard_heads=conv_shard_heads)
 
     # vLLM's compile cache is keyed on the model config and not on the op
     # body, so the kernel variant goes in the op name (see
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
+    if conv_shard_heads is not None:
+        # Stored state order is part of the compiled program, including for
+        # decode-local requests and prefix-cache seeds, not just PD loads.
+        op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
 
     def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,

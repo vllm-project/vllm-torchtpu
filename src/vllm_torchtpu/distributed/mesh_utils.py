@@ -86,11 +86,13 @@ def _get_tpu_global_device_id() -> int:
         return 0
 
 
-def _collect_rank_to_device_id(group: Any, global_rank: int,
-                               device_id: int) -> dict[int, int]:
+def _collect_rank_to_device_id(
+    group: Any, global_rank: int, device_id: int
+) -> dict[int, int]:
     gathered: list[tuple[int, int] | None] = [None] * int(group.world_size)
-    torch.distributed.all_gather_object(gathered, (global_rank, device_id),
-                                        group=group.cpu_group)
+    torch.distributed.all_gather_object(
+        gathered, (global_rank, device_id), group=group.cpu_group
+    )
     rank_to_device_id: dict[int, int] = {}
     for item in gathered:
         if item is None:
@@ -116,8 +118,8 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     device_id = _get_tpu_global_device_id()
     if group is None or int(group.world_size) == 1:
         return CpGroupLayout(
-            ranks=(global_rank, ),
-            device_ids=(device_id, ),
+            ranks=(global_rank,),
+            device_ids=(device_id,),
             rank_in_group=0,
             world_size=1,
         )
@@ -129,13 +131,13 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     if cached is not None:
         return cached
 
-    rank_to_device_id = _collect_rank_to_device_id(group, global_rank,
-                                                   device_id)
+    rank_to_device_id = _collect_rank_to_device_id(group, global_rank, device_id)
     missing = [rank for rank in ranks if rank not in rank_to_device_id]
     if missing:
         raise RuntimeError(
             "Could not map all CP ranks to TPU global device ids: "
-            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}")
+            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
+        )
     device_ids = tuple(rank_to_device_id[rank] for rank in ranks)
     layout = CpGroupLayout(
         ranks=ranks,
@@ -172,19 +174,20 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
         for idx, device in enumerate(jax.devices())
     }
     missing = [
-        device_id for device_id in layout.device_ids
-        if device_id not in devices_by_id
+        device_id for device_id in layout.device_ids if device_id not in devices_by_id
     ]
     if missing:
         raise RuntimeError(
             f"Cannot build the '{axis_name}' mesh because JAX does not "
             f"expose all of the group's TPU device ids: missing={missing}, "
             f"layout={layout}, "
-            f"jax_device_ids={sorted(devices_by_id)}")
+            f"jax_device_ids={sorted(devices_by_id)}"
+        )
 
     mesh_devices = np.asarray(
-        [devices_by_id[device_id] for device_id in layout.device_ids])
-    mesh = Mesh(mesh_devices, axis_names=(axis_name, ))
+        [devices_by_id[device_id] for device_id in layout.device_ids]
+    )
+    mesh = Mesh(mesh_devices, axis_names=(axis_name,))
 
     # This is the mesh the CP kernel runs on, so it is the only place that
     # sees the rank -> device correspondence the ring actually uses.
@@ -198,10 +201,16 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
         f"@{tuple(getattr(device, 'coords', ()))}"
         f"c{getattr(device, 'core_on_chip', '?')}"
         for position, (rank, device_id, device) in enumerate(
-            zip(layout.ranks, layout.device_ids, mesh_devices)))
+            zip(layout.ranks, layout.device_ids, mesh_devices)
+        )
+    )
     logger.info(
         "CP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
-        axis_name, layout.world_size, layout.rank_in_group, positions)
+        axis_name,
+        layout.world_size,
+        layout.rank_in_group,
+        positions,
+    )
 
     _MESH_CACHE[cache_key] = mesh
     return mesh

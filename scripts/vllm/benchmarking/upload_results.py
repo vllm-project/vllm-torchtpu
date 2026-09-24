@@ -104,6 +104,13 @@ def main():
         help="If set, only print SQL query without executing upload.",
     )
     parser.add_argument(
+        "--skip-spanner",
+        action="store_true",
+        help="Skip the Spanner insert but still write to BigQuery. For a "
+        "fleet that reports into the shared table and has no Spanner "
+        "record of its own; --skip-db-upload still skips both.",
+    )
+    parser.add_argument(
         "--project",
         default=os.getenv("GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
         help="GCP project ID.",
@@ -287,9 +294,10 @@ def main():
         print(f"SQL for Spanner ({rf.name}):")
         print(sql)
 
-        if args.skip_db_upload:
+        if args.skip_db_upload or args.skip_spanner:
+            why = "--skip-db-upload" if args.skip_db_upload else "--skip-spanner"
             print(
-                f"=== Skipping Spanner DB Upload (--skip-db-upload specified) ===. RecordId: {record_id}"
+                f"=== Skipping Spanner DB Upload ({why} specified) ===. RecordId: {record_id}"
             )
         else:
             cmd = [
