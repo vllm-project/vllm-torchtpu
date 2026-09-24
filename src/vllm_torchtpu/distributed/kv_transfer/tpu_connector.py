@@ -3507,11 +3507,11 @@ class TPURaidenConnectorWorker:
                 continue
             try:
                 with TraceAnnotation(
-                        "KV_Cache_Prefill_Register_Blocks",
-                        uuid=uuid,
-                        request_id=str(req_id),
-                        num_tokens=num_tokens,
-                        num_blocks=len(registered_ids),
+                    "KV_Cache_Prefill_Register_Blocks",
+                    uuid=uuid,
+                    request_id=str(req_id),
+                    num_tokens=num_tokens,
+                    num_blocks=len(registered_ids),
                 ):
                     facade.register_request_blocks(
                         req_id=req_id,
@@ -4323,12 +4323,12 @@ class TPURaidenConnectorWorker:
                     self._record_stage3_load_failure(destination_req_id, local_blocks)
                     continue
             with TraceAnnotation(
-                    "KV_Cache_Decode_Submit_Load",
-                    uuid=uuid,
-                    request_id=str(destination_req_id),
-                    source_req_id=str(source_req_id),
-                    num_tokens=num_tokens,
-                    num_blocks=len(local_blocks),
+                "KV_Cache_Decode_Submit_Load",
+                uuid=uuid,
+                request_id=str(destination_req_id),
+                source_req_id=str(source_req_id),
+                num_tokens=num_tokens,
+                num_blocks=len(local_blocks),
             ):
                 self._dispatch_stage3_load_submit(pending, synchronous)
 
@@ -5267,14 +5267,14 @@ class TPURaidenConnectorWorker:
                     if start_time is not None:
                         latency_ms = (time.perf_counter() - start_time) * 1000
                     with TraceAnnotation(
-                            "KV_Cache_Decode_Recv_Complete",
-                            uuid=uuid,
-                            request_id=str(req_id),
-                            source_req_id=str(source_req_id),
-                            num_tokens=num_tokens,
-                            reshard_e2e_latency_ms=(round(latency_ms, 3)
-                                                    if latency_ms is not None
-                                                    else 0.0),
+                        "KV_Cache_Decode_Recv_Complete",
+                        uuid=uuid,
+                        request_id=str(req_id),
+                        source_req_id=str(source_req_id),
+                        num_tokens=num_tokens,
+                        reshard_e2e_latency_ms=(
+                            round(latency_ms, 3) if latency_ms is not None else 0.0
+                        ),
                     ):
                         logger.info(
                             "%s",
