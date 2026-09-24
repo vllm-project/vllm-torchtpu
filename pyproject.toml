@@ -87,11 +87,6 @@ test = [
     "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
 ]
 
-# Dev tools (linting, formatting)
-dev = [
-    "yapf>=0.43.0",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -178,25 +173,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Paths isort still owns, one per line, so a migration PR deletes exactly the
-# lines for the paths it converts. Every entry has a twin in `exclude` under
-# [tool.ruff.format] and in `files` on the isort and yapf hooks in
-# .pre-commit-config.yaml. All three move together, otherwise two tools format
-# the same file. Use `dir/**` or a full path: in a `*` pattern the star also
-# matches `/`, so `dir/*.py` silently covers the whole subtree.
-
-
-
-
-
-
-
-
-
-
-
-
-
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
 # that built it. B023 warns that a closure outliving its loop sees the last
@@ -210,22 +186,6 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
-
-# Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
-exclude = [
-
-
-
-
-
-
-
-
-
-
-
-
-]
 
 [tool.pyrefly]
 project-includes = ["src"]

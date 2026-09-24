@@ -15,50 +15,12 @@ repos:
         args: [--allow-multiple-documents] # k8s manifests are multi-document
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
-- repo: https://github.com/PyCQA/isort
-  rev: 6.0.1
-  hooks:
-  - id: isort
-    # The paths isort still owns. Anything not listed is formatted by ruff. The
-    # same paths appear in pyproject.toml under [tool.ruff.format] `exclude` and
-    # [tool.ruff.lint.per-file-ignores]; all three move together, otherwise two
-    # tools format the same file.
-    files: &legacy_formatter_paths |
-      (?x)^(
-      # (?!) never matches, so every path below can carry a leading `|` and a
-      # migration deletes whole lines only.
-      (?!)
-
-
-
-
-
-
-
-
-
-
-
-
-      )
-    # protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting
-    # it would make every regeneration produce a spurious diff.
-    exclude: &legacy_formatter_skip ^src/vllm_torchtpu/tools/xplane_pb2\.py$
-- repo: https://github.com/google/yapf
-  rev: v0.43.0
-  hooks:
-  - id: yapf
-    args: [--in-place, --verbose]
-    files: *legacy_formatter_paths
-    exclude: *legacy_formatter_skip
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
   - id: ruff-check
     args: [--output-format, github, --fix]
   - id: ruff-format
-    # Scoped by `exclude` under [tool.ruff.format] in pyproject.toml, which
-    # holds for explicitly passed filenames because `force-exclude` is set.
 - repo: https://github.com/pre-commit/mirrors-clang-format
   rev: v20.1.3
   hooks:

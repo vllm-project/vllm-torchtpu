@@ -73,8 +73,9 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   echo "Files changed:"
   echo "${FILES_CHANGED}"
 
-  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE)
-  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$)" || true)
+  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE,
+  # .git-blame-ignore-revs)
+  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$)" || true)
 
   if [[ -z "${NON_SKIPPABLE_FILES}" && -n "${FILES_CHANGED}" ]]; then
     echo "Only documentation/non-code files changed. Skipping CI build."
