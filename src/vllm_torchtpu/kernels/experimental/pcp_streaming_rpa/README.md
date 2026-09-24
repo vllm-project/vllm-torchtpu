@@ -70,7 +70,11 @@ Important fields include:
 - `KV_GLOBAL_START`: global position of the first KV token in the scheduled
   page.
 - `KV_VALID_LEN`: number of valid KV tokens in the scheduled page.
-- `Q_HBM_OFFSET`: local compact query/output offset.
+- `Q_HBM_OFFSET`: local compact query/output offset. Its remainder modulo
+  `interleave_size` locates the first row within its ownership chunk. A query
+  tile packs consecutive local request rows, including partial head/tail
+  chunks; `query_row_positions` maps them to absolute causal positions.
+  Partial chunks do not get separate query tiles.
 - `Q_TILE_SIZE`: number of valid rows in the local Q tile.
 - `KV_HBM_OFFSET`: compact current-KV offset; a negative value selects the
   history-boundary page from the paged cache.
