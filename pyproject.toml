@@ -37,7 +37,7 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260917185328",
+    "torch-tpu==0.1.1.dev20260924000658",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
