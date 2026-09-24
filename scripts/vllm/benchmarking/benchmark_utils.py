@@ -11,7 +11,7 @@ import json
 import math
 import os
 import re
-from typing import Any, List, Tuple
+from typing import Any
 
 import evaluate
 import nltk
@@ -20,9 +20,9 @@ from backend_request_func import RequestFuncOutput
 from benchmark_dataset import SampleRequest
 
 
-def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
-                                        metrics: dict[str, list],
-                                        extra_info: dict[str, Any]) -> list:
+def convert_to_pytorch_benchmark_format(
+    args: argparse.Namespace, metrics: dict[str, list], extra_info: dict[str, Any]
+) -> list:
     """
     Save the benchmark results in the format used by PyTorch OSS benchmark with
     on metric per record
@@ -50,12 +50,12 @@ def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
             },
         }
 
-        tp = record["benchmark"]["extra_info"]["args"].get(
-            "tensor_parallel_size")
+        tp = record["benchmark"]["extra_info"]["args"].get("tensor_parallel_size")
         # Save tensor_parallel_size parameter if it's part of the metadata
         if not tp and "tensor_parallel_size" in extra_info:
-            record["benchmark"]["extra_info"]["args"][
-                "tensor_parallel_size"] = (extra_info["tensor_parallel_size"])
+            record["benchmark"]["extra_info"]["args"]["tensor_parallel_size"] = (
+                extra_info["tensor_parallel_size"]
+            )
 
         records.append(record)
 
@@ -63,7 +63,6 @@ def convert_to_pytorch_benchmark_format(args: argparse.Namespace,
 
 
 class InfEncoder(json.JSONEncoder):
-
     def clear_inf(self, o: Any):
         if isinstance(o, dict):
             return {k: self.clear_inf(v) for k, v in o.items()}
@@ -83,8 +82,7 @@ def write_to_json(filename: str, records: list) -> None:
             records,
             f,
             cls=InfEncoder,
-            default=lambda o:
-            f"<{type(o).__name__} object is not JSON serializable>",
+            default=lambda o: f"<{type(o).__name__} object is not JSON serializable>",
         )
 
 
@@ -123,8 +121,9 @@ def strip_reasoning(text: str) -> str:
     return text
 
 
-def postprocess_text_mmlu(preds: List[str],
-                          targets: List[str]) -> Tuple[List[int], List[int]]:
+def postprocess_text_mmlu(
+    preds: list[str], targets: list[str]
+) -> tuple[list[int], list[int]]:
     """
     Postprocess the generated text to get the predicted and target answers for the MMLU dataset.
 
@@ -143,8 +142,9 @@ def postprocess_text_mmlu(preds: List[str],
         # We will need to add rules for other models, as their output formats may differ.
 
         # To match 'assistantfinal' block.
-        final_block_match = re.search(r"assistant.*final(.*)", output,
-                                      re.IGNORECASE | re.DOTALL)
+        final_block_match = re.search(
+            r"assistant.*final(.*)", output, re.IGNORECASE | re.DOTALL
+        )
 
         if final_block_match:
             final_block = final_block_match.group(1)
@@ -162,7 +162,9 @@ def postprocess_text_mmlu(preds: List[str],
                 return match.group(1).upper()
 
         # To match ... so/thus answer ... option/choice A
-        re_str_fallback = r"(?:thus|so)\s+answer.*(?:option|choice).*\s*\(?([A-D])\s*\)?"
+        re_str_fallback = (
+            r"(?:thus|so)\s+answer.*(?:option|choice).*\s*\(?([A-D])\s*\)?"
+        )
         match = re.search(re_str_fallback, output, re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).upper()
@@ -180,7 +182,9 @@ def postprocess_text_mmlu(preds: List[str],
             return match.group(1).upper()
 
         # To match: bare A, B, C, or D (e.g. from highly constrained system prompt)
-        re_str_fallback = r"^\s*(?:\*{1,2}|_{1,2})?([A-D])(?:\*{1,2}|_{1,2})?\s*[\.\)\-–:]?\s*$"
+        re_str_fallback = (
+            r"^\s*(?:\*{1,2}|_{1,2})?([A-D])(?:\*{1,2}|_{1,2})?\s*[\.\)\-–:]?\s*$"
+        )
         match = re.search(re_str_fallback, output, re.IGNORECASE)
         if match:
             return match.group(1).upper()
@@ -192,7 +196,7 @@ def postprocess_text_mmlu(preds: List[str],
     return preds, targets
 
 
-def eval_accuracy_mmlu(request_outputs: List[RequestFuncOutput]) -> dict:
+def eval_accuracy_mmlu(request_outputs: list[RequestFuncOutput]) -> dict:
     """
     Evaluate the accuracy of the results of a given benchmark on the MMLU dataset.
 
@@ -263,8 +267,9 @@ def eval_accuracy_mlperf(request_outputs: list[RequestFuncOutput]) -> None:
     preds = []
     targets = []
     for output in request_outputs:
-        pred, target = postprocess_text_mlperf(output.generated_text,
-                                               output.input_request.completion)
+        pred, target = postprocess_text_mlperf(
+            output.generated_text, output.input_request.completion
+        )
         preds.append(pred)
         targets.append(target)
 
@@ -278,7 +283,7 @@ def eval_accuracy_mlperf(request_outputs: list[RequestFuncOutput]) -> None:
     print(result)
 
 
-def extract_abcd_gpqa(text: str, possible_choices: str = 'ABCD') -> str:
+def extract_abcd_gpqa(text: str, possible_choices: str = "ABCD") -> str:
     """
     Extract answer letter (A, B, C, or D) from GPQA response text.
     Based on gpt-oss abcd_grader.py with patterns for various answer formats.
@@ -289,51 +294,68 @@ def extract_abcd_gpqa(text: str, possible_choices: str = 'ABCD') -> str:
 
     patterns = [
         # "Answer: (C)" or "Answers: (B)"
-        re.compile(r'(?ix)\bAnswer[s]?\b\s*[:\-–]?\s*\(\s*([' +
-                   possible_choices + r'])\s*\)'),
+        re.compile(
+            r"(?ix)\bAnswer[s]?\b\s*[:\-–]?\s*\(\s*([" + possible_choices + r"])\s*\)"
+        ),
         # "Answer: C" or "Answers – D"
-        re.compile(r'(?ix)\bAnswer[s]?\b\s*[:\-–]?\s*([' + possible_choices +
-                   r'])\b'),
+        re.compile(r"(?ix)\bAnswer[s]?\b\s*[:\-–]?\s*([" + possible_choices + r"])\b"),
         # "answer is C" or "answer is (C)"
-        re.compile(r'(?ix)\banswer\s+is\s+\(?([' + possible_choices +
-                   r'])\)?'),
+        re.compile(r"(?ix)\banswer\s+is\s+\(?([" + possible_choices + r"])\)?"),
         # **Answer:** A or *Answers* – B (markdown wrapped)
         re.compile(
-            r'(?ix)(?:\*{1,2}|_{1,2})Answer[s]?\s*[:\-–]?(?:\*{1,2}|_{1,2})\s*(['
-            + possible_choices + r'])\b'),
+            r"(?ix)(?:\*{1,2}|_{1,2})Answer[s]?\s*[:\-–]?(?:\*{1,2}|_{1,2})\s*(["
+            + possible_choices
+            + r"])\b"
+        ),
         # "Option B" or "Choice: C"
-        re.compile(r'(?ix)\b(?:Option|Choice)\b\s*[:\-–]?\s*([' +
-                   possible_choices + r'])\b'),
+        re.compile(
+            r"(?ix)\b(?:Option|Choice)\b\s*[:\-–]?\s*([" + possible_choices + r"])\b"
+        ),
         # LaTeX \boxed{A}
-        re.compile(r'(?x)\\boxed\{[^}]*?([' + possible_choices + r'])[^}]*\}',
-                   re.MULTILINE),
+        re.compile(
+            r"(?x)\\boxed\{[^}]*?([" + possible_choices + r"])[^}]*\}", re.MULTILINE
+        ),
         # Bare (A), [B], etc.
-        re.compile(r'(?x)(?<![A-Za-z0-9])[\(\[]\s*([' + possible_choices +
-                   r'])\s*[\)\]](?![A-Za-z0-9])'),
+        re.compile(
+            r"(?x)(?<![A-Za-z0-9])[\(\[]\s*(["
+            + possible_choices
+            + r"])\s*[\)\]](?![A-Za-z0-9])"
+        ),
         # Markdown wrapped: *A*, **B**, _C_, __D__
-        re.compile(r'(?x)(?<![A-Za-z0-9])(?:\*{1,2}|_{1,2})([' +
-                   possible_choices + r'])(?:\*{1,2}|_{1,2})(?![A-Za-z0-9])'),
+        re.compile(
+            r"(?x)(?<![A-Za-z0-9])(?:\*{1,2}|_{1,2})(["
+            + possible_choices
+            + r"])(?:\*{1,2}|_{1,2})(?![A-Za-z0-9])"
+        ),
         # Final fallback: line that's exactly "A", "B.", "C)", etc.
         re.compile(
-            r'(?x)^\s*(?:\*{1,2}|_{1,2})?([' + possible_choices +
-            r'])(?:\*{1,2}|_{1,2})?\s*[\.\)\-–:]?\s*$', re.MULTILINE),
+            r"(?x)^\s*(?:\*{1,2}|_{1,2})?(["
+            + possible_choices
+            + r"])(?:\*{1,2}|_{1,2})?\s*[\.\)\-–:]?\s*$",
+            re.MULTILINE,
+        ),
     ]
 
     # Also check for gpt-oss style "assistantfinal" block
-    final_block_match = re.search(r"assistant.*final(.*)", text,
-                                  re.IGNORECASE | re.DOTALL)
+    final_block_match = re.search(
+        r"assistant.*final(.*)", text, re.IGNORECASE | re.DOTALL
+    )
     if final_block_match:
         final_block = final_block_match.group(1)
         # Check for **... (A) ...** pattern
         match = re.search(
             r"\*\*[^\(]*\s*\(?([" + possible_choices + r"])\s*\)?",
-            final_block, re.DOTALL)
+            final_block,
+            re.DOTALL,
+        )
         if match:
             return match.group(1).upper()
         # Check for choice/answer ... (A) pattern
         match = re.search(
-            r"(?:choice|answer)[^\(]*\s*\(?([" + possible_choices +
-            r"])\s*\)?", final_block, re.IGNORECASE | re.DOTALL)
+            r"(?:choice|answer)[^\(]*\s*\(?([" + possible_choices + r"])\s*\)?",
+            final_block,
+            re.IGNORECASE | re.DOTALL,
+        )
         if match:
             return match.group(1).upper()
 
@@ -354,15 +376,16 @@ def extract_abcd_gpqa(text: str, possible_choices: str = 'ABCD') -> str:
     #
     # A lookahead rather than a required character, so a response that is just
     # "D" still matches at end of text.
-    match = re.match(r'^([' + possible_choices + r'])(?![A-Za-z0-9])',
-                     text.strip(), re.IGNORECASE)
+    match = re.match(
+        r"^([" + possible_choices + r"])(?![A-Za-z0-9])", text.strip(), re.IGNORECASE
+    )
     if match:
         return match.group(1).upper()
 
     return None
 
 
-def eval_accuracy_gpqa(request_outputs: List[RequestFuncOutput]) -> dict:
+def eval_accuracy_gpqa(request_outputs: list[RequestFuncOutput]) -> dict:
     """
     Evaluate the accuracy of the results on the GPQA dataset.
 
@@ -410,7 +433,7 @@ def eval_accuracy_gpqa(request_outputs: List[RequestFuncOutput]) -> dict:
     return result
 
 
-def eval_accuracy_mmmu_pro(request_outputs: List[RequestFuncOutput]) -> dict:
+def eval_accuracy_mmmu_pro(request_outputs: list[RequestFuncOutput]) -> dict:
     """
     Evaluate accuracy on the MMMU-Pro dataset.
 
@@ -427,8 +450,9 @@ def eval_accuracy_mmmu_pro(request_outputs: List[RequestFuncOutput]) -> dict:
         if not output.success:
             continue
 
-        extracted = extract_abcd_gpqa(output.generated_text,
-                                      possible_choices='ABCDEFGHIJ')
+        extracted = extract_abcd_gpqa(
+            output.generated_text, possible_choices="ABCDEFGHIJ"
+        )
         target = output.input_request.completion
         if extracted is not None and extracted == target.upper():
             correct += 1
@@ -446,8 +470,9 @@ def eval_accuracy_mmmu_pro(request_outputs: List[RequestFuncOutput]) -> dict:
     return result
 
 
-def eval_benchmark_dataset_result(request_outputs: list[RequestFuncOutput],
-                                  dataset_name: str) -> None:
+def eval_benchmark_dataset_result(
+    request_outputs: list[RequestFuncOutput], dataset_name: str
+) -> None:
     """
     Evaluate the accuracy of the results of a given benchmark on a given dataset.
 
@@ -468,11 +493,12 @@ def eval_benchmark_dataset_result(request_outputs: list[RequestFuncOutput],
         print("Evaluating MMMU-Pro...")
         eval_accuracy_mmmu_pro(request_outputs)
     else:
-        raise NotImplementedError("Evaluation is not support for dataset: %s" %
-                                  dataset_name)
+        raise NotImplementedError(
+            "Evaluation is not support for dataset: %s" % dataset_name
+        )
 
 
-def sample_warmup_requests(requests: List[SampleRequest]):
+def sample_warmup_requests(requests: list[SampleRequest]):
     """
     Sample warmup requests from a list of requests.
 

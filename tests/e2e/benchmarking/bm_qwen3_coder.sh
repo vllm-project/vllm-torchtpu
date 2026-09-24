@@ -74,7 +74,7 @@ while true; do
       shift 2
       ;;
     --use_moe_ep_kernel)
-      use_moe_ep_kernel=$2
+      # Deprecated, kept for backward compatibility
       shift 2
       ;;
     --limit_mm_per_prompt)

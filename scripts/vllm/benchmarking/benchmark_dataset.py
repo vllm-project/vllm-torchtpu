@@ -17,7 +17,7 @@ import os
 import random
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -38,7 +38,7 @@ class BenchmarkDataset(ABC):
 
     def __init__(
         self,
-        dataset_path: Optional[str] = None,
+        dataset_path: str | None = None,
         random_seed: int = DEFAULT_SEED,
     ) -> None:
         """
@@ -56,9 +56,8 @@ class BenchmarkDataset(ABC):
         self.data = None
 
     def apply_multimodal_chat_transformation(
-            self,
-            prompt: str,
-            mm_content: Optional[MultiModalDataDict] = None) -> list[dict]:
+        self, prompt: str, mm_content: MultiModalDataDict | None = None
+    ) -> list[dict]:
         """
         Transform a prompt and optional multimodal content into a chat format.
         This method is used for chat models that expect a specific conversation
@@ -80,8 +79,7 @@ class BenchmarkDataset(ABC):
             NotImplementedError: If a subclass does not implement this method.
         """
         # TODO (jenniferzhao): add support for downloading data
-        raise NotImplementedError(
-            "load_data must be implemented in subclasses.")
+        raise NotImplementedError("load_data must be implemented in subclasses.")
 
     @abstractmethod
     def sample(
@@ -127,13 +125,13 @@ class BenchmarkDataset(ABC):
         if len(requests) < num_requests:
             random.seed(self.random_seed)
             additional = deepcopy(
-                random.choices(requests, k=num_requests - len(requests)))
+                random.choices(requests, k=num_requests - len(requests))
+            )
             for i in range(len(additional)):
                 req = additional[i]
                 req.request_id = request_id_prefix + str(len(requests) + i)
             requests.extend(additional)
-            logger.info("Oversampled requests to reach %d total samples.",
-                        num_requests)
+            logger.info("Oversampled requests to reach %d total samples.", num_requests)
 
 
 # -----------------------------------------------------------------------------
@@ -158,14 +156,14 @@ def is_valid_sequence(
     """
     # Check for invalid conditions
     prompt_too_short = prompt_len < min_len
-    output_too_short = (not skip_min_output_len_check) and (output_len
-                                                            < min_len)
+    output_too_short = (not skip_min_output_len_check) and (output_len < min_len)
     prompt_too_long = prompt_len > max_prompt_len
     combined_too_long = (prompt_len + output_len) > max_total_len
 
     # Return True if none of the invalid conditions are met
-    return not (prompt_too_short or output_too_short or prompt_too_long
-                or combined_too_long)
+    return not (
+        prompt_too_short or output_too_short or prompt_too_long or combined_too_long
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -179,16 +177,16 @@ class MMLUDataset(BenchmarkDataset):
     https://github.com/AI-Hypercomputer/JetStream/blob/bbfb5bd/benchmarks/benchmark_serving.py#L327.
     """
 
-    def __init__(self, num_shots: int, mmlu_method: str,
-                 use_chat_template: bool, **kwargs) -> None:
+    def __init__(
+        self, num_shots: int, mmlu_method: str, use_chat_template: bool, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.mmlu_method = mmlu_method
         self.num_shots = num_shots
         self.use_chat_template = use_chat_template
         self.load_data()
 
-    def load_mmlu_dataset_csv(self,
-                              dataset_path: str) -> tuple[Any, dict[str, str]]:
+    def load_mmlu_dataset_csv(self, dataset_path: str) -> tuple[Any, dict[str, str]]:
         assert dataset_path != ""
         dataset = []
         prompts_per_subject = dict()
@@ -215,15 +213,16 @@ class MMLUDataset(BenchmarkDataset):
         return combined_dataset, prompts_per_subject
 
     def gen_mmlu_qa(self, data: Any, mmlu_method: str = "") -> str:
-
         output = ""
         for _, row in data.iterrows():
-            output += (f"\nQuestion: {row['question']}\n"
-                       f"Choices:\n"
-                       f"(A) {row['A']}\n"
-                       f"(B) {row['B']}\n"
-                       f"(C) {row['C']}\n"
-                       f"(D) {row['D']}\n")
+            output += (
+                f"\nQuestion: {row['question']}\n"
+                f"Choices:\n"
+                f"(A) {row['A']}\n"
+                f"(B) {row['B']}\n"
+                f"(C) {row['C']}\n"
+                f"(D) {row['D']}\n"
+            )
             if self.use_chat_template:
                 output += "\nPlease think carefully and give the answer. "
                 if mmlu_method == "HELM":
@@ -246,21 +245,25 @@ class MMLUDataset(BenchmarkDataset):
             raise ValueError("dataset_path must be provided for loading data.")
 
         combined_dataset, prompts_per_subject = self.load_mmlu_dataset_csv(
-            self.dataset_path)
+            self.dataset_path
+        )
         num_rows, _ = combined_dataset.shape
         print(f"Loaded {num_rows} data from mmlu dataset")
 
         for subject in prompts_per_subject:
             header = (
                 f"The following are multiple choice questions (with answers) "
-                f"about {subject}:\n")
-            shots_data = combined_dataset[combined_dataset["subject"] ==
-                                          subject].head(self.num_shots)
+                f"about {subject}:\n"
+            )
+            shots_data = combined_dataset[combined_dataset["subject"] == subject].head(
+                self.num_shots
+            )
             prompts_per_subject[subject] = header + self.gen_mmlu_qa(
-                shots_data, mmlu_method=self.mmlu_method)
+                shots_data, mmlu_method=self.mmlu_method
+            )
 
         mmlu_data = []
-        for _, row in combined_dataset.iloc[self.num_shots:].iterrows():
+        for _, row in combined_dataset.iloc[self.num_shots :].iterrows():
             question_prompt = self.gen_mmlu_qa(pd.DataFrame([row]))
             output = row["answer"]
             prompt = prompts_per_subject[row["subject"]] + question_prompt
@@ -272,10 +275,10 @@ class MMLUDataset(BenchmarkDataset):
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
-        input_len: Optional[int] = None,
-        output_len: Optional[int] = None,
+        input_len: int | None = None,
+        output_len: int | None = None,
         enable_multimodal_chat: bool = False,
-        chat_template_system_prompt: Optional[str] = None,
+        chat_template_system_prompt: str | None = None,
         **kwargs,
     ) -> list:
         samples: list = []
@@ -284,34 +287,34 @@ class MMLUDataset(BenchmarkDataset):
                 break
 
             if self.use_chat_template:
-                system_prompt = (chat_template_system_prompt
-                                 if chat_template_system_prompt is not None
-                                 else "Reasoning effort: high")
-                messages = [{
-                    "role": "system",
-                    "content": system_prompt
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }]
+                system_prompt = (
+                    chat_template_system_prompt
+                    if chat_template_system_prompt is not None
+                    else "Reasoning effort: high"
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ]
 
                 try:
                     prompt = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
                         add_generation_prompt=True,
-                        **kwargs.get("chat_template_kwargs",
-                                     {}))  # consider turning on thinking=False
+                        **kwargs.get("chat_template_kwargs", {}),
+                    )  # consider turning on thinking=False
                 except Exception as e:
-                    logger.error(f"Could not apply chat template: {e}. "
-                                 "Falling back to raw prompt. "
-                                 "This will likely fail for fine-tuned models")
+                    logger.error(
+                        f"Could not apply chat template: {e}. "
+                        "Falling back to raw prompt. "
+                        "This will likely fail for fine-tuned models"
+                    )
 
             prompt_ids = tokenizer(prompt).input_ids
             completion_ids = tokenizer(completion).input_ids
             prompt_len = len(prompt_ids)
-            new_output_len = len(
-                completion_ids) if output_len is None else output_len
+            new_output_len = len(completion_ids) if output_len is None else output_len
             # TODO @jacobplatin?
             # if not is_valid_sequence(
             #     prompt_len,
@@ -329,7 +332,8 @@ class MMLUDataset(BenchmarkDataset):
                     prompt_len=prompt_len,
                     expected_output_len=output_len or new_output_len,
                     completion=completion,
-                ))
+                )
+            )
         self.maybe_oversample_requests(samples, num_requests)
         return samples
 
@@ -366,7 +370,8 @@ class MLPerfDataset(BenchmarkDataset):
             dataset = pd.read_pickle(self.dataset_path)
         else:
             raise ValueError(
-                f"Unsupported dataset format for path: {self.dataset_path}")
+                f"Unsupported dataset format for path: {self.dataset_path}"
+            )
 
         mlperf_data = []
         print(f"Loaded {len(dataset)} data from mlperf dataset")
@@ -392,8 +397,8 @@ class MLPerfDataset(BenchmarkDataset):
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
-        input_len: Optional[int] = None,
-        output_len: Optional[int] = None,
+        input_len: int | None = None,
+        output_len: int | None = None,
         **kwargs,
     ) -> list:
         samples: list = []
@@ -404,8 +409,7 @@ class MLPerfDataset(BenchmarkDataset):
             prompt_ids = tokenizer(prompt).input_ids
             completion_ids = tokenizer(completion).input_ids
             prompt_len = len(prompt_ids)
-            new_output_len = len(
-                completion_ids) if output_len is None else output_len
+            new_output_len = len(completion_ids) if output_len is None else output_len
             # NOTE (jacobplatin): I don't believe that we filter the MLPerf dataset
             # at all, but it could be done here
             if input_len is not None and input_len <= prompt_len:
@@ -418,7 +422,8 @@ class MLPerfDataset(BenchmarkDataset):
                     prompt_len=prompt_len,
                     expected_output_len=output_len or new_output_len,
                     completion=completion,
-                ))
+                )
+            )
         self.maybe_oversample_requests(samples, num_requests)
         return samples
 
@@ -462,9 +467,7 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
 
         # Generate a random permutation for each example.
         examples = [
-            example | {
-                "permutation": rng.sample(range(4), 4)
-            } for example in examples
+            example | {"permutation": rng.sample(range(4), 4)} for example in examples
         ]
 
         gpqa_data = []
@@ -481,11 +484,13 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
             correct_answer = "ABCD"[correct_index]
 
             # Format the question
-            choices_dict = dict(A=choices[0],
-                                B=choices[1],
-                                C=choices[2],
-                                D=choices[3],
-                                Question=row["Question"])
+            choices_dict = dict(
+                A=choices[0],
+                B=choices[1],
+                C=choices[2],
+                D=choices[3],
+                Question=row["Question"],
+            )
             prompt = self.QUERY_TEMPLATE.format(**choices_dict)
             gpqa_data.append((prompt, correct_answer))
 
@@ -496,9 +501,9 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
-        input_len: Optional[int] = None,
-        output_len: Optional[int] = None,
-        chat_template_system_prompt: Optional[str] = None,
+        input_len: int | None = None,
+        output_len: int | None = None,
+        chat_template_system_prompt: str | None = None,
         **kwargs,
     ) -> list:
         samples: list = []
@@ -507,26 +512,28 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
                 break
 
             if self.use_chat_template:
-                system_prompt = (chat_template_system_prompt
-                                 if chat_template_system_prompt is not None
-                                 else "Reasoning effort: high")
-                messages = [{
-                    "role": "system",
-                    "content": system_prompt
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }]
+                system_prompt = (
+                    chat_template_system_prompt
+                    if chat_template_system_prompt is not None
+                    else "Reasoning effort: high"
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ]
 
                 try:
                     prompt = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
                         add_generation_prompt=True,
-                        **kwargs.get("chat_template_kwargs", {}))
+                        **kwargs.get("chat_template_kwargs", {}),
+                    )
                 except Exception as e:
-                    logger.error(f"Could not apply chat template: {e}. "
-                                 "Falling back to raw prompt.")
+                    logger.error(
+                        f"Could not apply chat template: {e}. "
+                        "Falling back to raw prompt."
+                    )
 
             prompt_ids = tokenizer(prompt).input_ids
             prompt_len = len(prompt_ids)
@@ -539,7 +546,8 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
                     prompt_len=prompt_len,
                     expected_output_len=new_output_len,
                     completion=completion,
-                ))
+                )
+            )
         self.maybe_oversample_requests(samples, num_requests)
         return samples
 
@@ -582,8 +590,11 @@ class RandomDataset(BenchmarkDataset):
         num_special_tokens = tokenizer.num_special_tokens_to_add()
         real_input_len = input_len - num_special_tokens
 
-        prefix_token_ids = (np.random.randint(
-            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+        prefix_token_ids = (
+            np.random.randint(0, vocab_size, size=prefix_len).tolist()
+            if prefix_len > 0
+            else []
+        )
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(real_input_len * (1 - range_ratio))
@@ -596,21 +607,17 @@ class RandomDataset(BenchmarkDataset):
 
         # Add logging for debugging
         logger.info("Sampling input_len from [%s, %s]", input_low, input_high)
-        logger.info("Sampling output_len from [%s, %s]", output_low,
-                    output_high)
+        logger.info("Sampling output_len from [%s, %s]", output_low, output_high)
 
-        input_lens = np.random.randint(input_low,
-                                       input_high + 1,
-                                       size=num_requests)
-        output_lens = np.random.randint(output_low,
-                                        output_high + 1,
-                                        size=num_requests)
+        input_lens = np.random.randint(input_low, input_high + 1, size=num_requests)
+        output_lens = np.random.randint(output_low, output_high + 1, size=num_requests)
         offsets = np.random.randint(0, vocab_size, size=num_requests)
 
         requests = []
         for i in range(num_requests):
-            inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
-                         vocab_size).tolist()
+            inner_seq = (
+                (offsets[i] + i + np.arange(input_lens[i])) % vocab_size
+            ).tolist()
             token_sequence = prefix_token_ids + inner_seq
             prompt = tokenizer.decode(token_sequence)
             # After decoding the prompt we have to encode and decode it again.
@@ -622,8 +629,9 @@ class RandomDataset(BenchmarkDataset):
             # To avoid uncontrolled change of the prompt length,
             # the encoded sequence is truncated before being decoded again.
             total_input_len = prefix_len + int(input_lens[i])
-            re_encoded_sequence = tokenizer.encode(
-                prompt, add_special_tokens=False)[:total_input_len]
+            re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
+                :total_input_len
+            ]
             prompt = tokenizer.decode(re_encoded_sequence)
             total_input_len = len(re_encoded_sequence)
             requests.append(
@@ -632,7 +640,8 @@ class RandomDataset(BenchmarkDataset):
                     prompt_len=total_input_len,
                     expected_output_len=int(output_lens[i]),
                     request_id=request_id_prefix + str(i),
-                ))
+                )
+            )
 
         return requests
 
@@ -660,17 +669,24 @@ class MMMUProDataset(BenchmarkDataset):
     PROMPT_FOOTER = (
         "Try to reason about the question step by step. Don't give a final"
         " answer without reasoning. Output the final answer in the format"
-        " 'Final Answer: (X)' where X is the correct letter choice. Answer:")
+        " 'Final Answer: (X)' where X is the correct letter choice. Answer:"
+    )
 
-    QUERY_TEMPLATE_VISION = """{options_text}
+    QUERY_TEMPLATE_VISION = (
+        """{options_text}
 
-""" + PROMPT_FOOTER
+"""
+        + PROMPT_FOOTER
+    )
 
-    QUERY_TEMPLATE_STANDARD = """{question}
+    QUERY_TEMPLATE_STANDARD = (
+        """{question}
 
 {options_text}
 
-""" + PROMPT_FOOTER
+"""
+        + PROMPT_FOOTER
+    )
 
     def __init__(
         self,
@@ -687,7 +703,8 @@ class MMMUProDataset(BenchmarkDataset):
         except ImportError as err:
             raise ImportError(
                 "The 'datasets' package is required for MMMUProDataset. "
-                "Install it with: pip install datasets") from err
+                "Install it with: pip install datasets"
+            ) from err
 
         dataset_path = self.dataset_path or "MMMU/MMMU_Pro"
         hf_dataset = load_dataset(dataset_path, self.subset, split="test")
@@ -697,12 +714,13 @@ class MMMUProDataset(BenchmarkDataset):
             options = row.get("options", [])
             if isinstance(options, str):
                 import ast
+
                 options = ast.literal_eval(options)
 
-            option_letters = self.OPTION_LETTERS[:len(options)]
+            option_letters = self.OPTION_LETTERS[: len(options)]
             options_text = "\n".join(
-                f"({letter}) {opt}"
-                for letter, opt in zip(option_letters, options))
+                f"({letter}) {opt}" for letter, opt in zip(option_letters, options)
+            )
 
             answer = row.get("answer", "A")
 
@@ -715,17 +733,17 @@ class MMMUProDataset(BenchmarkDataset):
 
             if self.subset == "vision":
                 question_text = self.QUERY_TEMPLATE_VISION.format(
-                    options_text=options_text)
+                    options_text=options_text
+                )
             else:
                 question_text = self.QUERY_TEMPLATE_STANDARD.format(
-                    question=row.get("question", ""),
-                    options_text=options_text)
+                    question=row.get("question", ""), options_text=options_text
+                )
 
             mmmu_pro_data.append((question_text, answer, images))
 
         self.data = mmmu_pro_data
-        print(f"Loaded {len(self.data)} examples from MMMU-Pro "
-              f"({self.subset}) dataset")
+        print(f"Loaded {len(self.data)} examples from MMMU-Pro ({self.subset}) dataset")
 
     def _images_to_mm_content(self, images: list) -> list[dict]:
         """Convert PIL images to OpenAI-style image_url content blocks."""
@@ -737,19 +755,19 @@ class MMMUProDataset(BenchmarkDataset):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{b64}"
-                },
-            })
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+            )
         return content
 
     def sample(
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
-        output_len: Optional[int] = None,
+        output_len: int | None = None,
         **kwargs,
     ) -> list:
         samples: list = []
@@ -762,10 +780,12 @@ class MMMUProDataset(BenchmarkDataset):
             # Build message content: images first, then question text.
             content: list = mm_content
             content.append({"type": "text", "text": question_text})
-            messages = [{
-                "role": "user",
-                "content": content,
-            }]
+            messages = [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ]
 
             new_output_len = output_len if output_len is not None else 16
 
@@ -775,7 +795,8 @@ class MMMUProDataset(BenchmarkDataset):
                     expected_output_len=new_output_len,
                     multi_modal_data=mm_content,
                     completion=answer,
-                ))
+                )
+            )
 
         self.maybe_oversample_requests(samples, num_requests)
         return samples
@@ -823,23 +844,23 @@ class SonnetDataset(BenchmarkDataset):
     ) -> list:
         # Calculate average token length for a poem line.
         tokenized_lines = [tokenizer(line).input_ids for line in self.data]
-        avg_len = sum(len(tokens)
-                      for tokens in tokenized_lines) / len(tokenized_lines)
+        avg_len = sum(len(tokens) for tokens in tokenized_lines) / len(tokenized_lines)
 
         # Build the base prompt.
         base_prompt = "Pick as many lines as you can from these poem lines:\n"
         base_msg = [{"role": "user", "content": base_prompt}]
-        base_fmt = tokenizer.apply_chat_template(base_msg,
-                                                 add_generation_prompt=True,
-                                                 tokenize=False,
-                                                 **kwargs.get(
-                                                     "chat_template_kwargs",
-                                                     {}))
+        base_fmt = tokenizer.apply_chat_template(
+            base_msg,
+            add_generation_prompt=True,
+            tokenize=False,
+            **kwargs.get("chat_template_kwargs", {}),
+        )
         base_offset = len(tokenizer(base_fmt).input_ids)
         if input_len <= base_offset:
             raise ValueError(
                 f"'input_len' must be higher than the base prompt length "
-                f"({base_offset}).")
+                f"({base_offset})."
+            )
 
         # Determine how many poem lines to use.
         num_input_lines = round((input_len - base_offset) / avg_len)
@@ -849,26 +870,28 @@ class SonnetDataset(BenchmarkDataset):
         samples = []
         ind = 0
         while len(samples) < num_requests:
-            extra_lines = random.choices(self.data,
-                                         k=num_input_lines - num_prefix_lines)
+            extra_lines = random.choices(
+                self.data, k=num_input_lines - num_prefix_lines
+            )
             prompt = f"{base_prompt}{''.join(prefix_lines + extra_lines)}"
             msg = [{"role": "user", "content": prompt}]
             prompt_formatted = tokenizer.apply_chat_template(
                 msg,
                 add_generation_prompt=True,
                 tokenize=False,
-                **kwargs.get("chat_template_kwargs", {}))
+                **kwargs.get("chat_template_kwargs", {}),
+            )
             prompt_len = len(tokenizer(prompt_formatted).input_ids)
 
             if prompt_len <= input_len:
                 samples.append(
                     SampleRequest(
-                        prompt=prompt_formatted
-                        if return_prompt_formatted else prompt,
+                        prompt=prompt_formatted if return_prompt_formatted else prompt,
                         messages=None if return_prompt_formatted else msg,
                         prompt_len=prompt_len,
                         expected_output_len=output_len,
                         request_id=request_id_prefix + str(ind),
-                    ))
+                    )
+                )
                 ind += 1
         return samples

@@ -18,37 +18,53 @@ import json
 from typing import Any
 
 
-def _create_vllm_model(model_args: str | dict[str, Any], batch_size: str | int,
-                       max_batch_size: int | None, device: str | None):
+def _create_vllm_model(
+    model_args: str | dict[str, Any],
+    batch_size: str | int,
+    max_batch_size: int | None,
+    device: str | None,
+):
     try:
         import vllm.entrypoints.chat_utils as chat_utils
+
         if not hasattr(chat_utils, "resolve_hf_chat_template"):
+
             def resolve_hf_chat_template(tokenizer=None, chat_template=None, **kwargs):
-                if hasattr(tokenizer, "chat_template") and getattr(tokenizer, "chat_template", None):
+                if hasattr(tokenizer, "chat_template") and getattr(
+                    tokenizer, "chat_template", None
+                ):
                     return tokenizer.chat_template
                 if chat_template is not None:
                     return chat_template
                 if hasattr(chat_utils, "load_chat_template"):
                     try:
-                        return chat_utils.load_chat_template(tokenizer, chat_template=chat_template)
+                        return chat_utils.load_chat_template(
+                            tokenizer, chat_template=chat_template
+                        )
                     except Exception:
                         pass
                 return getattr(tokenizer, "chat_template", chat_template)
-            setattr(chat_utils, "resolve_hf_chat_template", resolve_hf_chat_template)
+
+            chat_utils.resolve_hf_chat_template = resolve_hf_chat_template
     except Exception:
         pass
 
     try:
         from vllm.engine.arg_utils import EngineArgs
+
         if not getattr(EngineArgs, "_swap_space_patched", False):
             orig_init = EngineArgs.__init__
+
             def patched_init(self, *args, **kwargs):
                 if "swap_space" in kwargs:
                     swap_space = kwargs.pop("swap_space")
                     fields = getattr(EngineArgs, "__dataclass_fields__", {})
                     if "swap_space_bytes" in fields:
-                        kwargs["swap_space_bytes"] = int(swap_space * 1024 * 1024 * 1024)
+                        kwargs["swap_space_bytes"] = int(
+                            swap_space * 1024 * 1024 * 1024
+                        )
                 return orig_init(self, *args, **kwargs)
+
             EngineArgs.__init__ = patched_init
             EngineArgs._swap_space_patched = True
     except Exception:
@@ -125,13 +141,16 @@ def main() -> None:
 
     if args.include_path:
         import lm_eval.tasks
+
         lm_eval.tasks.include_path(args.include_path)
 
     evaluation_tracker = None
     if args.output_path or args.log_samples:
         from lm_eval.loggers import EvaluationTracker
 
-        evaluation_tracker = EvaluationTracker(output_path=args.output_path, )
+        evaluation_tracker = EvaluationTracker(
+            output_path=args.output_path,
+        )
 
     results = evaluate_with_vllm(
         model_args=_parse_model_args(args.model_args),
@@ -149,7 +168,9 @@ def main() -> None:
         return
 
     if evaluation_tracker is not None:
-        evaluation_tracker.save_results_aggregated(results=results, )
+        evaluation_tracker.save_results_aggregated(
+            results=results,
+        )
 
     from lm_eval.utils import make_table
 

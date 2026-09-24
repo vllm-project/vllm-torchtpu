@@ -35,12 +35,14 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
-from backend_request_func import (ASYNC_REQUEST_FUNCS,
-                                  OPENAI_COMPATIBLE_BACKENDS,
-                                  RequestFuncOutput, start_stop_profile)
+from backend_request_func import (
+    ASYNC_REQUEST_FUNCS,
+    OPENAI_COMPATIBLE_BACKENDS,
+    RequestFuncOutput,
+    start_stop_profile,
+)
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -56,11 +58,17 @@ except ImportError:
 
 # yapf: disable
 from benchmark_core import BenchmarkContext, SampleRequest
-from benchmark_dataset import (GPQADataset, MLPerfDataset, MMLUDataset,
-                               MMMUProDataset, RandomDataset, SonnetDataset)
+from benchmark_dataset import (
+    GPQADataset,
+    MLPerfDataset,
+    MMLUDataset,
+    MMMUProDataset,
+    RandomDataset,
+    SonnetDataset,
+)
+
 # yapf: disable
-from benchmark_utils import (eval_benchmark_dataset_result,
-                             sample_warmup_requests)
+from benchmark_utils import eval_benchmark_dataset_result, sample_warmup_requests
 
 logger = logging.getLogger(__name__)
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -264,7 +272,7 @@ async def benchmark(
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: list[SampleRequest],
-    logprobs: Optional[int],
+    logprobs: int | None,
     request_rate: float,
     burstiness: float,
     disable_tqdm: bool,
@@ -272,8 +280,8 @@ async def benchmark(
     selected_percentiles: list[float],
     ignore_eos: bool,
     goodput_config_dict: dict[str, float],
-    max_concurrency: Optional[int],
-    extra_body: Optional[dict],
+    max_concurrency: int | None,
+    extra_body: dict | None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]

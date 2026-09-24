@@ -45,7 +45,6 @@ usage() {
 
 # Initialize variables
 MODEL_NAME=""
-USE_MOE_EP_KERNEL=""
 TENSOR_PARALLEL_SIZE=""
 MAX_MODEL_LEN=""
 MAX_NUM_BATCHED_TOKENS=""
@@ -63,7 +62,7 @@ ENABLE_THINKING=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --model_name) MODEL_NAME="$2"; shift ;;
-        --use_moe_ep_kernel) USE_MOE_EP_KERNEL="$2"; shift ;;
+        --use_moe_ep_kernel) shift ;; # Deprecated, kept for backward compatibility
         --tensor_parallel_size) TENSOR_PARALLEL_SIZE="$2"; shift ;;
         --max_model_len) MAX_MODEL_LEN="$2"; shift ;;
         --max_num_batched_tokens) MAX_NUM_BATCHED_TOKENS="$2"; shift ;;

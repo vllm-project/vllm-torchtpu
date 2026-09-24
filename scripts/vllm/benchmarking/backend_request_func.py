@@ -12,14 +12,13 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, Literal, Optional, Protocol, Union
+from typing import Any, Literal, Protocol
 
 import aiohttp
 import huggingface_hub.constants
 from benchmark_core import BenchmarkContext, RequestFuncOutput, SampleRequest
 from tqdm.asyncio import tqdm
-from transformers import (AutoTokenizer, PreTrainedTokenizer,
-                          PreTrainedTokenizerFast)
+from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,6 @@ async def start_stop_profile(base_url: str, action: Literal["start", "stop"]):
     api_url = base_url + f"/{action}_profile"
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-
         async with session.post(url=api_url) as response:
             if (code := response.status) != 200:
                 logger.warning(f"{action=} profile failed: {code=}")
@@ -42,11 +40,12 @@ async def start_stop_profile(base_url: str, action: Literal["start", "stop"]):
 async def async_request_openai_completions(
     ctx: BenchmarkContext,
     request_func_input: SampleRequest,
-    pbar: Optional[tqdm] = None,
+    pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     api_url = ctx.api_url
     assert api_url.endswith("completions"), (
-        "OpenAI Completions API URL must end with 'completions'")
+        "OpenAI Completions API URL must end with 'completions'"
+    )
 
     payload = {
         "model": ctx.model_name if ctx.model_name else ctx.model,
@@ -83,9 +82,8 @@ async def async_request_openai_completions(
 async def async_request_openai_chat_completions(
     ctx: BenchmarkContext,
     request_func_input: SampleRequest,
-    pbar: Optional[tqdm] = None,
+    pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
-
     # Note: the major difference from openai_completions are
     # - different api_url suffix checking.
     # - "messages" field in payload instead of "prompt".
@@ -93,7 +91,8 @@ async def async_request_openai_chat_completions(
 
     api_url = ctx.api_url
     assert api_url.endswith("chat/completions"), (
-        "OpenAI Chat Completions API URL must end with 'chat/completions'")
+        "OpenAI Chat Completions API URL must end with 'chat/completions'"
+    )
 
     payload = {
         "model": ctx.model_name if ctx.model_name else ctx.model,
@@ -128,7 +127,6 @@ async def async_request_openai_chat_completions(
 
 
 class _ExtractFunc(Protocol):
-
     def __call__(self, choices) -> str:
         """Given the "choices" field, extract the message payload."""
         ...
@@ -141,18 +139,18 @@ async def _openai_fetch(
 ) -> RequestFuncOutput:
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
-    async with aiohttp.ClientSession(trust_env=True,
-                                     timeout=AIOHTTP_TIMEOUT) as session:
-
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=AIOHTTP_TIMEOUT
+    ) as session:
         output = RequestFuncOutput()
 
         generated_text = ""
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(url=ctx.api_url,
-                                    json=payload,
-                                    headers=headers) as response:
+            async with session.post(
+                url=ctx.api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     first_chunk_received = False
                     async for chunk_bytes in response.content:
@@ -160,8 +158,7 @@ async def _openai_fetch(
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
+                        chunk = chunk_bytes.decode("utf-8").removeprefix("data: ")
                         if chunk != "[DONE]":
                             data = json.loads(chunk)
 
@@ -181,23 +178,21 @@ async def _openai_fetch(
 
                                 # Decoding phase
                                 else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
                             if usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
-                                output.prompt_tokens = usage.get(
-                                    "prompt_tokens") or 0
+                                output.output_tokens = usage.get("completion_tokens")
+                                output.prompt_tokens = usage.get("prompt_tokens") or 0
                     if first_chunk_received:
                         output.success = True
                     else:
                         output.success = False
                         output.error = (
                             "Never received a valid chunk to calculate TTFT."
-                            "This response will be marked as failed!")
+                            "This response will be marked as failed!"
+                        )
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
                 else:
@@ -234,25 +229,25 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     **kwargs,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     if pretrained_model_name_or_path is not None and not os.path.exists(
-            pretrained_model_name_or_path):
-        pretrained_model_name_or_path = get_model(
-            pretrained_model_name_or_path)
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
-            raise ValueError(
-                "Cannot use the fast tokenizer in slow tokenizer mode.")
+            raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
     if tokenizer_mode == "mistral":
         try:
             from vllm.transformers_utils.tokenizer import MistralTokenizer
         except ImportError as e:
-            raise ImportError("MistralTokenizer requires vllm package.\n"
-                              "Please install it with `pip install vllm` "
-                              "to use mistral tokenizer mode.") from e
-        return MistralTokenizer.from_pretrained(
-            str(pretrained_model_name_or_path))
+            raise ImportError(
+                "MistralTokenizer requires vllm package.\n"
+                "Please install it with `pip install vllm` "
+                "to use mistral tokenizer mode."
+            ) from e
+        return MistralTokenizer.from_pretrained(str(pretrained_model_name_or_path))
     else:
         return AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path,

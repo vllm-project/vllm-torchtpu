@@ -93,8 +93,7 @@ class RequestFuncOutput:
     etc.).
     """
     ttft: float = 0.0  # Time to first token
-    itl: list[float] = field(
-        default_factory=list)  # list of inter-token latencies
+    itl: list[float] = field(default_factory=list)  # list of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     error: str = ""
     input_request: SampleRequest = field(default_factory=SampleRequest)

@@ -31,8 +31,8 @@ steps:
          allow_failure: true
        - step: "v7x-group"
          allow_failure: true
-     agents: 
-       queue: cpu 
+     agents:
+       queue: cpu
      commands: |
         if [ "$(buildkite-agent meta-data get stop_support_matrix --default 'false')" = "true" ]; then
           echo "--- 🛑 Detected critical metadata failure. Blocking support matrix generation."
@@ -67,7 +67,7 @@ steps:
       else
         echo "--- Skipping v7 matrix generation (No v7 test data found)"
       fi
-  
+
    - label: "Commit support matrices if is nightly build or release tag specified"
      # commit_support_matrices and record_verified_commit_hashes push to the repo via
      # GITHUB_PAT, which is only provisioned for main / release tags. Gate them off
@@ -87,7 +87,7 @@ steps:
    - label: "Notify test results"
      <<: *run-on-nightly-or-tag
      key: notify_test_results
-     depends_on: 
+     depends_on:
        - "commit_support_matrices"
        - "v6_generate_matrices"
        - "v7_generate_matrices"

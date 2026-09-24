@@ -21,7 +21,6 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
 
 
 def get_buildkite_metadata(key: str, default: str = "") -> str:
@@ -137,7 +136,7 @@ def main() -> None:
                 f"{tpu_metadata_prefix}{model}_category", default="text-only"
             )
 
-            row: Dict[str, str] = {"Model": model}
+            row: dict[str, str] = {"Model": model}
 
             if category == "multimodal":
                 row["Type"] = "Multimodal"
@@ -167,15 +166,15 @@ def main() -> None:
             writer.writerows(model_rows)
 
         print(f"--- Uploading Model Matrix: {model_csv_path} ---")
-        with open(model_csv_path, "r", encoding="utf-8") as f:
+        with open(model_csv_path, encoding="utf-8") as f:
             print(f.read())
         upload_buildkite_artifact(model_csv_path)
 
     # 2. Process Default Features
     default_features_file = ".buildkite/features/default_features.txt"
-    default_features: List[Tuple[str, str]] = []
+    default_features: list[tuple[str, str]] = []
     if os.path.isfile(default_features_file):
-        with open(default_features_file, "r", encoding="utf-8") as f:
+        with open(default_features_file, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -184,7 +183,9 @@ def main() -> None:
                 if match:
                     feat_name, cat = match.group(1).strip(), match.group(2).strip()
                     default_features.append((feat_name, cat))
-                    set_buildkite_metadata(f"{tpu_metadata_prefix}{feat_name}_category", cat)
+                    set_buildkite_metadata(
+                        f"{tpu_metadata_prefix}{feat_name}_category", cat
+                    )
                 else:
                     default_features.append((line, "feature support matrix"))
 
@@ -192,7 +193,9 @@ def main() -> None:
     raw_features = get_buildkite_metadata("feature-list", "")
     metadata_features = [f.strip() for f in raw_features.splitlines() if f.strip()]
 
-    feature_groups: Dict[str, List[Tuple[str, str]]] = {}  # category -> list of (feature, mode)
+    feature_groups: dict[
+        str, list[tuple[str, str]]
+    ] = {}  # category -> list of (feature, mode)
     for feat, cat in default_features:
         feature_groups.setdefault(cat, []).append((feat, "DEFAULT"))
     for feat in metadata_features:
@@ -202,7 +205,13 @@ def main() -> None:
         feature_groups.setdefault(cat, []).append((feat, "METADATA"))
 
     valid_feature_outcomes = {
-        "✅ Passing", "⚪ N/A", "❓ Untested", "⚠️ Beta", "🧪 Experimental", "📝 Planned", "⛔️ Unplanned"
+        "✅ Passing",
+        "⚪ N/A",
+        "❓ Untested",
+        "⚠️ Beta",
+        "🧪 Experimental",
+        "📝 Planned",
+        "⛔️ Unplanned",
     }
 
     feature_csv_files = []
@@ -218,7 +227,12 @@ def main() -> None:
                 "CorrectnessTest",
                 "PerformanceTest",
             ]
-            stages = ["QuantizationMethods", "RecommendedTPUGenerations", "CorrectnessTest", "PerformanceTest"]
+            stages = [
+                "QuantizationMethods",
+                "RecommendedTPUGenerations",
+                "CorrectnessTest",
+                "PerformanceTest",
+            ]
         elif category == "kernel support matrix microbenchmarks":
             headers = ["kernels", "CorrectnessTest", "PerformanceTest"]
             stages = ["CorrectnessTest", "PerformanceTest"]
@@ -276,29 +290,39 @@ def main() -> None:
             print(f"Skipping direct upload for {csv_file} (will be pivoted later).")
             continue
         print(f"--- Uploading Feature Matrix: {csv_file} ---")
-        with open(csv_file, "r", encoding="utf-8") as f:
+        with open(csv_file, encoding="utf-8") as f:
             print(f.read())
         upload_buildkite_artifact(csv_file)
 
     # 4. Pivot Logic (Microbenchmarks)
-    kernel_input_csv = os.path.join(tpu_dir, "kernel_support_matrix_microbenchmarks.csv")
-    kernel_output_csv = os.path.join(tpu_dir, "kernel_support_matrix-microbenchmarks.csv")
+    kernel_input_csv = os.path.join(
+        tpu_dir, "kernel_support_matrix_microbenchmarks.csv"
+    )
+    kernel_output_csv = os.path.join(
+        tpu_dir, "kernel_support_matrix-microbenchmarks.csv"
+    )
     if os.path.isfile(kernel_input_csv):
         quant_order = ["w16a16", "w8a8", "w8a16", "w4a4", "w4a8", "w4a16"]
         pivot_headers = [
             "Kernel",
-            "W16 A16 (Corr)", "W16 A16 (Perf)",
-            "W8 A8 (Corr)", "W8 A8 (Perf)",
-            "W8 A16 (Corr)", "W8 A16 (Perf)",
-            "W4 A4 (Corr)", "W4 A4 (Perf)",
-            "W4 A8 (Corr)", "W4 A8 (Perf)",
-            "W4 A16 (Corr)", "W4 A16 (Perf)",
+            "W16 A16 (Corr)",
+            "W16 A16 (Perf)",
+            "W8 A8 (Corr)",
+            "W8 A8 (Perf)",
+            "W8 A16 (Corr)",
+            "W8 A16 (Perf)",
+            "W4 A4 (Corr)",
+            "W4 A4 (Perf)",
+            "W4 A8 (Corr)",
+            "W4 A8 (Perf)",
+            "W4 A16 (Corr)",
+            "W4 A16 (Perf)",
         ]
 
-        matrix: Dict[Tuple[str, str], Tuple[str, str]] = {}
-        kernel_names: List[str] = []
+        matrix: dict[tuple[str, str], tuple[str, str]] = {}
+        kernel_names: list[str] = []
 
-        with open(kernel_input_csv, "r", encoding="utf-8") as f:
+        with open(kernel_input_csv, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
                 feat = r.get("kernels", "")
@@ -339,7 +363,7 @@ def main() -> None:
             writer.writerows(pivot_rows)
 
         print(f"--- Uploading Pivoted Kernel Matrix: {kernel_output_csv} ---")
-        with open(kernel_output_csv, "r", encoding="utf-8") as f:
+        with open(kernel_output_csv, encoding="utf-8") as f:
             print(f.read())
         upload_buildkite_artifact(kernel_output_csv)
 
