@@ -74,6 +74,11 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    DP_PLACEMENT: str = ""
+    DP_SCHED_BUFFER_THRESHOLD: int = 0
+    DP_SCHED_BUFFER_FLUSH_MS: int = 5000
+    DP_SCHED_BUFFER_IDLE_TRIGGER: bool = True
+    DP_SCHED_BUFFER_QUIET_MS: int = 0
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -574,6 +579,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # DP_PLACEMENT=release: the API server's router holds new requests and
+    # releases them as a group across the engines, at DP_SCHED_BUFFER_THRESHOLD
+    # requests, after DP_SCHED_BUFFER_FLUSH_MS, when an engine is idle
+    # (DP_SCHED_BUFFER_IDLE_TRIGGER), or after DP_SCHED_BUFFER_QUIET_MS without
+    # a new arrival.
+    "DP_PLACEMENT":
+    lambda: os.getenv("DP_PLACEMENT", ""),
+    "DP_SCHED_BUFFER_THRESHOLD":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_THRESHOLD") or 0),
+    "DP_SCHED_BUFFER_FLUSH_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_FLUSH_MS") or 5000),
+    "DP_SCHED_BUFFER_IDLE_TRIGGER":
+    env_bool("DP_SCHED_BUFFER_IDLE_TRIGGER", default=True),
+    "DP_SCHED_BUFFER_QUIET_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_QUIET_MS") or 0),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
