@@ -1094,7 +1094,12 @@ class TestReorderBatchForRpa:
 
 class TestInitializeAttentionKernelsThreshold:
     """`reorder_batch_threshold` is the smallest DECODE query width across the
-    kernels `_initialize_attention_kernels` builds, draft layers included."""
+    TARGET kernels `_initialize_attention_kernels` builds.
+
+    Draft layers are excluded, and are always pinned to a 1-token tile. A
+    K+1-wide decode tile describes the target's verify step; a proposer runs
+    one query token per draft step and builds its own pure-decode request
+    distribution, so it never reads this threshold and must never widen it."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -1139,20 +1144,29 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert runner.reorder_batch_threshold == 1
 
-    def test_relocated_draft_forces_one_token_decode(self):
+    def test_replicated_draft_relocated_and_pinned_to_one_token(self):
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1
         )
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
-        assert runner.reorder_batch_threshold == 1
+        # The draft's 1 must not leak into the threshold: it would disable the
+        # RPAd verify lane for the target, which is unrelated to draft TP.
+        assert runner.reorder_batch_threshold == 4
 
-    def test_sharded_draft_keeps_width(self):
+    def test_sharded_draft_also_pinned_to_one_token(self):
+        """Regression: `PallasBatchedRPAAttentionBackendImpl.__init__` stamps
+        K+1 on every layer it builds, draft included, because it only keys on
+        "a spec config exists". A sharded draft left at K+1 mistiles its single
+        query token and degenerates after one token -- while acceptance reads a
+        perfect 100%, because target and draft agree on the same garbage."""
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
         )
         self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 4
 
     def test_no_pallas_layers(self):
