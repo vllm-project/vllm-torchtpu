@@ -323,8 +323,7 @@ def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     for cand in range(cap, 0, -align):
         if size_k % cand == 0:
             return cand
-    # should not reach here.
-    assert False, f"Cannot find a tile_k that divides size_k={size_k}"
+    raise AssertionError(f"Cannot find a tile_k that divides size_k={size_k}")
 
 
 @functools.partial(

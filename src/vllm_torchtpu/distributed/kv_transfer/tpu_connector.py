@@ -5472,11 +5472,11 @@ class TPURaidenConnectorWorker:
             try:
                 with socket.create_connection((host, port), timeout=0.5):
                     return
-            except OSError:
+            except OSError as err:
                 if time.perf_counter() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for address {address} to be ready"
-                    )
+                    ) from err
                 time.sleep(0.05)
 
     def _raiden_endpoint_identity(self) -> tuple[int, int]:

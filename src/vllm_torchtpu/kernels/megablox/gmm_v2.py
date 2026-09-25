@@ -958,9 +958,9 @@ def calculate_tiling(
         tile_n_limit //= fuse_act_factor
 
     def _is_tile_k_quant_block_compatible(tk: int) -> bool:
-        if tk % rhs_cfgs.quant_block_size != 0 and rhs_cfgs.quant_block_size % tk != 0:
-            return False
-        return True
+        return (
+            tk % rhs_cfgs.quant_block_size == 0 or rhs_cfgs.quant_block_size % tk == 0
+        )
 
     # Initialize tile_k and tile_n to their maximum valid values.
     num_k_tiles = num_n_tiles = 1

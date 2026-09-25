@@ -36,10 +36,8 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
         architectures = getattr(hf_config, "architectures", [])
         if any("qwen3vl" in str(arch).lower() for arch in architectures):
             return True
-    model_name = getattr(model_config, "model", "")
-    if "qwen3-vl" in str(model_name).lower() or "qwen3vl" in str(model_name).lower():
-        return True
-    return False
+    model_name = str(getattr(model_config, "model", "")).lower()
+    return "qwen3-vl" in model_name or "qwen3vl" in model_name
 
 
 def _patched_masked_scatter_(

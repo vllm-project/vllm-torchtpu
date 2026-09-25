@@ -245,9 +245,11 @@ def test_raises_when_new_group_cannot_preserve_order():
     original_new_group = torch.distributed.new_group
     torch.distributed.new_group = lambda ranks=None, backend=None: None
     try:
-        with pytest.raises(RuntimeError, match="no sort_ranks parameter"):
-            with order_mod.pcp_topology_order({"pcp": [[0, 1]]}):
-                pass
+        with (
+            pytest.raises(RuntimeError, match="no sort_ranks parameter"),
+            order_mod.pcp_topology_order({"pcp": [[0, 1]]}),
+        ):
+            pass
     finally:
         torch.distributed.new_group = original_new_group
 

@@ -1,7 +1,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -17,7 +17,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
-LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
+type LayerKVCache = torch.Tensor | list[torch.Tensor]
 
 
 @dataclass(frozen=True)
