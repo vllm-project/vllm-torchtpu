@@ -306,9 +306,10 @@ class MMLUDataset(BenchmarkDataset):
                     )  # consider turning on thinking=False
                 except Exception as e:
                     logger.error(
-                        f"Could not apply chat template: {e}. "
+                        "Could not apply chat template: %s. "
                         "Falling back to raw prompt. "
-                        "This will likely fail for fine-tuned models"
+                        "This will likely fail for fine-tuned models",
+                        e,
                     )
 
             prompt_ids = tokenizer(prompt).input_ids
@@ -531,8 +532,9 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
                     )
                 except Exception as e:
                     logger.error(
-                        f"Could not apply chat template: {e}. "
-                        "Falling back to raw prompt."
+                        "Could not apply chat template: %s. "
+                        "Falling back to raw prompt.",
+                        e,
                     )
 
             prompt_ids = tokenizer(prompt).input_ids

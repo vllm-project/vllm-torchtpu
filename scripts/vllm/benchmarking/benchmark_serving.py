@@ -168,7 +168,7 @@ def calculate_metrics(
     e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
-            logger.debug(f"Prompt: {input_requests[i].prompt}\nOutput: {outputs[i].generated_text}")
+            logger.debug("Prompt: %s\nOutput: %s", input_requests[i].prompt, outputs[i].generated_text)
             output_len = outputs[i].output_tokens
 
             if not output_len:

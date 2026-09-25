@@ -33,7 +33,7 @@ async def start_stop_profile(base_url: str, action: Literal["start", "stop"]):
         session.post(url=api_url) as response,
     ):
         if (code := response.status) != 200:
-            logger.warning(f"{action=} profile failed: {code=}")
+            logger.warning("action=%r profile failed: code=%r", action, code)
             return False
         return True
 
