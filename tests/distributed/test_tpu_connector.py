@@ -2266,13 +2266,24 @@ def _synthetic_qwen35_unified_pool_materialization(*, tp_size: int, pcp_size: in
 
 
 class TestTPURaidenConnectorWorker:
-    def test_pcp_tp1_transfer_rank_preserves_main_cache_ownership(self):
+    def test_pcp_tp1_transfer_rank_is_the_pcp_rank(self):
+        """At tp_size == 1 the transfer rank is the PCP rank.
+
+        This case used to assert the opposite -- that the rank came from
+        `get_pcp_cache_rank`, the device-id readback #554 added -- and was
+        named for it. That readback existed because Torchtpu built the kernel
+        DeviceAssignment from device enumeration rather than from the mesh, so
+        the chunk a worker's kernels computed was not its PCP rank.
+        google-pytorch/torch_tpu#3522 removed the enumeration, the readback
+        went with it, and `_local_raiden_transfer_rank` now reads the PCP rank
+        directly. Measured, not assumed: with the mesh built from the process
+        group, a rank's compiled partition index equals its rank in that group
+        even for a non-contiguous group (ring_probe.py, split [0,2,4,6],
+        8/8 match, job j-881f1c8f).
+        """
         worker = _make_raiden_worker(tp_size=1, pcp_size=8)
-        with (
-            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1),
-            patch("vllm_torchtpu.distributed.pcp.get_pcp_cache_rank", return_value=3),
-        ):
-            assert worker._local_raiden_transfer_rank() == 3
+        with patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1):
+            assert worker._local_raiden_transfer_rank() == 1
 
     @pytest.mark.parametrize(
         "pcp,tp,k,v",
@@ -2300,15 +2311,14 @@ class TestTPURaidenConnectorWorker:
         for pcp_rank in range(pcp):
             for tp_rank in range(tp):
                 worker = _make_raiden_worker(tp_rank=tp_rank, tp_size=tp, pcp_size=pcp)
-                with (
-                    patch(
-                        "vllm_torchtpu.distributed.pcp.get_pcp_rank",
-                        return_value=pcp_rank,
-                    ),
-                    patch(
-                        "vllm_torchtpu.distributed.pcp.get_pcp_cache_rank",
-                        return_value=pcp_rank,
-                    ),
+                # Only the PCP rank is patched: since torch_tpu#3522 the
+                # transfer rank IS the PCP rank, and `get_pcp_cache_rank` --
+                # the device-id readback that stood in for it -- is gone.
+                # Both patches set the same value here anyway, so nothing
+                # this case asserts changes.
+                with patch(
+                    "vllm_torchtpu.distributed.pcp.get_pcp_rank",
+                    return_value=pcp_rank,
                 ):
                     rank = worker._local_raiden_transfer_rank()
                 ranks.append(rank)
