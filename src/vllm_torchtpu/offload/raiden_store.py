@@ -60,6 +60,13 @@ Key components and mechanisms:
   reserves no capacity, keeps no host copy, and leaves no directory entry, so
   the same key is fetched again on every miss until a local store admits it.
 
+- Storage tier (optional): with a storage path configured, every save also
+  writes the block to a POSIX directory behind the host DRAM pool, one file per
+  TP rank, and the save completes only once the files are written. Raiden
+  reports a block found only in storage as `SHARED_STORAGE`. The connector
+  cannot read those back yet, so they count as misses and get recomputed.
+  Nothing deletes the files; the directory grows until an operator prunes it.
+
 See `raiden_connector.py` for connector wiring, device fencing, and echo channels.
 """
 
@@ -67,10 +74,12 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import math
 import os
 import socket
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -244,6 +253,9 @@ class RaidenOffloadingManager(OffloadingManager):
         store_server_ip: str = "",
         kv_pool_group: str = "",
         key_namespace: bytes = b"",
+        # Storage tier behind the host DRAM pool: raiden BackendConfigs from
+        # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
+        secondary_backend_configs: Sequence[object] = (),
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -306,6 +318,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 # rank registers, and raises on timeout
                 # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
                 expected_worker_count=world_size,
+                # Passed only when set, so a DRAM-only store is constructed
+                # exactly as before the storage tier existed.
+                **(
+                    {"secondary_backend_configs": list(secondary_backend_configs)}
+                    if secondary_backend_configs
+                    else {}
+                ),
             )
             logger.info(
                 "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d "
@@ -542,6 +561,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 all_local = False
                 remote_slices[sub_hash] = block
                 continue
+            # Anything else is a miss, SHARED_STORAGE included: the storage
+            # tier has the block's files, but this connector cannot read them
+            # back yet, so the block recomputes and `prepare_store` offers it
+            # again, which brings it back into host DRAM.
             return LookupResult.MISS
         if not all_local:
             self._remote_slices.update(remote_slices)
@@ -554,12 +577,19 @@ class RaidenOffloadingManager(OffloadingManager):
         # nothing. A partially resident chain needs no special case — only the
         # entries that were actually found move, and prepare_store re-offers
         # the key on its next appearance.
+        #
+        # Only host-pool entries were pinned. A SHARED_STORAGE entry holds no
+        # pin, and it must not be released: the storage tier answers for the
+        # hashes past the first host-pool miss without the host pool having
+        # been asked about them, so the pool may still hold the same hash,
+        # pinned by an in-flight job, and a release would drop that job's pin.
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
         for key in keys:
             sub_hashes = self._sub_hashes(key)
             held = [
                 sub_hash
                 for sub_hash, block in self._store.lookup(sub_hashes)
-                if block.status != self._block_status.REMOTE
+                if block.status not in skip
             ]
             if held:
                 self._store.release(held)
@@ -581,17 +611,43 @@ class RaidenOffloadingManager(OffloadingManager):
         # the resident PREFIX of what it was asked, stopping at the first hash
         # it cannot find, so each miss is resolved against the stash and the
         # walk resumes after it.
+        #
+        # A storage tier bends that rule in one place. Past the first host-pool
+        # miss the store answers from the storage tier, and its SHARED_STORAGE
+        # hits hold no pin and say nothing about the host pool. Looking each of
+        # them up again would re-check the whole remainder against storage
+        # every time, so a storage run is taken from the stash in one pass: a
+        # sub-hash in it that the stash covers is read from the peer even if it
+        # is also resident here. The first one the stash does not cover gets a
+        # fresh lookup, which finds it if it is resident.
         remote_slices: dict[bytes, object] = {}
         local_hashes: list[bytes] = []
         idx = 0
         while idx < len(sub_hashes):
             matched = self._store.lookup(sub_hashes[idx:])
-            local_hashes.extend(sub_hash for sub_hash, _ in matched)
-            idx += len(matched)
+            local_run = next(
+                (
+                    i
+                    for i, (_, block) in enumerate(matched)
+                    if block.status == self._block_status.SHARED_STORAGE
+                ),
+                len(matched),
+            )
+            local_hashes.extend(sub_hash for sub_hash, _ in matched[:local_run])
+            idx += local_run
             if idx == len(sub_hashes):
                 break
-            block = self._remote_slices.pop(sub_hashes[idx], None)
-            if block is None:
+            # sub_hashes[idx] missed the host pool; so, perhaps, did the rest
+            # of the storage run it starts.
+            run_end = idx + max(len(matched) - local_run, 1)
+            resolved_to = idx
+            for pos in range(idx, run_end):
+                block = self._remote_slices.pop(sub_hashes[pos], None)
+                if block is None:
+                    break
+                remote_slices[sub_hashes[pos]] = block
+                resolved_to = pos + 1
+            if resolved_to == idx:
                 # Neither resident nor a peer's: the entry the lookup promised
                 # is gone. Give back the pins taken so far and return an
                 # unpinned spec so submit_load_job fails the job cleanly and
@@ -607,8 +663,7 @@ class RaidenOffloadingManager(OffloadingManager):
                     req_context.req_id,
                 )
                 return RaidenLoadStoreSpec(keys, pinned=False)
-            remote_slices[sub_hashes[idx]] = block
-            idx += 1
+            idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
@@ -618,7 +673,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # re-offered here on its next appearance. A key is skipped only when
         # its whole sub-hash chain is host-resident (HOST/HOST_AND_HBM) or
         # cluster-resident (REMOTE — the data exists on a peer; no local
-        # re-store).
+        # re-store). A key found only in the storage tier (SHARED_STORAGE) is
+        # offered again on purpose: while the connector cannot read storage,
+        # a store is the only way back into host DRAM, and the save rewrites
+        # the same files.
         keys_to_store: list[OffloadKey] = []
         resident_statuses = (
             self._block_status.HOST,
@@ -1062,6 +1120,10 @@ class RaidenOffloadingManager(OffloadingManager):
         sub-hashes are not re-saved. drain_jobs zeroes retries_left first —
         after a flush the source blocks are about to be reused, so a retry
         would read garbage.
+
+        With a storage tier the failed save also drops the entries' pin, so
+        the store refuses the retry's save() and the job fails the way it
+        would once out of retries.
         """
         if (
             admission.op != AdmissionOp.STORE
@@ -1428,9 +1490,17 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         controller_address: str,
         rank: int,
         block_major_contract: BlockMajorContract | None = None,
+        # This rank's storage-tier config, from
+        # `build_worker_storage_backend_config`. Empty registers no storage
+        # backend, which is right only when the store has no storage tier:
+        # with one, every save needs every worker to write its shard.
+        backend_configs: Sequence[object] = (),
     ):
         import numpy as np
         import torch
+
+        # Set before either branch below starts the registration thread.
+        self._backend_configs = list(backend_configs)
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -1586,6 +1656,16 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 try:
                     from tpu_sync.api.torch import kv_cache_manager as _kcm
 
+                    # Registers the storage backend this rank writes its
+                    # shards through; omitted when there is no storage tier.
+                    # Any, not the inferred list type: a type checker matches
+                    # an unpacked dict's value type against every keyword
+                    # parameter the call does not pass explicitly.
+                    storage_kwargs: dict[str, Any] = (
+                        {"backend_configs": self._backend_configs}
+                        if self._backend_configs
+                        else {}
+                    )
                     self._mgr = _kcm.KVCacheManager(
                         kv_caches=self._device_tensors,
                         local_control_port=0,
@@ -1594,13 +1674,15 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         raiden_controller_address=self._controller_address,
                         worker_id=f"shard_{self._rank}",
                         node_id=self._rank,
+                        **storage_kwargs,
                     )
                     logger.info(
                         "TPURaidenOffloadingConnector: rank %d registered with offload "
-                        "controller at %s (%d host kernel blocks)",
+                        "controller at %s (%d host kernel blocks%s)",
                         self._rank,
                         self._controller_address,
                         self._host_blocks_to_allocate,
+                        ", storage tier on" if self._backend_configs else "",
                     )
                     return
                 except Exception:
@@ -1652,6 +1734,226 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._stop_registration.set()
         self._register_thread.join(timeout=5.0)
         self._mgr = None
+
+
+# -- storage tier ---------------------------------------------------------------
+
+# kv_connector_extra_config keys for the storage tier. A non-empty value wins
+# over the RAIDEN_STORAGE_* environment variable with the same meaning.
+_STORAGE_PATH_KEY = "raiden_storage_path"
+_STORAGE_TYPE_KEY = "raiden_storage_type"
+_STORAGE_CAPACITY_GB_KEY = "raiden_storage_capacity_gb"
+_STORAGE_MODEL_NAME_KEY = "raiden_storage_model_name"
+
+# The only storage backend type raiden accepts today.
+_POSIX_STORAGE_TYPE = "posix"
+
+
+@dataclass(frozen=True)
+class RaidenStorageConfig:
+    """Resolved settings for the storage tier behind the host DRAM pool.
+
+    Each TP rank writes its shard of a block to
+    `<root_dir>/<model_name>/tp<tp_size>_r<tp_rank>/...`. Raiden replaces
+    characters outside `[A-Za-z0-9._-]` in `model_name` with `_`.
+    """
+
+    storage_type: str
+    root_dir: str
+    model_name: str
+    # Reported to raiden as the tier's capacity; 0 leaves it unset. Raiden
+    # does not enforce it, and nothing deletes files from root_dir.
+    capacity_bytes: int = 0
+
+
+def _storage_setting(extra_config: Mapping[str, Any], key: str, env_value: str) -> str:
+    """One storage setting: a non-empty extra-config value, else the env value."""
+    value = extra_config.get(key)
+    value = "" if value is None else str(value).strip()
+    return value or env_value
+
+
+def _parse_storage_capacity(value: str) -> int:
+    """GiB as a string -> bytes. "" means unset and reads as 0."""
+    if not value:
+        return 0
+    try:
+        gib = float(value)
+    except ValueError:
+        gib = math.nan
+    if not (math.isfinite(gib) and gib > 0):
+        raise ValueError(
+            "TPURaidenOffloadingConnector: storage capacity "
+            f"({_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB) must be "
+            f"a positive number of GiB, got {value!r}"
+        )
+    return int(gib * (1 << 30))
+
+
+def _ensure_writable_dir(path: str) -> None:
+    """Create `path` if needed and check that this process can write to it,
+    so a bad directory stops startup instead of failing every save."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: cannot create storage directory "
+            f"{path!r}: {exc}"
+        ) from exc
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage directory {path!r} is not "
+            "writable by this process"
+        )
+
+
+def resolve_storage_config(
+    extra_config: Mapping[str, Any],
+    *,
+    model_name: str,
+    pp_size: int,
+    pcp_size: int,
+) -> RaidenStorageConfig | None:
+    """Read and check the storage-tier settings. None means the tier is off.
+
+    The tier is on when a storage path is set, through `raiden_storage_path`
+    in kv_connector_extra_config or RAIDEN_STORAGE_PATH; the other settings
+    are read only then. Every check raises ValueError, so a bad setting stops
+    engine startup: raiden itself would only log it, and every save would
+    fail.
+    """
+    root_dir = _storage_setting(
+        extra_config, _STORAGE_PATH_KEY, envs.RAIDEN_STORAGE_PATH
+    )
+    if not root_dir:
+        return None
+    storage_type = (
+        _storage_setting(extra_config, _STORAGE_TYPE_KEY, envs.RAIDEN_STORAGE_TYPE)
+        or _POSIX_STORAGE_TYPE
+    ).lower()
+    if storage_type != _POSIX_STORAGE_TYPE:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage type {storage_type!r} "
+            f"({_STORAGE_TYPE_KEY} / RAIDEN_STORAGE_TYPE) is not supported; the "
+            f"only type is {_POSIX_STORAGE_TYPE!r}"
+        )
+    if not os.path.isabs(root_dir):
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage path {root_dir!r} "
+            f"({_STORAGE_PATH_KEY} / RAIDEN_STORAGE_PATH) must be absolute"
+        )
+    if pp_size > 1 or pcp_size > 1:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the storage tier does not support "
+            f"pipeline or prefill context parallelism (pp_size={pp_size}, "
+            f"pcp_size={pcp_size}). Storage files are keyed by TP rank only, "
+            "so two ranks with the same TP rank would write different bytes "
+            "to the same file."
+        )
+    if not os.environ.get("PYTHONHASHSEED"):
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the storage tier requires "
+            "PYTHONHASHSEED to be set, to the same value on every engine that "
+            "shares the directory: unseeded engines derive fresh block hashes "
+            "on every start, so nothing they write could be found again."
+        )
+    capacity_bytes = _parse_storage_capacity(
+        _storage_setting(
+            extra_config, _STORAGE_CAPACITY_GB_KEY, envs.RAIDEN_STORAGE_CAPACITY_GB
+        )
+    )
+    root_dir = os.path.normpath(root_dir)
+    _ensure_writable_dir(root_dir)
+    return RaidenStorageConfig(
+        storage_type=storage_type,
+        root_dir=root_dir,
+        model_name=(
+            _storage_setting(extra_config, _STORAGE_MODEL_NAME_KEY, "") or model_name
+        ),
+        capacity_bytes=capacity_bytes,
+    )
+
+
+@dataclass(frozen=True)
+class StorageRankCoords:
+    """Where one rank's shards sit in the storage layout.
+
+    The layout is keyed by TP rank alone today. Parallel dimensions that also
+    split a block across ranks (PCP, PP) would add fields here;
+    `resolve_storage_config` refuses them until the layout can key by them.
+    """
+
+    tp_rank: int
+    tp_size: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.tp_rank < self.tp_size:
+            raise ValueError(
+                f"TPURaidenOffloadingConnector: storage TP rank {self.tp_rank} is "
+                f"outside [0, {self.tp_size})"
+            )
+
+
+def worker_storage_rank_coords() -> StorageRankCoords:
+    """This worker's storage coordinates, read from its TP group.
+
+    Not from the world rank: with data parallelism that counts the ranks of
+    every replica, while storage paths are per TP rank.
+    """
+    from vllm.distributed import parallel_state
+
+    return StorageRankCoords(
+        tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+        tp_size=parallel_state.get_tensor_model_parallel_world_size(),
+    )
+
+
+def _new_storage_backend_config(impl: Any, storage: RaidenStorageConfig) -> Any:
+    backend_config_cls = getattr(impl, "BackendConfig", None)
+    if backend_config_cls is None:
+        raise RuntimeError(
+            "TPURaidenOffloadingConnector: the installed tpu_sync has no "
+            "BackendConfig, so it cannot configure the storage tier; upgrade "
+            "tpu-sync-torch or unset the storage path"
+        )
+    cfg = backend_config_cls()
+    cfg.type = storage.storage_type
+    cfg.set_property("root_dir", storage.root_dir)
+    cfg.set_property("model_name", storage.model_name)
+    if storage.capacity_bytes:
+        cfg.set_property("capacity_bytes", str(storage.capacity_bytes))
+    return cfg
+
+
+def build_store_storage_backend_config(
+    impl: Any, storage: RaidenStorageConfig, coords: StorageRankCoords
+) -> Any:
+    """The scheduler-side store's config for the storage tier.
+
+    The store decides whether storage has a block by looking for rank 0's
+    file, so it needs the TP size to build that path. It must be set here:
+    raiden would otherwise take the store's shard count, which this connector
+    sets to 1.
+    """
+    cfg = _new_storage_backend_config(impl, storage)
+    cfg.set_property("tp_size", str(coords.tp_size))
+    return cfg
+
+
+def build_worker_storage_backend_config(
+    impl: Any, storage: RaidenStorageConfig, coords: StorageRankCoords
+) -> Any:
+    """One worker's config for the storage tier: which rank's shards it writes.
+
+    A worker refuses a config without a TP rank and only logs the refusal, so
+    a missing rank would surface later, as every save failing.
+    """
+    cfg = _new_storage_backend_config(impl, storage)
+    parallelism = impl.ParallelismConfig()
+    parallelism.tp_rank = coords.tp_rank
+    parallelism.tp_size = coords.tp_size
+    cfg.parallelism = parallelism
+    return cfg
 
 
 class TPURaidenStoreOffloadingSpec(OffloadingSpec):
@@ -1800,6 +2102,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "shm-backed host pools are unsupported."
             )
 
+        # Optional storage tier behind the host DRAM pool; None when off. The
+        # spec is built in the scheduler and in every worker, so each process
+        # checks the settings, the directory included, on its own host.
+        self.tp_size = parallel.tp_size
+        self.storage_config = resolve_storage_config(
+            self.extra_config,
+            model_name=vllm_config.model_config.model,
+            pp_size=parallel.pp_size,
+            pcp_size=parallel.pcp_size,
+        )
+
         # Offset controller port by local data parallel (DP) rank so multiple
         # DP replicas colocated on the same host bind unique control ports.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -1822,6 +2135,31 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
+            secondary_backend_configs: list[object] = []
+            storage = self.storage_config
+            if storage is not None:
+                from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+                secondary_backend_configs.append(
+                    build_store_storage_backend_config(
+                        _torch_impl(),
+                        storage,
+                        StorageRankCoords(tp_rank=0, tp_size=self.tp_size),
+                    )
+                )
+                logger.info(
+                    "TPURaidenOffloadingConnector: storage tier on: %s under %s "
+                    "(model dir %r, %d TP ranks, capacity %s)",
+                    storage.storage_type,
+                    storage.root_dir,
+                    storage.model_name,
+                    self.tp_size,
+                    (
+                        f"{storage.capacity_bytes / (1 << 30):g} GiB"
+                        if storage.capacity_bytes
+                        else "unset"
+                    ),
+                )
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
@@ -1833,6 +2171,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 store_server_ip=self.store_server_ip,
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
+                secondary_backend_configs=secondary_backend_configs,
             )
         return self._manager
 
@@ -1846,6 +2185,31 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             controller_address = (
                 f"{self.store_server_ip or '127.0.0.1'}:{self.raiden_controller_port}"
             )
+            backend_configs: list[object] = []
+            if self.storage_config is not None:
+                from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+                coords = worker_storage_rank_coords()
+                # The store looks for rank 0's file under the TP size from the
+                # config; a worker that disagreed would write where it never
+                # looks.
+                assert coords.tp_size == self.tp_size, (
+                    "TPURaidenOffloadingConnector: worker TP group size "
+                    f"{coords.tp_size} != configured tp_size {self.tp_size}"
+                )
+                backend_configs.append(
+                    build_worker_storage_backend_config(
+                        _torch_impl(), self.storage_config, coords
+                    )
+                )
+                logger.info(
+                    "TPURaidenOffloadingConnector: rank %d writes storage shards as "
+                    "TP rank %d of %d under %s",
+                    rank,
+                    coords.tp_rank,
+                    coords.tp_size,
+                    self.storage_config.root_dir,
+                )
             self._worker = RaidenStoreOffloadingWorker(
                 kv_caches,
                 vllm_config=self.vllm_config,
@@ -1854,5 +2218,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 controller_address=controller_address,
                 rank=rank,
                 block_major_contract=self.block_major_contract,
+                backend_configs=backend_configs,
             )
         return self._worker

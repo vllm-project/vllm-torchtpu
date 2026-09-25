@@ -133,12 +133,16 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, offload retry and drain limits, a weight-load sync cadence, a
-    # debug log switch, and the local-rank offsets, which move a worker to a
-    # different chip without changing the executable it runs.
+    # checks, the raiden offload storage tier, offload retry and drain
+    # limits, a weight-load sync cadence, a debug log switch, and the
+    # local-rank offsets, which move a worker to a different chip without
+    # changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",
+    "RAIDEN_STORAGE_CAPACITY_GB",
+    "RAIDEN_STORAGE_PATH",
+    "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
     "TORCH_TPU_BASE_PORT",

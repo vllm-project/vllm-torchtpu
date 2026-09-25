@@ -127,6 +127,9 @@ if TYPE_CHECKING:
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
+    RAIDEN_STORAGE_PATH: str = ""
+    RAIDEN_STORAGE_TYPE: str = ""
+    RAIDEN_STORAGE_CAPACITY_GB: str = ""
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TORCHTPU_IPC_KEY: str = ""
@@ -803,6 +806,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read raw, not through env_str: the check must see the same bytes the
     # raiden library sees, and a whitespace-only key still counts as set.
     "RAIDEN_SHM_KEY": lambda: os.getenv("RAIDEN_SHM_KEY", ""),
+    # Directory for the TPU offloading connector's storage tier, a third
+    # tier behind host DRAM. Every block the connector offloads to DRAM is
+    # also written under this directory. "" (the default) turns the tier off.
+    # The raiden_storage_path key in kv_connector_extra_config wins over it.
+    "RAIDEN_STORAGE_PATH": env_str("RAIDEN_STORAGE_PATH", ""),
+    # Storage backend type for RAIDEN_STORAGE_PATH; "" means "posix", the
+    # only type supported today.
+    "RAIDEN_STORAGE_TYPE": env_str("RAIDEN_STORAGE_TYPE", ""),
+    # Storage capacity in GiB, reported to the raiden store; "" leaves it
+    # unset. Kept as a string here; raiden_store.py parses and validates it.
+    "RAIDEN_STORAGE_CAPACITY_GB": env_str("RAIDEN_STORAGE_CAPACITY_GB", ""),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
     # jobs whose blocks are about to be reused.
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S": env_float(
