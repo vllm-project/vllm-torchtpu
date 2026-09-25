@@ -910,6 +910,9 @@ class ZmqShmKvConnectorBase:
         self._stop_event.set()
         # Wake the stage waiter so it can observe _stop_event and exit.
         if hasattr(self, "_stage_pending_q"):
+            # TODO: The queue is unbounded, so put_nowait cannot raise
+            # queue.Full. Remove this suppress once the teardown test stops
+            # injecting queue.Full.
             with contextlib.suppress(queue.Full):
                 self._stage_pending_q.put_nowait(None)
         if hasattr(self, "_coord_executor"):

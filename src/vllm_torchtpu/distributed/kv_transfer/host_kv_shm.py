@@ -414,5 +414,7 @@ class HostKVShmPool:
                 "HostKVShmPool close: error closing shm %s", self._shm.name
             )
         if self._owner:
+            # TODO: Track whether the segment was already unlinked and stop
+            # ignoring FileNotFoundError, so a missing segment is reported.
             with contextlib.suppress(FileNotFoundError):
                 self._shm.unlink()

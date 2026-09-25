@@ -346,11 +346,15 @@ def _shutdown_connectors(monkeypatch):
     while _LIVE:
         conn = _LIVE.pop()
         conn._stop_event.set()
+        # TODO: Collect teardown errors and report them after cleanup
+        # finishes, instead of dropping them.
         with contextlib.suppress(Exception):
             conn._coord_teardown()
     while _POOLS:
         # Unlink shared memory segments even if tests fail mid-execution to
         # prevent resource leaks in /dev/shm.
+        # TODO: Collect teardown errors and report them after cleanup
+        # finishes, instead of dropping them.
         with contextlib.suppress(Exception):
             _POOLS.pop().close()
 
