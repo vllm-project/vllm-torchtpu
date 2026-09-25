@@ -25,7 +25,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vllm_torchtpu.model_loader_patches import (
-    _compute_local_expert_ids, _sharded_runai_weights_iterator, _should_skip)
+    _compute_local_expert_ids,
+    _sharded_runai_weights_iterator,
+    _should_skip,
+)
 
 # ---------------------------------------------------------------------------
 # _should_skip
@@ -63,13 +66,11 @@ def test_local_expert_ids_use_loader_ownership_mapping():
     model_executor = ModuleType("vllm.model_executor")
     model_executor.__path__ = []
     loader_module = ModuleType("vllm.model_executor.model_loader")
-    loader_module.default_loader = SimpleNamespace(
-        compute_local_expert_ids=compute_ids)
+    loader_module.default_loader = SimpleNamespace(compute_local_expert_ids=compute_ids)
     distributed_module = ModuleType("vllm.distributed")
     distributed_module.get_dp_group = MagicMock()
     distributed_module.get_pcp_group = MagicMock()
-    distributed_module.get_tensor_model_parallel_rank = MagicMock(
-        return_value=11)
+    distributed_module.get_tensor_model_parallel_rank = MagicMock(return_value=11)
     logger_module = ModuleType("vllm.logger")
     logger_module.init_logger = MagicMock(return_value=MagicMock())
 
@@ -103,11 +104,11 @@ def test_keeps_local_expert_weights():
 def test_keeps_dense_shared_and_gate_weights():
     prefix = "language_model.model.layers.3"
     for name in (
-            f"{prefix}.self_attn.o_proj.weight",
-            f"{prefix}.block_sparse_moe.shared_experts.up_proj.weight",
-            f"{prefix}.block_sparse_moe.gate.weight",
-            f"{prefix}.block_sparse_moe.gate.e_score_correction_bias",
-            "language_model.model.embed_tokens.weight",
+        f"{prefix}.self_attn.o_proj.weight",
+        f"{prefix}.block_sparse_moe.shared_experts.up_proj.weight",
+        f"{prefix}.block_sparse_moe.gate.weight",
+        f"{prefix}.block_sparse_moe.gate.e_score_correction_bias",
+        "language_model.model.embed_tokens.weight",
     ):
         assert not _should_skip(name, _LOCAL), name
 
@@ -115,8 +116,7 @@ def test_keeps_dense_shared_and_gate_weights():
 def test_keeps_expert_tensors_with_unknown_suffix():
     # Only known heavy suffixes are skippable; anything else is kept even
     # for a non-local expert, mirroring upstream's conservatism.
-    name = ("language_model.model.layers.3.block_sparse_moe.experts.500"
-            ".w1.some_metadata")
+    name = "language_model.model.layers.3.block_sparse_moe.experts.500.w1.some_metadata"
     assert not _should_skip(name, _LOCAL)
 
 
@@ -165,7 +165,6 @@ def test_request_plan_groups_contiguous_kept_runs():
     captured = {}
 
     class FakeStreamer:
-
         def __init__(self):
             self.file_streamer = self
 
@@ -190,13 +189,17 @@ def test_request_plan_groups_contiguous_kept_runs():
     fake_metadata = MagicMock()
     fake_metadata.from_files.return_value = [file_meta]
 
-    with patch.object(safetensors_streamer, "SafetensorsStreamer",
-                      FakeStreamer), \
-         patch.object(sp, "SafetensorsMetadata", fake_metadata):
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp, "SafetensorsMetadata", fake_metadata),
+    ):
         list(
-            _sharded_runai_weights_iterator(["gs://bucket/file0.safetensors"],
-                                            local_expert_ids={0},
-                                            use_tqdm_on_load=False))
+            _sharded_runai_weights_iterator(
+                ["gs://bucket/file0.safetensors"],
+                local_expert_ids={0},
+                use_tqdm_on_load=False,
+            )
+        )
 
     requests = captured["requests"]
     assert [(r.offset, r.chunks) for r in requests] == [
@@ -232,7 +235,6 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
     captured = {}
 
     class FakeStreamer:
-
         def __init__(self):
             self.file_streamer = self
 
@@ -255,15 +257,18 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
     fake_metadata.from_files.return_value = [file_meta]
     fake_create = MagicMock(return_value=MagicMock())
 
-    with patch.object(safetensors_streamer, "SafetensorsStreamer",
-                      FakeStreamer), \
-         patch.object(sp, "SafetensorsMetadata", fake_metadata), \
-         patch.object(sp, "create_torch_tensor", fake_create):
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp, "SafetensorsMetadata", fake_metadata),
+        patch.object(sp, "create_torch_tensor", fake_create),
+    ):
         yielded = [
-            name for name, _ in _sharded_runai_weights_iterator(
+            name
+            for name, _ in _sharded_runai_weights_iterator(
                 ["gs://bucket/file0.safetensors"],
                 local_expert_ids=set(),
-                use_tqdm_on_load=False)
+                use_tqdm_on_load=False,
+            )
         ]
 
     requests = captured["requests"]
@@ -281,7 +286,9 @@ def test_streamer_split_preserves_chunk_index_mapping():
     # The Run:AI streamer ships with PR #331; skip until it is in the image.
     pytest.importorskip("runai_model_streamer")
     from runai_model_streamer.file_streamer.requests_iterator import (
-        FileChunks, FilesRequestsIterator)
+        FileChunks,
+        FilesRequestsIterator,
+    )
 
     # One request of 5 chunks, memory limit 6 -> split into [3,3],[3,3],[3]
     chunks = [3, 3, 3, 3, 3]
@@ -295,7 +302,8 @@ def test_streamer_split_preserves_chunk_index_mapping():
         for local_file_idx, fc in enumerate(req.files):
             for local_chunk_idx in range(len(fc.chunks)):
                 file_id, global_idx = it.get_global_file_and_chunk(
-                    local_file_idx, local_chunk_idx)
+                    local_file_idx, local_chunk_idx
+                )
                 seen.append((file_id, global_idx))
     assert seen == [(7, i) for i in range(len(chunks))]
 

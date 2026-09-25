@@ -36,8 +36,7 @@ def apply_omni_tpu_patches() -> None:
     import os
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
-    logger.info(
-        "Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -63,10 +62,10 @@ def apply_omni_tpu_patches() -> None:
         **kwargs: Any,
     ) -> torch.Tensor:
         if input.device.type == "tpu" and mode == "linear":
-            return orig_interpolate(input.cpu(), size, scale_factor, mode,
-                                    *args, **kwargs).to(input.device)
-        return orig_interpolate(input, size, scale_factor, mode, *args,
-                                **kwargs)
+            return orig_interpolate(
+                input.cpu(), size, scale_factor, mode, *args, **kwargs
+            ).to(input.device)
+        return orig_interpolate(input, size, scale_factor, mode, *args, **kwargs)
 
     torch.nn.functional.interpolate = _safe_interpolate
     logger.info(
@@ -105,8 +104,7 @@ def apply_omni_model_specific_patches() -> None:
         return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
-    logger.info(
-        "Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
+    logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:

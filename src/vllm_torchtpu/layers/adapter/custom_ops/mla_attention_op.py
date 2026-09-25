@@ -39,7 +39,7 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     cp_rank_as_data,
@@ -575,6 +575,7 @@ class VllmTPUMLAAttention(MLAAttention):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_backend: Any | None = None,
+        dcp_q_replicate: bool = False,
         use_sparse: bool = False,
         indexer: object | None = None,
         **extra_impl_args,
@@ -621,6 +622,11 @@ class VllmTPUMLAAttention(MLAAttention):
                 mla_attention.get_mla_prefill_backend = original_mla_get_backend
             if original_selector_get_backend is not None:
                 selector.get_mla_prefill_backend = original_selector_get_backend
+
+        # Set after super(), not through it: upstream's
+        # process_weights_after_loading gathers W_UK_T on the flag too, and
+        # this class does that itself once the weight is on device.
+        self.dcp_q_replicate = dcp_q_replicate
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -684,6 +690,26 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
         self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
 
+        # Query replication attends with the whole DCP group's heads, so the
+        # absorbed W_UK_T has to span them too. Gathered once here rather than
+        # gathering q every step -- that trade is the point of qrep.
+        self.W_UK_T_dcp_qrep = None
+        self.W_UK_T_dcp_qrep_scale = None
+        if self.dcp_q_replicate:
+            dcp_group = get_dcp_group()
+            if dcp_group is None or int(dcp_group.world_size) <= 1:
+                raise RuntimeError(
+                    "dcp_q_replicate is set but no DCP group is initialized, "
+                    "so W_UK_T cannot be gathered across the group."
+                )
+            self.W_UK_T_dcp_qrep = _fresh(
+                dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
+            )
+            if hasattr(self, "W_UK_T_scale"):
+                self.W_UK_T_dcp_qrep_scale = _fresh(
+                    dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
+                )
+
         # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
         for key in kv_b_proj_params:
@@ -696,6 +722,11 @@ class VllmTPUMLAAttention(MLAAttention):
             tensors = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
+            tensors.extend(
+                t
+                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                if t is not None
+            )
             synchronize_tensors(tensors)
 
         q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
@@ -730,6 +761,7 @@ class VllmTPUMLAAttention(MLAAttention):
             attn_metadata=attn_metadata,
             output=output,
             topk_indices=kwargs.get("topk_indices"),
+            q_dcp_replicated=kwargs.get("q_dcp_replicated"),
         )
 
 
@@ -804,6 +836,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
 
+        # DCP query replication: `q_proj` is sharded across DCP *groups*, so it
+        # returns the group's whole head set and decode needs no q all-gather.
+        q_proj_layer = self._q_proj_layer()
+        self.dcp_q_replicate = bool(getattr(q_proj_layer, "qrep_active", False))
+        self.dcp_group_size = (
+            int(getattr(q_proj_layer, "group_size", 1)) if self.dcp_q_replicate else 1
+        )
+
         self.mla_attn = VllmTPUMLAAttention(
             num_heads=self.num_heads,
             scale=scale,
@@ -816,12 +856,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             kv_b_proj=self.kv_b_proj,
+            dcp_q_replicate=self.dcp_q_replicate and self.is_sparse,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
         self.prefix = prefix
+
+    def _q_proj_layer(self):
+        """The projection that produces `q`, whichever of the two is wired."""
+        return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
@@ -895,7 +940,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        # `dcp_group_size` is 1 unless query replication is on, in which case
+        # the projection already returned the whole DCP group's heads.
+        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
@@ -928,12 +975,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_nope *= llama_4_scaling
             q_pe *= llama_4_scaling
 
+        # Hand the group-wide q to the sparse DCP path, which would otherwise
+        # all-gather the heads itself; everything else takes this rank's shard.
+        q_dcp_replicated = None
+        if self.dcp_q_replicate:
+            if self.is_sparse:
+                q_dcp_replicated = (q_nope, q_pe)
+            local_view = self._q_proj_layer()._local_view
+            q_nope, q_pe = local_view(q_nope), local_view(q_pe)
+
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
             output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
+            q_dcp_replicated=q_dcp_replicated,
         )
 
         if output_gate is not None:

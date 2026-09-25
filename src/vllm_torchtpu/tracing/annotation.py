@@ -1,5 +1,6 @@
 # Copyright 2026 Google LLC
 """PyTorch Kineto and TPU profiler trace annotation utilities."""
+
 import contextlib
 from typing import Any
 
@@ -12,7 +13,6 @@ def is_trace_annotation_enabled() -> bool:
 
 
 class TraceAnnotation(contextlib.ContextDecorator):
-
     def __init__(self, name: str, **kwargs: Any) -> None:
         self.name = name
         self.kwargs = kwargs

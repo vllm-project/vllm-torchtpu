@@ -11,22 +11,26 @@ from dataclasses import dataclass
 # instead. Other hybrid architectures unpack two state tensors unconditionally,
 # so they stay on the per-layer KV caches until they grow a pooled path.
 # Extend this set in the same change that adds one.
-QWEN_GDN_ARCHITECTURES = frozenset({
-    "Qwen3NextForCausalLM",
-    "Qwen3_5ForCausalLM",
-    "Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-})
-POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset({
-    # Kimi-Linear and Kimi-K3 run their KDA layers through the gather/scatter
-    # pooled op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3
-    # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are
-    # byte-identical to misses and GSM8K scores 100/100 with and without the
-    # pool.
-    "KimiLinearForCausalLM",
-    "KimiK3ForConditionalGeneration",
-})
+QWEN_GDN_ARCHITECTURES = frozenset(
+    {
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
+    {
+        # Kimi-Linear and Kimi-K3 run their KDA layers through the gather/scatter
+        # pooled op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3
+        # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are
+        # byte-identical to misses and GSM8K scores 100/100 with and without the
+        # pool.
+        "KimiLinearForCausalLM",
+        "KimiK3ForConditionalGeneration",
+    }
+)
 
 # The pooled GDN kernel's state dtypes inside the unified pool are fixed for
 # Conv, while SSM follows the layer's declared MambaSpec dtype. Everything
@@ -43,7 +47,8 @@ _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
 
 
 def pooled_gdn_state_dtypes(
-    dtypes: tuple[object, ...], ) -> tuple[object, object]:
+    dtypes: tuple[object, ...],
+) -> tuple[object, object]:
     """Resolve declared Conv/SSM dtypes to their pooled physical dtypes."""
     return DEFAULT_POOLED_GDN_CONV_STATE_DTYPE, dtypes[1]
 
@@ -55,12 +60,10 @@ def pooled_gdn_state_itemsize(dtype: object) -> int:
     try:
         return _ITEMSIZE_BY_DTYPE[name]
     except KeyError as exc:
-        raise ValueError(f"unsupported pooled GDN state dtype: {dtype}") \
-            from exc
+        raise ValueError(f"unsupported pooled GDN state dtype: {dtype}") from exc
 
 
-def unified_kv_layout_enabled_for_architecture(
-        architecture: str | None) -> bool:
+def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool:
     """Whether `architecture` runs on the attention-shaped unified KV pool.
 
     Split out of `platforms.tpu_block_size_utils.unified_kv_layout_enabled`
@@ -69,6 +72,7 @@ def unified_kv_layout_enabled_for_architecture(
     TpuPlatform, which imports the layers back.
     """
     from vllm_torchtpu import envs as tpu_envs
+
     override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
     if override is not None:
         return override
@@ -79,8 +83,11 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
     the pool (verify windows roll back via per-slot checkpoints instead)."""
-    return ((kernel_size - 1) * conv_dim *
-            pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE))
+    return (
+        (kernel_size - 1)
+        * conv_dim
+        * pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    )
 
 
 def pooled_gdn_ssm_state_bytes(
@@ -91,8 +98,7 @@ def pooled_gdn_ssm_state_bytes(
     dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
 ) -> int:
     """Live bytes of one slot's head-major, dense SSM region in ``dtype``."""
-    return (num_v_heads * head_k_dim * head_v_dim *
-            pooled_gdn_state_itemsize(dtype))
+    return num_v_heads * head_k_dim * head_v_dim * pooled_gdn_state_itemsize(dtype)
 
 
 @dataclass(frozen=True)

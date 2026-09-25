@@ -2,12 +2,18 @@ import math
 from dataclasses import replace
 
 import torch
-from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
-                                        MLAAttentionSpec)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 
 from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
-from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
-                                                    PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend,
+    PallasMLAttentionBackend,
+)
 
 
 def normalize_kv_cache_specs_for_tpu(
@@ -39,10 +45,7 @@ def normalize_kv_cache_specs_for_tpu(
             attention_backend=attention_backend,
         )
     if enable_unified_kv_layout:
-        non_exempt_specs = {
-            k: v
-            for k, v in normalized.items() if k not in exempt
-        }
+        non_exempt_specs = {k: v for k, v in normalized.items() if k not in exempt}
         if _has_hybrid_attention_and_mamba(non_exempt_specs):
             # The pool stores the mamba state regions in its fixed physical
             # dtypes (bf16 conv -- see gdn_pool_layout), not the layer's
@@ -58,11 +61,12 @@ def normalize_kv_cache_specs_for_tpu(
             }
             normalized.update(non_exempt_specs)
             page_size = max(
-                _required_page_size_bytes(spec)
-                for spec in non_exempt_specs.values())
+                _required_page_size_bytes(spec) for spec in non_exempt_specs.values()
+            )
             normalized = {
-                layer_name: (spec if layer_name in exempt else _pad_page_size(
-                    spec, page_size))
+                layer_name: (
+                    spec if layer_name in exempt else _pad_page_size(spec, page_size)
+                )
                 for layer_name, spec in normalized.items()
             }
     return normalized
@@ -120,36 +124,39 @@ def _normalize_one_spec(
             spec.head_size,
             kv_cache_dtype,
         )
-    backend = (PallasMLAttentionBackend
-               if isinstance(spec, MLAAttentionSpec) else attention_backend)
+    backend = (
+        PallasMLAttentionBackend
+        if isinstance(spec, MLAAttentionSpec)
+        else attention_backend
+    )
     target_spec = backend.customize_spec(replace(spec, dtype=kv_cache_dtype))
     padded_page_size = spec.page_size_padded or 0
-    page_size = max(page_size, target_spec.real_page_size_bytes,
-                    padded_page_size)
+    page_size = max(page_size, target_spec.real_page_size_bytes, padded_page_size)
     if target_spec.page_size_padded == page_size:
         return target_spec
     return replace(target_spec, page_size_padded=page_size)
 
 
 def _has_hybrid_attention_and_mamba(
-    kv_cache_specs: dict[str, KVCacheSpec], ) -> bool:
+    kv_cache_specs: dict[str, KVCacheSpec],
+) -> bool:
     has_attention = any(
-        isinstance(spec, AttentionSpec) for spec in kv_cache_specs.values())
-    has_mamba = any(
-        isinstance(spec, MambaSpec) for spec in kv_cache_specs.values())
+        isinstance(spec, AttentionSpec) for spec in kv_cache_specs.values()
+    )
+    has_mamba = any(isinstance(spec, MambaSpec) for spec in kv_cache_specs.values())
     return has_attention and has_mamba
 
 
 def _mamba_unpadded_page_size_bytes(spec: MambaSpec) -> int:
     return sum(
         math.prod(shape) * dtype.itemsize
-        for shape, dtype in zip(spec.shapes, spec.dtypes))
+        for shape, dtype in zip(spec.shapes, spec.dtypes)
+    )
 
 
 def _required_page_size_bytes(spec: KVCacheSpec) -> int:
     if isinstance(spec, MambaSpec):
-        return max(_mamba_unpadded_page_size_bytes(spec), spec.page_size_padded
-                   or 0)
+        return max(_mamba_unpadded_page_size_bytes(spec), spec.page_size_padded or 0)
     return spec.page_size_bytes
 
 

@@ -20,11 +20,6 @@
 # it is a property of this lane, not of any one benchmark.
 env:
   ARTIFACTS_DIR: "perf_eval_results"
-  # The image is built into the fleet's own registry, which its nodes can pull
-  # from; the project default (inferact-vllm-tpu, see ci_image.sh) is outside
-  # it. The mirror is emptied because it is this same repository.
-  CI_IMAGE_REPO: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-  CI_IMAGE_MIRROR_REPOS: ""
 
 x-kube-plugin: &kube_plugin
   kubernetes:

@@ -596,9 +596,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         return kda_state_dtype(self.vllm_config)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        # Keep the KDA short-convolution cache in the Pallas DMA layout.
+        # Declared in the fused kernel's (taps, 1, dim) slot layout so XLA does
+        # not relayout the whole pool around every call.
         return (
-            (self.conv_size - 1, 3, self.num_heads, self.head_dim),
+            (self.conv_size - 1, 1, 3 * self.local_projection_size),
             (self.num_heads, self.head_dim, self.head_dim),
         )
 

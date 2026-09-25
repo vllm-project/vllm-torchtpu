@@ -59,10 +59,12 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
     connector = object()
 
     with patch.object(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector):
-        with pytest.raises(RuntimeError, match="synthetic warmup failed"):
-            with tpu_runner._suspend_kv_transfer_group():
-                assert kv_transfer_state._KV_CONNECTOR_AGENT is None
-                raise RuntimeError("synthetic warmup failed")
+        with (
+            pytest.raises(RuntimeError, match="synthetic warmup failed"),
+            tpu_runner._suspend_kv_transfer_group(),
+        ):
+            assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+            raise RuntimeError("synthetic warmup failed")
 
         assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 

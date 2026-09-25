@@ -389,13 +389,12 @@ class TestConstructionGuards(unittest.TestCase):
     def test_registry_requires_pythonhashseed(self):
         # Require PYTHONHASHSEED to prevent hash mismatch across distributed replicas.
         env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
-        with patch.dict(os.environ, env, clear=True):
-            with self.assertRaises(ValueError):
-                make_manager(
-                    FakeKVCacheStore(),
-                    global_registry_address="registry:50051",
-                    store_server_ip="10.0.0.1",
-                )
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            make_manager(
+                FakeKVCacheStore(),
+                global_registry_address="registry:50051",
+                store_server_ip="10.0.0.1",
+            )
 
 
 class TestLookup(unittest.TestCase):
@@ -690,9 +689,7 @@ class TestTouchAndMisc(unittest.TestCase):
         self.manager.prepare_store([_key(0)], _ctx())
         for call in self.store.calls_named("lookup"):
             pin_found = call.args[2]
-            self.assertFalse(
-                pin_found, "a probe must not take a pin: %r" % (call.args,)
-            )
+            self.assertFalse(pin_found, f"a probe must not take a pin: {call.args!r}")
         self.assertEqual(self.store.pinned_hashes(), {})
 
         # touch, by contrast, deliberately does take one and give it back.

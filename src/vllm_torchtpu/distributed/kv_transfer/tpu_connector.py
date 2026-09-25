@@ -58,6 +58,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -3298,13 +3300,20 @@ class TPURaidenConnectorWorker:
                         lowering_parallelism,
                     )
                 )
-                facade.register_request_blocks(
-                    req_id=req_id,
+                with TraceAnnotation(
+                    "KV_Cache_Prefill_Register_Blocks",
                     uuid=uuid,
-                    unit=self._raiden_work_unit,
-                    block_ids=list(local_ids),
-                    pool_spans=pool_spans,
-                )
+                    request_id=str(req_id),
+                    num_tokens=num_tokens,
+                    num_blocks=len(local_ids),
+                ):
+                    facade.register_request_blocks(
+                        req_id=req_id,
+                        uuid=uuid,
+                        unit=self._raiden_work_unit,
+                        block_ids=list(local_ids),
+                        pool_spans=pool_spans,
+                    )
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
@@ -3497,13 +3506,20 @@ class TPURaidenConnectorWorker:
                     )
                 continue
             try:
-                facade.register_request_blocks(
-                    req_id=req_id,
+                with TraceAnnotation(
+                    "KV_Cache_Prefill_Register_Blocks",
                     uuid=uuid,
-                    unit=self._raiden_work_unit,
-                    block_ids=list(registered_ids),
-                    pool_spans=pool_spans,
-                )
+                    request_id=str(req_id),
+                    num_tokens=num_tokens,
+                    num_blocks=len(registered_ids),
+                ):
+                    facade.register_request_blocks(
+                        req_id=req_id,
+                        uuid=uuid,
+                        unit=self._raiden_work_unit,
+                        block_ids=list(registered_ids),
+                        pool_spans=pool_spans,
+                    )
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
@@ -4306,7 +4322,15 @@ class TPURaidenConnectorWorker:
                 if not all(ready):
                     self._record_stage3_load_failure(destination_req_id, local_blocks)
                     continue
-            self._dispatch_stage3_load_submit(pending, synchronous)
+            with TraceAnnotation(
+                "KV_Cache_Decode_Submit_Load",
+                uuid=uuid,
+                request_id=str(destination_req_id),
+                source_req_id=str(source_req_id),
+                num_tokens=num_tokens,
+                num_blocks=len(local_blocks),
+            ):
+                self._dispatch_stage3_load_submit(pending, synchronous)
 
         if tp_group is not None and synchronous:
             self._drain_stage3_submit_outcomes()
@@ -5242,20 +5266,30 @@ class TPURaidenConnectorWorker:
                     latency_ms = None
                     if start_time is not None:
                         latency_ms = (time.perf_counter() - start_time) * 1000
-                    logger.info(
-                        "%s",
-                        json.dumps(
-                            {
-                                "event": "raiden_stage3_receiver_complete",
-                                "req_id": source_req_id,
-                                "destination_req_id": req_id,
-                                "uuid": uuid,
-                                "num_tokens": num_tokens,
-                                "reshard_e2e_latency_ms": latency_ms,
-                            },
-                            sort_keys=True,
+                    with TraceAnnotation(
+                        "KV_Cache_Decode_Recv_Complete",
+                        uuid=uuid,
+                        request_id=str(req_id),
+                        source_req_id=str(source_req_id),
+                        num_tokens=num_tokens,
+                        reshard_e2e_latency_ms=(
+                            round(latency_ms, 3) if latency_ms is not None else 0.0
                         ),
-                    )
+                    ):
+                        logger.info(
+                            "%s",
+                            json.dumps(
+                                {
+                                    "event": "raiden_stage3_receiver_complete",
+                                    "req_id": source_req_id,
+                                    "destination_req_id": req_id,
+                                    "uuid": uuid,
+                                    "num_tokens": num_tokens,
+                                    "reshard_e2e_latency_ms": latency_ms,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
             for req_id in failed_recving:
                 source_req_id = self._stage3_source_request_id(req_id)
                 logger.error(
@@ -5293,11 +5327,17 @@ class TPURaidenConnectorWorker:
                 # release. Active ranks may race the idempotent aggregate
                 # cleanup RPC after genuine native completion.
                 if force_release:
-                    facade.complete_request_blocks(
-                        req_id=req_id,
+                    with TraceAnnotation(
+                        "KV_Cache_Prefill_Send_Complete",
                         uuid=registration.uuid,
-                        unit=self._raiden_work_unit,
-                    )
+                        request_id=str(req_id),
+                        num_tokens=registration.num_tokens,
+                    ):
+                        facade.complete_request_blocks(
+                            req_id=req_id,
+                            uuid=registration.uuid,
+                            unit=self._raiden_work_unit,
+                        )
                 tombstone_deadline = time.perf_counter() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
@@ -5432,11 +5472,11 @@ class TPURaidenConnectorWorker:
             try:
                 with socket.create_connection((host, port), timeout=0.5):
                     return
-            except OSError:
+            except OSError as err:
                 if time.perf_counter() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for address {address} to be ready"
-                    )
+                    ) from err
                 time.sleep(0.05)
 
     def _raiden_endpoint_identity(self) -> tuple[int, int]:

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 
-from vllm_torchtpu.model_loader_patches import (ExpertParamStager,
-                                                ExpertWriteTracker)
+from vllm_torchtpu.model_loader_patches import ExpertParamStager, ExpertWriteTracker
 
 
 def test_w13_completes_after_both_shards_of_every_expert():
@@ -17,16 +16,19 @@ def test_w13_completes_after_both_shards_of_every_expert():
 def test_w2_completes_after_every_expert():
     tracker = ExpertWriteTracker()
     w2 = torch.empty(3, 8, 6)
-    assert [tracker.record(w2, e, "w2")
-            for e in range(3)] == [False, False, True]
+    assert [tracker.record(w2, e, "w2") for e in range(3)] == [False, False, True]
 
 
 def test_w13_waits_for_w3_when_every_w1_arrives_first():
     tracker = ExpertWriteTracker()
     w13 = torch.empty(4, 6, 8)
     assert not any(tracker.record(w13, e, "w1") for e in range(4))
-    assert [tracker.record(w13, e, "w3")
-            for e in range(4)] == [False, False, False, True]
+    assert [tracker.record(w13, e, "w3") for e in range(4)] == [
+        False,
+        False,
+        False,
+        True,
+    ]
 
 
 def test_one_local_expert_needs_both_shards():
@@ -105,8 +107,7 @@ def test_flush_uploads_in_chunks(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 
     # two experts per upload
-    monkeypatch.setattr(model_loader_patches, "_UPLOAD_CHUNK_BYTES",
-                        2 * 8 * 4 * 4)
+    monkeypatch.setattr(model_loader_patches, "_UPLOAD_CHUNK_BYTES", 2 * 8 * 4 * 4)
     stager = ExpertParamStager()
     w2 = _param(5, 8, 4)
     host = stager.host_param(w2)
@@ -118,9 +119,9 @@ def test_flush_uploads_in_chunks(monkeypatch):
         assert torch.equal(w2.data[expert], torch.full((8, 4), expert + 1.0))
 
 
-def test_the_oldest_parameter_is_written_early_when_too_many_are_staged(
-        monkeypatch):
+def test_the_oldest_parameter_is_written_early_when_too_many_are_staged(monkeypatch):
     from vllm_torchtpu import model_loader_patches
+
     monkeypatch.setattr(model_loader_patches, "_MAX_STAGED", 2)
     stager = ExpertParamStager()
     first, second, third = _param(2, 4, 4), _param(2, 4, 4), _param(2, 4, 4)
@@ -160,19 +161,19 @@ def test_the_patched_loader_keeps_the_upstream_loader_attributes(monkeypatch):
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.model_loader import base_loader
 
-    from vllm_torchtpu.model_loader_patches import \
-        patch_moe_expert_write_staging
+    from vllm_torchtpu.model_loader_patches import patch_moe_expert_write_staging
 
     # The patch is process-wide; undo it after the test so later tests load
     # expert weights through the stock loader.
-    monkeypatch.setattr(RoutedExperts, "weight_loader",
-                        RoutedExperts.weight_loader)
-    monkeypatch.setattr(RoutedExperts,
-                        "_tpu_expert_staging_patch",
-                        False,
-                        raising=False)
-    monkeypatch.setattr(base_loader, "process_weights_after_loading",
-                        base_loader.process_weights_after_loading)
+    monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
+    monkeypatch.setattr(
+        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
+    )
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        base_loader.process_weights_after_loading,
+    )
     patch_moe_expert_write_staging()
     loader = RoutedExperts.weight_loader
     assert loader.supports_moe_loading is True

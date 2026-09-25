@@ -3178,11 +3178,13 @@ class TestTPURaidenConnectorWorker:
 
         facade.start_transfer.reset_mock()
         facade.start_transfer.side_effect = RuntimeError("fingerprint mismatch")
-        with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0):
-            with pytest.raises(RuntimeError, match="fingerprint mismatch"):
-                TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry(
-                    facade, req_id="not-retryable", uuid=988
-                )
+        with (
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+            pytest.raises(RuntimeError, match="fingerprint mismatch"),
+        ):
+            TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry(
+                facade, req_id="not-retryable", uuid=988
+            )
         facade.start_transfer.assert_called_once()
 
     @pytest.mark.parametrize("hybrid", [False, True])

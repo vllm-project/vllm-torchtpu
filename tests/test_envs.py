@@ -4,6 +4,7 @@ It is not aliased to USE_MOE_FUSED_EP_KERNEL, which would enable the kernel
 under the recipes that still set the old name and change results they have
 already recorded.
 """
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,10 +42,10 @@ def test_startup_rejects_the_removed_knob(monkeypatch, vllm_config, value):
 
 
 @patch("vllm_torchtpu.patch_registry.apply")
-@patch("vllm_torchtpu.platforms.tpu_platform."
-       "TpuPlatform._prepare_singlehost_tpu_env")
-def test_startup_accepts_the_knob_unset(mock_prepare_env, mock_apply_patches,
-                                        monkeypatch, vllm_config):
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_startup_accepts_the_knob_unset(
+    mock_prepare_env, mock_apply_patches, monkeypatch, vllm_config
+):
     monkeypatch.delenv(REMOVED, raising=False)
 
     TpuPlatform.check_and_update_config(vllm_config)

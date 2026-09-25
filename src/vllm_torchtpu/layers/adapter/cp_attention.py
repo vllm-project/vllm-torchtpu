@@ -135,9 +135,12 @@ def _pallas_rpa_kernel_dcp(
     cp_rank_val: int,
     attention_scope: _batched_rpa_configs.AttentionScope,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
-    output, lse). cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
+    output, lse). decode_query_size widens the DECODE bucket so speculative
+    verify windows (K + 1 tokens) run there instead of in MIXED.
+    cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
     inside ragged_paged_attention, needed by both scopes: CACHE_ONLY to
     compute this rank's local cache length, NEW_TOKENS_ONLY to land the
     write on the right physical page of this rank's DCP-interleaved
@@ -164,6 +167,7 @@ def _pallas_rpa_kernel_dcp(
         cp_group_size=cp_group_size,
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
+        decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
     )
@@ -228,6 +232,7 @@ def build_dcp_kernels(
     cp_group_size: int,
     cp_rank: int,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -250,6 +255,7 @@ def build_dcp_kernels(
         cp_group_size,
         cp_rank,
         kv_layout,
+        decode_query_size,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -269,6 +275,7 @@ def build_dcp_kernels(
             cp_rank_val=cp_rank,
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -284,6 +291,7 @@ def build_dcp_kernels(
             cp_rank_val=cp_rank,
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
@@ -312,6 +320,7 @@ def forward_with_dcp(
     dcp_world_size: int,
     dcp_rank: int,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.
 
@@ -339,6 +348,7 @@ def forward_with_dcp(
         cp_group_size=dcp_world_size,
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
     )
 
     own_num_heads = query.shape[1]

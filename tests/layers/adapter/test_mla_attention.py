@@ -17,9 +17,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import DCPGroupColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import attention as attention_adapter
+from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
 from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     PallasMLAttentionBackendImpl,
@@ -325,6 +328,8 @@ def test_mla_wrapper_rope_preserves_activation_dtype():
     wrapper.kv_a_layernorm = lambda value: value
     wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(), k_pe.float())
     wrapper.is_sparse = False
+    wrapper.dcp_q_replicate = False
+    wrapper.dcp_group_size = 1
     wrapper.g_proj = None
     wrapper.gate_is_fused = False
     wrapper.mla_attn = MagicMock(return_value=torch.ones((3, 4), dtype=torch.bfloat16))
@@ -704,6 +709,209 @@ def test_tpu_platform_keeps_the_selected_backend_without_mla(selected, expected)
     )
     assert cls_name == AttentionBackendEnum[expected].get_path()
     assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
+
+
+class _FakeQProj:
+    """A `DCPGroupColumnParallelLinear` stand-in carrying upstream's own
+    `_local_view`, so the slicing under test is the real one."""
+
+    qrep_active = True
+    _local_view = DCPGroupColumnParallelLinear._local_view
+
+    def __init__(self, group_size: int, rank_in_group: int, out=None):
+        self.group_size = group_size
+        self.rank_in_group = rank_in_group
+        self._out = out
+
+    def __call__(self, _hidden):
+        return self._out, None
+
+
+class _FakeHeadGatherGroup:
+    """Serves `all_gather(dim=1)` from a known per-rank stack."""
+
+    def __init__(self, per_rank, rank):
+        self.world_size = len(per_rank)
+        self.rank_in_group = rank
+        self._per_rank = per_rank
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 1
+        torch.testing.assert_close(tensor, self._per_rank[self.rank_in_group])
+        return torch.cat(self._per_rank, dim=1)
+
+
+def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
+    """qrep replaces the head all-gather with a local slice, so the two must
+    agree on where in the group's head axis a rank's own block sits. If they
+    disagree the heads are silently permuted and nothing raises."""
+    group_size, heads, dim = 4, 3, 5
+    torch.manual_seed(0)
+    per_rank = [torch.randn(2, heads, dim) for _ in range(group_size)]
+    grouped = torch.cat(per_rank, dim=1)
+
+    for rank in range(group_size):
+        group = _FakeHeadGatherGroup(per_rank, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        torch.testing.assert_close(cp_mla.all_gather_heads(per_rank[rank]), grouped)
+        torch.testing.assert_close(
+            _FakeQProj(group_size, rank)._local_view(grouped), per_rank[rank]
+        )
+
+
+def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
+    """With query replication the projection returns the group's heads. Viewing
+    them as `num_heads` would fold the extra heads into the token axis, which is
+    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+    group_size, local_heads, num_tokens = 4, 2, 3
+    wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
+        VllmMultiHeadLatentAttentionWrapper
+    )
+    torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
+    wrapper.q_lora_rank = None
+    wrapper.kv_lora_rank = 4
+    wrapper.qk_nope_head_dim = 3
+    wrapper.qk_rope_head_dim = 2
+    wrapper.qk_head_dim = 5
+    wrapper.num_heads = local_heads
+    wrapper.v_head_dim = 2
+    wrapper.dcp_q_replicate = True
+    wrapper.dcp_group_size = group_size
+    wrapper.is_sparse = True
+    wrapper.indexer = None
+    wrapper.skip_topk = True
+    wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
+    group_width = local_heads * group_size * wrapper.qk_head_dim
+    wrapper.kv_a_proj_with_mqa = lambda hidden: (
+        torch.ones((hidden.shape[0], 6), dtype=hidden.dtype),
+        None,
+    )
+    q_values = torch.arange(num_tokens * group_width, dtype=torch.bfloat16).view(
+        num_tokens, group_width
+    )
+    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=2, out=q_values)
+    wrapper.kv_a_layernorm = lambda value: value
+    wrapper.rotary_emb = None
+    wrapper.g_proj = None
+    wrapper.gate_is_fused = False
+    wrapper.mla_attn = MagicMock(
+        return_value=torch.ones((num_tokens, 4), dtype=torch.bfloat16)
+    )
+    wrapper.o_proj = lambda value: (value, None)
+
+    VllmMultiHeadLatentAttentionWrapper.forward(
+        wrapper,
+        positions=torch.arange(num_tokens),
+        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+    )
+
+    (q_nope, q_pe) = wrapper.mla_attn.call_args.args[0]
+    rep_nope, rep_pe = wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"]
+    # The token axis survives; only the head axis carries the group.
+    assert q_nope.shape == (num_tokens, local_heads, wrapper.qk_nope_head_dim)
+    assert rep_nope.shape == (
+        num_tokens,
+        local_heads * group_size,
+        wrapper.qk_nope_head_dim,
+    )
+    assert rep_pe.shape == (
+        num_tokens,
+        local_heads * group_size,
+        wrapper.qk_rope_head_dim,
+    )
+    # And the local view is this rank's block of the replicated tensor.
+    start = 2 * local_heads
+    torch.testing.assert_close(q_nope, rep_nope[:, start : start + local_heads])
+    torch.testing.assert_close(q_pe, rep_pe[:, start : start + local_heads])
+
+
+def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
+    """On the sparse DCP path a replicated q is consumed directly, against the
+    group-wide `W_UK_T`, and the per-step head all-gather is not run."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(1)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+
+    def _explode(_tensor):
+        raise AssertionError("qrep must not all-gather the query heads")
+
+    monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse: out[:, :local_heads, :],
+    )
+
+    q_nope_rep = torch.randn(num_tokens, group_heads, 128)
+    q_pe_rep = torch.randn(num_tokens, group_heads, 64)
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(q_nope_rep, q_pe_rep),
+    )
+
+    layer.sparse_mla_dcp_op.assert_called_once()
+    _cache, ql_nope, q_pe, *_ = layer.sparse_mla_dcp_op.call_args.args
+    expected_ql = torch.bmm(
+        q_nope_rep.transpose(0, 1), layer.W_UK_T_dcp_qrep
+    ).transpose(0, 1)
+    torch.testing.assert_close(ql_nope, expected_ql)
+    torch.testing.assert_close(q_pe, q_pe_rep)
+
+
+def test_mla_forward_without_qrep_still_gathers(monkeypatch):
+    """The gather is only skipped when a replicated q actually arrives; the
+    unreplicated DCP path is untouched."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+
+    partial = torch.randn(num_tokens, local_heads * dcp_size, 512)
+    lse = torch.zeros(num_tokens, local_heads * dcp_size)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+
+    gathered = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse: out[:, :local_heads, :],
+    )
+
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+
+    assert len(gathered) == 2
+    assert all(t.shape[1] == local_heads for t in gathered)
 
 
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():

@@ -205,19 +205,21 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
 
-    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
-        with pytest.raises(NotImplementedError, match=expected_message):
-            _impl(**impl_kwargs).forward(
-                _layer(), query, key, value, kv_cache, metadata
-            )
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match=expected_message),
+    ):
+        _impl(**impl_kwargs).forward(_layer(), query, key, value, kv_cache, metadata)
 
 
 def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
     vllm_config_context,
 ):
-    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
-        with pytest.raises(NotImplementedError, match="logits soft cap"):
-            _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match="logits soft cap"),
+    ):
+        _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
 
 
 def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch, vllm_config_context):

@@ -420,6 +420,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             weight_format="fp4",
             rhs_qb=block,
             weights=weights,
+            supplies_hash_ids=True,
         )
 
     def _resolve_tpu_activation(self, layer) -> str:
@@ -667,6 +668,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 activation_str,
                 weight_format="fp4",
                 rhs_qb=REQUANTIZED_BLOCK_SIZE,
+                supplies_hash_ids=True,
             )
             # Admission already accepted this exact layout on meta tensors, so
             # a mismatch here is a preparation bug rather than a fallback case.
@@ -702,6 +704,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
+            hash_topk_ids_operand,
             score_bias_operand,
         )
 
@@ -719,5 +722,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 layer._tpu_fused_w2_scale,
                 router_logits,
                 score_bias_operand(layer),
+                hash_topk_ids_operand(layer, input_ids),
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
