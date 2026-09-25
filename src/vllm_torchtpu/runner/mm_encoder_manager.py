@@ -87,8 +87,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
         )
 
         logger.info(
-            f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
-            f"max_batch_size={self.max_batch_size}"
+            "[mm_encoder_manager] Initialized XLA path_budgets=%s max_batch_size=%s",
+            self.path_token_budgets,
+            self.max_batch_size,
         )
 
     def _pad_to_template(

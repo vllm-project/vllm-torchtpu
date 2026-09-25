@@ -259,7 +259,7 @@ def time_function(func):
         end_time = time.perf_counter()
         execution_time = end_time - start_time
         logger.debug(
-            f"Function '{func.__name__}' executed in {execution_time:.4f} seconds."
+            "Function '%s' executed in %.4f seconds.", func.__name__, execution_time
         )
         return result
 

@@ -719,10 +719,7 @@ class KVCacheManager:
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
-        if max_count < min_count * 1.5:
-            group_size = max_count
-        else:
-            group_size = min_count
+        group_size = max_count if max_count < min_count * 1.5 else min_count
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
         num_mamba_groups = (num_mamba + group_size - 1) // group_size

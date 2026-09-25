@@ -289,9 +289,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             dist_utils.configure_raiden_telemetry()
             telemetry = dist_utils.get_raiden_telemetry_module()
             descriptors = []
-            if telemetry is not None:
-                if hasattr(telemetry, "get_metric_metadata"):
-                    descriptors = telemetry.get_metric_metadata()
+            if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
+                descriptors = telemetry.get_metric_metadata()
         except Exception as e:
             logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
 

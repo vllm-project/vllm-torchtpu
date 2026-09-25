@@ -385,7 +385,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         slicebuilder_addresses = ",".join(sb_addresses)
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = slicebuilder_addresses
         logger.info(
-            f"RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {slicebuilder_addresses}"
+            "RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s",
+            slicebuilder_addresses,
         )
 
         node_rank_by_ip = {ip: rank for rank, ip in enumerate(host_order)}
@@ -544,7 +545,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
             logger.debug(
-                f"RayDistributedExecutorV2 | Worker {i} (slice rank {slice_rank}) environment variables: {combined_env}"
+                "RayDistributedExecutorV2 | Worker %s (slice rank %s) environment variables: %s",
+                i,
+                slice_rank,
+                combined_env,
             )
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
@@ -602,7 +606,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # Check if placement group is already provided (e.g., by ray.serve.llm)
         if self.parallel_config.placement_group is not None:
             logger.info(
-                f"Using existing placement group: {self.parallel_config.placement_group}"
+                "Using existing placement group: %s",
+                self.parallel_config.placement_group,
             )
             return
 
@@ -622,15 +627,17 @@ class RayDistributedExecutorV2(RayExecutorV2):
         placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
-        logger.info(f"RayDistributedExecutorV2 | ray_nodes={ray_nodes}")
+        logger.info("RayDistributedExecutorV2 | ray_nodes=%s", ray_nodes)
 
         # Filter nodes that have the required TPU resource
         nodes_with_device = [
             n for n in ray_nodes if device_str in n.get("Resources", {})
         ]
         logger.info(
-            f"RayDistributedExecutorV2 | nodes_with_device={len(nodes_with_device)} "
-            f"(filtered from {len(ray_nodes)} total nodes)"
+            "RayDistributedExecutorV2 | nodes_with_device=%s "
+            "(filtered from %s total nodes)",
+            len(nodes_with_device),
+            len(ray_nodes),
         )
 
         dp_size, dp_rank, _ = self._get_dp_geometry()
@@ -705,7 +712,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             placement_group_specs[0][f"node:{current_ip}"] = 0.001
 
         logger.info(
-            f"RayDistributedExecutorV2 | placement_group_specs={placement_group_specs}"
+            "RayDistributedExecutorV2 | placement_group_specs=%s", placement_group_specs
         )
 
         # By default, Ray packs resources as much as possible. Each engine

@@ -1336,7 +1336,8 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         return tuned_params_mapping[tuning_key]
     else:
         logger.warning(
-            f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
+            "No tuned parameters found for the given tuning key: %s, using default parameters",
+            tuning_key,
         )
         if tuning_key.case == "mixed":
             return TunableParams(

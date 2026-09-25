@@ -148,7 +148,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # TPU topology (e.g., 4 bundles × 4 TPUs for v6e 4x4) and have vLLM reuse it.
         if self.parallel_config.placement_group is not None:
             logger.info(
-                f"Using existing placement group: {self.parallel_config.placement_group}"
+                "Using existing placement group: %s",
+                self.parallel_config.placement_group,
             )
             return
 
@@ -168,7 +169,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
-        logger.info(f"RayDistributedExecutor | ray_nodes={ray_nodes}")
+        logger.info("RayDistributedExecutor | ray_nodes=%s", ray_nodes)
 
         # Filter nodes that have the required TPU
         # This is necessary when the head node doesn't have TPU resources
@@ -177,8 +178,10 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             n for n in ray_nodes if device_str in n.get("Resources", {})
         ]
         logger.info(
-            f"RayDistributedExecutor | nodes_with_device={len(nodes_with_device)} "
-            f"(filtered from {len(ray_nodes)} total nodes)"
+            "RayDistributedExecutor | nodes_with_device=%s "
+            "(filtered from %s total nodes)",
+            len(nodes_with_device),
+            len(ray_nodes),
         )
 
         if pp_size == 1:
@@ -220,7 +223,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # node.
         placement_group_specs[0][f"node:{current_ip}"] = 0.001
         logger.info(
-            f"RayDistributedExecutor | placement_group_specs={placement_group_specs}"
+            "RayDistributedExecutor | placement_group_specs=%s", placement_group_specs
         )
 
         # By default, Ray packs resources as much as possible.
@@ -307,7 +310,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         for each, ip in zip(worker_metadata, worker_ips):
             each.ip = ip
 
-        logger.debug(f"Initialized worker_metadata: {worker_metadata}")
+        logger.debug("Initialized worker_metadata: %s", worker_metadata)
 
         ip_counts: dict[str, int] = {}
         for ip in worker_ips:
@@ -335,7 +338,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         start_rank = 0
         for i, item in enumerate(sorted_worker_metadata):
             item.adjusted_rank = i + start_rank
-        logger.info(f"Initialized sorted worker_metadata: {sorted_worker_metadata}")
+        logger.info("Initialized sorted worker_metadata: %s", sorted_worker_metadata)
 
         self.workers = [item.worker for item in sorted_worker_metadata]
         rerank_mapping = {
@@ -376,10 +379,12 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         if n_nodes != n_ips:
             logger.warning(
-                f"Got {n_nodes} nodes but with {n_ips} IP addresses. "
+                "Got %s nodes but with %s IP addresses. "
                 "This is not a typical production setup whose "
                 "number of nodes and IPs is euqal. This setup may "
-                "lead to unexpected behaviors."
+                "lead to unexpected behaviors.",
+                n_nodes,
+                n_ips,
             )
 
         # Construct TORCH_TPU_SLICEBUILDER_ADDRESSES for multi-host
@@ -395,7 +400,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
         logger.info(
-            f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {os.environ['TORCH_TPU_SLICEBUILDER_ADDRESSES']}"
+            "Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s",
+            os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
         )
 
         # Set environment variables for the driver and workers.
@@ -446,7 +452,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 if name in os.environ:
                     args[name] = os.environ[name]
             logger.debug(
-                f"RayDistributedExecutor | Worker {i} environment variables: {args}"
+                "RayDistributedExecutor | Worker %s environment variables: %s", i, args
             )
 
         self._env_vars_for_all_workers = all_args_to_update_environment_variables

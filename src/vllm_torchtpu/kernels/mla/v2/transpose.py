@@ -210,15 +210,23 @@ def xpose_pipeline(
         )
     if n_tile_new != n_tile:
         logger.warning(
-            f"Adjusting n_tile={n_tile} to new valid tiling={n_tile_new} "
-            f"which is <= n_tile={n_tile} and sublane-aligned (i.e a multiple of "
-            f"{sublane_multiple})."
+            "Adjusting n_tile=%s to new valid tiling=%s "
+            "which is <= n_tile=%s and sublane-aligned (i.e a multiple of "
+            "%s).",
+            n_tile,
+            n_tile_new,
+            n_tile,
+            sublane_multiple,
         )
     if m_tile_new != m_tile:
         logger.warning(
-            f"Adjusting m_tile={m_tile} to new valid tiling={m_tile_new} "
-            f"which is <= m_tile={m_tile} and sublane-aligned (i.e a multiple of "
-            f"{sublane_multiple})."
+            "Adjusting m_tile=%s to new valid tiling=%s "
+            "which is <= m_tile=%s and sublane-aligned (i.e a multiple of "
+            "%s).",
+            m_tile,
+            m_tile_new,
+            m_tile,
+            sublane_multiple,
         )
     n_tile, m_tile = n_tile_new, m_tile_new
     grid = (input.shape[parallel_axis] // n_tile, input.shape[pipeline_axis] // m_tile)

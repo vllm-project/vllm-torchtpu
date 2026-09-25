@@ -172,9 +172,12 @@ class VllmDeepseekV4MLAAttention(
             self.custom_prefix = prefix
             object.__setattr__(self, "mla_attn", self)
             for module in self.modules():
-                if module is not self and hasattr(module, "get_kv_cache_spec"):
-                    if module.__class__.__name__ == "DeepseekV4Attention":
-                        module.get_kv_cache_spec = self.get_kv_cache_spec
+                if (
+                    module is not self
+                    and hasattr(module, "get_kv_cache_spec")
+                    and module.__class__.__name__ == "DeepseekV4Attention"
+                ):
+                    module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
@@ -242,7 +245,7 @@ class VllmDeepseekV4MLAAttention(
         block_size = vllm_config.cache_config.block_size
         comp_ratio = max(1, self.compress_ratio)
         hf_config = vllm_config.model_config.hf_config
-        if comp_ratio == 4:
+        if comp_ratio == 4:  # noqa: SIM108 (one comment per branch)
             # CSA (`sparse_mla`) reads the NoPE record from this array and the
             # RoPE channels from the companion `{prefix}_rope` array; the
             # packed width here budgets for both.

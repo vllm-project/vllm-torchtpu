@@ -1189,7 +1189,7 @@ def prepare_inputs(
         q_packing,
         head_dim,
     )
-    if not fuse_non_tiling_axis_swap:
+    if not fuse_non_tiling_axis_swap:  # noqa: SIM108 (one comment per path)
         # Legacy path: Separate query axis swap emitting xlu.transpose (Transpose::Execute).
         q = q_reshaped.swapaxes(0, 1)
     else:
@@ -1371,9 +1371,8 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
 ):
     """Validate inputs to the RPA kernel statically."""
-    if use_causal_mask:
-        if skip_kv_mask:
-            raise ValueError("Can not skip kv mask when using causal mask.")
+    if use_causal_mask and skip_kv_mask:
+        raise ValueError("Can not skip kv mask when using causal mask.")
 
     q, k, v = queries, keys, values
     if not (len(q.shape) == len(k.shape) == len(v.shape) == 3):

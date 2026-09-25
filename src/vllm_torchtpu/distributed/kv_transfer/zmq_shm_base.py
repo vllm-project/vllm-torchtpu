@@ -26,6 +26,7 @@ pool plus ZMQ ROUTER/DEALER coordination.
     releases the slot once all ranks have copied.
 """
 
+import contextlib
 import hashlib
 import hmac
 import os
@@ -909,10 +910,8 @@ class ZmqShmKvConnectorBase:
         self._stop_event.set()
         # Wake the stage waiter so it can observe _stop_event and exit.
         if hasattr(self, "_stage_pending_q"):
-            try:
+            with contextlib.suppress(queue.Full):
                 self._stage_pending_q.put_nowait(None)
-            except Exception:
-                pass
         if hasattr(self, "_coord_executor"):
             self._coord_executor.shutdown(wait=False)
         if hasattr(self, "_coord_channel_executor"):

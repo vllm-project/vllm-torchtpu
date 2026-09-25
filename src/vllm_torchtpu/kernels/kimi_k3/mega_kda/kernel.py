@@ -1193,9 +1193,8 @@ def _fwd_mega_kernel_native_segids(
         scratch_ref[...] = h_B_new
         if STORE_FINAL_STATE and MANUAL_HT_DMA and OVERLAP_HT_DMA:
             ht_A_copy.wait()
-        if STORE_FINAL_STATE:
-            if not MANUAL_HT_DMA:
-                ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
+        if STORE_FINAL_STATE and not MANUAL_HT_DMA:
+            ht_ref[last_seg - 1, ...] = h_B_new.astype(ht_ref.dtype)[:, None, :, :]
 
         if STORE_RESIDUALS:
             if RESIDUAL_CHUNK_LAYOUT:

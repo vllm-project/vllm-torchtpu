@@ -916,8 +916,8 @@ class TpuPlatform(Platform):
                 logger.info("Force using RayDistributedExecutor for TPU on multihost.")
         else:
             logger.warning(
-                f"Unknown TPU multihost backend: {multihost_backend}. "
-                "Using uniproc_executor."
+                "Unknown TPU multihost backend: %s. Using uniproc_executor.",
+                multihost_backend,
             )
             parallel_config.distributed_executor_backend = "uni"
 

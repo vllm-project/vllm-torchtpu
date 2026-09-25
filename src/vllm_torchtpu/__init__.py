@@ -1042,11 +1042,12 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     # models imported after the first call also have their bindings updated.
     patched_fn = vllm_utils._merge_multimodal_embeddings
     for mod_name, mod in list(sys.modules.items()):
-        if mod_name.startswith("vllm.model_executor.models") and hasattr(
-            mod, "_merge_multimodal_embeddings"
+        if (
+            mod_name.startswith("vllm.model_executor.models")
+            and hasattr(mod, "_merge_multimodal_embeddings")
+            and mod._merge_multimodal_embeddings is not patched_fn
         ):
-            if mod._merge_multimodal_embeddings is not patched_fn:
-                mod._merge_multimodal_embeddings = patched_fn
+            mod._merge_multimodal_embeddings = patched_fn
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
@@ -1362,12 +1363,13 @@ if "proxy" in envs.JAX_PLATFORMS:
         vllm.platforms._current_platform = resolved_platform_instance
         vllm.platforms._init_trace = "".join(traceback.format_stack())
         logger.info(
-            f"vLLM platform resolved to: {resolved_platform_instance.__class__.__name__}"
+            "vLLM platform resolved to: %s",
+            resolved_platform_instance.__class__.__name__,
         )
 
     except Exception as e:
         logger.error(
-            f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
+            "Error occurred while importing pathwaysutils or logging TPU info: %s", e
         )
 
 

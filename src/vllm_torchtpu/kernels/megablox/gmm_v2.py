@@ -1206,9 +1206,8 @@ def make_gmm_configs(
             is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
             if is_rhs_float or is_rhs_4bits:
                 lhs_q_dtype = jnp.float8_e4m3fn.dtype
-        if tpu_info.int8_ops_per_second > 0:
-            if not is_rhs_float:
-                lhs_q_dtype = jnp.int8.dtype
+        if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
+            lhs_q_dtype = jnp.int8.dtype
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,

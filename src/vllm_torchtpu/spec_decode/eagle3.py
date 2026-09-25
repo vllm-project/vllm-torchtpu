@@ -657,7 +657,7 @@ class Eagle3Proposer:
         self._draft_kv_shared = True
 
     def _load_draft_model(self) -> None:
-        logger.info(f"Loading {self.speculative_config.method} draft model...")
+        logger.info("Loading %s draft model...", self.speculative_config.method)
         model_loader = get_model_loader(self.vllm_config.load_config)
         # Tag the draft compile with "eagle_head" so its torch.compile cache
         # lives in a separate prefix from the target's "backbone" prefix.

@@ -142,10 +142,7 @@ def ref_ragged_paged_attention_hd64(
 
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-        if use_causal_mask:
-            mask = q_span < kv_span
-        else:
-            mask = False
+        mask = q_span < kv_span if use_causal_mask else False
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
@@ -411,10 +408,7 @@ def _ragged_paged_attention_kernel(
             + lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
         )
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        if use_causal_mask:
-            mask = k_span <= q_span
-        else:
-            mask = True
+        mask = k_span <= q_span if use_causal_mask else True
 
         if sliding_window is not None and strict_sliding_window:
             mask = jnp.logical_and(mask, q_span - sliding_window < k_span)
@@ -1305,12 +1299,10 @@ def static_validate_inputs(
         raise ValueError(f"{soft_cap=} must not be 0.0.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
-    if num_kv_pages_per_block is not None:
-        if num_kv_pages_per_block <= 0:
-            raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
-    if num_queries_per_block is not None:
-        if num_queries_per_block <= 0:
-            raise ValueError(f"{num_queries_per_block=} must be positive.")
+    if num_kv_pages_per_block is not None and num_kv_pages_per_block <= 0:
+        raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
+    if num_queries_per_block is not None and num_queries_per_block <= 0:
+        raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 

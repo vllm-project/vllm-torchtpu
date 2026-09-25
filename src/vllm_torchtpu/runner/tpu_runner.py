@@ -677,7 +677,7 @@ class TPUModelRunner(GPUModelRunner):
             and self.input_batch is not None
             and hasattr(self.input_batch, "block_table")
         ):
-            try:
+            try:  # noqa: SIM105 (keep the default if the block table is not ready)
                 self.max_num_blocks_per_req = int(
                     self.input_batch.block_table[0].get_cpu_tensor().shape[1]
                 )
@@ -1259,13 +1259,16 @@ class TPUModelRunner(GPUModelRunner):
         fresh = self._fresh_xla_graphs(entries)
         new_compiled_graphs = total_graphs - self.num_xla_graphs
         if new_compiled_graphs == 0 and not fresh:
-            logger.info(f"No new compiled graphs for case: {case_str}")
+            logger.info("No new compiled graphs for case: %s", case_str)
             return
 
-        logger.info(f"Total Requests: {stats.num_cache_reqs}")
-        logger.info(f"Total Hits: {stats.num_cache_hits}")
+        logger.info("Total Requests: %s", stats.num_cache_reqs)
+        logger.info("Total Hits: %s", stats.num_cache_hits)
         logger.info(
-            f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
+            "Total number of cached graphs: %s, new: %s, case: %s",
+            total_graphs,
+            new_compiled_graphs,
+            case_str,
         )
 
         # A count says four graphs appeared; it does not say which op keeps
@@ -5305,7 +5308,7 @@ class TPUModelRunner(GPUModelRunner):
             _suspend_kv_transfer_group(),
             self._precompile_timed("PCP MTP real prefill warmup"),
         ):
-            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):
+            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
                 if not self._warmup_one_pcp_mtp_prefill(P):
                     raise RuntimeError(
                         "PCP MTP prefill warmup failed after retry; refusing "
@@ -5965,23 +5968,26 @@ class TPUModelRunner(GPUModelRunner):
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
         super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        if hasattr(self, "input_batch") and self.input_batch is not None:
-            if hasattr(self.input_batch, "block_table"):
-                try:
-                    self.max_num_blocks_per_req = int(
-                        self.input_batch.block_table[0].get_cpu_tensor().shape[1]
+        if (
+            hasattr(self, "input_batch")
+            and self.input_batch is not None
+            and hasattr(self.input_batch, "block_table")
+        ):
+            try:
+                self.max_num_blocks_per_req = int(
+                    self.input_batch.block_table[0].get_cpu_tensor().shape[1]
+                )
+                if (
+                    self.block_table_cpu.shape[0] != self.max_num_reqs
+                    or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
+                ):
+                    self.block_table_cpu = torch.zeros(
+                        (self.max_num_reqs, self.max_num_blocks_per_req),
+                        dtype=torch.int32,
+                        device="cpu",
                     )
-                    if (
-                        self.block_table_cpu.shape[0] != self.max_num_reqs
-                        or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
-                    ):
-                        self.block_table_cpu = torch.zeros(
-                            (self.max_num_reqs, self.max_num_blocks_per_req),
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                except (IndexError, TypeError, AttributeError, KeyError):
-                    pass
+            except (IndexError, TypeError, AttributeError, KeyError):
+                pass
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

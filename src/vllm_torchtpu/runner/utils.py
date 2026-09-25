@@ -274,8 +274,8 @@ class PhaseBasedProfiler:
             self.profiling_n_steps_left = self.num_steps_to_profile_for
             self.current_phase = phase.name.lower()
 
-            logger.info(f"Starting profiling for {self.current_phase} phase")
-            logger.info(f"Batch composition stats: {batch_composition_stats}")
+            logger.info("Starting profiling for %s phase", self.current_phase)
+            logger.info("Batch composition stats: %s", batch_composition_stats)
             phase_dir = os.path.join(self.profile_dir, self.current_phase)
             os.makedirs(phase_dir, exist_ok=True)
 
@@ -335,7 +335,7 @@ class PhaseBasedProfiler:
             self.profile_context = None
 
         self._merge_profile_directories()
-        logger.info(f"Profiling for {self.current_phase} phase finished")
+        logger.info("Profiling for %s phase finished", self.current_phase)
         self.current_phase = ""
         self.profiling_n_steps_left = 0
 

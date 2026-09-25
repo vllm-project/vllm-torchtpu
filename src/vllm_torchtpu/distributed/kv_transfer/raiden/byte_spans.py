@@ -148,10 +148,7 @@ def lower_fa_spans(
 
 
 def _region_value(region: object, name: str) -> int | str:
-    if isinstance(region, dict):
-        value = region[name]
-    else:
-        value = getattr(region, name)
+    value = region[name] if isinstance(region, dict) else getattr(region, name)
     return str(value) if name == "name" else int(value)
 
 

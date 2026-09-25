@@ -135,7 +135,7 @@ def get_cpu_weight_loader_hook(
 def release_memory_to_os() -> None:
     """Forces Python GC and instructs the C allocator to return free memory to the OS."""
     gc.collect()
-    try:
+    try:  # noqa: SIM105 (malloc_trim exists only on glibc)
         ctypes.CDLL(None).malloc_trim(0)
     except Exception:
         pass

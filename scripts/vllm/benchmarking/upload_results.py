@@ -167,10 +167,7 @@ def main():
         if queue:
             # map tpu_v7x_8_queue -> tpu7x-8
             m = re.match(r"tpu_v(\d+x)_(\d+)_queue", queue)
-            if m:
-                device = f"tpu{m.group(1)}-{m.group(2)}"
-            else:
-                device = queue
+            device = f"tpu{m.group(1)}-{m.group(2)}" if m else queue
         else:
             device = "unknown-device"
 

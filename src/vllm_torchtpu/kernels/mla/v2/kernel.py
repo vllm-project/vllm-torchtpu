@@ -1610,10 +1610,7 @@ def _mla_ragged_paged_attention_kernel(
                 )
 
     # TODO(b/506245022): Split out the KV handling functions into separate files.
-    if not transpose_kv_cache:
-        _fetch_bkv_fn = _fetch_bkv
-    else:
-        _fetch_bkv_fn = _fetch_transposed_bkv
+    _fetch_bkv_fn = _fetch_bkv if not transpose_kv_cache else _fetch_transposed_bkv
 
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv_fn(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
@@ -2150,9 +2147,13 @@ def prepare_q_nope_inputs(
         )[0]
     except ValueError as e:
         logger.warning(
-            f"xpose_pipeline failed for shape={q.shape} dtype={q.dtype} "
-            f"(sublane_multiple={sublane_multiple}): {e}. "
-            f"Falling back to jnp.transpose — this may be slower."
+            "xpose_pipeline failed for shape=%s dtype=%s "
+            "(sublane_multiple=%s): %s. "
+            "Falling back to jnp.transpose — this may be slower.",
+            q.shape,
+            q.dtype,
+            sublane_multiple,
+            e,
         )
         q = jnp.transpose(q, (1, 0, 2))
     return q  # (max_num_tokens, num_q_heads, head_dim)
@@ -2211,9 +2212,13 @@ def prepare_outputs(
     except ValueError as e:
         sublane_multiple = get_dtype_packing(out.dtype) * 8
         logger.warning(
-            f"xpose_pipeline failed for shape={out.shape} dtype={out.dtype} "
-            f"(sublane_multiple={sublane_multiple}): {e}. "
-            f"Falling back to jnp.transpose — this may be slower."
+            "xpose_pipeline failed for shape=%s dtype=%s "
+            "(sublane_multiple=%s): %s. "
+            "Falling back to jnp.transpose — this may be slower.",
+            out.shape,
+            out.dtype,
+            sublane_multiple,
+            e,
         )
         out = jnp.transpose(out, (1, 0, 2))
     return out[:actual_num_q_heads, :actual_max_num_tokens, :actual_head_dim]

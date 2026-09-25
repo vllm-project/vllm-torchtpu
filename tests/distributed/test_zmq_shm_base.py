@@ -17,6 +17,7 @@ Event loops governed by timeouts substitute `_stop_event` with `_ScriptedEvent`
 to execute deterministic, single-sweep passes without sleeping on the clock.
 """
 
+import contextlib
 import hashlib
 import itertools
 import os
@@ -66,10 +67,7 @@ class _ScriptedEvent(threading.Event):
         self._results = list(wait_results)
 
     def wait(self, timeout=None):  # type: ignore[override]
-        if self._results:
-            result = self._results.pop(0)
-        else:
-            result = True
+        result = self._results.pop(0) if self._results else True
         if result:
             self.set()
         return result
@@ -348,17 +346,13 @@ def _shutdown_connectors(monkeypatch):
     while _LIVE:
         conn = _LIVE.pop()
         conn._stop_event.set()
-        try:
+        with contextlib.suppress(Exception):
             conn._coord_teardown()
-        except Exception:
-            pass
     while _POOLS:
         # Unlink shared memory segments even if tests fail mid-execution to
         # prevent resource leaks in /dev/shm.
-        try:
+        with contextlib.suppress(Exception):
             _POOLS.pop().close()
-        except Exception:
-            pass
 
 
 def _make_vllm_config(

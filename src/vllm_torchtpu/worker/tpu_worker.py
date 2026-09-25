@@ -447,12 +447,17 @@ class TPUWorker(WorkerBase):
             profiler_world_size=self.profile_world_size,
         )
         logger.info(
-            f"Init worker | "
-            f"rank={self.rank} | "
-            f"is_first_rank={is_first_rank} | "
-            f"is_last_rank={is_last_rank} | "
-            f"node_id={dist_utils.get_node_id()} | "
-            f"is_driver_worker={self.is_driver_worker} | "
+            "Init worker | "
+            "rank=%s | "
+            "is_first_rank=%s | "
+            "is_last_rank=%s | "
+            "node_id=%s | "
+            "is_driver_worker=%s | ",
+            self.rank,
+            is_first_rank,
+            is_last_rank,
+            dist_utils.get_node_id(),
+            self.is_driver_worker,
         )
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
@@ -498,12 +503,17 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
-            f"Memory statistics | "
-            f"{total_hbm_limit_gb=}GiB | "
-            f"{total_hbm_limit_cap_gb=}GiB | "
-            f"{total_hbm_used_gb=}GiB | "
-            f"{kv_connector_hbm_reserve_gb=}GiB | "
-            f"{total_hbm_avail_gb=}GiB"
+            "Memory statistics | "
+            "total_hbm_limit_gb=%rGiB | "
+            "total_hbm_limit_cap_gb=%rGiB | "
+            "total_hbm_used_gb=%rGiB | "
+            "kv_connector_hbm_reserve_gb=%rGiB | "
+            "total_hbm_avail_gb=%rGiB",
+            total_hbm_limit_gb,
+            total_hbm_limit_cap_gb,
+            total_hbm_used_gb,
+            kv_connector_hbm_reserve_gb,
+            total_hbm_avail_gb,
         )
 
         if available <= 0:

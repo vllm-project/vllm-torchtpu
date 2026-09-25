@@ -2016,20 +2016,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     == request.request_id
                 ):
                     del self._stage3_active_source_req_ids[source_req_id]
-            if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
-                if (
-                    isinstance(params, dict)
-                    and params.get("uuid")
-                    and not params.get(_KV_PARAMS_REJECTED)
-                ):
-                    in_flight_load = self.reqs_to_load.get(request.request_id)
-                    if in_flight_load is not None or not params.get(
-                        "_remote_kv_processed"
-                    ):
-                        self._enqueue_stage3_release(
-                            request, report_completion=in_flight_load is not None
-                        )
-                        params["_remote_kv_processed"] = True
+            if request.status != RequestStatus.FINISHED_LENGTH_CAPPED and (
+                isinstance(params, dict)
+                and params.get("uuid")
+                and not params.get(_KV_PARAMS_REJECTED)
+            ):
+                in_flight_load = self.reqs_to_load.get(request.request_id)
+                if in_flight_load is not None or not params.get("_remote_kv_processed"):
+                    self._enqueue_stage3_release(
+                        request, report_completion=in_flight_load is not None
+                    )
+                    params["_remote_kv_processed"] = True
             return False, None
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
@@ -2069,17 +2066,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 return False, {}
 
         max_transfer_tokens = tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS
-        if max_transfer_tokens is not None and max_transfer_tokens > 0:
-            if num_tokens > max_transfer_tokens:
-                logger.warning(
-                    "Stage-3 producer token count (%d) exceeds "
-                    "TPU_RAIDEN_MAX_TRANSFER_TOKENS (%d) for req_id=%s; "
-                    "skipping transfer and freeing blocks immediately.",
-                    num_tokens,
-                    max_transfer_tokens,
-                    request.request_id,
-                )
-                return False, {}
+        if (
+            max_transfer_tokens is not None
+            and max_transfer_tokens > 0
+            and num_tokens > max_transfer_tokens
+        ):
+            logger.warning(
+                "Stage-3 producer token count (%d) exceeds "
+                "TPU_RAIDEN_MAX_TRANSFER_TOKENS (%d) for req_id=%s; "
+                "skipping transfer and freeing blocks immediately.",
+                num_tokens,
+                max_transfer_tokens,
+                request.request_id,
+            )
+            return False, {}
 
         # Multi-group models page each group at its own size, so the primary
         # block table is trimmed against group 0's page rather than the

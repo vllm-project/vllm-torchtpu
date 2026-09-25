@@ -154,10 +154,6 @@ ignore = [
     # Firing today and not fixed yet. `ruff check --fix` does not clear any of
     # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
     # change. Delete the entry once its count reaches zero.
-    "G004",    #  39  f-string passed to a logging call
-    "SIM108",  #  15  if/else that could be a conditional expression
-    "SIM102",  #  13  nested if that could be one
-    "SIM105",  #  12  try/except/pass that could be contextlib.suppress
     "SIM115",  #   1  open() outside a context manager
 ]
 

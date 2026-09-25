@@ -21,6 +21,7 @@ both the phased profiler (``runner/utils.py``) and the standard
 ``torch_profiler_dir`` flow (``worker/tpu_worker.py``).
 """
 
+import contextlib
 import datetime
 import os
 import shutil
@@ -126,10 +127,8 @@ def clear_canonical_ts_marker(dst_root: str, session_key: str | None = None) -> 
     """Drop the marker once the run it describes is merged (rank 0 only)."""
     if session_key is None:
         session_key = profile_session_id()
-    try:
+    with contextlib.suppress(OSError):
         os.remove(canonical_ts_marker_path(dst_root, session_key))
-    except OSError:
-        pass
 
 
 def merge_rank_capture(
@@ -174,10 +173,8 @@ def merge_rank_capture(
                     os.path.join(src_ts_dir, fname),
                     os.path.join(dst_ts_dir, new_fname),
                 )
-            try:
+            with contextlib.suppress(OSError):
                 os.rmdir(src_ts_dir)
-            except OSError:
-                pass
         # rmdir only succeeds on an empty directory, so the sandbox survives
         # when the caller left other artifacts (batch composition stats) in
         # it and is cleaned up when the trace was all it held.
@@ -186,10 +183,8 @@ def merge_rank_capture(
             os.path.dirname(source_profile_path),
             capture_dir,
         ):
-            try:
+            with contextlib.suppress(OSError):
                 os.rmdir(cleanup)
-            except OSError:
-                pass
         logger.info("Successfully merged profile directories into: %s", dst_ts_dir)
     except Exception as e:
         logger.warning("Failed to merge profile directories: %s", e)

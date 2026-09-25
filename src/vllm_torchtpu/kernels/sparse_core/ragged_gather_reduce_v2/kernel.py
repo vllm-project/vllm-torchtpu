@@ -365,10 +365,7 @@ def _col_kernel(
             # restart otherwise. Sorting guarantees rows of one group are
             # contiguous.
             dst_row_hbm = dst_slice[row_src]
-            if row_src == 0:
-                prev_dst = prev_dst_vals_vec[0]
-            else:
-                prev_dst = dst_slice[row_src - 1]
+            prev_dst = prev_dst_vals_vec[0] if row_src == 0 else dst_slice[row_src - 1]
             accumulated_data = jnp.where(
                 dst_row_hbm == prev_dst,
                 previous_accumulated_data + data_f32,
