@@ -236,26 +236,121 @@ class ModelSplicer:
         print(f">>> [SPLICER] Saved into {output_dir}\n")
         return output_dir
 
+    @staticmethod
+    def _read_shard_keys(shard_path: str) -> Set[str]:
+        """
+        Returns the tensor keys actually stored in one safetensors shard.
+
+        Reads only the header, then checks that the file is exactly as long as
+        the header says, so a shard cut short by a failed write is rejected
+        rather than trusted. Raises ValueError if the shard is truncated or its
+        header is unreadable.
+        """
+        file_size = os.path.getsize(shard_path)
+        with open(shard_path, "rb") as f:
+            prefix = f.read(8)
+            if len(prefix) < 8:
+                raise ValueError(
+                    f"'{shard_path}' is truncated: {file_size} bytes cannot hold a safetensors header"
+                )
+            header_len = int.from_bytes(prefix, "little")
+            if header_len > file_size - 8:
+                raise ValueError(
+                    f"'{shard_path}' is truncated: header declares {header_len} bytes, file has {file_size}"
+                )
+            try:
+                header = json.loads(f.read(header_len))
+            except ValueError as e:
+                raise ValueError(
+                    f"'{shard_path}' has an unreadable safetensors header: {e}"
+                ) from e
+        if not isinstance(header, dict):
+            raise ValueError(
+                f"'{shard_path}' has an unreadable safetensors header")
+
+        tensors = {
+            k: v
+            for k, v in header.items()
+            if k != "__metadata__" and isinstance(v, dict)
+        }
+        try:
+            data_end = max((int(v["data_offsets"][1])
+                            for v in tensors.values() if "data_offsets" in v),
+                           default=0)
+        except (TypeError, IndexError, ValueError) as e:
+            raise ValueError(
+                f"'{shard_path}' has an unreadable safetensors header: {e}"
+            ) from e
+        expected_size = 8 + header_len + data_end
+        if file_size != expected_size:
+            raise ValueError(
+                f"'{shard_path}' is truncated: header implies {expected_size} bytes, file has {file_size}"
+            )
+        return set(tensors)
+
     @classmethod
     def assert_checkpoint_integrity(cls, base_model_dir: str,
                                     checkpoint_dir: str) -> None:
         """
         Asserts that checkpoint_dir has an identical set of safetensors keys to base_model_dir.
         Fails loudly naming all missing and extra keys before evaluation launches.
+
+        The checkpoint's keys are read from the shard files on disk, never from
+        its model.safetensors.index.json: save_substituted_checkpoint copies the
+        base model's index before writing any shard, so a save that dies part
+        way (e.g. ENOSPC on the last shard) leaves an index that lists every
+        key. Every shard the index names must exist and be complete.
         """
         base_map = cls.get_weight_map(base_model_dir)
-        ckpt_map = cls.get_weight_map(checkpoint_dir)
-
         base_keys = set(base_map.keys())
-        ckpt_keys = set(ckpt_map.keys())
+
+        index_path = os.path.join(checkpoint_dir,
+                                  "model.safetensors.index.json")
+        index_map: Dict[str, str] = {}
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, "r") as f:
+                    index_map = json.load(f).get("weight_map") or {}
+                if not isinstance(index_map, dict):
+                    raise ValueError("weight_map is not an object")
+            except (OSError, ValueError, AttributeError) as e:
+                raise ValueError(
+                    f"Checkpoint integrity assertion failed for '{checkpoint_dir}': "
+                    f"unreadable index {index_path}: {e}") from e
+        if index_map:
+            shard_names = sorted(set(index_map.values()))
+        else:
+            shard_names = sorted(f for f in os.listdir(checkpoint_dir)
+                                 if f.endswith(".safetensors"))
+
+        missing_shards = []
+        broken_shards = []
+        ckpt_keys: Set[str] = set()
+        for shard_name in shard_names:
+            shard_path = os.path.join(checkpoint_dir, shard_name)
+            if not os.path.isfile(shard_path):
+                missing_shards.append(shard_name)
+                continue
+            try:
+                ckpt_keys |= cls._read_shard_keys(shard_path)
+            except ValueError as e:
+                broken_shards.append(str(e))
 
         missing_keys = sorted(base_keys - ckpt_keys)
         extra_keys = sorted(ckpt_keys - base_keys)
 
-        if missing_keys or extra_keys:
+        if missing_shards or broken_shards or missing_keys or extra_keys:
             error_lines = [
                 f"Checkpoint integrity assertion failed for '{checkpoint_dir}' against base '{base_model_dir}':"
             ]
+            if missing_shards:
+                error_lines.append(
+                    f"  Missing shard files ({len(missing_shards)}): {missing_shards}"
+                )
+            if broken_shards:
+                error_lines.append(
+                    f"  Unreadable shards ({len(broken_shards)}): {broken_shards}"
+                )
             if missing_keys:
                 error_lines.append(
                     f"  Missing keys ({len(missing_keys)}): {missing_keys}")

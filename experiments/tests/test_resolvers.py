@@ -386,6 +386,37 @@ class TestResolversEndToEnd(unittest.TestCase):
         model_path2, _ = resolver.resolve(current_config, resolver_config)
         self.assertEqual(model_path, model_path2)
 
+    def test_partial_cached_checkpoint_is_regenerated_not_reused(self):
+        """
+        Regression: a cached checkpoint whose last shard was never written
+        (ENOSPC mid-save) must not be returned as a cache hit; resolve()
+        regenerates it in place.
+        """
+        resolver = BaseSparsityResolver()
+        current_config = {"num_sparse_layers": 2}
+        resolver_config = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "strategy": "first_to_last",
+            "checkpoint_base_dir": self.work_dir
+        }
+        model_path, _ = resolver.resolve(current_config, resolver_config)
+        shard_names = sorted(f for f in os.listdir(model_path)
+                             if f.endswith(".safetensors"))
+        self.assertEqual(len(shard_names), 2)
+
+        # The copied index survives; the last shard does not.
+        os.remove(os.path.join(model_path, shard_names[-1]))
+        with self.assertRaises(ValueError):
+            ModelSplicer.assert_checkpoint_integrity(self.dense_dir,
+                                                     model_path)
+
+        model_path2, _ = resolver.resolve(current_config, resolver_config)
+        self.assertEqual(model_path, model_path2)
+        self.assertTrue(
+            os.path.isfile(os.path.join(model_path2, shard_names[-1])))
+        ModelSplicer.assert_checkpoint_integrity(self.dense_dir, model_path2)
+
     def test_naive_magnitude_resolver_resolve(self):
         """
         Arrange-Act-Assert: Verify NaiveMagnitudeResolver resolution.
@@ -972,6 +1003,69 @@ class TestCheckpointIntegrityGate(unittest.TestCase):
             self.assertIn("Extra keys (1)", str(ctx_extra.exception))
             self.assertIn("model.audio_tower.extra.weight",
                           str(ctx_extra.exception))
+
+    def test_checkpoint_integrity_gate_reads_shards_not_index(self):
+        """
+        Regression: a save that dies before its last shard leaves the base
+        model's index (copied first) naming every key. The gate must read the
+        shards on disk, so a missing or truncated shard fails the check.
+        """
+        import json
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            ckpt_dir = os.path.join(tmpdir, "ckpt")
+            os.makedirs(base_dir)
+            os.makedirs(ckpt_dir)
+
+            shards = {
+                "model-00001-of-00002.safetensors": {
+                    "model.language_model.layers.0.self_attn.q_proj.weight":
+                    torch.randn(8, 8),
+                },
+                "model-00002-of-00002.safetensors": {
+                    "model.language_model.layers.1.self_attn.q_proj.weight":
+                    torch.randn(8, 8),
+                },
+            }
+            index = {
+                "metadata": {},
+                "weight_map": {
+                    key: shard_name
+                    for shard_name, tensors in shards.items()
+                    for key in tensors
+                },
+            }
+            for d in (base_dir, ckpt_dir):
+                with open(os.path.join(d, "model.safetensors.index.json"),
+                          "w") as f:
+                    json.dump(index, f)
+            for shard_name, tensors in shards.items():
+                save_file(tensors, os.path.join(base_dir, shard_name))
+            first, last = sorted(shards)
+            save_file(shards[first], os.path.join(ckpt_dir, first))
+
+            # 1. Last shard never written: the index alone would pass.
+            with self.assertRaises(ValueError) as ctx_missing:
+                ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
+            self.assertIn("Missing shard files (1)",
+                          str(ctx_missing.exception))
+            self.assertIn(last, str(ctx_missing.exception))
+
+            # 2. Complete: passes.
+            last_path = os.path.join(ckpt_dir, last)
+            save_file(shards[last], last_path)
+            ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
+
+            # 3. Last shard cut short mid-write: fails.
+            with open(last_path, "r+b") as f:
+                f.truncate(os.path.getsize(last_path) - 16)
+            with self.assertRaises(ValueError) as ctx_truncated:
+                ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
+            self.assertIn("truncated", str(ctx_truncated.exception))
 
     def test_save_substituted_checkpoint_preserves_multimodal_keys(self):
         """
