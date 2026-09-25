@@ -17,7 +17,10 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadata,
+    AttentionMetadataBuilderContext,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -1546,6 +1549,107 @@ class Eagle3Proposer:
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
 
+    def _target_draft_attn_metadata(
+        self, chunk: DraftChunkInputs
+    ) -> dict[str, AttentionMetadata] | None:
+        """The draft layers' entries of the target forward's own metadata.
+
+        The target's walk in `_prepare_inputs` builds every KV cache group,
+        the draft layers' included, from the chunk's builder context. A step-0
+        rebuild would construct that same context and walk every group again
+        (one block-table upload plus, on the unified pool, every mamba group's
+        state-index gathers) only to keep the draft layers' entries. So these
+        entries are the step-0 metadata, and a loop step differs from them
+        only in seq_lens, query_start_loc and request_distribution: block
+        tables cannot change mid-propose, and draft layers are attention
+        layers, so no mamba field applies.
+
+        None when the chunk carries no target metadata (EP-DP dummy chunks,
+        standalone callers) or it does not cover every draft layer; the caller
+        then rebuilds. Also None for a KV-sharing draft (Gemma-4 MTP): it runs
+        inside the target's cache group and gets the group's full dict from
+        the rebuild, not just the draft layers' entries.
+        """
+        if self._draft_kv_shared:
+            return None
+        target_md = getattr(chunk, "attn_metadata", None)
+        if not target_md or chunk.attn_ctx.position_ids_override is not None:
+            return None
+        names = self._draft_attn_layer_names
+        assert names is not None, (
+            "draft attn layer names were not captured during load_model"
+        )
+        result = {name: md for name, md in target_md.items() if name in names}
+        if len(result) != len(names) or not all(
+            isinstance(md, AttentionMetadata) for md in result.values()
+        ):
+            return None
+        return result
+
+    def _loop_step_attn_inputs(
+        self,
+        chunk: DraftChunkInputs,
+        seq_lens_delta: int,
+        num_rejected_np: np.ndarray | None,
+        num_rejected_dev: torch.Tensor | None,
+        loop_query_start_loc: torch.Tensor | None,
+        loop_request_distribution: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """seq_lens, query_start_loc and request_distribution of a loop step
+        (one query per request), padded to the chunk's kernel_num_reqs."""
+        runner = self.runner
+        num_reqs = chunk.num_reqs
+        kernel_num_reqs = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        # query_start_loc / request_distribution depend only on num_reqs;
+        # the loop hoists them across steps. Fall back to building them here
+        # when not supplied (keeps this helper usable standalone).
+        if loop_query_start_loc is not None:
+            query_start_loc = loop_query_start_loc
+        else:
+            qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
+            qsl_np = np.minimum(qsl_np, num_reqs)
+            query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+        # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
+        # [num_reqs:] gets the same delta / a zero subtraction but is ignored
+        # by the kernel (query_start_loc caps queries at num_reqs), so this
+        # stays correct while avoiding a per-num_reqs slice-assign that
+        # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
+        # chunk.attn_ctx.seq_lens is not mutated — no .clone() needed.)
+        seq_lens = chunk.attn_ctx.seq_lens + seq_lens_delta
+        # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
+        # program is ONE shape — the variant WITH a num_rejected operand —
+        # regardless of whether this step actually had rejections. The spec
+        # warmup's synthetic request is all-accept (dummy logits ->
+        # draft==target -> zero rejections), so it only ever exercised the
+        # add-only branch; the sub-with-num_rejected variant then recompiled
+        # cold on the first real serving rejection (the residual tt_jit_sub at
+        # the first reject step). Subtracting zeros is value-identical to the
+        # add-only path, and building num_rejected via from_numpy().to(device)
+        # keeps it a runtime PARAMETER (matching the real-rejection program),
+        # not a folded constant. num_rejected_dev (async) is already
+        # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
+        # (query_start_loc caps queries at num_reqs).
+        if num_rejected_dev is None:
+            padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
+            if num_rejected_np is not None:
+                padded_rej[:num_reqs] = num_rejected_np
+            num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
+        seq_lens = seq_lens - num_rejected_dev
+        # Pure decode distribution; matches precompile loop-step shape.
+        if loop_request_distribution is not None:
+            request_distribution = loop_request_distribution
+        else:
+            request_distribution = torch.tensor(
+                [num_reqs, num_reqs, num_reqs],
+                dtype=torch.int32,
+                device=runner.device,
+            )
+        return seq_lens, query_start_loc, request_distribution
+
     def _build_draft_attn_metadata(
         self,
         chunk: DraftChunkInputs,
@@ -1566,6 +1670,33 @@ class Eagle3Proposer:
         runner = self.runner
         num_reqs = chunk.num_reqs
         chunk_ctx = chunk.attn_ctx
+
+        target_md = self._target_draft_attn_metadata(chunk)
+        if target_md is not None:
+            if step_idx == 0:
+                return target_md
+            seq_lens, query_start_loc, request_distribution = (
+                self._loop_step_attn_inputs(
+                    chunk,
+                    seq_lens_delta=seq_lens_delta,
+                    num_rejected_np=num_rejected_np,
+                    num_rejected_dev=num_rejected_dev,
+                    loop_query_start_loc=loop_query_start_loc,
+                    loop_request_distribution=loop_request_distribution,
+                )
+            )
+            replaced: dict[int, AttentionMetadata] = {}
+            result = {}
+            for name, md in target_md.items():
+                if id(md) not in replaced:
+                    replaced[id(md)] = dataclasses.replace(
+                        md,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        request_distribution=request_distribution,
+                    )
+                result[name] = replaced[id(md)]
+            return result
 
         # Loop-step metadata reuse: between loop iterations of one step the
         # metadata is identical except seq_lens (+1 per iteration) — qsl and
@@ -1613,50 +1744,16 @@ class Eagle3Proposer:
             max_query_len = 1
         else:
             num_tokens = num_reqs
-            # query_start_loc / request_distribution depend only on num_reqs;
-            # the loop hoists them across steps. Fall back to building them here
-            # when not supplied (keeps this helper usable standalone).
-            if loop_query_start_loc is not None:
-                query_start_loc = loop_query_start_loc
-            else:
-                qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
-                qsl_np = np.minimum(qsl_np, num_reqs)
-                query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
-            # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
-            # [num_reqs:] gets the same delta / a zero subtraction but is ignored
-            # by the kernel (query_start_loc caps queries at num_reqs), so this
-            # stays correct while avoiding a per-num_reqs slice-assign that
-            # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
-            # chunk_ctx.seq_lens is not mutated — no .clone() needed.)
-            seq_lens = chunk_ctx.seq_lens + seq_lens_delta
-            # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
-            # program is ONE shape — the variant WITH a num_rejected operand —
-            # regardless of whether this step actually had rejections. The spec
-            # warmup's synthetic request is all-accept (dummy logits ->
-            # draft==target -> zero rejections), so it only ever exercised the
-            # add-only branch; the sub-with-num_rejected variant then recompiled
-            # cold on the first real serving rejection (the residual tt_jit_sub at
-            # the first reject step). Subtracting zeros is value-identical to the
-            # add-only path, and building num_rejected via from_numpy().to(device)
-            # keeps it a runtime PARAMETER (matching the real-rejection program),
-            # not a folded constant. num_rejected_dev (async) is already
-            # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
-            # (query_start_loc caps queries at num_reqs).
-            if num_rejected_dev is None:
-                padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
-                if num_rejected_np is not None:
-                    padded_rej[:num_reqs] = num_rejected_np
-                num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
-            seq_lens = seq_lens - num_rejected_dev
-            # Pure decode distribution; matches precompile loop-step shape.
-            if loop_request_distribution is not None:
-                request_distribution = loop_request_distribution
-            else:
-                request_distribution = torch.tensor(
-                    [num_reqs, num_reqs, num_reqs],
-                    dtype=torch.int32,
-                    device=runner.device,
+            seq_lens, query_start_loc, request_distribution = (
+                self._loop_step_attn_inputs(
+                    chunk,
+                    seq_lens_delta=seq_lens_delta,
+                    num_rejected_np=num_rejected_np,
+                    num_rejected_dev=num_rejected_dev,
+                    loop_query_start_loc=loop_query_start_loc,
+                    loop_request_distribution=loop_request_distribution,
                 )
+            )
             max_query_len = 1
 
         effective_num_tokens = num_tokens_padded if num_tokens_padded else num_tokens
