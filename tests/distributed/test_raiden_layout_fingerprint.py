@@ -6,7 +6,7 @@ import pytest
 from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, glm_named_kv_caches
+from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
 
 
 def _manifest(*, page_tokens=4096):
@@ -218,3 +218,90 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
             layout_getter=_glm_layout_getter,
             package_version=lambda package: "unused",
         )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 fingerprint (per-role page geometry).
+# ---------------------------------------------------------------------------
+
+
+def _dsv4_manifest(**kwargs):
+    named_kv_caches, kv_cache_groups = dsv4_materialization(**kwargs)
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named_kv_caches, kv_cache_groups=kv_cache_groups, raw_tensors=()
+    )
+
+
+def test_measured_dsv4_layout_fingerprint_records_every_role():
+    _, payload = rlf.measured_dsv4_layout_fingerprint(
+        _dsv4_manifest(),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+
+    assert payload["schema"] == "dsv4-raw-layout-fingerprint-v1"
+    # No page_tokens key: the roles disagree on how many logical tokens sit on
+    # a page, so the identity is per-tag page geometry instead.
+    assert "page_tokens" not in payload
+    assert set(payload["layouts"]) == {
+        "dsv4.csa.nope.g0",
+        "dsv4.csa.rope.g0",
+        "dsv4.idx.g1",
+        "dsv4.hca.g2",
+        "dsv4.swa.g3",
+        "dsv4.state.csa.g4",
+        "dsv4.state.idx.g5",
+        "dsv4.state.hca.g6",
+    }
+    assert payload["layouts"]["dsv4.csa.nope.g0"] == {
+        "page_shape": [256, 4, 128],
+        "row_bytes": 512,
+        "minor_to_major": [3, 2, 1, 0],
+        "tiles": [[4, 128], [4, 1]],
+        "element_size_in_bits": 8,
+    }
+    assert payload["layouts"]["dsv4.hca.g2"]["page_shape"] == [512, 4, 128]
+    assert payload["layouts"]["dsv4.idx.g1"]["row_bytes"] == 1024
+
+
+def test_dsv4_fingerprint_matches_its_host_array_for_aliased_pools():
+    _, payload = rlf.measured_dsv4_layout_fingerprint(
+        _dsv4_manifest(),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    host = payload["layouts"]["dsv4.csa.nope.g0"]
+    for aliased in ("dsv4.swa.g3", "dsv4.state.csa.g4", "dsv4.state.hca.g6"):
+        assert payload["layouts"][aliased] == host
+
+
+@pytest.mark.parametrize(
+    ("layout", "message"),
+    [
+        (([2, 3, 1, 0], [[4, 128], [4, 1]], 0), "physical order"),
+        (([3, 2, 1, 0], [[8, 128], [4, 1]], 0), "tile shape"),
+        (None, "no materialized"),
+    ],
+)
+def test_measured_dsv4_layout_fingerprint_fails_closed(layout, message):
+    with pytest.raises(RuntimeError, match=message):
+        rlf.measured_dsv4_layout_fingerprint(
+            _dsv4_manifest(),
+            layout_getter=lambda tensor: layout,
+            package_version=lambda package: "unused",
+        )
+
+
+def test_dsv4_fingerprint_is_stable_across_pool_capacity():
+    """Prefill and decode admit different block counts on the same layout."""
+    small, _ = rlf.measured_dsv4_layout_fingerprint(
+        _dsv4_manifest(num_blocks=16),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    large, _ = rlf.measured_dsv4_layout_fingerprint(
+        _dsv4_manifest(num_blocks=64),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert small == large

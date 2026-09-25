@@ -1055,6 +1055,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_world_size=self.dcp_world_size,
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
+            decode_query_size=self.decode_query_size,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1249,8 +1250,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
         )
         if dcp_configured:
-            # TODO(kwang3939): forward decode_query_size to the DCP ops
-            self.decode_query_size = 1
             # These backends allocate NHD even when the global layout is HND.
             # Passing HND to LONGCTX would reinterpret the physical KV pool.
             if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and (
@@ -1275,6 +1274,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_group_size=self.dcp_world_size,
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
+                    decode_query_size=self.decode_query_size,
                 )
             return
 
@@ -2187,17 +2187,40 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             output.fill_(1)
             return output
 
+        topk_indices = kwargs.get("topk_indices")
+        q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # Query replication hands us the whole DCP group's heads already, so
+        # the sparse DCP path below can skip its per-step q all-gather. It is
+        # the only consumer, hence the `topk_indices` term.
+        use_qrep = (
+            q_dcp_replicated is not None
+            and self.dcp_size > 1
+            and topk_indices is not None
+        )
+        if use_qrep:
+            assert layer.W_UK_T_dcp_qrep is not None, (
+                "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
+                "built; `process_weights_after_loading` must run first."
+            )
+            q_nope, q_pe = q_dcp_replicated
+            w_uk_t_src = layer.W_UK_T_dcp_qrep
+            w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
+        else:
+            w_uk_t_src = layer.W_UK_T
+            w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
+        attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+
         # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
         # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
         q_nope_t = q_nope.transpose(0, 1)
         w_uk_t = (
-            layer.W_UK_T.to(q_nope_t.dtype)
-            if layer.W_UK_T.dtype != q_nope_t.dtype
-            else layer.W_UK_T
+            w_uk_t_src.to(q_nope_t.dtype)
+            if w_uk_t_src.dtype != q_nope_t.dtype
+            else w_uk_t_src
         )
         ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if hasattr(layer, "W_UK_T_scale"):
-            ql_nope = ql_nope * layer.W_UK_T_scale
+        if w_uk_t_scale is not None:
+            ql_nope = ql_nope * w_uk_t_scale
         ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
@@ -2210,12 +2233,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
             )
 
-        ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
-        q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
+        ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
+        q_pe_flat = q_pe.view(-1, attn_heads, layer.qk_rope_head_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
-        topk_indices = kwargs.get("topk_indices")
         if topk_indices is not None:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
                 "sparse MLA layers use a native (nope, rope) split "
@@ -2230,9 +2252,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # heads, so attention runs at `tp // dcp` head sharding: every
                 # rank attends with the whole DCP group's heads over its own
                 # KV shard, and the head axis is scattered back after the
-                # merge.
-                ql_nope_dcp = all_gather_heads(ql_nope_flat)
-                q_pe_dcp = all_gather_heads(q_pe_flat)
+                # merge. Under qrep the group's heads are already local, so
+                # the gather is the identity and is skipped outright.
+                ql_nope_dcp = (
+                    ql_nope_flat if use_qrep else all_gather_heads(ql_nope_flat)
+                )
+                q_pe_dcp = q_pe_flat if use_qrep else all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.

@@ -13,7 +13,7 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, glm_named_kv_caches
+from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
 
 pytestmark = pytest.mark.cpu_test
 
@@ -934,3 +934,116 @@ def test_glm_manifest_rejects_bad_geometry(overrides, message):
         rpm.build_glm_mla_pool_manifest(
             named_kv_caches=named, raw_tensors=(), block_size_tokens=_GLM_BLOCK_SIZE
         )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.
+# ---------------------------------------------------------------------------
+
+
+def test_dsv4_manifest_tags_every_pool_with_its_cache_group():
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    assert manifest.tag_counts() == {
+        "dsv4.csa.nope.g0": 2,
+        "dsv4.csa.rope.g0": 2,
+        "dsv4.idx.g1": 2,
+        "dsv4.hca.g2": 1,
+        "dsv4.swa.g3": 2,
+        "dsv4.state.csa.g4": 2,
+        "dsv4.state.idx.g5": 2,
+        "dsv4.state.hca.g6": 1,
+    }
+    # Aliased pools resolve to the storage they were overlaid onto, so the
+    # manifest registers each array exactly once.
+    assert len(manifest.storages) == 2 + 2 + 2 + 1  # csa nope/rope, idx, hca
+
+
+def test_dsv4_aliased_pools_share_their_host_storage_and_geometry():
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    by_tag: dict[str, list] = {}
+    for pool in manifest.pools:
+        by_tag.setdefault(pool.tag, []).append(pool)
+
+    # SWA, the CSA state and the HCA state all sit on CSA NoPE array 0, at the
+    # same byte offset. Only the block IDs their cache groups hand out keep
+    # them apart, which is why each carries a different tag.
+    host = by_tag["dsv4.csa.nope.g0"][0]
+    for tag in ("dsv4.swa.g3", "dsv4.state.csa.g4", "dsv4.state.hca.g6"):
+        alias = by_tag[tag][0]
+        assert alias.storage_index == host.storage_index
+        assert alias.base_offset_bytes == host.base_offset_bytes
+        assert alias.block_stride_bytes == host.block_stride_bytes
+        assert alias.num_blocks == host.num_blocks
+
+
+def test_dsv4_csa_state_pool_covers_nope_only():
+    """The compressor runs CSA in overlap mode: no separate state view, and
+    the state rows go through NoPE, so RoPE holds no state to transfer."""
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    state_pools = [p for p in manifest.pools if p.tag == "dsv4.state.csa.g4"]
+    rope_storages = {
+        p.storage_index for p in manifest.pools if p.tag == "dsv4.csa.rope.g0"
+    }
+    assert len(state_pools) == 2
+    assert not {p.storage_index for p in state_pools} & rope_storages
+
+
+@pytest.mark.parametrize(
+    "layer_name,replacement,match",
+    [
+        # Both SWA layers of group 3 land on one CSA NoPE array. They share a
+        # block table, so this is real corruption rather than benign aliasing.
+        (
+            "model.layers.1.self_attn.swa_cache",
+            "model.layers.0.self_attn.swa_cache",
+            "share an array inside",
+        ),
+        # HCA keeps raw bf16 latents: two rows per token, not one.
+        ("model.layers.2.self_attn.attn", (16, 256, 4, 128), "256 rows; the 256-token"),
+    ],
+)
+def test_dsv4_manifest_rejects_a_materialization_it_cannot_describe(
+    layer_name, replacement, match
+):
+    named, groups = dsv4_materialization()
+    named[layer_name] = (
+        named[replacement]
+        if isinstance(replacement, str)
+        else FakeTensor(replacement, 1, dtype="torch.uint8")
+    )
+
+    with pytest.raises(rpm.ManifestError, match=match):
+        rpm.build_dsv4_pool_manifest(
+            named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+        )
+
+
+def test_dsv4_state_cache_name_resolves_its_compressed_kv_layer():
+    assert (
+        rpm.dsv4_compressed_kv_layer_name(
+            "model.layers.3.self_attn.attn.compressor.state_cache"
+        )
+        == "model.layers.3.self_attn.attn"
+    )
+    assert (
+        rpm.dsv4_compressed_kv_layer_name(
+            "model.layers.3.self_attn.attn.indexer.compressor.state_cache"
+        )
+        == "model.layers.3.self_attn.attn.indexer.k_cache"
+    )
+    with pytest.raises(rpm.ManifestError, match="cannot be derived"):
+        rpm.dsv4_compressed_kv_layer_name("model.layers.3.self_attn.attn")

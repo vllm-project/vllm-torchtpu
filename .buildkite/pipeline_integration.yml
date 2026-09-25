@@ -153,6 +153,30 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: Nightly dsv4-pd-disagg-correctness"
+        key: "integration_nightly_dsv4_pd_disagg_correctness"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 150
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          DISAGG_SCRIPT: "./scripts/vllm/integration/run_dsv4_pd_correctness.sh"
+          DISAGG_RUN_ROOT: "/perf_eval_results/dsv4_pd_disagg_ci"
+          # Streamed, not staged: the checkpoint is 149 GiB and v7x-16 agents
+          # have ~30 GB free on the boot disk and nothing attached.
+          MODEL_PATH: "gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
+          SERVED_MODEL_NAME: "deepseek-ai/DeepSeek-V4-Flash"
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "0"
+          # DP attention on both sides, so no page is ever striped across ranks.
+          PREFILL_DP: "8"
+          DECODE_DP: "8"
+          TPU_RAIDEN_TRANSFER_PARALLELISM: "1"
+        commands:
+          - "bash .buildkite/scripts/run_disagg_multihost.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: Nightly glm52-fp4-offload-correctness"
         key: "integration_nightly_glm52_fp4_offload_correctness"
         # Nightly only, like its DSv4 sibling above and for the same reason:

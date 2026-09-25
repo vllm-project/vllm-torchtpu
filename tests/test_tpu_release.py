@@ -39,8 +39,7 @@ def test_scan_skips_the_self_symlinks():
     A scan that includes it reports the caller as a second owner of its own
     chip, and anything parsing that name as a pid fails on it.
     """
-    assert all(
-        link.split("/")[2].isdigit() for link in tpu_release._fd_links())
+    assert all(link.split("/")[2].isdigit() for link in tpu_release._fd_links())
 
 
 @pytest.mark.cpu_test
@@ -59,8 +58,7 @@ def test_a_process_exiting_mid_scan_is_not_an_owner(monkeypatch):
 def test_returns_once_the_holder_exits(monkeypatch):
     """The wait ends on the poll after the owner disappears, not on a timer."""
     remaining = [{"/dev/vfio/0": 123}] * 3 + [{}]
-    monkeypatch.setattr(tpu_release, "tpu_device_owners",
-                        lambda: remaining.pop(0))
+    monkeypatch.setattr(tpu_release, "tpu_device_owners", lambda: remaining.pop(0))
     monkeypatch.setattr(tpu_release.time, "sleep", lambda _: None)
 
     tpu_release.wait_for_tpu_release()
@@ -70,8 +68,7 @@ def test_returns_once_the_holder_exits(monkeypatch):
 
 @pytest.mark.cpu_test
 def test_raises_and_names_the_holder_when_the_chip_never_frees(monkeypatch):
-    monkeypatch.setattr(tpu_release, "tpu_device_owners",
-                        lambda: {"/dev/vfio/0": 4242})
+    monkeypatch.setattr(tpu_release, "tpu_device_owners", lambda: {"/dev/vfio/0": 4242})
 
     with pytest.raises(RuntimeError, match="4242"):
         tpu_release.wait_for_tpu_release(timeout=0.0)

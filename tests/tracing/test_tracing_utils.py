@@ -2,9 +2,11 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
-                                         extract_request_ids_for_tracing,
-                                         trim_request_id_suffix)
+from vllm_torchtpu.tracing.utils import (
+    extract_kv_lens_for_tracing,
+    extract_request_ids_for_tracing,
+    trim_request_id_suffix,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -17,8 +19,10 @@ def test_trim_request_id_suffix():
     assert trim_request_id_suffix("cmpl-1234") == "cmpl-1234"
 
     # Case C: Non-"cmpl" prefixed IDs are bypassed.
-    assert trim_request_id_suffix(
-        "custom-req-id-1-2-3-4-5-6-7") == "custom-req-id-1-2-3-4-5-6-7"
+    assert (
+        trim_request_id_suffix("custom-req-id-1-2-3-4-5-6-7")
+        == "custom-req-id-1-2-3-4-5-6-7"
+    )
 
 
 def test_extract_request_ids_for_tracing():
@@ -36,14 +40,12 @@ def test_extract_request_ids_for_tracing():
 
     # Case C: Mock the internal components to fail and verify it swallows error
     class BadItem:
-
         def __str__(self):
             raise ValueError("Intentional crash")
 
     with patch("vllm_torchtpu.tracing.utils.logger.warning") as mock_warning:
         res_3 = extract_request_ids_for_tracing(["cmpl-1", BadItem()], 0, 2)
-        assert res_3 == {
-        }  # the list comprehension exception catches in outer try
+        assert res_3 == {}  # the list comprehension exception catches in outer try
         mock_warning.assert_called_once()
 
 
@@ -51,9 +53,7 @@ def test_extract_kv_lens_for_tracing():
     num_computed_tokens = [100, 200, 300, 400]
 
     # Case A: Test pagination by passing start_index and num_reqs
-    res = extract_kv_lens_for_tracing(num_computed_tokens,
-                                      start_index=1,
-                                      num_reqs=2)
+    res = extract_kv_lens_for_tracing(num_computed_tokens, start_index=1, num_reqs=2)
     assert res == {
         "kv_len1": 200,
         "kv_len2": 300,
@@ -75,7 +75,5 @@ def test_extract_kv_lens_for_tracing():
     }
 
     # Case C: Empty slice yields no kwargs and no summary stats
-    res_3 = extract_kv_lens_for_tracing(num_computed_tokens,
-                                        start_index=4,
-                                        num_reqs=2)
+    res_3 = extract_kv_lens_for_tracing(num_computed_tokens, start_index=4, num_reqs=2)
     assert res_3 == {}

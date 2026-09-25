@@ -48,8 +48,19 @@ the same live server:
   prompt-len), median TTFT is queue-position noise, so nightly baselines are
   calibrated with `--gate-ttft-max-concurrency 0` to omit it.
 - `--mode eval` compares `lm_eval` accuracy to
-  `baselines/eval/<config>.<task>.baseline.json` (1.5pp tolerance). Only keys
-  present in the baseline are gated. `--run-lm-eval` walks `LM_EVAL_TASKS`
+  `baselines/eval/<config>.<task>.baseline.json` (1.5pp default tolerance, or
+  config `EVAL_TOLERANCE`). Only keys present in the baseline are gated. Where
+  the baseline carries standard error (`exact_match_stderr`), the allowed drop
+  becomes `max(tolerance, 1.645 * hypot(stderr_baseline, stderr_run))` — a
+  one-sided 95% significance test. The gate compares two independent runs, so
+  the noisy quantity is their *difference*, whose standard error combines both
+  sides in quadrature; using one raw stderr would still fail ~24% of clean
+  reruns on small benchmarks like `humaneval_plus_tpu` (N=164). When only one
+  side records a stderr the two cases differ: a baseline stderr sets the scale
+  for both sides (`sqrt(2) * stderr_baseline`), while a run stderr covers only
+  its own side and the baseline is treated as exact (`stderr_run`). The flat
+  tolerance governs only where neither side records one.
+  `--run-lm-eval` walks `LM_EVAL_TASKS`
   (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
   (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
   code-generation tasks

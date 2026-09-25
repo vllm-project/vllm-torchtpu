@@ -6,8 +6,12 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu.core import pp_chunk_scheduler
 from vllm_torchtpu.core.pp_chunk_scheduler import (
-    SCHEDULER_CLS, TpuPipelineChunkScheduler, patch_engine_core_for_pp_chunks,
-    profile_and_install_cost_model, uses_dynamic_chunks)
+    SCHEDULER_CLS,
+    TpuPipelineChunkScheduler,
+    patch_engine_core_for_pp_chunks,
+    profile_and_install_cost_model,
+    uses_dynamic_chunks,
+)
 from vllm_torchtpu.core.pp_chunks import StepCostModel
 
 BUCKETS = [4096, 8192, 12288, 16384]
@@ -17,15 +21,12 @@ _EMPTY_STEP = SimpleNamespace(total_num_scheduled_tokens=0)
 def _model(attn=1.5e-7, slack=0.1, granularity=4096) -> StepCostModel:
     linear = {b: 12.0 + 0.0109 * b for b in BUCKETS}
     full = linear[16384] + attn * 16384**2 / 2
-    return StepCostModel(BUCKETS, linear, attn, full * (1 + slack),
-                         granularity)
+    return StepCostModel(BUCKETS, linear, attn, full * (1 + slack), granularity)
 
 
-def _scheduler(mamba_split=False,
-               cost=None,
-               running=(),
-               waiting=(),
-               step_limit=None) -> TpuPipelineChunkScheduler:
+def _scheduler(
+    mamba_split=False, cost=None, running=(), waiting=(), step_limit=None
+) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
@@ -33,7 +34,8 @@ def _scheduler(mamba_split=False,
     scheduler.waiting = list(waiting)
     scheduler.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=8))
+        parallel_config=SimpleNamespace(pipeline_parallel_size=8),
+    )
     scheduler._mamba_split = mamba_split
     scheduler.need_mamba_block_aligned_split = True
     scheduler.running = list(running)
@@ -53,7 +55,8 @@ def _request(computed: int, prompt: int, req_id="r", num_tokens=None):
         num_computed_tokens=computed,
         num_prompt_tokens=prompt,
         num_tokens=prompt if num_tokens is None else num_tokens,
-        request_id=req_id)
+        request_id=req_id,
+    )
 
 
 def _decode(req_id: str, computed: int = 8192):
@@ -62,16 +65,14 @@ def _decode(req_id: str, computed: int = 8192):
 
 def test_without_a_model_chunks_pass_through():
     scheduler = _scheduler()
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536),
-                                                16384) == 16384
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536), 16384) == 16384
     assert scheduler._step_tokens == 16384
     assert scheduler._step_prefill_tokens == 16384
 
 
 def test_prefix_free_first_chunk_is_untouched():
     scheduler = _scheduler(cost=_model())
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536),
-                                                16384) == 16384
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536), 16384) == 16384
     assert scheduler._clips == 0
 
 
@@ -84,18 +85,15 @@ def test_chunk_behind_a_prefix_is_clipped_and_accounted():
     assert scheduler._step_squares == pytest.approx(12288.0**2)
     assert scheduler._clips == 1
     # The step is at its target: the next request waits for the next step.
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"),
-                                                16384) == 0
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"), 16384) == 0
     assert scheduler._waits == 1
     assert scheduler._step_tokens == 12288
 
 
 def test_a_light_chunk_leaves_room_for_the_next_request():
     scheduler = _scheduler(cost=_model())
-    assert scheduler._mamba_block_aligned_split(_request(16384, 20480),
-                                                4096) == 4096
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"),
-                                                16384) == 12288
+    assert scheduler._mamba_block_aligned_split(_request(16384, 20480), 4096) == 4096
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"), 16384) == 12288
     assert scheduler._step_tokens == 16384
 
 
@@ -107,14 +105,13 @@ def test_the_first_prefill_of_a_step_advances_even_behind_decodes():
         scheduler.schedule()
     assert scheduler._step_tokens == 32
     assert scheduler._step_prefill_tokens == 0
-    assert scheduler._cost.chunk(65536, 16384, 32, scheduler._step_pairs,
-                                 32.0) == 0
+    assert scheduler._cost.chunk(65536, 16384, 32, scheduler._step_pairs, 32.0) == 0
     # One granule for the first prompt anyway.
-    assert scheduler._mamba_block_aligned_split(_request(65536, 131072),
-                                                16384) == 4096
+    assert scheduler._mamba_block_aligned_split(_request(65536, 131072), 16384) == 4096
     # A second prompt waits for the next step.
-    assert scheduler._mamba_block_aligned_split(_request(65536, 131072, "s"),
-                                                16384) == 0
+    assert (
+        scheduler._mamba_block_aligned_split(_request(65536, 131072, "s"), 16384) == 0
+    )
     assert scheduler._waits == 1
 
 
@@ -129,8 +126,10 @@ def test_decodes_are_counted_once_before_prefill_chunks_are_sized():
     assert scheduler._mamba_block_aligned_split(decodes[0], 1) == 1
     assert scheduler._step_tokens == 37
     # A prefill chunk lands the step total on a granule multiple.
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536),
-                                                16384 - 37) == 16384 - 37
+    assert (
+        scheduler._mamba_block_aligned_split(_request(0, 65536), 16384 - 37)
+        == 16384 - 37
+    )
     assert scheduler._step_tokens == 16384
 
 
@@ -141,10 +140,8 @@ def test_a_prefill_still_in_flight_is_not_seeded_as_a_decode():
         scheduler.schedule()
     assert scheduler._step_tokens == 0 and not scheduler._seeded
     # Two whole 8K prompts still share one step.
-    assert scheduler._mamba_block_aligned_split(_request(0, 8192, "a"),
-                                                8192) == 8192
-    assert scheduler._mamba_block_aligned_split(_request(0, 8192, "b"),
-                                                8192) == 8192
+    assert scheduler._mamba_block_aligned_split(_request(0, 8192, "a"), 8192) == 8192
+    assert scheduler._mamba_block_aligned_split(_request(0, 8192, "b"), 8192) == 8192
 
 
 def test_a_decode_admitted_after_the_seed_is_counted_when_visited():
@@ -174,7 +171,8 @@ def test_external_and_local_computed_tokens_count_as_prefix():
         _request(0, 65536),
         16384,
         num_new_local_computed_tokens=8192,
-        num_external_computed_tokens=8192)
+        num_external_computed_tokens=8192,
+    )
     assert got == 12288
 
 
@@ -187,8 +185,7 @@ def test_mamba_alignment_runs_after_the_clip_when_the_model_needs_it():
         return num_new_tokens - 1
 
     with patch.object(Scheduler, "_mamba_block_aligned_split", align):
-        got = scheduler._mamba_block_aligned_split(_request(16384, 65536),
-                                                   16384)
+        got = scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384)
     assert seen["tokens"] == 12288
     assert got == 12287
     assert scheduler._step_tokens == 12287
@@ -196,12 +193,10 @@ def test_mamba_alignment_runs_after_the_clip_when_the_model_needs_it():
 
 def test_a_limited_step_takes_one_small_chunk_and_fills_with_it():
     scheduler = _scheduler(cost=_model(granularity=2048), step_limit=4096)
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536),
-                                                16384) == 4096
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536), 16384) == 4096
     assert scheduler._clips == 1
     # The step is full: the next request waits for the next step.
-    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"),
-                                                16384) == 0
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"), 16384) == 0
     assert scheduler._waits == 1
 
 
@@ -254,7 +249,8 @@ def test_schedule_resets_the_step_accounting():
 def _config(pp=8, cls=SCHEDULER_CLS):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
-        scheduler_config=SimpleNamespace(scheduler_cls=cls))
+        scheduler_config=SimpleNamespace(scheduler_cls=cls),
+    )
 
 
 def test_uses_dynamic_chunks_follows_the_installed_scheduler_class():
@@ -266,7 +262,6 @@ def test_uses_dynamic_chunks_follows_the_installed_scheduler_class():
 
 
 class _Executor:
-
     def __init__(self, reports):
         self.reports = reports
         self.calls = []
@@ -305,16 +300,15 @@ def test_profile_and_install_skips_other_schedulers(monkeypatch):
 
 def test_engine_core_patch_installs_after_init_of_subclasses(monkeypatch):
     from vllm.v1.engine import core as engine_core
+
     monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_PP_CHUNK_SLACK", 0.1)
 
     class FakeCore:
-
         def __init__(self, *args, **kwargs):
             self.scheduler = _scheduler()
             self.model_executor = _Executor([_report(10.0)])
 
     class FakeProc(FakeCore):
-
         def __init__(self):
             super().__init__()
             self.after_init = self.scheduler._cost

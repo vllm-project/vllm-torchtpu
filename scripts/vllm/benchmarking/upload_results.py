@@ -312,9 +312,7 @@ def main():
             ]
 
             print(f"Executing: {' '.join(cmd)}")
-            res_proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            res_proc = subprocess.run(cmd, capture_output=True, text=True)
             if res_proc.returncode != 0:
                 print(
                     f"Failed to update Spanner record for {rf.name}!", file=sys.stderr

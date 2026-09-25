@@ -2,8 +2,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm_torchtpu.tracing.annotation import (TraceAnnotation,
-                                              is_trace_annotation_enabled)
+from vllm_torchtpu.tracing.annotation import (
+    TraceAnnotation,
+    is_trace_annotation_enabled,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -40,14 +42,11 @@ def test_trace_annotation_enabled_with_kwargs(mock_profiler_enabled):
         mock_context = MagicMock()
         mock_rf.return_value = mock_context
 
-        with TraceAnnotation("ModelForward",
-                             num_reqs=2,
-                             request_id1="cmpl-xyz"):
+        with TraceAnnotation("ModelForward", num_reqs=2, request_id1="cmpl-xyz"):
             pass
 
         # Verify the context properly appends the delimiter hash tags
-        mock_rf.assert_called_once_with(
-            "ModelForward#num_reqs=2,request_id1=cmpl-xyz#")
+        mock_rf.assert_called_once_with("ModelForward#num_reqs=2,request_id1=cmpl-xyz#")
 
 
 @patch("torch.autograd._profiler_enabled", return_value=True)
@@ -61,7 +60,7 @@ def test_trace_annotation_with_batch_composition(mock_profiler_enabled):
             "num_prefill_tokens": 1024,
             "num_decode_tokens": 128,
             "phase": "PREFILL_HEAVY",
-            "batch_id": 42
+            "batch_id": 42,
         }
         with TraceAnnotation("ModelForward", num_reqs=8, **trace_kwargs):
             pass

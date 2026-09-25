@@ -366,12 +366,31 @@ class DeepseekV4Model(nn.Module):
     def _dp_gather_hash_moe_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """All-gather input_ids over the DP group for hash-MoE routing.
 
-        Hash layers route on hash_indices_table[input_ids], and the MoE runner
-        routes over the DP-gathered global batch, so every rank needs every id.
-        Uses the same all_gather(dim=0) as hidden_states to keep rows aligned.
+        Hash layers route on hash_indices_table[input_ids], so the ids must
+        line up row-for-row with the hidden states the experts are handed.
+        That is the DP-gathered global batch whenever the MoE runner gathers
+        it, and this rank's own rows when the layer owns its dispatch -- the
+        fused EP kernel does, and then gathering here would hand a layer ids
+        for dp_size times the rows it computes. Uses the same
+        all_gather(dim=0) as hidden_states to keep rows aligned.
         """
         dp_group = get_dp_group()
         if dp_group.world_size == 1:
+            return input_ids
+        # One gather serves every hash layer, so they have to agree on which
+        # rows they want. They are built from one config and armed by one
+        # weight-load path, so disagreeing is a bug here rather than a case to
+        # handle -- and it would be a silent shape mismatch deep in a layer.
+        hash_layers = self.layers[
+            self.start_layer : min(self.end_layer, self.config.num_hash_layers)
+        ]
+        wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
+        assert len(wants) == 1, (
+            "DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
+            "DP-gathers the token rows, so no single gather of input_ids can "
+            "serve them all"
+        )
+        if not wants.pop():
             return input_ids
         return dp_group.all_gather(input_ids, dim=0)
 

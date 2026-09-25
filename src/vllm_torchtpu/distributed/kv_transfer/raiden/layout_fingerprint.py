@@ -20,12 +20,25 @@ from vllm_torchtpu import envs as tpu_envs
 from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
 from .tags import class_tag
 
-EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
+
+def _row_major_minor_to_major(rank: int) -> tuple[int, ...]:
+    """Row-major order for a rank-``rank`` tensor.
+
+    XLA lists dimensions minor to major, so row-major counts down: (1, 0) for
+    a matrix, (3, 2, 1, 0) for the rank-4 page caches. Nothing here is
+    model-specific; the rank picks the value.
+    """
+    return tuple(range(rank - 1, -1, -1))
+
+
+# FA storages are rank 5, the packed-row page caches rank 4.
+EXPECTED_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(5)
+ROW_CACHE_MINOR_TO_MAJOR = _row_major_minor_to_major(4)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
-GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
+DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -144,6 +157,7 @@ def measured_fa_layout_fingerprint(
 
 
 __all__ = [
+    "DSV4_LAYOUT_FINGERPRINT_SCHEMA",
     "EXPECTED_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
@@ -151,6 +165,7 @@ __all__ = [
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "fa_page_tokens",
+    "measured_dsv4_layout_fingerprint",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
     "measured_kimi_k3_layout_fingerprint",
@@ -243,10 +258,34 @@ def measured_glm_layout_fingerprint(
     return canonical_layout_fingerprint(payload), payload
 
 
+def measured_dsv4_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fingerprint of the admitted DeepSeek-V4 cache layout.
+
+    No ``page_tokens``: each DSv4 role pages at its own size, so the page shape
+    is recorded per tag rather than checked against one number.
+    """
+    layouts = _measure_packed_row_layouts(
+        manifest, page_tokens=None, layout_getter=layout_getter, include_page_shape=True
+    )
+    version = package_version or importlib.metadata.version
+    payload = {
+        "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
+        "layouts": layouts,
+    }
+    return canonical_layout_fingerprint(payload), payload
+
+
 def _measure_packed_row_layouts(
     manifest: PoolManifest,
     *,
-    page_tokens: int,
+    page_tokens: int | None,
     layout_getter: Callable[[Any], Any] | None,
     include_page_shape: bool,
 ) -> dict[str, Any]:
@@ -256,10 +295,13 @@ def _measure_packed_row_layouts(
     prefix of the page. That only holds for the natural
     [blocks, rows, packing, width] physical order, so reject anything else --
     for every pool, since one odd layer would corrupt just that layer.
+
+    Pass ``page_tokens`` when every tag shares one page, which GLM and Kimi do
+    and DSv4 does not.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    if page_tokens <= 0:
+    if page_tokens is not None and page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     getter = layout_getter or _default_layout_getter
 
@@ -293,13 +335,14 @@ def _measure_packed_row_layouts(
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
         _, rows, packing, width = shape
-        page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
-        if page_rows_tokens != page_tokens:
-            raise RuntimeError(
-                f"{pool.tag} page geometry {rows}x{packing} does not match "
-                f"page_tokens {page_tokens}"
-            )
-        if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
+        if page_tokens is not None:
+            page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
+            if page_rows_tokens != page_tokens:
+                raise RuntimeError(
+                    f"{pool.tag} page geometry {rows}x{packing} does not "
+                    f"match page_tokens {page_tokens}"
+                )
+        if minor_to_major != ROW_CACHE_MINOR_TO_MAJOR:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "

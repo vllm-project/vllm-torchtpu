@@ -1,8 +1,13 @@
 import pytest
 
-from vllm_torchtpu.core.pp_chunks import (StepCostModel, chunk_buckets,
-                                          chunk_granularity, chunk_pairs,
-                                          profile_points, schedule_pairs)
+from vllm_torchtpu.core.pp_chunks import (
+    StepCostModel,
+    chunk_buckets,
+    chunk_granularity,
+    chunk_pairs,
+    profile_points,
+    schedule_pairs,
+)
 
 BUCKETS = [16, 4096, 8192, 12288, 16384]
 ATTN = 1.5e-7  # ms per token of chunk per token of context
@@ -16,8 +21,7 @@ def _linear(tokens: int) -> float:
 def _measured(tokens: int, prefix: int, scale: float = 1.0) -> float:
     """What one stage reports: the ladder plus attention over the prefix
     and over the chunk itself."""
-    return scale * (_linear(tokens) + ATTN *
-                    (tokens * prefix + tokens * tokens / 2))
+    return scale * (_linear(tokens) + ATTN * (tokens * prefix + tokens * tokens / 2))
 
 
 def _stage(scale=1.0):
@@ -50,8 +54,7 @@ def test_granularity_ignores_the_block_without_alignment_or_above_a_step():
 def test_buckets_cover_every_granule_multiple():
     assert chunk_buckets(16384, 4096) == [4096, 8192, 12288]
     assert chunk_buckets(16384, 4352) == [4352, 8704, 13056]
-    assert chunk_buckets(4096,
-                         512) == [512, 1024, 1536, 2048, 2560, 3072, 3584]
+    assert chunk_buckets(4096, 512) == [512, 1024, 1536, 2048, 2560, 3072, 3584]
     assert chunk_buckets(4096, 4096) == []
 
 
@@ -70,12 +73,13 @@ def test_profile_points_cover_every_bucket_and_prefixes_for_large_ones():
 def test_schedule_pairs_sums_chunk_pairs_over_sequences():
     # One sequence of q new tokens behind a prefix is exactly chunk_pairs.
     schedule = (0, 256, 256)
-    assert schedule_pairs([16384], [32768 + 16384], 256,
-                          256) == chunk_pairs(schedule, 16384, 32768)
+    assert schedule_pairs([16384], [32768 + 16384], 256, 256) == chunk_pairs(
+        schedule, 16384, 32768
+    )
     # Sequences add up; empty ones contribute nothing.
-    assert schedule_pairs([4096, 0, 1], [4096, 100, 8193], 256,
-                          256) == (chunk_pairs(schedule, 4096, 0) +
-                                   chunk_pairs(schedule, 1, 8192))
+    assert schedule_pairs([4096, 0, 1], [4096, 100, 8193], 256, 256) == (
+        chunk_pairs(schedule, 4096, 0) + chunk_pairs(schedule, 1, 8192)
+    )
     assert schedule_pairs([], [], 256, 256) == 0
 
 
@@ -102,8 +106,7 @@ def test_fit_takes_the_slowest_stage_and_removes_the_causal_term():
 def test_fit_uses_the_median_slope_and_ignores_a_faster_prefix_run():
     stage = _stage()
     # One bucket whose far prefix point ran faster than its near one.
-    stage = [(t, p, ms if (t, p) != (16384, 32768) else 100.0)
-             for t, p, ms in stage]
+    stage = [(t, p, ms if (t, p) != (16384, 32768) else 100.0) for t, p, ms in stage]
     model = StepCostModel.fit([stage], 0.1, 4096)
     assert model.attn_ms_per_token_pair == pytest.approx(ATTN, rel=1e-6)
 
@@ -132,7 +135,8 @@ def test_step_time_adds_the_causal_term_of_each_chunk():
     model = _model()
     # Four 4K first chunks cost less than one 16K chunk in the same bucket.
     assert model.step_ms(16384, 0.0, 4 * 4096.0**2) < model.step_ms(
-        16384, 0.0, 16384.0**2)
+        16384, 0.0, 16384.0**2
+    )
 
 
 def test_first_chunk_fills_the_step():
@@ -164,8 +168,7 @@ def test_a_step_limit_holds_the_step_to_a_smaller_bucket():
     # Buckets at every granule multiple, as the runner compiles them.
     buckets = list(range(2048, 16385, 2048))
     linear = {b: _linear(b) for b in buckets}
-    model = StepCostModel(buckets, linear, ATTN, 1.1 * _measured(16384, 0),
-                          2048)
+    model = StepCostModel(buckets, linear, ATTN, 1.1 * _measured(16384, 0), 2048)
     # A first chunk fills the limited step; a short request is untouched.
     assert model.chunk(0, 65536, 0, 0.0, 0.0, step_limit=4096) == 4096
     assert model.chunk(0, 1000, 0, 0.0, 0.0, step_limit=4096) == 1000
@@ -202,8 +205,7 @@ def test_a_slow_odd_bucket_does_not_hide_a_larger_fitting_one():
 
 
 def test_without_an_attention_term_chunks_fill_the_bucket():
-    model = StepCostModel.fit([[(b, 0, _linear(b)) for b in BUCKETS]], 0.0,
-                              4096)
+    model = StepCostModel.fit([[(b, 0, _linear(b)) for b in BUCKETS]], 0.0, 4096)
     assert model.attn_ms_per_token_pair == 0.0
     assert model.chunk(65536, 16384, 0, 0.0, 0.0) == 16384
 

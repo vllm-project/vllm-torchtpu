@@ -1300,11 +1300,11 @@ class TestVllmGatedDeltaNetAttention:
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
-        with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
-            with pytest.raises(
-                RuntimeError, match="GDN PCP prefill op was not initialized"
-            ):
-                attn.forward(hidden_states)
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            pytest.raises(RuntimeError, match="GDN PCP prefill op was not initialized"),
+        ):
+            attn.forward(hidden_states)
 
         attn.gdn_op.assert_not_called()
 

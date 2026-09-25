@@ -190,10 +190,12 @@ def test_patch_is_reverted_even_when_construction_raises(monkeypatch) -> None:
         moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 1, 2, 0)
     )
     original = FusedMoEParallelConfig.make
-    with pytest.raises(RuntimeError, match="boom"):
-        with moe_hierarchical.hierarchical_moe_parallel_config():
-            assert FusedMoEParallelConfig.make is not original
-            raise RuntimeError("boom")
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        moe_hierarchical.hierarchical_moe_parallel_config(),
+    ):
+        assert FusedMoEParallelConfig.make is not original
+        raise RuntimeError("boom")
     assert FusedMoEParallelConfig.make is original
 
 

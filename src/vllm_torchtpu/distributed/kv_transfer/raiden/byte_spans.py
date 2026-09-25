@@ -487,3 +487,66 @@ def lower_glm_row_spans(
         declared_bytes=sum(span.size_bytes for span in spans),
         dst_space_version=1,
     )
+
+
+def lower_dsv4_row_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    transfer_rank: int,
+    parallelism: int,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans."""
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    if parallelism <= 0:
+        raise ValueError("parallelism must be positive")
+    if not 0 <= transfer_rank < parallelism:
+        raise ValueError(
+            f"transfer_rank {transfer_rank} is outside parallelism {parallelism}"
+        )
+    if row_bytes <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("row_bytes and live_bytes_per_block must be positive")
+    if live_bytes_per_block % row_bytes:
+        raise ValueError(
+            "page live bytes must be whole rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
+    rows_per_page = live_bytes_per_block // row_bytes
+
+    num_pages = (num_tokens + page_tokens - 1) // page_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
+    tail_tokens = num_tokens - (num_pages - 1) * page_tokens
+    tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+    tail_bytes = tail_rows * row_bytes
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=page,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=page * live_bytes_per_block,
+            size_bytes=(tail_bytes if page == num_pages - 1 else live_bytes_per_block),
+        )
+        for page in range(num_pages)
+        if page % parallelism == transfer_rank
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=sum(span.size_bytes for span in spans),
+        dst_space_version=1,
+    )

@@ -32,6 +32,14 @@ export MOE_REQUANTIZE_WEIGHT_DTYPE=fp4
 export MOE_REQUANTIZE_BLOCK_SIZE=512
 export TPU_ROPE_CACHE_ROW_MAJOR=1
 export TPU_MOE_HASH_TABLE_ROW_MAJOR=1
+# Fused MoE v2. W4A8 is required too: on fp4 weights the first var alone is a
+# no-op.
+export USE_MOE_FUSED_EP_KERNEL=1
+export MOE_FUSED_EP_ENABLE_W4A8=1
+export MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE=2
+export TPU_MOE_SKIP_PADDED_TOKENS=1
+export RAGGED_GATHER_REDUCE_VERSION=v3
+export LIBTPU_INIT_ARGS="--xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
 export VLLM_NO_USAGE_STATS=1
@@ -48,7 +56,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=14400
 # REQUIRED on the Ray path, silent if omitted: vllm only copies prefixed vars
 # into DP engine actors, so the model-defining vars above are dropped and the
 # actors build a different model without failing.
-export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="NEW_MODEL_DESIGN,MODEL_IMPL_TYPE,MOE_REQUANTIZE_WEIGHT_DTYPE,MOE_REQUANTIZE_BLOCK_SIZE,TPU_ROPE_CACHE_ROW_MAJOR,TPU_MOE_HASH_TABLE_ROW_MAJOR,TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE,TORCH_DIST_TIMEOUT"
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="NEW_MODEL_DESIGN,MODEL_IMPL_TYPE,MOE_REQUANTIZE_WEIGHT_DTYPE,MOE_REQUANTIZE_BLOCK_SIZE,TPU_ROPE_CACHE_ROW_MAJOR,TPU_MOE_HASH_TABLE_ROW_MAJOR,TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE,TORCH_DIST_TIMEOUT,USE_MOE_FUSED_EP_KERNEL,MOE_FUSED_EP_ENABLE_W4A8,MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,TPU_MOE_SKIP_PADDED_TOKENS,RAGGED_GATHER_REDUCE_VERSION,LIBTPU_INIT_ARGS"
 
 # mmlu_llama prefills an assistant turn; renders without a trailing eos_token.
 export TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE=1

@@ -325,7 +325,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         raw_gate: jax.Array,  # [T, H * D]
         beta: jax.Array,  # [T, H]
         output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 3, H, D]
+        conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D] or flat 3-D
         recurrent_state: jax.Array,  # [num_slots, H, K, V]
         conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
         a_log: jax.Array,  # [H]
@@ -355,10 +355,12 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         if window_distribution is None:
             window_distribution = distribution
 
-        # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
-        # out as (3, H, D) in row-major order, which is exactly the flat
-        # `dim` axis the fused kernel indexes -- the reshapes are free. The
-        # kernel wants the weight transposed to [dim, 1, kernel_size].
+        # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
+        # row-major order, which is exactly the flat `dim` axis the fused
+        # kernel indexes -- the reshapes are free. The dense `conv_state`
+        # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
+        # is read in place; the pooled path hands in its gathered slots flat.
+        # The kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
         if num_spec_tokens > 0 and slot_read_offsets is None:

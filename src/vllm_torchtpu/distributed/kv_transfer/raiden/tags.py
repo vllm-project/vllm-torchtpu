@@ -14,6 +14,27 @@ TAG_DSA_IDX = "dsa.idx"
 TAG_MLA_NOPE = "mla.nope"
 TAG_MLA_ROPE = "mla.rope"
 
+# DeepSeek-V4. Its logical caches alias one array at the same byte offset and
+# are told apart only by block ID, so every tag carries a ``.g{index}`` suffix
+# naming its kv-cache group. Without it a tag would address another cache's
+# pages.
+TAG_DSV4_CSA_NOPE = "dsv4.csa.nope"
+TAG_DSV4_CSA_ROPE = "dsv4.csa.rope"
+TAG_DSV4_IDX = "dsv4.idx"
+TAG_DSV4_HCA = "dsv4.hca"
+TAG_DSV4_SWA = "dsv4.swa"
+# The compressor's paged staging buffer. One tag per compressed-KV role,
+# because their windows, and so their per-request block counts, differ.
+TAG_DSV4_STATE_CSA = "dsv4.state.csa"
+TAG_DSV4_STATE_IDX = "dsv4.state.idx"
+TAG_DSV4_STATE_HCA = "dsv4.state.hca"
+
+
+def dsv4_group_tag(base_tag: str, group_index: int) -> str:
+    """``dsv4.swa`` + group 3 -> ``dsv4.swa.g3``."""
+    return f"{base_tag}.g{int(group_index)}"
+
+
 # Per-layer tags: ``<class tag>.l<layer index>``. A pipeline-parallel
 # producer stage registers only its own layers, so pools pair up by layer
 # rather than by manifest position; both transfer peers must build their

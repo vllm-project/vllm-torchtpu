@@ -10,12 +10,14 @@ from vllm_torchtpu import envs
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
     # Enable Tier-2 cache in memory (required by Tier-3)
-    os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE",
-                          "tpu_tier2_cache")
-    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
-                          envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT)
-    os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
-                          "tpu_tier2_cache")
+    os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", "tpu_tier2_cache")
+    os.environ.setdefault(
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+        envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT,
+    )
+    os.environ.setdefault(
+        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "tpu_tier2_cache"
+    )
 
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
@@ -31,8 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 # Dynamo Unsupported crash during vLLM startup (fullgraph=True). Setting
 # this to false allows functional collectives to compile under SPMD, which
 # is safe and required for Tensor Parallelism.
-os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                      "false")
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
 
 # vLLM 0.27.0 auto-enables breakable cudagraph for Kimi K3, disabling its
 # torch.compile pipeline. TPU does not support CUDA graphs and requires that
@@ -64,8 +65,10 @@ os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
 # A sized pool restores the pinned fast path; 16 GiB per worker covers the
 # connector's host mirrors with headroom. Must run before torch_tpu is
 # imported; overridable by presetting the variable.
-if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
-        "TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1":
+if (
+    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
+    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
+):
     os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
 
 # TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
@@ -86,10 +89,11 @@ if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
 # same layout; a mismatched pair still fails closed through the layout
 # fingerprint.  An unparsable value raises here, at startup, rather than
 # letting the two readers diverge.
-if os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden" or os.getenv(
-        "TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1":
-    _raiden_transfer_degree = int(
-        os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8")
+if (
+    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
+    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
+):
+    _raiden_transfer_degree = int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8")
     if _raiden_transfer_degree >= 8:
         os.environ.setdefault("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
 
@@ -121,6 +125,7 @@ def _fetch_tpu_type_from_metadata() -> str | None:
     # this file exists to enforce.
     try:
         import requests
+
         resp = requests.get(
             "http://metadata.google.internal/computeMetadata/v1/"
             "instance/attributes/accelerator-type",
@@ -160,7 +165,8 @@ def _user_has_flag(flag_name: str) -> bool:
     # that embeds ours as a prefix doesn't false-positive.
     return any(
         token.startswith(flag_name + "=") or token == flag_name
-        for token in _existing_libtpu_args.split())
+        for token in _existing_libtpu_args.split()
+    )
 
 
 _libtpu_extra_args: list[str] = []
@@ -180,8 +186,8 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
     for _flag_name in (
-            "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
@@ -221,6 +227,7 @@ def _patch_jax_pallas_fori_lowering() -> None:
 
     import inspect
     import textwrap
+
     try:
         src = textwrap.dedent(inspect.getsource(orig))
     except Exception:
@@ -232,8 +239,7 @@ def _patch_jax_pallas_fori_lowering() -> None:
     patched_src = src.replace(needle, fix, 1)
     ns: dict = {"__name__": _lowering.__name__}
     try:
-        exec(compile(patched_src, _lowering.__file__, "exec"),
-             _lowering.__dict__, ns)
+        exec(compile(patched_src, _lowering.__file__, "exec"), _lowering.__dict__, ns)
     except Exception:
         return
     new_fn = ns.get("_lower_jaxpr_to_for_loop")

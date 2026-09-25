@@ -173,6 +173,7 @@ def _build_op(
     scoring_fn="softmax",
     has_score_bias=False,
     routed_scaling_factor=1.0,
+    has_hash_ids=False,
     *,
     token_replica_groups=None,
 ):
@@ -190,6 +191,7 @@ def _build_op(
         scoring_fn,
         has_score_bias,
         routed_scaling_factor,
+        has_hash_ids,
         token_replica_groups,
     )
     cached = _OPS.get(key)
@@ -268,6 +270,28 @@ def _build_op(
             score_bias=score_bias.astype(jnp.float32),
         )
 
+    def moe_with_hash_ids(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+        )
+
+    assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -275,17 +299,27 @@ def _build_op(
     # straight to shard_map, so a heterogeneous tuple is what it wants; the
     # bias is NOT closed over as a constant because it differs per layer and
     # `_OPS` would then key one exported program per MoE layer.
-    input_specs = (spec,) * 7 + ((PartitionSpec(),) if has_score_bias else ())
+    input_specs = (
+        (spec,) * 7
+        + ((PartitionSpec(),) if has_score_bias else ())
+        + ((spec,) if has_hash_ids else ())
+    )
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
     # where a shard_map result is recorded as replicated, so this rank's 2048
     # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
     # with only that line replaced.
+    if has_score_bias:
+        fn = moe_with_score_bias
+    elif has_hash_ids:
+        fn = moe_with_hash_ids
+    else:
+        fn = moe
     op = sharded_jax_op(
         name,
-        moe_with_score_bias if has_score_bias else moe,
+        fn,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias] -- and
-        # the single output is sharded on axis 0 like x.
+        # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+        # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
@@ -311,6 +345,7 @@ def fused_moe_ep(
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
+    hash_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -321,9 +356,11 @@ def fused_moe_ep(
     only call this when that said yes.
 
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
-    f32, and must be passed exactly when prebuild saw one on the layer --
-    prebuild built the op's signature around that. Getting it wrong is a
-    torch arity error at the first call, not a wrong answer.
+    f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
+    lookup. Each must be passed exactly when prebuild saw the corresponding
+    thing on the layer -- prebuild built the op's signature around that.
+    Getting it wrong is a torch arity error at the first call, not a wrong
+    answer.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -335,9 +372,8 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    if score_bias is None:
-        return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, score_bias)
+    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -365,6 +401,30 @@ def register_score_bias_buffer(layer) -> torch.Tensor | None:
 def score_bias_operand(layer) -> torch.Tensor | None:
     """The staged bias for this layer, or None. Safe inside a traced forward."""
     return getattr(layer, FUSED_MOE_EP_SCORE_BIAS_ATTR, None)
+
+
+def hash_topk_ids_operand(layer, input_ids: torch.Tensor | None) -> torch.Tensor | None:
+    """DeepSeek-V4's per-token expert ids, or None for a top-k layer.
+
+    The table lookup stays out here rather than moving into the kernel: it is
+    one gather of `[tokens, topk]` int32 against a table the kernel would
+    otherwise have to hold, and it is the same expression the grouped-matmul
+    path routes with (`moe_routing._hash_moe_select`), so the two paths cannot
+    drift into selecting different experts.
+
+    `input_ids` must be this rank's OWN ids, one per row of the hidden states
+    the kernel is about to be handed -- an armed layer owns its dispatch, so
+    vLLM does not DP-gather the rows and the ids must not be gathered either.
+    """
+    table = getattr(layer, "hash_indices_table", None)
+    if table is None:
+        return None
+    if input_ids is None:
+        raise ValueError(
+            "the fused EP MoE kernel is armed for a hash-routed layer, which "
+            "selects its experts from input_ids, and none were supplied"
+        )
+    return table[input_ids.long().flatten()].to(torch.int32)
 
 
 def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
@@ -417,6 +477,7 @@ def prebuild_fused_moe_ep(
     weight_format="fp8",
     rhs_qb=None,
     weights=None,
+    supplies_hash_ids=False,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -427,6 +488,14 @@ def prebuild_fused_moe_ep(
     Returns the op to serve this layer with, or None on any refusal. The caller
     records it, which is what makes arming per layer rather than per process --
     several of the refusals below read things that vary by layer.
+
+    `supplies_hash_ids` says the caller will pass `hash_topk_ids_operand` on
+    every forward. Hash routing is a property of the LAYER, but whether it can
+    be served is a property of the quant method calling this: only the
+    DeepSeek-V4 MXFP4 method is handed `input_ids`, and arming a hash-routed
+    layer under a method that is not would route every token by top-k instead,
+    silently. So the layer's table alone does not admit it; the caller's
+    promise does.
 
     `weights` optionally supplies (w1, w2, w1_scale, w2_scale) before they are
     installed on the layer. NVFP4 uses meta tensors describing the proposed
@@ -551,7 +620,12 @@ def prebuild_fused_moe_ep(
         return None
 
     reason = fused_moe_ep_unsupported_reason(
-        layer, weights, activation, weight_format=weight_format, rhs_qb=rhs_qb
+        layer,
+        weights,
+        activation,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        supplies_hash_ids=supplies_hash_ids,
     )
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
@@ -562,6 +636,7 @@ def prebuild_fused_moe_ep(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
+    has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     op = _build_op(
         mesh,
         topk,
@@ -574,12 +649,14 @@ def prebuild_fused_moe_ep(
         scoring_fn,
         has_score_bias,
         routed_scale,
+        has_hash_ids,
         token_replica_groups=token_replica_groups,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s routed_scale=%s token_replica_groups=%s",
+        "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
+        "token_replica_groups=%s",
         hidden,
         inter,
         local_experts,
@@ -593,6 +670,7 @@ def prebuild_fused_moe_ep(
         activation,
         scoring_fn,
         has_score_bias,
+        has_hash_ids,
         routed_scale,
         token_replica_groups,
     )
@@ -613,7 +691,13 @@ def prebuild_fused_moe_ep(
 
 
 def fused_moe_ep_unsupported_reason(
-    layer, weights, activation, *, weight_format="fp8", rhs_qb=None
+    layer,
+    weights,
+    activation,
+    *,
+    weight_format="fp8",
+    rhs_qb=None,
+    supplies_hash_ids=False,
 ) -> str | None:
     """Validate prepared (or meta) weights and routing before installation."""
     w1, w2, w1_scale, w2_scale = weights
@@ -671,7 +755,7 @@ def fused_moe_ep_unsupported_reason(
         or getattr(layer, "w2_bias", None) is not None
     ):
         return "expert biases are not wired through the fused EP op"
-    return _unsupported_routing_reason(layer)
+    return _unsupported_routing_reason(layer, supplies_hash_ids=supplies_hash_ids)
 
 
 def _routing_config(layer) -> tuple[str, bool, float]:
@@ -688,17 +772,22 @@ def _routing_config(layer) -> tuple[str, bool, float]:
     return scoring_fn, has_bias, scale
 
 
-def _unsupported_routing_reason(layer) -> str | None:
+def _unsupported_routing_reason(layer, *, supplies_hash_ids=False) -> str | None:
     """Why this layer's ROUTING cannot go through the kernel, or None.
 
     The fused path never calls `moe_routing.route`: the kernel scores with a
     plain softmax and selects top-k itself, with `renormalize` as its only
     option. Everything else `select_experts` can do -- a different scoring
-    function, an expert-score correction bias, expert grouping, hash routing,
-    a routed scaling factor, a supplied `custom_routing_function` -- is not
-    that, and taking the fused path anyway routes tokens to a DIFFERENT set of
-    experts with different gate weights, with nothing raised and nothing
-    logged. Each of these is a refusal rather than a silent divergence.
+    function, an expert-score correction bias, expert grouping, a supplied
+    `custom_routing_function` -- is not that, and taking the fused path anyway
+    routes tokens to a DIFFERENT set of experts with different gate weights,
+    with nothing raised and nothing logged. Each of these is a refusal rather
+    than a silent divergence.
+
+    Hash routing is the one that is now served rather than refused: the
+    caller looks the ids up and hands them to the kernel in place of its own
+    selection. It is still refused for a caller that did not promise to supply
+    them -- see `supplies_hash_ids` on `prebuild_fused_moe_ep`.
     """
     from vllm_torchtpu.kernels.fused_moe.v2.layer import SCORING_FNS
     from vllm_torchtpu.layers.adapter import moe_routing
@@ -729,8 +818,26 @@ def _unsupported_routing_reason(layer) -> str | None:
         and layer.topk_group < layer.num_expert_group
     ):
         return "grouped top-k routing is not implemented in the kernel"
-    if getattr(layer, "hash_indices_table", None) is not None:
-        return "hash routing is not implemented in the kernel"
+    table = getattr(layer, "hash_indices_table", None)
+    if table is not None:
+        if not supplies_hash_ids:
+            return (
+                "this layer routes by hash table and its quant method "
+                "does not supply input_ids to the fused op"
+            )
+        if has_bias:
+            # Nothing selects with the biased scores on this path, so a bias
+            # here would be dropped rather than applied.
+            return (
+                "hash routing with an e_score_correction_bias: the table "
+                "makes the selection the bias exists to shift"
+            )
+        topk = layer.moe_config.experts_per_token
+        if table.ndim != 2 or table.shape[1] != topk:
+            return (
+                f"hash_indices_table {tuple(table.shape)} is not one row "
+                f"per token id with the layer's topk={topk} expert ids"
+            )
     # The routing simulator replaces the routing output wholesale, so a run
     # that asked for it and got real routing is a profiling result that is
     # quietly not the thing it claims to measure.

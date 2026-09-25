@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mocks for vllm-omni modules for unit testing."""
+
 import sys
 from unittest.mock import MagicMock
 
@@ -44,7 +45,6 @@ class _MockOmniPlatform:
 
 
 class _MockSDPABackend:
-
     @classmethod
     def get_name(cls):
         return "SDPA"
@@ -59,24 +59,15 @@ class _MockSDPABackend:
 
 
 class _MockSDPAImpl:
-
-    def __init__(self,
-                 num_heads,
-                 head_size,
-                 scale=None,
-                 num_kv_heads=None,
-                 **kwargs):
+    def __init__(self, num_heads, head_size, scale=None, num_kv_heads=None, **kwargs):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
 
-    def _forward_impl(self,
-                      query,
-                      key,
-                      value,
-                      attn_metadata=None,
-                      mask_mode="broadcast_k"):
+    def _forward_impl(
+        self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
+    ):
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             key = torch.repeat_interleave(key, n_rep, dim=2)
@@ -85,7 +76,8 @@ class _MockSDPAImpl:
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scale)
+            q, k, v, scale=self.scale
+        )
         return out.transpose(1, 2)
 
 
@@ -111,28 +103,30 @@ vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
 vllm_omni_mock.diffusion.attention.backends.sdpa.SDPABackend = _MockSDPABackend
 vllm_omni_mock.diffusion.attention.backends.sdpa.SDPAImpl = _MockSDPAImpl
 vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend = (
-    lambda *args, **kwargs: None)
-vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = (
-    _MockLTXRuntime)
+    lambda *args, **kwargs: None
+)
+vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
-sys.modules[
-    "vllm_omni.platforms.interface"] = vllm_omni_mock.platforms.interface
+sys.modules["vllm_omni.platforms.interface"] = vllm_omni_mock.platforms.interface
 sys.modules["vllm_omni.diffusion"] = vllm_omni_mock.diffusion
 sys.modules["vllm_omni.diffusion.ipc"] = vllm_omni_mock.diffusion.ipc
-sys.modules[
-    "vllm_omni.diffusion.diffusion_engine"] = vllm_omni_mock.diffusion.diffusion_engine
-sys.modules[
-    "vllm_omni.diffusion.attention"] = vllm_omni_mock.diffusion.attention
+sys.modules["vllm_omni.diffusion.diffusion_engine"] = (
+    vllm_omni_mock.diffusion.diffusion_engine
+)
+sys.modules["vllm_omni.diffusion.attention"] = vllm_omni_mock.diffusion.attention
 sys.modules["vllm_omni.diffusion.attention.backends"] = (
-    vllm_omni_mock.diffusion.attention.backends)
+    vllm_omni_mock.diffusion.attention.backends
+)
 sys.modules["vllm_omni.diffusion.attention.backends.registry"] = (
-    vllm_omni_mock.diffusion.attention.backends.registry)
+    vllm_omni_mock.diffusion.attention.backends.registry
+)
 sys.modules["vllm_omni.diffusion.attention.backends.sdpa"] = (
-    vllm_omni_mock.diffusion.attention.backends.sdpa)
-sys.modules["vllm_omni.diffusion.models"] = (vllm_omni_mock.diffusion.models)
-sys.modules["vllm_omni.diffusion.models.ltx2"] = (
-    vllm_omni_mock.diffusion.models.ltx2)
+    vllm_omni_mock.diffusion.attention.backends.sdpa
+)
+sys.modules["vllm_omni.diffusion.models"] = vllm_omni_mock.diffusion.models
+sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models.ltx2
 sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
-    vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime)
+    vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
+)

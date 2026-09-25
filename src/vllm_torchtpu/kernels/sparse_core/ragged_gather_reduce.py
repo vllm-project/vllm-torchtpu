@@ -360,11 +360,11 @@ def main_kernel(
                 # (and to avoid using `pl.when`).
                 last_valid_src_row_vmem = -1
                 last_valid_dst_row_hbm = -1
-                for i, (src_row_idx_in_vmem, row_valid) in enumerate(
+                for i, (src_row_idx, row_valid) in enumerate(
                     zip(src_row_idx_in_vmem, row_valid_vec, strict=True)
                 ):
                     src_row_vmem = jnp.where(
-                        row_valid, src_row_idx_in_vmem, last_valid_src_row_vmem
+                        row_valid, src_row_idx, last_valid_src_row_vmem
                     )
                     dst_row_hbm = jnp.where(
                         row_valid, dst_indices[i], last_valid_dst_row_hbm

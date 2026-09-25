@@ -17,11 +17,9 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query,
-                                  key,
-                                  value,
-                                  attn_metadata,
-                                  mask_mode="broadcast_k")
+        return self._forward_impl(
+            query, key, value, attn_metadata, mask_mode="broadcast_k"
+        )
 
 
 class TpuSDPABackend(SDPABackend):
