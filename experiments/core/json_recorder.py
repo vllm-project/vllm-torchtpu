@@ -1,7 +1,8 @@
 """Thread-safe recorder for persisting experiment results to sweep.json.
 
 Complies with the formal Experiment Sweep JSON schema v1.0.0 and optionally
-uploads artifacts (such as xplane traces) and sweep metadata to GCS.
+uploads artifacts (such as xplane traces and, when ``evaluation.upload_samples``
+is set, the whole lm_eval eval_logs/ folder) and sweep metadata to GCS.
 """
 
 import glob
@@ -148,6 +149,20 @@ class JsonResultRecorder(IResultRecorder):
             exp.get("parameters", {}).get("trace") is True
             for exp in self.data.get("experiments", []))
 
+    def _is_sample_upload_enabled(self) -> bool:
+        """Returns True if ``evaluation.upload_samples`` is set in sweep metadata."""
+        meta = self.data.get("metadata", {}) or {}
+        candidates = (meta.get("evaluation"), (meta.get("config")
+                                               or {}).get("evaluation"))
+        for eval_cfg in candidates:
+            if isinstance(eval_cfg, dict):
+                val = eval_cfg.get("upload_samples")
+                if val is True:
+                    return True
+                if str(val).strip().lower() in ("true", "1", "yes"):
+                    return True
+        return False
+
     def _verify_traces_saved(self,
                              traces_dir: str,
                              timeout_s: float = 30.0) -> List[str]:
@@ -186,6 +201,9 @@ class JsonResultRecorder(IResultRecorder):
             if self.upload_gcs and self._is_tracing_enabled(
             ) and os.path.isdir(traces_dir):
                 self._upload_traces_unlocked(traces_dir)
+
+            if self.upload_gcs and self._is_sample_upload_enabled():
+                self._upload_eval_logs_unlocked()
 
             self._flush_unlocked()
             if self.upload_gcs:
@@ -257,6 +275,39 @@ class JsonResultRecorder(IResultRecorder):
                         traces.append(u)
 
         return trace_uris
+
+    def _upload_eval_logs_unlocked(self) -> Optional[str]:
+        """Uploads the whole eval_logs/ folder (samples_*.jsonl, results_*.json, ...) to GCS.
+
+        The local layout is mirrored under <gcs_sweep_dir>/eval_logs/, e.g.
+        eval_logs/<model>/samples_<task>_<ts>.jsonl. Failures are logged, never raised.
+        """
+        eval_logs = os.path.join(self.json_dir, "eval_logs")
+        n_files = sum(len(files) for _, _, files in os.walk(eval_logs))
+        if not n_files:
+            print(
+                f">>> [GCS UPLOAD WARNING] upload_samples enabled but {eval_logs} is missing or empty"
+            )
+            return None
+        dest = f"{self.gcs_sweep_dir}/eval_logs"
+        try:
+            res = subprocess.run(
+                ["gsutil", "-m", "-q", "rsync", "-r", eval_logs, dest],
+                capture_output=True,
+                text=True,
+                timeout=600)
+            if res.returncode == 0:
+                print(
+                    f">>> [GCS UPLOAD] Successfully uploaded eval_logs/ ({n_files} file(s)) to {dest}/"
+                )
+                return dest
+            print(
+                f">>> [GCS UPLOAD WARNING] eval_logs upload failed (code {res.returncode}): {res.stderr.strip()}"
+            )
+        except Exception as e:
+            print(">>> [GCS UPLOAD ERROR] Exception during eval_logs upload: "
+                  f"{e}")
+        return None
 
     def _upload_to_gcs_unlocked(self) -> None:
         """Uploads sweep.json to GCS staging bucket."""
