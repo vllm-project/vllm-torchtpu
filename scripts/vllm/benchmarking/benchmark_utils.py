@@ -494,7 +494,7 @@ def eval_benchmark_dataset_result(
         eval_accuracy_mmmu_pro(request_outputs)
     else:
         raise NotImplementedError(
-            "Evaluation is not support for dataset: %s" % dataset_name
+            f"Evaluation is not support for dataset: {dataset_name}"
         )
 
 

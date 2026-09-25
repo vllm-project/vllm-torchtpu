@@ -28,13 +28,14 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 async def start_stop_profile(base_url: str, action: Literal["start", "stop"]):
     """A start / stop profile utility for vLLM server."""
     api_url = base_url + f"/{action}_profile"
-
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        async with session.post(url=api_url) as response:
-            if (code := response.status) != 200:
-                logger.warning(f"{action=} profile failed: {code=}")
-                return False
-            return True
+    async with (
+        aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session,
+        session.post(url=api_url) as response,
+    ):
+        if (code := response.status) != 200:
+            logger.warning(f"{action=} profile failed: {code=}")
+            return False
+        return True
 
 
 async def async_request_openai_completions(

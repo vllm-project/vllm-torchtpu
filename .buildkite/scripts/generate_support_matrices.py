@@ -29,8 +29,7 @@ def get_buildkite_metadata(key: str, default: str = "") -> str:
         result = subprocess.run(
             ["buildkite-agent", "meta-data", "get", key, "--default", default],
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
         return result.stdout.rstrip("\r\n")
@@ -44,8 +43,7 @@ def set_buildkite_metadata(key: str, value: str) -> None:
         subprocess.run(
             ["buildkite-agent", "meta-data", "set", key, value],
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
@@ -58,8 +56,7 @@ def upload_buildkite_artifact(file_path: str) -> None:
         subprocess.run(
             ["buildkite-agent", "artifact", "upload", file_path],
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
