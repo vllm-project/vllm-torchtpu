@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 from vllm.config import get_current_vllm_config
 
 import vllm_torchtpu.envs as envs
@@ -38,7 +39,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
     ep_token_replica_groups,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental import adaptive_fused_moe as adaptive_kernel
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
@@ -479,11 +479,14 @@ def _build_op(
         )
 
     spec = PartitionSpec(EP_AXIS_NAME)
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
-    op = sharded_jax_op(
+    # Stock jax_op. It used to size its outputs from the export's avals, where
+    # a shard_map result is recorded as replicated, so this rank's 2048 rows
+    # came back claiming the mesh-wide 16384; `sharded_jax_op`, which derives
+    # JaxCallable.__call__ from the installed source and replaces the line that
+    # builds the output placeholders, was the way around it. Torchtpu takes
+    # output_partition_specs itself now -- the same information, and it cannot
+    # come loose the way a text match on someone else's source can.
+    op = jax_op(
         name,
         moe,
         mesh=mesh,
@@ -493,9 +496,8 @@ def _build_op(
         output_partition_specs=spec,
     )
 
-    # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
-    # which resolves the output aval by running a real `jax.export` every time
-    # Dynamo traces the op. This kernel returns the rows it was given, so the
+    # Deliberately replaces the fake jax_op installs, which resolves the output
+    # aval by running a real `jax.export` every time Dynamo traces the op. This kernel returns the rows it was given, so the
     # answer is known without exporting for it.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
