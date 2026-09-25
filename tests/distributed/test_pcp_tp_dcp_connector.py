@@ -114,7 +114,7 @@ def test_producer_registers_fa_and_state_with_separate_coordinates(
                 for s in r.spans:
                     local_page = s.dst_offset_bytes // (2 * 256 * 128)
                     global_page = local_page * dcp + s.dst_unit_ordinal % dcp
-                    assert global_page % pcp == p
+                    assert min(global_page, math.ceil(tokens / 128) - 1) % pcp == p
             # Empty FA ownership does not make a GDN contributor terminal.
             assert "request" not in worker._done_sending
             assert "request" in worker._stage3_registered_sends

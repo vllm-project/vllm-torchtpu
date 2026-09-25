@@ -2028,7 +2028,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     )
                     params["_remote_kv_processed"] = True
             return False, None
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             return False, None
 
         # Decode deliberately computes the final prompt token locally to
@@ -2057,9 +2060,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if (
             not _uses_tp_stage3_source(self.vllm_config)
             and not _use_raiden_dsv4_admission()
+            and not self._stage3_mamba_group_indices
             and pcp_size > 1
         ):
-            # The interleave minimum applies to PCP sources only.
+            # Retain the short-prefix bypass for FA-only PCP sources.
+            # Hybrid ranks have GDN state to send even without FA tokens.
             interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
             min_transfer_tokens = pcp_size * interleave_size
             if num_tokens < min_transfer_tokens:

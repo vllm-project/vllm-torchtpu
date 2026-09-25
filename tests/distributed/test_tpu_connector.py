@@ -1452,6 +1452,57 @@ class TestTPURaidenConnectorScheduler:
         else:
             assert (delay, params) == (False, {})
 
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("prompt_tokens", [1, 2, 65, 2048, 2049, 8192])
+    def test_stage3_short_hybrid_pcp16tp2_metadata(self, status, hybrid, prompt_tokens):
+        producer = _make_raiden_scheduler(
+            is_producer=True, block_size=384, pcp_size=16, tp_size=2
+        )
+        producer.vllm_config.parallel_config.cp_kv_cache_interleave_size = 128
+        producer.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "destination_decode_context_parallel_size": 8,
+        }
+        producer._stage3_mamba_group_indices = [1] if hybrid else []
+        req = SimpleNamespace(
+            request_id="short-hybrid",
+            num_prompt_tokens=prompt_tokens,
+            num_computed_tokens=prompt_tokens,
+            status=status,
+            kv_transfer_params=None,
+        )
+        num_tokens = prompt_tokens - 1
+        block_ids = list(range(100, 100 + (num_tokens + 6143) // 6144))
+        with (
+            patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+            patch(f"{_MOD}._use_raiden_glm_admission", return_value=False),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS", "p:27000"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "producer"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 32),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS", None),
+            patch(f"{_MOD}._raiden_dst_shards", return_value=32),
+        ):
+            delay, params = producer.request_finished(
+                req, block_ids, mamba_block_ids=[[200]] if hybrid else None
+            )
+        if num_tokens > 0 and (hybrid or num_tokens >= 2048):
+            assert delay
+            assert params["num_tokens"] == num_tokens
+            assert params["dst_tp_size"] == 32
+            assert params["dst_dcp_size"] == 8
+            send = producer.reqs_to_send[req.request_id]
+            assert send.local_block_ids == block_ids
+            assert send.mamba_state_block_ids == ([200] if hybrid else None)
+        else:
+            assert (delay, params) == (False, {})
+            assert not producer.reqs_to_send
+
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         requests = []

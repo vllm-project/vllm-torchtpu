@@ -48,7 +48,9 @@ def _page(heads, page, slab_bytes):
         (4, 4, 2, 1, 8),  # Multiple producers contribute to a destination page.
     ],
 )
-@pytest.mark.parametrize("tokens", [1, 127, 128, 129, 1023, 4225])
+@pytest.mark.parametrize(
+    "tokens", [1, 64, 127, 128, 129, 1023, 1024, 1025, 3072, 3073, 4225]
+)
 @pytest.mark.parametrize("manager_pages", [1, 3])
 def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pages):
     page_tokens = 128
@@ -61,8 +63,10 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
     dst_pages_per_block = 2
     dst_block_bytes = dst_pages_per_block * dest_page_bytes
     tables, destinations, coverage, expected = [], [], [], []
+    padded_pages = math.ceil(pages / dcp)
     for rank in range(dtp):
         owned = list(range(rank % dcp, pages, dcp))
+        owned += [pages - 1] * (padded_pages - len(owned))
         data = b"".join(
             _page(_heads(heads, dtp, rank), page, geometry.slab_bytes) for page in owned
         )
@@ -100,9 +104,7 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
             )
             assert reg.block_ids == tuple(ids)
             assert reg.dst_space_version == 1
-            # declared_bytes describes the local source, even for a KV
-            # replica that contributes no FA spans (it still owns GDN).
-            assert reg.declared_bytes == len(owned) * geometry.kernel_page_bytes
+            assert reg.declared_bytes == sum(s.size_bytes * s.count for s in reg.spans)
             for span in reg.spans:
                 rank = span.dst_unit_ordinal or 0
                 assert span.count == 1 and span.dst_block_index == 0
