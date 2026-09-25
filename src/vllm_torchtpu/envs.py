@@ -819,14 +819,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION":
-    env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
-    "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE":
-    env_nonnegative_int("MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0),
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
+        "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
+    ),
 }
 
 

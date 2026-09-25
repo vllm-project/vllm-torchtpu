@@ -126,10 +126,12 @@ class TestChunkedVideoEncodingContext:
         model_config = SimpleNamespace(multimodal_config=None)
 
         kwargs, _, _ = _make_video_kwargs(8, 2, 2)  # 32 patches
-        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "8"}):
-            with mvc.chunked_video_encoding(model, model_config):
-                assert model.embed_multimodal is not embed_multimodal
-                model.embed_multimodal(**kwargs)
+        with (
+            patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "8"}),
+            mvc.chunked_video_encoding(model, model_config),
+        ):
+            assert model.embed_multimodal is not embed_multimodal
+            model.embed_multimodal(**kwargs)
 
         # Chunked into 4 forwards of 2 temporal patches each ...
         assert len(calls) == 4
@@ -141,20 +143,20 @@ class TestChunkedVideoEncodingContext:
         embed_multimodal = MagicMock()
         model.embed_multimodal = embed_multimodal
 
-        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "0"}):
-            with mvc.chunked_video_encoding(
-                model, SimpleNamespace(multimodal_config=None)
-            ):
-                assert model.embed_multimodal is embed_multimodal
+        with (
+            patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "0"}),
+            mvc.chunked_video_encoding(model, SimpleNamespace(multimodal_config=None)),
+        ):
+            assert model.embed_multimodal is embed_multimodal
 
     def test_noop_for_text_only_model(self):
         """A model without ``embed_multimodal`` is left alone."""
         model = torch.nn.Linear(2, 2)
-        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "8"}):
-            with mvc.chunked_video_encoding(
-                model, SimpleNamespace(multimodal_config=None)
-            ):
-                assert not hasattr(model, "embed_multimodal")
+        with (
+            patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "8"}),
+            mvc.chunked_video_encoding(model, SimpleNamespace(multimodal_config=None)),
+        ):
+            assert not hasattr(model, "embed_multimodal")
 
 
 class TestVideoEncoderChunking:
