@@ -98,7 +98,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         if hbm is not None:
             return hbm
         raise ValueError(
-            f"Could not determine HBM memory for attached TPU device: {hardware.get_tpu_device_name()}"
+            "Could not determine HBM memory for attached TPU device: "
+            f"{hardware.get_tpu_device_name()}"
         )
 
     @classmethod

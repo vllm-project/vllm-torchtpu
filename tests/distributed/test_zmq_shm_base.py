@@ -162,7 +162,8 @@ class _FakeContext:
 
 
 class _RecordingPool(HostKVShmPool):
-    """HostKVShmPool subclass that records invocations while preserving real shm operations.
+    """HostKVShmPool subclass that records invocations while preserving
+    real shm operations.
 
     Subclassing the production pool ensures end-to-end byte layout fidelity:
     slot allocation, tensor views passed to H2D, memoryviews passed to ZeroMQ
@@ -219,7 +220,9 @@ def _pool_spec(num_slots=2, ranks_per_host=1) -> PoolSpec:
 
 
 def _layer_payload(num_blocks: int, fill: int) -> bytes:
-    """Construct a serialized single-layer KV shard matching unpack_rank_layers requirements."""
+    """Construct a serialized single-layer KV shard matching
+    unpack_rank_layers requirements.
+    """
     elems = num_blocks * _BLOCK_SHAPE[0] * _BLOCK_SHAPE[1]
     return bytes([fill]) * (elems * _ELEM_BYTES)
 
@@ -241,7 +244,9 @@ class _FakeFuture:
 
 
 class _FakeConnector(zsb.ZmqShmKvConnectorBase):
-    """Concrete ZmqShmKvConnectorBase implementation routing transport hooks to CPU tensors."""
+    """Concrete ZmqShmKvConnectorBase implementation routing transport hooks to
+    CPU tensors.
+    """
 
     def __init__(self, vllm_config):
         self.stage_calls: list[tuple] = []
@@ -287,7 +292,8 @@ class _FakeConnector(zsb.ZmqShmKvConnectorBase):
 
 
 class _ModuleStub:
-    """Module wrapper that overrides specified attributes while delegating remaining lookups.
+    """Module wrapper that overrides specified attributes while delegating
+    remaining lookups.
 
     Patching `zsb.time` or `zsb.os` with this stub scopes overrides strictly to
     the module under test, preventing concurrent background threads from
@@ -306,7 +312,9 @@ class _ModuleStub:
 
 
 class _InlineExecutor:
-    """Synchronous executor that executes submitted callables immediately on the calling thread."""
+    """Synchronous executor that executes submitted callables immediately on
+    the calling thread.
+    """
 
     def __init__(self):
         self.submitted: list = []
@@ -325,7 +333,9 @@ class _InlineExecutor:
 
 
 def _frame(data: bytes):
-    """Lightweight zmq.Frame stand-in providing a `.buffer` attribute for message deserialization."""
+    """Lightweight zmq.Frame stand-in providing a `.buffer` attribute for
+    message deserialization.
+    """
     return SimpleNamespace(buffer=memoryview(data))
 
 
@@ -455,7 +465,9 @@ def _attach_runner(conn, *, ranks_per_host=1, num_slots=2, runner=None, pool=Tru
 
 
 def _drain_ipc(conn) -> list[tuple]:
-    """Drain all messages currently queued for the IPC thread as (ident, tag, payload) tuples."""
+    """Drain all messages currently queued for the IPC thread as
+    (ident, tag, payload) tuples.
+    """
     out = []
     while True:
         try:
@@ -820,7 +832,9 @@ class TestPoolSpec:
 
 class TestCoordSetup:
     def _setup(self, conn, *, pin=False):
-        """Execute _coord_setup with termination events preset to suppress background threads."""
+        """Execute _coord_setup with termination events preset to suppress
+        background threads.
+        """
         conn._stop_event.set()
         with (
             patch(f"{_BASE}.dist_utils.get_kv_shm_pool_gb", return_value=1.0),
@@ -1454,7 +1468,9 @@ def _pull_frames(
     with_header=True,
     uuid_echo=b"11",
 ):
-    """Construct a producer PULL response frame sequence with patterned per-layer test data."""
+    """Construct a producer PULL response frame sequence with patterned
+    per-layer test data.
+    """
     frames = [_frame(zsb._MSG_OK), _frame(uuid_echo), _frame(str(len(ranks)).encode())]
     if with_header:
         frames.append(_frame(zsb._secure_dumps({"tp_size": 1})))
@@ -1469,7 +1485,9 @@ def _pull_frames(
 
 class TestRank0Pull:
     def _prepare(self, conn, sockets):
-        """Configure make_zmq_socket to return the provided _FakeSocket instances in sequence."""
+        """Configure make_zmq_socket to return the provided _FakeSocket
+        instances in sequence.
+        """
         handed = iter(sockets)
         return patch(f"{_BASE}.make_zmq_socket", side_effect=lambda **kw: next(handed))
 
@@ -1558,7 +1576,8 @@ class TestRank0Pull:
         assert not entry.pull_ok
         assert all(s.closed for s in socks)
         # Invariant: Channel errors are deduplicated so that exactly one IPC_DROP
-        # is sent and the shm slot is released only once regardless of channel error count.
+        # is sent and the shm slot is released only once regardless of channel
+        # error count.
         assert [m[1] for m in _drain_ipc(conn)] == [zsb._IPC_DROP]
         assert conn._coord_pool.released == [0]
         assert 11 not in conn._coord_recv
@@ -2434,7 +2453,8 @@ class TestCoordinatorWorkerHandoff:
         coord._coord_sockets_lock = threading.Lock()
         _recv_entry(coord, uuid=11, slot_idx=1, side_port=9700)
 
-        # Scatter rank 0 local shard into device cache, then verify worker IPC_COPY_DONE ack.
+        # Scatter rank 0 local shard into device cache, then verify worker
+        # IPC_COPY_DONE ack.
         coord._coord_scatter_and_ack("d1", 11, 1, 2, [0, 1])
         assert 11 in coord._coord_recv
 

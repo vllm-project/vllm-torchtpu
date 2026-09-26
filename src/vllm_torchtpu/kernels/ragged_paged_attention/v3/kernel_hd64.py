@@ -31,7 +31,8 @@ def ref_ragged_paged_attention_hd64(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads, kv_packing, actual_head_dim_x2]
+    # [total_num_pages, page_size, num_kv_heads, kv_packing, actual_head_dim_x2]
+    kv_cache: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -255,24 +256,42 @@ def _ragged_paged_attention_kernel(
     # TODO(jevinjiang): merge these into one so we can save SMEM.
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
+    # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
+    #     bkv_sem_0_sz, bkv_sem_1_sz)
+    bkv_update_ids_ref,
     # Input
-    q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    kv_hbm_ref,  # [max_num_tokens, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
-    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
+    #     q_packing, head_dim]
+    q_hbm_ref,
+    # [max_num_tokens, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    kv_hbm_ref,
+    # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
+    #     actual_head_dim_x2]
+    kv_cache_hbm_ref,
     attention_sink_ref,  # [actual_num_kv_heads, num_q_heads_per_kv_head, 128]
     # Output
-    o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, actual_head_dim_x2]
-    updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
+    #     q_packing, actual_head_dim_x2]
+    o_hbm_ref,
+    # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
+    #     actual_head_dim_x2]
+    updated_kv_cache_hbm_ref,
     # Scratch
-    bkv_x2_ref,  # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
-    bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, actual_head_dim_x2]
-    bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, actual_head_dim_x2]
+    # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    bkv_x2_ref,
+    # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing,
+    #     actual_head_dim_x2]
+    bq_x2_ref,
+    # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing,
+    #     actual_head_dim_x2]
+    bo_x2_ref,
     sems,  # [4, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
-    acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, actual_head_dim_x2],
+    # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, actual_head_dim_x2],
+    acc_ref,
     *,
     sm_scale: float,
     sliding_window: int | None = None,
@@ -886,11 +905,12 @@ def _ragged_paged_attention_kernel(
                             bq_sem_idx, cur_kv_head_idx, actual_bq_sz=actual_bq_sz
                         )
                         cur_kv_head__bkv = bkv_lst[i]
-                        # FlashAttention is divided into `flash_attention_step1_qk_softmax`
-                        # and `flash_attention_step2_pv` to pipeline the computation.
-                        # `step2_pv` for the previous KV head, which depends on the softmax
-                        # output, is overlapped with `step1_qk_softmax` for the current KV
-                        # head, reducing overall wait times.
+                        # FlashAttention is divided into
+                        # `flash_attention_step1_qk_softmax` and
+                        # `flash_attention_step2_pv` to pipeline the computation.
+                        # `step2_pv` for the previous KV head, which depends on the
+                        # softmax output, is overlapped with `step1_qk_softmax` for the
+                        # current KV head, reducing overall wait times.
                         cur_kv_head_p, cur_kv_head_exp_m_diff = (
                             flash_attention_step1_qk_softmax(
                                 cur_kv_head_bq,
@@ -1058,7 +1078,9 @@ def prepare_inputs(
 
 
 def prepare_outputs(
-    out,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, actual_head_dim_x2]
+    # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
+    #     q_packing, actual_head_dim_x2]
+    out,
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
 ):
@@ -1087,7 +1109,8 @@ def dynamic_validate_inputs(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
+    # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
+    kv_cache: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1176,7 +1199,9 @@ def static_validate_inputs(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
+    #     actual_head_dim_x2]
+    kv_cache: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1340,7 +1365,9 @@ def ragged_paged_attention_hd64(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, actual_head_dim_x2]
+    # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
+    #     actual_head_dim_x2]
+    kv_cache: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1522,7 +1549,8 @@ def ragged_paged_attention_hd64(
         jnp.zeros((3,), jnp.int32),
         # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
         jnp.full((4,), -1, jnp.int32),
-        # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+        # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
+        #     bkv_sem_0_sz, bkv_sem_1_sz)
         jnp.full((6,), -1, jnp.int32),
     )
 

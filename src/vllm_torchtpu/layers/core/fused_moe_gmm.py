@@ -138,7 +138,8 @@ def requant_unpack_kmajor(
 def quantize_to_native_fp4_kmajor(
     w: jax.Array, block: int, pack: bool = True
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
+    """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and
+    per-block FP32 scale.
     Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
 
     ``pack=False`` returns the same values as ``float4_e2m1fn`` [..., K, N]
@@ -147,7 +148,8 @@ def quantize_to_native_fp4_kmajor(
     differs: the quantization above is one cast either way, so the two forms
     carry bit-identical weights and a caller may choose per layer.
 
-    TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
+    TODO: Make a more generic version of this function;
+    possibly combine with quantize_tensor_to_fp4
     """
 
     size_k = w.shape[-2]
@@ -583,12 +585,14 @@ def fused_moe_func(
     flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
     pre-#193 plain-JAX path).
 
-    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the weights.
-    Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier containers are
-    supported. Weights must be packed along the contracting dimension (K-axis) in LSB-first order.
+    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
+    weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
+    containers are supported. Weights must be packed along the contracting dimension
+    (K-axis) in LSB-first order.
     """
 
-    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N] expected by gmm_v2.
+    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
+    # expected by gmm_v2.
     if w1_scale is not None and w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
     if w2_scale is not None and w2_scale.ndim == 3:

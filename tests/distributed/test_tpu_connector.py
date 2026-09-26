@@ -1355,7 +1355,9 @@ class TestTPURaidenConnectorScheduler:
         assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
 
     def test_v3_stage3_finish_rejects_exceeding_max_transfer_tokens(self):
-        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer and free blocks."""
+        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer
+        and free blocks.
+        """
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         req = MagicMock()
         req.request_id = "too-long"
@@ -5065,16 +5067,19 @@ class TestTPUConnectorStats(unittest.TestCase):
         self, hist, num_buckets, non_zero_buckets
     ):
         assert len(hist._buckets) == num_buckets, (
-            f"Incorrect number of buckets returned: expected {num_buckets} actual {len(hist._buckets)}"
+            f"Incorrect number of buckets returned: expected {num_buckets} "
+            f"actual {len(hist._buckets)}"
         )
         for i in range(num_buckets):
             if i in non_zero_buckets:
                 assert hist._buckets[i].get() == non_zero_buckets[i], (
-                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} "
+                    f"actual: {hist._buckets[i].get()}"
                 )
             else:
                 assert hist._buckets[i].get() == 0, (
-                    f"Incorrect value for bucket {i}: expected 0 actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected 0 "
+                    f"actual: {hist._buckets[i].get()}"
                 )
 
     def test_tpu_stats_aggregation_d2h_transfer(self):

@@ -159,7 +159,8 @@ def xpose_pipeline(
 ):
     """
     Double buffer transpose custom call implementation.
-    n_tile is used to tile the parallel dimension while m_tile is used to tile the pipeline dimension.
+    n_tile is used to tile the parallel dimension while m_tile is used to tile the
+    pipeline dimension.
     Args:
       input: input array to be transposed
       tranpose_axes: transpose ordering
@@ -195,8 +196,8 @@ def xpose_pipeline(
         raise ValueError(
             f"No divisor of parallel axis size {input.shape[parallel_axis]} "
             f"is both <= {n_tile} and divisible by {sublane_multiple} "
-            f"(dtype={input.dtype}). Consider increasing n_tile and/or padding your input to be "
-            f"suble-aligned (i.e. a multiple of {sublane_multiple})."
+            f"(dtype={input.dtype}). Consider increasing n_tile and/or padding "
+            f"your input to be suble-aligned (i.e. a multiple of {sublane_multiple})."
         )
     m_tile_new = prev_closest_valid_divisor(
         input.shape[pipeline_axis], m_tile, multiple_of=sublane_multiple
@@ -205,8 +206,8 @@ def xpose_pipeline(
         raise ValueError(
             f"No divisor of pipeline axis size {input.shape[pipeline_axis]} "
             f"is both <= {m_tile} and divisible by {sublane_multiple} "
-            f"(dtype={input.dtype}). Consider increasing n_tile and/or padding your input to be "
-            f"suble-aligned (i.e. a multiple of {sublane_multiple})."
+            f"(dtype={input.dtype}). Consider increasing n_tile and/or padding "
+            f"your input to be suble-aligned (i.e. a multiple of {sublane_multiple})."
         )
     if n_tile_new != n_tile:
         logger.warning(
@@ -273,7 +274,10 @@ def xpose_pipeline(
     ]
     shape_str = "x".join([str(i) for i in input.shape])
     transpose_str = "x".join([str(i) for i in transpose_axes])
-    scope_name = f"xpose_pipeline_shape_{shape_str}_xpose_{transpose_str}_n_tile_{n_tile}_m_tile_{m_tile}_pa_{parallel_axis}_pi_{pipeline_axis}"
+    scope_name = (
+        f"xpose_pipeline_shape_{shape_str}_xpose_{transpose_str}_n_tile_{n_tile}"
+        f"_m_tile_{m_tile}_pa_{parallel_axis}_pi_{pipeline_axis}"
+    )
     return pl.pallas_call(
         xpose_kernel,
         grid=grid,

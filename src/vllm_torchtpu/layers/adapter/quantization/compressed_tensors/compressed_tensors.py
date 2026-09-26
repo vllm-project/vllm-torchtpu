@@ -26,7 +26,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
     CompressedTensorsScheme,
@@ -36,7 +36,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (  # noqa: E501
     VllmCompressedTensorsMoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
@@ -114,7 +114,8 @@ def _build_fp8_linear_method(
 
 def _raise_not_implemented(scheme_class: str) -> None:
     raise NotImplementedError(
-        f"Compressed-tensors scheme '{scheme_class}' is not implemented yet in vllm-torchtpu."
+        f"Compressed-tensors scheme '{scheme_class}' "
+        "is not implemented yet in vllm-torchtpu."
     )
 
 
@@ -213,14 +214,15 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 if weight_quant is None:
                     return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
-                # This is a bypass way of handling FP8 as a compressed tensors method for this is
-                # not implemented yet in vllm-torchtpu. Since this was an
+                # This is a bypass way of handling FP8 as a compressed tensors method
+                # for this is not implemented yet in vllm-torchtpu. Since this was an
                 # existing code, it has been moved here to ensure backward compatibility
                 if _is_weight_fp8(weight_quant):
                     return _build_fp8_linear_method(layer, weight_quant, input_quant)
 
-                # get_scheme will raise NotImplementedError since custom CompressedTensorsScheme subclasses (like
-                # W4A8, W8A8, NVFP4) have not been ported to vllm-torchtpu yet (except for non-quantized layouts).
+                # get_scheme will raise NotImplementedError since custom
+                # CompressedTensorsScheme subclasses (like W4A8, W8A8, NVFP4) have not
+                # been ported to vllm-torchtpu yet (except for non-quantized layouts).
                 scheme = self.get_scheme(layer=layer, layer_name=prefix)
                 if scheme is None:
                     return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)

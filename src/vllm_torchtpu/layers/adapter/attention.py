@@ -241,7 +241,9 @@ def _pallas_rpa_kernel_impl(
         )
         block_tables = block_tables * page_stride
     metadata = AttentionMetadata(
-        input_positions=None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
+        # NOTE: vLLM applies RoPE before attention,
+        # so input_positions is not consumed here.
+        input_positions=None,
         block_tables=block_tables,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
@@ -325,9 +327,9 @@ def _pallas_rpa_kernel_default(
 
 
 # KV-fetch block cap (tokens) for the tp=1 eagle3 draft's local RPA kernel.
-# Capping bkv shrinks the dominant KV scratch tile; the flash kernel loops over more KV chunks.
-# 1024 was validated on Llama-3.1-8B (TP=2) and Qwen3-Coder-480b(TP=8). Models with
-# many KV heads or longer sequences may need a smaller value to avoid VMEM OOM.
+# Capping bkv shrinks the dominant KV scratch tile; the flash kernel loops over more KV
+# chunks. 1024 was validated on Llama-3.1-8B (TP=2) and Qwen3-Coder-480b(TP=8). Models
+# with many KV heads or longer sequences may need a smaller value to avoid VMEM OOM.
 _DRAFT_KV_BLOCK_CAP = 1024
 
 
@@ -466,7 +468,8 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
-    """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
+    """Batched-RPA Pallas kernel entry — used by
+    `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -497,9 +500,9 @@ def _pallas_rpa_kernel_batched(
     )
 
 
-# =========================================================================================
+# ======================================================================================
 # VLLM Attention Backend
-# =========================================================================================
+# ======================================================================================
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
@@ -534,7 +537,8 @@ class PallasAttentionBackend(AttentionBackend):
         # Two different RPA kernels have different KV cache layouts:
         # - hd64 (head_dim=64): K/V packed along head_dim
         # - v3 (head_dim!=64): K/V packed along heads
-        # The Pallas kernels expect a 5D KV cache: [L, S, Kx2 / kv_packing, kv_packing, H]
+        # The Pallas kernels expect a 5D KV cache:
+        # [L, S, Kx2 / kv_packing, kv_packing, H]
         # where Kx2 = num_kv_heads for hd64 and Kx2 = num_kv_heads * 2 for v3.
         use_hd64 = head_size == 64
         # vLLM's OffloadingConnectorWorker.register_kv_caches probes this
@@ -1104,7 +1108,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Fail closed when the layer-major kernel is overridden (e.g. subclass
         # ClassVar like batched RPA, or per-instance rebinds like single-device
         # local kernels) without a corresponding bundled counterpart, preventing
-        # silent fallback to default kernels. Read via `self` to detect instance overrides.
+        # silent fallback to default kernels. Read via `self` to detect
+        # instance overrides.
         if (
             self._kernel_entry is not PallasAttentionBackendImpl._kernel_entry
             and self._kernel_entry_bundled
@@ -1199,7 +1204,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if k_scale_value != 0.0 and v_scale_value != 0.0:
                 k_scale = k_scale_value
                 v_scale = v_scale_value
-        # Pre-allocate layer index tensor on device to avoid per-step Host-to-Device copies.
+        # Pre-allocate layer index tensor on device to avoid per-step
+        # Host-to-Device copies.
         self._bundle_layer_idx_tensor = torch.tensor(
             int(layer_idx), dtype=torch.int32, device=bundle_device
         )
@@ -1286,7 +1292,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        """Process sinks after model loading - convert to float32 as required by RPA kernel."""
+        """Process sinks after model loading - convert to float32 as required
+        by RPA kernel."""
         if self.sinks is not None:
             # RPA v3 kernel requires sinks to be float32
             self.sinks = torch.nn.Parameter(
@@ -1584,7 +1591,8 @@ class PallasMLAttentionBackend(AttentionBackend):
         ):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
         if PallasMLAttentionBackend._is_ds_mla_packed_cache(cache_dtype_str):
-            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to 128-aligned minor dim.
+            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to
+            # 128-aligned minor dim.
             if head_size_is_packed_width:
                 packed_width = head_size
             else:
@@ -1818,9 +1826,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     ) -> tuple[float | None, float | None, float | None]:
         """Harvest scalar quantization scales from heterogeneous layer attributes.
 
-        Extracting deterministic scalar float values guarantees purely static execution inside
-        Pallas FX graphs without tracing dynamic tensor-shape overhead right when consuming
-        heterogeneous checkpoint FP8 scales.
+        Extracting deterministic scalar float values guarantees purely static execution
+        inside Pallas FX graphs without tracing dynamic tensor-shape overhead right when
+        consuming heterogeneous checkpoint FP8 scales.
         """
         q_scale = getattr(layer, "_q_scale_float", None)
         if q_scale is None and hasattr(layer, "_q_scale"):
@@ -2174,9 +2182,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_nope, q_pe = q
         input_dtype = q_nope.dtype
 
-        # For determine_available_memory when cache memory buffer is empty right during probe
-        # (before binding, `layer.kv_cache` is the layer's default empty
-        # tensor; after binding, sparse layers hold a (nope, rope) pair).
+        # For determine_available_memory when cache memory buffer is empty right during
+        # probe (before binding, `layer.kv_cache` is the layer's default empty tensor;
+        # after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
@@ -2210,8 +2218,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
 
-        # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
-        # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
+        # Evaluate projection matrices directly across input precision
+        # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
+        # right before `torch.bmm`.
         q_nope_t = q_nope.transpose(0, 1)
         w_uk_t = (
             w_uk_t_src.to(q_nope_t.dtype)
@@ -2341,7 +2350,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         k_scale: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Structural no-op. TPU Pallas MLA unifies projection and evaluation inside `self.forward`."""
+        """Structural no-op. TPU Pallas MLA unifies projection and evaluation
+        inside `self.forward`."""
         pass
 
     def forward_mqa(
@@ -2351,7 +2361,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         attn_metadata: AttentionMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Structural no-op. TPU Pallas MLA unifies projection and evaluation inside `self.forward`."""
+        """Structural no-op. TPU Pallas MLA unifies projection and evaluation
+        inside `self.forward`."""
         pass
 
     def do_kv_cache_update(
@@ -2363,5 +2374,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        """Structural no-op. KV cache updates occur in-place during ragged paged attention kernel run."""
+        """Structural no-op. KV cache updates occur in-place during
+        ragged paged attention kernel run."""
         pass

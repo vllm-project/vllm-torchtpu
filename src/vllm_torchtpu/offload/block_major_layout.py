@@ -56,8 +56,8 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # Schema version of the bundle memory layout (distinct from model-specific parameters).
-# Included in the logical fingerprint and namespace salt to invalidate stale cache entries
-# across layout format changes.
+# Included in the logical fingerprint and namespace salt to invalidate stale cache
+# entries across layout format changes.
 BLOCK_MAJOR_LAYOUT_VERSION = 1
 
 
@@ -66,10 +66,13 @@ class BlockMajorContract:
     """Immutable specification of the bundled KV layout agreed upon across ranks.
 
     Attributes:
-        fragment_count: Number of physical fragments folded into the bundle's layer dimension (dim 1).
+        fragment_count: Number of physical fragments folded into the bundle's layer
+            dimension (dim 1).
         fragment_row_bytes: Byte size of a single fragment's row for one kernel block.
-        bundle_row_bytes: Total contiguous byte length of one bundled kernel block across all fragments (= F * fragment_row_bytes).
-        logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must match across all serving peers.
+        bundle_row_bytes: Total contiguous byte length of one bundled kernel block
+            across all fragments (= F * fragment_row_bytes).
+        logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must
+            match across all serving peers.
     """
 
     fragment_count: int
@@ -79,7 +82,8 @@ class BlockMajorContract:
 
 
 def _canonical_layout_fingerprint(value: Mapping[str, Any]) -> str:
-    """Computes a deterministic SHA-256 fingerprint from a canonical JSON layout payload."""
+    """Computes a deterministic SHA-256 fingerprint from a canonical
+    JSON layout payload."""
     encoded = json.dumps(
         dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
@@ -116,7 +120,8 @@ def block_major_layer_indices(
             result[name] = offset // fragment_row_bytes
     if set(result.values()) != set(range(row_bytes // fragment_row_bytes)):
         raise ValueError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: placement does not tile kernel-row bytes (empty fragments)"
+            "VLLM_TPU_BLOCK_MAJOR_KV=1: placement does not tile kernel-row bytes "
+            "(empty fragments)"
         )
     return result
 
@@ -129,7 +134,8 @@ def resolve_block_major_contract(
 
     Args:
         vllm_config: Resolved vLLM engine configuration.
-        kv_cache_config: Resolved KV cache configuration containing tensor specifications.
+        kv_cache_config: Resolved KV cache configuration containing
+            tensor specifications.
 
     Returns:
         A BlockMajorContract describing the bundled layout, or None if
@@ -159,9 +165,10 @@ def resolve_block_major_contract(
     assert device_block_size % kernel_block_size == 0
     factor = device_block_size // kernel_block_size
     if factor != 1:
-        # The bundled RPA kernel and worker view require factor == 1 (device_block_size == kernel_block_size).
-        # A factor > 1 bundle would pass flat byte-size validations while scrambling layer vs. sub-block
-        # dimensional ordering during DMA transfers.
+        # The bundled RPA kernel and worker view require factor == 1
+        # (device_block_size == kernel_block_size). A factor > 1 bundle would pass flat
+        # byte-size validations while scrambling layer vs. sub-block dimensional
+        # ordering during DMA transfers.
         raise ValueError(
             "VLLM_TPU_BLOCK_MAJOR_KV=1: device_block_size "
             f"{device_block_size} != kernel_block_size {kernel_block_size} "

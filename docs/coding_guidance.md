@@ -49,7 +49,10 @@ Two meta-principles organize this document set:
   ruff manually first.
 - **R-1.3** `ruff format` wraps code at 88 columns. When a multi-line call or
   literal keeps getting re-wrapped, add a trailing comma after the last
-  element so ruff keeps one element per line.
+  element so ruff keeps one element per line. `ruff check` fails any line
+  longer than 88 (E501), and the formatter does not split comments or
+  strings, so wrap those by hand. End a line with `# noqa: E501` only when it
+  cannot be split, such as a table row or a long URL.
 - **R-1.4** Explicit imports only — no `from x import *`. Import modules or
   names directly; no aliasing to obscure single letters.
 - **R-1.5** Use modern typing: PEP 604 unions (`int | None`, not

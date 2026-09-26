@@ -93,7 +93,8 @@ TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
 
 # Multi-host TPU slice mesh topologies for TPU v8i, which uses a hierarchical
 # BoardFly topology: (Chips per Board) x (Boards per Group) x (Groups per Slice),
-# noted as C x B x G (4 chips per board, up to 8 boards per group, up to 32 groups per slice).
+# noted as C x B x G (4 chips per board, up to 8 boards per group,
+# up to 32 groups per slice).
 TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
     4: "4,1,1",
     8: "4,2,1",
@@ -111,7 +112,8 @@ TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
 }
 
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
-# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
+# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects
+# (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 
 # 3D Torus generations that expose two devices per chip. The device name
@@ -319,10 +321,12 @@ def _register_tpu_kv_connectors() -> None:
     Required for the API server metrics pipeline: TPUMultiConnector aggregates child
     connector statistics by looking up classes via get_connector_class_by_name().
     Without registry registration, the first metrics collection triggers an unhandled
-    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on
+    subsequent requests.
 
     Invoked from check_and_update_config() in every process that builds a VllmConfig
-    (including the API server). Defers imports lazily until connector names are accessed.
+    (including the API server). Defers imports lazily until connector names
+    are accessed.
     """
     global _tpu_kv_connectors_registered
     if _tpu_kv_connectors_registered:

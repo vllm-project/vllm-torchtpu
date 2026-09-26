@@ -325,7 +325,8 @@ class MMLUDataset(BenchmarkDataset):
             #     continue
             if input_len is not None and input_len <= prompt_len:
                 raise ValueError(
-                    f"prompt is too short: prompt_len is {prompt_len} but input_len is {input_len}"
+                    f"prompt is too short: prompt_len is {prompt_len} "
+                    f"but input_len is {input_len}"
                 )
             samples.append(
                 SampleRequest(
@@ -415,7 +416,8 @@ class MLPerfDataset(BenchmarkDataset):
             # at all, but it could be done here
             if input_len is not None and input_len <= prompt_len:
                 raise ValueError(
-                    f"prompt is too short: prompt_len is {prompt_len} but input_len is {input_len}"
+                    f"prompt is too short: prompt_len is {prompt_len} "
+                    f"but input_len is {input_len}"
                 )
             samples.append(
                 SampleRequest(

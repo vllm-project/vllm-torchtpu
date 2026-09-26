@@ -360,7 +360,9 @@ def test_comparison_detects_a_wrong_index(corruption):
     ],
 )
 def test_return_scores(b: int, n: int, k: int):
-    """Verifies that return_scores=True returns matching scores for winners and -inf for pad."""
+    """Verifies that return_scores=True returns matching scores for winners and
+    -inf for pad.
+    """
     np.random.seed(800 + b + n + k)
     scores = np.random.randn(b, n).astype(np.float32)
     row_lengths = np.random.randint(k, n + 1, size=(b,), dtype=np.int32)

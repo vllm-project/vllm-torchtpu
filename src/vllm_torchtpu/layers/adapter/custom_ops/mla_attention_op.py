@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
+"""Out-of-tree (OOT) custom operator layers and wrappers for
+Multi-Head Latent Attention (MLA)."""
 
 from typing import Any
 
@@ -192,7 +193,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
             weights: jax.Array,  # [num_tokens, H]
-            cache_kv: jax.Array,  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim] where lkv_dim = D + 1 padded to a 128 multiple
+            # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim]
+            # where lkv_dim = D + 1 padded to a 128 multiple
+            cache_kv: jax.Array,
             k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
             seq_lens: jax.Array,  # i32 [num_seqs]
             page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
@@ -411,7 +414,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
-        kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim], lkv_dim = head_dim + 1 padded to a 128 multiple
+        # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim],
+        # lkv_dim = head_dim + 1 padded to a 128 multiple
+        kv_cache = self.k_cache.kv_cache
         if kv_cache.numel() == 0:
             return self.topk_indices_buffer
 
@@ -710,7 +715,8 @@ class VllmTPUMLAAttention(MLAAttention):
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
 
-        # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
+        # Safely detach and clear kv_b_proj parameter buffers without breaking
+        # PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
         for key in kv_b_proj_params:
             if key in self.kv_b_proj._parameters:
@@ -969,7 +975,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 topk_index = self.topk_indices_buffer
             topk_indices = topk_index[: hidden_states.shape[0]]
 
-            # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")
+            # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling

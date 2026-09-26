@@ -125,21 +125,24 @@ def postprocess_text_mmlu(
     preds: list[str], targets: list[str]
 ) -> tuple[list[int], list[int]]:
     """
-    Postprocess the generated text to get the predicted and target answers for the MMLU dataset.
+    Postprocess the generated text to get the predicted and target answers for
+    the MMLU dataset.
 
     Args:
         preds (List[str]): List of generated text
         targets (List[str]): List of target text
 
     Returns:
-        Tuple[List[int], List[int]]: List of predicted answers and list of target answers"""
+        Tuple[List[int], List[int]]: List of predicted answers and list of
+            target answers"""
     choices = _MMLU_CHOICES
 
     def _parse_answer(output):
         output = strip_reasoning(output)
-        # TODO: This parser handles output regardless of whether a chat template is enabled.
-        # Currently, the chat-template parsing rules are based on the gpt-oss format.
-        # We will need to add rules for other models, as their output formats may differ.
+        # TODO: This parser handles output regardless of whether a chat template is
+        # enabled. Currently, the chat-template parsing rules are based on the gpt-oss
+        # format. We will need to add rules for other models, as their output formats
+        # may differ.
 
         # To match 'assistantfinal' block.
         final_block_match = re.search(

@@ -43,7 +43,8 @@ def _stitch_decode_lane(
     outer_dim = strided_vmem_ref.shape[0] // lanes_per_col
     max_col = lanes_per_col - 1
 
-    # Destination: VREG row (`dst_chunk_idx`) and lane offset (`dst_rel`) for new token insertion.
+    # Destination: VREG row (`dst_chunk_idx`) and lane offset (`dst_rel`) for new
+    # token insertion.
     dst_chunk_idx = bkv_sz_cache // num_lanes
     dst_rel = bkv_sz_cache % num_lanes
 
@@ -146,7 +147,8 @@ def store_new_kv_lane(
 
         k_rows = cfgs.serve.page_size // num_lanes
         dst_page_start = (cols[0] // k_rows) * k_rows
-        # Overwrite all rows of the target page with clean tokens so trailing HBM NaN padding cannot poison systolic dot products.
+        # Overwrite all rows of the target page with clean tokens so trailing HBM NaN
+        # padding cannot poison systolic dot products.
         for r_offset in range(k_rows + len(cols) - 1):
             r = dst_page_start + r_offset
             new_row = strided_vmem_ref[pl.ds(r, outer_dim, lanes_per_col)]

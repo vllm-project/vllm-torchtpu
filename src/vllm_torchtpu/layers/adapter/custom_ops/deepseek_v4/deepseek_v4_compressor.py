@@ -69,7 +69,8 @@ def _run_compressor(
     rms_eps: float,
     quant_block: int,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
-    """Shared body of the three op variants, for CSA compressor, HCA compressor, and CSA indexer compressor respectively."""
+    """Shared body of the three op variants, for CSA compressor, HCA compressor,
+    and CSA indexer compressor respectively."""
     return compressor_forward(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,

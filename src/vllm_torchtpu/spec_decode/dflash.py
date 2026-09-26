@@ -111,7 +111,9 @@ class DFlashProposer:
     def _get_static_attn_tensors(
         self, padded_num_reqs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fetch or create persistent static TPU tensors for draft attention metadata."""
+        """Fetch or create persistent static TPU tensors for draft
+        attention metadata.
+        """
         if padded_num_reqs not in self._static_attn_tensors_cache:
             qsl = (
                 torch.arange(
@@ -566,7 +568,8 @@ class DFlashProposer:
             return torch.cat(sliced_chunks, dim=0)
 
         # Single synchronization and transfer to the host (return_device=False)
-        # We transfer the ENTIRE padded tensor to CPU to avoid dynamic-shape recompilations
+        # We transfer the ENTIRE padded tensor to CPU to avoid
+        # dynamic-shape recompilations
         draft_tokens_list = []
         for logits, chunk in zip(draft_logits_per_chunk, chunks):
             logits_host = logits.cpu().tolist()
@@ -613,7 +616,8 @@ class DFlashProposer:
                         sync=True,
                     )
 
-                # Context-KV updates allow short chunks; draft forward needs a full block.
+                # Context-KV updates allow short chunks;
+                # draft forward needs a full block.
                 if not block_size <= num_tokens <= max_draft_tokens:
                     continue
 
@@ -842,9 +846,9 @@ class DFlashProposer:
         Projects target model hidden states directly into the draft model's KV space.
 
         Instead of computing KV projections and RoPE iteratively per layer (which would
-        create L tiny, sequential XLA graphs), we project to a single massive flat tensor
-        for all layers at once using `_fused_kv_weight`. We then reshape and compute
-        RoPE across all layers simultaneously in a single vectorized operation.
+        create L tiny, sequential XLA graphs), we project to a single massive flat
+        tensor for all layers at once using `_fused_kv_weight`. We then reshape and
+        compute RoPE across all layers simultaneously in a single vectorized operation.
         """
         self_model = self.draft_model.model
         if isinstance(hidden_states, (list, tuple)):
@@ -966,7 +970,8 @@ class DFlashProposer:
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
-        # 3. Reshape and slice off slot 0 (base token), keeping only the K mask token slots
+        # 3. Reshape and slice off slot 0 (base token), keeping only
+        # the K mask token slots
         hidden_reshaped = valid_hidden.view(
             padded_num_reqs, block_size, hidden.shape[-1]
         )
@@ -1060,7 +1065,8 @@ class DFlashProposer:
         invalid_token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compiled XLA graph that builds the drafter's inputs directly from the target model's output.
+        Compiled XLA graph that builds the drafter's inputs directly from the target
+        model's output.
 
         Args:
             next_tokens_device: Tensor of shape [num_reqs, K+1] containing the target
@@ -1070,16 +1076,20 @@ class DFlashProposer:
             draft_lengths: Number of verified drafts per request (0 for prompt chunks).
             num_reqs: Number of active requests.
             block_size: K + 1 (1 base token + K draft mask slots).
-            padded_len: Total length of the flattened tensors (padded_num_reqs * block_size).
+            padded_len: Total length of the flattened tensors
+                (padded_num_reqs * block_size).
             mask_token_id: The vocabulary ID for the MASK token.
-            invalid_token_id: The ID denoting unused/padding tokens in next_tokens_device.
+            invalid_token_id: The ID denoting unused/padding tokens
+                in next_tokens_device.
 
         Returns:
             input_ids: 1D Tensor of shape [padded_len] formatted as:
                 [Base, MASK, MASK, ..., Base, MASK, MASK, ...]
-            positions: 1D Tensor of shape [padded_len] containing the absolute positional encodings:
+            positions: 1D Tensor of shape [padded_len] containing the
+                absolute positional encodings:
                 [Pos, Pos+1, Pos+2, ..., Pos', Pos'+1, Pos'+2, ...]
-            seq_lens: 1D Tensor of shape [padded_num_reqs] containing the new sequence lengths.
+            seq_lens: 1D Tensor of shape [padded_num_reqs] containing the
+                new sequence lengths.
         """
         padded_num_reqs = padded_len // block_size
 
@@ -1113,7 +1123,8 @@ class DFlashProposer:
         )
         num_accepted = num_valid.unsqueeze(1).to(torch.int32)
 
-        # Anchor verify windows at start + num_accepted; anchor prompt chunks at last_pos + 1.
+        # Anchor verify windows at start + num_accepted;
+        # anchor prompt chunks at last_pos + 1.
         num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
         is_verify_window = (num_draft > 0).to(torch.int32)
         verify_base = start_positions_padded + num_accepted
@@ -1136,7 +1147,8 @@ class DFlashProposer:
         mask_token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compiled XLA graph that builds the drafter's inputs from a 1D tensor of seed tokens.
+        Compiled XLA graph that builds the drafter's inputs from a
+        1D tensor of seed tokens.
 
         Args:
             device_seed: 1D Tensor of shape [num_reqs] containing base tokens.
@@ -1144,15 +1156,18 @@ class DFlashProposer:
             position_ids: 1D Tensor containing position IDs.
             num_reqs: Number of active requests.
             block_size: K + 1 (1 base token + K draft mask slots).
-            padded_len: Total length of the flattened tensors (padded_num_reqs * block_size).
+            padded_len: Total length of the flattened tensors
+                (padded_num_reqs * block_size).
             mask_token_id: The vocabulary ID for the MASK token.
 
         Returns:
             input_ids: 1D Tensor of shape [padded_len] formatted as:
                 [SeedToken, MASK, MASK, ..., SeedToken2, MASK, MASK, ...]
-            positions: 1D Tensor of shape [padded_len] containing the absolute positional encodings:
+            positions: 1D Tensor of shape [padded_len] containing the
+                absolute positional encodings:
                 [Pos, Pos+1, Pos+2, ..., Pos', Pos'+1, Pos'+2, ...]
-            seq_lens: 1D Tensor of shape [padded_num_reqs] containing the new sequence lengths.
+            seq_lens: 1D Tensor of shape [padded_num_reqs] containing the
+                new sequence lengths.
         """
         padded_num_reqs = padded_len // block_size
 

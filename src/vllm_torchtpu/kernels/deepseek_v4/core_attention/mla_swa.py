@@ -71,19 +71,24 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
+    # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
+    #     bkv_sem_0_sz, bkv_sem_1_sz)
+    bkv_update_ids_ref,
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
-    cache_kv_hbm_ref,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     in_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     in_m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    updated_cache_kv_hbm_ref,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    updated_cache_kv_hbm_ref,
     l_hbm_ref,  # [max_num_tokens, num_l_heads]
     m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Scratch
@@ -640,8 +645,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
-                    # The next block may belong to a different (seq, bq), so it needs its
-                    # own start offset.
+                    # The next block may belong to a different (seq, bq), so it needs
+                    # its own start offset.
                     next_start_offset = _start_offset(next_seq_idx, next_bq_idx)
                     start_fetch_bkv(
                         next_seq_idx,
@@ -856,17 +861,20 @@ def _mla_batched_decode_kernel(
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
-    cache_kv_hbm_ref,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     in_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     in_m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    updated_cache_kv_hbm_ref,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    updated_cache_kv_hbm_ref,
     l_hbm_ref,  # [max_num_tokens, num_l_heads]
     m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Scratch (x2 for double buffering)
-    bkv_batch_x2_vmem,  # [2, seq_batch_sz, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    # [2, seq_batch_sz, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    bkv_batch_x2_vmem,
     q_batch_x2_vmem,  # [2, seq_batch_sz, num_q_heads, head_dim]
     o_batch_x2_vmem,  # [2, seq_batch_sz, num_q_heads, head_dim]
     l_batch_x2_vmem,  # [2, seq_batch_sz, num_l_heads]
@@ -1225,7 +1233,8 @@ def _mla_batched_decode_kernel(
 def run_mla_batched_decode_kernel(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
     new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
-    cache_kv: jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1395,7 +1404,8 @@ def run_mla_batched_decode_kernel(
 def mla_sliding_window_ragged_paged_attention(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     new_kv: jax.Array,  # [max_num_tokens, actual_head_dim]
-    cache_kv: jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
+    # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1510,7 +1520,8 @@ def mla_sliding_window_ragged_paged_attention(
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
         new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
-        cache_kv: jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+        # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
+        cache_kv: jax.Array,
         kv_lens: jax.Array,  # i32[max_num_seqs]
         page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1604,7 +1615,8 @@ def mla_sliding_window_ragged_paged_attention(
             jnp.zeros((3,), jnp.int32),
             # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
             jnp.full((4,), -1, jnp.int32),
-            # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+            # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
+            #     bkv_sem_0_sz, bkv_sem_1_sz)
             jnp.full((6,), -1, jnp.int32),
         )
 

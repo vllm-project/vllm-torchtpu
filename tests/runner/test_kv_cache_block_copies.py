@@ -149,7 +149,8 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
 
 
 def test_tpu_bind_kv_cache_unpacks_lists():
-    """Verify that `tpu_bind_kv_cache` flattens nested lists and tuples in `runner_kv_caches`.
+    """Verify that `tpu_bind_kv_cache` flattens nested lists and tuples in
+    `runner_kv_caches`.
 
     Hybrid models (e.g. Attention + GDN/Mamba) store recurrent layer states
     as lists or tuples of tensors `[conv_state, ssm_state]`. If appended directly,
@@ -158,7 +159,8 @@ def test_tpu_bind_kv_cache_unpacks_lists():
     attribute 'device'`.
 
     This test verifies that:
-    1. `runner_kv_caches` receives flat `torch.Tensor` objects only (unpacks both lists and tuples).
+    1. `runner_kv_caches` receives flat `torch.Tensor` objects only (unpacks both lists
+       and tuples).
     2. `forward_context` retains the original sequence structure for model layers.
     """
     t1 = torch.empty(1)
@@ -185,7 +187,8 @@ def test_tpu_bind_kv_cache_unpacks_lists():
 
 
 def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
-    """Verify that speculative decoding mamba read offsets are migrated during CoW copy."""
+    """Verify that speculative decoding mamba read offsets are migrated
+    during CoW copy."""
     raw_tensors = [torch.zeros(32, 4)]
     offsets = torch.arange(10, dtype=torch.long)
     fake = SimpleNamespace(
@@ -259,7 +262,8 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
 
 
 def test_is_unified_pool_used():
-    """Verify is_unified_pool_used checks whether kv_cache_raw_tensors is present and non-empty."""
+    """Verify is_unified_pool_used checks whether kv_cache_raw_tensors
+    is present and non-empty."""
     runner = object.__new__(TPUModelRunner)
     # Attribute missing
     assert not runner.is_unified_pool_used()

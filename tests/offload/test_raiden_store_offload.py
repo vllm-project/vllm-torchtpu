@@ -6,7 +6,8 @@ physical TPU hardware or native C++ wheels:
 
 1. Registration & Lifecycle:
    - Registration gate: Blocks operations until all worker ranks register.
-   - Sub-hash expansion: OffloadKey maps to device_block_size_factor physical sub-hashes.
+   - Sub-hash expansion: OffloadKey maps to device_block_size_factor
+     physical sub-hashes.
    - Atomic admission & cleanup: insert on submit, a post-admission lookup
      classifying the pinned batch, and a terminal release of exactly the pins
      no transfer spent.
@@ -191,7 +192,8 @@ class FakeKVCacheStore:
         self.calls.append(_Call("save", (list(block_hashes), dst_raiden_id)))
         if self.fail_save:
             return False
-        # Mirror Raiden C++ preconditions: hashes must exist in HBM status and be pinned.
+        # Mirror Raiden C++ preconditions: hashes must exist in HBM status
+        # and be pinned.
         for h in block_hashes:
             entry = self.entries.get(h)
             if (
@@ -625,7 +627,8 @@ class TestLoadJobLifecycle(unittest.TestCase):
             self.assertEqual(self.store.entries[h].pin_count, 0)
 
     def test_prepare_load_pin_failure_fails_job_cleanly(self):
-        # Losing the lookup-to-pin race against eviction fails the job cleanly without raising.
+        # Losing the lookup-to-pin race against eviction fails the job cleanly
+        # without raising.
         spec = self.manager.prepare_load([_key(9)], _ctx("r1"))
         self.assertFalse(spec.pinned)
         self.manager.submit_load_job(3, [_key(9)], [10], "r1", pinned=spec.pinned)
@@ -642,7 +645,8 @@ class TestTouchAndMisc(unittest.TestCase):
         self.manager = make_manager(self.store)
 
     def test_reset_cache_raises(self):
-        # External cache reset is unsupported; verify that calling reset_cache raises NotImplementedError.
+        # External cache reset is unsupported; verify that calling reset_cache raises
+        # NotImplementedError.
         with self.assertRaises(NotImplementedError):
             self.manager.reset_cache()
 
@@ -872,7 +876,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
             sched, self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])})
         )
 
-        # Cancel parked store before rank acknowledgements when source blocks are reclaimed.
+        # Cancel parked store before rank acknowledgements
+        # when source blocks are reclaimed.
         meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
         self.assertIn(7, meta.finished_store_job_ids)
         self.assertNotIn(7, sched._fence_pending)
@@ -887,7 +892,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         manager.prepare_store([_key(0)], _ctx())
         sched = self._make_scheduler(manager)
 
-        # Created and flushed in same step: cancelled immediately without shipping redundant fence requests.
+        # Created and flushed in same step: cancelled immediately without shipping
+        # redundant fence requests.
         meta = self._build_meta(
             sched,
             self._stock_meta(
@@ -1037,7 +1043,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         self.assertEqual(job.src_spec.block_ids.tolist(), [1, 2, 3])
 
     def test_aborted_request_caps_at_computed_tokens(self):
-        # 3 blocks allocated but only 10 tokens computed: unwritten third block is omitted.
+        # 3 blocks allocated but only 10 tokens computed:
+        # unwritten third block is omitted.
         sched, keys = self._aborted_setup(num_computed_tokens=10)
         jobs = sched._build_store_jobs(self._sched_output("r1"))
         (job,) = jobs.values()
@@ -1513,7 +1520,8 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertTrue(self.manager.has_pending_work())
         self.assertEqual(self.manager.poll_finished_jobs(), [])
 
-        # Concurrent lookup for in-flight fetch returns HIT_PENDING without duplicate read.
+        # Concurrent lookup for in-flight fetch returns HIT_PENDING
+        # without duplicate read.
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
 
         self.store.complete_remote_read(sub_hashes(key))
@@ -1632,7 +1640,8 @@ class TestRemoteReadFlow(unittest.TestCase):
             self.assertIn(h, self.store.global_entries)
 
     def test_stale_stash_degenerates_to_local_load(self):
-        # Keys promoted to local before prepare_load are routed to load() instead of read_remote().
+        # Keys promoted to local before prepare_load are routed to load() instead of
+        # read_remote().
         key = _key(1)
         seed_global_entries(self.store, key)
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
@@ -1726,7 +1735,8 @@ class TestNamespace(unittest.TestCase):
         ns = derive_offload_namespace(cfg(), **kwargs)
         self.assertEqual(len(ns), 16)
         self.assertEqual(ns, derive_offload_namespace(cfg(), **kwargs))
-        # Compatibility namespace prevents cache collisions across incompatible engine configurations.
+        # Compatibility namespace prevents cache collisions across
+        # incompatible engine configurations.
         self.assertNotEqual(ns, derive_offload_namespace(cfg(model="o"), **kwargs))
         self.assertNotEqual(ns, derive_offload_namespace(cfg(quant="fp8"), **kwargs))
         self.assertNotEqual(

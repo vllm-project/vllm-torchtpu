@@ -862,7 +862,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                         "Stage-3 transfers a single KV cache group's pages "
                         "per request; this model has "
                         f"{len(self._stage3_transfer_groups)} "
-                        f"({[g.cache_group_index for g in self._stage3_transfer_groups]}) "
+                        f"({[g.cache_group_index for g in self._stage3_transfer_groups]}) "  # noqa: E501
                         "and needs TPU_RAIDEN_DSV4_ADMISSION=1"
                     )
                 group_block_ids = [
@@ -2639,7 +2639,8 @@ class TPURaidenConnectorWorker:
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
         logger.info(
-            "TPURaidenConnectorWorker rank%d --> registering %d pools with transfer engine",
+            "TPURaidenConnectorWorker rank%d --> registering %d pools "
+            "with transfer engine",
             self.tp_rank,
             len(manifest.pools),
         )
@@ -2651,7 +2652,8 @@ class TPURaidenConnectorWorker:
 
         if stage3_enabled:
             logger.info(
-                "TPURaidenConnectorWorker rank%d --> registering stage3 work unit with %s",
+                "TPURaidenConnectorWorker rank%d --> "
+                "registering stage3 work unit with %s",
                 self.tp_rank,
                 controller_address,
             )
@@ -2662,7 +2664,8 @@ class TPURaidenConnectorWorker:
             )
             summary["stage3_registration"] = registration
             logger.info(
-                "TPURaidenConnectorWorker rank%d --> stage3 work unit registered successfully",
+                "TPURaidenConnectorWorker rank%d --> stage3 work unit "
+                "registered successfully",
                 self.tp_rank,
             )
 
@@ -2787,8 +2790,8 @@ class TPURaidenConnectorWorker:
 
         self._raiden_transfer_engine = engine
         self._raiden_manifest = manifest
-        # Per-tag (live_bytes_per_block, row_bytes) is fixed by the admitted
-        # manifest; cache it here because the producer's span lowering reads it every step.
+        # Per-tag (live_bytes_per_block, row_bytes) is fixed by the admitted manifest;
+        # cache it here because the producer's span lowering reads it every step.
         self._stage3_row_geometry = self._measure_glm_tag_geometry(manifest)
 
         counts = manifest.tag_counts()
@@ -3051,7 +3054,7 @@ class TPURaidenConnectorWorker:
             page_tokens = int(self.vllm_config.cache_config.block_size)
             return fingerprint, payload, page_tokens
         if self._stage3_kimi:
-            from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
+            from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (  # noqa: E501
                 measured_kimi_k3_layout_fingerprint,
             )
 
