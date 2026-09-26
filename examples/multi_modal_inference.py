@@ -217,11 +217,13 @@ def main(args):
     data = mm_input["data"]
     questions = mm_input["questions"]
 
-    # NOTE: Currently, only Qwen2.5-VL is supported. If later we want to support a model with new chat template, we may need to change this
+    # NOTE: Currently, only Qwen2.5-VL is supported. If later we want to support a model
+    # with new chat template, we may need to change this
     req_data = model_example_map["qwen2_5_vl"](questions, modality, args)
 
     # Disable other modalities to save memory
-    # Initial all modalities to be 0s and add the specifc modality limit later accordingly
+    # Initial all modalities to be 0s and add the specifc modality limit
+    # later accordingly
     default_limits = {"image": 0, "video": 0, "audio": 0}
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}

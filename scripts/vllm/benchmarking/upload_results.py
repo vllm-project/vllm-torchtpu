@@ -233,7 +233,9 @@ def main():
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
-            "CreatedBy": f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
+            "CreatedBy": (
+                f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'"
+            ),
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -244,7 +246,8 @@ def main():
             "CreatedTime": "CURRENT_TIMESTAMP()",
         }
 
-        # Optional metrics (omit from columns list if missing, so Spanner defaults to NULL)
+        # Optional metrics (omit from columns list if missing,
+        # so Spanner defaults to NULL)
         optional_metrics = {
             "Throughput": res.get("request_throughput"),
             "OutputTokenThroughput": res.get("output_throughput"),
@@ -294,7 +297,8 @@ def main():
         if args.skip_db_upload or args.skip_spanner:
             why = "--skip-db-upload" if args.skip_db_upload else "--skip-spanner"
             print(
-                f"=== Skipping Spanner DB Upload ({why} specified) ===. RecordId: {record_id}"
+                f"=== Skipping Spanner DB Upload ({why} specified) ===. "
+                f"RecordId: {record_id}"
             )
         else:
             cmd = [
@@ -319,7 +323,8 @@ def main():
                 success = False
             else:
                 print(
-                    f"Successfully updated Spanner record for {rf.name}. RecordId: {record_id}"
+                    f"Successfully updated Spanner record for {rf.name}. "
+                    f"RecordId: {record_id}"
                 )
 
         # Dual write to BigQuery while dashboards migrate off Spanner. The
