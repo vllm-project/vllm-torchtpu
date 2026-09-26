@@ -30,7 +30,6 @@ PAGE_SIZE = 32
 
 
 class CsaGatherTest(parameterized.TestCase):
-
     def setUp(self):
         super().setUp()
         if jax.devices()[0].platform != "tpu":
@@ -42,24 +41,28 @@ class CsaGatherTest(parameterized.TestCase):
         num_tokens = pages * PAGE_SIZE
         nope_bytes = self.rng.integers(0, 256, (num_tokens, LKV_DIM), np.uint8)
         rope_bytes = self.rng.integers(
-            0, 256, (num_tokens, kv_cache_utils.TILE_LANE_BYTES), np.uint8)
+            0, 256, (num_tokens, kv_cache_utils.TILE_LANE_BYTES), np.uint8
+        )
 
         nope_cache = jnp.asarray(nope_bytes).reshape(
-            pages, PAGE_SIZE, kv_cache_utils.WORD_BYTES,
-            kv_cache_utils.TILE_LANE_BYTES)
+            pages, PAGE_SIZE, kv_cache_utils.WORD_BYTES, kv_cache_utils.TILE_LANE_BYTES
+        )
         rope_cache = jnp.asarray(rope_bytes).reshape(
-            pages, PAGE_SIZE // kv_cache_utils.WORD_BYTES,
-            kv_cache_utils.WORD_BYTES, kv_cache_utils.TILE_LANE_BYTES)
+            pages,
+            PAGE_SIZE // kv_cache_utils.WORD_BYTES,
+            kv_cache_utils.WORD_BYTES,
+            kv_cache_utils.TILE_LANE_BYTES,
+        )
         return nope_cache, rope_cache, nope_bytes, rope_bytes
 
     def _check(self, nope_cache, rope_cache, nope_bytes, rope_bytes, indices):
-        nope_out, rope_out = dsa_gather.dsa_gather(nope_cache, rope_cache,
-                                                   jnp.asarray(indices))
+        nope_out, rope_out = dsa_gather.dsa_gather(
+            nope_cache, rope_cache, jnp.asarray(indices)
+        )
         np.testing.assert_array_equal(
-            np.asarray(nope_out).reshape(len(indices), -1),
-            nope_bytes[indices])
-        np.testing.assert_array_equal(np.asarray(rope_out),
-                                      rope_bytes[indices])
+            np.asarray(nope_out).reshape(len(indices), -1), nope_bytes[indices]
+        )
+        np.testing.assert_array_equal(np.asarray(rope_out), rope_bytes[indices])
 
     @parameterized.named_parameters(
         # Odd count exercises the internal padding to the SC block size;
@@ -69,8 +72,7 @@ class CsaGatherTest(parameterized.TestCase):
         dict(testcase_name="large", pages=16, n=8192),
     )
     def test_gather_matches_direct_indexing(self, pages, n):
-        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(
-            pages)
+        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(pages)
         indices = self.rng.integers(0, pages * PAGE_SIZE, n).astype(np.int32)
         self._check(nope_cache, rope_cache, nope_bytes, rope_bytes, indices)
 
@@ -78,15 +80,13 @@ class CsaGatherTest(parameterized.TestCase):
         """Every position of every page: covers all four rope byte lanes and
         every tile row, in permuted (non-contiguous) order."""
         pages = 4
-        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(
-            pages)
+        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(pages)
         indices = self.rng.permutation(pages * PAGE_SIZE).astype(np.int32)
         self._check(nope_cache, rope_cache, nope_bytes, rope_bytes, indices)
 
     def test_single_repeated_index(self):
         """Maximal duplication: the gather-hotspot access pattern."""
         pages = 4
-        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(
-            pages)
+        nope_cache, rope_cache, nope_bytes, rope_bytes = self._make_caches(pages)
         indices = np.full(512, 77, np.int32)
         self._check(nope_cache, rope_cache, nope_bytes, rope_bytes, indices)

@@ -19,9 +19,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.rope import (LANE, CosSinRef,
-                                                    _cos_sin_lanes,
-                                                    _rotate_gptj)
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    LANE,
+    CosSinRef,
+    _cos_sin_lanes,
+    _rotate_gptj,
+)
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -37,12 +40,16 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _cos_sin_body(cos_sin_ref: jax.Ref, out_ref: jax.Ref, *, rotary_dim: int,
-                  inverse: bool, out_dtype: jnp.dtype) -> None:
+def _cos_sin_body(
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    rotary_dim: int,
+    inverse: bool,
+    out_dtype: jnp.dtype,
+) -> None:
     """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...],
-                              rotary_dim=rotary_dim,
-                              inverse=inverse)
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
     out_ref[...] = jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
 
 
@@ -72,10 +79,9 @@ def _cos_sin_kernel(
         index_map=lambda i: (i, 0),
     )
     # The per-token row gather; one buffer of lookahead hides its DMAs.
-    cos_sin_alloc = CosSinRef.create(spec=cos_sin_spec,
-                                     dtype=cos_sin_dtype,
-                                     buffer_count=2,
-                                     tile_n=tile_n)
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
 
     pipeline = pltpu.emit_pipeline(
         functools.partial(
@@ -84,7 +90,7 @@ def _cos_sin_kernel(
             inverse=inverse,
             out_dtype=out_dtype,
         ),
-        grid=(num_tiles, ),
+        grid=(num_tiles,),
         in_specs=[cos_sin_spec],
         out_specs=[out_spec],
     )
@@ -118,9 +124,9 @@ def gather_cos_sin(
 ) -> jax.Array:
     """Builds ``wo_a_projection``'s ``[T, 2 * LANE]`` cos/sin table.
 
-  Gathers ``cos_sin_cache[positions]`` based on the token positions, expands
-  each row to ``[2 * LANE]``
-  """
+    Gathers ``cos_sin_cache[positions]`` based on the token positions, expands
+    each row to ``[2 * LANE]``
+    """
     assert positions.ndim == 1
     assert cos_sin_cache.ndim == 2
 
@@ -143,7 +149,7 @@ def gather_cos_sin(
         out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM), ),
+            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         ),
         compiler_params=pltpu.CompilerParams(
@@ -154,8 +160,7 @@ def gather_cos_sin(
     )(positions, cos_sin_cache)
 
 
-def _rope_heads(x: jax.Array, cos_sin: jax.Array, *,
-                head_dim: int) -> jax.Array:
+def _rope_heads(x: jax.Array, cos_sin: jax.Array, *, head_dim: int) -> jax.Array:
     """apply RoPE to the last rope dim of head dim of ``x``."""
     cos = cos_sin[:, :LANE]
     sin = cos_sin[:, LANE:]
@@ -193,8 +198,9 @@ def _kernel(
         inv = None
         if quantize_activations:
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
-            inv = (FP8_E4M3_MAX /
-                   jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(jnp.bfloat16)
+            inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
+                jnp.bfloat16
+            )
             lhs = (x * inv).astype(jnp.float8_e4m3fn)
         else:
             lhs = x
@@ -202,7 +208,7 @@ def _kernel(
         partial = jax.lax.dot_general(
             lhs,
             rhs,
-            (((1, ), (0, )), ((), ())),
+            (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
         if quantize_activations:
@@ -235,20 +241,20 @@ def wo_a_projection(
 ) -> jax.Array:
     """Do DSv4 wo_a projection.
 
-  T: num_tokens
-  G: num_groups
-  H: num_heads_per_group
-  D: H * head_dim
-  R: o_lora_dim
+    T: num_tokens
+    G: num_groups
+    H: num_heads_per_group
+    D: H * head_dim
+    R: o_lora_dim
 
-  Equivalent to
-  x = rope(x)
-  return ``einsum("tgd,dgr->tgr", x.view(t, g, d), wo_a.view(d, g, r),
-  preferred_element_type=f32) * wo_a_scale.view(g, r).to(bf16)``
+    Equivalent to
+    x = rope(x)
+    return ``einsum("tgd,dgr->tgr", x.view(t, g, d), wo_a.view(d, g, r),
+    preferred_element_type=f32) * wo_a_scale.view(g, r).to(bf16)``
 
-  ``quantize_activations`` quantizes each activation block's rows to fp8 in
-  the kernel so both MXU operands are fp8.
-  """
+    ``quantize_activations`` quantizes each activation block's rows to fp8 in
+    the kernel so both MXU operands are fp8.
+    """
     assert x.ndim == 3
     assert x.dtype == jnp.bfloat16
     assert wo_a.ndim == 2 and wo_a_scale.ndim == 1
@@ -297,19 +303,19 @@ def wo_a_projection(
         grid=(num_groups, num_t_tiles, num_r_tiles),
         in_specs=[
             # x: one group's heads, [t, g, 0] over [T, G * H, head_dim].
-            pl.BlockSpec((tile_t, heads_per_group, head_dim), lambda g, t, r:
-                         (t, g, 0)),
+            pl.BlockSpec(
+                (tile_t, heads_per_group, head_dim), lambda g, t, r: (t, g, 0)
+            ),
             # wo_a: the whole reduction, column block g * R + r * tile_r.
-            pl.BlockSpec((reduction, tile_r), lambda g, t, r:
-                         (0, g * num_r_tiles + r)),
+            pl.BlockSpec((reduction, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             # wo_a_scale
-            pl.BlockSpec((1, tile_r), lambda g, t, r:
-                         (0, g * num_r_tiles + r)),
+            pl.BlockSpec((1, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             # cos_sin: one token block
             pl.BlockSpec((tile_t, 2 * LANE), lambda g, t, r: (t, 0)),
         ],
-        out_specs=pl.BlockSpec((tile_t, tile_r), lambda g, t, r:
-                               (t, g * num_r_tiles + r)),
+        out_specs=pl.BlockSpec(
+            (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
+        ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,

@@ -18,7 +18,6 @@ def queue(monkeypatch):
     from vllm.distributed.device_communicators import shm_broadcast
 
     class _Queue:
-
         def __init__(self, n_reader, n_local_reader, **kwargs):
             self.kwargs = kwargs
 
@@ -27,7 +26,6 @@ def queue(monkeypatch):
 
 
 class _Executor:
-
     def __init__(self):
         self.output_rank = 7
         self.calls = []
@@ -48,8 +46,8 @@ def _futures(executor, wave, count):
     for _ in range(count):
         step = wave.dispatched()
         futures.append(
-            pp_push._PushFuture(_done(step), executor, wave, step,
-                                wave.real_steps))
+            pp_push._PushFuture(_done(step), executor, wave, step, wave.real_steps)
+        )
     return futures
 
 
@@ -62,10 +60,9 @@ def test_pushes_exactly_the_missing_later_steps():
     assert executor.calls == []
     # step 5 with 4 later in flight needs 6: two pushes, replies not awaited
     assert futures[4].result() == 5
-    assert executor.calls == [("pp_push", {
-        "non_block": True,
-        "unique_reply_rank": 7
-    })] * 2
+    assert (
+        executor.calls == [("pp_push", {"non_block": True, "unique_reply_rank": 7})] * 2
+    )
     assert wave.steps == 11 and wave.pushes == 2
     # the pushes count as later steps: step 6 now has 5 later, one push
     assert futures[5].result() == 6
@@ -94,11 +91,10 @@ def test_settles_when_the_awaited_step_is_the_newest():
     assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle"]
     assert not wave.open
     # the next step opens a new burst; alone, it settles too
-    (third, ) = _futures(executor, wave, 1)
+    (third,) = _futures(executor, wave, 1)
     assert wave.open
     assert third.result() == 4
-    assert [c[0]
-            for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
+    assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
 
 
 def test_the_future_forwards_to_the_executors_future():
@@ -130,8 +126,10 @@ def test_waiting_for_the_exception_settles_too():
     executor = _Executor()
     wave = pp_push._WaveState(stages=8)
     step = wave.dispatched()
-    assert pp_push._PushFuture(_done(1), executor, wave, step,
-                               wave.real_steps).exception() is None
+    assert (
+        pp_push._PushFuture(_done(1), executor, wave, step, wave.real_steps).exception()
+        is None
+    )
     assert [c[0] for c in executor.calls] == ["pp_settle"]
 
 
@@ -157,8 +155,7 @@ def test_a_deeper_pipeline_widens_the_rings_a_shallower_one_keeps_them(queue):
 
 
 def _config(pp):
-    return SimpleNamespace(parallel_config=SimpleNamespace(
-        pipeline_parallel_size=pp))
+    return SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=pp))
 
 
 def test_worker_side_widening_follows_the_pipeline_size(queue):
@@ -177,7 +174,6 @@ def _install_on_fake_executor(monkeypatch, stages):
     from vllm.v1.executor import multiproc_executor
 
     class _FakeExecutor:
-
         def __init__(self, stages=stages):
             self.vllm_config = _config(stages)
             self.output_rank = stages - 1
@@ -207,8 +203,7 @@ def test_forward_futures_push_like_sampling_futures(monkeypatch, queue):
     # A pooling model waits on execute_model's future, never on sampling.
     executor = _install_on_fake_executor(monkeypatch, stages=4)
     futures = [
-        executor.execute_model(_step(16, i), non_block=True)
-        for i in range(1, 4)
+        executor.execute_model(_step(16, i), non_block=True) for i in range(1, 4)
     ]
     assert all(isinstance(f, pp_push._PushFuture) for f in futures)
     # step 1 with 2 later in flight: the wave carries it, no push

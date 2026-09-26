@@ -27,29 +27,29 @@ from vllm_torchtpu.kernels import pool_adapters
 # counterpart of upstream vLLM's ``preprocess_mamba`` block copies.
 
 
-def _copy_fn(pool: jax.Array, src: jax.Array,
-             dst: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _copy_fn(
+    pool: jax.Array, src: jax.Array, dst: jax.Array
+) -> tuple[jax.Array, jax.Array]:
     new_pool = pool_adapters.copy_blocks(pool, src, dst)
     return new_pool, src[0]
 
 
-_copy_op = pallas.jax_op("pallas::mamba_state_block_copy",
-                         _copy_fn,
-                         donate_argnums=(0, ))
+_copy_op = pallas.jax_op(
+    "pallas::mamba_state_block_copy", _copy_fn, donate_argnums=(0,)
+)
 
 
 def _fake_copy(pool: torch.Tensor, src: torch.Tensor, dst: torch.Tensor):
-    return torch.empty_like(pool), torch.empty((),
-                                               dtype=src.dtype,
-                                               device=src.device)
+    return torch.empty_like(pool), torch.empty((), dtype=src.dtype, device=src.device)
 
 
 _copy_op.register_fake(_fake_copy)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def copy_mamba_state_blocks(pools: list[torch.Tensor], src: torch.Tensor,
-                            dst: torch.Tensor) -> torch.Tensor:
+def copy_mamba_state_blocks(
+    pools: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
+) -> torch.Tensor:
     """``pool[dst[i]] = pool[src[i]]`` on every pool, as one program.
 
     A hybrid model's unified pool is split over several raw buffers, and a

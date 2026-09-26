@@ -52,7 +52,8 @@ def mask_kernel(
 
     def _body(topk_indices_vmem_ref, mask_out_vmem_ref):
         mask_out_vmem_ref[pl.ds(0, 1), pl.ds(0, max_kv_len)] = jnp.zeros(
-            (1, max_kv_len), dtype=jnp.int32)
+            (1, max_kv_len), dtype=jnp.int32
+        )
 
         if topk % 8 == 0:
             # Read 8 indices per SIMD load; `unroll=8` keeps the scatter
@@ -64,10 +65,12 @@ def mask_kernel(
 
                     def write_fn(i=idx):
                         mask_out_vmem_ref[0, pl.ds(i, 1)] = jnp.ones(
-                            (1, ), dtype=jnp.int32)
+                            (1,), dtype=jnp.int32
+                        )
 
-                    jax.lax.cond((idx >= 0) & (idx < max_kv_len), write_fn,
-                                 lambda: None)
+                    jax.lax.cond(
+                        (idx >= 0) & (idx < max_kv_len), write_fn, lambda: None
+                    )
 
             jax.lax.fori_loop(0, topk // 8, vec_k_loop, None, unroll=8)
         else:
@@ -76,17 +79,15 @@ def mask_kernel(
                 idx = topk_indices_vmem_ref[0, pl.ds(k, 1)][0]
 
                 def write_fn(i=idx):
-                    mask_out_vmem_ref[0, pl.ds(i, 1)] = jnp.ones(
-                        (1, ), dtype=jnp.int32)
+                    mask_out_vmem_ref[0, pl.ds(i, 1)] = jnp.ones((1,), dtype=jnp.int32)
 
-                jax.lax.cond((idx >= 0) & (idx < max_kv_len), write_fn,
-                             lambda: None)
+                jax.lax.cond((idx >= 0) & (idx < max_kv_len), write_fn, lambda: None)
 
             jax.lax.fori_loop(0, topk, k_loop, None, unroll=16)
 
     pltpu.emit_pipeline(
         _body,
-        grid=(rows_per_core, ),
+        grid=(rows_per_core,),
         in_specs=pl.BlockSpec(
             (1, topk),
             lambda r: (r * num_cores + core_index, 0),
@@ -98,7 +99,7 @@ def mask_kernel(
     )(topk_indices_hbm_ref, mask_out_hbm_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("max_kv_len", ))
+@functools.partial(jax.jit, static_argnames=("max_kv_len",))
 def generate_mask_sc(
     topk_indices: jax.Array,  # i32[num_tokens, topk]
     max_kv_len: int,
@@ -122,8 +123,9 @@ def generate_mask_sc(
     # The grid stripes rows across subcores, so the row count must divide
     # evenly; `-1` rows produce an all-zero mask row and are then dropped.
     pad_size = (num_cores - (chunk_size % num_cores)) % num_cores
-    padded_topk_indices = jnp.pad(topk_indices, ((0, pad_size), (0, 0)),
-                                  constant_values=-1)
+    padded_topk_indices = jnp.pad(
+        topk_indices, ((0, pad_size), (0, 0)), constant_values=-1
+    )
     padded_chunk_size = chunk_size + pad_size
 
     vector_mesh = plsc.VectorSubcoreMesh(
@@ -141,8 +143,7 @@ def generate_mask_sc(
             topk=topk,
             max_kv_len=max_kv_len,
         ),
-        out_type=jax.ShapeDtypeStruct((padded_chunk_size, max_kv_len),
-                                      jnp.int32),
+        out_type=jax.ShapeDtypeStruct((padded_chunk_size, max_kv_len), jnp.int32),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             disable_bounds_checks=True,

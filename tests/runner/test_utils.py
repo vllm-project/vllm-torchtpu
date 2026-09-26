@@ -5,24 +5,31 @@ import pytest
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
-    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
-    PhaseBasedProfiler, determine_phase_from_batch_composition_stats)
+    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+    InferencePhase,
+    PhaseBasedProfiler,
+    determine_phase_from_batch_composition_stats,
+)
 
 
 @pytest.fixture
 def profiler_fixture(tmp_path):
     """Fixture to set up a PhaseBasedProfiler with mocked dependencies."""
     target_module = "vllm_torchtpu.runner.utils"
-    with patch("torch.profiler.profile") as mock_profile, patch(
-            "builtins.open", mock_open()
-    ) as mock_file, patch(f"{target_module}.datetime") as mock_datetime, patch(
+    with (
+        patch("torch.profiler.profile") as mock_profile,
+        patch("builtins.open", mock_open()) as mock_file,
+        patch(f"{target_module}.datetime") as mock_datetime,
+        patch(
             f"{target_module}.determine_phase_from_batch_composition_stats"
-    ) as mock_determine_phase, patch.object(
+        ) as mock_determine_phase,
+        patch.object(
             PhaseBasedProfiler,
             "_resolve_canonical_dst_ts",
             return_value="2024_01_01_12_00_00",
-    ), patch.object(PhaseBasedProfiler, "_merge_profile_directories"):
-
+        ),
+        patch.object(PhaseBasedProfiler, "_merge_profile_directories"),
+    ):
         mock_now = MagicMock()
         mock_now.strftime.return_value = "2024_01_01_12_00_00"
         mock_datetime.datetime.now.return_value = mock_now
@@ -31,20 +38,20 @@ def profiler_fixture(tmp_path):
         mock_context = MagicMock()
         mock_profile.return_value = mock_context
 
-        profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
-                                      standard_opts={
-                                          'host_tracer_level': 2,
-                                          'device_tracer_level': 1,
-                                          'python_tracer_level': 1
-                                      },
-                                      advanced_opts={
-                                          'tpu_trace_mode': 'TRACE_COMPUTE',
-                                          'tpu_num_sparse_cores_to_trace': 1,
-                                          'tpu_num_sparse_core_tiles_to_trace':
-                                          1
-                                      })
-        profiler.num_steps_to_profile_for = (
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+        profiler = PhaseBasedProfiler(
+            profile_dir=str(tmp_path),
+            standard_opts={
+                "host_tracer_level": 2,
+                "device_tracer_level": 1,
+                "python_tracer_level": 1,
+            },
+            advanced_opts={
+                "tpu_trace_mode": "TRACE_COMPUTE",
+                "tpu_num_sparse_cores_to_trace": 1,
+                "tpu_num_sparse_core_tiles_to_trace": 1,
+            },
+        )
+        profiler.num_steps_to_profile_for = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
 
         yield {
             "profiler": profiler,
@@ -70,8 +77,7 @@ def test_phased_profiler_full_cycle(profiler_fixture):
     profiler.step(stats)
     mock_profile.assert_called_once()
     mock_context.__enter__.assert_called_once()
-    assert (profiler.profiling_n_steps_left ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+    assert profiler.profiling_n_steps_left == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
     assert profiler.current_phase == "prefill_heavy"
     assert profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
     assert mock_file().write.call_count == 1  # Wrote stats on start
@@ -79,8 +85,10 @@ def test_phased_profiler_full_cycle(profiler_fixture):
     # 2. Step profiling (N-1 steps)
     for i in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1):
         profiler.step(stats)
-        assert (profiler.profiling_n_steps_left ==
-                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1 - i)
+        assert (
+            profiler.profiling_n_steps_left
+            == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1 - i
+        )
         mock_profile.assert_called_once()  # Not called again
         mock_context.__exit__.assert_not_called()
 
@@ -89,8 +97,7 @@ def test_phased_profiler_full_cycle(profiler_fixture):
     mock_context.__exit__.assert_called_once_with(None, None, None)
     assert profiler.profiling_n_steps_left == 0
     assert profiler.current_phase == ""
-    assert (mock_file().write.call_count ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1)
+    assert mock_file().write.call_count == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1
 
 
 def test_phased_profiler_finish_stops_a_phase_mid_capture(profiler_fixture):
@@ -147,12 +154,15 @@ def test_phased_profiler_ignores_steps_with_no_work(profiler_fixture):
 
 def test_determine_phase_treats_single_token_step_as_decode_only():
     """One request in decode schedules exactly one token, all of it decode."""
-    assert determine_phase_from_batch_composition_stats({
-        "total_num_scheduled_tokens":
-        1,
-        "num_prefill_tokens":
-        0,
-    }) == InferencePhase.DECODE_ONLY
+    assert (
+        determine_phase_from_batch_composition_stats(
+            {
+                "total_num_scheduled_tokens": 1,
+                "num_prefill_tokens": 0,
+            }
+        )
+        == InferencePhase.DECODE_ONLY
+    )
 
 
 def test_phased_profiler_full_cycle_at_batch_size_one(profiler_fixture):
@@ -178,8 +188,7 @@ def test_phased_profiler_full_cycle_at_batch_size_one(profiler_fixture):
     mock_profile.assert_called_once()
     assert profiler.current_phase == "decode_only"
     assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
-    assert (profiler.profiling_n_steps_left ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+    assert profiler.profiling_n_steps_left == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
 
     # The budget must count down on its own and close the capture.
     for _ in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR):
@@ -251,8 +260,7 @@ def test_phased_profiler_skips_decode_steps_before_profiling(profiler_fixture):
     mock_profile.assert_called_once()
     assert profiler.inference_phase_seen[InferencePhase.DECODE_HEAVY]
     assert profiler.current_phase == "decode_heavy"
-    assert (profiler.profiling_n_steps_left ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+    assert profiler.profiling_n_steps_left == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
 
 
 def test_phased_profiler_skip_only_affects_decode_heavy(profiler_fixture):
@@ -298,7 +306,8 @@ def test_phased_profiler_skip_only_affects_decode_heavy(profiler_fixture):
 
 
 def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
-    profiler_fixture, ):
+    profiler_fixture,
+):
     """Tests that the profiler skips DECODE_ONLY steps until min KV len reaches threshold."""
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
@@ -322,8 +331,7 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     mock_profile.assert_called_once()
     assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
     assert profiler.current_phase == "decode_only"
-    assert (profiler.profiling_n_steps_left ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+    assert profiler.profiling_n_steps_left == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
 
     # Profiling continues
     stats["min_kv_len"] = 11
@@ -338,7 +346,8 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
 
 
 def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
-    profiler_fixture, ):
+    profiler_fixture,
+):
     """Tests that the profiler skips PREFILL_ONLY steps until min KV len reaches threshold."""
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
@@ -368,8 +377,7 @@ def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
     mock_profile.assert_called_once()
     assert profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
     assert profiler.current_phase == "prefill_only"
-    assert (profiler.profiling_n_steps_left ==
-            PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+    assert profiler.profiling_n_steps_left == PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
 
     # Profiling continues
     stats["min_kv_len"] = 11
@@ -384,7 +392,8 @@ def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
 
 
 def test_phased_profiler_prefill_kv_len_threshold_defaults_to_off(
-    profiler_fixture, ):
+    profiler_fixture,
+):
     """Without a threshold the capture must still arm on the first prefill step."""
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
@@ -401,7 +410,8 @@ def test_phased_profiler_prefill_kv_len_threshold_defaults_to_off(
 
 
 def test_phased_profiler_prefill_threshold_does_not_gate_prefill_heavy(
-    profiler_fixture, ):
+    profiler_fixture,
+):
     """PREFILL_HEAVY always carries a freshly-admitted request at kv len 0, so a
     min-based threshold must not be applied to it or it would never arm."""
     profiler = profiler_fixture["profiler"]
@@ -453,7 +463,8 @@ def test_resolve_canonical_dst_ts_non_zero_rank_reads_marker(tmp_path):
 
 
 def test_resolve_canonical_dst_ts_non_zero_rank_falls_back_on_timeout(
-        tmp_path, monkeypatch):
+    tmp_path, monkeypatch
+):
     """When rank 0 never publishes, a non-zero rank falls back to own ts."""
     phase_dir = tmp_path / "prefill_heavy"
     phase_dir.mkdir()
@@ -481,8 +492,9 @@ def test_merge_profile_directories_single_rank(tmp_path):
     profiler._canonical_dst_ts = "2026_05_06_04_47_36"
 
     # We need to create the actual directory structure for listdir to work in test
-    _stage_rank_capture(rank_dir, "2026_05_06_04_47_36_pt",
-                        "t1v-n-host-w-0.xplane.pb", "data_0")
+    _stage_rank_capture(
+        rank_dir, "2026_05_06_04_47_36_pt", "t1v-n-host-w-0.xplane.pb", "data_0"
+    )
     # A phase always writes stats into the sandbox before it captures.
     (rank_dir / "batch_composition_stats_1.json").write_text("{}")
 
@@ -503,16 +515,16 @@ def test_merge_profile_directories_clears_marker_on_rank_zero(tmp_path):
     profilers = {}
     # Rank 0 resolves first so it publishes the marker the other rank reads.
     for rank in (0, 1):
-        profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
-                                      worker_rank=rank,
-                                      world_size=2)
+        profiler = PhaseBasedProfiler(
+            profile_dir=str(tmp_path), worker_rank=rank, world_size=2
+        )
         rank_dir = phase_dir / f"rank_{rank}"
         rank_dir.mkdir()
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
-        profiler._canonical_dst_ts = profiler._resolve_canonical_dst_ts(
-            str(phase_dir))
-        _stage_rank_capture(rank_dir, f"pt_ts_{rank}",
-                            "t1v-n-host-w-0.xplane.pb", f"rank_{rank}")
+        profiler._canonical_dst_ts = profiler._resolve_canonical_dst_ts(str(phase_dir))
+        _stage_rank_capture(
+            rank_dir, f"pt_ts_{rank}", "t1v-n-host-w-0.xplane.pb", f"rank_{rank}"
+        )
         profilers[rank] = profiler
 
     assert profilers[1]._canonical_dst_ts == profilers[0]._canonical_dst_ts
@@ -539,9 +551,9 @@ def test_merge_profile_directories_multiworker(tmp_path):
     canonical_ts = "2026_05_06_04_47_36"
     profilers = []
     for rank in range(4):
-        profiler = PhaseBasedProfiler(profile_dir=str(tmp_path),
-                                      worker_rank=rank,
-                                      world_size=4)
+        profiler = PhaseBasedProfiler(
+            profile_dir=str(tmp_path), worker_rank=rank, world_size=4
+        )
         rank_dir = phase_dir / f"rank_{rank}"
         rank_dir.mkdir(parents=True)
         profiler.profile_dir_with_phase_suffix = str(rank_dir)
@@ -559,7 +571,8 @@ def test_merge_profile_directories_multiworker(tmp_path):
 
     dst = phase_dir / "plugins" / "profile" / canonical_ts
     for rank in range(4):
-        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
-                ).read_text() == f"rank_{rank}_xplane"
+        assert (
+            dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
+        ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()

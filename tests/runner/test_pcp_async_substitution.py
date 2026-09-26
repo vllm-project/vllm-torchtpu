@@ -7,17 +7,21 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    build_pcp_rank_major_token_order
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    build_pcp_rank_major_token_order,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, SequenceLayoutDescriptor,
-    SequenceLayoutKind, SequenceLayoutPlan)
+    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+    SequenceLayoutDescriptor,
+    SequenceLayoutKind,
+    SequenceLayoutPlan,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
-def _runner_with_async_state(req_ids,
-                             previous_req_positions=None,
-                             sequence_layout_plan=None):
+def _runner_with_async_state(
+    req_ids, previous_req_positions=None, sequence_layout_plan=None
+):
     if previous_req_positions is None:
         pre_async_results = None
     else:
@@ -40,14 +44,14 @@ def _current_async_substitution_indices(
     scheduled_tokens,
     sequence_layout_plan=None,
 ):
-    runner = _runner_with_async_state(req_ids, previous_req_positions,
-                                      sequence_layout_plan)
+    runner = _runner_with_async_state(
+        req_ids, previous_req_positions, sequence_layout_plan
+    )
     return TPUModelRunner._prepare_async_token_substitution_indices(
         runner,
         start_index=0,
         num_reqs=len(req_ids),
-        num_scheduled_tokens_per_req=np.asarray(scheduled_tokens,
-                                                dtype=np.int32),
+        num_scheduled_tokens_per_req=np.asarray(scheduled_tokens, dtype=np.int32),
     )
 
 
@@ -73,8 +77,7 @@ def _expected_pcp_local_async_substitution_indices(
         pcp_size,
         interleave_size,
         int(local_padded_tokens) * int(pcp_size),
-        token_start_offsets_per_req=np.asarray(token_start_offsets,
-                                               dtype=np.int64),
+        token_start_offsets_per_req=np.asarray(token_start_offsets, dtype=np.int64),
     )
 
     local_start = int(pcp_rank) * int(local_padded_tokens)
@@ -98,16 +101,21 @@ def _expected_pcp_local_async_substitution_indices(
     return cur_indices_array, src_indices_array
 
 
-def _pcp_sequence_layout_plan(*, scheduled_tokens, token_start_offsets,
-                              pcp_size, interleave_size, local_padded_tokens,
-                              pcp_rank):
+def _pcp_sequence_layout_plan(
+    *,
+    scheduled_tokens,
+    token_start_offsets,
+    pcp_size,
+    interleave_size,
+    local_padded_tokens,
+    pcp_rank,
+):
     _, inverse_order = build_pcp_rank_major_token_order(
         np.asarray(scheduled_tokens, dtype=np.int32),
         pcp_size,
         interleave_size,
         int(local_padded_tokens) * int(pcp_size),
-        token_start_offsets_per_req=np.asarray(token_start_offsets,
-                                               dtype=np.int64),
+        token_start_offsets_per_req=np.asarray(token_start_offsets, dtype=np.int64),
     )
     local_start = int(pcp_rank) * int(local_padded_tokens)
     local_end = local_start + int(local_padded_tokens)
@@ -120,8 +128,10 @@ def _pcp_sequence_layout_plan(*, scheduled_tokens, token_start_offsets,
         global_num_tokens=int(np.sum(scheduled_tokens)),
         global_padded_num_tokens=int(local_padded_tokens) * int(pcp_size),
         local_num_tokens=int(
-            np.count_nonzero((local_start <= inverse_order)
-                             & (inverse_order < local_end))),
+            np.count_nonzero(
+                (local_start <= inverse_order) & (inverse_order < local_end)
+            )
+        ),
         local_padded_num_tokens=int(local_padded_tokens),
         _request_major_to_packed_token_indices=inverse_order,
     )

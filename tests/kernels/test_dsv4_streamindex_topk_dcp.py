@@ -13,38 +13,93 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _select_owned_winners, cp_local_to_global, streamindex_topk,
-    streamindex_topk_dcp)
+    DCP_AXIS_NAME,
+    _select_owned_winners,
+    cp_local_to_global,
+    cp_rank_as_data,
+    streamindex_topk,
+    streamindex_topk_dcp,
+)
 
 P = jax.sharding.PartitionSpec
 
 
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_candidate_all_gather_is_rank_major(dcp_size):
+    """The merge reads a winner's position in its own list as `slot % k`.
+
+    The source rank now travels as its own lane, so the chunk *order* no longer
+    matters -- but the chunk *width* still does, and nothing else in the merge
+    would notice it changing: every rank would resolve the wrong candidate and
+    still return a full, plausible, silently wrong list. Asserting the full
+    rank-major arange pins width and order together.
+    """
+    devices = jax.devices()
+    if len(devices) < dcp_size:
+        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
+
+    rows, k = 4, 8
+    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME,))
+
+    def _local(_):
+        rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
+        # Rank r writes r*k + j, so a rank-major gather reads back as arange.
+        mine = rank * k + jnp.arange(k, dtype=jnp.int32)
+        return jax.lax.all_gather(
+            jnp.broadcast_to(mine, (rows, k)), DCP_AXIS_NAME, axis=1, tiled=True
+        )
+
+    gathered = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(DCP_AXIS_NAME),
+            check_vma=False,
+        )
+    )(jnp.zeros((rows, 1), jnp.int32))
+
+    got = np.asarray(gathered).reshape(dcp_size, rows, dcp_size * k)
+    want = np.broadcast_to(
+        np.arange(dcp_size * k, dtype=np.int32), (rows, dcp_size * k)
+    )
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            got[r], want, err_msg=f"rank {r} saw a non-rank-major candidate axis"
+        )
+
+
 def _filter_all_ranks(merged, dcp_size, interleave_c):
     """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
-    return np.stack([
-        np.asarray(
-            _select_owned_winners(jnp.asarray(merged), dcp_size, interleave_c,
-                                  jnp.int32(r))) for r in range(dcp_size)
-    ])
+    return np.stack(
+        [
+            np.asarray(
+                _select_owned_winners(
+                    jnp.asarray(merged), dcp_size, interleave_c, jnp.int32(r)
+                )
+            )
+            for r in range(dcp_size)
+        ]
+    )
 
 
-@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4),
-                                                   (8, 64)])
+@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
 def test_owner_filters_partition_the_list(dcp_size, interleave_c):
     rng = np.random.default_rng(20260906)
     num_rows, k, span = 16, 128, 4096
-    merged = np.stack([
-        rng.choice(span, size=k, replace=False).astype(np.int32)
-        for _ in range(num_rows)
-    ])
+    merged = np.stack(
+        [
+            rng.choice(span, size=k, replace=False).astype(np.int32)
+            for _ in range(num_rows)
+        ]
+    )
     merged[0, -5:] = -1
 
     lists = _filter_all_ranks(merged, dcp_size, interleave_c)
@@ -77,73 +132,93 @@ WIDTH = 256
 
 def _global_records(kv_len, seed=7):
     """One record array; both paths are views of it, so any diff is a real bug."""
-    vals = jax.random.normal(jax.random.key(seed), (kv_len, D_IDX),
-                             jnp.float32)
-    fp8 = jax.lax.bitcast_convert_type(vals.astype(jnp.float8_e4m3fn),
-                                       jnp.uint8).reshape(kv_len, D_IDX)
+    vals = jax.random.normal(jax.random.key(seed), (kv_len, D_IDX), jnp.float32)
+    fp8 = jax.lax.bitcast_convert_type(
+        vals.astype(jnp.float8_e4m3fn), jnp.uint8
+    ).reshape(kv_len, D_IDX)
     # 127 is the e8m0 exponent bias, i.e. a scale of exactly 1.0.
     rec = jnp.concatenate([fp8, jnp.full((kv_len, 1), 127, jnp.uint8)], -1)
     return jnp.pad(rec, ((0, 0), (0, WIDTH - rec.shape[-1])))
+
+
+def _need_devices(dcp_size):
+    n = len(jax.devices())
+    if n < dcp_size:
+        pytest.skip(f"needs {dcp_size} devices, have {n}")
+
+
+def _dcp_case(dcp_size, seed):
+    """Records plus the positional args and kwargs of one sharded DCP call."""
+    rec = _global_records(KV_LEN)
+    kq, kw = jax.random.split(jax.random.key(seed))
+    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+        jnp.float8_e4m3fn
+    )
+    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+
+    # interleave_size=1: global position g lives on rank g % dcp_size at local
+    # index g // dcp_size, so the shards are a strided de-interleave.
+    vpages = KV_LEN // (PAGE_SIZE * dcp_size)
+    shards = jnp.concatenate(
+        [
+            rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
+            for r in range(dcp_size)
+        ],
+        0,
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]), (DCP_AXIS_NAME,))
+    shards = jax.device_put(shards, jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
+
+    args = (
+        q,
+        weights,
+        shards,
+        jnp.array([KV_LEN], jnp.int32),
+        jnp.arange(vpages, dtype=jnp.int32),
+        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32),
+    )
+    kwargs = dict(
+        mesh=mesh,
+        k=K,
+        compression_ratio=1,
+        dcp_size=dcp_size,
+        interleave_size=1,
+        num_kv_pages_per_block=2,
+        num_queries_per_block=128,
+    )
+    return rec, args, kwargs
 
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
     """Union the per-rank lists back together; it must be the global top-k"""
-    devices = jax.devices()
-    if len(devices) < dcp_size:
-        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-
-    rec = _global_records(KV_LEN)
-    kq, kw = jax.random.split(jax.random.key(0))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *
-         0.5).astype(jnp.float8_e4m3fn)
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX),
-                                jnp.float32).astype(jnp.bfloat16)
-    seq_lens = jnp.array([KV_LEN], jnp.int32)
-    cu_q_lens = jnp.array([0, Q_LEN], jnp.int32)
-    distribution = jnp.array([0, 0, 1], jnp.int32)
+    _need_devices(dcp_size)
+    rec, args, kwargs = _dcp_case(dcp_size, 0)
+    q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
     reference = np.asarray(
-        streamindex_topk(q,
-                         weights,
-                         rec.reshape(pages, PAGE_SIZE // 4, 4, WIDTH),
-                         seq_lens,
-                         jnp.arange(pages, dtype=jnp.int32),
-                         cu_q_lens,
-                         distribution,
-                         k=K,
-                         compression_ratio=1,
-                         num_kv_pages_per_block=2,
-                         num_queries_per_block=128))
-
-    # interleave_size=1: global position g lives on rank g % dcp_size at local
-    # index g // dcp_size, so the shards are a strided de-interleave.
-    vpages = KV_LEN // (PAGE_SIZE * dcp_size)
-    shards = jnp.concatenate([
-        rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
-        for r in range(dcp_size)
-    ], 0)
-    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME, ))
-    shards = jax.device_put(shards,
-                            jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
-
-    local_topk = jax.jit(
-        functools.partial(
-            streamindex_topk_dcp,
-            mesh=mesh,
+        streamindex_topk(
+            q,
+            weights,
+            rec.reshape(pages, PAGE_SIZE // 4, 4, WIDTH),
+            jnp.array([KV_LEN], jnp.int32),
+            jnp.arange(pages, dtype=jnp.int32),
+            jnp.array([0, Q_LEN], jnp.int32),
+            jnp.array([0, 0, 1], jnp.int32),
             k=K,
             compression_ratio=1,
-            dcp_size=dcp_size,
-            interleave_size=1,
             num_kv_pages_per_block=2,
-            num_queries_per_block=128))(q, weights, shards, seq_lens,
-                                        jnp.arange(vpages, dtype=jnp.int32),
-                                        cu_q_lens, distribution)
+            num_queries_per_block=128,
+        )
+    )
 
     # Global leading dim is dcp_size * Q_LEN, rank-major.
-    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
+    local_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs)).reshape(
+        dcp_size, Q_LEN, K
+    )
     assert local_topk.max() < KV_LEN // dcp_size, "a rank got a foreign index"
 
     for t in range(Q_LEN):
@@ -153,5 +228,28 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
             for local in row[row >= 0].tolist():
                 got.add(int(cp_local_to_global(local, r, dcp_size, 1)))
         want = set(reference[t][reference[t] >= 0].tolist())
-        assert got == want, (f"token {t}: {len(want - got)} missing, "
-                             f"{len(got - want)} spurious")
+        assert got == want, (
+            f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
+        )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("chunk_tokens", [32, 64, 128])
+def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 11)
+
+    hlo = streamindex_topk_dcp.lower(
+        *args, **kwargs, chunk_tokens=chunk_tokens
+    ).as_text()
+    assert "_scheduling_group_id" in hlo, (
+        "no scheduling group annotation: the DCP path ran a single unchunked"
+        " pass, so this comparison would pass trivially"
+    )
+
+    unchunked = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    chunked = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, chunk_tokens=chunk_tokens)
+    )
+    np.testing.assert_array_equal(chunked, unchunked)

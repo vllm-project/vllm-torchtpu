@@ -52,14 +52,15 @@ def ref_wkv_proj_and_save_state(
     tokens_per_page = page_size // slots_per_token
     assert state_block_size <= tokens_per_page, (
         f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
-        f"token states a {page_size}-row page holds")
+        f"token states a {page_size}-row page holds"
+    )
 
     # 3. Unpack inline
-    cache_reshaped = cache.reshape(num_pages, tokens_per_page, slots_per_token,
-                                   d1, d2)
+    cache_reshaped = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
     cache_t = cache_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_bitcast_shape = cache_t.reshape(num_pages, tokens_per_page,
-                                          slots_per_token, (d2 * d1) // 4, 4)
+    cache_bitcast_shape = cache_t.reshape(
+        num_pages, tokens_per_page, slots_per_token, (d2 * d1) // 4, 4
+    )
     f32_flat = jax.lax.bitcast_convert_type(cache_bitcast_shape, jnp.float32)
     flat = f32_flat.reshape(num_pages * tokens_per_page, state_dim)
 
@@ -72,14 +73,13 @@ def ref_wkv_proj_and_save_state(
     flat = flat_padded[:-1]
 
     # 5. Pack inline back
-    chunk = flat.reshape(num_pages, tokens_per_page, slots_per_token,
-                         f32_per_slot, 1)
+    chunk = flat.reshape(num_pages, tokens_per_page, slots_per_token, f32_per_slot, 1)
     chunk_bytes = jax.lax.bitcast_convert_type(chunk, jnp.uint8)
-    chunk_bytes_reshaped = chunk_bytes.reshape(num_pages, tokens_per_page,
-                                               slots_per_token, d2, d1)
+    chunk_bytes_reshaped = chunk_bytes.reshape(
+        num_pages, tokens_per_page, slots_per_token, d2, d1
+    )
     chunk_bytes_t = chunk_bytes_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_view = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1,
-                               d2)
+    cache_view = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
     cache_view = cache_view.at[:].set(chunk_bytes_t)
     new_cache = cache_view.reshape(num_pages, page_size, d1, d2)
 

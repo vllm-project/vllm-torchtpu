@@ -1,21 +1,25 @@
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import (EncoderOnlyAttentionSpec,
-                                        FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, KVCacheTensor,
-                                        MambaSpec)
+from vllm.v1.kv_cache_interface import (
+    EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
-    format_kv_cache_layout_summary, materialize_kv_cache_tensors)
-from vllm_torchtpu.kv_cache_spec_normalizer import \
-    normalize_kv_cache_specs_for_tpu
+    format_kv_cache_layout_summary,
+    materialize_kv_cache_tensors,
+)
+from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 
 class FakeAttentionBackend:
-
     @staticmethod
     def get_kv_cache_shape(
         num_blocks,
@@ -84,7 +88,8 @@ def make_hybrid_config(
                 layers=[name],
                 layer_stride=page_size * num_blocks,
                 block_stride=page_size,
-            ) for name in ["model.layers.0.self_attn", "model.layers.1.mamba"]
+            )
+            for name in ["model.layers.0.self_attn", "model.layers.1.mamba"]
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -99,8 +104,7 @@ def make_hybrid_config(
     )
 
 
-def make_attention_encoder_attention_config(
-        num_blocks: int = 4) -> KVCacheConfig:
+def make_attention_encoder_attention_config(num_blocks: int = 4) -> KVCacheConfig:
     page_size = 16 * 2 * 2 * 8 * torch.bfloat16.itemsize
     attn_spec = FullAttentionSpec(
         block_size=16,
@@ -180,9 +184,11 @@ def make_hybrid_with_encoder_gap_config(num_blocks: int = 4) -> KVCacheConfig:
                 layers=[name],
                 layer_stride=page_size * num_blocks,
                 block_stride=page_size,
-            ) for name in [
-                "model.layers.0.self_attn", "model.layers.2.self_attn",
-                "model.layers.3.mamba"
+            )
+            for name in [
+                "model.layers.0.self_attn",
+                "model.layers.2.self_attn",
+                "model.layers.3.mamba",
             ]
         ],
         kv_cache_groups=[
@@ -207,14 +213,17 @@ def make_hybrid_with_encoder_gap_config(num_blocks: int = 4) -> KVCacheConfig:
 
 
 def make_attention_groups(cfg: KVCacheConfig) -> list[list[AttentionGroup]]:
-    return [[
-        AttentionGroup(
-            backend=FakeAttentionBackend,
-            layer_names=list(group.layer_names),
-            kv_cache_spec=group.kv_cache_spec,
-            kv_cache_group_id=gid,
-        )
-    ] for gid, group in enumerate(cfg.kv_cache_groups)]
+    return [
+        [
+            AttentionGroup(
+                backend=FakeAttentionBackend,
+                layer_names=list(group.layer_names),
+                kv_cache_spec=group.kv_cache_spec,
+                kv_cache_group_id=gid,
+            )
+        ]
+        for gid, group in enumerate(cfg.kv_cache_groups)
+    ]
 
 
 def test_attention_only_allocates_direct_cache_without_raw_backing():
@@ -242,8 +251,7 @@ def test_attention_only_allocates_direct_cache_without_raw_backing():
     assert attn_cache.is_contiguous()
 
 
-def test_direct_attention_materialization_maps_kernel_block_sizes_after_encoder_only_gap(
-):
+def test_direct_attention_materialization_maps_kernel_block_sizes_after_encoder_only_gap():
     cfg = make_attention_encoder_attention_config(num_blocks=4)
 
     materialized = materialize_kv_cache_tensors(
@@ -272,8 +280,7 @@ def test_hybrid_materializes_one_attention_shaped_pool(attn_dtype):
         attn_groups=_hybrid_groups(cfg),
         kernel_block_sizes=[16, 16],
         device=torch.device("cpu"),
-        cache_dtype=("fp8"
-                     if attn_dtype == torch.float8_e4m3fn else "bfloat16"),
+        cache_dtype=("fp8" if attn_dtype == torch.float8_e4m3fn else "bfloat16"),
     )
 
     pool = materialized.raw_tensors[0]
@@ -298,11 +305,13 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
         named_kv_caches=materialized.kv_caches,
         kv_cache_groups=cfg.kv_cache_groups,
         raw_tensors=materialized.raw_tensors,
-        gdn_geometry=rpm.GdnHeadGeometry(local_key_heads=1,
-                                         local_value_heads=1,
-                                         key_head_dim=2,
-                                         value_head_dim=4,
-                                         conv_kernel_size=3),
+        gdn_geometry=rpm.GdnHeadGeometry(
+            local_key_heads=1,
+            local_value_heads=1,
+            key_head_dim=2,
+            value_head_dim=4,
+            conv_kernel_size=3,
+        ),
         mamba_group_ordinal_by_layer={"model.layers.1.mamba": 0},
     )
 
@@ -322,8 +331,9 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
     # Kernel-tied SSM bytes from the geometry (1 V head × 4 × 2 fp32), not
     # from the declared MambaSpec ssm shape.
     assert conv.base_offset_bytes == 1 * 4 * 2 * torch.float32.itemsize
-    rpm.verify_storage_binding(manifest, materialized.kv_caches,
-                               materialized.raw_tensors)
+    rpm.verify_storage_binding(
+        manifest, materialized.kv_caches, materialized.raw_tensors
+    )
 
 
 def test_hybrid_materialization_skips_encoder_only_kernel_entry():
@@ -349,8 +359,7 @@ def test_hybrid_materialization_skips_encoder_only_kernel_entry():
 
 
 @pytest.mark.parametrize("kernel_block_sizes", ([16], [16, 8, 16]))
-def test_materialization_rejects_mismatched_kernel_block_size_count(
-        kernel_block_sizes):
+def test_materialization_rejects_mismatched_kernel_block_size_count(kernel_block_sizes):
     cfg = make_attention_encoder_attention_config(num_blocks=4)
 
     with pytest.raises(ValueError):
@@ -450,7 +459,7 @@ def test_hybrid_materialization_workload_a_geometry() -> None:
     )
     mamba_spec = MambaSpec(
         block_size=1536,
-        shapes=[(274432, )],
+        shapes=[(274432,)],
         dtypes=[torch.bfloat16],
         page_size_padded=None,
     )
@@ -479,7 +488,8 @@ def test_hybrid_materialization_workload_a_geometry() -> None:
                 layers=[name],
                 layer_stride=pool_page_bytes * num_blocks,
                 block_stride=pool_page_bytes,
-            ) for name in ["model.layers.0.self_attn", "model.layers.1.mamba"]
+            )
+            for name in ["model.layers.0.self_attn", "model.layers.1.mamba"]
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -539,17 +549,16 @@ def test_native_placements_preserve_pool_budget_and_aliases(hybrid):
     attention = seed.kv_cache_groups[0].kv_cache_spec
     other = seed.kv_cache_groups[-1].kv_cache_spec
     groups = [
-        KVCacheGroupSpec(layer_names=["attn.0", "attn.1"],
-                         kv_cache_spec=attention),
-        KVCacheGroupSpec(layer_names=["alias.0", "alias.1"],
-                         kv_cache_spec=other),
+        KVCacheGroupSpec(layer_names=["attn.0", "attn.1"], kv_cache_spec=attention),
+        KVCacheGroupSpec(layer_names=["alias.0", "alias.1"], kv_cache_spec=other),
     ]
     cache_config = CacheConfig()
     cache_config.kv_cache_layout = "LBNHC"
     num_blocks = 4
     budget = 2 * num_blocks * attention.page_size_bytes
     config = get_kv_cache_config_from_groups(
-        SimpleNamespace(cache_config=cache_config), groups, budget)
+        SimpleNamespace(cache_config=cache_config), groups, budget
+    )
     assert config.num_blocks == num_blocks
     assert all(tensor.size == budget for tensor in config.kv_cache_tensors)
     assert all(len(tensor.layers) == 2 for tensor in config.kv_cache_tensors)
@@ -582,14 +591,13 @@ def test_attention_aliases_reject_mixed_native_shapes():
     spec = config.kv_cache_groups[0].kv_cache_spec
     alias = "other.attn"
     config.kv_cache_groups.append(
-        KVCacheGroupSpec(layer_names=[alias],
-                         kv_cache_spec=replace(spec,
-                                               num_kv_heads=1,
-                                               head_size=16)))
-    config.kv_cache_tensors.append(
-        replace(config.kv_cache_tensors[0], layers=[alias]))
-    with pytest.raises(NotImplementedError,
-                       match="identical native cache geometry"):
+        KVCacheGroupSpec(
+            layer_names=[alias],
+            kv_cache_spec=replace(spec, num_kv_heads=1, head_size=16),
+        )
+    )
+    config.kv_cache_tensors.append(replace(config.kv_cache_tensors[0], layers=[alias]))
+    with pytest.raises(NotImplementedError, match="identical native cache geometry"):
         materialize_kv_cache_tensors(
             kv_cache_config=config,
             attn_groups=make_attention_groups(config),

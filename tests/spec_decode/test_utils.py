@@ -37,17 +37,15 @@ def test_own_vocab_weights_are_kept_when_tp_layout_matches():
     )
 
     utils.maybe_share_embeddings(draft, target, tp_layout_matches=True)
-    utils.maybe_share_lm_head(draft,
-                              target,
-                              draft_replicated=False,
-                              tp_layout_matches=True)
+    utils.maybe_share_lm_head(
+        draft, target, draft_replicated=False, tp_layout_matches=True
+    )
 
     assert draft.model.embed_tokens is draft_embed
     assert draft.lm_head is draft_head
 
 
 class _SharedHeadLayer(torch.nn.Module):
-
     def __init__(self, hidden: int, vocab: int):
         super().__init__()
         self.shared_head = torch.nn.Module()
@@ -58,14 +56,14 @@ def _make_mtp_draft(num_layers: int = 1, hidden: int = 2, vocab: int = 3):
     """A DeepSeek/GLM-5.2-shaped MTP draft: no top-level lm_head, one head per
     MTP layer at model.layers.<N>.shared_head.head, LogitsProcessor on the
     inner model."""
-    layers = torch.nn.ModuleDict({
-        str(78 + i): _SharedHeadLayer(hidden, vocab)
-        for i in range(num_layers)
-    })
+    layers = torch.nn.ModuleDict(
+        {str(78 + i): _SharedHeadLayer(hidden, vocab) for i in range(num_layers)}
+    )
     inner = torch.nn.Module()
     inner.layers = layers
     inner.logits_processor = SimpleNamespace(
-        _gather_logits=lambda logits: logits.clone())
+        _gather_logits=lambda logits: logits.clone()
+    )
     draft = torch.nn.Module()
     draft.model = inner
     return draft
@@ -81,10 +79,9 @@ def test_mtp_shared_head_is_bound_to_target_lm_head():
     draft = _make_mtp_draft(num_layers=2)
     target = _make_target()
 
-    utils.maybe_share_lm_head(draft,
-                              target,
-                              draft_replicated=False,
-                              tp_layout_matches=True)
+    utils.maybe_share_lm_head(
+        draft, target, draft_replicated=False, tp_layout_matches=True
+    )
 
     heads = [sh.head for sh in utils.iter_mtp_shared_heads(draft)]
     assert len(heads) == 2
@@ -99,10 +96,9 @@ def test_mtp_replicated_draft_overrides_inner_logits_processor():
     draft = _make_mtp_draft()
     target = _make_target()
 
-    utils.maybe_share_lm_head(draft,
-                              target,
-                              draft_replicated=True,
-                              tp_layout_matches=True)
+    utils.maybe_share_lm_head(
+        draft, target, draft_replicated=True, tp_layout_matches=True
+    )
 
     logits = torch.randn(2, 3)
     assert draft.model.logits_processor._gather_logits(logits) is logits
@@ -114,10 +110,9 @@ def test_replicated_draft_without_logits_processor_raises():
     target = _make_target()
 
     with pytest.raises(RuntimeError, match="LogitsProcessor"):
-        utils.maybe_share_lm_head(draft,
-                                  target,
-                                  draft_replicated=True,
-                                  tp_layout_matches=True)
+        utils.maybe_share_lm_head(
+            draft, target, draft_replicated=True, tp_layout_matches=True
+        )
 
 
 def test_top_level_lm_head_draft_is_unchanged():
@@ -126,15 +121,13 @@ def test_top_level_lm_head_draft_is_unchanged():
     draft = SimpleNamespace(
         model=SimpleNamespace(),
         lm_head=torch.nn.Linear(2, 3, bias=False),
-        logits_processor=SimpleNamespace(
-            _gather_logits=lambda logits: logits.clone()),
+        logits_processor=SimpleNamespace(_gather_logits=lambda logits: logits.clone()),
     )
     target = _make_target()
 
-    utils.maybe_share_lm_head(draft,
-                              target,
-                              draft_replicated=True,
-                              tp_layout_matches=True)
+    utils.maybe_share_lm_head(
+        draft, target, draft_replicated=True, tp_layout_matches=True
+    )
 
     assert draft.lm_head is target.lm_head
     assert list(utils.iter_mtp_shared_heads(draft)) == []

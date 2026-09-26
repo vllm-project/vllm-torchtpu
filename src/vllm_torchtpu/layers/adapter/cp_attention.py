@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """DCP (Decode Context Parallelism) attention: kernel building and forward
-orchestration, on top of batched_rpa_longctx's schedule_cp.CPMetadataComputer.
+orchestration, on top of batched_rpa's schedule_cp.CPMetadataComputer.
 Process-group access lives in distributed/dcp.py.
 
 Each DCP rank stores a shard of the KV cache (interleaved by page_size).
@@ -37,10 +37,12 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
-    configs as _rpa_longctx_configs
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
-    wrapper as _rpa_longctx_wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as _batched_rpa_configs,
+)
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    wrapper as _batched_rpa_wrapper,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 # ---------------------------------------------------------------------------
@@ -71,8 +73,9 @@ def lse_weighted_combine(
     out_a = torch.nan_to_num(out_a, nan=0.0, posinf=0.0, neginf=0.0)
     out_b = torch.nan_to_num(out_b, nan=0.0, posinf=0.0, neginf=0.0)
     norm_safe = torch.where(norm > 0, norm, torch.ones_like(norm))
-    out = (ea.unsqueeze(-1) * out_a +
-           eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(-1)
+    out = (ea.unsqueeze(-1) * out_a + eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(
+        -1
+    )
     lse_out = torch.where(m_finite, m + torch.log(norm_safe), m)
     return out, lse_out
 
@@ -102,7 +105,8 @@ def dcp_allgather_lse_combine(
     out_combined, lse_combined = out_chunks[0], lse_chunks[0]
     for i in range(1, dcp_world_size):
         out_combined, lse_combined = lse_weighted_combine(
-            out_combined, lse_combined, out_chunks[i], lse_chunks[i])
+            out_combined, lse_combined, out_chunks[i], lse_chunks[i]
+        )
     return out_combined, lse_combined
 
 
@@ -129,20 +133,23 @@ def _pallas_rpa_kernel_dcp(
     soft_cap: float | None = None,
     cp_group_size: int,
     cp_rank_val: int,
-    attention_scope: _rpa_longctx_configs.AttentionScope,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
-    HEAD_ALONG_SUBLANE,
+    attention_scope: _batched_rpa_configs.AttentionScope,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
-    output, lse). cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
+    output, lse). decode_query_size widens the DECODE bucket so speculative
+    verify windows (K + 1 tokens) run there instead of in MIXED.
+    cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
     inside ragged_paged_attention, needed by both scopes: CACHE_ONLY to
     compute this rank's local cache length, NEW_TOKENS_ONLY to land the
     write on the right physical page of this rank's DCP-interleaved
     kv_cache (its own write offset is otherwise global, not rank-local).
     """
     import jax.numpy as jnp
+
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
-    output, new_kv_cache, lse = _rpa_longctx_wrapper.ragged_paged_attention(
+    output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
         keys=key,
         values=value,
@@ -160,6 +167,7 @@ def _pallas_rpa_kernel_dcp(
         cp_group_size=cp_group_size,
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
+        decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
     )
@@ -185,10 +193,9 @@ def _alloc_instance_id() -> int:
 
 
 def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
-    lse = torch.empty(query.shape[0],
-                      query.shape[1],
-                      dtype=query.dtype,
-                      device=query.device)
+    lse = torch.empty(
+        query.shape[0], query.shape[1], dtype=query.dtype, device=query.device
+    )
     return torch.empty_like(kv_cache), torch.empty_like(query), lse
 
 
@@ -202,11 +209,9 @@ def _build_dcp_kernel_op(op_name: str, fn):
     The kv_cache.copy_ below keeps the caller's tensor validly bound to
     that (possibly aliased) result and compiles to a no-op for CACHE_ONLY.
     """
-    op = pallas.jax_op(op_name,
-                       fn,
-                       donate_argnums=(0, ),
-                       mesh=None,
-                       input_partition_specs=None)
+    op = pallas.jax_op(
+        op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
+    )
     op.register_fake(_fake_dcp)
 
     def kernel_impl(kv_cache, *args, **kwargs):
@@ -226,8 +231,8 @@ def build_dcp_kernels(
     v_scale: float | None,
     cp_group_size: int,
     cp_rank: int,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
-    HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -239,9 +244,19 @@ def build_dcp_kernels(
     """
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
-    kv_layout = _rpa_longctx_configs.KVLayout(kv_layout)
-    base_key = (sliding_window, sm_scale, logits_soft_cap, q_scale, k_scale,
-                v_scale, cp_group_size, cp_rank, kv_layout)
+    kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
+    base_key = (
+        sliding_window,
+        sm_scale,
+        logits_soft_cap,
+        q_scale,
+        k_scale,
+        v_scale,
+        cp_group_size,
+        cp_rank,
+        kv_layout,
+        decode_query_size,
+    )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
 
@@ -258,11 +273,13 @@ def build_dcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            attention_scope=_rpa_longctx_configs.AttentionScope.CACHE_ONLY,
+            attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn)
+            f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
+        )
 
     if cached_new is None:
         fn = functools.partial(
@@ -272,12 +289,13 @@ def build_dcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            attention_scope=_rpa_longctx_configs.AttentionScope.
-            NEW_TOKENS_ONLY,
+            attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn)
+            f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
+        )
 
     return cached_cache, cached_new
 
@@ -301,8 +319,8 @@ def forward_with_dcp(
     kv_cache_quantized_dtype,
     dcp_world_size: int,
     dcp_rank: int,
-    kv_layout: _rpa_longctx_configs.KVLayout = _rpa_longctx_configs.KVLayout.
-    HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.
 
@@ -314,8 +332,7 @@ def forward_with_dcp(
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
-        raise RuntimeError(
-            "DCP group not initialized; cannot run DCP attention.")
+        raise RuntimeError("DCP group not initialized; cannot run DCP attention.")
 
     q_scale = None
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
@@ -331,6 +348,7 @@ def forward_with_dcp(
         cp_group_size=dcp_world_size,
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
     )
 
     own_num_heads = query.shape[1]
@@ -353,11 +371,11 @@ def forward_with_dcp(
         v_scale,
     )
 
-    ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp,
-                                       *shared_args)
+    ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
 
     combined_output, combined_lse = dcp_allgather_lse_combine(
-        ctx_output, ctx_lse, dcp_group, dcp_world_size)
+        ctx_output, ctx_lse, dcp_group, dcp_world_size
+    )
 
     # all_gather above concatenates in rank order, so this rank's own
     # heads sit at [rank * own_num_heads : (rank + 1) * own_num_heads).
@@ -368,8 +386,7 @@ def forward_with_dcp(
 
     new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
 
-    output, _ = lse_weighted_combine(combined_output, combined_lse, new_output,
-                                     new_lse)
+    output, _ = lse_weighted_combine(combined_output, combined_lse, new_output, new_lse)
 
     if not torch.compiler.is_compiling():
         synchronize_tensors(kv_cache, wait=False)

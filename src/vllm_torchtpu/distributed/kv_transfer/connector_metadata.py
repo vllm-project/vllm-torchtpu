@@ -8,10 +8,8 @@ live here rather than inside either transport module.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import \
-    KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 ReqId = str
 
@@ -28,6 +26,10 @@ class SendMeta:
     # ordinal (the block holding the final recurrent state); None for FA-only
     # Stage-3 models and all legacy paths.
     mamba_state_block_ids: list[int] | None = None
+    # One block table per transferred kv-cache group, in Stage-3 transfer-plan
+    # order. Only DSv4 sets it, because its groups page at different sizes;
+    # single-group models leave it None and use local_block_ids.
+    group_block_ids: list[list[int]] | None = None
 
 
 @dataclass
@@ -37,7 +39,7 @@ class LoadMeta:
     remote_block_ids: list[int]
     remote_host: str | list[str]
     remote_port: int | list[int]
-    remote_side_channel_port: Optional[int] = None
+    remote_side_channel_port: int | None = None
     # Whether the worker reports this load's completion to the scheduler as
     # finished_recving. False when this connector doesn't own the request's
     # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
@@ -45,6 +47,8 @@ class LoadMeta:
     # report would trip the scheduler's assert or prematurely resume the
     # request.
     report_completion: bool = True
+    # The scheduler rejected this load after allocation.
+    fail_only: bool = False
 
 
 @dataclass

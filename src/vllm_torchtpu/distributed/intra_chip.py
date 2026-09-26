@@ -38,10 +38,12 @@ def _chip_rank_groups() -> list[list[int]] | None:
     if topology.cores_per_chip < 2:
         logger.warning(
             "Only %d core(s) per chip; nothing to split within a chip.",
-            topology.cores_per_chip)
+            topology.cores_per_chip,
+        )
         return None
 
     import torch.distributed as dist
+
     if not (dist.is_available() and dist.is_initialized()):
         return None
 
@@ -52,8 +54,10 @@ def _chip_rank_groups() -> list[list[int]] | None:
         # Anything else would silently pair up the wrong cores.
         logger.warning(
             "World size %d does not match the %d visible devices; refusing to "
-            "guess the intra-chip grouping.", world_size,
-            len(topology.device_ids))
+            "guess the intra-chip grouping.",
+            world_size,
+            len(topology.device_ids),
+        )
         return None
 
     by_chip: dict[int, list[int]] = collections.defaultdict(list)
@@ -64,8 +68,7 @@ def _chip_rank_groups() -> list[list[int]] | None:
     groups = [sorted(by_chip[chip]) for chip in sorted(by_chip)]
     sizes = {len(g) for g in groups}
     if sizes != {topology.cores_per_chip}:
-        logger.warning("Chip groups are ragged (%s); not usable.",
-                       sorted(sizes))
+        logger.warning("Chip groups are ragged (%s); not usable.", sorted(sizes))
         return None
     return groups
 
@@ -87,8 +90,10 @@ def get_intra_chip_group():
         return None
 
     import torch.distributed as dist
-    from vllm.distributed.parallel_state import (get_world_group,
-                                                 init_model_parallel_group)
+    from vllm.distributed.parallel_state import (
+        get_world_group,
+        init_model_parallel_group,
+    )
 
     world = get_world_group()
     backend = dist.get_backend(world.device_group)
@@ -100,6 +105,10 @@ def get_intra_chip_group():
     )
     logger.info(
         "Intra-chip group ready: %d chip(s) x %d core(s), this rank is "
-        "%d/%d within its chip.", len(groups), len(groups[0]),
-        _group.rank_in_group, _group.world_size)
+        "%d/%d within its chip.",
+        len(groups),
+        len(groups[0]),
+        _group.rank_in_group,
+        _group.world_size,
+    )
     return _group

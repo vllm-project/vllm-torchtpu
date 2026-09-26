@@ -13,8 +13,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.kimi_k3.mega_kda.kernel import \
-    _chunk_kda_fwd_native_segids
+from vllm_torchtpu.kernels.kimi_k3.mega_kda.kernel import _chunk_kda_fwd_native_segids
 
 
 def _layout_supported(
@@ -42,9 +41,11 @@ def _layout_supported(
     ends = jnp.minimum(query_start_loc[1:], num_tokens)
     tile_starts = jnp.arange(0, num_tokens, chunk_size, dtype=jnp.int32)
     tile_ends = tile_starts + chunk_size
-    overlaps = ((starts < ends)[:, None]
-                & (starts[:, None] < tile_ends[None, :])
-                & (ends[:, None] > tile_starts[None, :]))
+    overlaps = (
+        (starts < ends)[:, None]
+        & (starts[:, None] < tile_ends[None, :])
+        & (ends[:, None] > tile_starts[None, :])
+    )
     return jnp.all(jnp.sum(overlaps, axis=0) <= 2)
 
 
@@ -104,14 +105,16 @@ def kda_forward_inference(
     """
     if q.dtype != jnp.bfloat16:
         raise ValueError(
-            f"kda_forward_inference currently requires BF16, got {q.dtype}")
+            f"kda_forward_inference currently requires BF16, got {q.dtype}"
+        )
     if not (q.dtype == k.dtype == v.dtype == g.dtype):
         raise ValueError("q, k, v, and g must have the same dtype")
     if beta.dtype != q.dtype:
         raise ValueError("beta must have the same dtype as q")
     if chunk_size != 64:
         raise ValueError(
-            "the optimized inference kernel currently requires chunk_size=64")
+            "the optimized inference kernel currently requires chunk_size=64"
+        )
     if q.shape[:3] != k.shape[:3] or q.shape != g.shape:
         raise ValueError("q, k, and g must agree on [B, T, H, K]")
     if q.shape[:3] != v.shape[:3] or q.shape[:3] != beta.shape:
@@ -123,23 +126,22 @@ def kda_forward_inference(
     if segment_ids.ndim == 1:
         segment_ids = segment_ids[None, :]
     if segment_ids.shape != q.shape[:2]:
-        raise ValueError(f"segment_ids must have shape {q.shape[:2]}, got "
-                         f"{segment_ids.shape}")
-    if segment_ids.dtype != jnp.int32:
         raise ValueError(
-            f"segment_ids must use int32, got {segment_ids.dtype}")
+            f"segment_ids must have shape {q.shape[:2]}, got {segment_ids.shape}"
+        )
+    if segment_ids.dtype != jnp.int32:
+        raise ValueError(f"segment_ids must use int32, got {segment_ids.dtype}")
     if A_log is None or dt_bias is None:
         raise ValueError("fused gate activation requires A_log and dt_bias")
     if not use_qk_l2norm_in_kernel:
         raise ValueError(
             "standalone inference requires in-kernel Q/K L2 normalization "
-            "to bound the triangular solve")
+            "to bound the triangular solve"
+        )
     if not use_gate_in_kernel or not safe_gate:
-        raise ValueError(
-            "standalone inference requires safe fused gate activation")
+        raise ValueError("standalone inference requires safe fused gate activation")
     if lower_bound is None or not (-5 <= lower_bound < 0):
-        raise ValueError(
-            "safe fused gate activation requires lower_bound in [-5, 0)")
+        raise ValueError("safe fused gate activation requires lower_bound in [-5, 0)")
     if N_max is None:
         if initial_state is not None:
             N_max = initial_state.shape[-4]
@@ -153,7 +155,7 @@ def kda_forward_inference(
     # becoming inf before gate activation.
     A_log = jnp.minimum(A_log, jnp.asarray(80.0, dtype=A_log.dtype))
 
-    actual_scale = q.shape[-1]**-0.5 if scale is None else scale
+    actual_scale = q.shape[-1] ** -0.5 if scale is None else scale
     output, final_state, *_ = _chunk_kda_fwd_native_segids(
         q=q,
         k=k,

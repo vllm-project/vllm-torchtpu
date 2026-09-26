@@ -37,27 +37,23 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260912075415",
+    "torch-tpu==0.1.1.dev20260924085621",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
-    # installed torch at import time.
-    "tpu-sync-torch==0.0.1.dev20260917080754",
+    # installed torch at import time. Published to PyPI as nightly .dev
+    # pre-releases, so it needs no registry source below.
+    "tpu-sync-torch==0.0.1.dev20260923040928",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.11. vLLM 0.29.0 only sets a floor (>=5.10.4), and letting
-    # transformers float to 5.17.0 fails
-    # test_structured_output_spec_decode_correctness_greedy[single_chunk] with
-    # assert 1 == 0 -- a wrong answer under grammar-constrained decoding, not an
-    # import or API error, so nothing catches it before the test.
-    #
-    # 5.10.4 is vLLM's floor and the closest available release to 5.8.0, which
-    # was the last version this suite was green on. It is NOT a bisected ceiling:
-    # the break is somewhere in 5.11.0-5.17.0 and could be much later than 5.11.
-    # Widen it by bisecting against that test, not by bumping and hoping.
-    "transformers>=5.10.4,<5.11",
+    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
+    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
+    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
+    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
+    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -91,11 +87,6 @@ test = [
     "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
 ]
 
-# Dev tools (linting, formatting)
-dev = [
-    "yapf>=0.43.0",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -114,7 +105,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.27.0rc1",
+    "vllm-omni==0.29.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -143,24 +134,43 @@ markers = [
 # makes `exclude` hold for both `ruff format .` and the hook.
 force-exclude = true
 
+# protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
+# would make every regeneration produce a spurious diff.
+exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+
 [tool.ruff.lint]
 # E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
-# I import sorting. Line length (E501) is in E5 and is not selected.
-select = ["E4", "E7", "E9", "F", "I"]
+# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
+# G logging calls, ISC string concatenation.
+# Line length (E501) is in E5 and is not selected.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+
+ignore = [
+    # Off on purpose, matching upstream vllm.
+    "B905",   # zip() without an explicit strict=
+    "B007",   # loop control variable not used in the body
+    "UP032",  # .format() that could be an f-string
+
+    # Firing today and not fixed yet. `ruff check --fix` does not clear any of
+    # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
+    # change. Delete the entry once its count reaches zero.
+    "SIM115",  #   1  open() outside a context manager
+]
 
 [tool.ruff.lint.per-file-ignores]
-# isort and yapf still own these paths. The same list appears in `exclude`
-# under [tool.ruff.format] and in the isort and yapf excludes in
-# .pre-commit-config.yaml; all three move together, otherwise two tools format the
-# same file.
-"src/**" = ["I"]
-"tests/**" = ["I"]
+# Pallas runs a kernel closure the moment it is defined: `pl.when` and
+# `pl.loop` trace the body during the decorator call, inside the iteration
+# that built it. B023 warns that a closure outliving its loop sees the last
+# value of the loop variable, which cannot happen to a body that never
+# outlives the iteration.
+#
+# Switching the rule off here would also hide a capture that does escape, so
+# tools/check_b023_baseline.py counts the findings per file and fails when a
+# file gains one. Both move together.
+"src/vllm_torchtpu/kernels/**" = ["B023"]
 
 [tool.ruff.format]
 docstring-code-format = true
-
-# Same paths as [tool.ruff.lint.per-file-ignores] above; see the note there.
-exclude = ["src/**", "tests/**"]
 
 [tool.pyrefly]
 project-includes = ["src"]
@@ -226,4 +236,3 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
-tpu-sync-torch = { index = "torch-tpu-registry" }

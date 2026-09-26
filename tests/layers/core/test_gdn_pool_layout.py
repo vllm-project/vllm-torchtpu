@@ -38,8 +38,7 @@ def test_qwen35_layout_includes_conv_tile_padding(
         pytest.param(262144, 9216, 2560, 103, 4, id="kimi-linear-tp8"),
         # The conv tile no longer needs to divide the SSM region, so it may
         # exceed it in token count.
-        pytest.param(
-            3 * 1024, 12 * 1024, 1024, 3, 16, id="conv-wider-than-ssm"),
+        pytest.param(3 * 1024, 12 * 1024, 1024, 3, 16, id="conv-wider-than-ssm"),
     ],
 )
 def test_layout_pads_states_to_token_rows(

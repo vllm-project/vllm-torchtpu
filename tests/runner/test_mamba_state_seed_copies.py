@@ -14,6 +14,7 @@ here reads stale recurrent state on a cache hit. End-to-end this is covered by
 MMLU-with-prefix-caching parity; this file pins the block-selection logic
 directly and cheaply.
 """
+
 import inspect
 from types import SimpleNamespace
 
@@ -29,26 +30,29 @@ STATE_DIM = 8
 NUM_BLOCKS = 32
 
 _HAS_SPLIT = "_pool_block_split" in inspect.getsource(
-    TPUModelRunner._collect_mamba_state_seed_copies)
+    TPUModelRunner._collect_mamba_state_seed_copies
+)
 
 
 def _table(block_rows, num_rows=16, num_cols=8):
     cpu = torch.zeros((num_rows, num_cols), dtype=torch.int32)
     for row, blocks in enumerate(block_rows):
-        cpu[row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
+        cpu[row, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
     return SimpleNamespace(get_cpu_tensor=lambda cpu=cpu: cpu)
 
 
-def _make_self(req_ids,
-               num_computed,
-               group_block_rows,
-               *,
-               state_pos=None,
-               split=1,
-               num_cols=8,
-               state_block_size=BLOCK_SIZE,
-               ckpt_window=1,
-               read_offsets=None):
+def _make_self(
+    req_ids,
+    num_computed,
+    group_block_rows,
+    *,
+    state_pos=None,
+    split=1,
+    num_cols=8,
+    state_block_size=BLOCK_SIZE,
+    ckpt_window=1,
+    read_offsets=None,
+):
     """Build a minimal fake runner ``self`` for the collector.
 
     ``group_block_rows`` is a list (one entry per mamba group) of block-table
@@ -59,17 +63,13 @@ def _make_self(req_ids,
     world size, never by the attention ``block_size``.
     """
     input_batch = SimpleNamespace(
-        req_id_to_index={
-            rid: i
-            for i, rid in enumerate(req_ids)
-        },
-        num_computed_tokens_cpu=np.array(num_computed + [0] *
-                                         (16 - len(num_computed))),
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        num_computed_tokens_cpu=np.array(num_computed + [0] * (16 - len(num_computed))),
         req_ids=list(req_ids) + [None] * (16 - len(req_ids)),
         # block_table is indexed by group id; give attn gid 0 a dummy table
         # so mamba gids start at 1 (matching a real hybrid model layout).
-        block_table=[_table([], num_cols=num_cols)] +
-        [_table(rows, num_cols=num_cols) for rows in group_block_rows],
+        block_table=[_table([], num_cols=num_cols)]
+        + [_table(rows, num_cols=num_cols) for rows in group_block_rows],
     )
     raws = [
         torch.zeros((NUM_BLOCKS, STATE_DIM), dtype=torch.float32)
@@ -99,8 +99,7 @@ def _make_self(req_ids,
     # class methods are already callable as-is.
     ns._bucket_len = TPUModelRunner._bucket_len
     ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
-    for name in ("_pad_dev_to_bucket", "_expand_pool_split",
-                 "_spec_seed_sources"):
+    for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws
 
@@ -112,8 +111,11 @@ def _sched(num_scheduled):
 def _real_pairs(staged):
     """Non-padding (src, dst) pairs from one staged (raws, src_t, dst_t)."""
     _raws, src_t, dst_t = staged
-    return [(int(s), int(d)) for s, d in zip(src_t.tolist(), dst_t.tolist())
-            if (s, d) != (0, 0)]
+    return [
+        (int(s), int(d))
+        for s, d in zip(src_t.tolist(), dst_t.tolist())
+        if (s, d) != (0, 0)
+    ]
 
 
 def _collect(fake, sched, num_reqs=None):
@@ -134,8 +136,7 @@ def test_first_prefill_chunk_no_copy():
 
 
 def test_chunk_advance_copies_state():
-    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 1})
+    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     assert fake._mamba_state_pos["a"] == 2
     assert len(fake._pending_mamba_state_copies) == 1
@@ -144,10 +145,12 @@ def test_chunk_advance_copies_state():
 
 
 def test_pcp_uses_rank_local_state_block_size(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+    )
     # A PCP rank's two table columns cover 16 logical manager blocks. The
     # third global chunk is still in local column 0 and must not index column 2.
     fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6]]])
@@ -157,22 +160,25 @@ def test_pcp_uses_rank_local_state_block_size(monkeypatch):
 
 
 def test_pcp_local_state_block_crossing_copies(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
-    fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]],
-                         state_pos={"a": 0})
+    monkeypatch.setattr(
+        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]], state_pos={"a": 0})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(5, 6)]
 
 
 def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+    )
     # Simulate disaggregated serving where Mamba physical block size is 2048
     # (rounded up power-of-two fit size for TP=2 decode).
     # With max_model_len = 4096 and mamba_block_size = 2048, the block table
@@ -182,9 +188,9 @@ def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
     mamba_block_size = 2048
     num_cols = max_model_len // mamba_block_size  # 2 columns
 
-    fake, _ = _make_self(["a"], [32], [[[5, 6]]],
-                         num_cols=num_cols,
-                         state_block_size=mamba_block_size)
+    fake, _ = _make_self(
+        ["a"], [32], [[[5, 6]]], num_cols=num_cols, state_block_size=mamba_block_size
+    )
     _collect(fake, _sched({"a": 1}))
 
     assert fake._mamba_state_pos["a"] == 0
@@ -199,41 +205,41 @@ def test_pcp_disagg_mamba_block_stride_comparison(monkeypatch):
     attention-derived size instead. Each wrong stride is simulated here by
     installing it as ``_mamba_state_block_size``.
     """
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+    )
 
     # Wrong stride 1 (pre-PR172): attention block_size=16 with no cp factor,
     # i.e. an effective stride of 16 logical tokens per column.
     # At token 32, curr = 32 // 16 = 2 -> IndexError on a 2-column table.
-    fake_bug, _ = _make_self(["a"], [32], [[[5, 6]]],
-                             num_cols=2,
-                             state_block_size=16 // 8)
+    fake_bug, _ = _make_self(
+        ["a"], [32], [[[5, 6]]], num_cols=2, state_block_size=16 // 8
+    )
     with pytest.raises(IndexError):
         _collect(fake_bug, _sched({"a": 1}))
 
     # Wrong stride 2 (PR 172): attention block_size * cp = 16 * 8 = 128.
     # Survives token 32 (32 // 128 = 0) -- the CI's short prompts hid it...
-    fake_pr172, _ = _make_self(["a"], [32], [[[5, 6]]],
-                               num_cols=2,
-                               state_block_size=16)
+    fake_pr172, _ = _make_self(["a"], [32], [[[5, 6]]], num_cols=2, state_block_size=16)
     _collect(fake_pr172, _sched({"a": 1}))
     assert fake_pr172._mamba_state_pos["a"] == 0
 
     # ...but any sequence past 2 columns * 128 tokens crashes again:
     # curr = 256 // 128 = 2 -> IndexError.
-    fake_pr172_large, _ = _make_self(["a"], [256], [[[5, 6]]],
-                                     num_cols=2,
-                                     state_block_size=16)
+    fake_pr172_large, _ = _make_self(
+        ["a"], [256], [[[5, 6]]], num_cols=2, state_block_size=16
+    )
     with pytest.raises(IndexError):
         _collect(fake_pr172_large, _sched({"a": 1}))
 
     # Correct stride: the mamba groups' physical block size (2048), giving
     # 2048 * 8 = 16384 logical tokens per column.
-    fake_mamba_true, _ = _make_self(["a"], [256], [[[5, 6]]],
-                                    num_cols=2,
-                                    state_block_size=2048)
+    fake_mamba_true, _ = _make_self(
+        ["a"], [256], [[[5, 6]]], num_cols=2, state_block_size=2048
+    )
     _collect(fake_mamba_true, _sched({"a": 1}))
     assert fake_mamba_true._mamba_state_pos["a"] == 0
 
@@ -249,9 +255,12 @@ def test_cache_hit_resume_copies_from_checkpoint():
 
 def test_cache_hit_uses_mamba_group_block_size():
     mamba_block_size = 768
-    fake, _ = _make_self(["b"], [2 * mamba_block_size],
-                         [[[5, 6, 7, 8, 9, 10]]],
-                         state_block_size=mamba_block_size)
+    fake, _ = _make_self(
+        ["b"],
+        [2 * mamba_block_size],
+        [[[5, 6, 7, 8, 9, 10]]],
+        state_block_size=mamba_block_size,
+    )
     # The runner's constructor-time attention scalars can still contain the
     # input value after the platform derives the physical Mamba geometry.
     fake.block_size = 16
@@ -263,16 +272,16 @@ def test_cache_hit_uses_mamba_group_block_size():
 
 
 def test_decode_within_block_no_copy():
-    fake, _ = _make_self(["a"], [3 * BLOCK_SIZE - 1], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 2})
+    fake, _ = _make_self(
+        ["a"], [3 * BLOCK_SIZE - 1], [[[5, 6, 7, 8]]], state_pos={"a": 2}
+    )
     _collect(fake, _sched({"a": 1}))
     assert fake._pending_mamba_state_copies == []
     assert fake._mamba_state_pos["a"] == 2
 
 
 def test_decode_boundary_crossing_copies():
-    fake, _ = _make_self(["a"], [3 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 2})
+    fake, _ = _make_self(["a"], [3 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 2})
     _collect(fake, _sched({"a": 1}))
     assert fake._mamba_state_pos["a"] == 3
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(7, 8)]
@@ -283,11 +292,9 @@ def test_decode_boundary_crossing_copies():
 
 def test_stale_request_positions_are_forgotten():
     # A req_id no longer in the batch is dropped from _mamba_state_pos.
-    fake, _ = _make_self(["live"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={
-                             "live": 1,
-                             "gone": 3
-                         })
+    fake, _ = _make_self(
+        ["live"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"live": 1, "gone": 3}
+    )
     _collect(fake, _sched({"live": BLOCK_SIZE}))
     assert "gone" not in fake._mamba_state_pos
     assert "live" in fake._mamba_state_pos
@@ -295,17 +302,15 @@ def test_stale_request_positions_are_forgotten():
 
 def test_start_index_window_skips_other_rows():
     # num_reqs covers only a sub-window; rows outside it are untouched.
-    fake, _ = _make_self(["a", "b"], [2 * BLOCK_SIZE, 2 * BLOCK_SIZE],
-                         [[[5, 6, 7, 8], [9, 10, 11, 12]]],
-                         state_pos={
-                             "a": 1,
-                             "b": 1
-                         })
+    fake, _ = _make_self(
+        ["a", "b"],
+        [2 * BLOCK_SIZE, 2 * BLOCK_SIZE],
+        [[[5, 6, 7, 8], [9, 10, 11, 12]]],
+        state_pos={"a": 1, "b": 1},
+    )
     TPUModelRunner._collect_mamba_state_seed_copies(
-        fake, _sched({
-            "a": BLOCK_SIZE,
-            "b": BLOCK_SIZE
-        }), 1, 1)
+        fake, _sched({"a": BLOCK_SIZE, "b": BLOCK_SIZE}), 1, 1
+    )
     # only row 1 (req "b") processed
     assert fake._mamba_state_pos["b"] == 2
     assert fake._mamba_state_pos["a"] == 1
@@ -317,8 +322,7 @@ def test_start_index_window_skips_other_rows():
 
 def test_no_plan_is_noop():
     # Non-align modes leave the copy plan empty => collector does nothing.
-    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 1})
+    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1})
     fake._mamba_copy_plan = []
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     assert fake._pending_mamba_state_copies == []
@@ -334,9 +338,12 @@ def test_null_block_pairs_filtered():
 
 
 def test_multiple_mamba_groups_get_independent_copies():
-    fake, raws = _make_self(["a"], [2 * BLOCK_SIZE],
-                            [[[5, 6, 7, 8]], [[15, 16, 17, 18]]],
-                            state_pos={"a": 1})
+    fake, raws = _make_self(
+        ["a"],
+        [2 * BLOCK_SIZE],
+        [[[5, 6, 7, 8]], [[15, 16, 17, 18]]],
+        state_pos={"a": 1},
+    )
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     # Each group lives on its own raw buffer here, so each gets its own
     # program; groups sharing a buffer set would be merged into one.
@@ -344,25 +351,26 @@ def test_multiple_mamba_groups_get_independent_copies():
         tuple(id(r) for r in s[0]): _real_pairs(s)
         for s in fake._pending_mamba_state_copies
     }
-    assert staged[(id(raws[0]), )] == [(6, 7)]
-    assert staged[(id(raws[1]), )] == [(16, 17)]
+    assert staged[(id(raws[0]),)] == [(6, 7)]
+    assert staged[(id(raws[1]),)] == [(16, 17)]
 
 
 def test_pairs_padded_to_bucket_ladder():
     # 3 real pairs pad up to the first bucket (8); 9 pairs to the next (32).
-    fake, _ = _make_self(["a", "b", "c"], [2 * BLOCK_SIZE] * 3,
-                         [[[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]],
-                         state_pos={
-                             "a": 1,
-                             "b": 1,
-                             "c": 1
-                         })
+    fake, _ = _make_self(
+        ["a", "b", "c"],
+        [2 * BLOCK_SIZE] * 3,
+        [[[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]],
+        state_pos={"a": 1, "b": 1, "c": 1},
+    )
     _collect(fake, _sched({"a": BLOCK_SIZE, "b": BLOCK_SIZE, "c": BLOCK_SIZE}))
     _raws, src_t, _dst_t = fake._pending_mamba_state_copies[0]
     assert len(src_t) == 8
-    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7),
-                                                                (10, 11),
-                                                                (14, 15)]
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
+        (6, 7),
+        (10, 11),
+        (14, 15),
+    ]
 
 
 # --- apply path ---------------------------------------------------------
@@ -371,11 +379,15 @@ def test_pairs_padded_to_bucket_ladder():
 def test_flush_applies_and_clears(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        runner_mod, "copy_mamba_state_blocks",
+        runner_mod,
+        "copy_mamba_state_blocks",
         lambda raws, src, dst: calls.append(
-            ([id(r) for r in raws], src.tolist(), dst.tolist())))
-    fake, raws = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                            state_pos={"a": 1})
+            ([id(r) for r in raws], src.tolist(), dst.tolist())
+        ),
+    )
+    fake, raws = _make_self(
+        ["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1}
+    )
     _collect(fake, _sched({"a": BLOCK_SIZE}))
     TPUModelRunner._flush_mamba_state_seed_copies(fake)
     assert len(calls) == 1
@@ -386,18 +398,21 @@ def test_flush_applies_and_clears(monkeypatch):
 # --- split expansion (batched-RPA kernel-granular pool birth, #405) ------
 
 
-@pytest.mark.skipif(not _HAS_SPLIT,
-                    reason="split expansion only exists on the batched-RPA PR")
+@pytest.mark.skipif(
+    not _HAS_SPLIT, reason="split expansion only exists on the batched-RPA PR"
+)
 def test_split_expansion_fans_out_pairs():
     # split=3: manager pair (6,7) fans out to 3 consecutive kernel-block pairs
     # (6*3+j, 7*3+j) for j in 0..2.
-    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 1},
-                         split=3)
+    fake, _ = _make_self(
+        ["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"a": 1}, split=3
+    )
     _collect(fake, _sched({"a": BLOCK_SIZE}))
-    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(18, 21),
-                                                                (19, 22),
-                                                                (20, 23)]
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
+        (18, 21),
+        (19, 22),
+        (20, 23),
+    ]
 
 
 # --- speculative decoding: the checkpoint group slides with the state ----
@@ -422,19 +437,22 @@ def _spec_self(offset, *, window=3, row=(10, 11, 12, 13), split=1):
     """
     read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
     read_offsets[row[0]] = offset
-    return _make_self(["a"], [BLOCK_SIZE], [[list(row)]],
-                      state_pos={"a": 0},
-                      ckpt_window=window,
-                      read_offsets=read_offsets,
-                      split=split)
+    return _make_self(
+        ["a"],
+        [BLOCK_SIZE],
+        [[list(row)]],
+        state_pos={"a": 0},
+        ckpt_window=window,
+        read_offsets=read_offsets,
+        split=split,
+    )
 
 
 @pytest.mark.parametrize("offset,expected_src", [(0, 10), (1, 11), (2, 12)])
 def test_spec_crossing_seeds_from_the_resumed_checkpoint(offset, expected_src):
     fake, _ = _spec_self(offset)
     _collect(fake, _sched({"a": 1}))
-    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(expected_src,
-                                                                 11)]
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(expected_src, 11)]
 
 
 def test_spec_crossing_does_not_carry_the_stale_state_block():
@@ -462,15 +480,18 @@ def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
 
 
-@pytest.mark.skipif(not _HAS_SPLIT,
-                    reason="split expansion only exists on the batched-RPA PR")
+@pytest.mark.skipif(
+    not _HAS_SPLIT, reason="split expansion only exists on the batched-RPA PR"
+)
 def test_spec_crossing_fans_out_pool_split():
     # The device-side source selection still expands to kernel blocks.
     fake, _ = _spec_self(2, split=3)
     _collect(fake, _sched({"a": 1}))
-    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(36, 33),
-                                                                (37, 34),
-                                                                (38, 35)]
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
+        (36, 33),
+        (37, 34),
+        (38, 35),
+    ]
 
 
 def test_non_spec_crossing_keeps_the_state_block_source():
@@ -478,10 +499,14 @@ def test_non_spec_crossing_keeps_the_state_block_source():
     # and its offset migrates to the new state block unchanged.
     read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
     read_offsets[7] = 3
-    fake, _ = _make_self(["a"], [3 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
-                         state_pos={"a": 2},
-                         ckpt_window=1,
-                         read_offsets=read_offsets)
+    fake, _ = _make_self(
+        ["a"],
+        [3 * BLOCK_SIZE],
+        [[[5, 6, 7, 8]]],
+        state_pos={"a": 2},
+        ckpt_window=1,
+        read_offsets=read_offsets,
+    )
     _collect(fake, _sched({"a": 1}))
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(7, 8)]
     assert int(fake.mamba_slot_read_offsets[8]) == 3
@@ -504,14 +529,15 @@ def _copy_plan_split(raw_shape, raw_dtype, manager_tokens, page_bytes):
     kv_cache_config = SimpleNamespace(
         num_blocks=raw.nbytes // page_bytes,
         kv_cache_tensors=[
-            KVCacheTensor(size=raw.nbytes,
-                          layers=["model.layers.0.lin"],
-                          layer_stride=raw.nbytes,
-                          block_stride=page_bytes)
+            KVCacheTensor(
+                size=raw.nbytes,
+                layers=["model.layers.0.lin"],
+                layer_stride=raw.nbytes,
+                block_stride=page_bytes,
+            )
         ],
         kv_cache_groups=[
-            SimpleNamespace(kv_cache_spec=spec,
-                            layer_names=["model.layers.0.lin"])
+            SimpleNamespace(kv_cache_spec=spec, layer_names=["model.layers.0.lin"])
         ],
     )
     raw = torch.zeros(raw_shape, dtype=raw_dtype)
@@ -529,10 +555,12 @@ def test_copy_plan_split_is_one_for_token_packed_mla_pool():
     # MLA pool: a 214-token manager block is one pool block of 107 packed
     # rows (2 tokens each) x 2560 B; a row count of 107 must not read as a
     # 214 // 107 = 2 split.
-    split = _copy_plan_split((8, 107, 2, 640),
-                             torch.bfloat16,
-                             manager_tokens=214,
-                             page_bytes=107 * 2 * 640 * 2)
+    split = _copy_plan_split(
+        (8, 107, 2, 640),
+        torch.bfloat16,
+        manager_tokens=214,
+        page_bytes=107 * 2 * 640 * 2,
+    )
     assert split == 1
 
 
@@ -542,10 +570,12 @@ def test_copy_plan_split_from_kernel_granular_rpa_pool():
     manager_page = 256 * 1024
     kernel_page = 64 * 1024
     raw_numel_per_block = kernel_page // 2  # bf16
-    split = _copy_plan_split((16, 64, raw_numel_per_block // 64),
-                             torch.bfloat16,
-                             manager_tokens=256,
-                             page_bytes=manager_page)
+    split = _copy_plan_split(
+        (16, 64, raw_numel_per_block // 64),
+        torch.bfloat16,
+        manager_tokens=256,
+        page_bytes=manager_page,
+    )
     assert split == 4
 
 
@@ -555,8 +585,10 @@ def test_copy_plan_split_for_seq_on_lane_pool():
     # which axis holds tokens: a 256-token manager block spans two 128-token
     # kernel blocks either way.
     kernel_block_bytes = 2 * 64 * 2 * 128 * 2  # (kv2, hd/2, packing, 128 tok)
-    split = _copy_plan_split((16, 2, 64, 2, 128),
-                             torch.bfloat16,
-                             manager_tokens=256,
-                             page_bytes=2 * kernel_block_bytes)
+    split = _copy_plan_split(
+        (16, 2, 64, 2, 128),
+        torch.bfloat16,
+        manager_tokens=256,
+        page_bytes=2 * kernel_block_bytes,
+    )
     assert split == 2

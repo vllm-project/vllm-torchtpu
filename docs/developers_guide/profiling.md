@@ -9,13 +9,14 @@ Every mode writes XPlane protobuf (`*.xplane.pb`), readable in
 modes also write Chrome-format JSON. See [Trace formats](#trace-formats) for
 which mode produces what.
 
-There are three ways to profile a workload:
+There are four ways to profile a workload:
 
 | Approach | Also called | Best for |
 |---|---|---|
 | [`examples/tpu_profiling.py`](#offline-profiling-with-examplestpu_profilingpy) | non-phased, on-demand profiling | Isolating a single shape — one prefill or one decode batch, offline |
 | [Server-side capture](#server-side-capture-vllm-serve) | end-to-end (e2e) profiling | A real serving window under `vllm bench serve` or your own client |
 | [Phased profiling](#phased-profiling) | phased profiling | One trace per inference phase from a single mixed benchmark run |
+| [Disaggregated serving (Raiden3)](#disaggregated-serving-prefilldecode-with-raiden3) | PD disagg / KV cache transfer profiling | Correlating Prefill (`kv_producer`) and Decode (`kv_consumer`) traces across pods |
 
 ## Prerequisites
 
@@ -101,6 +102,58 @@ curl -X POST http://localhost:8000/stop_profile
 `vllm bench serve --profile` fires those two endpoints around its main run for
 you.
 
+### Dynamic profiling options (`profiler_kwargs` and `profile_prefix`)
+
+Both the standard server-side profiler and the [phased profiler](#phased-profiling)
+resolve per-session options through
+[`src/vllm_torchtpu/tracing/options.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/tracing/options.py).
+You can override standard tracer levels (`host_tracer_level`,
+`device_tracer_level`, `python_tracer_level`) and pass advanced TPU
+`experimental_options` (such as `tpu_trace_mode`,
+`tpu_num_sparse_cores_to_trace`, `tpu_num_sparse_core_tiles_to_trace`, or
+firmware event flags like `e2e_enable_fw_throttle_event`,
+`e2e_enable_fw_power_level_event`, and `e2e_enable_fw_thermal_event`) dynamically
+at `/start_profile` time without restarting `vllm serve`:
+
+* **Online serving (`POST /start_profile`)** — pass a JSON payload (or query
+  parameters). `profile_prefix` names the output subdirectory under
+  `torch_profiler_dir`, and all other keys are forwarded via `profiler_kwargs`:
+
+```bash
+curl -X POST http://localhost:8000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_prefix": "fw_events_run",
+    "host_tracer_level": 3,
+    "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+    "e2e_enable_fw_throttle_event": true,
+    "e2e_enable_fw_power_level_event": true,
+    "e2e_enable_fw_thermal_event": true
+  }'
+```
+
+* **Offline Python API (`LLM.start_profile`)** — pass `profile_prefix` and
+  `profiler_kwargs` directly:
+
+```python
+llm.start_profile(
+    profile_prefix="fw_events_run",
+    profiler_kwargs={
+        "host_tracer_level": 3,
+        "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC",
+        "e2e_enable_fw_throttle_event": True,
+        "e2e_enable_fw_power_level_event": True,
+        "e2e_enable_fw_thermal_event": True,
+    },
+)
+```
+
+* **Legacy string format (`profile_prefix`)** — semicolon-delimited `key:value`
+  pairs in `profile_prefix` (e.g.,
+  `"host_tracer_level:3;e2e_enable_fw_throttle_event:true"`) remain supported
+  and are merged with any options supplied in `profiler_kwargs` (with
+  `profiler_kwargs` taking precedence on key collisions).
+
 Those are two separate steps, and the rest of this page keeps them distinct:
 
 * **Configured** — the server was started with a profiler kind and a trace
@@ -129,13 +182,18 @@ and `--profiler-config.max_iterations` limits are honored only by the
 
 [`scripts/vllm/benchmarking/run_benchmarks.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/run_benchmarks.sh)
 wires all of this up. Setting `CAPTURE_PROFILE=1` adds the profiler flags to the
-server and `--profile` to the bench client, writing traces to
-`<results-dir>/profile`:
+server and, after each cell's measured run, runs that cell once more with
+`--profile`, writing traces to `<results-dir>/profile`:
 
 ```bash
 CAPTURE_PROFILE=1 ./scripts/vllm/benchmarking/run_benchmarks.sh \
   --config qwen3.5-35b-fp8-tp4-ep
 ```
+
+Neither the warmup passes nor the measured run are profiled, so the numbers the
+harness reports stay comparable to a baseline. The extra run's
+`<cell>.profile.json` is ignored by the regression check and the results upload,
+and `PROFILE_NUM_PROMPTS` sizes it — one full concurrency wave by default.
 
 `CAPTURE_PROFILE=1` is *inferred* whenever `EXTRA_SERVE_ARGS` contains
 `--profiler-config.torch_profiler_dir`, which then also chooses the destination.
@@ -144,8 +202,7 @@ client would not send `--profile`, so nothing would call `/start_profile` and
 the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
 out.
 
-Warmup passes are never profiled. Prefer a single ISL/OSL case so the trace maps
-to one workload shape.
+Prefer a single ISL/OSL cell so the trace maps to one workload shape.
 
 ## Phased profiling
 
@@ -175,8 +232,8 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
 trace directory in `EXTRA_SERVE_ARGS`
 ([as above](#through-the-benchmark-harness)) and passes `--profile` to
-`vllm bench serve`, which POSTs to the two endpoints around the measured run.
-Warmup passes are excluded.
+`vllm bench serve` for the extra profile run, which POSTs to the two endpoints
+around it.
 
 ### Option 2: against your own `vllm serve`
 
@@ -252,7 +309,7 @@ Token accounting, from
 
 Each phase is captured **once per profiling session** — the window between
 `/start_profile` and `/stop_profile` — for `max_iterations` steps, and then not
-again within that session. A new session (for example, the next benchmark case
+again within that session. A new session (for example, the next benchmark cell
 run with `--profile`) starts with fresh phase tracking and captures each phase
 again. A phase that the workload never produces simply yields no subdirectory.
 
@@ -272,6 +329,198 @@ appended to the `vllm serve` command line. Each per-config `.sh` merges an
 exported value ahead of its own arguments
 (`${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }...`), so profiling flags can be
 injected without editing the config file.
+
+## Disaggregated serving (Prefill/Decode with Raiden3)
+
+> [!NOTE]
+> Raiden3 (`TPURaidenConnector`) Prefill/Decode (PD) disaggregation profiling is
+> currently experimental and under active development. The configuration and
+> workflow below have been verified against commit
+> [`7bb6a4a`](https://github.com/vllm-project/vllm-torchtpu/commit/7bb6a4ae2a8379f2e6cf9f6d5922ac5ef8ca8c15).
+
+In a disaggregated Prefill/Decode (PD) deployment, prompt ingestion and
+autoregressive token generation run on **two separate sets of TPU pods**
+interconnected via the native C++ **Raiden3** (`tpu_sync`) KV cache transfer
+engine:
+
+* **Prefill cluster (`kv_producer`)** — computes the prompt's KV cache (and any
+  hybrid Mamba/GDN state blocks) and registers the resulting block handles with
+  its local `RaidenControllerServer` (`register_request_blocks`), returning the
+  transfer metadata (`uuid`, source controller address, and block IDs) in
+  `kv_transfer_params`.
+* **Decode cluster (`kv_consumer`)** — receives `kv_transfer_params`, coordinates
+  an asynchronous cross-slice pull/reshard transfer from the Prefill store using
+  the shared `uuid`, scatters the KV blocks into its local HBM, and generates
+  the completion tokens.
+
+Because Prefill and Decode run in separate pods with independent TPU workers,
+profiling a disaggregated request requires arming `/start_profile` on **both**
+services before sending traffic, then disarming `/stop_profile` on both and
+extracting traces from each pod's persistent volume.
+
+### KV transfer `TraceAnnotation` markers
+
+[`TPURaidenConnectorWorker`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py)
+emits `TraceAnnotation` scopes carrying the shared Raiden transfer `uuid` and
+`request_id` so you can correlate a single disaggregated request across both the
+Prefill and Decode XPlane timelines:
+
+| Cluster Role | TraceAnnotation Name | Annotated Metadata | Description |
+|---|---|---|---|
+| Prefill (`kv_producer`) | `KV_Cache_Prefill_Register_Blocks` | `uuid`, `request_id`, `num_tokens`, `num_blocks` | Registers computed KV cache blocks and state spans in the local Raiden store. |
+| Prefill (`kv_producer`) | `KV_Cache_Prefill_Send_Complete` | `uuid`, `request_id`, `num_tokens` | Marks completion and release of producer KV blocks after consumer pull completes. |
+| Decode (`kv_consumer`) | `KV_Cache_Decode_Submit_Load` | `uuid`, `request_id`, `source_req_id`, `num_tokens`, `num_blocks` | Submits the cross-slice reshard/pull request to fetch KV blocks from the producer. |
+| Decode (`kv_consumer`) | `KV_Cache_Decode_Recv_Complete` | `uuid`, `request_id`, `source_req_id`, `num_tokens`, `reshard_e2e_latency_ms` | Records completion of the KV transfer and logs end-to-end reshard latency in ms. |
+
+### Step 1: Configure and deploy Prefill and Decode pods on GKE
+
+Both the Prefill and Decode GKE deployments must enable the Raiden3 store-based
+KV cache manager in their `env` blocks and configure `--profiler-config` to
+write traces to a mounted Persistent Volume Claim (such as
+`/usr/vllm/vllm_profile`) so captured traces persist across container restarts:
+
+```yaml
+env:
+  - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+    value: "1"
+  - name: TPU_KV_RESHARD_TRANSPORT
+    value: "raiden"
+  - name: TPU_RAIDEN_RESHARD_IMPL
+    value: "store"
+  - name: USE_PHASED_PROFILER
+    value: "true"  # set to "false" or omit for continuous non-phased profiling
+```
+
+Pass `--profiler-config` and `--kv-transfer-config` to `vllm serve` (with
+`"kv_role": "kv_producer"` on the Prefill deployment and
+`"kv_role": "kv_consumer"` on the Decode deployment):
+
+```yaml
+args:
+  - --profiler-config='{"profiler": "torch", "torch_profiler_dir": "/usr/vllm/vllm_profile", "ignore_frontend": true}'
+  - --kv-transfer-config='{"kv_connector": "TPURaidenConnector", "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector", "kv_role": "kv_producer", "kv_port": 14579}'
+```
+
+Complete reference GKE `Deployment` and `Service` manifests for both clusters
+are available in `docs/developers_guide/examples/`:
+
+* **Prefill Pod Manifest (`TPU v6e 2x2, PCP=4, TP=1`)**:
+  [`docs/developers_guide/examples/raiden_pd_prefill.yaml`](examples/raiden_pd_prefill.yaml)
+* **Decode Pod Manifest (`TPU v6e 2x2, DP=4, TP=1`)**:
+  [`docs/developers_guide/examples/raiden_pd_decode.yaml`](examples/raiden_pd_decode.yaml)
+
+Deploy both manifests into your target namespace (e.g., `disagg-1-1`):
+
+```bash
+kubectl apply -f docs/developers_guide/examples/raiden_pd_prefill.yaml
+kubectl apply -f docs/developers_guide/examples/raiden_pd_decode.yaml
+```
+
+### Step 2: Coordinate `/start_profile`, KV transfer, and `/stop_profile`
+
+Port-forward the Prefill service to local port `8000` and the Decode service to
+local port `8001`:
+
+```bash
+kubectl -n disagg-1-1 port-forward svc/vllm-service-prefill 8000:8000 &
+kubectl -n disagg-1-1 port-forward svc/vllm-service-decode 8001:8000 &
+```
+
+Arm `/start_profile` simultaneously on **both** clusters before triggering the
+Prefill-to-Decode `uuid` transfer, then call `/stop_profile` on both clusters
+once generation finishes:
+
+```python
+import json
+import time
+import urllib.request
+
+PREFILL_HOST = "http://127.0.0.1:8000"
+DECODE_HOST = "http://127.0.0.1:8001"
+MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
+PROMPT = "San Francisco is a major cultural and commercial center in " * 64
+
+
+def post_json(url: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else b""
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
+
+
+# 1. Start profiling on both Prefill and Decode clusters
+post_json(f"{PREFILL_HOST}/start_profile")
+post_json(f"{DECODE_HOST}/start_profile")
+time.sleep(1)
+
+# 2. Run Prefill (kv_producer) and extract Raiden kv_transfer_params (UUID)
+print("1/2 Executing Prefill on producer cluster...")
+prefill_resp = post_json(
+    f"{PREFILL_HOST}/v1/completions",
+    {
+        "model": MODEL,
+        "prompt": PROMPT,
+        "max_tokens": 1,
+        "temperature": 0,
+        "kv_transfer_params": {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+        },
+    },
+)
+kv_transfer_params = prefill_resp.get("kv_transfer_params", {})
+print("Extracted kv_transfer_params:", json.dumps(kv_transfer_params, indent=2))
+
+# 3. Run Decode (kv_consumer) using the returned kv_transfer_params
+print("2/2 Executing Decode on consumer cluster...")
+decode_resp = post_json(
+    f"{DECODE_HOST}/v1/completions",
+    {
+        "model": MODEL,
+        "prompt": PROMPT,
+        "max_tokens": 32,
+        "temperature": 0,
+        "kv_transfer_params": kv_transfer_params,
+    },
+)
+
+# 4. Stop profiling and flush XPlane traces on both clusters
+post_json(f"{PREFILL_HOST}/stop_profile")
+post_json(f"{DECODE_HOST}/stop_profile")
+print("Profiling completed. XPlane traces saved on both Prefill and Decode pods!")
+```
+
+### Step 3: Extract and inspect the Prefill and Decode traces
+
+With `USE_PHASED_PROFILER=true`, the Prefill pod writes its captures under
+`/usr/vllm/vllm_profile/prefill_only/` and the Decode pod writes its captures
+under `/usr/vllm/vllm_profile/decode_only/`. Copy both directories from their
+respective pods to your local machine:
+
+```bash
+export NAMESPACE="disagg-1-1"
+export PREFILL_POD=$(kubectl -n "$NAMESPACE" get pods -l app=vllm-prefill -o jsonpath="{.items[0].metadata.name}")
+export DECODE_POD=$(kubectl -n "$NAMESPACE" get pods -l app=vllm-decode -o jsonpath="{.items[0].metadata.name}")
+
+mkdir -p ./phased_traces
+kubectl cp "${NAMESPACE}/${PREFILL_POD}:/usr/vllm/vllm_profile/prefill_only" ./phased_traces/prefill_only -c vllm-tpu
+kubectl cp "${NAMESPACE}/${DECODE_POD}:/usr/vllm/vllm_profile/decode_only" ./phased_traces/decode_only -c vllm-decode
+```
+
+Launch XProf pointing at `./phased_traces` to inspect both `prefill_only` and
+`decode_only` runs, and search the Trace Viewer for the shared `uuid` on the
+`KV_Cache_Prefill_Register_Blocks`, `KV_Cache_Decode_Submit_Load`, and
+`KV_Cache_Decode_Recv_Complete` events:
+
+```bash
+xprof --logdir ./phased_traces
+```
 
 ## Output layout
 

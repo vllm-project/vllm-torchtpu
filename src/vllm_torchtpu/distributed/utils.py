@@ -81,6 +81,19 @@ def get_p2p_wait_pull_timeout() -> int:
     return envs.TPU_P2P_WAIT_PULL_TIMEOUT
 
 
+# Min delta added on top of the producer lease when computing the reshard store's
+# request-block registry TTL.
+_RAIDEN_REGISTRY_TTL_MIN_DELTA_S = 60.0
+
+
+def get_raiden_registry_ttl_s() -> float:
+    """TTL, in seconds, for the raiden reshard store's request-block
+    registry: the prefill lease (TPU_P2P_WAIT_PULL_TIMEOUT) plus a delta
+    of max(60s, 10%). The registry must outlive the lease."""
+    lease = float(get_p2p_wait_pull_timeout())
+    return lease + max(_RAIDEN_REGISTRY_TTL_MIN_DELTA_S, 0.1 * lease)
+
+
 def get_stage3_status_probe_s() -> float:
     """Interval, in seconds, at which a Stage-3 producer worker probes the
     source store's request-block registry for its registrations that have
@@ -266,16 +279,15 @@ def get_raiden_telemetry_module():
         _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = True
         try:
             from tpu_sync.api.torch import kv_cache_manager as kcm
+
             _RAIDEN_TELEMETRY_MODULE = kcm._torch_impl()
         except Exception as e:
-            logger.warning("Failed to import TPU Raiden telemetry module: %s",
-                           e)
+            logger.warning("Failed to import TPU Raiden telemetry module: %s", e)
             return None
     return _RAIDEN_TELEMETRY_MODULE
 
 
-def configure_raiden_telemetry(
-        backends: list[str] | set[str] | None = None) -> None:
+def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> None:
     """Configures TPU Raiden C++ telemetry backends if available."""
     global _RAIDEN_TELEMETRY_CONFIGURED
     try:

@@ -27,8 +27,9 @@ import pytest
 
 from vllm_torchtpu.kernels.kimi_k3 import ragged_kda
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
-from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import \
-    kimi_short_conv_scan
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
+    kimi_short_conv_scan,
+)
 
 HEADS = 2
 HEAD_DIM = 128
@@ -43,13 +44,9 @@ EPS = 1e-5
 # ---------------------------------------------------------------------------
 
 
-def _build(num_live,
-           bucket,
-           *,
-           seed=0,
-           carry=True,
-           conv_state_dim_first=False,
-           context_len=128):
+def _build(
+    num_live, bucket, *, seed=0, carry=True, conv_state_dim_first=False, context_len=128
+):
     """One decode step: ``num_live`` one-token requests padded to ``bucket``.
 
     ``carry`` sets whether the live requests have context behind them. Slot 0 is
@@ -66,17 +63,23 @@ def _build(num_live,
     query_len, prior = 1, (context_len if carry else 0)
     lengths = [query_len + prior] * num_live + [0] * (bucket - num_live)
 
-    conv_tail = ((MIXED_DIM, KERNEL_SIZE - 1) if conv_state_dim_first else
-                 (KERNEL_SIZE - 1, MIXED_DIM))
+    conv_tail = (
+        (MIXED_DIM, KERNEL_SIZE - 1)
+        if conv_state_dim_first
+        else (KERNEL_SIZE - 1, MIXED_DIM)
+    )
     conv_state = jnp.asarray(
-        rng.standard_normal((num_slots, ) + conv_tail) * 0.1, jnp.bfloat16)
+        rng.standard_normal((num_slots,) + conv_tail) * 0.1, jnp.bfloat16
+    )
     conv_weight_raw = jnp.asarray(
-        rng.standard_normal((MIXED_DIM, 1, KERNEL_SIZE)) * 0.3, jnp.bfloat16)
-    conv_weight = jnp.swapaxes(conv_weight_raw[:, 0, :], 0,
-                               1).reshape(KERNEL_SIZE, 3, HEADS, HEAD_DIM)
+        rng.standard_normal((MIXED_DIM, 1, KERNEL_SIZE)) * 0.3, jnp.bfloat16
+    )
+    conv_weight = jnp.swapaxes(conv_weight_raw[:, 0, :], 0, 1).reshape(
+        KERNEL_SIZE, 3, HEADS, HEAD_DIM
+    )
     pool = jnp.asarray(
-        rng.standard_normal((num_slots, HEADS, HEAD_DIM, HEAD_DIM)) * 0.05,
-        jnp.float32)
+        rng.standard_normal((num_slots, HEADS, HEAD_DIM, HEAD_DIM)) * 0.05, jnp.float32
+    )
     a_log = jnp.asarray(rng.standard_normal(HEADS) * 0.3, jnp.float32)
     dt_bias = jnp.asarray(rng.standard_normal(PROJECTION) * 0.2, jnp.float32)
 
@@ -84,8 +87,7 @@ def _build(num_live,
     # both Pallas kernels want it already through the sigmoid, which the
     # production op does exactly this way -- in float32, rounded back to bf16.
     beta_raw = jnp.asarray(rng.standard_normal((bucket, HEADS)), jnp.bfloat16)
-    beta = jnp.asarray(jax.nn.sigmoid(beta_raw.astype(jnp.float32)),
-                       jnp.bfloat16)
+    beta = jnp.asarray(jax.nn.sigmoid(beta_raw.astype(jnp.float32)), jnp.bfloat16)
 
     return {
         "mixed_qkv": activation(MIXED_DIM),
@@ -148,8 +150,7 @@ def _reference_step(inputs, seq, *, lower_bound):
     Returns ``(output, new_conv_window, new_state)`` for that sequence.
     """
     slot = int(inputs["state_indices"][seq])
-    query_len = int(inputs["query_start_loc"][seq + 1] -
-                    inputs["query_start_loc"][seq])
+    query_len = int(inputs["query_start_loc"][seq + 1] - inputs["query_start_loc"][seq])
     carries = int(inputs["seq_lens"][seq]) > query_len
 
     token = np.asarray(inputs["mixed_qkv"][seq]).astype(np.float64)
@@ -160,25 +161,29 @@ def _reference_step(inputs, seq, *, lower_bound):
     # A first step starts from zero: the slot may hold another request's tail.
     prior = prior if carries else np.zeros_like(prior)
 
-    weights = np.asarray(inputs["conv_weight"]).astype(np.float64).reshape(
-        KERNEL_SIZE, MIXED_DIM)
+    weights = (
+        np.asarray(inputs["conv_weight"])
+        .astype(np.float64)
+        .reshape(KERNEL_SIZE, MIXED_DIM)
+    )
     window = np.concatenate([prior, token[None]], axis=0)  # [K, mixed_dim]
     # The kernel rounds back to bfloat16 after the activation, so the reference
     # has to as well or the comparison measures the cast.
     conv_out = np.asarray(
-        jnp.asarray(_silu(np.sum(window * weights, axis=0)),
-                    jnp.bfloat16), ).astype(np.float64)
+        jnp.asarray(_silu(np.sum(window * weights, axis=0)), jnp.bfloat16),
+    ).astype(np.float64)
 
     q, k, v = (conv_out.reshape(3, HEADS, HEAD_DIM)[i] for i in range(3))
     q = _l2_normalize(q) * SCALE
     k = _l2_normalize(k)
 
-    gate = np.asarray(inputs["raw_gate"][seq]).astype(np.float64).reshape(
-        HEADS, HEAD_DIM)
+    gate = (
+        np.asarray(inputs["raw_gate"][seq]).astype(np.float64).reshape(HEADS, HEAD_DIM)
+    )
     gate = gate + np.asarray(inputs["dt_bias"]).astype(np.float64).reshape(
-        HEADS, HEAD_DIM)
-    decay_coeff = np.exp(np.asarray(inputs["a_log"]).astype(np.float64))[:,
-                                                                         None]
+        HEADS, HEAD_DIM
+    )
+    decay_coeff = np.exp(np.asarray(inputs["a_log"]).astype(np.float64))[:, None]
     if lower_bound is None:
         gate = -decay_coeff * np.logaddexp(0.0, gate)
     else:
@@ -194,7 +199,7 @@ def _reference_step(inputs, seq, *, lower_bound):
     v_new = beta[:, None] * (v - predicted)
     state = state + k[:, :, None] * v_new[:, None, :]
     output = np.einsum("hk,hkv->hv", q, state)
-    return output, window[-(KERNEL_SIZE - 1):], state
+    return output, window[-(KERNEL_SIZE - 1) :], state
 
 
 def _assert_close(actual, expected, *, rtol, name):
@@ -235,16 +240,20 @@ def test_decode_kda_abi_shapes_and_dtypes() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("num_live", "bucket"), [
-    (1, 1),
-    (1, 8),
-    (4, 8),
-    (8, 8),
-    (3, 16),
-])
+@pytest.mark.parametrize(
+    ("num_live", "bucket"),
+    [
+        (1, 1),
+        (1, 8),
+        (4, 8),
+        (8, 8),
+        (3, 16),
+    ],
+)
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
-def test_decode_kda_matches_the_reference(num_live: int, bucket: int,
-                                          lower_bound: float | None) -> None:
+def test_decode_kda_matches_the_reference(
+    num_live: int, bucket: int, lower_bound: float | None
+) -> None:
     """Output and both state pools, over live/padded splits and both gates."""
     inputs = _build(num_live, bucket, seed=num_live + bucket)
     out, conv_state, pool = _call(inputs, lower_bound=lower_bound)
@@ -256,16 +265,13 @@ def test_decode_kda_matches_the_reference(num_live: int, bucket: int,
     for seq in range(num_live):
         slot = int(inputs["state_indices"][seq])
         want_out, want_conv, want_state = _reference_step(
-            inputs, seq, lower_bound=lower_bound)
+            inputs, seq, lower_bound=lower_bound
+        )
         _assert_close(out[seq], want_out, rtol=3e-2, name=f"output[{seq}]")
-        _assert_close(pool[slot],
-                      want_state,
-                      rtol=2e-2,
-                      name=f"state[slot {slot}]")
-        _assert_close(conv_state[slot],
-                      want_conv,
-                      rtol=3e-2,
-                      name=f"conv state[slot {slot}]")
+        _assert_close(pool[slot], want_state, rtol=2e-2, name=f"state[slot {slot}]")
+        _assert_close(
+            conv_state[slot], want_conv, rtol=3e-2, name=f"conv state[slot {slot}]"
+        )
 
 
 def test_decode_kda_starts_from_zero_on_a_sequences_first_step() -> None:
@@ -282,14 +288,14 @@ def test_decode_kda_starts_from_zero_on_a_sequences_first_step() -> None:
 
     for seq in range(4):
         slot = int(inputs["state_indices"][seq])
-        want_out, _, want_state = _reference_step(inputs,
-                                                  seq,
-                                                  lower_bound=None)
+        want_out, _, want_state = _reference_step(inputs, seq, lower_bound=None)
         _assert_close(out[seq], want_out, rtol=3e-2, name=f"output[{seq}]")
-        _assert_close(np.asarray(pool, np.float64)[slot],
-                      want_state,
-                      rtol=2e-2,
-                      name=f"state[slot {slot}]")
+        _assert_close(
+            np.asarray(pool, np.float64)[slot],
+            want_state,
+            rtol=2e-2,
+            name=f"state[slot {slot}]",
+        )
 
 
 def test_decode_kda_mixes_carried_and_fresh_sequences_in_one_batch() -> None:
@@ -309,14 +315,9 @@ def test_decode_kda_mixes_carried_and_fresh_sequences_in_one_batch() -> None:
     pool = np.asarray(pool, np.float64)
     for seq in range(4):
         slot = int(inputs["state_indices"][seq])
-        want_out, _, want_state = _reference_step(inputs,
-                                                  seq,
-                                                  lower_bound=None)
+        want_out, _, want_state = _reference_step(inputs, seq, lower_bound=None)
         _assert_close(out[seq], want_out, rtol=3e-2, name=f"output[{seq}]")
-        _assert_close(pool[slot],
-                      want_state,
-                      rtol=2e-2,
-                      name=f"state[slot {slot}]")
+        _assert_close(pool[slot], want_state, rtol=2e-2, name=f"state[slot {slot}]")
 
 
 # ---------------------------------------------------------------------------
@@ -343,10 +344,10 @@ def test_decode_kda_leaves_the_null_block_untouched() -> None:
     """
     inputs = _build(3, 16, seed=7)
     _, conv_state, pool = _call(inputs)
-    np.testing.assert_array_equal(np.asarray(pool[0]),
-                                  np.asarray(inputs["pool"][0]))
-    np.testing.assert_array_equal(np.asarray(conv_state[0]),
-                                  np.asarray(inputs["conv_state"][0]))
+    np.testing.assert_array_equal(np.asarray(pool[0]), np.asarray(inputs["pool"][0]))
+    np.testing.assert_array_equal(
+        np.asarray(conv_state[0]), np.asarray(inputs["conv_state"][0])
+    )
 
 
 def test_decode_kda_leaves_slots_of_unscheduled_requests_untouched() -> None:
@@ -358,10 +359,10 @@ def test_decode_kda_leaves_slots_of_unscheduled_requests_untouched() -> None:
     inputs = _build(3, 16, seed=9)
     _, conv_state, pool = _call(inputs)
     # Slots 1..3 are live; 4..16 belong to requests not scheduled this step.
-    np.testing.assert_array_equal(np.asarray(pool[4:]),
-                                  np.asarray(inputs["pool"][4:]))
-    np.testing.assert_array_equal(np.asarray(conv_state[4:]),
-                                  np.asarray(inputs["conv_state"][4:]))
+    np.testing.assert_array_equal(np.asarray(pool[4:]), np.asarray(inputs["pool"][4:]))
+    np.testing.assert_array_equal(
+        np.asarray(conv_state[4:]), np.asarray(inputs["conv_state"][4:])
+    )
 
 
 def test_decode_kda_advances_only_the_scheduled_slots() -> None:
@@ -369,11 +370,11 @@ def test_decode_kda_advances_only_the_scheduled_slots() -> None:
     inputs = _build(3, 16, seed=13)
     _, conv_state, pool = _call(inputs)
     for slot in (1, 2, 3):
-        assert not np.allclose(np.asarray(pool[slot]),
-                               np.asarray(inputs["pool"][slot]))
+        assert not np.allclose(np.asarray(pool[slot]), np.asarray(inputs["pool"][slot]))
         assert not np.allclose(
             np.asarray(conv_state[slot], np.float32),
-            np.asarray(inputs["conv_state"][slot], np.float32))
+            np.asarray(inputs["conv_state"][slot], np.float32),
+        )
 
 
 def test_decode_kda_honours_out_of_order_slot_assignments() -> None:
@@ -389,14 +390,9 @@ def test_decode_kda_honours_out_of_order_slot_assignments() -> None:
     pool = np.asarray(pool, np.float64)
     for seq in range(4):
         slot = int(inputs["state_indices"][seq])
-        want_out, _, want_state = _reference_step(inputs,
-                                                  seq,
-                                                  lower_bound=None)
+        want_out, _, want_state = _reference_step(inputs, seq, lower_bound=None)
         _assert_close(out[seq], want_out, rtol=3e-2, name=f"output[{seq}]")
-        _assert_close(pool[slot],
-                      want_state,
-                      rtol=2e-2,
-                      name=f"state[slot {slot}]")
+        _assert_close(pool[slot], want_state, rtol=2e-2, name=f"state[slot {slot}]")
 
 
 # ---------------------------------------------------------------------------
@@ -417,14 +413,13 @@ def test_decode_kda_reads_a_transposed_state_pool() -> None:
     swapped["pool"] = jnp.swapaxes(inputs["pool"], -1, -2)
     out, _, pool = _call(swapped, state_transposed=True)
 
-    _assert_close(out,
-                  np.asarray(plain_out, np.float64),
-                  rtol=0,
-                  name="output")
-    _assert_close(np.swapaxes(np.asarray(pool, np.float64), -1, -2),
-                  np.asarray(plain_pool, np.float64),
-                  rtol=0,
-                  name="state")
+    _assert_close(out, np.asarray(plain_out, np.float64), rtol=0, name="output")
+    _assert_close(
+        np.swapaxes(np.asarray(pool, np.float64), -1, -2),
+        np.asarray(plain_pool, np.float64),
+        rtol=0,
+        name="state",
+    )
 
 
 def test_decode_kda_reads_a_dim_first_conv_state() -> None:
@@ -437,10 +432,7 @@ def test_decode_kda_reads_a_dim_first_conv_state() -> None:
     out, conv_state, _ = _call(swapped, conv_state_dim_first=True)
 
     assert conv_state.shape == swapped["conv_state"].shape
-    _assert_close(out,
-                  np.asarray(plain_out, np.float64),
-                  rtol=0,
-                  name="output")
+    _assert_close(out, np.asarray(plain_out, np.float64), rtol=0, name="output")
     np.testing.assert_array_equal(
         np.asarray(jnp.swapaxes(conv_state, 1, 2), np.float32),
         np.asarray(plain_conv, np.float32),
@@ -454,19 +446,19 @@ def test_decode_kda_accepts_native_rank5_conv_state() -> None:
 
     native = dict(inputs)
     native["conv_state"] = inputs["conv_state"].reshape(
-        inputs["conv_state"].shape[0], KERNEL_SIZE - 1, 3, HEADS, HEAD_DIM)
+        inputs["conv_state"].shape[0], KERNEL_SIZE - 1, 3, HEADS, HEAD_DIM
+    )
     out, conv_state, pool = _call(native)
 
     assert conv_state.shape == native["conv_state"].shape
-    _assert_close(out,
-                  np.asarray(plain_out, np.float64),
-                  rtol=0,
-                  name="output")
+    _assert_close(out, np.asarray(plain_out, np.float64), rtol=0, name="output")
     np.testing.assert_array_equal(
         np.asarray(conv_state, np.float32),
-        np.asarray(plain_conv, np.float32).reshape(conv_state.shape))
-    np.testing.assert_array_equal(np.asarray(pool, np.float32),
-                                  np.asarray(plain_pool, np.float32))
+        np.asarray(plain_conv, np.float32).reshape(conv_state.shape),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(pool, np.float32), np.asarray(plain_pool, np.float32)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +476,7 @@ def test_decode_kda_matches_mains_two_op_path() -> None:
     main activates beta in float32 while the kernel is handed it in bfloat16.
     """
     inputs = _build(6, 16, seed=29)
-    norm_weight = jnp.ones((HEAD_DIM, ), jnp.float32)
+    norm_weight = jnp.ones((HEAD_DIM,), jnp.float32)
     fused_out, fused_conv, fused_pool = _call(inputs)
 
     conv_out, naive_conv = kimi_short_conv_scan(
@@ -516,20 +508,16 @@ def test_decode_kda_matches_mains_two_op_path() -> None:
     # ``ragged_kda`` folds the output norm and gate in, so apply them to the
     # fused output to land on the same quantity.
     normed = fused_out.astype(jnp.float32)
-    normed *= jax.lax.rsqrt(
-        jnp.mean(normed * normed, axis=-1, keepdims=True) + EPS)
+    normed *= jax.lax.rsqrt(jnp.mean(normed * normed, axis=-1, keepdims=True) + EPS)
     normed = (normed * norm_weight).astype(jnp.bfloat16)
-    normed = normed * jax.nn.sigmoid(inputs["output_gate"].reshape(
-        normed.shape))
+    normed = normed * jax.nn.sigmoid(inputs["output_gate"].reshape(normed.shape))
 
-    _assert_close(normed,
-                  np.asarray(naive_out, np.float64),
-                  rtol=4e-2,
-                  name="gated output")
-    _assert_close(fused_pool,
-                  np.asarray(naive_pool, np.float64),
-                  rtol=3e-2,
-                  name="recurrent pool")
+    _assert_close(
+        normed, np.asarray(naive_out, np.float64), rtol=4e-2, name="gated output"
+    )
+    _assert_close(
+        fused_pool, np.asarray(naive_pool, np.float64), rtol=3e-2, name="recurrent pool"
+    )
     np.testing.assert_allclose(
         np.asarray(fused_conv, np.float32),
         np.asarray(naive_conv, np.float32),
@@ -544,10 +532,9 @@ def test_decode_kda_matches_mains_two_op_path() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_decode_kda_rejects_a_mixed_qkv_width_that_is_not_three_projections(
-) -> None:
+def test_decode_kda_rejects_a_mixed_qkv_width_that_is_not_three_projections() -> None:
     inputs = _build(2, 4, seed=31)
-    inputs["mixed_qkv"] = inputs["mixed_qkv"][:, :MIXED_DIM - HEAD_DIM]
+    inputs["mixed_qkv"] = inputs["mixed_qkv"][:, : MIXED_DIM - HEAD_DIM]
     with pytest.raises(ValueError, match="mixed_qkv must have width"):
         _call(inputs)
 
@@ -596,6 +583,6 @@ def test_decode_kda_rejects_a_dt_bias_in_the_flat_layout() -> None:
 
 def test_decode_kda_rejects_unequal_key_and_value_dims() -> None:
     inputs = _build(2, 4, seed=39)
-    inputs["pool"] = inputs["pool"][..., :HEAD_DIM // 2]
+    inputs["pool"] = inputs["pool"][..., : HEAD_DIM // 2]
     with pytest.raises(ValueError, match="d_v == d_k"):
         _call(inputs)

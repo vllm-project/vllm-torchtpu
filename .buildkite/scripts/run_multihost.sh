@@ -211,6 +211,9 @@ CONTAINER_ENV_COMMON=(
   -e TQDM_MININTERVAL="30"
   -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
   ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
+  ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"}
+  # RAY_TMPDIR keeps Ray on /tmp; following TMPDIR breaks log collection.
+  ${CONTAINER_TMPDIR:+-e TMPDIR="${CONTAINER_TMPDIR}" -e RAY_TMPDIR=/tmp}
   ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"}
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"}
 )
@@ -234,16 +237,17 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     "docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true$( [ "$BACKEND" = "ray" ] && echo "; sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true" )" || true
 done
 
+# Both backends return the command's exit code. Catch it rather than letting
+# set -e kill the script here, which skipped the copy-back and the summary.
+EXIT_CODE=0
 if [ "$BACKEND" = "ray" ]; then
   # shellcheck source=.buildkite/scripts/run_multihost_ray.sh
   source "${SCRIPT_DIR}/run_multihost_ray.sh"
-  run_ray_multihost "$@"
-  EXIT_CODE=$?
+  run_ray_multihost "$@" || EXIT_CODE=$?
 elif [ "$BACKEND" = "mp" ]; then
   # shellcheck source=.buildkite/scripts/run_multihost_mp.sh
   source "${SCRIPT_DIR}/run_multihost_mp.sh"
-  run_mp_multihost "$@"
-  EXIT_CODE=$?
+  run_mp_multihost "$@" || EXIT_CODE=$?
 else
   echo "ERROR: Unknown backend: ${BACKEND}. Supported backends: ray, mp"
   exit 1

@@ -9,7 +9,7 @@ wait_for_server() {
   local port=$1
   local pid=$2
   timeout 1200 bash -c "
-    until curl -s localhost:${port}/health > /dev/null; do
+    until curl -s 127.0.0.1:${port}/health > /dev/null; do
       if ! kill -0 $pid 2>/dev/null; then
         echo \"Error: vLLM server on port $port (PID $pid) crashed or failed to start!\" >&2
         exit 1
@@ -138,7 +138,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
     > $LOG_DIR/prefill_$i.txt 2>&1 &
 
-    PREFILL_HOSTS+=("localhost")
+    PREFILL_HOSTS+=("127.0.0.1")
     PREFILL_PORTS+=($PORT)
     PREFILL_PIDS+=($!)
 done
@@ -169,7 +169,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
     > $LOG_DIR/decode_$i.txt 2>&1 &
 
-    DECODE_HOSTS+=("localhost")
+    DECODE_HOSTS+=("127.0.0.1")
     DECODE_PORTS+=($PORT)
     DECODE_PIDS+=($!)
 done
@@ -192,7 +192,7 @@ echo "starting proxy server"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # Start proxy server
 python $SCRIPT_DIR/toy_proxy_server.py \
---host localhost \
+--host 127.0.0.1 \
 --port 8000 \
 --prefiller-hosts ${PREFILL_HOSTS[@]} \
 --prefiller-ports ${PREFILL_PORTS[@]} \
@@ -214,7 +214,7 @@ vllm bench serve \
   --random-output-len=${OUTPUT_LEN} \
   --num-prompts=${NUM_PROMPTS} \
   --ignore-eos \
-  --host=localhost \
+  --host=127.0.0.1 \
   --port 8000 \
   --request-rate=${REQUEST_RATE} \
   >> $LOG_FILE 2>&1

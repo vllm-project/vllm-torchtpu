@@ -8,8 +8,11 @@ def _legacy_ray_executor() -> bool:
     import vllm.envs as vllm_envs
 
     from vllm_torchtpu import envs
-    return (envs.TPU_MULTIHOST_BACKEND == "ray"
-            and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND)
+
+    return (
+        envs.TPU_MULTIHOST_BACKEND == "ray"
+        and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    )
 
 
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
@@ -29,8 +32,10 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
         start, end = get_pp_indices(len(layer_types), stage, stages)
         kinds = layer_types[start:end]
         if "full_attention" not in kinds:
-            return (f"stage {stage} holds layers {start}-{end - 1}, "
-                    f"{'/'.join(sorted(set(kinds)))} only")
+            return (
+                f"stage {stage} holds layers {start}-{end - 1}, "
+                f"{'/'.join(sorted(set(kinds)))} only"
+            )
     return None
 
 
@@ -58,21 +63,26 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         remedy = " Pass --no-async-scheduling."
     elif vllm_config.speculative_config is not None:
         unsupported = "speculative decoding"
-    elif (vllm_config.kv_transfer_config is not None and
-          vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"):
+    elif (
+        vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    ):
         # The raiden connector transfers each stage's own layers; the
         # other connectors assume every worker holds every layer.
-        unsupported = ("KV transfer connectors other than "
-                       "TPURaidenConnector")
-    elif (vllm_config.kv_transfer_config is not None
-          and (stage := _stage_without_full_attention(vllm_config))):
+        unsupported = "KV transfer connectors other than TPURaidenConnector"
+    elif vllm_config.kv_transfer_config is not None and (
+        stage := _stage_without_full_attention(vllm_config)
+    ):
         # The raiden connector pairs a stage with its peer through the
         # measured layout of a full-attention KV pool, so a stage made of
         # linear-attention layers alone has nothing to register.
-        unsupported = ("TPURaidenConnector with a stage holding no "
-                       f"full-attention layer ({stage})")
-        remedy = (" Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
-                  "gives every stage a full-attention layer.")
+        unsupported = (
+            f"TPURaidenConnector with a stage holding no full-attention layer ({stage})"
+        )
+        remedy = (
+            " Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
+            "gives every stage a full-attention layer."
+        )
     elif _legacy_ray_executor():
         # The pipeline's hand-off pushes go through the executor hook that
         # the multiprocess executor and the Ray V2 executor share; the
@@ -81,5 +91,5 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         remedy = " Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
     if unsupported is not None:
         raise NotImplementedError(
-            f"Pipeline parallelism on TPU does not support {unsupported} "
-            f"yet.{remedy}")
+            f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
+        )
