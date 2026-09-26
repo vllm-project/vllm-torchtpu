@@ -107,7 +107,8 @@ def get_batch_composition_stats(
         num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
         num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
 
-        # This is the number of tokens already processed for this request (before this step)
+        # This is the number of tokens already processed for this request
+        # (before this step)
         num_already_computed = int(num_computed_tokens_per_req[i])  # Cast from np.int32
         min_kv_len = min(min_kv_len, num_already_computed)
 
@@ -145,7 +146,9 @@ def get_batch_composition_stats(
 
 
 class PhaseBasedProfiler:
-    """Implements a phase-based profiler for PyTorch/XLA, profiling different inference phases."""
+    """Implements a phase-based profiler for PyTorch/XLA, profiling different
+    inference phases.
+    """
 
     def __init__(
         self,
@@ -162,7 +165,8 @@ class PhaseBasedProfiler:
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
         self.num_steps_to_profile_for: int = num_steps_to_profile_for
-        # Skip initial decode steps to avoid profiling XLA compilation and warmup overhead
+        # Skip initial decode steps to avoid profiling XLA compilation
+        # and warmup overhead
         self.num_decode_steps_to_skip: int = num_decode_steps_to_skip
         self.decode_steps_skipped: int = 0
         # Wait for KV cache to reach a certain length before profiling decode-only phase

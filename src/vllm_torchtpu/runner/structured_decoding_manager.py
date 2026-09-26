@@ -36,7 +36,8 @@ class StructuredDecodingManager:
             pin_memory=PIN_MEMORY,
         )
         self.device = runner.device
-        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
+        # Pre-allocate directly on device to avoid repeated host-to-device transfers
+        # every step
         self.structured_decode_arange = torch.arange(
             0, 32, dtype=torch.int32, device=self.device
         )
@@ -118,7 +119,8 @@ class StructuredDecodingManager:
 
         num_local = len(local_indices)
 
-        # Standard path: handles all structured batches (all-structured, mixed, or permuted).
+        # Standard path: handles all structured batches (all-structured,
+        # mixed, or permuted).
         self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
         self.require_structured_out_cpu[:padded_num_reqs].zero_()
 
@@ -339,8 +341,9 @@ class StructuredDecodingManager:
         target_dim = logits.shape[-1]
         if target_dim < self.vocab_size:
             raise ValueError(
-                f"TPU logits vocab dimension must be at least vocab_size ({self.vocab_size}) "
-                f"(padded to hardware alignment boundary), but got logits.shape[-1]={target_dim}"
+                "TPU logits vocab dimension must be at least "
+                f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
+                f"boundary), but got logits.shape[-1]={target_dim}"
             )
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)

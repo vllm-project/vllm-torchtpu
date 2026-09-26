@@ -168,7 +168,8 @@ class Eagle3Proposer:
         # SHARDED across the whole TP group (draft_tp == target_tp).
         if draft_tp not in (1, target_tp):
             raise ValueError(
-                f"{self.speculative_config.method} draft_tensor_parallel_size={draft_tp} is unsupported "
+                f"{self.speculative_config.method} "
+                f"draft_tensor_parallel_size={draft_tp} is unsupported "
                 f"on TPU: it must be 1 (replicated draft) or {target_tp} "
                 f"(== target tensor_parallel_size, sharded draft)."
             )
@@ -950,8 +951,8 @@ class Eagle3Proposer:
         if not chunks:
             raise RuntimeError(
                 f"{self.__class__.__name__}.propose() called but no draft chunks were "
-                "captured (aux_hidden_states was None for every target chunk in eagle3, or "
-                "no hidden_states were captured). "
+                "captured (aux_hidden_states was None for every target chunk "
+                "in eagle3, or no hidden_states were captured). "
                 "Ensure target verify step correctly recorded state."
             )
         # First pass, per chunk — mirrors the target's chunked verify forward.
@@ -1692,8 +1693,8 @@ class Eagle3Proposer:
         """Width of the per-token tensor that combine_hidden_states consumes.
 
         When the draft uses aux hidden states, this is the draft's own
-        `fc_input_size`. Otherwise combine_hidden_states is an identity over the plain hidden_size-wide
-        target hidden state, so the input width is just hidden_size.
+        `fc_input_size`. Otherwise combine_hidden_states is an identity over the plain
+        hidden_size-wide target hidden state, so the input width is just hidden_size.
         """
         if self._draft_uses_aux_hidden_state():
             return self.draft_model.model.fc_input_size
