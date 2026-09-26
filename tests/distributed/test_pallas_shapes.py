@@ -27,7 +27,7 @@ def test_native_placeholder_local_global_roundtrip(monkeypatch, spec, expected):
     ]
     import numpy as np
 
-    mesh = pallas.PallasMesh(np.array(devices).reshape(4, 2), ("pcp", "tp"))
+    mesh = jax.sharding.Mesh(np.array(devices).reshape(4, 2), ("pcp", "tp"))
     monkeypatch.setattr(pallas, "get_global_shape", pallas_shapes.get_global_shape)
     monkeypatch.setattr(pallas, "get_local_shape", pallas_shapes.get_local_shape)
     value = pallas.jax_placeholder(torch.zeros(3, 8, 16), mesh, spec)
