@@ -21,7 +21,6 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
-# yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     bref_override,
     configs,
@@ -30,8 +29,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     stitch_utils,
     utils,
 )
-
-# yapf: enable
 
 # Define inner kernel.
 

@@ -151,11 +151,6 @@ ignore = [
     "B905",   # zip() without an explicit strict=
     "B007",   # loop control variable not used in the body
     "UP032",  # .format() that could be an f-string
-
-    # Firing today and not fixed yet. `ruff check --fix` does not clear any of
-    # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
-    # change. Delete the entry once its count reaches zero.
-    "SIM115",  #   1  open() outside a context manager
 ]
 
 [tool.ruff.lint.per-file-ignores]

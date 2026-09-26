@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "scripts" / "vllm" / "benchmarking")
 )
-import bq_utils  # noqa: E402
+import bq_utils
 
 
 def parse_and_upload(file_path, record_id, dry_run=False) -> bool:

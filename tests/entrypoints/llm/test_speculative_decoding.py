@@ -1812,56 +1812,56 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     # Log to a file rather than a pipe. vLLM startup writes far more than a
     # pipe buffer holds, and nothing here drains it, so PIPE would block the
     # server mid-startup and the health poll would never succeed.
-    log = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".log", prefix="vllm_serve_dp_", delete=False
-    )
+    ) as log:
 
-    def _fail(message: str) -> RuntimeError:
-        log.flush()
-        with open(log.name) as fh:
-            tail = fh.read()[-4000:]
-        return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+        def _fail(message: str) -> RuntimeError:
+            log.flush()
+            with open(log.name) as fh:
+                tail = fh.read()[-4000:]
+            return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
 
-    # The first request against a fresh engine pair compiles the runtime
-    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
-    # worker-RPC deadline -- the engine is torn down mid-compile and every
-    # request 500s. Raise the deadline past the compile.
-    env = dict(
-        os.environ, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S)
-    )
+        # The first request against a fresh engine pair compiles the runtime
+        # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+        # worker-RPC deadline -- the engine is torn down mid-compile and every
+        # request 500s. Raise the deadline past the compile.
+        env = dict(
+            os.environ,
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
+        )
 
-    server = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
-    )
-    try:
-        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
-        while True:
-            if server.poll() is not None:
-                raise _fail(
-                    f"vllm serve exited with {server.returncode} during startup"
-                )
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=10).close()
-                break
-            except (urllib.error.URLError, OSError):
-                pass
-            if time.time() > deadline:
-                raise _fail(
-                    "vllm serve did not become healthy within "
-                    f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
-                )
-            time.sleep(10)
-        print(f"vllm serve ready at {base}; log: {log.name}")
-        yield _ServedEngine(base, model_name)
-    finally:
-        server.terminate()
+        server = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
+        )
         try:
-            server.wait(timeout=180)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=60)
-        log.close()
-        wait_for_tpu_release()
+            deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+            while True:
+                if server.poll() is not None:
+                    raise _fail(
+                        f"vllm serve exited with {server.returncode} during startup"
+                    )
+                try:
+                    urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                    break
+                except (urllib.error.URLError, OSError):
+                    pass
+                if time.time() > deadline:
+                    raise _fail(
+                        "vllm serve did not become healthy within "
+                        f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
+                    )
+                time.sleep(10)
+            print(f"vllm serve ready at {base}; log: {log.name}")
+            yield _ServedEngine(base, model_name)
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=60)
+            wait_for_tpu_release()
 
 
 def _qwen35_dp_kwargs() -> dict:
