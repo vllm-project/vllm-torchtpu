@@ -37,7 +37,8 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 def test_mla_attention_interface_mixed_q_split(monkeypatch):
-    """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to mla_ragged_paged_attention."""
+    """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to
+    mla_ragged_paged_attention."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -108,7 +109,8 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     assert kwargs["mixed_q_split"] == 1
     assert kwargs["sm_scale"] == 0.1
 
-    # 2. Overridden env vars (MIXED_Q_SPLIT=16, MIXED_NUM_QUERIES_PER_BLOCK=64, MIXED_NUM_KV_PAGES_PER_BLOCK=4): overrides mixed_tuned
+    # 2. Overridden env vars (MIXED_Q_SPLIT=16, MIXED_NUM_QUERIES_PER_BLOCK=64,
+    #    MIXED_NUM_KV_PAGES_PER_BLOCK=4): overrides mixed_tuned
     mock_mla_kernel.reset_mock()
     monkeypatch.setattr(envs, "MIXED_Q_SPLIT", 16)
     monkeypatch.setattr(envs, "MIXED_NUM_QUERIES_PER_BLOCK", 64)
