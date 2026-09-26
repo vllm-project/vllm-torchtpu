@@ -52,6 +52,7 @@ import functools
 import gc
 import os
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -366,29 +367,37 @@ def patch_default_loader_ep_weight_filter() -> None:
     )
 
 
+def _evict_one_checkpoint_file(fpath: str) -> float | None:
+    if not os.path.isfile(fpath):
+        return None
+    try:
+        file_size_gb = os.path.getsize(fpath) / (1024**3)
+        with open(fpath, "rb") as f:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        logger.info(
+            "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
+            fpath,
+            file_size_gb,
+        )
+        return file_size_gb
+    except Exception as e:
+        logger.warning(
+            "[tpu-model-loader] Failed to evict page cache for %s: %s",
+            fpath,
+            e,
+        )
+        return None
+
+
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
     """Drop clean host page cache for weight files via posix_fadvise."""
-    evicted_count = 0
-    evicted_gb = 0.0
-    for fpath in files:
-        if os.path.isfile(fpath):
-            try:
-                file_size_gb = os.path.getsize(fpath) / (1024**3)
-                with open(fpath, "rb") as f:
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                evicted_gb += file_size_gb
-                evicted_count += 1
-                logger.info(
-                    "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
-                    fpath,
-                    file_size_gb,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[tpu-model-loader] Failed to evict page cache for %s: %s",
-                    fpath,
-                    e,
-                )
+    if not files:
+        return
+    max_workers = min(len(files), os.cpu_count() or 32)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        sizes = list(executor.map(_evict_one_checkpoint_file, files))
+    evicted_count = sum(s is not None for s in sizes)
+    evicted_gb = sum(s for s in sizes if s is not None)
     gc.collect()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
