@@ -14,6 +14,9 @@
 
 import dataclasses
 import functools
+import itertools
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -320,6 +323,26 @@ def _localize_gdn_mamba_spec_for_pcp(
         shapes=geometry.local_state_shapes(spec.shapes, d_k, d_v),
         page_size_padded=page_size_padded,
     )
+
+
+# GDN custom ops shared by every layer with the same kernel config. A
+# JaxCallable caches its jax.export per instance, so one op per layer re-exported
+# (and re-lowered) the identical kernel for every layer at every compile bucket.
+_shared_gdn_ops: dict[tuple, Any] = {}
+_shared_gdn_op_ids = itertools.count()
+
+
+def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
+    """Return the ``pallas::<kind>_<n>`` op for ``(kind, key)``, building it once.
+
+    ``kind`` and ``key`` together must cover every value that the op's kernel
+    and fake capture.
+    """
+    op = _shared_gdn_ops.get((kind, key))
+    if op is None:
+        op = build(f"pallas::{kind}_{next(_shared_gdn_op_ids)}")
+        _shared_gdn_ops[(kind, key)] = op
+    return op
 
 
 @QwenGatedDeltaNetAttention.register_oot
@@ -736,25 +759,37 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             new_pool, output = result
             return new_pool.reshape(recurrent_state.shape), output
 
-        op_name = (
-            f"pallas::gdn_attention_pooled_"
-            f"{self.prefix.replace('.', '_')}"
-            f"{'_bm' if block_major else ''}"
-        )
-        # The recurrent state (arg 3) is the attention-shaped pool: the ssm
-        # and conv byte-regions are read/written through it by the pool
-        # adapters, so it is the only donated input. inplace-donation
-        # aliases its program-level output to the input buffer so the
-        # ~pool-sized update is not double-counted at compile.
-        gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3,))
-
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out_shape = (num_tokens, local_num_v_heads, d_v)
             out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
             return torch.empty_like(recurrent_state), out
 
-        gdn_jax_op.register_fake(_fake_gdn)
+        def build_op(op_name: str):
+            # The recurrent state (arg 3) is the attention-shaped pool: the ssm
+            # and conv byte-regions are read/written through it by the pool
+            # adapters, so it is the only donated input. inplace-donation
+            # aliases its program-level output to the input buffer so the
+            # ~pool-sized update is not double-counted at compile.
+            op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3,))
+            op.register_fake(_fake_gdn)
+            return op
+
+        gdn_jax_op = _get_shared_gdn_op(
+            "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
+            (
+                id(mesh),
+                id(vllm_config),
+                n_kq,
+                local_num_v_heads,
+                d_k,
+                d_v,
+                kernel_size,
+                recurrent_state_dtype,
+                num_spec_tokens,
+            ),
+            build_op,
+        )
 
         def gdn_impl(
             mixed_qkv: torch.Tensor,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -585,6 +586,35 @@ class TestVllmGatedDeltaNetAttention:
         # Nothing silently dropped on the way to the kernel.
         assert len(captured["args"]) == len(operands)
         assert captured["args"][-1] is operands[-1]
+
+    def test_pooled_op_is_shared_by_layers_with_one_kernel_config(
+        self, cpu_vllm_config_context
+    ):
+        """Every op exports its kernel on its own, so layers must share one.
+
+        One op per layer re-exported the identical kernel for each GDN layer
+        at every compile bucket, which dominated cold-start FX interpretation.
+        """
+        attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+        attn1 = _qwen35_397b_gdn_attn("language_model.model.layers.1.linear_attn")
+        spec_attn = _qwen35_397b_gdn_attn("language_model.model.layers.2.linear_attn")
+        spec_attn.num_spec = 3
+
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                "pallas.jax_op",
+                side_effect=lambda *args, **kwargs: MagicMock(),
+            ) as mock_jax_op,
+        ):
+            for attn in (attn0, attn1, spec_attn):
+                attn._build_pooled_gdn_op()
+
+        names = [c.args[0] for c in mock_jax_op.call_args_list]
+        assert len(names) == 2
+        assert len(set(names)) == 2
+        assert all(re.fullmatch(r"pallas::gdn_attention_pooled_\d+", n) for n in names)
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
@@ -1593,9 +1623,6 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
             *([MagicMock()] * 3), pool, *([MagicMock()] * 8)
         )
 
-    assert captured["name"] == (
-        "pallas::gdn_attention_pooled_language_model_model_layers_0_linear_attn"
-        + suffix
-    )
+    assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
