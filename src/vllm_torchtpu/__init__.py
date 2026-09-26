@@ -732,13 +732,31 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     import sys
     from dataclasses import replace
 
+    from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
+        FullAttentionSpec,
         KVCacheSpec,
         MambaSpec,
         UniformTypeKVCacheSpecs,
     )
+
+    def full_attention_max_memory_usage_bytes(self, vllm_config):
+        # Specs describe physical, rank-local pages. Capacity admission and
+        # auto-fit run before the coordinator converts them to logical PCP
+        # pages, so account for context sharding here as well as for DCP.
+        parallel = vllm_config.parallel_config
+        cp_size = max(
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        )
+        num_pages = cdiv(
+            vllm_config.model_config.max_model_len, self.block_size * cp_size
+        )
+        return num_pages * self.page_size_bytes
+
+    FullAttentionSpec.max_memory_usage_bytes = full_attention_max_memory_usage_bytes
 
     already_patched = getattr(
         kv_cache_utils, "_tpu_hybrid_pcp_block_sizes_patch", False
@@ -854,12 +872,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
 
-    hybrid_coordinator = kv_cache_coordinator.HybridKVCacheCoordinator
-    if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch", False):
-        original_hybrid_init = hybrid_coordinator.__init__
+    coordinator_factory = kv_cache_coordinator.get_kv_cache_coordinator
+    if not getattr(coordinator_factory, "_tpu_hybrid_pcp_coordinator_patch", False):
+        original_factory = coordinator_factory
 
-        def _hybrid_init_with_logical_pcp_blocks(
-            self,
+        def _get_coordinator_with_logical_pcp_blocks(
             kv_cache_config,
             max_model_len,
             max_in_flight_tokens,
@@ -930,8 +947,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 )
                 pcp_world_size = 1
 
-            original_hybrid_init(
-                self,
+            return original_factory(
                 kv_cache_config,
                 max_model_len,
                 max_in_flight_tokens,
@@ -946,8 +962,21 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 num_prefill_lookahead=num_prefill_lookahead,
             )
 
-        hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
-        hybrid_coordinator._tpu_hybrid_pcp_coordinator_patch = True
+        _get_coordinator_with_logical_pcp_blocks._tpu_hybrid_pcp_coordinator_patch = (
+            True
+        )
+        kv_cache_coordinator.get_kv_cache_coordinator = (
+            _get_coordinator_with_logical_pcp_blocks
+        )
+
+    # Normalize before the factory selects a prefix-cached or no-prefix
+    # coordinator. Patching only HybridKVCacheCoordinator misses the latter,
+    # so runtime admission would count unsharded pages and stall long prompts.
+    from vllm.v1.core import kv_cache_manager
+
+    kv_cache_manager.get_kv_cache_coordinator = (
+        kv_cache_coordinator.get_kv_cache_coordinator
+    )
 
     from vllm.v1.engine.core import EngineCoreProc
 
