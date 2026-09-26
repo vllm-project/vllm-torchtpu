@@ -457,7 +457,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, int
     ]:
-        """Dequantize staged shards on CPU, concatenate w13, and pad to strided block boundaries."""
+        """Dequantize staged shards on CPU, concatenate w13, and pad to
+        strided block boundaries."""
         w1_scale = layer.w13_weight_scale.data.to("cpu")[:, : self.intermediate_size, :]
         w3_scale = layer.w13_weight_scale.data.to("cpu")[:, self.intermediate_size :, :]
         w2_scale = layer.w2_weight_scale.data.to("cpu")

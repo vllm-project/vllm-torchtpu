@@ -399,7 +399,8 @@ def quantize_tensor_to_fp4(
         if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
             if dim % block_size != 0:
                 raise ValueError(
-                    f"Dimension {i} of size {dim} is not divisible by block_size={block_size}"
+                    f"Dimension {i} of size {dim} is not divisible by "
+                    f"block_size={block_size}"
                 )
             num_blocks = dim // block_size
             blocked_shape.extend([num_blocks, block_size])

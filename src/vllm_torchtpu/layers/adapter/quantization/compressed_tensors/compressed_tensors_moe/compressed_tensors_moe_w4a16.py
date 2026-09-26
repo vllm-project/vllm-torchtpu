@@ -13,7 +13,8 @@
 # limitations under the License.
 """TPU W4A16 MoE implementation for Compressed Tensors.
 
-This class supprts W4A16 and W4A8 quantization scheme where weights are quantized in int4 format.
+This class supprts W4A16 and W4A8 quantization scheme where weights are quantized in
+int4 format.
 """
 
 import ctypes
@@ -26,7 +27,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     RoutedExperts,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
     CompressedTensorsWNA16MoEMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -42,7 +43,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
     release_memory_to_os,
     requantize_int4_to_fp4_weights,
@@ -159,7 +160,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             ):
                 raise ValueError(
                     f"hidden_size ({hidden_size}) and intermediate_size_per_partition "
-                    f"({intermediate_size_per_partition}) must be divisible by group_size ({self.group_size})"
+                    f"({intermediate_size_per_partition}) must be divisible by "
+                    f"group_size ({self.group_size})"
                 )
             num_groups_w13 = hidden_size // self.group_size
             num_groups_w2 = intermediate_size_per_partition // self.group_size
