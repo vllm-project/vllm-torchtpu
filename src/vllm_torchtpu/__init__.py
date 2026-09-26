@@ -465,6 +465,11 @@ def _patch_vllm_compile_all_ranges() -> None:
         create_concrete_args,
         get_fake_args_from_graph,
     )
+    from vllm.distributed.parallel_state import (
+        get_pp_group,
+        get_world_group,
+        model_parallel_is_initialized,
+    )
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -475,16 +480,39 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
 
         local_rank = int(os.environ["LOCAL_RANK"])
-        range_entry_list = list(self.range_entries.values())
+        # Sort descending by bucket size and pair largest with smallest via
+        # snake order so each rank's initial share takes roughly equal time.
+        range_entry_list = sorted(
+            self.range_entries.values(),
+            key=lambda r: r.compile_range.start,
+            reverse=True,
+        )
 
         range_entry_len = len(range_entry_list)
 
         expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
-        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
-        d.rotate(-local_rank * (len(d) // 8))
+        d = deque(
+            sorted(
+                expanded_indexes,
+                key=lambda x: (x % 8 if (x // 8) % 2 == 0 else 7 - (x % 8), x),
+            )
+        )
+        per_rank = len(d) // 8
+        d.rotate(-local_rank * per_rank)
         indexes = list(d)
 
-        for i in indexes:
+        for step, i in enumerate(indexes):
+            if (
+                step == per_rank
+                and model_parallel_is_initialized()
+                and get_pp_group().world_size == 1
+                and get_world_group().world_size > 1
+            ):
+                # Wait for every rank to finish its own share so the remaining
+                # buckets can all be replayed from peer artifacts without
+                # racing and retracing a bucket another rank is still saving.
+                get_world_group().barrier()
+
             if i >= len(range_entry_list):
                 continue
 

@@ -448,3 +448,108 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_deserialize_entry_suppresses_deepcopy(self, monkeypatch):
+        """Verify _deserialize_entry suppresses deepcopy on the bundled entry."""
+        import copy
+
+        from torch._functorch._aot_autograd import aot_autograd_result
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        class _Entry:
+            def __init__(self) -> None:
+                self.deepcopied = False
+
+            def __deepcopy__(self, memo):
+                self.deepcopied = True
+                return self
+
+        seen = []
+
+        def fake_deserialize(entry):
+            seen.append(copy.deepcopy(entry))
+            return lambda *args: args
+
+        monkeypatch.setattr(
+            aot_autograd_result,
+            "deserialize_bundled_cache_entry",
+            fake_deserialize,
+        )
+        entry = _Entry()
+        tpu_compiler._deserialize_entry(entry)
+        assert not entry.deepcopied
+        assert seen == [entry]
+
+    def test_peer_artifact_replay(self, tmp_path, monkeypatch):
+        """A rank replays a peer rank's saved artifact for the same graph and
+        hard-links it into its own cache dir; a different graph recompiles."""
+        import torch
+        from torch import fx, nn
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        class _Add(nn.Module):
+            def __init__(self, delta: float) -> None:
+                super().__init__()
+                self.register_buffer("delta", torch.tensor([delta]))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.delta
+
+        def _fake_compiled(tag: str):
+            def fn(x):
+                return (x,)
+
+            fn.serialize = lambda: tag
+            return fn
+
+        calls = []
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_tpu_backend",
+            lambda graph, inputs: (
+                calls.append("compile") or _fake_compiled(f"entry_{len(calls)}")
+            ),
+        )
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_deserialize_entry",
+            lambda entry: lambda x: (f"replayed:{entry}",),
+        )
+        monkeypatch.setattr(envs, "TPU_PARALLEL_PRECOMPILE", True)
+
+        g_same_0 = fx.symbolic_trace(_Add(1.0))
+        g_same_1 = fx.symbolic_trace(_Add(1.0))
+        g_diff = fx.symbolic_trace(_Add(2.0))
+        x = torch.zeros(16, 4)
+        for g in (g_same_0, g_same_1, g_diff):
+            for node in g.graph.nodes:
+                if node.op == "placeholder":
+                    node.meta["val"] = x
+
+        rank0_dir = tmp_path / "hash" / "rank_0_0" / "backbone"
+        rank1_dir = tmp_path / "hash" / "rank_1_0" / "backbone"
+        c0 = tpu_compiler.TpuCompilerAdaptor()
+        c0.initialize_cache(str(rank0_dir))
+        c1 = tpu_compiler.TpuCompilerAdaptor()
+        c1.initialize_cache(str(rank1_dir))
+
+        _, h0 = c0.compile(g_same_0, [x], {}, Range(16, 16), key="sub0_16")
+        assert calls == ["compile"]
+        assert h0 is not None
+
+        fn1, h1 = c1.compile(g_same_1, [x], {}, Range(16, 16), key="sub0_16")
+        assert calls == ["compile"]
+        assert fn1(x) == "replayed:entry_1"
+        assert h1 is not None and Path(h1[1]).is_file()
+        assert os.stat(h0[1]).st_ino == os.stat(h1[1]).st_ino
+
+        # Different constant -> fingerprint mismatch -> compiles its own.
+        rank2_dir = tmp_path / "hash" / "rank_2_0" / "backbone"
+        c2 = tpu_compiler.TpuCompilerAdaptor()
+        c2.initialize_cache(str(rank2_dir))
+        c2.compile(g_diff, [x], {}, Range(16, 16), key="sub0_16")
+        assert len(calls) == 2

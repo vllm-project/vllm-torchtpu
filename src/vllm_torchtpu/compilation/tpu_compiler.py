@@ -85,6 +85,24 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
+    # `deserialize_bundled_cache_entry` starts with `deepcopy(entry)` before
+    # calling `entry.wrap_post_compile(...)` so the returned
+    # `SerializableCompiledFunction` can still be `.serialize()`d later: for
+    # Inductor's `CompiledFxGraph`, `post_compile` mutates `current_callable`
+    # and `compiled_fn_runner` in place with unpicklable runtime closures and
+    # C++ runners.
+    #
+    # For TorchTPU's `TorchTpuCompiledExecutable`, however, `pickle.loads` has
+    # already called `load_serialized_executable` once, and `post_compile` is a
+    # no-op (`wrap_post_compile` only sets `example_inputs = []`, leaving `entry`
+    # picklable). Letting `deepcopy(entry)` run would invoke
+    # `TorchTpuCompiledExecutable.__reduce__` -> `serialize_executable` ->
+    # `load_serialized_executable` a second time, allocating a duplicate PJRT
+    # executable in TPU HBM and pinning it on `compiled_fn.serialize`. Returning
+    # `entry` directly skips that second PJRT load while keeping
+    # `compiled_fn.serialize()` functional.
+    with contextlib.suppress(AttributeError, TypeError):
+        entry.__deepcopy__ = lambda _memo: entry
     return deserialize_bundled_cache_entry(entry)
 
 
@@ -337,6 +355,21 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
 
 # TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
 # once our local vLLM checkout exposes that helper.
+def _output_node(graph: fx.GraphModule) -> fx.Node | None:
+    for node in graph.graph.nodes:
+        if node.op == "output":
+            return node
+    return None
+
+
+def _needs_tuple_output(graph: fx.GraphModule) -> bool:
+    """Whether `graph` returns a single value that aot_autograd needs wrapped."""
+    output_node = _output_node(graph)
+    return output_node is not None and not isinstance(
+        output_node.args[0], (tuple, list)
+    )
+
+
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
@@ -345,22 +378,14 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 
     Returns (wrapped_graph, was_wrapped).
     """
-    output_node = None
-    for node in graph.graph.nodes:
-        if node.op == "output":
-            output_node = node
-            break
-
-    if output_node is None:
+    if not _needs_tuple_output(graph):
         return graph, False
 
-    output_args = output_node.args[0]
-    if isinstance(output_args, (tuple, list)):
-        return graph, False
-
+    output_node = _output_node(graph)
+    assert output_node is not None
     # Single return value — wrap in a tuple
     with graph.graph.inserting_before(output_node):
-        output_node.args = ((output_args,),)
+        output_node.args = ((output_node.args[0],),)
     graph.graph.lint()
     graph.recompile()
     return graph, True
@@ -704,16 +729,10 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
-        # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
-        # first because _ensure_tuple_output rewrites the output node in place
-        # and vLLM keeps its own reference to `graph`. Only the output node
-        # moves, so the placeholder signature is unaffected.
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
         caching = (
             key is not None and self.cache_dir is not None and not self._disable_cache
         )
+        was_wrapped = _needs_tuple_output(graph)
         # Only a graph that may be handed between ranks is fingerprinted; the
         # rest save no fingerprint and are never replayed on another rank.
         fingerprint = (
@@ -734,6 +753,13 @@ class TpuCompilerAdaptor(CompilerInterface):
                 peer_path,
             )
         else:
+            # aot_autograd (inside TpuBackend) requires tuple outputs.
+            # Deep-copied first because _ensure_tuple_output rewrites the
+            # output node in place and vLLM keeps its own reference to `graph`.
+            # Only the output node moves, so the placeholder signature is
+            # unaffected.
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
             compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
@@ -812,13 +838,11 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
+        was_wrapped = _needs_tuple_output(graph)
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
