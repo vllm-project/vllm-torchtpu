@@ -383,8 +383,9 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
+@pytest.mark.parametrize("block_major", [False, True])
 def test_build_streaming_kernel_registers_eight_tensor_custom_op(
-    monkeypatch, vllm_config_context
+    monkeypatch, vllm_config_context, block_major
 ):
     impl = _impl()
     fake_mesh = object()
@@ -411,6 +412,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     def fake_jax_op(_name, fn, **kwargs):
         captured["signature"] = inspect.signature(fn, follow_wrapped=False)
         captured["input_partition_specs"] = kwargs["input_partition_specs"]
+        captured["output_partition_specs"] = kwargs["output_partition_specs"]
         return FakeOp()
 
     monkeypatch.setattr(
@@ -429,12 +431,28 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
             None,
             use_pcp_streaming=True,
             cp_kv_cache_interleave_size=4,
+            block_major=block_major,
         )
 
     params = list(captured["signature"].parameters.values())
     assert len(params) == 8
     assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
     assert len(captured["input_partition_specs"]) == 8
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    local_cache = (8, 3, 16, 2, 1, 128) if block_major else (8, 16, 2, 1, 128)
+    global_cache = (32, 3, 16, 4, 1, 128) if block_major else (32, 16, 4, 1, 128)
+    assert (
+        pallas_shapes.get_global_shape(
+            local_cache, mesh, captured["input_partition_specs"][0]
+        )
+        == global_cache
+    )
+    assert (
+        pallas_shapes.get_local_shape(
+            global_cache, mesh, captured["output_partition_specs"][0]
+        )
+        == local_cache
+    )
 
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)

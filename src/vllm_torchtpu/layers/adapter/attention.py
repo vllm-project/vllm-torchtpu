@@ -45,6 +45,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
+    PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS,
     get_pcp_streaming_mesh,
     invoke_pcp_streaming_op,
     make_pcp_streaming_rpa_kernel,
@@ -928,6 +929,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
             ctx.mesh, use_pcp_streaming
         )
+        output_partition_specs = PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+        if use_pcp_streaming and block_major:
+            # The merged pool inserts rows_per_block before the page axes.
+            # Keep TP on the head axis when sizing native Pallas placeholders.
+            cache_spec = input_partition_specs[0]
+            cache_spec = P(cache_spec[0], None, *cache_spec[1:])
+            input_partition_specs = (cache_spec, *input_partition_specs[1:])
+            output_partition_specs = (cache_spec, output_partition_specs[1])
         registry_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1015,6 +1024,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 donate_argnums=rpa_donate_argnums,
                 mesh=op_mesh,
                 input_partition_specs=input_partition_specs,
+                output_partition_specs=output_partition_specs,
             )
             if envs.TPU_KERNEL_ITER_MODE:
                 from vllm_torchtpu.compilation import kernel_reload
@@ -1024,6 +1034,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     make_kwargs=pcp_make_kwargs,
                     op_mesh=op_mesh,
                     specs=input_partition_specs,
+                    out_specs=output_partition_specs,
                     donate=rpa_donate_argnums,
                 ):
                     import importlib
@@ -1039,6 +1050,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         donate_argnums=donate,
                         mesh=op_mesh,
                         input_partition_specs=specs,
+                        output_partition_specs=out_specs,
                     )
 
                 kernel_reload.register_builder(op_name, _rebuild_pcp_callable)
