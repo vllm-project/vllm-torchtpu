@@ -279,10 +279,12 @@ def test_tp2dp4_decode_fa_geometry_is_derived():
     assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
     assert len(manifest.pools) == 105
     geometry = manifest.geometry_by_tag()
+    # One live KV head of the two head slots a token stride holds: the
+    # padding slot is declared live too, so a page is one contiguous range.
     assert geometry[rpm.TAG_FA] == {
         "num_blocks": 16,
         "block_stride_bytes": 1_048_576,
-        "live_bytes_per_block": 524_288,
+        "live_bytes_per_block": 1_048_576,
     }
     assert geometry[rpm.TAG_GDN_CONV] == {
         "num_blocks": 16,
@@ -299,7 +301,7 @@ def test_tp2dp4_decode_fa_geometry_is_derived():
     (region, ) = fa_pool.regions
     assert region.num_units == 1024
     assert (region.offset_bytes, region.stride_bytes, region.unit_bytes,
-            region.units_per_stride) == (0, 1024, 512, 1)
+            region.units_per_stride) == (0, 1024, 512, 2)
 
 
 # --------------------------------------------------------------------------

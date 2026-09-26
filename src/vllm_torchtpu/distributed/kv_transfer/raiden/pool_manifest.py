@@ -273,13 +273,22 @@ def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
         raise ManifestError(
             "full-attention live bytes per token exceed the physical token "
             f"stride: live={live_per_token} stride={token_stride_bytes}")
+    # A tensor-parallel shard pads its KV heads up to the layout's head tile,
+    # so a token's stride may hold more head slots than live heads. The
+    # padding slots travel with the live ones: both ends of a transfer hold
+    # the same shard layout, and a page then lowers to one contiguous byte
+    # range instead of one range per token (a 4096-token page would need
+    # 4096 iovecs, more than the transport accepts in one push).
+    units_per_stride = num_kv_heads
+    if token_stride_bytes % unit_bytes == 0:
+        units_per_stride = token_stride_bytes // unit_bytes
     return (RegionSpec(
         name="fa_payload",
         offset_bytes=0,
         stride_bytes=token_stride_bytes,
         unit_bytes=unit_bytes,
         num_units=block_size_tokens,
-        units_per_stride=num_kv_heads,
+        units_per_stride=units_per_stride,
     ), )
 
 

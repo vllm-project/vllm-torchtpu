@@ -102,6 +102,26 @@ def test_spawned_worker_binding_uses_inherited_local_rank():
     assert b.init_local_rank == 6
 
 
+def test_ray_placed_pcp_worker_uses_the_executors_local_rank():
+    """The Ray executor sets no LOCAL_RANK; the chip slot it chose arrives as
+    the worker's local rank, so a two-host PCP16 worker binds that chip
+    rather than every worker of a host opening chip 0."""
+    b = binding.get_tpu_worker_binding(
+        _parallel_config(prefill_context_parallel_size=16,
+                         world_size=16,
+                         local_world_size=8,
+                         enable_expert_parallel=True),
+        rank=13,
+        local_rank=5,
+        env={"LOCAL_WORLD_SIZE": "8"},
+        use_spawned_pcp_local_rank=True,
+    )
+
+    assert b.as_env()["LOCAL_RANK"] == "5"
+    assert b.init_local_rank == 5
+    assert b.rank == 13 and b.world_size == 16
+
+
 def test_spawned_worker_binding_rejects_out_of_range_local_rank():
     with pytest.raises(ValueError, match="out of range"):
         binding.get_tpu_worker_binding(

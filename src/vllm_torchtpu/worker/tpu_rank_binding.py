@@ -94,8 +94,15 @@ def _get_spawned_pcp_local_rank(
     env: Mapping[str, str],
     local_rank_offset: int,
     local_world: int,
+    executor_local_rank: int,
 ) -> int:
-    """LOCAL_RANK a spawned PCP worker was handed by its parent."""
+    """LOCAL_RANK a spawned PCP worker was handed by its parent.
+
+    The Ray executor hands no LOCAL_RANK down: it places every worker itself
+    and passes the chip slot as the worker's local rank, which is used then.
+    """
+    if not env.get("LOCAL_RANK"):
+        return int(executor_local_rank)
     local_rank_env = _get_int_env(env, "LOCAL_RANK", local_rank_offset)
     local_rank = local_rank_env - local_rank_offset
     if not 0 <= local_rank < local_world:
@@ -253,6 +260,7 @@ def get_tpu_worker_binding(
                 env=env,
                 local_rank_offset=local_rank_offset,
                 local_world=global_world,
+                executor_local_rank=native_local_rank,
             )
         else:
             tpu_local_rank = native_local_rank
@@ -277,6 +285,7 @@ def get_tpu_worker_binding(
             env=env,
             local_rank_offset=local_rank_offset,
             local_world=world_size,
+            executor_local_rank=local_rank,
         )
     else:
         # LOCAL_RANK stays replica-local; native_local_rank carries the

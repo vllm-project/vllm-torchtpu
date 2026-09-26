@@ -46,6 +46,13 @@ def test_no_order_when_multiple_nodes():
     assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
 
 
+def test_no_order_under_the_ray_multihost_backend(monkeypatch):
+    """The Ray executor places the workers of a multi-host slice itself and
+    leaves nnodes at 1; topology_aware_mesh still sees one host."""
+    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
+    assert order_mod.resolve_pcp_topology_order(_config(pcp=16)) is None
+
+
 # --- resolve_pcp_topology_order: faults raise ------------------------------
 
 

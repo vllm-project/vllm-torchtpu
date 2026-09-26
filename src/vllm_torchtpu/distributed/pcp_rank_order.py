@@ -68,11 +68,15 @@ def resolve_pcp_topology_order(
     # Multi-host workers already have a global rank order spanning the slice.
     # topology_aware_mesh can currently inspect only a single host, so retain
     # that global order instead of trying to derive a partial mesh locally.
+    # The Ray executor places the workers itself and leaves nnodes at 1, so
+    # its backend counts as multi-host too.
+    from vllm_torchtpu import envs as tpu_envs
     nnodes = int(parallel_config.nnodes)
-    if nnodes > 1:
+    if nnodes > 1 or tpu_envs.TPU_MULTIHOST_BACKEND == "ray":
         logger.info(
-            "Topology aware mesh not applied: nnodes=%d. Topology aware "
-            "mesh is currently only supported for single host", nnodes)
+            "Topology aware mesh not applied: nnodes=%d backend=%s. Topology "
+            "aware mesh is currently only supported for single host", nnodes,
+            tpu_envs.TPU_MULTIHOST_BACKEND or "mp")
         return None
 
     dp_size = int(parallel_config.data_parallel_size)
