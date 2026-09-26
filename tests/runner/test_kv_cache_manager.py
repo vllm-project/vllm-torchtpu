@@ -919,9 +919,11 @@ class TestKVCacheManager:
             self.runner.initialize_kv_cache(kv_cache_config)
 
     def test_initialize_kv_cache_block_major(self):
-        """Verifies that block-major initialization allocates a single shared bundle backing all layer views."""
+        """Verifies that block-major initialization allocates a single shared bundle
+        backing all layer views."""
         num_blocks = 4
-        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact uniform tiling.
+        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact
+        # uniform tiling.
         per_layer_shape = (16, 4, 1, 128)
         # FullAttentionSpec.real_page_size_bytes for (16, 2, 128, bf16) is
         # block_size * (k+v) * head_size * itemsize = 16 * 4 * 128 * 2 = 16384.
@@ -993,7 +995,8 @@ class TestKVCacheManager:
         ):
             self.runner.initialize_kv_cache(kv_cache_config)
 
-        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and layer index mappings.
+        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and
+        # layer index mappings.
         assert isinstance(self.runner._kv_cache_bundle, torch.Tensor)
         expected_bundle_shape = (num_blocks, len(layer_names)) + per_layer_shape
         assert tuple(self.runner._kv_cache_bundle.shape) == expected_bundle_shape
@@ -1004,7 +1007,8 @@ class TestKVCacheManager:
             "attn.2": 2,
         }
 
-        # Verify that bound per-layer views alias the underlying bundle storage via strided slices.
+        # Verify that bound per-layer views alias the underlying bundle storage via
+        # strided slices.
         created = mock_bind.call_args[0][0]
         for idx, name in enumerate(layer_names):
             view = created[name]
@@ -1016,7 +1020,8 @@ class TestKVCacheManager:
                 == self.runner._kv_cache_bundle.untyped_storage().data_ptr()
             )
 
-        # Verify that mutating a per-layer strided view modifies the bundle in-place while isolating other layers.
+        # Verify that mutating a per-layer strided view modifies the bundle in-place
+        # while isolating other layers.
         target = 1
         created[layer_names[target]].fill_(7)
         assert torch.all(self.runner._kv_cache_bundle[:, target] == 7), (
@@ -1031,7 +1036,8 @@ class TestKVCacheManager:
             )
 
     def test_initialize_kv_cache_block_major_rejects_mamba(self):
-        """Verifies that standard dense block-major initialization fails closed on unsupported multi-group configurations."""
+        """Verifies that standard dense block-major initialization fails closed on
+        unsupported multi-group configurations."""
         attn_spec = FullAttentionSpec(
             block_size=16,
             num_kv_heads=2,

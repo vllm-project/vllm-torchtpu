@@ -54,7 +54,8 @@ def test_rope_bitcast_correctness():
 
     # -------------------------------------------------------------------------
     # Method 3: Correct Direct Slicing Version
-    # Directly indexes the first element of the 3D bitcasted array without transposing/reshaping
+    # Directly indexes the first element of the 3D bitcasted array without
+    # transposing/reshaping
     # -------------------------------------------------------------------------
     rope_correct = rope_bitcast_3d[:, :, 0]
 

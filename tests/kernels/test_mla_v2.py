@@ -251,7 +251,9 @@ def test_batched_decode_matches_unbatched_decode() -> None:
 
 
 def test_mixed_q_split_matches_unsplit_mixed_mode() -> None:
-    """Mixed prefill+decode with mixed_q_split > 1 must numerically match unsplit execution."""
+    """Mixed prefill+decode with mixed_q_split > 1 must numerically match
+    unsplit execution.
+    """
     num_q_heads = 12
     num_decode = 2
     num_prefill = 2

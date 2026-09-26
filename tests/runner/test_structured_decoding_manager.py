@@ -304,7 +304,8 @@ class TestStructuredDecode:
         ],
     )
     def test_padded_vocab_dimension(self, vocab_size, padded_vocab_dim):
-        """Hardware-padded logits slots (target_dim > vocab_size) must be masked to -inf."""
+        """Hardware-padded logits slots (target_dim > vocab_size)
+        must be masked to -inf."""
         torch.manual_seed(0)
         num_reqs = 4
         num_words = -(-vocab_size // 32)
@@ -341,7 +342,8 @@ class TestStructuredDecode:
         with pytest.raises(
             ValueError,
             match=r"TPU logits vocab dimension must be at least vocab_size \(64\) "
-            r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
+            r"\(padded to hardware alignment boundary\), "
+            r"but got logits\.shape\[-1\]=32",
         ):
             manager.apply_grammar_bitmask(logits, bitmask, arange)
 
@@ -362,7 +364,8 @@ class TestStructuredDecode:
         out = manager._structured_decode(require, bitmask, logits, arange)
 
         assert out.shape == (3, padded_vocab_dim)
-        # Row 0 (structured): tokens 0..31 allowed, 32..49 blocked (-inf), 50..127 padded (-inf)
+        # Row 0 (structured): tokens 0..31 allowed, 32..49 blocked (-inf),
+        # 50..127 padded (-inf)
         assert torch.equal(out[0, :32], logits[0, :32])
         assert torch.isneginf(out[0, 32:vocab_size]).all()
         assert torch.isneginf(out[0, vocab_size:]).all()

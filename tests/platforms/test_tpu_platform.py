@@ -722,8 +722,8 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
     """Verify TPU KV connectors are registered in the factory by name idempotently.
 
     When loaded dynamically via module paths, connectors are not registered by name
-    in KVConnectorFactory. However, the API server's multi-connector metrics path resolves
-    child connectors via get_connector_class_by_name().
+    in KVConnectorFactory. However, the API server's multi-connector metrics path
+    resolves child connectors via get_connector_class_by_name().
 
     This test verifies that _register_tpu_kv_connectors() populates the name registry
     safely across repeated invocations without raising duplicate-registration errors.
