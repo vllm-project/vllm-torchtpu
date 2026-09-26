@@ -146,10 +146,7 @@ def test_chunk_advance_copies_state():
 
 def test_pcp_uses_rank_local_state_block_size(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     # A PCP rank's two table columns cover 16 logical manager blocks. The
     # third global chunk is still in local column 0 and must not index column 2.
@@ -161,10 +158,7 @@ def test_pcp_uses_rank_local_state_block_size(monkeypatch):
 
 def test_pcp_local_state_block_crossing_copies(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]], state_pos={"a": 0})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
@@ -174,10 +168,7 @@ def test_pcp_local_state_block_crossing_copies(monkeypatch):
 
 def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
     # Simulate disaggregated serving where Mamba physical block size is 2048
     # (rounded up power-of-two fit size for TP=2 decode).
@@ -206,10 +197,7 @@ def test_pcp_disagg_mamba_block_stride_comparison(monkeypatch):
     installing it as ``_mamba_state_block_size``.
     """
     monkeypatch.setattr(
-        runner_mod, "get_dcp_group", lambda: SimpleNamespace(world_size=8)
-    )
-    monkeypatch.setattr(
-        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=1)
+        runner_mod, "get_pcp_group", lambda: SimpleNamespace(world_size=8)
     )
 
     # Wrong stride 1 (pre-PR172): attention block_size=16 with no cp factor,
