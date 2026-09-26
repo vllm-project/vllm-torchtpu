@@ -200,18 +200,21 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
     return tuple(int(tensor.cpu().item()) for tensor in gathered)
 
 
-def _build_mesh(jax, np, global_device_ids: tuple[int, ...],
-                pcp_axis_name: str, tp_axis_name: str):
+def _build_mesh(
+    jax, np, global_device_ids: tuple[int, ...], pcp_axis_name: str, tp_axis_name: str
+):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
         device_id for device_id in global_device_ids if device_id not in devices_by_id
     ]
     if missing:
-        raise RuntimeError(f"JAX does not expose worker TPU ids {missing}; "
-                           f"available={sorted(devices_by_id)}")
-    devices = np.asarray([
-        devices_by_id[device_id] for device_id in global_device_ids
-    ]).reshape(PCP_SIZE, TP_SIZE)
+        raise RuntimeError(
+            f"JAX does not expose worker TPU ids {missing}; "
+            f"available={sorted(devices_by_id)}"
+        )
+    devices = np.asarray(
+        [devices_by_id[device_id] for device_id in global_device_ids]
+    ).reshape(PCP_SIZE, TP_SIZE)
     return jax.sharding.Mesh(devices, axis_names=(pcp_axis_name, tp_axis_name))
 
 
@@ -357,12 +360,12 @@ def _run_worker(result_dir: Path) -> None:
         import jax
 
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
-            PCP_AXIS_NAME, TP_AXIS_NAME)
+            PCP_AXIS_NAME,
+            TP_AXIS_NAME,
+        )
 
-        global_device_ids = _gather_global_device_ids(torch, dist,
-                                                      tpu_distributed)
-        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME,
-                           TP_AXIS_NAME)
+        global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
+        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME, TP_AXIS_NAME)
         case_results = []
         comparison_outputs = []
         for case in CASES:

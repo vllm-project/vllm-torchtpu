@@ -295,7 +295,7 @@ def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
 
 
 def test_streaming_rpa_partition_specs_cover_pcp_and_tp_axes():
-    assert pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS == (
+    assert (
         PartitionSpec("pcp", None, "tp"),
         PartitionSpec("pcp", "tp"),
         PartitionSpec("pcp", "tp"),
@@ -304,11 +304,11 @@ def test_streaming_rpa_partition_specs_cover_pcp_and_tp_axes():
         PartitionSpec(),
         PartitionSpec(),
         PartitionSpec(),
-    )
-    assert pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS == (
+    ) == pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+    assert (
         PartitionSpec("pcp", None, "tp"),
         PartitionSpec("pcp", "tp"),
-    )
+    ) == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
 
 
 def test_streaming_rpa_mesh_requests_full_pcp_tp_grid(monkeypatch):
@@ -704,14 +704,12 @@ def test_adapter_converts_dimensions_sharded_over_pcp_and_tp():
     mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
     spec = PartitionSpec(None, ("tp", "pcp"), None)
 
-    global_shape = pallas_shapes._convert_partitioned_shape((3, 8, 16),
-                                                            mesh,
-                                                            spec,
-                                                            to_global=True)
-    local_shape = pallas_shapes._convert_partitioned_shape(global_shape,
-                                                           mesh,
-                                                           spec,
-                                                           to_global=False)
+    global_shape = pallas_shapes._convert_partitioned_shape(
+        (3, 8, 16), mesh, spec, to_global=True
+    )
+    local_shape = pallas_shapes._convert_partitioned_shape(
+        global_shape, mesh, spec, to_global=False
+    )
 
     assert global_shape == (3, 64, 16)
     assert local_shape == (3, 8, 16)

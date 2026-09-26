@@ -21,7 +21,10 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
     PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
-    PCP_AXIS_NAME, TP_AXIS_NAME, sharded_pcp_ragged_paged_attention)
+    PCP_AXIS_NAME,
+    TP_AXIS_NAME,
+    sharded_pcp_ragged_paged_attention,
+)
 
 _PCP_STREAMING_RPA_TENSOR_ARG_COUNT = 9
 
@@ -170,8 +173,7 @@ def pcp_streaming_jax_op(
 
 
 def get_pcp_streaming_mesh():
-    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME,
-                                  tp_axis_name=TP_AXIS_NAME)
+    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME, tp_axis_name=TP_AXIS_NAME)
 
 
 def make_pcp_streaming_rpa_kernel(

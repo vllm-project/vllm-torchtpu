@@ -684,9 +684,11 @@ def sharded_pcp_ragged_paged_attention(
             f"{pcp_size=}."
         )
     if kv_cache.shape[0] % pcp_size != 0:
-        raise ValueError("PCP streaming RPA requires KV cache blocks to be "
-                         f"evenly sharded across PCP ranks: "
-                         f"{kv_cache.shape[0]=} {pcp_size=}.")
+        raise ValueError(
+            "PCP streaming RPA requires KV cache blocks to be "
+            f"evenly sharded across PCP ranks: "
+            f"{kv_cache.shape[0]=} {pcp_size=}."
+        )
     if TP_AXIS_NAME in mesh.axis_names:
         qkv_spec = P(PCP_AXIS_NAME, TP_AXIS_NAME)
         kv_cache_spec = P(PCP_AXIS_NAME, None, TP_AXIS_NAME)

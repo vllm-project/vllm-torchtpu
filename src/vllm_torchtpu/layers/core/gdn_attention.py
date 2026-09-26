@@ -45,12 +45,10 @@ _GDN_TP_AXIS_NAME = "tp"
 
 def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
     """Return the optional TP axis used by an op-local PCP mesh."""
-    return (_GDN_TP_AXIS_NAME
-            if _GDN_TP_AXIS_NAME in tuple(mesh.axis_names) else None)
+    return _GDN_TP_AXIS_NAME if _GDN_TP_AXIS_NAME in tuple(mesh.axis_names) else None
 
 
-def _gdn_pcp_tp_state_axis(pcp_axis: str,
-                           tp_axis: str | None) -> str | tuple[str, str]:
+def _gdn_pcp_tp_state_axis(pcp_axis: str, tp_axis: str | None) -> str | tuple[str, str]:
     """Map TP-local, then PCP-local state slices to global shard order."""
     if tp_axis is None:
         return pcp_axis
