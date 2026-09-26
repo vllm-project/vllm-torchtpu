@@ -386,26 +386,55 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
 
 def _patch_expert_map_host_lookup() -> None:
-    """Serve expert-map lookups from a host-side copy of the expert map.
+    """Build the expert map on the host and serve host readers from a copy.
 
-    ``ExpertMapManager.map_global_to_local`` reads the device-resident
-    expert map with ``.item()`` once per (expert, shard) tensor during MoE
-    weight loading. On TPU every ``.item()`` is a blocking sync that
-    flushes the deferred graph, so loading dispatches one tiny device
-    program per expert copy (~200k per worker on Qwen3.5-397B). Index a
-    cached host copy in Python instead; the cache follows reassignment
-    and in-place rebalance via the tensor's version counter.
+    ``ExpertMapManager`` builds its maps under the model-init device context,
+    so every op of ``determine_expert_map`` is a device op, and host readers
+    then read the map back:
+
+    - ``map_global_to_local`` reads it with ``.item()`` once per (expert,
+      shard) tensor during MoE weight loading (~200k per worker on
+      Qwen3.5-397B).
+    - ``get_compressed_map_string`` calls ``.item()`` on every element for
+      the per-layer EP log line; the ``info_once`` argument is evaluated for
+      every MoE layer, and each element index compiled its own slice module
+      (128 compiles, ~5.4 min serialized, at EP8).
+
+    On TPU every read is a blocking sync that flushes the deferred graph.
+    Build the maps on CPU, keep the host copy, move the tensors to the
+    device once, and index the host copy in Python. The cache follows
+    reassignment and in-place rebalance via the tensor's version counter.
     """
+    import torch
     from vllm.model_executor.layers.fused_moe import expert_map_manager as _em
 
     cls = _em.ExpertMapManager
     if getattr(cls, "_tpu_host_expert_map_patch", False):
         return
 
-    def map_global_to_local(self, global_id: int) -> int:
+    def _calculate_expert_maps(self) -> None:
+        device = torch.get_default_device()
+        with torch.device("cpu"):
+            local_num_experts, expert_map, expert_mask = _em.determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts,
+                expert_placement_strategy=self._placement_strategy,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                return_expert_mask=self.rocm_aiter_enabled,
+            )
+        self._local_num_experts = local_num_experts + self.num_fused_shared_experts
+        self._expert_map = None if expert_map is None else expert_map.to(device)
+        self._expert_mask = None if expert_mask is None else expert_mask.to(device)
+        # The device map as built; a fresh tensor starts at version 0.
+        self._tpu_expert_map_source = self._expert_map
+        self._tpu_expert_map_version = (
+            None if self._expert_map is None else self._expert_map._version
+        )
+        self._tpu_expert_map_host = None if expert_map is None else expert_map.tolist()
+
+    def _host_expert_map(self) -> list[int]:
         expert_map = self._expert_map
-        if expert_map is None:
-            return global_id
         if (
             self._tpu_expert_map_source is not expert_map
             or self._tpu_expert_map_version != expert_map._version
@@ -413,14 +442,30 @@ def _patch_expert_map_host_lookup() -> None:
             self._tpu_expert_map_source = expert_map
             self._tpu_expert_map_version = expert_map._version
             self._tpu_expert_map_host = expert_map.tolist()
-        return self._tpu_expert_map_host[global_id]
+        return self._tpu_expert_map_host
 
+    def map_global_to_local(self, global_id: int) -> int:
+        if self._expert_map is None:
+            return global_id
+        return _host_expert_map(self)[global_id]
+
+    def get_compressed_map_string(self) -> str:
+        if self._expert_map is None:
+            return f"[0..{self.global_num_experts - 1}]"
+        return ", ".join(
+            f"{local_index}->{global_index}"
+            for global_index, local_index in enumerate(_host_expert_map(self))
+            if local_index != -1
+        )
+
+    cls._calculate_expert_maps = _calculate_expert_maps
     cls.map_global_to_local = map_global_to_local
+    cls.get_compressed_map_string = get_compressed_map_string
     cls._tpu_expert_map_source = None
     cls._tpu_expert_map_version = None
     cls._tpu_expert_map_host = None
     cls._tpu_host_expert_map_patch = True
-    logger.info("Applied TPU patch: host-side expert-map lookup.")
+    logger.info("Applied TPU patch: host-built expert map with host-side reads.")
 
 
 def _patch_vllm_disable_compile_ranges() -> None:
