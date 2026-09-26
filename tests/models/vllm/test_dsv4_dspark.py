@@ -154,9 +154,18 @@ def dist_ctx():
     yield
 
 
+def _use_cpu_platform(monkeypatch, request):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
+
+
 @pytest.fixture()
-def tiny_fc(dist_ctx, monkeypatch):
+def tiny_fc(monkeypatch, request):
     """A real DSparkDeepseekV4ForCausalLM at toy scale, layers stubbed."""
+    _use_cpu_platform(monkeypatch, request)
     monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     vllm_config = _tiny_vllm_config()
     with set_current_vllm_config(vllm_config):
@@ -187,9 +196,10 @@ def test_construction_wiring(tiny_fc):
 
 
 @pytest.mark.cpu_test
-def test_block_must_fit_the_sliding_window(dist_ctx, monkeypatch):
+def test_block_must_fit_the_sliding_window(monkeypatch, request):
     """The non-causal block mode only reaches keys inside the window's
     key-block walk, so construction rejects a block that cannot fit."""
+    _use_cpu_platform(monkeypatch, request)
     monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     monkeypatch.setattr(_StubDecoderLayer, "window_size", 4)
     vllm_config = _tiny_vllm_config()
