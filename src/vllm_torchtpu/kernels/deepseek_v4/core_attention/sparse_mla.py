@@ -474,7 +474,8 @@ def _attention_kernel(
             bq = load_bq(bi_sem_idx, batch_idx)
 
             if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting LLO's QK runahead
+                # Artificial dependency to force MXU/VPU interleaving by limiting
+                # LLO's QK runahead
                 # We use jnp.where to prevent XLA from optimizing the dependency away.
                 # prev_out won't be inf in practice.
                 bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
@@ -748,7 +749,8 @@ def sparse_ragged_paged_attention(
             bl_double_buf,  # Double buffering for l output.
             bm_double_buf,  # Double buffering for m output.
             swa_acc_double_buf,  # Buffer for swa_accumution.
-            # Semaphores for double buffering of bkv_nope, bq, bo, swa_acc, swa_l, swa_m, bkv_rope
+            # Semaphores for double buffering of
+            # bkv_nope, bq, bo, swa_acc, swa_l, swa_m, bkv_rope
             pltpu.SemaphoreType.DMA((7, 2)),
         ]
 

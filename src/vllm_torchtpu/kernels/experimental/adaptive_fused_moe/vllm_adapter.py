@@ -497,8 +497,8 @@ def _build_op(
     )
 
     # Deliberately replaces the fake jax_op installs, which resolves the output
-    # aval by running a real `jax.export` every time Dynamo traces the op. This kernel returns the rows it was given, so the
-    # answer is known without exporting for it.
+    # aval by running a real `jax.export` every time Dynamo traces the op. This kernel
+    # returns the rows it was given, so the answer is known without exporting for it.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 

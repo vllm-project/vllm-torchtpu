@@ -83,7 +83,8 @@ def get_kv_cache_shape(
     kv_dtype: jnp.dtype | None = None,
     kv_packing: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Computes padded 4D shape `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
+    """Computes padded 4D shape
+    `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
     if kv_packing is None:
         assert kv_dtype is not None, "must pass kv_dtype if kv_packing is None"
         kv_packing = get_dtype_packing(kv_dtype)
@@ -347,8 +348,10 @@ def update_sparse_mla_kv_cache(
       kv_cache_rope: Rope cache, shaped and typed by `rope_spec`.
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
-      block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
+      seq_lens: Per-sequence total KV length including the tokens being inserted
+        in this step (`[num_seqs]`).
+      block_tables: Flattened per-sequence-padded page table
+        (`[num_seqs * pages_per_seq]`).
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       nope_spec: Layout descriptor the nope cache was allocated from.
       rope_spec: Layout descriptor the rope cache was allocated from.

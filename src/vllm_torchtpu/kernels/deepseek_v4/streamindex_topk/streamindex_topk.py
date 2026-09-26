@@ -75,8 +75,10 @@ def kernel(
     # Input
     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
-    cache_kv_hbm_ref,  # HEAD_ALONG_SUBLANE: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # HEAD_ALONG_SUBLANE:
+    #     [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
+    cache_kv_hbm_ref,
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
     *score_refs,
