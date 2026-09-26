@@ -3850,9 +3850,11 @@ class TPUModelRunner(GPUModelRunner):
                         attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
-            # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
-            if hasattr(self, "model") and self.model is not None:
-                for module in self.model.modules():
+            # Pre-build custom attention, compressor, and indexer kernels
+            # (e.g. DeepSeek-V4 SWA/CSA/HCA)
+            def _prebuild_module_ops(root) -> None:
+                nonlocal initialized_count
+                for module in root.modules():
                     if hasattr(module, "_build_attn_op") and hasattr(
                             module, "attn_op"):
                         module.__dict__.pop("_attn_op_instance", None)
@@ -3872,6 +3874,12 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
+
+            if hasattr(self, "model") and self.model is not None:
+                _prebuild_module_ops(self.model)
+            draft_model = getattr(spec_drafter, "draft_model", None)
+            if draft_model is not None:
+                _prebuild_module_ops(draft_model)
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",

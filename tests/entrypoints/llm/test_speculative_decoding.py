@@ -1893,3 +1893,82 @@ def test_qwen35_dflash_dp_performance_greedy(
         async_scheduling=False,
         extra_kwargs=_qwen35_dflash_dp_kwargs(),
     )
+
+
+# DeepSeek-V4-Flash ships its DSpark draft (three decoder layers, combiner,
+# Markov head) inside the target checkpoint under mtp.*, so the speculative
+# config carries no separate draft `model`; the TPU registers its own draft
+# class for it (DSparkDeepseekV4ForCausalLM). fp8 at tp=8 with expert
+# parallelism is the deployed geometry and the only one exercised so far.
+DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+DSV4_DSPARK_TP_SIZE = 8
+# The checkpoint's dspark_block_size; the proposer rejects any other K.
+DSV4_DSPARK_NUM_SPECULATIVE_TOKENS = 5
+# Measured 57.6% on 8 mixed prompts at 64 tokens; the floor is a collapse
+# guard, not a quality target, like the Qwen3 DSpark floors above.
+DSV4_DSPARK_MIN_ACCEPTANCE_RATE = 0.2
+
+
+def _dsv4_dspark_kwargs() -> dict:
+    return {
+        "quantization": "deepseek_v4_fp8",
+        "tensor_parallel_size": DSV4_DSPARK_TP_SIZE,
+        "enable_expert_parallel": True,
+        "trust_remote_code": True,
+        "kv_cache_dtype": "fp8_e4m3",
+        "gpu_memory_utilization": 0.4,
+        # Kept off on both engines so the reference matches the spec run's
+        # cache behaviour.
+        "enable_prefix_caching": False,
+    }
+
+
+def _dsv4_dspark_speculative_config() -> dict:
+    return {
+        "method": "dspark",
+        "num_speculative_tokens": DSV4_DSPARK_NUM_SPECULATIVE_TOKENS,
+    }
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_dsv4_dspark_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """DSpark on DeepSeek-V4 must not change greedy output.
+
+    Same helper and comparison as the Qwen3 DSpark case; this one runs the
+    TPU draft class, its context-KV insert, and the non-causal SWA kernel
+    mode, none of which the Qwen3 checkpoint reaches.
+    """
+    _require_chips_for_dp(1, DSV4_DSPARK_TP_SIZE)
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        DSV4_DSPARK_MODEL,
+        _dsv4_dspark_speculative_config(),
+        async_scheduling=False,
+        extra_kwargs=_dsv4_dspark_kwargs(),
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_dsv4_dspark_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """The DeepSeek-V4 draft proposes and gets drafts accepted."""
+    _require_chips_for_dp(1, DSV4_DSPARK_TP_SIZE)
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _dsv4_dspark_speculative_config(),
+        min_acceptance_rate=DSV4_DSPARK_MIN_ACCEPTANCE_RATE,
+        model_name=DSV4_DSPARK_MODEL,
+        async_scheduling=False,
+        extra_kwargs=_dsv4_dspark_kwargs(),
+    )
