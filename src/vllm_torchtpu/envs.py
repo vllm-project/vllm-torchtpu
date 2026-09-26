@@ -138,6 +138,8 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    VLLM_TPU_STATIC_POOLER: bool = True
+    VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
 
 
 def env_with_choices(
@@ -845,6 +847,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Pooling models: run LAST/CLS/MEAN embed pooling through the AOT-compiled
+    # static pooler over the (token, request) bucket grid. 0 falls back to the
+    # eager vLLM pooler (finished-mask gating still applies).
+    "VLLM_TPU_STATIC_POOLER": env_bool("VLLM_TPU_STATIC_POOLER", True),
+    # Pooling models: KV cache token budget. -1 (default) derives a
+    # deterministic cap from the scheduler config, 0 disables the cap (all
+    # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
 }
 
 

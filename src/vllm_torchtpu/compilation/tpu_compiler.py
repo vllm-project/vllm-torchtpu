@@ -152,6 +152,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Pooling: the static pooler is a separate backend="tpu" helper outside the
+    # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
+    "VLLM_TPU_STATIC_POOLER",
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
