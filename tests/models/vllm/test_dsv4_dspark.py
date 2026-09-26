@@ -26,8 +26,7 @@ from vllm.model_executor.models import ModelRegistry
 import vllm_torchtpu.models.vllm.deepseek_v4.dspark as dspark_mod
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v4.dspark import _rewrite_dspark_name
-from vllm_torchtpu.models.vllm.deepseek_v4.model import \
-    _make_deepseek_v4_weights_mapper
+from vllm_torchtpu.models.vllm.deepseek_v4.model import _make_deepseek_v4_weights_mapper
 
 HIDDEN = 64
 HC = 2
@@ -56,28 +55,35 @@ def test_dspark_draft_model_registration():
         # Per-layer params go to their stage's decoder block; the target's
         # scale and rename conventions apply on top.
         ("fp4", "mtp.0.attn.wq_a.weight", "layers.0.attn.wq_a.weight"),
-        ("fp4", "mtp.1.attn.wq_a.scale",
-         "layers.1.attn.wq_a.weight_scale_inv"),
-        ("fp4", "mtp.0.ffn.experts.7.w1.scale",
-         "layers.0.ffn.experts.7.w1.weight_scale"),
-        ("fp8", "mtp.0.ffn.experts.7.w1.scale",
-         "layers.0.ffn.experts.7.w1.weight_scale_inv"),
-        ("fp4", "mtp.2.ffn.gate.bias",
-         "layers.2.ffn.gate.e_score_correction_bias"),
-        ("fp4", "mtp.1.ffn.shared_experts.w2.weight",
-         "layers.1.ffn.shared_experts.down_proj.weight"),
+        ("fp4", "mtp.1.attn.wq_a.scale", "layers.1.attn.wq_a.weight_scale_inv"),
+        (
+            "fp4",
+            "mtp.0.ffn.experts.7.w1.scale",
+            "layers.0.ffn.experts.7.w1.weight_scale",
+        ),
+        (
+            "fp8",
+            "mtp.0.ffn.experts.7.w1.scale",
+            "layers.0.ffn.experts.7.w1.weight_scale_inv",
+        ),
+        ("fp4", "mtp.2.ffn.gate.bias", "layers.2.ffn.gate.e_score_correction_bias"),
+        (
+            "fp4",
+            "mtp.1.ffn.shared_experts.w2.weight",
+            "layers.1.ffn.shared_experts.down_proj.weight",
+        ),
         # Combiner and head stack live at model level; markov weights must
         # not be touched by any stacking or scale rule.
         ("fp4", "mtp.0.main_proj.scale", "main_proj.weight_scale_inv"),
         ("fp4", "mtp.2.norm.weight", "norm.weight"),
         ("fp4", "mtp.2.hc_head_fn", "hc_head_fn"),
-        ("fp4", "mtp.2.markov_head.markov_w1.weight",
-         "markov_head.markov_w1.weight"),
+        ("fp4", "mtp.2.markov_head.markov_w1.weight", "markov_head.markov_w1.weight"),
         # Dropped: the confidence head, and everything the target owns.
         ("fp4", "mtp.2.confidence_head.proj.weight", None),
         ("fp4", "layers.7.attn.wkv.weight", None),
         ("fp4", "embed.weight", None),
-    ])
+    ],
+)
 def test_checkpoint_name_rewrite(expert_dtype, name, expected):
     mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
     assert _rewrite_dspark_name(name, mapper) == expected
@@ -95,7 +101,8 @@ class _StubDecoderLayer(nn.Module):
         self.prefix = prefix
         self.attn = SimpleNamespace(
             swa_cache_layer=SimpleNamespace(prefix=f"{prefix}.attn.swa"),
-            window_size=type(self).window_size)
+            window_size=type(self).window_size,
+        )
 
 
 def _tiny_vllm_config():
@@ -117,24 +124,30 @@ def _tiny_vllm_config():
     vllm_config = VllmConfig()
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=5,
-        draft_model_config=SimpleNamespace(hf_config=hf_config))
+        draft_model_config=SimpleNamespace(hf_config=hf_config),
+    )
     return vllm_config
 
 
 @pytest.fixture(scope="module")
 def dist_ctx():
     import torch.distributed as dist
-    from vllm.distributed import (ensure_model_parallel_initialized,
-                                  init_distributed_environment)
+    from vllm.distributed import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
     if not dist.is_initialized():
         import portpicker
+
         port = portpicker.pick_unused_port()
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
             distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo")
+            backend="gloo",
+        )
     # GroupCoordinator construction consults the current vLLM config.
     with set_current_vllm_config(VllmConfig()):
         ensure_model_parallel_initialized(1, 1)
@@ -144,12 +157,12 @@ def dist_ctx():
 @pytest.fixture()
 def tiny_fc(dist_ctx, monkeypatch):
     """A real DSparkDeepseekV4ForCausalLM at toy scale, layers stubbed."""
-    monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer",
-                        _StubDecoderLayer)
+    monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     vllm_config = _tiny_vllm_config()
     with set_current_vllm_config(vllm_config):
-        return dspark_mod.DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config,
-                                                      prefix="")
+        return dspark_mod.DSparkDeepseekV4ForCausalLM(
+            vllm_config=vllm_config, prefix=""
+        )
 
 
 @pytest.mark.cpu_test
@@ -157,35 +170,34 @@ def test_construction_wiring(tiny_fc):
     model = tiny_fc.model
     # vLLM prefixes continue the target's numbering so the KV-cache layer
     # names stay distinct; checkpoint params land at model.layers.{0,1,2}.
-    assert [layer.prefix for layer in model.layers
-            ] == [f"model.layers.{N_TARGET_LAYERS + i}" for i in range(3)]
+    assert [layer.prefix for layer in model.layers] == [
+        f"model.layers.{N_TARGET_LAYERS + i}" for i in range(3)
+    ]
     assert tiny_fc.get_draft_kv_cache_layer_names() == [
         f"model.layers.{N_TARGET_LAYERS + i}.attn.swa" for i in range(3)
     ]
     # Every draft layer runs the non-causal block mode of the SWA kernel.
     assert tiny_fc.get_draft_attn_causal() == [False, False, False]
-    assert all(layer.attn.non_causal_multi_token_decode
-               for layer in model.layers)
+    assert all(layer.attn.non_causal_multi_token_decode for layer in model.layers)
     # The draft shares the target's embedding and head.
     assert tiny_fc.has_own_embed_tokens is False
     assert tiny_fc.has_own_lm_head is False
     # main_proj consumes the concat of one hidden per tagged target layer.
-    assert model.main_proj.weight.shape == (HIDDEN,
-                                            HIDDEN * len(TARGET_LAYER_IDS))
+    assert model.main_proj.weight.shape == (HIDDEN, HIDDEN * len(TARGET_LAYER_IDS))
 
 
 @pytest.mark.cpu_test
 def test_block_must_fit_the_sliding_window(dist_ctx, monkeypatch):
     """The non-causal block mode only reaches keys inside the window's
     key-block walk, so construction rejects a block that cannot fit."""
-    monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer",
-                        _StubDecoderLayer)
+    monkeypatch.setattr(dspark_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     monkeypatch.setattr(_StubDecoderLayer, "window_size", 4)
     vllm_config = _tiny_vllm_config()
-    with set_current_vllm_config(vllm_config):
-        with pytest.raises(ValueError, match="sliding window"):
-            dspark_mod.DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config,
-                                                   prefix="")
+    with (
+        set_current_vllm_config(vllm_config),
+        pytest.raises(ValueError, match="sliding window"),
+    ):
+        dspark_mod.DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config, prefix="")
 
 
 @pytest.mark.cpu_test
@@ -217,12 +229,15 @@ def test_weight_load_round_trip(tiny_fc):
         "model.markov_head.markov_w1.weight",
         "model.markov_head.markov_w2.weight",
     }
-    torch.testing.assert_close(model.main_proj.weight,
-                               ckpt["mtp.0.main_proj.weight"])
+    torch.testing.assert_close(model.main_proj.weight, ckpt["mtp.0.main_proj.weight"])
     torch.testing.assert_close(model.norm.weight, ckpt["mtp.2.norm.weight"])
     torch.testing.assert_close(model.hc_head_fn, ckpt["mtp.2.hc_head_fn"])
     # Vocab-padded params round-trip their real rows.
-    torch.testing.assert_close(model.markov_head.markov_w1.weight[:VOCAB],
-                               ckpt["mtp.2.markov_head.markov_w1.weight"])
-    torch.testing.assert_close(model.markov_head.markov_w2.weight[:VOCAB],
-                               ckpt["mtp.2.markov_head.markov_w2.weight"])
+    torch.testing.assert_close(
+        model.markov_head.markov_w1.weight[:VOCAB],
+        ckpt["mtp.2.markov_head.markov_w1.weight"],
+    )
+    torch.testing.assert_close(
+        model.markov_head.markov_w2.weight[:VOCAB],
+        ckpt["mtp.2.markov_head.markov_w2.weight"],
+    )

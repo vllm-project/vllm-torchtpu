@@ -57,15 +57,18 @@ class DSparkProposer(DFlashProposer):
             )
         # vLLM 0.29 drafting options this proposer does not implement yet.
         spec = self.speculative_config
-        if (spec.draft_sample_method != "greedy"
-                or spec.enable_adaptive_verification
-                or spec.dspark_draft_topk is not None):
+        if (
+            spec.draft_sample_method != "greedy"
+            or spec.enable_adaptive_verification
+            or spec.dspark_draft_topk is not None
+        ):
             raise ValueError(
                 "DSpark on TPU does not support draft_sample_method="
                 f"{spec.draft_sample_method!r}, enable_adaptive_verification="
                 f"{spec.enable_adaptive_verification}, dspark_draft_topk="
                 f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
-                "block is implemented.")
+                "block is implemented."
+            )
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head

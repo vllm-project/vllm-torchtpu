@@ -27,14 +27,17 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.model import (
-    DeepseekV4DecoderLayer, DeepseekV4Model, _make_deepseek_v4_weights_mapper)
+    DeepseekV4DecoderLayer,
+    DeepseekV4Model,
+    _make_deepseek_v4_weights_mapper,
+)
 
 logger = init_logger(__name__)
 
 
 def _remap_dspark_name(name: str) -> str | None:
     """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
-            Returns None for non-mtp weights (owned by the target model).
+    Returns None for non-mtp weights (owned by the target model).
     """
     m = re.match(r"mtp\.(\d+)\.(.*)", name)
     if m is None:
@@ -50,8 +53,7 @@ def _remap_dspark_name(name: str) -> str | None:
         "hc_head_scale",
         "markov_head.",
     )
-    if rest.startswith(
-        ("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
+    if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
         return f"model.{rest}"
     return f"model.layers.{stage}.{rest}"
 
@@ -71,13 +73,18 @@ def _rewrite_dspark_name(name: str, mapper: WeightsMapper) -> str | None:
     return mapped.removeprefix("model.")
 
 
-def _insert_context_kv(attn, kv: torch.Tensor, positions: torch.Tensor,
-                       metadata) -> None:
-    """Insert of context KV for verified tokens.
-    Input attn is one draft layer's attention module, kv is that layer's already-normalised latent K/V for the verified tokens, 
-    positions are those tokens' absolute positions, metadata is this layer's sliding-window attention metadata, built by the
-    proposer from the target's verify batch. The DSV4 Pallas attention op is the only KV-write path on this backend,
-    so the insert runs the op with a zero query and discards the attention output.
+def _insert_context_kv(
+    attn, kv: torch.Tensor, positions: torch.Tensor, metadata
+) -> None:
+    """Insert the context KV of verified tokens into one draft layer's cache.
+
+    ``attn`` is one draft layer's attention module, ``kv`` that layer's
+    already-normalised latent K/V for the verified tokens, ``positions``
+    their absolute positions, and ``metadata`` this layer's sliding-window
+    attention metadata, built by the proposer from the target's verify batch.
+    The DSV4 Pallas attention op is the only KV-write path on this backend,
+    so the insert runs the op with a zero query and discards the attention
+    output.
     """
     orig_sw_cache = attn._get_active_sw_cache()
     if orig_sw_cache is None:
@@ -85,7 +92,8 @@ def _insert_context_kv(attn, kv: torch.Tensor, positions: torch.Tensor,
     # Draft layers are SWA-only on every DSpark checkpoint.
     assert attn.compress_ratio <= 1, (
         f"{attn.custom_prefix}: DSpark draft layers must be SWA-only, "
-        f"got compress_ratio={attn.compress_ratio}")
+        f"got compress_ratio={attn.compress_ratio}"
+    )
 
     kv = attn.kv_rope(kv, positions)
     num_tokens = kv.shape[0]
@@ -117,7 +125,6 @@ def _insert_context_kv(attn, kv: torch.Tensor, positions: torch.Tensor,
 
 
 class DSparkDeepseekV4Model(nn.Module):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -151,26 +158,28 @@ class DSparkDeepseekV4Model(nn.Module):
         )
 
         current_vllm_config = get_current_vllm_config()
-        self.layers = nn.ModuleList([
-            DeepseekV4DecoderLayer(
-                current_vllm_config,
-                prefix=maybe_prefix(prefix,
-                                    f"layers.{self.num_hidden_layers + i}"),
-                topk_indices_buffer=self.topk_indices_buffer,
-            ) for i in range(self.num_dspark_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DeepseekV4DecoderLayer(
+                    current_vllm_config,
+                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
+                    topk_indices_buffer=self.topk_indices_buffer,
+                )
+                for i in range(self.num_dspark_layers)
+            ]
+        )
         # The SWA kernel's non-causal block mode walks key blocks sized from
         # the sliding window, so a block longer than the window would
         # silently lose its earliest in-block keys. K + 1 rows covers the
         # DFlash 1 + K layout as well as the dense DSpark K layout.
-        max_block_rows = (
-            vllm_config.speculative_config.num_speculative_tokens + 1)
+        max_block_rows = vllm_config.speculative_config.num_speculative_tokens + 1
         for layer in self.layers:
             if max_block_rows > layer.attn.window_size:
                 raise ValueError(
                     f"DSpark draft block of up to {max_block_rows} rows "
                     f"exceeds the DSV4 sliding window "
-                    f"({layer.attn.window_size}).")
+                    f"({layer.attn.window_size})."
+                )
             # The runtime counterpart of get_draft_attn_causal(): the SWA
             # kernel attends bidirectionally within the draft query block
             # (picked up by _build_attn_op as the `_ncb` op variant).
@@ -191,8 +200,9 @@ class DSparkDeepseekV4Model(nn.Module):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        draft_vocab_size = (getattr(config, "draft_vocab_size", None)
-                            or config.vocab_size)
+        draft_vocab_size = (
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
         self.markov_head = DSparkMarkovHead(
             config.vocab_size,
             draft_vocab_size,
@@ -200,7 +210,8 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "markov_head"),
         )
 
-    # Borrowed from the target: the lazily built MHC post op, expert mapping, and per-layer loader. 
+    # Borrowed from the target: the lazily built MHC post op, the expert
+    # mapping, and the per-layer loader.
     # The loader expects names already rewritten by ``_rewrite_dspark_name``.
     mhc_post_op = DeepseekV4Model.mhc_post_op
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
@@ -210,8 +221,7 @@ class DSparkDeepseekV4Model(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
-    def combine_hidden_states(self,
-                              aux_hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux states))."""
         return self.main_norm(self.main_proj(aux_hidden_states))
 
@@ -238,7 +248,7 @@ class DSparkDeepseekV4Model(nn.Module):
         for i, layer in enumerate(self.layers):
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.mla_attn.q_lora_rank:]
+            kv = qr_kv[..., attn.mla_attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             _insert_context_kv(attn, kv, positions, metadata[i])
         return main_x
@@ -264,8 +274,7 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = self.mhc_post_op(hidden_states, residual, post_mix,
-                                         res_mix)
+        hidden_states = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
         return mhc_collapse_head(
             hidden_states,
             self.hc_head_fn,
@@ -290,11 +299,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
-        self.config = (
-            vllm_config.speculative_config.draft_model_config.hf_config)
-        self.model = DSparkDeepseekV4Model(vllm_config=vllm_config,
-                                           prefix=maybe_prefix(
-                                               prefix, "model"))
+        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.model = DSparkDeepseekV4Model(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
@@ -304,8 +312,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def combine_hidden_states(self,
-                              aux_hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(aux_hidden_states)
 
     def get_draft_attn_causal(self) -> list[bool]:
@@ -321,7 +328,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         metadata: tuple,
     ) -> torch.Tensor:
         return self.model.precompute_and_store_context_kv(
-            hidden_states, positions, metadata)
+            hidden_states, positions, metadata
+        )
 
     def forward(
         self,
@@ -334,11 +342,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits = lm_head(norm(pre-norm head hidden))."""
         assert self.lm_head is not None
-        return self.logits_processor(self.lm_head,
-                                     self.model.norm(hidden_states))
+        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
-    def compute_draft_logits(self,
-                             hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
@@ -353,16 +359,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     # --- Weight loading -----------------------------------------------------
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load ``mtp.{i}.*`` draft weights from the target checkpoint.
 
         The per-stage tensor set is one full DSV4 decoder layer, so after
-        the DSpark remap and the target's own name conventions the stream 
+        the DSpark remap and the target's own name conventions the stream
         is handed to ``DeepseekV4Model.load_weights``
         """
         mapper = _make_deepseek_v4_weights_mapper(
-            getattr(self.config, "expert_dtype", "fp4"))
+            getattr(self.config, "expert_dtype", "fp4")
+        )
         model_params = dict(self.model.named_parameters())
         loaded: set[str] = set()
 
@@ -378,8 +384,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 # layer loader, ``markov_w1`` would collide with the ``w1``
                 # stacking rule.
                 param = model_params[mapped]
-                getattr(param, "weight_loader", default_weight_loader)(param,
-                                                                       weight)
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
                 loaded.add(mapped)
 
         loaded |= self.model.load_weights(_layer_stream())

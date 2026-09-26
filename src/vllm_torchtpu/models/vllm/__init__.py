@@ -4,8 +4,9 @@ _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
 _KIMI_K3_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiK3ForConditionalGeneration"
 _DSV4_MODEL = "vllm_torchtpu.models.vllm.deepseek_v4:DeepseekV4ForCausalLM"
 _K3_DSPARK_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:K3DSparkForCausalLM"
-_DSV4_DSPARK_MODEL = ("vllm_torchtpu.models.vllm.deepseek_v4.dspark:"
-                      "DSparkDeepseekV4ForCausalLM")
+_DSV4_DSPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
