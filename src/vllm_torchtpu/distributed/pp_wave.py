@@ -148,16 +148,18 @@ class PPWave:
                  template: dict[str, tuple[tuple[int, ...], torch.dtype]]):
         from vllm.distributed.parallel_state import get_pp_group
 
-        from vllm_torchtpu.distributed.pcp import (get_pcp_rank,
-                                                   get_pcp_world_size)
+        from vllm_torchtpu.distributed.mesh_utils import \
+            gather_stage_device_table
         group = get_pp_group()
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
         # This device's column in its stage: the same column of every stage
-        # holds the same token rows.
-        self.column = get_pcp_rank()
-        self.columns = get_pcp_world_size()
+        # holds the rows this device hands off (a context-parallel stage's
+        # token shard, or a tensor-parallel stage's replica).
+        table = gather_stage_device_table()
+        self.column = table.column
+        self.columns = table.num_columns
         if (set(template) != {HIDDEN_STATES, RESIDUAL}
                 or template[HIDDEN_STATES] != template[RESIDUAL]
                 or len(template[HIDDEN_STATES][0]) != 1):

@@ -232,6 +232,7 @@ def test_output_rank_and_stage_order_follow_the_workers_positions():
     executor.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=2,
                                         prefill_context_parallel_size=2,
+                                        tensor_parallel_size=1,
                                         world_size=4))
     positions = [(0, 0), (1, 1), (1, 0), (0, 1)]
     executor.collective_rpc = MagicMock(return_value=positions)
@@ -242,11 +243,31 @@ def test_output_rank_and_stage_order_follow_the_workers_positions():
     assert executor._stage_major([10, 11, 12, 13]) == [10, 13, 12, 11]
 
 
-def test_stage_order_is_the_rank_order_without_context_parallel_stages():
+def test_tensor_parallel_stages_report_their_positions_too():
+    """PP2 x TP2: vLLM lays tp out on consecutive ranks, so the positions
+    come back in rank order and the output rank is the last stage's first
+    worker."""
     executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
     executor.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=2,
                                         prefill_context_parallel_size=1,
+                                        tensor_parallel_size=2,
+                                        world_size=4))
+    positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    executor.collective_rpc = MagicMock(return_value=positions)
+    with patch.object(MultiprocExecutor, "_init_executor"), \
+            patch("vllm_torchtpu._patch_multiproc_worker_global_rank_env"):
+        executor._init_executor()
+    assert executor.output_rank == 2
+    assert executor._stage_major([10, 11, 12, 13]) == [10, 11, 12, 13]
+
+
+def test_stage_order_is_the_rank_order_without_multi_device_stages():
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2,
+                                        prefill_context_parallel_size=1,
+                                        tensor_parallel_size=1,
                                         world_size=2))
     executor.collective_rpc = MagicMock()
     with patch.object(MultiprocExecutor, "_init_executor"), \

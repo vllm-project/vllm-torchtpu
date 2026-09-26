@@ -21,8 +21,9 @@ asked -- a layout is just "this group's ranks, in order, and where they live"
 `ep_mesh.py` builds its own mesh but takes the rank/device helpers from here
 too, which is why this module is named for the job rather than for an axis.
 
-Under pipeline parallelism a context-parallel group is one pipeline stage, and
-a multi-device kernel of that group must run on the stage's devices alone: the
+Under pipeline parallelism a context- or tensor-parallel group is one pipeline
+stage, and a multi-device kernel of that group must run on the stage's devices
+alone: the
 other stages run other layers at other times, so a slice-wide launch would
 wait for devices that never join. torch_tpu compiles a program for a proper
 subgroup of the slice when every collective and kernel in it is tagged with
@@ -171,6 +172,20 @@ def stage_group_ranks(stages: int,
     return {"pcp": rows, "pp": columns, "ep": rows}
 
 
+def stage_column() -> int:
+    """This rank's position in its pipeline stage's device group.
+
+    A stage spans devices as a prefill-context-parallel group or as a
+    tensor-parallel group. vLLM lays the axes out with tp innermost, so
+    within a stage's block of consecutive world ranks the position is
+    ``pcp_rank * tp_size + tp_rank`` (either axis may be trivial).
+    """
+    from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
+    tp = get_tp_group()
+    return (int(get_pcp_group().rank_in_group) * int(tp.world_size) +
+            int(tp.rank_in_group))
+
+
 def gather_stage_device_table() -> StageDeviceTable:
     """Gather every rank's stage, group position and device id over the world
     group. A collective: every rank calls it once the parallel groups exist
@@ -178,11 +193,10 @@ def gather_stage_device_table() -> StageDeviceTable:
     global _STAGE_TABLE
     if _STAGE_TABLE is not None:
         return _STAGE_TABLE
-    from vllm.distributed.parallel_state import (get_pcp_group, get_pp_group,
-                                                 get_world_group)
+    from vllm.distributed.parallel_state import get_pp_group, get_world_group
     world = get_world_group()
-    mine = (int(get_pp_group().rank_in_group),
-            int(get_pcp_group().rank_in_group), _get_tpu_global_device_id())
+    mine = (int(get_pp_group().rank_in_group), stage_column(),
+            _get_tpu_global_device_id())
     gathered: list[tuple[int, int, int]
                    | None] = [None] * int(world.world_size)
     torch.distributed.all_gather_object(gathered, mine, group=world.cpu_group)

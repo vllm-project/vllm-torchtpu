@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The (stage, group) mesh a pipeline stage's context-parallel kernels run
-on, and the stage tag those kernels carry."""
+"""The (stage, group) mesh a pipeline stage's multi-device kernels run on,
+and the stage tag those kernels carry."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -51,6 +51,28 @@ def test_stage_groups_put_each_stage_on_a_rank_block(monkeypatch):
     }
     assert mesh_utils.stage_group_ranks(2, 4)["pcp"] == [[0, 1, 2, 3],
                                                          [4, 5, 6, 7]]
+
+
+def _groups(monkeypatch, tp, pcp):
+    from vllm.distributed import parallel_state
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp[1], rank_in_group=tp[0]))
+    monkeypatch.setattr(
+        parallel_state, "get_pcp_group",
+        lambda: SimpleNamespace(world_size=pcp[1], rank_in_group=pcp[0]))
+
+
+def test_stage_column_is_the_position_in_the_stages_group(monkeypatch):
+    # A tensor-parallel stage: the column is the tp rank ...
+    _groups(monkeypatch, tp=(1, 2), pcp=(0, 1))
+    assert mesh_utils.stage_column() == 1
+    # ... a context-parallel stage: the pcp rank ...
+    _groups(monkeypatch, tp=(0, 1), pcp=(3, 4))
+    assert mesh_utils.stage_column() == 3
+    # ... and tp is the inner axis of vLLM's rank layout.
+    _groups(monkeypatch, tp=(1, 2), pcp=(1, 2))
+    assert mesh_utils.stage_column() == 3
 
 
 def test_stage_groups_need_the_whole_rank_range(monkeypatch):

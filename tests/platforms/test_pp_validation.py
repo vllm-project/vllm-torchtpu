@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.platforms import pp_validation
 from vllm_torchtpu.platforms.pp_validation import \
     validate_pipeline_parallel_config
 
@@ -13,10 +14,12 @@ def _config(pp=2,
             speculative=None,
             kv_transfer=None,
             tp=1,
+            pcp=1,
             layer_types=None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp,
-                                        tensor_parallel_size=tp),
+                                        tensor_parallel_size=tp,
+                                        prefill_context_parallel_size=pcp),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=speculative,
         kv_transfer_config=kv_transfer,
@@ -90,9 +93,26 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
-    with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
+def test_tensor_parallel_stages_need_subgroup_collective_programs(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_stage_capable_torch_tpu",
+                        lambda: False)
+    with pytest.raises(NotImplementedError,
+                       match="subgroup-collective.*tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
+
+
+def test_accepts_tensor_parallel_stages_on_a_stage_capable_torch_tpu(
+        monkeypatch):
+    monkeypatch.setattr(pp_validation, "_stage_capable_torch_tpu",
+                        lambda: True)
+    validate_pipeline_parallel_config(_config(pp=8, tp=2))
+
+
+def test_rejects_tensor_and_context_parallelism_in_one_stage(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_stage_capable_torch_tpu",
+                        lambda: True)
+    with pytest.raises(NotImplementedError, match="one of them per stage"):
+        validate_pipeline_parallel_config(_config(pp=2, tp=2, pcp=2))
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):

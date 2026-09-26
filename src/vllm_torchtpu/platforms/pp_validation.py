@@ -12,6 +12,12 @@ def _legacy_ray_executor() -> bool:
             and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND)
 
 
+def _stage_capable_torch_tpu() -> bool:
+    from vllm_torchtpu.distributed.sharded_jax_op import \
+        stage_capable_torch_tpu
+    return stage_capable_torch_tpu()
+
+
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
     """Describe the first stage holding no full-attention layer, or None.
 
@@ -45,12 +51,22 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     unsupported = None
     remedy = ""
-    if parallel_config.tensor_parallel_size > 1:
-        # A stage spans devices only as a prefill context-parallel group,
-        # whose kernels and collectives are compiled for the stage alone.
-        unsupported = "tensor parallelism inside a stage"
-        remedy = (" Use --tensor-parallel-size 1 (a stage may span devices "
-                  "with --prefill-context-parallel-size).")
+    if (parallel_config.tensor_parallel_size > 1
+            and parallel_config.prefill_context_parallel_size > 1):
+        # A stage spans devices as a tensor-parallel group or as a prefill
+        # context-parallel group; the combined layout was never modelled.
+        unsupported = ("tensor parallelism and prefill context parallelism "
+                       "in one stage")
+        remedy = " Use one of them per stage."
+    elif (parallel_config.tensor_parallel_size > 1
+          and not _stage_capable_torch_tpu()):
+        # Without subgroup-collective programs a stage's TP collectives
+        # stall on the first serving step, when the other stages are not
+        # launching the same collectives; warmup, where every stage runs
+        # them, passes.
+        unsupported = ("tensor parallelism inside a stage on a torch_tpu "
+                       "without subgroup-collective programs")
+        remedy = " Use --tensor-parallel-size 1."
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async
         # placeholder substitution reads from the device.

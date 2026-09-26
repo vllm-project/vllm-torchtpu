@@ -153,12 +153,11 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def pipeline_position(self) -> tuple[int, int]:
-        """This worker's pipeline stage and its rank in the stage's
-        context-parallel group, which the executor reads rather than derives
-        from the worker's index."""
-        from vllm.distributed.parallel_state import get_pcp_group
-        return (int(get_pp_group().rank_in_group),
-                int(get_pcp_group().rank_in_group))
+        """This worker's pipeline stage and its rank in the stage's device
+        group, which the executor reads rather than derives from the
+        worker's index."""
+        from vllm_torchtpu.distributed.mesh_utils import stage_column
+        return (int(get_pp_group().rank_in_group), stage_column())
 
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as

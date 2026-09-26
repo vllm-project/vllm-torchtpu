@@ -42,6 +42,18 @@ class _Ring:
             return self.slots[((rank - 1) % self.size, pos)].clone()
 
 
+def _table(stages, columns, stage, column):
+    """A stage device table of ``stages`` x ``columns`` ranks in rank order,
+    seen from (``stage``, ``column``)."""
+    from vllm_torchtpu.distributed import mesh_utils
+    return mesh_utils.StageDeviceTable(
+        stages=tuple(r // columns for r in range(stages * columns)),
+        columns=tuple(r % columns for r in range(stages * columns)),
+        device_ids=tuple(range(stages * columns)),
+        stage=stage,
+        column=column)
+
+
 @pytest.fixture
 def stages(monkeypatch):
     """Eight PPWave instances on CPU sharing one fake ring."""
@@ -50,6 +62,9 @@ def stages(monkeypatch):
     current = {}
     from vllm_torchtpu.distributed import mesh_utils
     monkeypatch.setattr(mesh_utils, "get_stage_device_table", lambda: None)
+    monkeypatch.setattr(
+        mesh_utils, "gather_stage_device_table", lambda: _table(
+            stages=size, columns=1, stage=current["rank"], column=0))
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(
         pp_wave, "pp_permute_op", lambda mesh:
@@ -197,14 +212,14 @@ def test_warmup_tells_the_device_columns_apart(monkeypatch):
     from column 0 (index 3) is a routing error."""
     from vllm.distributed import parallel_state
 
-    from vllm_torchtpu.distributed import mesh_utils, pcp
+    from vllm_torchtpu.distributed import mesh_utils
     monkeypatch.setattr(mesh_utils, "get_stage_device_table", lambda: None)
+    monkeypatch.setattr(mesh_utils, "gather_stage_device_table",
+                        lambda: _table(stages=4, columns=2, stage=2, column=1))
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh: None)
     monkeypatch.setattr(parallel_state, "get_pp_group",
                         lambda: SimpleNamespace(rank_in_group=2, world_size=4))
-    monkeypatch.setattr(pcp, "get_pcp_rank", lambda: 1)
-    monkeypatch.setattr(pcp, "get_pcp_world_size", lambda: 2)
     template = {
         "hidden_states": ((HIDDEN, ), torch.float32),
         "residual": ((HIDDEN, ), torch.float32),
@@ -230,12 +245,11 @@ def test_a_stage_over_two_chips_drains_before_every_hand_off(monkeypatch):
     import jax
     from vllm.distributed import parallel_state
 
-    from vllm_torchtpu.distributed import mesh_utils, pcp
+    from vllm_torchtpu.distributed import mesh_utils
     devices = [SimpleNamespace(id=i, coords=(i // 2, 0, 0)) for i in range(8)]
     monkeypatch.setattr(jax, "devices", lambda: devices)
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh: None)
-    monkeypatch.setattr(pcp, "get_pcp_rank", lambda: 0)
     drains = []
     monkeypatch.setattr(pp_wave, "_drain_slice", lambda: drains.append(1))
     template = {
@@ -246,11 +260,12 @@ def test_a_stage_over_two_chips_drains_before_every_hand_off(monkeypatch):
     def stage(table, rank, columns):
         monkeypatch.setattr(mesh_utils, "get_stage_device_table",
                             lambda: table)
+        monkeypatch.setattr(mesh_utils, "gather_stage_device_table",
+                            lambda: table)
         monkeypatch.setattr(
             parallel_state, "get_pp_group",
             lambda: SimpleNamespace(rank_in_group=rank,
                                     world_size=table.num_stages))
-        monkeypatch.setattr(pcp, "get_pcp_world_size", lambda: columns)
         monkeypatch.setattr(
             pp_wave, "_launch_now",
             lambda op, x: torch.full_like(x, float((rank - 1) * columns + 1)))
@@ -279,6 +294,10 @@ def test_a_stage_over_two_chips_drains_before_every_hand_off(monkeypatch):
 
 def test_the_hand_off_carries_hidden_states_and_residual_only(monkeypatch):
     from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import mesh_utils
+    monkeypatch.setattr(mesh_utils, "gather_stage_device_table",
+                        lambda: _table(stages=2, columns=1, stage=0, column=0))
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh: None)
     monkeypatch.setattr(parallel_state, "get_pp_group",

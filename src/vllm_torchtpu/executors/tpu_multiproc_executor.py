@@ -20,14 +20,15 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         from vllm_torchtpu import _patch_multiproc_worker_global_rank_env
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
-        # The workers build the pipeline stages of a context-parallel group
-        # themselves, so the output rank and the per-stage block
-        # reconciliation follow the workers' own positions rather than rank
-        # arithmetic here.
+        # The workers build the pipeline stages of a device group (context-
+        # or tensor-parallel) themselves, so the output rank and the
+        # per-stage block reconciliation follow the workers' own positions
+        # rather than rank arithmetic here.
         self._pipeline_positions: list[tuple[int, int]] | None = None
         pc = self.vllm_config.parallel_config
         if (pc.pipeline_parallel_size > 1
-                and pc.prefill_context_parallel_size > 1):
+                and (pc.prefill_context_parallel_size > 1
+                     or pc.tensor_parallel_size > 1)):
             self._pipeline_positions = [
                 tuple(position)
                 for position in self.collective_rpc("pipeline_position")

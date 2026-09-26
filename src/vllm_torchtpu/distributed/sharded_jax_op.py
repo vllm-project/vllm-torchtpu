@@ -57,6 +57,18 @@ def stage_tag_for_mesh(mesh: jax.sharding.Mesh) -> list[int] | None:
     return stage_collective_devices()
 
 
+def stage_capable_torch_tpu() -> bool:
+    """Whether the installed torch_tpu compiles a program whose collectives
+    and kernels are tagged with a device group for that group alone
+    (subgroup-collective programs). Without it a stage's collectives pair
+    with the other stages' launches and stall on the first uneven step."""
+    try:
+        return "collective_devices" in inspect.signature(
+            pallas_impl.JaxCallable.__init__).parameters
+    except Exception:
+        return False
+
+
 def make_jax_callable(cls, *, collective_devices: list[int] | None, **kwargs):
     """Construct a JaxCallable, tagged with its device group when given."""
     if collective_devices is None:
