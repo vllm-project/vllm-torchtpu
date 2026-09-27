@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -56,6 +56,39 @@ def test_platform_attributes():
 
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
+
+
+def test_shared_slicebuilder_addresses(monkeypatch):
+    # Every worker derives the same list from the shared MASTER_PORT.
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+    # A correctly sized inherited list is kept.
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "a:1,b:2"
+
+
+def test_dist_backend_after_world_size_pop(monkeypatch):
+    # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
+    # size set_device recorded must keep multi-rank groups on tpu_dist.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    monkeypatch.delenv("WORLD_SIZE")
+    assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
 def test_memory_methods(monkeypatch):

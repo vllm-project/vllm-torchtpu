@@ -67,6 +67,8 @@ EXEMPT_PATHS = {
 #                           value; the registry has no equivalent.
 #   raiden_store.py         checks whether PYTHONHASHSEED is set, not its
 #                           value, and it is a CPython knob, not one of ours.
+#   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
+#                           vLLM-Omni's DiffusionWorker) must raise when unset.
 #
 # The TORCH_TPU_* names and TPU_NUM_HOSTS are computed from the slice shape
 # by tpu_platform.py, tpu_mp_multihost.py and the Ray executors, written to
@@ -79,6 +81,7 @@ EXEMPT_PATHS = {
 BOOTSTRAP_VARS = {
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
+    "MASTER_PORT",
     "PYTHONHASHSEED",
     "RANK",
     "TORCH_TPU_DP_MASTER_ADDR",

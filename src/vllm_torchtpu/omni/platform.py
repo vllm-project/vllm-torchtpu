@@ -23,9 +23,17 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     _omni_enum = OmniPlatformEnum.OOT
 
+    # Diffusion worker world size recorded by set_device (see dist_backend).
+    _worker_world_size: int = 1
+
     @property
     def dist_backend(self) -> str:
-        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        # DiffusionWorker exports WORLD_SIZE before set_device, but building
+        # the worker's VllmConfig afterwards runs check_and_update_config,
+        # which pops WORLD_SIZE for that world_size=1 vLLM config. Fall back
+        # to the size set_device saw, so multi-rank process groups get
+        # tpu_dist instead of gloo.
+        world_size = int(os.environ.get("WORLD_SIZE") or self._worker_world_size)
         return TpuPlatform.get_worker_distributed_backend(world_size=world_size)
 
     def __init__(self) -> None:
@@ -67,10 +75,33 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1:
+            cls._worker_world_size = world_size
+            cls._set_shared_slicebuilder_addresses(world_size)
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _set_shared_slicebuilder_addresses(world_size: int) -> None:
+        """Give every diffusion worker the same PjRt slicebuilder addresses.
+
+        Root cause: vLLM-Omni spawns diffusion workers with no platform hook
+        in the parent, so each worker reaches ``_prepare_singlehost_tpu_env``
+        without TORCH_TPU_SLICEBUILDER_ADDRESSES and picks its own random
+        ports. torch_tpu needs one identical list on every rank, otherwise
+        the slice bootstrap never completes. The workers already share
+        MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
+        list is derived from it.
+        """
+        addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
+        if addresses and len(addresses.split(",")) == world_size:
+            return
+        base_port = int(os.environ["MASTER_PORT"])
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+            f"localhost:{base_port + 1 + i}" for i in range(world_size)
+        )
 
     @classmethod
     def get_torch_device(cls, _local_rank: int | None = None) -> torch.device:
