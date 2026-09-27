@@ -18,6 +18,7 @@ prompt so the kernel never overruns its SMEM. The cost model
 arrives after the engine core has built its executor and scheduler; until
 then chunks are cut by token count alone.
 """
+
 from typing import Any
 
 from vllm.logger import init_logger
@@ -28,16 +29,17 @@ from vllm_torchtpu.core.pp_chunks import StepCostModel
 
 logger = init_logger(__name__)
 
-SCHEDULER_CLS = ("vllm_torchtpu.core.pp_chunk_scheduler."
-                 "TpuPipelineChunkScheduler")
+SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
     """Whether this configuration sizes pipeline steps by time; the platform
     installs the scheduler class only when it does."""
-    return (vllm_config is not None
-            and vllm_config.parallel_config.pipeline_parallel_size > 1
-            and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS)
+    return (
+        vllm_config is not None
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+        and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+    )
 
 
 def _prefill_end(request: Any) -> int:
@@ -45,7 +47,6 @@ def _prefill_end(request: Any) -> int:
 
 
 class TpuPipelineChunkScheduler(Scheduler):
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._cost: StepCostModel | None = None
@@ -61,8 +62,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._seeded: set[str] = set()
         self._clips = 0
         self._waits = 0
-        logger.info(
-            "Pipeline chunk scheduler: waiting for the step cost model")
+        logger.info("Pipeline chunk scheduler: waiting for the step cost model")
 
     def install_cost_model(self, model: StepCostModel) -> None:
         self._cost = model
@@ -88,8 +88,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         # nothing to compute yet.
         for request in self.running:
             computed = request.num_computed_tokens
-            if (computed >= _prefill_end(request)
-                    and request.num_tokens > computed):
+            if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
         return super().schedule(throttle_prefills)
@@ -103,11 +102,9 @@ class TpuPipelineChunkScheduler(Scheduler):
             return None
         pending = 0
         for request in self.running:
-            pending += max(
-                _prefill_end(request) - request.num_computed_tokens, 0)
+            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         for request in self.waiting:
-            pending += max(
-                _prefill_end(request) - request.num_computed_tokens, 0)
+            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:
             return None
         granularity = self._cost.granularity
@@ -122,16 +119,25 @@ class TpuPipelineChunkScheduler(Scheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        start = (request.num_computed_tokens + num_new_local_computed_tokens +
-                 num_external_computed_tokens)
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
         if start >= _prefill_end(request):
             if request.request_id not in self._seeded:
                 self._account(num_new_tokens, start)
             return num_new_tokens
         if self._cost is not None and num_new_tokens > 0:
-            cap = self._cost.chunk(start, num_new_tokens, self._step_tokens,
-                                   self._step_pairs, self._step_squares,
-                                   self._step_limit, self._step_schedule)
+            cap = self._cost.chunk(
+                start,
+                num_new_tokens,
+                self._step_tokens,
+                self._step_pairs,
+                self._step_squares,
+                self._step_limit,
+                self._step_schedule,
+            )
             if cap == 0 and self._step_prefill_tokens == 0:
                 # The first prefill chunk of a step always advances.
                 cap = min(num_new_tokens, self._cost.granularity)
@@ -141,13 +147,21 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._clips += 1
                 logger.debug(
                     "Pipeline chunk: request %s prefix %d, %d -> %d tokens "
-                    "(step holds %d)", request.request_id, start,
-                    num_new_tokens, cap, self._step_tokens)
+                    "(step holds %d)",
+                    request.request_id,
+                    start,
+                    num_new_tokens,
+                    cap,
+                    self._step_tokens,
+                )
             num_new_tokens = cap
         if self._mamba_split and num_new_tokens > 0:
             num_new_tokens = super()._mamba_block_aligned_split(
-                request, num_new_tokens, num_new_local_computed_tokens,
-                num_external_computed_tokens)
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
         self._account(num_new_tokens, start)
         self._step_prefill_tokens += num_new_tokens
         if self._cost is not None:
@@ -162,13 +176,16 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
     reports = executor.collective_rpc("profile_pipeline_chunks")
     granularity = max(int(report["granularity"]) for report in reports)
     schedules = [
-        tuple(int(x) for x in report["schedule"]) for report in reports
+        tuple(int(x) for x in report["schedule"])
+        for report in reports
         if report.get("schedule") is not None
     ]
-    model = StepCostModel.fit([[tuple(s) for s in report["samples"]]
-                               for report in reports], envs.TPU_PP_CHUNK_SLACK,
-                              granularity,
-                              min(schedules) if schedules else None)
+    model = StepCostModel.fit(
+        [[tuple(s) for s in report["samples"]] for report in reports],
+        envs.TPU_PP_CHUNK_SLACK,
+        granularity,
+        min(schedules) if schedules else None,
+    )
     scheduler.install_cost_model(model)
 
 
@@ -179,6 +196,7 @@ def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
     if not uses_dynamic_chunks(vllm_config):
         return
     from vllm.v1.engine.core import EngineCore
+
     if getattr(EngineCore, "_tpu_pp_chunks_patch", False):
         return
     orig_init = EngineCore.__init__

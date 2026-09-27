@@ -279,16 +279,15 @@ def get_raiden_telemetry_module():
         _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = True
         try:
             from tpu_sync.api.torch import kv_cache_manager as kcm
+
             _RAIDEN_TELEMETRY_MODULE = kcm._torch_impl()
         except Exception as e:
-            logger.warning("Failed to import TPU Raiden telemetry module: %s",
-                           e)
+            logger.warning("Failed to import TPU Raiden telemetry module: %s", e)
             return None
     return _RAIDEN_TELEMETRY_MODULE
 
 
-def configure_raiden_telemetry(
-        backends: list[str] | set[str] | None = None) -> None:
+def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> None:
     """Configures TPU Raiden C++ telemetry backends if available."""
     global _RAIDEN_TELEMETRY_CONFIGURED
     try:

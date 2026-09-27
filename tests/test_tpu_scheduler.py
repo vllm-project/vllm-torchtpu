@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 
@@ -20,8 +21,7 @@ def test_unthrottled_step_opens_drain_window():
     scheduler = _make_scheduler(waiting=[object()])
     expected = object()
 
-    with patch.object(AsyncScheduler, "schedule",
-                      return_value=expected) as schedule:
+    with patch.object(AsyncScheduler, "schedule", return_value=expected) as schedule:
         result = scheduler.schedule(throttle_prefills=False)
 
     assert result is expected
@@ -40,8 +40,7 @@ def test_throttled_step_pauses_new_requests():
         seen["pause_state"] = scheduler._pause_state
         return expected
 
-    with patch.object(AsyncScheduler, "schedule",
-                      side_effect=capture) as schedule:
+    with patch.object(AsyncScheduler, "schedule", side_effect=capture) as schedule:
         result = scheduler.schedule(throttle_prefills=True)
 
     assert result is expected
@@ -77,10 +76,10 @@ def test_drain_spans_throttled_steps_until_queue_empties():
 def test_pause_state_restored_when_schedule_raises():
     scheduler = _make_scheduler(waiting=[object()])
 
-    with patch.object(AsyncScheduler, "schedule", side_effect=RuntimeError):
-        try:
-            scheduler.schedule(throttle_prefills=True)
-        except RuntimeError:
-            pass
+    with (
+        patch.object(AsyncScheduler, "schedule", side_effect=RuntimeError),
+        pytest.raises(RuntimeError),
+    ):
+        scheduler.schedule(throttle_prefills=True)
 
     assert scheduler._pause_state is PauseState.UNPAUSED

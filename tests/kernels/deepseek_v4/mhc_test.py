@@ -47,13 +47,12 @@ FUSED_F32_RTOL, FUSED_F32_ATOL = 1e-3, 1e-5
 FUSED_SMALL_H_RTOL = 5e-3
 
 
-def _ref_mhc_pre_mixes(x2d: jax.Array,
-                       fn: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _ref_mhc_pre_mixes(x2d: jax.Array, fn: jax.Array) -> tuple[jax.Array, jax.Array]:
     x = x2d.astype(jnp.float32)
     mixes = jax.lax.dot_general(
         x,
         fn,
-        dimension_numbers=(((1, ), (1, )), ((), ())),
+        dimension_numbers=(((1,), (1,)), ((), ())),
         precision=jax.lax.Precision.HIGHEST,
     )
     sqrsum = jnp.sum(x * x, axis=-1, keepdims=True)
@@ -68,9 +67,10 @@ def _ref_mhc_pre_collapse(
 ) -> jax.Array:
     out = pre_mix[:, 0:1] * x2d[:, :hidden_size].astype(jnp.float32)
     for i in range(1, hc_mult):
-        out = out + (pre_mix[:, i:i + 1] *
-                     x2d[:, i * hidden_size:
-                         (i + 1) * hidden_size].astype(jnp.float32))
+        out = out + (
+            pre_mix[:, i : i + 1]
+            * x2d[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
+        )
     return out.astype(jnp.bfloat16)
 
 
@@ -94,13 +94,25 @@ def _ref_mhc_pre(
 
     mixes, sqrsum = _ref_mhc_pre_mixes(x2d, fn)
     pre_mix, post_mix, comb_mix = utils.mhc_pre_gates(
-        mixes, sqrsum, hc_mult, hidden_size, hc_scale, hc_base, rms_eps,
-        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
     layer_input = _ref_mhc_pre_collapse(pre_mix, x2d, hc_mult, hidden_size)
 
-    return (post_mix.reshape(*outer_shape, hc_mult, 1),
-            comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
-            layer_input.reshape(*outer_shape, hidden_size))
+    return (
+        post_mix.reshape(*outer_shape, hc_mult, 1),
+        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
+        layer_input.reshape(*outer_shape, hidden_size),
+    )
 
 
 def _ref_mhc_post(
@@ -117,8 +129,7 @@ def _ref_mhc_post(
         residual.astype(jnp.float32),
         precision=precision,
     )
-    post_term = (post_layer_mix.astype(jnp.float32) *
-                 x[..., None, :].astype(jnp.float32))
+    post_term = post_layer_mix.astype(jnp.float32) * x[..., None, :].astype(jnp.float32)
     return (mixed_residual + post_term).astype(residual.dtype)
 
 
@@ -136,14 +147,20 @@ def _ref_mhc_fused_post_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    residual_cur = _ref_mhc_post(x,
-                                 residual,
-                                 post_layer_mix,
-                                 comb_res_mix,
-                                 precision=jax.lax.Precision.HIGHEST)
+    residual_cur = _ref_mhc_post(
+        x, residual, post_layer_mix, comb_res_mix, precision=jax.lax.Precision.HIGHEST
+    )
     post_mix_cur, comb_mix_cur, layer_input_cur = _ref_mhc_pre(
-        residual_cur, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
-        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+        residual_cur,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
     return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
 
@@ -154,28 +171,22 @@ def _to_np(x) -> np.ndarray:
 
 def _make_pre_inputs(rng, num_tokens, hidden_size):
     hc_mult3 = 2 * HC_MULT + HC_MULT * HC_MULT
-    residual = rng.standard_normal((num_tokens, HC_MULT, hidden_size),
-                                   dtype=np.float32)
-    fn = (rng.standard_normal(
-        (hc_mult3, HC_MULT * hidden_size), dtype=np.float32) * 0.02)
+    residual = rng.standard_normal((num_tokens, HC_MULT, hidden_size), dtype=np.float32)
+    fn = rng.standard_normal((hc_mult3, HC_MULT * hidden_size), dtype=np.float32) * 0.02
     hc_scale = (1.0 + 0.1 * rng.standard_normal(3)).astype(np.float32)
     hc_base = (0.5 * rng.standard_normal(hc_mult3)).astype(np.float32)
     return residual, fn, hc_scale, hc_base
 
 
 class MhcPreParityTest(parameterized.TestCase):
-
     @parameterized.product(
         num_tokens=[1, 8, 17, 128],
         hidden_size=[256, 7168],
         sinkhorn_repeat=[1, 2, 20],
     )
-    def test_matches_torch_reference(self, num_tokens, hidden_size,
-                                     sinkhorn_repeat):
-
+    def test_matches_torch_reference(self, num_tokens, hidden_size, sinkhorn_repeat):
         rng = np.random.default_rng(0)
-        residual, fn, hc_scale, hc_base = _make_pre_inputs(
-            rng, num_tokens, hidden_size)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
 
         want_post, want_comb, want_layer = mhc_kernels.mhc_pre_torch(
             torch.from_numpy(residual).to(torch.bfloat16),
@@ -206,18 +217,18 @@ class MhcPreParityTest(parameterized.TestCase):
         self.assertEqual(got_layer.shape, (num_tokens, hidden_size))
         self.assertEqual(got_layer.dtype, jnp.bfloat16)
 
-        np.testing.assert_allclose(_to_np(got_post),
-                                   want_post.float().numpy(),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_comb),
-                                   want_comb.float().numpy(),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_layer),
-                                   want_layer.float().numpy(),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got_post), want_post.float().numpy(), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_comb), want_comb.float().numpy(), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_layer),
+            want_layer.float().numpy(),
+            rtol=BF16_RTOL,
+            atol=BF16_ATOL,
+        )
 
     def test_padded_zero_rows_are_finite(self):
         """vLLM pads token buckets with all-zero rows; they must not NaN."""
@@ -242,20 +253,24 @@ class MhcPreParityTest(parameterized.TestCase):
 
 
 class MhcPostParityTest(parameterized.TestCase):
-
     @parameterized.product(num_tokens=[1, 17, 128], hidden_size=[256, 7168])
     def test_matches_torch_reference(self, num_tokens, hidden_size):
-
         rng = np.random.default_rng(2)
         x = rng.standard_normal((num_tokens, hidden_size), dtype=np.float32)
-        residual = rng.standard_normal((num_tokens, HC_MULT, hidden_size),
-                                       dtype=np.float32)
+        residual = rng.standard_normal(
+            (num_tokens, HC_MULT, hidden_size), dtype=np.float32
+        )
         # Mimic mhc_pre outputs: positive doubly-normalized-ish comb mix and
         # sigmoid-scaled post mix, both f32.
-        post_mix = (2.0 / (1.0 + np.exp(-rng.standard_normal(
-            (num_tokens, HC_MULT, 1))))).astype(np.float32)
-        comb_raw = np.abs(rng.standard_normal(
-            (num_tokens, HC_MULT, HC_MULT))).astype(np.float32) + 0.01
+        post_mix = (
+            2.0 / (1.0 + np.exp(-rng.standard_normal((num_tokens, HC_MULT, 1))))
+        ).astype(np.float32)
+        comb_raw = (
+            np.abs(rng.standard_normal((num_tokens, HC_MULT, HC_MULT))).astype(
+                np.float32
+            )
+            + 0.01
+        )
         comb_mix = comb_raw / comb_raw.sum(axis=-1, keepdims=True)
 
         want = mhc_kernels.mhc_post_torch(
@@ -274,26 +289,28 @@ class MhcPostParityTest(parameterized.TestCase):
 
         self.assertEqual(got.shape, (num_tokens, HC_MULT, hidden_size))
         self.assertEqual(got.dtype, jnp.bfloat16)
-        np.testing.assert_allclose(_to_np(got),
-                                   want.float().numpy(),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got), want.float().numpy(), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 def _make_post_inputs(rng, num_tokens, hidden_size):
     x = rng.standard_normal((num_tokens, hidden_size), dtype=np.float32)
-    residual = rng.standard_normal((num_tokens, HC_MULT, hidden_size),
-                                   dtype=np.float32)
+    residual = rng.standard_normal((num_tokens, HC_MULT, hidden_size), dtype=np.float32)
     post_mix = (
-        2.0 /
-        (1.0 + np.exp(-rng.standard_normal((num_tokens, HC_MULT, 1))))).astype(
-            np.float32)
-    comb_raw = np.abs(rng.standard_normal(
-        (num_tokens, HC_MULT, HC_MULT))).astype(np.float32) + 0.01
+        2.0 / (1.0 + np.exp(-rng.standard_normal((num_tokens, HC_MULT, 1))))
+    ).astype(np.float32)
+    comb_raw = (
+        np.abs(rng.standard_normal((num_tokens, HC_MULT, HC_MULT))).astype(np.float32)
+        + 0.01
+    )
     comb_mix = comb_raw / comb_raw.sum(axis=-1, keepdims=True)
-    return (jnp.asarray(x).astype(jnp.bfloat16),
-            jnp.asarray(residual).astype(jnp.bfloat16), jnp.asarray(post_mix),
-            jnp.asarray(comb_mix))
+    return (
+        jnp.asarray(x).astype(jnp.bfloat16),
+        jnp.asarray(residual).astype(jnp.bfloat16),
+        jnp.asarray(post_mix),
+        jnp.asarray(comb_mix),
+    )
 
 
 class MhcPostPallasSmallShapeTest(parameterized.TestCase):
@@ -317,10 +334,9 @@ class MhcPostPallasSmallShapeTest(parameterized.TestCase):
 
         self.assertEqual(got.shape, want.shape)
         self.assertEqual(got.dtype, jnp.bfloat16)
-        np.testing.assert_allclose(_to_np(got),
-                                   _to_np(want),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 class MhcPostPallasTpuTest(parameterized.TestCase):
@@ -345,26 +361,42 @@ class MhcPostPallasTpuTest(parameterized.TestCase):
         got = post_kernel.mhc_post(*args, token_block_size=token_block_size)
 
         self.assertEqual(got.shape, want.shape)
-        np.testing.assert_allclose(_to_np(got),
-                                   _to_np(want),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 def _make_fused_inputs(rng, num_tokens, hidden_size):
     """x/residual/gates (post-style) plus fn/scale/base (pre-style)."""
-    x, residual, post_mix, comb_mix = _make_post_inputs(
-        rng, num_tokens, hidden_size)
+    x, residual, post_mix, comb_mix = _make_post_inputs(rng, num_tokens, hidden_size)
     _, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
-    return (x, residual, post_mix, comb_mix, jnp.asarray(fn),
-            jnp.asarray(hc_scale), jnp.asarray(hc_base))
+    return (
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        jnp.asarray(fn),
+        jnp.asarray(hc_scale),
+        jnp.asarray(hc_base),
+    )
 
 
 def _fused_args(rng, num_tokens, hidden_size, sinkhorn_repeat=20):
-    x, res, plm, crm, fn, sc, hb = _make_fused_inputs(rng, num_tokens,
-                                                      hidden_size)
-    return (x, res, plm, crm, fn, sc, hb, RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS,
-            HC_POST_MULT_VALUE, sinkhorn_repeat)
+    x, res, plm, crm, fn, sc, hb = _make_fused_inputs(rng, num_tokens, hidden_size)
+    return (
+        x,
+        res,
+        plm,
+        crm,
+        fn,
+        sc,
+        hb,
+        RMS_EPS,
+        HC_PRE_EPS,
+        HC_SINKHORN_EPS,
+        HC_POST_MULT_VALUE,
+        sinkhorn_repeat,
+    )
 
 
 class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
@@ -383,30 +415,30 @@ class MhcFusedPostPrePallasSmallShapeTest(parameterized.TestCase):
         args = _fused_args(np.random.default_rng(9), num_tokens, hidden_size)
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
 
-        want_res, want_post, want_comb, want_layer = (_ref_mhc_fused_post_pre(
-            *args))
-        got_res, got_post, got_comb, got_layer = (fused_fn(
-            *args, token_block_size=64))
+        want_res, want_post, want_comb, want_layer = _ref_mhc_fused_post_pre(*args)
+        got_res, got_post, got_comb, got_layer = fused_fn(*args, token_block_size=64)
 
         self.assertEqual(got_res.shape, want_res.shape)
         self.assertEqual(got_res.dtype, jnp.bfloat16)
         self.assertEqual(got_layer.dtype, jnp.bfloat16)
-        np.testing.assert_allclose(_to_np(got_res),
-                                   _to_np(want_res),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
-        np.testing.assert_allclose(_to_np(got_post),
-                                   _to_np(want_post),
-                                   rtol=FUSED_SMALL_H_RTOL,
-                                   atol=FUSED_F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_comb),
-                                   _to_np(want_comb),
-                                   rtol=FUSED_SMALL_H_RTOL,
-                                   atol=FUSED_F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_layer),
-                                   _to_np(want_layer),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got_res), _to_np(want_res), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_post),
+            _to_np(want_post),
+            rtol=FUSED_SMALL_H_RTOL,
+            atol=FUSED_F32_ATOL,
+        )
+        np.testing.assert_allclose(
+            _to_np(got_comb),
+            _to_np(want_comb),
+            rtol=FUSED_SMALL_H_RTOL,
+            atol=FUSED_F32_ATOL,
+        )
+        np.testing.assert_allclose(
+            _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
@@ -432,12 +464,12 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
         got = fused_fn(*args, token_block_size=token_block_size)
 
         for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
-            rtol, atol = ((BF16_RTOL, BF16_ATOL) if tol == "bf16" else
-                          (FUSED_F32_RTOL, FUSED_F32_ATOL))
-            np.testing.assert_allclose(_to_np(g),
-                                       _to_np(w),
-                                       rtol=rtol,
-                                       atol=atol)
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if tol == "bf16"
+                else (FUSED_F32_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
 
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
@@ -456,8 +488,11 @@ class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
 
         rng = np.random.default_rng(4)
         residual, fn, _, _ = _make_pre_inputs(rng, num_tokens, hidden_size)
-        x2d = (jnp.asarray(residual).astype(jnp.bfloat16).reshape(
-            num_tokens, HC_MULT * hidden_size))
+        x2d = (
+            jnp.asarray(residual)
+            .astype(jnp.bfloat16)
+            .reshape(num_tokens, HC_MULT * hidden_size)
+        )
         fn_j = jnp.asarray(fn)
 
         want_mixes, want_sqrsum = _ref_mhc_pre_mixes(x2d, fn_j)
@@ -469,14 +504,12 @@ class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):
 
         self.assertEqual(got_mixes.shape, want_mixes.shape)
         self.assertEqual(got_sqrsum.shape, want_sqrsum.shape)
-        np.testing.assert_allclose(_to_np(got_mixes),
-                                   _to_np(want_mixes),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_sqrsum),
-                                   _to_np(want_sqrsum),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got_mixes), _to_np(want_mixes), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_sqrsum), _to_np(want_sqrsum), rtol=F32_RTOL, atol=F32_ATOL
+        )
 
 
 class MhcPrePallasTpuTest(parameterized.TestCase):
@@ -497,22 +530,24 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         hidden_size = 7168  # DeepSeek-V4 shape; D = 28672
         rng = np.random.default_rng(5)
         residual, fn, _, _ = _make_pre_inputs(rng, num_tokens, hidden_size)
-        x2d = (jnp.asarray(residual).astype(jnp.bfloat16).reshape(
-            num_tokens, HC_MULT * hidden_size))
+        x2d = (
+            jnp.asarray(residual)
+            .astype(jnp.bfloat16)
+            .reshape(num_tokens, HC_MULT * hidden_size)
+        )
         fn_j = jnp.asarray(fn)
 
         want_mixes, want_sqrsum = _ref_mhc_pre_mixes(x2d, fn_j)
         got_mixes, got_sqrsum = pre_kernel.mhc_pre_mixes(
-            x2d, fn_j, token_block_size=token_block_size)
+            x2d, fn_j, token_block_size=token_block_size
+        )
 
-        np.testing.assert_allclose(_to_np(got_mixes),
-                                   _to_np(want_mixes),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_sqrsum),
-                                   _to_np(want_sqrsum),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got_mixes), _to_np(want_mixes), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_sqrsum), _to_np(want_sqrsum), rtol=F32_RTOL, atol=F32_ATOL
+        )
 
     @parameterized.product(num_tokens=[16, 128], sinkhorn_repeat=[1, 20])
     def test_full_op_matches_reference(self, num_tokens, sinkhorn_repeat):
@@ -520,29 +555,32 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
 
         hidden_size = 7168
         rng = np.random.default_rng(6)
-        residual, fn, hc_scale, hc_base = _make_pre_inputs(
-            rng, num_tokens, hidden_size)
-        args = (jnp.asarray(residual).astype(jnp.bfloat16), jnp.asarray(fn),
-                jnp.asarray(hc_scale), jnp.asarray(hc_base), RMS_EPS,
-                HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE,
-                sinkhorn_repeat)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
+        args = (
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            sinkhorn_repeat,
+        )
 
         want_post, want_comb, want_layer = _ref_mhc_pre(*args)
         got_post, got_comb, got_layer = pre_kernel.mhc_pre(*args)
 
         self.assertEqual(got_layer.dtype, jnp.bfloat16)
-        np.testing.assert_allclose(_to_np(got_post),
-                                   _to_np(want_post),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_comb),
-                                   _to_np(want_comb),
-                                   rtol=F32_RTOL,
-                                   atol=F32_ATOL)
-        np.testing.assert_allclose(_to_np(got_layer),
-                                   _to_np(want_layer),
-                                   rtol=BF16_RTOL,
-                                   atol=BF16_ATOL)
+        np.testing.assert_allclose(
+            _to_np(got_post), _to_np(want_post), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_comb), _to_np(want_comb), rtol=F32_RTOL, atol=F32_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 if __name__ == "__main__":

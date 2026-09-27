@@ -40,8 +40,14 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v2 import (AXIS, WeightFormat,
-                                                fused_ep_moe_v2)
+from vllm_torchtpu.kernels.fused_moe.v2 import (
+    AXIS,
+    WeightFormat,
+    fused_ep_moe_v2,
+    host,
+    kernel,
+    layer,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -63,9 +69,11 @@ def _require_eight_devices():
     the eight-chip agent nothing here touches the accelerator at all.
     """
     if jax.device_count() < 8:
-        pytest.skip("the fused EP MoE kernel is an eight-way expert-parallel "
-                    "collective and this host reports fewer than 8 JAX "
-                    "devices")
+        pytest.skip(
+            "the fused EP MoE kernel is an eight-way expert-parallel "
+            "collective and this host reports fewer than 8 JAX "
+            "devices"
+        )
 
 
 # The expert-parallel width, and the tile height the serving adapter passes
@@ -112,7 +120,7 @@ ROTATED_CONTROL_FACTOR = 10
 
 def _mesh():
     """The single-axis expert-parallel mesh, over the first eight devices."""
-    return Mesh(np.asarray(jax.devices()[:EP]), axis_names=(AXIS, ))
+    return Mesh(np.asarray(jax.devices()[:EP]), axis_names=(AXIS,))
 
 
 def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
@@ -124,7 +132,7 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
     along each matmul's contraction axis, which is the layout the kernel
     takes: w1_scale [E, 2 * inter], w2_scale [E, hidden].
     """
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     g_local = e_total // mesh.shape[axis]
     quantized = weight_format == WeightFormat.FP8
 
@@ -132,8 +140,10 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
         me = lax.axis_index(axis)
         k1, k2 = jax.random.split(jax.random.fold_in(jax.random.key(seed), me))
         weights = []
-        for key, shape in ((k1, (g_local, hidden, 2 * inter)),
-                           (k2, (g_local, inter, hidden))):
+        for key, shape in (
+            (k1, (g_local, hidden, 2 * inter)),
+            (k2, (g_local, inter, hidden)),
+        ):
             w = jax.random.normal(key, shape, jnp.float32) / 10
             if not quantized:
                 weights.append((w.astype(jnp.bfloat16), None))
@@ -141,40 +151,80 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
             amax = jnp.max(jnp.abs(w), axis=1, keepdims=True)
             scale = jnp.where(amax == 0, 1.0, amax / float(jnp.finfo(FP8).max))
             weights.append(
-                ((w / scale).astype(FP8),
-                 scale.astype(jnp.float32).reshape(shape[0], shape[2])))
+                (
+                    (w / scale).astype(FP8),
+                    scale.astype(jnp.float32).reshape(shape[0], shape[2]),
+                )
+            )
         (w1, w1s), (w2, w2s) = weights
         return (w1, w2) if not quantized else (w1, w2, w1s, w2s)
 
-    out_specs = (P(axis), ) * (4 if quantized else 2)
+    out_specs = (P(axis),) * (4 if quantized else 2)
     built = jax.jit(
-        jax.shard_map(local,
-                      mesh=mesh,
-                      in_specs=(P(axis), ),
-                      out_specs=out_specs,
-                      check_vma=False))(jnp.zeros((EP, ), jnp.float32))
+        jax.shard_map(
+            local, mesh=mesh, in_specs=(P(axis),), out_specs=out_specs, check_vma=False
+        )
+    )(jnp.zeros((EP,), jnp.float32))
     return built if quantized else (built[0], built[1], None, None)
+
+
+def _make_fp4_weights(mesh, seed, *, hidden, inter, e_total, rhs_qb):
+    """((w1, w2), (w1_scale, w2_scale), decoded) as fp4 e2m1 with block scales.
+
+    One scale per `rhs_qb` rows of each matmul's contraction axis, which is
+    the layout the kernel takes: w1_scale [E, hidden / qb, 2 * inter] and
+    w2_scale [E, inter / qb, hidden]. `decoded` is what those two decode to,
+    and is what the dense reference is computed over, so the band between
+    them is the kernel's transport rather than the four-bit rounding.
+    """
+    shard = NamedSharding(mesh, P(AXIS))
+    rng = np.random.default_rng(seed)
+    weights, scales, decoded = [], [], []
+    for shape in ((e_total, hidden, 2 * inter), (e_total, inter, hidden)):
+        raw = rng.normal(0, 0.1, shape).astype(np.float32)
+        grouped = raw.reshape(shape[0], shape[1] // rhs_qb, rhs_qb, shape[2])
+        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
+        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
+        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
+        s = jax.device_put(scale, shard)
+        weights.append(w)
+        scales.append(s)
+        decoded.append(
+            (w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]).reshape(
+                shape
+            )
+        )
+    return weights, scales, decoded
 
 
 def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     """(x, gating) as global arrays sharded on the tokens."""
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     shard = NamedSharding(mesh, P(axis))
 
     @jax.jit
     def build():
         kx, kg = jax.random.split(jax.random.key(seed))
         x = (jax.random.normal(kx, (tokens, hidden), jnp.float32) / 10).astype(
-            jnp.bfloat16)
+            jnp.bfloat16
+        )
         gating = jax.random.normal(kg, (tokens, e_total), jnp.float32)
-        return (lax.with_sharding_constraint(x, shard),
-                lax.with_sharding_constraint(gating, shard))
+        return (
+            lax.with_sharding_constraint(x, shard),
+            lax.with_sharding_constraint(gating, shard),
+        )
 
     return build()
 
 
-def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
+def _dense_reference(
+    mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, hash_ids=None
+):
     """The plain MoE: softmax, top-k, dense per-expert FFN, weighted sum.
+
+    `hash_ids` [tokens, topk] replaces the top-k selection with ids the caller
+    chose, keeping the weights as the scores at those ids -- the reference
+    form of DeepSeek-V4's table router.
 
     Every expert is applied to every token in f32 and weighted by the router
     weight of the slots that chose it, which is zero for a token that did
@@ -187,30 +237,37 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
     summed across shards -- which is a distribution of the reference, not a
     change of it: the summands and their order are the same.
     """
-    (axis, ) = mesh.axis_names
+    (axis,) = mesh.axis_names
     g_local = w1.shape[0] // mesh.shape[axis]
     inter = w1.shape[2] // 2
     scaled = w1_scale is not None
 
-    def local(x_g, gating_g, w1_l, w2_l, *scales):
-        s1, s2 = scales if scaled else (None, None)
+    def local(x_g, gating_g, w1_l, w2_l, *scales_and_ids):
+        s1, s2 = scales_and_ids[:2] if scaled else (None, None)
+        ids_g = scales_and_ids[-1] if hash_ids is not None else None
         scores = jax.nn.softmax(gating_g.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = lax.top_k(scores, topk)
+        if ids_g is None:
+            topk_weights, topk_idx = lax.top_k(scores, topk)
+        else:
+            topk_idx = ids_g
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
         first = lax.axis_index(axis) * g_local
         x32 = x_g.astype(jnp.float32)
 
         def expert(e, acc):
-            w1e = lax.dynamic_index_in_dim(w1_l, e, 0,
-                                           keepdims=False).astype(jnp.float32)
-            w2e = lax.dynamic_index_in_dim(w2_l, e, 0,
-                                           keepdims=False).astype(jnp.float32)
+            w1e = lax.dynamic_index_in_dim(w1_l, e, 0, keepdims=False).astype(
+                jnp.float32
+            )
+            w2e = lax.dynamic_index_in_dim(w2_l, e, 0, keepdims=False).astype(
+                jnp.float32
+            )
             if scaled:
                 w1e = w1e * lax.dynamic_index_in_dim(s1, e, 0, keepdims=True)
                 w2e = w2e * lax.dynamic_index_in_dim(s2, e, 0, keepdims=True)
-            weight = jnp.sum(jnp.where(topk_idx == first + e, topk_weights,
-                                       0.0),
-                             axis=-1)[:, None]
+            weight = jnp.sum(
+                jnp.where(topk_idx == first + e, topk_weights, 0.0), axis=-1
+            )[:, None]
             acc1 = x32 @ w1e
             row = (jax.nn.silu(acc1[:, :inter]) * acc1[:, inter:]) @ w2e
             return acc + weight * row
@@ -218,15 +275,21 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
         mine = lax.fori_loop(0, g_local, expert, jnp.zeros_like(x32))
         return lax.psum(mine, axis)
 
-    in_specs = (P(), P(), P(axis), P(axis)) + ((P(axis), ) * 2 if scaled else
-                                               ())
-    args = (x, gating, w1, w2) + ((w1_scale, w2_scale) if scaled else ())
+    in_specs = (
+        (P(), P(), P(axis), P(axis))
+        + ((P(axis),) * 2 if scaled else ())
+        + ((P(),) if hash_ids is not None else ())
+    )
+    args = (
+        (x, gating, w1, w2)
+        + ((w1_scale, w2_scale) if scaled else ())
+        + ((hash_ids,) if hash_ids is not None else ())
+    )
     return jax.jit(
-        jax.shard_map(local,
-                      mesh=mesh,
-                      in_specs=in_specs,
-                      out_specs=P(),
-                      check_vma=False))(*args)
+        jax.shard_map(
+            local, mesh=mesh, in_specs=in_specs, out_specs=P(), check_vma=False
+        )
+    )(*args)
 
 
 def _relative_l2(actual, want):
@@ -245,80 +308,73 @@ def _worst_token_relative_l2(actual, want):
     return float(np.max(per_token / np.where(scale == 0, 1.0, scale)))
 
 
-def _check_against_the_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating,
-                                 *, topk, batch_bound, token_bound):
+def _check_against_the_reference(
+    mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, batch_bound, token_bound
+):
     """Run the layer, hold it to the dense reference, and rotate the experts.
 
     The rotation is the control the bands need: both are wide enough to
     cover an fp8 wire, so without it a layer that sent every token to the
     wrong expert could still pass one of them.
     """
-    out = fused_ep_moe_v2(x,
-                          w1,
-                          w2,
-                          w1_scale,
-                          w2_scale,
-                          gating,
-                          topk=topk,
-                          renormalize=True,
-                          mesh=mesh,
-                          capacity=CAPACITY,
-                          weight_format=(WeightFormat.FP8 if w1.dtype == FP8
-                                         else WeightFormat.BF16))
+    out = fused_ep_moe_v2(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=(WeightFormat.FP8 if w1.dtype == FP8 else WeightFormat.BF16),
+    )
     # [tokens, hidden] sharded the way x is: the combine leaves each token's
     # row on the shard that owns the token, so nothing has to be gathered.
     assert out.shape == x.shape
     assert out.dtype == x.dtype
     assert out.sharding.spec == x.sharding.spec
 
-    want = _dense_reference(mesh,
-                            x,
-                            w1,
-                            w2,
-                            w1_scale,
-                            w2_scale,
-                            gating,
-                            topk=topk)
+    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=topk)
     error = _relative_l2(out, want)
-    assert error < batch_bound, (
-        f"relative L2 {error:.4f} past the {batch_bound} band")
+    assert error < batch_bound, f"relative L2 {error:.4f} past the {batch_bound} band"
     worst = _worst_token_relative_l2(out, want)
     assert worst < token_bound, (
         f"worst token's relative error {worst:.4f} past the {token_bound} "
         f"per-token band; the batch norm was {error:.4f}, so this is a few "
-        f"tokens rather than the whole batch")
+        f"tokens rather than the whole batch"
+    )
 
     def roll(a):
         return None if a is None else jnp.roll(a, 1, axis=0)
 
-    rotated = _dense_reference(mesh,
-                               x,
-                               roll(w1),
-                               roll(w2),
-                               roll(w1_scale),
-                               roll(w2_scale),
-                               gating,
-                               topk=topk)
+    rotated = _dense_reference(
+        mesh, x, roll(w1), roll(w2), roll(w1_scale), roll(w2_scale), gating, topk=topk
+    )
     assert _relative_l2(out, rotated) > ROTATED_CONTROL_FACTOR * error
     return error, worst
 
 
-@pytest.mark.parametrize("weight_format",
-                         [WeightFormat.FP8, WeightFormat.BF16])
+@pytest.mark.parametrize("weight_format", [WeightFormat.FP8, WeightFormat.BF16])
 def test_small_shape_tracks_a_dense_reference(weight_format):
     """The layer end to end at a small but structurally complete shape."""
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               0,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=weight_format)
-    x, gating = _make_inputs(mesh,
-                             1,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        0,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=weight_format,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        1,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
     quantized = weight_format == WeightFormat.FP8
     _check_against_the_reference(
         mesh,
@@ -330,44 +386,116 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         gating,
         topk=SMALL["topk"],
         batch_bound=FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
-        token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND)
+        token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND,
+    )
+
+
+def _make_hash_ids(mesh, seed, *, tokens, topk, e_total):
+    """Per-token expert ids, as DeepSeek-V4's table would hand them over.
+
+    Distinct within a row, because the real table is: a repeated id would
+    weight one expert twice, which is a routing question rather than a
+    kernel one and would make the reference the only thing under test.
+    """
+    rng = np.random.default_rng(seed)
+    ids = np.stack(
+        [rng.choice(e_total, size=topk, replace=False) for _ in range(tokens)]
+    ).astype(np.int32)
+    return jax.device_put(ids, NamedSharding(mesh, P(AXIS)))
+
+
+def test_hash_routing_serves_the_ids_it_was_given():
+    """DeepSeek-V4's bottom layers select by a table indexed on token id, not
+    by the gate. The gate is still scored -- the weights are its scores at the
+    given ids -- so the only thing that changes is which experts are chosen.
+
+    The control is the same layer with the ids withheld: if the operand were
+    ignored the kernel would fall back to its own top-k, and the two runs
+    would agree.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        30,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        31,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    hash_ids = _make_hash_ids(
+        mesh, 32, tokens=SMALL["tokens"], topk=SMALL["topk"], e_total=SMALL["e_total"]
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+    out = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, hash_topk_ids=hash_ids, **common
+    )
+    assert out.shape == x.shape
+    assert out.sharding.spec == x.sharding.spec
+
+    want = _dense_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        hash_ids=hash_ids,
+    )
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"
+
+    selected = fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    assert _relative_l2(selected, want) > ROTATED_CONTROL_FACTOR * error
 
 
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     """Plan decomposition changes only how the kernel operands are built."""
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               20,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             21,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
-    common = dict(topk=SMALL["topk"],
-                  renormalize=True,
-                  mesh=mesh,
-                  capacity=CAPACITY,
-                  weight_format=WeightFormat.FP8)
-    replicated = fused_ep_moe_v2(x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 sharded_plan=False,
-                                 **common)
-    sharded = fused_ep_moe_v2(x,
-                              w1,
-                              w2,
-                              w1_scale,
-                              w2_scale,
-                              gating,
-                              sharded_plan=True,
-                              **common)
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        20,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        21,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+    replicated = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, sharded_plan=False, **common
+    )
+    sharded = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, sharded_plan=True, **common
+    )
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
@@ -380,17 +508,21 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     enabled, which is the served configuration.
     """
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               22,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             23,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        22,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        23,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
     order = (0, 1, 6, 7, 2, 3, 4, 5)
     g_local = SMALL["e_total"] // EP
     expert_sharding = NamedSharding(mesh, P(AXIS))
@@ -401,20 +533,17 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
         placed = by_rank[np.asarray(order)].reshape(host.shape)
         return jax.device_put(placed, expert_sharding)
 
-    common = dict(topk=SMALL["topk"],
-                  renormalize=True,
-                  mesh=mesh,
-                  capacity=CAPACITY,
-                  weight_format=WeightFormat.FP8,
-                  sharded_plan=True)
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=True,
+    )
     identity = fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
-    placed = tuple(
-        place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
-    remapped = fused_ep_moe_v2(x,
-                               *placed,
-                               gating,
-                               mesh_ep_ranks=order,
-                               **common)
+    placed = tuple(place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
+    remapped = fused_ep_moe_v2(x, *placed, gating, mesh_ep_ranks=order, **common)
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
@@ -426,12 +555,14 @@ def production_weights():
     shapes below run against them.
     """
     mesh = _mesh()
-    weights = _make_weights(mesh,
-                            7,
-                            hidden=PROD["hidden"],
-                            inter=PROD["inter"],
-                            e_total=PROD["e_total"],
-                            weight_format=WeightFormat.FP8)
+    weights = _make_weights(
+        mesh,
+        7,
+        hidden=PROD["hidden"],
+        inter=PROD["inter"],
+        e_total=PROD["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
     jax.block_until_ready(weights)
     yield weights
     del weights
@@ -442,21 +573,21 @@ def test_production_shape_tracks_a_dense_reference(production_weights, tokens):
     """Qwen3.5-397B's MoE block at the decode and prefill batch shapes."""
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = production_weights
-    x, gating = _make_inputs(mesh,
-                             2,
-                             tokens=tokens,
-                             hidden=PROD["hidden"],
-                             e_total=PROD["e_total"])
-    _check_against_the_reference(mesh,
-                                 x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 topk=PROD["topk"],
-                                 batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+    x, gating = _make_inputs(
+        mesh, 2, tokens=tokens, hidden=PROD["hidden"], e_total=PROD["e_total"]
+    )
+    _check_against_the_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=PROD["topk"],
+        batch_bound=FP8_RELATIVE_BOUND,
+        token_bound=FP8_TOKEN_BOUND,
+    )
 
 
 def test_any_mesh_axis_name_works():
@@ -471,67 +602,55 @@ def test_any_mesh_axis_name_works():
     mesh it is handed, so nothing is left that hardcodes a name. Held here so
     the freedom is stated, and so a revert to axis_index fails loudly.
     """
-    mesh = Mesh(np.asarray(jax.devices()[:EP]), axis_names=("ep", ))
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               0,
-                                               hidden=SMALL["hidden"],
-                                               inter=SMALL["inter"],
-                                               e_total=SMALL["e_total"],
-                                               weight_format=WeightFormat.FP8)
-    x, gating = _make_inputs(mesh,
-                             1,
-                             tokens=SMALL["tokens"],
-                             hidden=SMALL["hidden"],
-                             e_total=SMALL["e_total"])
-    _check_against_the_reference(mesh,
-                                 x,
-                                 w1,
-                                 w2,
-                                 w1_scale,
-                                 w2_scale,
-                                 gating,
-                                 topk=SMALL["topk"],
-                                 batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+    mesh = Mesh(np.asarray(jax.devices()[:EP]), axis_names=("ep",))
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        0,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        1,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    _check_against_the_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        batch_bound=FP8_RELATIVE_BOUND,
+        token_bound=FP8_TOKEN_BOUND,
+    )
 
 
 def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     """FP4 block scales and FP8 transport, including a single-block W2."""
     mesh = _mesh()
-    shard = NamedSharding(mesh, P(AXIS))
-    rng = np.random.default_rng(42)
-    weights, scales, decoded = [], [], []
-    for shape in ((32, 1024, 1024), (32, 512, 1024)):
-        raw = rng.normal(0, 0.1, shape).astype(np.float32)
-        grouped = raw.reshape(shape[0], shape[1] // 512, 512, shape[2])
-        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
-        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
-        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
-        s = jax.device_put(scale, shard)
-        dequant = (w.astype(jnp.float32).reshape(grouped.shape) *
-                   s[:, :, None, :]).reshape(shape)
-        weights.append(w)
-        scales.append(s)
-        decoded.append(dequant)
+    weights, scales, decoded = _make_fp4_weights(
+        mesh, 42, hidden=1024, inter=512, e_total=32, rhs_qb=512
+    )
     x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
-    common = dict(topk=4,
-                  renormalize=True,
-                  mesh=mesh,
-                  capacity=CAPACITY,
-                  weight_format=WeightFormat.FP4,
-                  rhs_qb=512)
-    out = fused_ep_moe_v2(x,
-                          *weights,
-                          *scales,
-                          gating,
-                          sharded_plan=True,
-                          **common)
-    replicated = fused_ep_moe_v2(x,
-                                 *weights,
-                                 *scales,
-                                 gating,
-                                 sharded_plan=False,
-                                 **common)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+    )
+    out = fused_ep_moe_v2(x, *weights, *scales, gating, sharded_plan=True, **common)
+    replicated = fused_ep_moe_v2(
+        x, *weights, *scales, gating, sharded_plan=False, **common
+    )
     np.testing.assert_array_equal(np.asarray(out), np.asarray(replicated))
     ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=4)
     error = _relative_l2(out, ref)
@@ -539,12 +658,141 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     print(f"FP4 block512 relative_l2={error} worst_token={worst}")
     assert error < FP8_RELATIVE_BOUND
     assert worst < FP8_TOKEN_BOUND
-    wrong = _dense_reference(mesh,
-                             x,
-                             jnp.roll(decoded[0], 1, axis=0),
-                             jnp.roll(decoded[1], 1, axis=0),
-                             None,
-                             None,
-                             gating,
-                             topk=4)
+    wrong = _dense_reference(
+        mesh,
+        x,
+        jnp.roll(decoded[0], 1, axis=0),
+        jnp.roll(decoded[1], 1, axis=0),
+        None,
+        None,
+        gating,
+        topk=4,
+    )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
+# --------------------------------------------------------------------------- #
+# The weight-DMA schedule.
+#
+# How far ahead of the computing expert a weight refill goes out is not an
+# argument to the layer: the build asks `host.fit_weight_slots` for the
+# deepest runway this shape's VMEM affords, and every shape small enough to
+# test here affords the ceiling. So the schedules below are reached by
+# capping the fitter, which is the one line of the build that reads it.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def at_prefetch_depth(monkeypatch):
+    """Build at a named weight-prefetch depth, and report what was built.
+
+    Yields `depth -> observed`, where `observed` fills with the schedule each
+    build resolved to. Reporting it is not decoration: a cap that stopped
+    biting would leave every case running one schedule and agreeing trivially.
+
+    BOTH caches have to go, and the second one is the trap. `_BUILD_CACHE`
+    holds the kernel; `_LAYER_SM_CACHE` holds a shard_map over a `local_fn`
+    that CLOSES OVER the kernel built on the call that filled it, and its key
+    is the layer's arguments -- which the schedule is not one of, because the
+    build derives it from the device. Clearing only the first rebuilds the
+    kernel, logs it and fills `observed`, and then runs the cached shard_map's
+    older kernel: every depth passes, and a depth-zero-only fault is invisible.
+    """
+    observed = []
+    # Captured once, before the first cap: taken inside `at` it would be the
+    # PREVIOUS cap on the second use, and the two depths would compose.
+    real = host.fit_weight_slots
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+
+    def at(depth):
+        def capped(*args, **kwargs):
+            slots = real(*args, **{**kwargs, "max_distance": depth})
+            observed.append(slots)
+            return slots
+
+        monkeypatch.setattr(host, "fit_weight_slots", capped)
+        observed.clear()
+        clear()
+        return observed
+
+    yield at
+    clear()
+
+
+# An fp4 shape built for the streamed schedule: hidden and inter each span
+# several `rhs_qb` contraction blocks, so a slab's wait lands in a block that
+# is not also the one that retires it; and the batch puts 2048 * 4 / 32 = 256
+# rows on an expert against a tile of CAPACITY, so a visit runs more than one
+# tile and the wait has to be the first tile's alone.
+STREAM = dict(hidden=1024, inter=512, e_total=32, topk=4, tokens=2048)
+STREAM_QB = 256
+STREAM_DEPTHS = (2, 1, 0)
+
+
+def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
+    """The three fp4 weight schedules compute the same thing, bit for bit.
+
+    The depth changes only WHERE a weight DMA is started and waited. Depth two
+    starts an expert's slabs two visits ahead into a slot of its own; depth
+    zero has a single slot, streams the slabs into the blocks that read them,
+    and starts the next expert's where this expert's reads of the slot retire.
+    Same weights, same order, so the outputs have to agree exactly -- a refill
+    landing on a slot still being read is not a small numeric drift, it is
+    another expert's weights in the matmul.
+
+    The band against the dense reference is what stops that agreement from
+    being vacuous: three identically broken schedules would still match.
+    """
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        45,
+        tokens=STREAM["tokens"],
+        hidden=STREAM["hidden"],
+        e_total=STREAM["e_total"],
+    )
+    common = dict(
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+
+    outs = {}
+    for depth in STREAM_DEPTHS:
+        observed = at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert observed, "the build never asked for a weight schedule"
+        assert [(s.distance, s.nbuf) for s in observed] == [
+            (depth, host.nbuf_for(depth))
+        ] * len(observed)
+
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=STREAM["topk"])
+    for depth, out in outs.items():
+        error = _relative_l2(out, ref)
+        worst = _worst_token_relative_l2(out, ref)
+        assert error < FP8_RELATIVE_BOUND, f"depth {depth}: relative L2 {error}"
+        assert worst < FP8_TOKEN_BOUND, f"depth {depth}: worst token {worst}"
+    deepest = outs[max(STREAM_DEPTHS)]
+    for depth in STREAM_DEPTHS:
+        np.testing.assert_array_equal(
+            outs[depth],
+            deepest,
+            err_msg=f"depth {depth} disagrees with the deepest schedule",
+        )

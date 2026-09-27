@@ -27,15 +27,20 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, id="async"),
+    ],
+)
 def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 8:
-        pytest.skip(f"TP test expects an 8-chip agent, found {tp_size} chips; "
-                    "running here would silently reduce TP coverage")
+        pytest.skip(
+            f"TP test expects an 8-chip agent, found {tp_size} chips; "
+            "running here would silently reduce TP coverage"
+        )
 
     llm = LLM(
         model=MODEL_NAME,

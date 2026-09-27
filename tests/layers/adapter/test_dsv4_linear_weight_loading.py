@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for DeepSeek-V4 linear weight loading and quantization config resolution."""
+"""Unit tests for DeepSeek-V4 linear weight loading and
+quantization config resolution."""
 
 import torch
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-    VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.core.quant_methods import DEEPSEEK_V4_FP8
 
 
@@ -37,8 +37,10 @@ def test_linear_weight_loading_quant_config_resolving():
         weight_block_size=[1, 32],
     )
 
-    for prefix in ("model.layers.0.self_attn.fused_wqa_wkv",
-                   "model.layers.0.mlp.experts.0.w13"):
+    for prefix in (
+        "model.layers.0.self_attn.fused_wqa_wkv",
+        "model.layers.0.mlp.experts.0.w13",
+    ):
         method = VllmFp8LinearMethodTPU(
             quant_config=dummy_quant_config,
             prefix=prefix,

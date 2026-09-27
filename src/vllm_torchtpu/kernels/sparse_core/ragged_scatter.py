@@ -55,15 +55,15 @@ def main_kernel(
     send_sem = sem_ref.at[1]
 
     # Read total number of valid rows tensor values.
-    dma = pltpu.make_async_copy(total_num_rows_ref,
-                                total_num_rows_vmem_ref.at[:1], recv_sem)
+    dma = pltpu.make_async_copy(
+        total_num_rows_ref, total_num_rows_vmem_ref.at[:1], recv_sem
+    )
     dma.start()
     dma.wait()
     total_num_rows = total_num_rows_vmem_ref[...][0]
 
     # Calculate number of tiles to visit.
-    num_blocks = jnp.where(total_num_rows == 0, 0,
-                           pl.cdiv(total_num_rows, block_size))
+    num_blocks = jnp.where(total_num_rows == 0, 0, pl.cdiv(total_num_rows, block_size))
     num_cols = pl.cdiv(hidden_size, col_size)
 
     def inner_kernel(block_id, core_id, col_id):
@@ -75,18 +75,18 @@ def main_kernel(
             dma_list = []
             dma_list.append(
                 pltpu.make_async_copy(
-                    src_indices_hbm_ref.at[pl.ds(row_tile_start,
-                                                 num_simd_lanes)],
+                    src_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
                     src_indices_vmem_ref,
                     recv_sem,
-                ))
+                )
+            )
             dma_list.append(
                 pltpu.make_async_copy(
-                    dst_indices_hbm_ref.at[pl.ds(row_tile_start,
-                                                 num_simd_lanes)],
+                    dst_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
                     dst_indices_vmem_ref,
                     recv_sem,
-                ))
+                )
+            )
             jax.tree.map(lambda x: x.start(), dma_list)
             jax.tree.map(lambda x: x.wait(), dma_list)
 
@@ -115,10 +115,8 @@ def main_kernel(
                 # memory addresss does not yield desired values anymore. Therefore,
                 # we break up a dmas into multiple num_lanes sized requests.
                 pltpu.make_async_copy(
-                    in_32b_hbm_ref.at[row_hbm,
-                                      pl.ds(col_hbm_start, num_lanes)],
-                    out_vmem_ref.at[row_vmem,
-                                    pl.ds(col_vmem_start, num_lanes)],
+                    in_32b_hbm_ref.at[row_hbm, pl.ds(col_hbm_start, num_lanes)],
+                    out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
                     recv_sem,
                 ).start()
 
@@ -144,8 +142,9 @@ def main_kernel(
             # elements and reorder them.
             if packing > 1:
                 for col_compute_offset in range(0, num_lanes, num_simd_lanes):
-                    col_slice = pl.ds(col_vmem_start + col_compute_offset,
-                                      num_simd_lanes)
+                    col_slice = pl.ds(
+                        col_vmem_start + col_compute_offset, num_simd_lanes
+                    )
 
                     previous_data = None
                     for row_src in range(num_simd_lanes):
@@ -195,8 +194,7 @@ def main_kernel(
                 row_hbm = dst_indices[row_vmem] // packing
                 if row_vmem < num_simd_lanes - 1:
                     next_row_hbm = dst_indices[row_vmem + 1] // packing
-                    next_row_valid = (row_tile_start + row_vmem +
-                                      1) < total_num_rows
+                    next_row_valid = (row_tile_start + row_vmem + 1) < total_num_rows
                 else:
                     next_row_hbm = -1
                     next_row_valid = False
@@ -211,8 +209,7 @@ def main_kernel(
                 #
                 # If the current row is out of bounds, we just repeat the last valid
                 # write to avoid valid data in hbm being overwritten.
-                merged_data_vmem_row = (row_vmem //
-                                        packing) * packing + packing - 1
+                merged_data_vmem_row = (row_vmem // packing) * packing + packing - 1
                 src_row_vmem = jnp.where(
                     jnp.logical_and(row_hbm == next_row_hbm, next_row_valid),
                     merged_data_vmem_row,
@@ -224,16 +221,16 @@ def main_kernel(
                     jnp.where(row_valid, row_hbm, last_valid_row_hbm),
                 )
                 pltpu.make_async_copy(
-                    out_vmem_ref.at[src_row_vmem,
-                                    pl.ds(col_vmem_start, num_lanes)],
-                    out_32b_hbm_ref.at[dst_row_hbm,
-                                       pl.ds(col_hbm_start, num_lanes)],
+                    out_vmem_ref.at[src_row_vmem, pl.ds(col_vmem_start, num_lanes)],
+                    out_32b_hbm_ref.at[dst_row_hbm, pl.ds(col_hbm_start, num_lanes)],
                     send_sem,
                 ).start()
-                last_valid_row_vmem = jnp.where(row_valid, src_row_vmem,
-                                                last_valid_row_vmem)
-                last_valid_row_hbm = jnp.where(row_valid, dst_row_hbm,
-                                               last_valid_row_hbm)
+                last_valid_row_vmem = jnp.where(
+                    row_valid, src_row_vmem, last_valid_row_vmem
+                )
+                last_valid_row_hbm = jnp.where(
+                    row_valid, dst_row_hbm, last_valid_row_hbm
+                )
 
         # Wait for dma write to finish.
         for _ in range(0, col_size, num_lanes):
@@ -320,17 +317,19 @@ def _preprocess_indices(
     #    we can guarantee that all writes to the same destination sublane are
     #    assigned to same core, same row tile.
 
-    src_indices = jnp.where(jnp.logical_and(indices >= start, indices < end),
-                            indices, -1)
+    src_indices = jnp.where(
+        jnp.logical_and(indices >= start, indices < end), indices, -1
+    )
     src_indices = jnp.pad(src_indices, ((0, out_pad_size)), constant_values=-1)
     src_indices = src_indices.reshape(-1, packing)
     is_valid_src_row = src_indices != -1
     num_sublanes = src_indices.shape[0]
-    num_valid_src_rows_per_dst_sublane = jnp.sum(is_valid_src_row,
-                                                 axis=-1,
-                                                 keepdims=False)
+    num_valid_src_rows_per_dst_sublane = jnp.sum(
+        is_valid_src_row, axis=-1, keepdims=False
+    )
     num_valid_src_rows_per_dst_sublane = jnp.broadcast_to(
-        num_valid_src_rows_per_dst_sublane[:, None], (num_sublanes, packing))
+        num_valid_src_rows_per_dst_sublane[:, None], (num_sublanes, packing)
+    )
     # For each destination sublane that has more than one valid writes, we
     # consider all writes to that sublane as valid so that total number of
     # writes for those sublanes are always equal to packing.
@@ -340,8 +339,9 @@ def _preprocess_indices(
         jnp.where(is_valid_src_row, 1, 0),
     ).reshape(-1)
     sorted_by_cnts = jnp.argsort(cnts, descending=True, stable=True)
-    src_indices = (jnp.pad(indices, ((0, out_pad_size)),
-                           constant_values=0))[sorted_by_cnts]
+    src_indices = (jnp.pad(indices, ((0, out_pad_size)), constant_values=0))[
+        sorted_by_cnts
+    ]
     dst_indices = sorted_by_cnts
 
     # Due to possible considering more source rows as valid, the total number of
@@ -351,30 +351,31 @@ def _preprocess_indices(
 
 
 @jax.jit
-def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
-                   end: jax.Array) -> jax.Array:
+def ragged_scatter(
+    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+) -> jax.Array:
     """Gathers rows from `x` according to `indices` within a specified range.
 
-  This function performs a gather operation equivalent to `x[indices]` for
-  indices that fall within the range `[start, end)`. For indices outside this
-  range, the behavior is undefined.
+    This function performs a gather operation equivalent to `x[indices]` for
+    indices that fall within the range `[start, end)`. For indices outside this
+    range, the behavior is undefined.
 
-  Args:
-    x: A 2D JAX array to gather data from, with shape `(num_rows, hidden_size)`.
-    indices: A 1D JAX array of indices to gather, with shape `(output_size,)`.
-    start: A scalar or 1D array of size 1 containing the start index (inclusive)
-      to process.
-    end: A scalar or 1D array of size 1 containing the end index (exclusive) to
-      process.
+    Args:
+      x: A 2D JAX array to gather data from, with shape `(num_rows, hidden_size)`.
+      indices: A 1D JAX array of indices to gather, with shape `(output_size,)`.
+      start: A scalar or 1D array of size 1 containing the start index (inclusive)
+        to process.
+      end: A scalar or 1D array of size 1 containing the end index (exclusive) to
+        process.
 
-  Returns:
-    A 2D JAX array of gathered data with shape `(output_size, hidden_size)`.
+    Returns:
+      A 2D JAX array of gathered data with shape `(output_size, hidden_size)`.
 
-  The typical usage of this kernel is "unpermute" after GMM of the MOE layers.
-  That is, replace `gmm2_res[topk_argsort_revert_indices]` with
-  `ragged_scatter(x, topk_argsort_revert_indices, ..)` in
-  vllm_torchtpu/layers/core/fused_moe_gmm.py.
-  """
+    The typical usage of this kernel is "unpermute" after GMM of the MOE layers.
+    That is, replace `gmm2_res[topk_argsort_revert_indices]` with
+    `ragged_scatter(x, topk_argsort_revert_indices, ..)` in
+    vllm_torchtpu/layers/core/fused_moe_gmm.py.
+    """
 
     assert x.ndim == 2, "Ragged scatter only supports 2d inputs."
     assert indices.ndim == 1, "Ragged scatter only supports 1d indices."
@@ -395,8 +396,7 @@ def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
     dtype_bytes = dtype_bits // 8
 
     # Heuristic threshold on whether to fallback to xla gather.
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info(
-    ).vmem_capacity_bytes * 0.6:
+    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
         # For small {input + output}, it's likely that both can be put in TC VMEM,
         # so it's likely faster to run TC-based gather on it than going through SC,
         # without data movement to/from HBM.
@@ -415,12 +415,8 @@ def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
     aligned_hidden_size = pl.cdiv(hidden_size, col_size) * col_size
 
     src_indices, dst_indices, total_num_rows = _preprocess_indices(
-        indices,
-        start,
-        end,
-        out_pad_size,
-        packing,
-        row_tile_size=num_simd_lanes)
+        indices, start, end, out_pad_size, packing, row_tile_size=num_simd_lanes
+    )
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -435,17 +431,18 @@ def ragged_scatter(x: jax.Array, indices: jax.Array, start: jax.Array,
             subcore_axis_name=vector_mesh.subcore_axis_name,
         ),
         out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype),
+            (out_size + out_pad_size, aligned_hidden_size), dtype
+        ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             disable_bounds_checks=True,
         ),
         scratch_types=dict(
-            total_num_rows_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
+            total_num_rows_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-            src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
-            dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
-            sem_ref=pltpu.SemaphoreType.DMA((2, )),
+            src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            sem_ref=pltpu.SemaphoreType.DMA((2,)),
         ),
         mesh=vector_mesh,
         name="sc_ragged_scatter",

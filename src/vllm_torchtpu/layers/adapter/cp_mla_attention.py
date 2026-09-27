@@ -60,8 +60,9 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
-def merge_lse_partials_scatter_heads(output: torch.Tensor,
-                                     lse: torch.Tensor) -> torch.Tensor:
+def merge_lse_partials_scatter_heads(
+    output: torch.Tensor, lse: torch.Tensor
+) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
     With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
@@ -75,15 +76,16 @@ def merge_lse_partials_scatter_heads(output: torch.Tensor,
       2. reduce-scatter the weighted outputs
 
     Args:
-      output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`, this rank's partial.
+      output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
+        this rank's partial.
       lse: `[num_tokens, tp_local_num_heads * dcp_size]`, the matching log-sum-exps.
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
 
     Returns:
-      `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` -- this rank's head
-      slice of the whole-context result.
+      `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
+      this rank's head slice of the whole-context result.
     """
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
@@ -93,8 +95,7 @@ def merge_lse_partials_scatter_heads(output: torch.Tensor,
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
 
 
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor,
-                   group: Any) -> torch.Tensor:
+def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
     """This rank's `softmax_r(lse) * o_r` term, in f32."""
     lse_f32 = lse.to(torch.float32).contiguous()
     # [world_size, num_tokens, num_heads]: small, and it removes the need for
@@ -104,15 +105,17 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor,
         gathered = torch.cat(list(gathered), dim=0)
 
     finite = torch.isfinite(gathered)
-    shift = torch.where(finite, gathered,
-                        torch.full_like(gathered, float("-inf"))).amax(dim=0)
+    shift = torch.where(
+        finite, gathered, torch.full_like(gathered, float("-inf"))
+    ).amax(dim=0)
     # A token with no contributor on any rank would give inf - inf; pin the
     # shift to 0 there and let the zero denominator carry the result to zero.
     empty = ~torch.isfinite(shift)
     shift = torch.where(empty, torch.zeros_like(shift), shift)
 
-    weights = torch.where(finite, torch.exp(gathered - shift.unsqueeze(0)),
-                          torch.zeros_like(gathered))
+    weights = torch.where(
+        finite, torch.exp(gathered - shift.unsqueeze(0)), torch.zeros_like(gathered)
+    )
     denom = weights.sum(dim=0)
     safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
 

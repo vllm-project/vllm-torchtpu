@@ -2,8 +2,9 @@
 import importlib
 import os
 import time
+from collections.abc import Callable, Sequence
 from functools import wraps
-from typing import Any, Callable, List, NamedTuple, Sequence, Tuple, Union
+from typing import Any, NamedTuple
 
 import jax
 import torch
@@ -53,11 +54,13 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
 
 
 def get_dp_size(parallel_config) -> int:
-    return (int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
-            or parallel_config.data_parallel_size)
+    return (
+        int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
+        or parallel_config.data_parallel_size
+    )
 
 
-def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
+def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
     if multihost_backend == "ray":
@@ -69,14 +72,16 @@ def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
                 hbm_used = device.memory_stats()["bytes_in_use"]
                 hbm_limit = device.memory_stats()["bytes_limit"]
                 logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
-                    device)
+                    "Get memory stats for device %s. "
+                    "Assuming all devices have the same usage.",
+                    device,
+                )
                 usage.extend([(hbm_used, hbm_limit)] * len(devices))
                 break
             except Exception as e:
                 logger.warning(
-                    "Failed to get memory stats for device %s: %s. ", device,
-                    e)
+                    "Failed to get memory stats for device %s: %s. ", device, e
+                )
     else:
         for device in devices:
             hbm_used = device.memory_stats()["bytes_in_use"]
@@ -88,36 +93,36 @@ def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
 
 def get_device_name(num_devices: int | None = None):
     kind = jax.devices()[0].device_kind
-    if 'TPU' not in kind:
-        raise RuntimeError('Expected TPU devices')
-    suffix = ''
-    if kind.endswith(' lite'):
-        kind = kind[:-len(' lite')]
-        suffix = 'e'
-    elif kind.endswith('e'):
+    if "TPU" not in kind:
+        raise RuntimeError("Expected TPU devices")
+    suffix = ""
+    if kind.endswith(" lite"):
+        kind = kind[: -len(" lite")]
+        suffix = "e"
+    elif kind.endswith("e"):
         kind = kind[:-1]
-        suffix = 'e'
-    elif kind.endswith('p'):
+        suffix = "e"
+    elif kind.endswith("p"):
         kind = kind[:-1]
-        suffix = 'p'
-    elif kind.endswith('i'):
+        suffix = "p"
+    elif kind.endswith("i"):
         kind = kind[:-1]
-        suffix = 'i'
+        suffix = "i"
 
-    if kind.startswith('TPU7'):
-        kind = 'TPU v7'
-    elif kind.startswith('TPU8'):
-        kind = 'TPU v8'
-    assert kind[:-1] == 'TPU v', kind
+    if kind.startswith("TPU7"):
+        kind = "TPU v7"
+    elif kind.startswith("TPU8"):
+        kind = "TPU v8"
+    assert kind[:-1] == "TPU v", kind
     kind += suffix
     if num_devices is not None:
-        kind += f'-{num_devices}'
+        kind += f"-{num_devices}"
     return kind
 
 
 def get_mesh_shape_product(
     mesh: Mesh,
-    axes: Union[str, list[str], None],
+    axes: str | list[str] | None,
 ) -> int:
     """
     Get the product of mesh dimensions for one or more axes.
@@ -145,10 +150,11 @@ def get_mesh_shape_product(
     return product
 
 
-def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
+def hbm_usage_gb(devices: Any) -> list[tuple[float, float]]:
     usage = hbm_usage_bytes(devices)
-    usage = [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
-             for used, limit in usage]
+    usage = [
+        (round(used / GBYTES, 2), round(limit / GBYTES, 2)) for used, limit in usage
+    ]
     return usage
 
 
@@ -161,14 +167,14 @@ class HbmBudget(NamedTuple):
       cap:         total_limit * gpu_memory_utilization.
       available:   cap - total_used - headroom; the budget for the KV cache.
     """
+
     total_limit: int
     total_used: int
     cap: int
     available: int
 
 
-def compute_hbm_budget(devices: Any,
-                       gpu_memory_utilization: float) -> HbmBudget:
+def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:
     """Compute the HBM budget available for the KV cache."""
     total_limit = total_used = 0
     for device in devices:
@@ -178,10 +184,9 @@ def compute_hbm_budget(devices: Any,
     cap = int(total_limit * gpu_memory_utilization)
     available = cap - total_used
 
-    return HbmBudget(total_limit=total_limit,
-                     total_used=total_used,
-                     cap=cap,
-                     available=available)
+    return HbmBudget(
+        total_limit=total_limit, total_used=total_used, cap=cap, available=available
+    )
 
 
 def estimate_kv_connector_hbm_reserve(vllm_config: Any) -> int:
@@ -255,7 +260,7 @@ def time_function(func):
         end_time = time.perf_counter()
         execution_time = end_time - start_time
         logger.debug(
-            f"Function '{func.__name__}' executed in {execution_time:.4f} seconds."
+            "Function '%s' executed in %.4f seconds.", func.__name__, execution_time
         )
         return result
 
@@ -263,7 +268,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor],
+    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
@@ -274,14 +279,18 @@ def tpu_bind_kv_cache(
     from collections import defaultdict
 
     from vllm.v1.worker.utils import extract_layer_index
+
     index2name = defaultdict(list)
     for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name,
-                                       num_attn_module)].append(layer_name)
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
     for layer_index in sorted(index2name.keys()):
         for layer_name in sorted(index2name[layer_index]):
-            runner_kv_caches.append(kv_caches[layer_name])
+            cache = kv_caches[layer_name]
+            if isinstance(cache, (list, tuple)):
+                runner_kv_caches.extend(cache)
+            else:
+                runner_kv_caches.append(cache)
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
@@ -292,29 +301,32 @@ def synchronize_device() -> None:
 
     Differences vs. `synchronize_tensors(tensors=...)`:
     - `synchronize_device()` is equivalent to `torch.cuda.synchronize()`. It waits for
-      enqueued hardware stream operations to finish on PJRT, but does NOT trigger deferred
-      graph compilation or materialization for uninstantiated PyTorch Eager tensors.
+      enqueued hardware stream operations to finish on PJRT, but does NOT trigger
+      deferred graph compilation or materialization for uninstantiated
+      PyTorch Eager tensors.
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
 
 def synchronize_tensors(
-    tensors: Union[torch.Tensor, Sequence[torch.Tensor], None] = None,
+    tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,
 ) -> None:
-    """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).
+    """Synchronize TPU execution and force materialization of deferred tensors
+    (Graph Sync).
 
     Differences vs. `synchronize_device()`:
-    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the deferred tensor
-      graph producing `tensors`, compile and enqueue the graph to PJRT, and materialize the
-      resulting buffers in device memory.
-    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands without
-      building/compiling pending deferred graphs.
-    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should be synchronized
-      (e.g., weight materialization across multiple tensors). Prefer `synchronize_device()` when
-      synchronizing immediately after a computation or across the entire device.
+    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the
+      deferred tensor graph producing `tensors`, compile and enqueue the graph to PJRT,
+      and materialize the resulting buffers in device memory.
+    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands
+      without building/compiling pending deferred graphs.
+    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should
+      be synchronized (e.g., weight materialization across multiple tensors). Prefer
+      `synchronize_device()` when synchronizing immediately after a computation or
+      across the entire device.
     """
     from torch_tpu._internal import sync
 

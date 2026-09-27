@@ -23,11 +23,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import \
-    build_runtime_schedule_reference
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import (
+    build_runtime_schedule_reference,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     RuntimeScheduleField,
-    build_pcp_streaming_schedule_inputs_from_metadata_jax)
+    build_pcp_streaming_schedule_inputs_from_metadata_jax,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -71,8 +73,17 @@ def _stage_runtime_schedule_kernel(
     store.wait()
 
 
-def _stage_runtime_schedule(tile_plan, block_tables, *, state_mode, group_idx,
-                            source_rank, pcp_size, page_size, interleave_size):
+def _stage_runtime_schedule(
+    tile_plan,
+    block_tables,
+    *,
+    state_mode,
+    group_idx,
+    source_rank,
+    pcp_size,
+    page_size,
+    interleave_size,
+):
     output_shape = jax.ShapeDtypeStruct(
         (pcp_size, 1, RuntimeScheduleField.PACKED_NUM_FIELDS),
         jnp.int32,
@@ -104,7 +115,7 @@ def _stage_runtime_schedule(tile_plan, block_tables, *, state_mode, group_idx,
                     jnp.int32,
                 ),
             ),
-            grid=(1, ),
+            grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=8 * 1024 * 1024),
         name=f"pcp_stage_{state_mode}_runtime_schedule",
@@ -126,24 +137,24 @@ def _require_tpu():
     ],
 )
 def test_pallas_staging_matches_runtime_schedule_reference(
-        release_jax_backend, state_mode, group_idx, source_rank):
+    release_jax_backend, state_mode, group_idx, source_rank
+):
     _require_tpu()
     pcp_size = 2
     page_size = 4
     interleave_size = 2
-    tile_plan, block_tables, *_ = \
-        build_pcp_streaming_schedule_inputs_from_metadata_jax(
-            kv_lens=np.asarray([19], dtype=np.int32),
-            page_indices=np.arange(8, dtype=np.int32) + 5,
-            cu_q_lens=np.asarray([0, 8], dtype=np.int32),
-            distribution=np.asarray([0, 0, 1], dtype=np.int32),
-            global_bucket_tokens=8,
-            local_kv_cache_num_blocks=8,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            q_block_size=4,
-        )
+    tile_plan, block_tables, *_ = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+        kv_lens=np.asarray([19], dtype=np.int32),
+        page_indices=np.arange(8, dtype=np.int32) + 5,
+        cu_q_lens=np.asarray([0, 8], dtype=np.int32),
+        distribution=np.asarray([0, 0, 1], dtype=np.int32),
+        global_bucket_tokens=8,
+        local_kv_cache_num_blocks=8,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        q_block_size=4,
+    )
     reference = build_runtime_schedule_reference(
         tile_plan,
         block_tables,
@@ -152,7 +163,7 @@ def test_pallas_staging_matches_runtime_schedule_reference(
         interleave_size=interleave_size,
     )
     active_tile = int(np.flatnonzero(reference.current_num_groups > 0)[0])
-    one_tile_plan = tile_plan[active_tile:active_tile + 1]
+    one_tile_plan = tile_plan[active_tile : active_tile + 1]
     staged = jax.jit(
         functools.partial(
             _stage_runtime_schedule,
@@ -162,11 +173,11 @@ def test_pallas_staging_matches_runtime_schedule_reference(
             pcp_size=pcp_size,
             page_size=page_size,
             interleave_size=interleave_size,
-        ))(one_tile_plan, block_tables)
+        )
+    )(one_tile_plan, block_tables)
     staged.block_until_ready()
 
-    rows = (reference.current_rows
-            if state_mode == "current" else reference.history_rows)
+    rows = reference.current_rows if state_mode == "current" else reference.history_rows
     expected = rows[active_tile, group_idx, source_rank]
     np.testing.assert_array_equal(
         np.asarray(jax.device_get(staged))[:, 0],

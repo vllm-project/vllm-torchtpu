@@ -25,15 +25,18 @@ class dynamically from the checkpoint's HF backend), so these tests stand a
 fake base class in for it. That is what the wrapper subclasses in production
 too, only with a real tokenizer.
 """
+
 import copy
 import pickle
 from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_torchtpu.tokenizers import (TpuDeepseekV4Tokenizer,
-                                      _tpu_deepseek_v4_tokenizer,
-                                      register_tokenizers)
+from vllm_torchtpu.tokenizers import (
+    TpuDeepseekV4Tokenizer,
+    _tpu_deepseek_v4_tokenizer,
+    register_tokenizers,
+)
 
 
 class _FakeBaseTokenizer:
@@ -47,11 +50,7 @@ class _FakeBaseTokenizer:
         self.seen = []
 
     def apply_chat_template(self, messages, tools=None, **kwargs):
-        self.seen.append({
-            "messages": messages,
-            "tools": tools,
-            "kwargs": kwargs
-        })
+        self.seen.append({"messages": messages, "tools": tools, "kwargs": kwargs})
         return "rendered"
 
 
@@ -80,18 +79,14 @@ def test_trailing_assistant_turn_is_marked_wo_eos(tokenizer, base):
     to the encoder with wo_eos set, so it renders without eos_token and the
     model continues that turn instead of starting a new one."""
     messages = [
-        {
-            "role": "user",
-            "content": "hi"
-        },
-        {
-            "role": "assistant",
-            "content": "partial answ"
-        },
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "partial answ"},
     ]
 
-    assert tokenizer.apply_chat_template(
-        messages, continue_final_message=True) == "rendered"
+    assert (
+        tokenizer.apply_chat_template(messages, continue_final_message=True)
+        == "rendered"
+    )
 
     conversation = _last_call(base)["kwargs"]["conversation"]
     assert conversation[-1] == {
@@ -107,11 +102,9 @@ def test_continue_final_message_is_not_forwarded(tokenizer, base):
     """The base encoder builds its config from thinking_mode/drop_thinking/
     reasoning_effort and does not know this flag; leaving it in kwargs would
     reach the checkpoint's encode_messages as an unexpected argument."""
-    tokenizer.apply_chat_template([{
-        "role": "assistant",
-        "content": "x"
-    }],
-                                  continue_final_message=True)
+    tokenizer.apply_chat_template(
+        [{"role": "assistant", "content": "x"}], continue_final_message=True
+    )
 
     assert "continue_final_message" not in _last_call(base)["kwargs"]
 
@@ -158,11 +151,9 @@ def test_without_the_flag_nothing_is_added(tokenizer, base):
 def test_flag_set_false_behaves_like_absent(tokenizer, base):
     """An explicit False must be indistinguishable from omitting the flag.
     kwargs.pop returns False for both, so neither reaches the encoder."""
-    tokenizer.apply_chat_template([{
-        "role": "assistant",
-        "content": "done"
-    }],
-                                  continue_final_message=False)
+    tokenizer.apply_chat_template(
+        [{"role": "assistant", "content": "done"}], continue_final_message=False
+    )
 
     kwargs = _last_call(base)["kwargs"]
     assert "conversation" not in kwargs
@@ -175,13 +166,12 @@ def test_tools_and_other_kwargs_reach_the_base_unchanged(tokenizer, base):
     reasoning_effort have to survive untouched."""
     tools = [{"type": "function", "function": {"name": "f"}}]
 
-    tokenizer.apply_chat_template([{
-        "role": "assistant",
-        "content": "x"
-    }],
-                                  tools,
-                                  continue_final_message=True,
-                                  reasoning_effort="high")
+    tokenizer.apply_chat_template(
+        [{"role": "assistant", "content": "x"}],
+        tools,
+        continue_final_message=True,
+        reasoning_effort="high",
+    )
 
     call = _last_call(base)
     assert call["tools"] is tools
@@ -212,9 +202,9 @@ def test_an_explicit_conversation_kwarg_wins_over_messages(tokenizer, base):
     messages = [{"role": "user", "content": "ignored"}]
     conversation = [{"role": "assistant", "content": "the real one"}]
 
-    tokenizer.apply_chat_template(messages,
-                                  conversation=conversation,
-                                  continue_final_message=True)
+    tokenizer.apply_chat_template(
+        messages, conversation=conversation, continue_final_message=True
+    )
 
     sent = _last_call(base)["kwargs"]["conversation"]
     assert sent[-1]["content"] == "the real one"
@@ -251,7 +241,7 @@ def test_reduce_rebuilds_through_the_factory(tokenizer, base):
     func, args = tokenizer.__reduce__()
 
     assert func is _tpu_deepseek_v4_tokenizer
-    assert args == (base, )
+    assert args == (base,)
 
 
 def test_pickle_round_trip_keeps_the_wrapping(tokenizer):
@@ -262,11 +252,9 @@ def test_pickle_round_trip_keeps_the_wrapping(tokenizer):
     revived = pickle.loads(pickle.dumps(tokenizer))
 
     assert type(revived).__name__ == "_TpuDeepseekV4Tokenizer"
-    revived.apply_chat_template([{
-        "role": "assistant",
-        "content": "x"
-    }],
-                                continue_final_message=True)
+    revived.apply_chat_template(
+        [{"role": "assistant", "content": "x"}], continue_final_message=True
+    )
     assert revived.seen[-1]["kwargs"]["conversation"][-1]["wo_eos"] is True
 
 
@@ -297,9 +285,9 @@ def test_registration_binds_the_deepseek_v4_tokenizer_mode(monkeypatch):
 
     register_tokenizers()
 
-    registry.register.assert_called_once_with("deepseek_v4",
-                                              "vllm_torchtpu.tokenizers",
-                                              "TpuDeepseekV4Tokenizer")
+    registry.register.assert_called_once_with(
+        "deepseek_v4", "vllm_torchtpu.tokenizers", "TpuDeepseekV4Tokenizer"
+    )
 
 
 def test_from_pretrained_returns_a_wrapped_tokenizer(monkeypatch):
@@ -307,12 +295,10 @@ def test_from_pretrained_returns_a_wrapped_tokenizer(monkeypatch):
     inner = _FakeBaseTokenizer()
     deepseek_cls = MagicMock()
     deepseek_cls.from_pretrained.return_value = inner
-    monkeypatch.setattr("vllm.tokenizers.deepseek_v4.DeepseekV4Tokenizer",
-                        deepseek_cls)
+    monkeypatch.setattr("vllm.tokenizers.deepseek_v4.DeepseekV4Tokenizer", deepseek_cls)
 
     wrapped = TpuDeepseekV4Tokenizer.from_pretrained("some/model", trust=True)
 
-    deepseek_cls.from_pretrained.assert_called_once_with("some/model",
-                                                         trust=True)
+    deepseek_cls.from_pretrained.assert_called_once_with("some/model", trust=True)
     assert type(wrapped).__name__ == "_TpuDeepseekV4Tokenizer"
     assert isinstance(wrapped, _FakeBaseTokenizer)

@@ -61,7 +61,7 @@ def _decode_step(q, k, k_t, v, decay, beta, state, compute_dtype):
     Structure follows ``recurrent_gdn_per_seq``; the only change is that
     ``decay`` carries a ``d_k`` axis instead of being a scalar per head.
     """
-    contract_dk = (((2, ), (1, )), ((0, ), (0, )))
+    contract_dk = (((2,), (1,)), ((0,), (0,)))
 
     # Per-channel decay: scales row k of the state, broadcasting over d_v.
     state_decayed = state * decay
@@ -148,8 +148,8 @@ def _kernel(
     k = _l2_norm(k)
 
     decay_2d = jnp.exp(
-        _activate_gate(g_ref[0], a_log_ref[...], dt_bias_ref[...],
-                       lower_bound)).astype(compute_dtype)
+        _activate_gate(g_ref[0], a_log_ref[...], dt_bias_ref[...], lower_bound)
+    ).astype(compute_dtype)
 
     # Promote to the 3-D per-head layout the step works in. Adding leading or
     # trailing size-1 axes is free; moving d_k from lanes to sublanes is not,
@@ -158,9 +158,9 @@ def _kernel(
     k3 = k.reshape(n_v, 1, d_k)
     v3 = v.reshape(n_v, 1, -1)
     k_t = fused_transpose_broadcast(k3, src_dim=2, dst_dim=1)  # [n_v, d_k, 1]
-    decay = fused_transpose_broadcast(decay_2d.reshape(n_v, 1, d_k),
-                                      src_dim=2,
-                                      dst_dim=1)  # [n_v, d_k, 1]
+    decay = fused_transpose_broadcast(
+        decay_2d.reshape(n_v, 1, d_k), src_dim=2, dst_dim=1
+    )  # [n_v, d_k, 1]
     # beta arrives with n_v already on sublanes, so this needs no transpose --
     # unlike GDN, which receives it with n_v on lanes and must move it.
     beta = beta_ref[0].reshape(n_v, 1, 1).astype(compute_dtype)
@@ -172,11 +172,9 @@ def _kernel(
     state_in = jnp.swapaxes(stored, -1, -2) if state_transposed else stored
     state = jnp.where(use_carried_state, state_in, 0.0)
 
-    out, new_state = _decode_step(q3, k3, k_t, v3, decay, beta, state,
-                                  compute_dtype)
+    out, new_state = _decode_step(q3, k3, k_t, v3, decay, beta, state, compute_dtype)
 
-    new_stored = (jnp.swapaxes(new_state, -1, -2)
-                  if state_transposed else new_state)
+    new_stored = jnp.swapaxes(new_state, -1, -2) if state_transposed else new_state
     new_conv = jnp.concat([prev_conv[1:], mixed_qkv[None]], axis=0)
     new_stored_conv = new_conv
     # Invalid entries emit zeros and leave their slot as found. Their writes land
@@ -192,8 +190,13 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("lower_bound", "compute_dtype", "scale",
-                     "conv_state_dim_first", "state_transposed"),
+    static_argnames=(
+        "lower_bound",
+        "compute_dtype",
+        "scale",
+        "conv_state_dim_first",
+        "state_transposed",
+    ),
 )
 def decode_kda(
     mixed_qkv: jax.Array,  # [num_seqs, 3 * n_v * d_k]
@@ -231,24 +234,33 @@ def decode_kda(
     projection_size = n_v * d_k
     mixed_dim = mixed_qkv.shape[-1]
     if mixed_dim != 3 * projection_size:
-        raise ValueError(f"mixed_qkv must have width 3 * n_v * d_k = "
-                         f"{3 * projection_size}, got {mixed_dim}.")
+        raise ValueError(
+            f"mixed_qkv must have width 3 * n_v * d_k = "
+            f"{3 * projection_size}, got {mixed_dim}."
+        )
     if conv_weight.ndim != 4 or conv_weight.shape[1:] != (3, n_v, d_k):
         raise ValueError(
             f"conv_weight must have shape [kernel_size, 3, {n_v}, {d_k}], got "
-            f"{conv_weight.shape}.")
+            f"{conv_weight.shape}."
+        )
     kernel_size = conv_weight.shape[0]
     state_len = kernel_size - 1
-    expected_conv_tail = ((state_len, 3, n_v, d_k) if conv_state.ndim == 5 else
-                          ((mixed_dim, state_len) if conv_state_dim_first else
-                           (state_len, mixed_dim)))
+    expected_conv_tail = (
+        (state_len, 3, n_v, d_k)
+        if conv_state.ndim == 5
+        else (
+            (mixed_dim, state_len) if conv_state_dim_first else (state_len, mixed_dim)
+        )
+    )
     if conv_state.shape[1:] != expected_conv_tail:
-        raise ValueError(f"conv_state must end in {expected_conv_tail}, got "
-                         f"{conv_state.shape}.")
+        raise ValueError(
+            f"conv_state must end in {expected_conv_tail}, got {conv_state.shape}."
+        )
     d_v = state.shape[-1]
     if d_v != d_k:
         raise ValueError(
-            f"KDA decode currently requires d_v == d_k, got {d_v} and {d_k}.")
+            f"KDA decode currently requires d_v == d_k, got {d_v} and {d_k}."
+        )
     if scale is None:
         scale = d_k**-0.5
     if dt_bias is None:
@@ -256,7 +268,8 @@ def decode_kda(
     if dt_bias.shape != (n_v, d_k):
         raise ValueError(
             f"dt_bias must be [n_v, d_k] = {(n_v, d_k)} for the decode kernel; "
-            f"got {dt_bias.shape}.")
+            f"got {dt_bias.shape}."
+        )
 
     a_log_2d = a_log.reshape(n_v, 1)
 
@@ -276,8 +289,7 @@ def decode_kda(
         # Compatibility for direct callers using the former flat cache ABI.
         if conv_state_dim_first:
             conv_state = jnp.swapaxes(conv_state, 1, 2)
-        conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
-                                        d_k)
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v, d_k)
     mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
 
     # Per-sequence activations are indexed by grid step; the state pool is
@@ -287,7 +299,7 @@ def decode_kda(
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
-        grid=(num_seqs, ),
+        grid=(num_seqs,),
         in_specs=[
             pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi: (s, 0, 0, 0)),
             pl.BlockSpec((1, n_v, d_k), seq_map),  # g
@@ -295,22 +307,25 @@ def decode_kda(
             # last two dims to be divisible by (8, 128) or match the array, and
             # a 2-D [num_seqs, n_v] array blocked as [1, n_v] satisfies neither.
             pl.BlockSpec((1, n_v, 1), seq_map),  # beta
-            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
-                         (si[s], 0, 0, 0, 0)),  # convolution state
-            pl.BlockSpec((kernel_size, 3, n_v, d_k), lambda s, si, hi:
-                         (0, 0, 0, 0)),  # convolution weight
+            pl.BlockSpec(
+                (1, state_len, 3, n_v, d_k), lambda s, si, hi: (si[s], 0, 0, 0, 0)
+            ),  # convolution state
+            pl.BlockSpec(
+                (kernel_size, 3, n_v, d_k), lambda s, si, hi: (0, 0, 0, 0)
+            ),  # convolution weight
             pl.BlockSpec((n_v, 1), lambda s, si, hi: (0, 0)),  # a_log
             pl.BlockSpec((n_v, d_k), lambda s, si, hi: (0, 0)),  # dt_bias
             # Paged state: this is the gather, expressed as a DMA.
-            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
-                         (si[s], 0, 0, 0)),
+            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi: (si[s], 0, 0, 0)),
         ],
         out_specs=[
             pl.BlockSpec((1, n_v, d_v), seq_map),  # out
-            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
-                         (si[s], 0, 0, 0, 0)),  # convolution state
-            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
-                         (si[s], 0, 0, 0)),  # state
+            pl.BlockSpec(
+                (1, state_len, 3, n_v, d_k), lambda s, si, hi: (si[s], 0, 0, 0, 0)
+            ),  # convolution state
+            pl.BlockSpec(
+                (1, n_v, d_k, d_v), lambda s, si, hi: (si[s], 0, 0, 0)
+            ),  # state
         ],
     )
 
@@ -326,15 +341,11 @@ def decode_kda(
         kernel,
         grid_spec=grid_spec,
         out_shape=out_shapes,
-        input_output_aliases={
-            5: 1,
-            9: 2
-        },
+        input_output_aliases={5: 1, 9: 2},
         name="kda_decode_fused_conv_recurrent",
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary", ),
-            vmem_limit_bytes=int(0.9 *
-                                 pltpu.get_tpu_info().vmem_capacity_bytes),
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes),
         ),
     )(
         state_indices.astype(jnp.int32),
@@ -349,8 +360,7 @@ def decode_kda(
         state,
     )
     if len(conv_state_shape) != 5:
-        conv_state = conv_state.reshape(conv_state.shape[0], state_len,
-                                        mixed_dim)
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len, mixed_dim)
         if conv_state_dim_first:
             conv_state = jnp.swapaxes(conv_state, 1, 2)
     return out, conv_state.reshape(conv_state_shape), state

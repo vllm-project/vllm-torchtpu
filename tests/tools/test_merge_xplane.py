@@ -20,9 +20,13 @@ from vllm_torchtpu.tools import merge_xplane, xplane_pb2
 # The five planes a real Qwen3 TP=4 capture on v6e contains, in capture order.
 # All four ranks name their own chip `/device:TPU:0` and carry their own
 # `/host:metadata`, which is the collision the merge exists to resolve.
-_REAL_PLANES = ("/device:TPU:0", "/host:metadata",
-                "/device:CUSTOM:Megascale Trace", "Task Environment",
-                "/host:CPU")
+_REAL_PLANES = (
+    "/device:TPU:0",
+    "/host:metadata",
+    "/device:CUSTOM:Megascale Trace",
+    "Task Environment",
+    "/host:CPU",
+)
 
 
 def _write_trace(session_dir, rank, *, host="host-0", planes=_REAL_PLANES):
@@ -77,27 +81,35 @@ def test_merge_combines_ranks_into_one_xspace(tmp_path):
     assert [p.id for p in merged.planes] == list(range(1, 18))
     # Each rank's chip is renumbered globally.
     assert [n for n in names if n.startswith("/device:TPU")] == [
-        "/device:TPU:0", "/device:TPU:1", "/device:TPU:2", "/device:TPU:3"
+        "/device:TPU:0",
+        "/device:TPU:1",
+        "/device:TPU:2",
+        "/device:TPU:3",
     ]
     # A plane whose name carries no `:<id>` is tagged instead of renumbered.
     assert names.count("/device:CUSTOM:Megascale Trace [rank 2]") == 1
     assert names.count("/host:metadata") == 1
     assert [n for n in names if n.startswith("/host:CPU")] == [
-        "/host:CPU", "/host:CPU [1]", "/host:CPU [2]", "/host:CPU [3]"
+        "/host:CPU",
+        "/host:CPU [1]",
+        "/host:CPU [2]",
+        "/host:CPU [3]",
     ]
     assert "Task Environment [rank 2]" in names
 
-    for expected, plane in enumerate(p for p in merged.planes
-                                     if p.name.startswith("/host:CPU")):
+    for expected, plane in enumerate(
+        p for p in merged.planes if p.name.startswith("/host:CPU")
+    ):
         # Internal XProf keys host traces on process_id, so it has to be
         # present, distinct, and must not disturb existing stat metadata.
-        stat_id, = [
-            key for key, meta in plane.stat_metadata.items()
+        (stat_id,) = [
+            key
+            for key, meta in plane.stat_metadata.items()
             if meta.name == "process_id"
         ]
-        assert [
-            s.int64_value for s in plane.stats if s.metadata_id == stat_id
-        ] == [expected]
+        assert [s.int64_value for s in plane.stats if s.metadata_id == stat_id] == [
+            expected
+        ]
         assert plane.stat_metadata[2].name == "existing_2"
         # Thread lines are tagged so ranks stay apart, with no leading space
         # for lines that have no name of their own.
@@ -114,8 +126,12 @@ def test_merge_preserves_every_event(tmp_path):
         return sum(len(line.events) for p in space.planes for line in p.lines)
 
     dropped = sum(
-        len(line.events) for path in sources[1:] for p in _load(path).planes
-        if p.name == "/host:metadata" for line in p.lines)
+        len(line.events)
+        for path in sources[1:]
+        for p in _load(path).planes
+        if p.name == "/host:metadata"
+        for line in p.lines
+    )
     assert events(merged) == sum(events(_load(p)) for p in sources) - dropped
 
 
@@ -143,8 +159,10 @@ def test_devices_are_renumbered_across_hosts(tmp_path):
     merged, _, _ = _merge(tmp_path)
 
     assert [p.name for p in merged.planes] == [
-        "/device:TPU:0", "/device:TPU:0 SparseCore 0", "/device:TPU:1",
-        "/device:TPU:1 SparseCore 0"
+        "/device:TPU:0",
+        "/device:TPU:0 SparseCore 0",
+        "/device:TPU:1",
+        "/device:TPU:1 SparseCore 0",
     ]
     assert list(merged.hostnames) == ["host-a", "host-b"]
 
@@ -173,24 +191,27 @@ def test_cli_merges_each_phase_into_its_own_phase_directory(tmp_path):
     assert merge_xplane.main([str(tmp_path)]) == 0
 
     assert [
-        str(p.relative_to(tmp_path))
-        for p in sorted(tmp_path.glob("*/*.xplane.pb"))
+        str(p.relative_to(tmp_path)) for p in sorted(tmp_path.glob("*/*.xplane.pb"))
     ] == [
         "decode_only/decode_only_2026_08_20_10_00_00.xplane.pb",
         "prefill_only/prefill_only_2026_08_20_10_00_00.xplane.pb",
     ]
 
 
-@pytest.mark.parametrize("start, argument", [
-    (".", "."),
-    (".", "decode_only"),
-    (".", "decode_only/plugins"),
-    (".", "decode_only/plugins/profile"),
-    (".", "decode_only/plugins/profile/2026_08_20_10_00_00"),
-    ("decode_only/plugins/profile/2026_08_20_10_00_00", "."),
-])
+@pytest.mark.parametrize(
+    "start, argument",
+    [
+        (".", "."),
+        (".", "decode_only"),
+        (".", "decode_only/plugins"),
+        (".", "decode_only/plugins/profile"),
+        (".", "decode_only/plugins/profile/2026_08_20_10_00_00"),
+        ("decode_only/plugins/profile/2026_08_20_10_00_00", "."),
+    ],
+)
 def test_destination_follows_the_capture_not_the_invocation(
-        tmp_path, monkeypatch, start, argument):
+    tmp_path, monkeypatch, start, argument
+):
     """Any way of naming a phase writes the merged file to the same place.
 
     Relative arguments included: `_phase_dir` walks up with `dirname`, which
@@ -203,7 +224,8 @@ def test_destination_follows_the_capture_not_the_invocation(
     assert merge_xplane.main([argument]) == 0
 
     assert [
-        str(p.relative_to(tmp_path)) for p in tmp_path.glob("**/*.xplane.pb")
+        str(p.relative_to(tmp_path))
+        for p in tmp_path.glob("**/*.xplane.pb")
         if not p.name.startswith("rank")
     ] == ["decode_only/decode_only_2026_08_20_10_00_00.xplane.pb"]
 
@@ -242,8 +264,10 @@ def test_dry_run_reports_without_writing(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "rank(s) 1" in out
     # The destination is the point of the report, so it has to be the full path.
-    assert str(tmp_path / "decode_only" /
-               "decode_only_2026_08_20_10_00_00.xplane.pb") in out
+    assert (
+        str(tmp_path / "decode_only" / "decode_only_2026_08_20_10_00_00.xplane.pb")
+        in out
+    )
     assert not list(tmp_path.glob("*/*.xplane.pb"))
 
 
@@ -259,6 +283,6 @@ def test_rerunning_ignores_previously_merged_output(tmp_path):
 
     assert merge_xplane.main([str(tmp_path)]) == 0
 
-    assert [
-        str(p.relative_to(tmp_path)) for p in tmp_path.glob("*/*.xplane.pb")
-    ] == ["decode_only/decode_only_2026_08_20_10_00_00.xplane.pb"]
+    assert [str(p.relative_to(tmp_path)) for p in tmp_path.glob("*/*.xplane.pb")] == [
+        "decode_only/decode_only_2026_08_20_10_00_00.xplane.pb"
+    ]

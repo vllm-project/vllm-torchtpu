@@ -24,9 +24,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
-                                                  get_cp_group_layout,
-                                                  get_or_create_cp_mesh)
+from vllm_torchtpu.distributed.mesh_utils import (
+    CpGroupLayout,
+    get_cp_group_layout,
+    get_or_create_cp_mesh,
+)
 
 # The JAX mesh axis the DCP kernels shard the KV cache over.
 DCP_AXIS_NAME = "dcp"
@@ -36,6 +38,7 @@ def get_dcp_group() -> Any | None:
     """Return vLLM's DCP GroupCoordinator, or None if not initialized."""
     try:
         from vllm.distributed.parallel_state import get_dcp_group as _get_group
+
         return _get_group()
     except (AssertionError, ImportError):
         return None

@@ -35,16 +35,15 @@ serves every layer, and ``segment_ids`` are built with tensor ops only --
 ``seg[t] = #{cu_seqlens[i] <= t}`` via a broadcast compare, so each image (and
 the flash padding) gets a distinct, equality-masked segment.
 """
+
 import jax
 import torch
 import torch.nn.functional as F
 from torch_tpu._internal import pallas
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention.mm_encoder_attention import \
-    MMEncoderAttention
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 
-from vllm_torchtpu.kernels.flash_attention.kernel import (SegmentIds,
-                                                          flash_attention)
+from vllm_torchtpu.kernels.flash_attention.kernel import SegmentIds, flash_attention
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -54,8 +53,9 @@ _BLOCK_SIZE = 128
 _VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
-def _vision_flash_core(q: jax.Array, k: jax.Array, v: jax.Array,
-                       q_seg: jax.Array, kv_seg: jax.Array) -> jax.Array:
+def _vision_flash_core(
+    q: jax.Array, k: jax.Array, v: jax.Array, q_seg: jax.Array, kv_seg: jax.Array
+) -> jax.Array:
     # q,k,v: [batch, num_heads, seq, head_dim]; seg: [batch, seq]. sm_scale is
     # folded into q by the caller, so use 1.0 here.
     return flash_attention(
@@ -80,41 +80,45 @@ class TpuMMEncoderAttention(MMEncoderAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if TpuMMEncoderAttention._vision_op is None:
-            op = pallas.jax_op("pallas::vision_flash_attention",
-                               _vision_flash_core)
-            op.register_fake(
-                lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
+            op = pallas.jax_op("pallas::vision_flash_attention", _vision_flash_core)
+            op.register_fake(lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
             TpuMMEncoderAttention._vision_op = op
 
     def forward_oot(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            cu_seqlens: torch.Tensor | None = None,
-            max_seqlen: torch.Tensor | None = None,
-            sequence_lengths: torch.Tensor | None = None) -> torch.Tensor:
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # The flash kernel requires equal q/kv head counts; GQA encoders fall
         # back to the default SDPA path.
         if self.num_heads != self.num_kv_heads:
-            return self.forward_native(query, key, value, cu_seqlens,
-                                       max_seqlen, sequence_lengths)
+            return self.forward_native(
+                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
+            )
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         if q_len != kv_len:
-            return self.forward_native(query, key, value, cu_seqlens,
-                                       max_seqlen, sequence_lengths)
+            return self.forward_native(
+                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
+            )
         is_reshaped = query.dim() != 4
-        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len,
-                                                kv_len)
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
         output = self._flash_attention(query, key, value, cu_seqlens)
         if is_reshaped:
             output = output.reshape(bsz, q_len, -1)
         return output
 
-    def _flash_attention(self, q: torch.Tensor, k: torch.Tensor,
-                         v: torch.Tensor,
-                         cu_seqlens: torch.Tensor | None) -> torch.Tensor:
+    def _flash_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
         """q,k,v: ``[batch, seq, num_heads, head_dim]``; cu_seqlens packs images."""
         bsz, seq_len, num_heads, head_dim = q.shape
         pad = (-seq_len) % _BLOCK_SIZE  # flash kernel needs seq % 128 == 0
@@ -127,13 +131,10 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         positions = torch.arange(padded, device=q.device)
         if cu_seqlens is not None:
             cu = cu_seqlens.to(positions.dtype)
-            seg = (positions[None, :] >= cu[:,
-                                            None]).sum(dim=0).to(torch.int32)
+            seg = (positions[None, :] >= cu[:, None]).sum(dim=0).to(torch.int32)
             seg = seg.unsqueeze(0).expand(bsz, padded).contiguous()
         else:
-            seg = torch.zeros((bsz, padded),
-                              dtype=torch.int32,
-                              device=q.device)
+            seg = torch.zeros((bsz, padded), dtype=torch.int32, device=q.device)
             seg[:, :seq_len] = 1
 
         def _prep(x: torch.Tensor) -> torch.Tensor:

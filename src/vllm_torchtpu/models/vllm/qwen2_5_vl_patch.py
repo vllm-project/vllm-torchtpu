@@ -8,14 +8,11 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 
-def maybe_patch_qwen2_5_vl(
-        model_config: "ModelConfig | None" = None) -> bool | None:
-    if (model_config is None
-            or model_config.hf_config.model_type != "qwen2_5_vl"):
+def maybe_patch_qwen2_5_vl(model_config: "ModelConfig | None" = None) -> bool | None:
+    if model_config is None or model_config.hf_config.model_type != "qwen2_5_vl":
         return False
 
-    from vllm.model_executor.models.qwen2_5_vl import \
-        Qwen2_5_VLForConditionalGeneration
+    from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
     model_cls = Qwen2_5_VLForConditionalGeneration
     graph_forward = model_cls.encoder_cudagraph_forward
@@ -28,15 +25,17 @@ def maybe_patch_qwen2_5_vl(
     def normalized_graph_forward(self, values, path="default"):
         values = {
             **values,
-            "pixel_values":
-            self.input_norm(values["pixel_values"], self.visual.dtype),
+            "pixel_values": self.input_norm(values["pixel_values"], self.visual.dtype),
         }
         return graph_forward(self, values, path=path)
 
     @wraps(eager_forward)
     def normalized_eager_forward(self, mm_kwargs, path="default"):
-        key = ("pixel_values" if self.get_input_modality(mm_kwargs) == "image"
-               else "pixel_values_videos")
+        key = (
+            "pixel_values"
+            if self.get_input_modality(mm_kwargs) == "image"
+            else "pixel_values_videos"
+        )
         mm_kwargs = {
             **mm_kwargs,
             key: self.input_norm(mm_kwargs[key], self.visual.dtype),

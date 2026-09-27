@@ -40,7 +40,7 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     eval_args=(
         --config "$config_name"
         --run-lm-eval
-        --results-dir "/perf_eval_results/$config_name"
+        --results-dir "${ARTIFACTS_DIR:-/perf_eval_results}/$config_name"
     )
     if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
         eval_args+=(--run-code-eval)

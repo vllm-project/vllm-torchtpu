@@ -31,9 +31,8 @@ def kda_step(
     """One fp32 KDA recurrence step, shared by the kernel and tests."""
     activation_dtype = query.dtype
     query = query.astype(jnp.float32)
-    query *= jax.lax.rsqrt(
-        jnp.sum(query * query, axis=-1, keepdims=True) + 1e-6)
-    query *= query.shape[-1]**-0.5
+    query *= jax.lax.rsqrt(jnp.sum(query * query, axis=-1, keepdims=True) + 1e-6)
+    query *= query.shape[-1] ** -0.5
     key = key.astype(jnp.float32)
     key *= jax.lax.rsqrt(jnp.sum(key * key, axis=-1, keepdims=True) + 1e-6)
     value = value.astype(jnp.float32)
@@ -45,23 +44,16 @@ def kda_step(
         gate = lower_bound * jax.nn.sigmoid(decay * gate_input)
 
     state = state.astype(jnp.float32) * jnp.exp(gate)[..., None]
-    prediction = jnp.einsum("hk,hkv->hv",
-                            key,
-                            state,
-                            preferred_element_type=jnp.float32)
-    delta = jax.nn.sigmoid(beta.astype(
-        jnp.float32))[:, None] * (value - prediction)
+    prediction = jnp.einsum(
+        "hk,hkv->hv", key, state, preferred_element_type=jnp.float32
+    )
+    delta = jax.nn.sigmoid(beta.astype(jnp.float32))[:, None] * (value - prediction)
     state += key[..., None] * delta[:, None, :]
 
-    output = jnp.einsum("hk,hkv->hv",
-                        query,
-                        state,
-                        preferred_element_type=jnp.float32)
+    output = jnp.einsum("hk,hkv->hv", query, state, preferred_element_type=jnp.float32)
     output = output.astype(activation_dtype).astype(jnp.float32)
-    output *= jax.lax.rsqrt(
-        jnp.mean(output * output, axis=-1, keepdims=True) + eps)
-    output = (output *
-              norm_weight.astype(jnp.float32)).astype(activation_dtype)
+    output *= jax.lax.rsqrt(jnp.mean(output * output, axis=-1, keepdims=True) + eps)
+    output = (output * norm_weight.astype(jnp.float32)).astype(activation_dtype)
     output *= jax.nn.sigmoid(output_gate)
     return output, state
 
@@ -69,7 +61,7 @@ def kda_step(
 @functools.partial(
     jax.jit,
     static_argnames=("lower_bound", "eps"),
-    donate_argnames=("recurrent_state", ),
+    donate_argnames=("recurrent_state",),
 )
 def ragged_kda(
     mixed_qkv: jax.Array,
@@ -99,32 +91,36 @@ def ragged_kda(
     if output_gate.shape != (num_tokens, num_heads * head_dim):
         raise ValueError("Incompatible KDA output-gate shape")
     num_sequences = state_indices.shape[0]
-    if a_log.shape != (num_heads, ):
+    if a_log.shape != (num_heads,):
         raise ValueError("KDA A_log shape does not match the head count")
-    if dt_bias.shape != (num_heads * head_dim, ):
+    if dt_bias.shape != (num_heads * head_dim,):
         raise ValueError("KDA dt_bias shape does not match the projection")
-    if norm_weight.shape != (head_dim, ):
+    if norm_weight.shape != (head_dim,):
         raise ValueError("KDA norm weight shape does not match the head size")
-    if query_start_loc.shape != (num_sequences + 1, ):
+    if query_start_loc.shape != (num_sequences + 1,):
         raise ValueError("KDA query starts and state indices disagree")
-    if seq_lens.shape != (num_sequences, ):
+    if seq_lens.shape != (num_sequences,):
         raise ValueError("KDA sequence lengths and state indices disagree")
-    if (raw_gate.dtype != mixed_qkv.dtype or beta.dtype != mixed_qkv.dtype
-            or output_gate.dtype != mixed_qkv.dtype):
+    if (
+        raw_gate.dtype != mixed_qkv.dtype
+        or beta.dtype != mixed_qkv.dtype
+        or output_gate.dtype != mixed_qkv.dtype
+    ):
         raise TypeError("KDA activations must have one common dtype")
     if recurrent_state.dtype != jnp.float32:
         raise TypeError("KDA recurrent state must be float32")
     if a_log.dtype != jnp.float32 or dt_bias.dtype != jnp.float32:
         raise TypeError("KDA A_log and dt_bias must be float32")
-    if (query_start_loc.dtype != jnp.int32 or state_indices.dtype != jnp.int32
-            or seq_lens.dtype != jnp.int32):
+    if (
+        query_start_loc.dtype != jnp.int32
+        or state_indices.dtype != jnp.int32
+        or seq_lens.dtype != jnp.int32
+    ):
         raise TypeError("KDA metadata tensors must be int32")
 
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-    sequence_ids = jnp.searchsorted(query_start_loc[1:],
-                                    token_ids,
-                                    side="right")
+    sequence_ids = jnp.searchsorted(query_start_loc[1:], token_ids, side="right")
     sequence_ids = jnp.minimum(sequence_ids, num_sequences - 1)
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     has_initial_state = seq_lens > query_lens
@@ -132,15 +128,24 @@ def ragged_kda(
     dt_bias_heads = dt_bias.reshape(num_heads, head_dim)
 
     def step(state, inputs):
-        (token_id, qkv_token, gate_token, beta_token, output_gate_token,
-         sequence_id) = inputs
+        (
+            token_id,
+            qkv_token,
+            gate_token,
+            beta_token,
+            output_gate_token,
+            sequence_id,
+        ) = inputs
         valid = token_id < total_tokens
         state_idx = state_indices[sequence_id]
         safe_state_idx = jnp.maximum(state_idx, 0)
         token_state = state[safe_state_idx]
         is_first = token_id == query_start_loc[sequence_id]
-        token_state = jnp.where(is_first & ~has_initial_state[sequence_id],
-                                jnp.zeros_like(token_state), token_state)
+        token_state = jnp.where(
+            is_first & ~has_initial_state[sequence_id],
+            jnp.zeros_like(token_state),
+            token_state,
+        )
         qkv = qkv_token.reshape(3, num_heads, head_dim)
         output, next_token_state = kda_step(
             qkv[0],

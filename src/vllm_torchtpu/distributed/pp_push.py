@@ -41,6 +41,8 @@ reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
 """
+
+import contextlib
 from concurrent.futures import Future
 from typing import Any
 
@@ -88,11 +90,12 @@ class _WaveState:
             self.open = False
             self.settles += 1
             if self.settles <= 5 or self.settles % 100 == 0:
-                logger.debug("PP wave settle %d before waiting on step %d",
-                             self.settles, step)
-            executor.collective_rpc("pp_settle",
-                                    non_block=True,
-                                    unique_reply_rank=executor.output_rank)
+                logger.debug(
+                    "PP wave settle %d before waiting on step %d", self.settles, step
+                )
+            executor.collective_rpc(
+                "pp_settle", non_block=True, unique_reply_rank=executor.output_rank
+            )
             return
         need = self.stages - 2 - (self.steps - step)
         if need <= 0:
@@ -100,12 +103,16 @@ class _WaveState:
         self.pushes += need
         if self.pushes <= 5 or self.pushes % 100 == 0:
             logger.debug(
-                "PP wave: %d pushes (%d total) before waiting on "
-                "step %d of %d", need, self.pushes, step, self.steps)
+                "PP wave: %d pushes (%d total) before waiting on step %d of %d",
+                need,
+                self.pushes,
+                step,
+                self.steps,
+            )
         for _ in range(need):
-            executor.collective_rpc("pp_push",
-                                    non_block=True,
-                                    unique_reply_rank=executor.output_rank)
+            executor.collective_rpc(
+                "pp_push", non_block=True, unique_reply_rank=executor.output_rank
+            )
         self.steps += need
 
 
@@ -118,8 +125,9 @@ class _PushFuture(Future):
     pushes otherwise.
     """
 
-    def __init__(self, inner: Future, executor: Any, wave: _WaveState,
-                 step: int, real_step: int):
+    def __init__(
+        self, inner: Future, executor: Any, wave: _WaveState, step: int, real_step: int
+    ):
         super().__init__()
         self._inner = inner
         self._executor = executor
@@ -135,10 +143,8 @@ class _PushFuture(Future):
         self._wave.before_waiting(self._executor, self._step, self._real_step)
         # The executor's future resolves only inside result(); a stored
         # exception raises there and is read back below.
-        try:
+        with contextlib.suppress(Exception):
             self._inner.result(timeout)
-        except Exception:
-            pass
         return self._inner.exception(timeout=0)
 
     def done(self):
@@ -182,14 +188,16 @@ def _widen_rpc_ring(stages: int) -> None:
     global _ring_chunks_needed
     _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages))
     from vllm.distributed.device_communicators import shm_broadcast
+
     cls = shm_broadcast.MessageQueue
     if getattr(cls, "_tpu_pp_wave_patch", False):
         return
     orig_init = cls.__init__
 
     def __init__(self, n_reader, n_local_reader, *args, **kwargs):
-        kwargs["max_chunks"] = max(int(kwargs.get("max_chunks", 10)),
-                                   _ring_chunks_needed)
+        kwargs["max_chunks"] = max(
+            int(kwargs.get("max_chunks", 10)), _ring_chunks_needed
+        )
         orig_init(self, n_reader, n_local_reader, *args, **kwargs)
 
     cls.__init__ = __init__
@@ -223,6 +231,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return
     _widen_rpc_ring(stages)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
     if getattr(MultiprocExecutor, "_tpu_pp_wave_patch", False):
         return
     orig_execute = MultiprocExecutor.execute_model
@@ -232,8 +241,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         state = getattr(executor, "_tpu_wave_state", None)
         if state is None:
             state = _WaveState(
-                int(executor.vllm_config.parallel_config.pipeline_parallel_size
-                    ))
+                int(executor.vllm_config.parallel_config.pipeline_parallel_size)
+            )
             executor._tpu_wave_state = state
         return state
 
@@ -253,13 +262,13 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         inner = orig_sample(self, grammar_output, non_block=True)
         # Sampling belongs to the last dispatched step, whatever pushes
         # went out since.
-        future = _PushFuture(inner, self, state, state.last_step,
-                             state.real_steps)
+        future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
-        "PP wave: engine push and settle installed, message ring "
-        "%d chunks", _ring_chunks_needed)
+        "PP wave: engine push and settle installed, message ring %d chunks",
+        _ring_chunks_needed,
+    )

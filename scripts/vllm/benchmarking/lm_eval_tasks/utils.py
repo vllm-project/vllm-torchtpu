@@ -26,7 +26,6 @@ evalplus's response sanitizer.
 """
 
 import re
-from typing import Union
 
 import evaluate as hf_evaluate
 
@@ -38,7 +37,7 @@ CODE_EVAL_TIMEOUT_S = 15.0
 
 
 def pass_at_1(
-    references: Union[str, list[str]], predictions: Union[list[str], list[list[str]]]
+    references: str | list[str], predictions: list[str] | list[list[str]]
 ) -> list[float]:
     if isinstance(references, str):
         references = [references]

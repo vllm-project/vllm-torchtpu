@@ -71,6 +71,15 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: status.podIP
+                # Both caches on the fleet's compilation bucket, mounted at
+                # /cache/jax. The default for VLLM_CACHE_ROOT is under the home
+                # directory, on the node's boot disk, which it does not fit on -
+                # so unset, each run recompiles its shapes and the first
+                # benchmark cell pays for it.
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm
                 # What the benchmark's dependsOn waits on: ready means the server
                 # answers, not that the container started.
                 readinessProbe:
@@ -129,6 +138,10 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: status.podIP
+                - name: VLLM_XLA_CACHE_PATH
+                  value: /cache/jax/xla
+                - name: VLLM_CACHE_ROOT
+                  value: /cache/jax/vllm
                 # What the benchmark's dependsOn waits on: ready means the server
                 # answers, not that the container started.
                 readinessProbe:

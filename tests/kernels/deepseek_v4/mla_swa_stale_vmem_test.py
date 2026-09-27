@@ -71,8 +71,9 @@ def _poison_vmem(fill):
 # The aliased operands are donated so XLA inserts no copies between the
 # poison and the kernel; a copy would overwrite the poisoned VMEM.
 @functools.partial(jax.jit, donate_argnums=(2, 6, 7, 8))
-def _decode(q, new_kv, cache, kv_lens, page_indices, cu_q_lens, in_out, l_sum,
-            m_max, sinks):
+def _decode(
+    q, new_kv, cache, kv_lens, page_indices, cu_q_lens, in_out, l_sum, m_max, sinks
+):
     batch = kv_lens.shape[0]
     return mla_swa.run_mla_batched_decode_kernel(
         q,
@@ -99,25 +100,26 @@ def _decode(q, new_kv, cache, kv_lens, page_indices, cu_q_lens, in_out, l_sum,
 
 
 class MlaSwaStaleVmemTest(parameterized.TestCase):
-
     def setUp(self):
         super().setUp()
         self.kv_lens = np.array([3, 9, 17, 40, 64, 100, 127, 128])
         batch = len(self.kv_lens)
         rng = np.random.default_rng(0)
         total_pages = batch * PAGES_PER_SEQ
-        tok = jnp.asarray(rng.standard_normal((total_pages * PAGE, HEAD_DIM)),
-                          jnp.bfloat16)
+        tok = jnp.asarray(
+            rng.standard_normal((total_pages * PAGE, HEAD_DIM)), jnp.bfloat16
+        )
         self.cache = mla_swa.prepare_kv_inputs(tok).reshape(
-            total_pages, PAGE * 2, 4, 128)
-        self.q = jnp.asarray(rng.standard_normal((batch, HEADS, HEAD_DIM)),
-                             jnp.bfloat16)
-        new_kv = jnp.asarray(rng.standard_normal((batch, HEAD_DIM)),
-                             jnp.bfloat16)
+            total_pages, PAGE * 2, 4, 128
+        )
+        self.q = jnp.asarray(
+            rng.standard_normal((batch, HEADS, HEAD_DIM)), jnp.bfloat16
+        )
+        new_kv = jnp.asarray(rng.standard_normal((batch, HEAD_DIM)), jnp.bfloat16)
         self.new_kv = mla_swa.prepare_kv_inputs(new_kv).reshape(batch, 8, 128)
         self.page_indices = jnp.arange(total_pages, dtype=jnp.int32)
         self.cu_q_lens = jnp.arange(batch + 1, dtype=jnp.int32)
-        self.sinks = jnp.zeros((HEADS, ), jnp.float32)
+        self.sinks = jnp.zeros((HEADS,), jnp.float32)
 
     def _step(self, fill):
         batch = len(self.kv_lens)
@@ -129,9 +131,18 @@ class MlaSwaStaleVmemTest(parameterized.TestCase):
             a.block_until_ready()
         _poison_vmem(fill).block_until_ready()
         kv_lens = jnp.asarray(self.kv_lens, jnp.int32)
-        out, _, l_sum, m_max = _decode(self.q, self.new_kv, cache, kv_lens,
-                                       self.page_indices, self.cu_q_lens,
-                                       in_out, l_sum, m_max, self.sinks)
+        out, _, l_sum, m_max = _decode(
+            self.q,
+            self.new_kv,
+            cache,
+            kv_lens,
+            self.page_indices,
+            self.cu_q_lens,
+            in_out,
+            l_sum,
+            m_max,
+            self.sinks,
+        )
         out = np.asarray(out.astype(jnp.float32))
         return out, np.asarray(l_sum), np.asarray(m_max)
 

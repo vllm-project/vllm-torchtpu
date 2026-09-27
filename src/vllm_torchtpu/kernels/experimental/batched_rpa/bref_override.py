@@ -34,12 +34,11 @@ class _BypassRef(pltpu.BufferedRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class KVBufferedRefSeqAlongLane(_BypassRef):
     """Handles fetching/updating KV cache using SEQ_ALONG_LANE memory layout."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -84,19 +83,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i)
+                    block_idx, b, i
+                )
                 hbm_p_idx = page_indices_ref[p_idx]
                 sz = dma_valid * self.cfgs.serve.page_size
                 num_lanes = pltpu.get_tpu_info().num_lanes
                 dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
-                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
+                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
                 pltpu.make_async_copy(
-                    kv_cache_hbm.at[hbm_p_idx, :, :, :,
-                                    pl.ds(0, sz)],
-                    vmem_dst_lane.at[b, :, :, :,
-                                     pl.ds(dst_off, sz)],
+                    kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
                     sem,
                 ).start()
 
@@ -109,12 +109,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 src_new_off = pl.multiple_of(src_new_off, 128)
                 dst_vmem_off = pl.multiple_of(dst_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
-                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
+                #     total_new_tokens)
+                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
                 pltpu.make_async_copy(
                     new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
-                    vmem_dst_lane.at[b, :, :, :,
-                                     pl.ds(dst_vmem_off, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
                     sem,
                 ).start()
 
@@ -137,15 +138,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 src_vmem_off = dma_entry.wb_vmem[...]
                 dma_valid = dma_entry.wb_val
                 hbm_p_idx = page_indices_ref[dst_hbm_p]
-                sz = jnp.where(do_writeback,
-                               dma_valid * self.cfgs.serve.page_size, 0)
+                sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
                 pltpu.make_async_copy(
-                    vmem_src_lane.at[b, :, :, :,
-                                     pl.ds(src_vmem_off, sz)],
-                    kv_out_ref.at[hbm_p_idx, :, :, :,
-                                  pl.ds(0, sz)],
+                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
+                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
                     sem,
                 ).start()
 
@@ -157,67 +155,46 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         _, _, schedule_ref, _ = src_ref
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
 
-        for b in range(self.cfgs.batch_size):
-            total_pages_b = 0
-            for i in range(self.cfgs.bkv_p_cache):
-                _, _, dma_valid = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i)
-                total_pages_b += dma_valid
-            for i in range(self.cfgs.bkv_p_new):
-                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-                dma_valid = dma_entry.fetch_val
-                total_pages_b += jnp.where(dma_valid > 0, 1, 0)
-
-            sz = total_pages_b * self.cfgs.serve.page_size
-            sz = pl.multiple_of(sz, 128)
-            pltpu.make_async_copy(
-                vmem_dst.at[b, :, :, :, pl.ds(0, sz)],
-                vmem_dst.at[b, :, :, :, pl.ds(0, sz)],
-                sem,
-            ).wait()
+        vmem_dst = self.window_ref.at[slot]
+        vmem_u32 = vmem_dst.bitcast(jnp.uint32)
+        flat_dst = vmem_u32.reshape((-1, 128))
+        # (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+        pltpu.make_async_copy(
+            flat_dst.at[pl.ds(0, wait_lanes), :],
+            flat_dst.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
 
     def wait_out(
         self,
         dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
+        _, _, schedule_ref, _ = dst_ref
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
 
-        for b in range(self.cfgs.batch_size):
-            do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
-            total_pages_b = 0
-            for i in range(self.cfgs.bkv_p_new):
-                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-                dma_valid = dma_entry.wb_val
-                total_pages_b += jnp.where(do_writeback, dma_valid, 0)
-
-            sz = total_pages_b * self.cfgs.serve.page_size
-            sz = pl.multiple_of(sz, 128)
-            dma_entry_0 = schedule_ref.dma_kv_new[block_idx, b, 0]
-            dst_hbm_p = dma_entry_0.wb_hbm[...]
-            hbm_p_idx = page_indices_ref[dst_hbm_p]
-            pltpu.make_async_copy(
-                kv_out_ref.at[hbm_p_idx, :, :, :,
-                              pl.ds(0, sz)],
-                kv_out_ref.at[hbm_p_idx, :, :, :,
-                              pl.ds(0, sz)],
-                sem,
-            ).wait()
+        vmem_src = self.window_ref.at[slot]
+        vmem_u32 = vmem_src.bitcast(jnp.uint32)
+        flat_src = vmem_u32.reshape((-1, 128))
+        pltpu.make_async_copy(
+            flat_src.at[pl.ds(0, wait_lanes), :],
+            flat_src.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class KVBufferedRefHeadAlongSublane(_BypassRef):
     """Handles fetching and updating KV cache using HEAD_ALONG_SUBLANE memory layout."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -229,8 +206,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
+        assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
 
         standard_ref = _BypassRef.create(
             spec=spec,
@@ -259,9 +235,11 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         sem = self.sem_recvs.at[slot]
         block_idx = jnp.maximum(grid_indices[0], 0)
 
-        vmem_dst = self.window_ref.at[slot, :, :, :self.cfgs.kv_hbm_stride]
-        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+        vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+        #     packing, page_size)
+        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
+        #     packing, page_size)
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         dma_list_cache = []
@@ -269,8 +247,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i)
+                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                 src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
                 dma_list_cache.append((src_off, dst_off, sz, b))
 
@@ -311,7 +288,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         block_idx = grid_indices[0]
 
         kv_out_ref_flat = kv_out_ref.reshape(-1, *kv_out_ref.shape[2:])
-        vmem_src = self.window_ref.at[slot, :, :, :self.cfgs.kv_hbm_stride]
+        vmem_src = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
 
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -322,8 +299,9 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 new_sz = dma_entry.wb_val
                 global_p_idx = encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
                 p_off = encoded_dst_hbm_off & self.cfgs.serve.page_size_mask
-                dst_hbm_off = (page_indices_ref[global_p_idx] <<
-                               self.cfgs.serve.page_size_log2) | p_off
+                dst_hbm_off = (
+                    page_indices_ref[global_p_idx] << self.cfgs.serve.page_size_log2
+                ) | p_off
                 sz = jnp.where(do_writeback, new_sz, 0)
                 pltpu.make_async_copy(
                     vmem_src.at[b, pl.ds(src_vmem_off, sz)],
@@ -339,25 +317,15 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         _, _, schedule_ref, _ = src_ref
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
 
-        total_sz = 0
-        for b in range(self.cfgs.batch_size):
-            for i in range(self.cfgs.bkv_p_cache):
-                _, _, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-                total_sz += sz
-
-            # Contiguous wait for new KV
-            for i in range(self.cfgs.bkv_p_new):
-                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-                total_sz += dma_entry.fetch_val
-
-        # Flatten the first two dimensions (Batch, Seq) to create a 1D view.
-        flat_vmem = vmem_dst.reshape((-1, *vmem_dst.shape[2:]))
+        vmem_dst = self.window_ref.at[slot]
+        vmem_u32 = vmem_dst.bitcast(jnp.uint32)
+        flat_dst = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
-            flat_vmem.at[pl.ds(0, total_sz), :self.cfgs.kv_hbm_stride],
-            flat_vmem.at[pl.ds(0, total_sz), :self.cfgs.kv_hbm_stride],
+            flat_dst.at[pl.ds(0, wait_lanes), :],
+            flat_dst.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
 
@@ -366,49 +334,40 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
+        _, _, schedule_ref, _ = dst_ref
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
 
-        total_sz = 0
-        for b in range(self.cfgs.batch_size):
-            do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
-            for i in range(self.cfgs.bkv_p_new):
-                dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
-                new_sz = dma_entry.wb_val
-                sz = jnp.where(do_writeback, new_sz, 0)
-                total_sz += sz
-
-        # Flatten to 2D: (Total_Rows, Head_Dim)
-        flat_ref = kv_out_ref.reshape((-1, *kv_out_ref.shape[2:]))
+        vmem_src = self.window_ref.at[slot]
+        vmem_u32 = vmem_src.bitcast(jnp.uint32)
+        flat_src = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
-            flat_ref.at[pl.ds(0, total_sz)],
-            flat_ref.at[pl.ds(0, total_sz)],
+            flat_src.at[pl.ds(0, wait_lanes), :],
+            flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingORef(pltpu.BufferedRef):
     """Handles normalizing and storing the final attention output."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
         cls,
         spec: pl.BlockSpec,
         dtype_or_type: jax.Array,
-        buffer_type,  # pltpu.BufferType,
+        buffer_type: pltpu.BufferType,
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.OUTPUT
+        assert buffer_type == pltpu.BufferType.OUTPUT
 
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
@@ -464,42 +423,115 @@ class BatchingORef(pltpu.BufferedRef):
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_o_out[block_idx]
 
-        total_sz = 0
-        for b in range(self.cfgs.batch_size):
-            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
-            _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-            q_sz = jnp.where(is_last_k, q_sz, 0)
-            total_sz += q_sz
-
-        flat_ref = o_hbm.reshape((-1, *o_hbm.shape[2:]))
+        ref_u32 = o_hbm.bitcast(jnp.uint32)
+        flat_ref = ref_u32.reshape((-1, 128))
         pltpu.make_async_copy(
-            flat_ref.at[pl.ds(0, total_sz * o_hbm.shape[0])],
-            flat_ref.at[pl.ds(0, total_sz * o_hbm.shape[0])],
+            flat_ref.at[pl.ds(0, wait_lanes), :],
+            flat_ref.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class BatchingQRef(pltpu.BufferedRef):
-    """Handles fetching Q blocks using precomputed metadata."""
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BatchingLSERef(pltpu.BufferedRef):
+    """Handles writing LSE values to HBM, overlapped with compute via
+    double buffering."""
 
-    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
-                                                 metadata=dict(static=True))
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
     def create(
         cls,
         spec: pl.BlockSpec,
         dtype_or_type: jax.Array,
-        buffer_type,  # pltpu.BufferType,
+        buffer_type,
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
     ):
-        # TODO(kyuyeunk): Uncomment this out after jax version update.
-        # assert buffer_type == pltpu.BufferType.INPUT
+        standard_ref = pltpu.BufferedRef.create(
+            spec=spec,
+            dtype_or_type=dtype_or_type,
+            buffer_type=buffer_type,
+            buffer_count=buffer_count,
+            grid_rank=1,
+            use_lookahead=use_lookahead,
+        )
+        return cls(
+            cfgs=cfgs,
+            **{
+                f.name: getattr(standard_ref, f.name)
+                for f in dataclasses.fields(pltpu.BufferedRef)
+            },
+        )
+
+    def copy_out(
+        self,
+        dst_ref: tuple[jax.Ref, schedule.RpaSchedule],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_src = self.window_ref.at[slot]
+        block_idx = grid_indices[0]
+        dma_list = []
+        for b in range(self.cfgs.batch_size):
+            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+            q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
+            q_sz = jnp.where(is_last_k, q_sz, 0)
+            dma_list.append((q_src, q_sz, b))
+        for i in range(len(dma_list)):
+            q_src, q_sz, b = dma_list[i]
+            # Tokens are a leading dimension, outside the tiled head/lane
+            # axes. Copy whole token records, matching BatchingORef.
+            pltpu.make_async_copy(
+                vmem_src.at[b, :, pl.ds(0, q_sz)],
+                lse_hbm.at[:, pl.ds(q_src, q_sz)],
+                sem,
+            ).start()
+
+    def wait_out(
+        self,
+        dst_ref: tuple[jax.Ref, schedule.RpaSchedule],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_wait_out_slot
+        sem = self.sem_sends.at[slot]
+        block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
+        # Packed token records can contribute fewer than eight u32 rows.
+        ref_u32 = lse_hbm.bitcast(jnp.uint32)
+        flat_ref = ref_u32.reshape((-1, 128))
+        pltpu.make_async_copy(
+            flat_ref.at[pl.ds(0, wait_lanes), :],
+            flat_ref.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BatchingQRef(pltpu.BufferedRef):
+    """Handles fetching Q blocks using precomputed metadata."""
+
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
+
+    @classmethod
+    def create(
+        cls,
+        spec: pl.BlockSpec,
+        dtype_or_type: jax.Array,
+        buffer_type: pltpu.BufferType,
+        buffer_count: int,
+        use_lookahead: bool,
+        cfgs: configs.RpaConfigs,
+    ):
+        assert buffer_type == pltpu.BufferType.INPUT
 
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
@@ -552,17 +584,12 @@ class BatchingQRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst = self.window_ref.at[slot]
         block_idx = grid_indices[0]
+        wait_lanes = schedule_ref.total_wait_q_in[block_idx]
 
-        total_sz = 0
-        for b in range(self.cfgs.batch_size):
-            _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-            total_sz += q_sz
-
-        # Flatten to 2D: (Total_Rows, Head_Dim)
-        # vmem_dst is (Batch, Heads, Q, Head_Dim). We copy Heads * q_sz rows.
-        flat_vmem = vmem_dst.reshape((-1, *vmem_dst.shape[3:]))
+        vmem_u32 = vmem_dst.bitcast(jnp.uint32)
+        flat_vmem = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
-            flat_vmem.at[pl.ds(0, total_sz * vmem_dst.shape[1])],
-            flat_vmem.at[pl.ds(0, total_sz * vmem_dst.shape[1])],
+            flat_vmem.at[pl.ds(0, wait_lanes), :],
+            flat_vmem.at[pl.ds(0, wait_lanes), :],
             sem,
         ).wait()

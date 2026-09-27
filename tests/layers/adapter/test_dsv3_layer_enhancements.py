@@ -1,4 +1,6 @@
-"""Unit tests for DeepSeek V3 layer enhancements (Attention kwargs/reshape, Grouped Top-K MoE, Unaligned FP8)."""
+"""Unit tests for DeepSeek V3 layer enhancements (Attention kwargs/reshape,
+Grouped Top-K MoE, Unaligned FP8).
+"""
 
 from unittest.mock import MagicMock, patch
 
@@ -6,15 +8,17 @@ import torch
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.adapter.moe_routing import select_experts
-from vllm_torchtpu.layers.adapter.quantization.fp8 import \
-    _dequantize_fp8_linear
+from vllm_torchtpu.layers.adapter.quantization.fp8 import _dequantize_fp8_linear
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    set_vllm_model_wrapper_context
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 
 
 def test_pallas_attention_init_kwargs(vllm_config_context):
-    """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank without raising TypeError."""
+    """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank
+    without raising TypeError.
+    """
     backend = PallasAttentionBackendImpl(
         num_heads=16,
         head_size=256,
@@ -32,7 +36,9 @@ def test_pallas_attention_init_kwargs(vllm_config_context):
 
 
 def test_pallas_attention_forward_2d_reshape(vllm_config_context):
-    """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors to 3D and restores 2D output."""
+    """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors
+    to 3D and restores 2D output.
+    """
     q_len = 10
     num_heads = 4
     head_size = 64
@@ -69,13 +75,16 @@ def test_pallas_attention_forward_2d_reshape(vllm_config_context):
         return torch.ones_like(query)
 
     # Execute forward pass
-    with patch.object(PallasAttentionBackendImpl,
-                      "_build_rpa_kernel",
-                      return_value=fake_kernel), patch(
-                          "vllm_torchtpu.layers.adapter.attention."
-                          "synchronize_tensors",
-                          lambda *_args, **_kwargs: None,
-                      ), set_vllm_model_wrapper_context(mesh=MagicMock()):
+    with (
+        patch.object(
+            PallasAttentionBackendImpl, "_build_rpa_kernel", return_value=fake_kernel
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.attention.synchronize_tensors",
+            lambda *_args, **_kwargs: None,
+        ),
+        set_vllm_model_wrapper_context(mesh=MagicMock()),
+    ):
         out = backend.forward(
             query=query,
             key=key,
@@ -94,13 +103,14 @@ def test_pallas_attention_forward_2d_reshape(vllm_config_context):
 # would only exercise whichever one TPU_MOE_ROUTER_TOPK happens to select.
 @patch("vllm_torchtpu.layers.adapter.moe_routing._topk")
 def test_moe_routing_select_experts_grouped_topk(mock_topk):
-    """Test that select_experts correctly delegates to grouped_topk when use_grouped_topk is True."""
+    """Test that select_experts correctly delegates to grouped_topk when
+    use_grouped_topk is True.
+    """
     hidden_states = torch.ones(2, 1024, dtype=torch.bfloat16)
     router_logits = torch.ones(2, 64, dtype=torch.float32)
 
     # 1. Standard Top-K Path
-    mock_topk.return_value = (torch.ones(2, 4),
-                              torch.zeros(2, 4, dtype=torch.int64))
+    mock_topk.return_value = (torch.ones(2, 4), torch.zeros(2, 4, dtype=torch.int64))
     weights_std, ids_std = select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
@@ -122,10 +132,12 @@ def test_moe_routing_select_experts_grouped_topk(mock_topk):
     layer_mock.e_score_correction_bias = None
 
     with patch(
-            "vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk"
+        "vllm.model_executor.layers.fused_moe.router.grouped_topk_router.grouped_topk"
     ) as mock_grouped:
-        mock_grouped.return_value = (torch.ones(2, 4),
-                                     torch.zeros(2, 4, dtype=torch.int64))
+        mock_grouped.return_value = (
+            torch.ones(2, 4),
+            torch.zeros(2, 4, dtype=torch.int64),
+        )
         weights_grp, ids_grp = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -140,11 +152,14 @@ def test_moe_routing_select_experts_grouped_topk(mock_topk):
 
 
 def test_dequantize_fp8_linear_unaligned_dims():
-    """Test that _dequantize_fp8_linear correctly handles unaligned weight tensor dimensions via repeat_interleave."""
+    """Test that _dequantize_fp8_linear correctly handles unaligned weight tensor
+    dimensions via repeat_interleave.
+    """
     # Create unaligned weight tensor (e.g., 10x10 with block size 4x4)
     weight = torch.ones(10, 10, dtype=torch.float32)
-    weight_scale_inv = torch.ones(
-        3, 3, dtype=torch.float32) * 2.0  # 3x3 blocks cover 12x12
+    weight_scale_inv = (
+        torch.ones(3, 3, dtype=torch.float32) * 2.0
+    )  # 3x3 blocks cover 12x12
     weight_block_size = (4, 4)
 
     dequant = _dequantize_fp8_linear(
