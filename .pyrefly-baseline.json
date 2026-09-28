@@ -2317,6 +2317,16 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "unbound-name",
+      "concise_description": "`row_tokens` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
     },
