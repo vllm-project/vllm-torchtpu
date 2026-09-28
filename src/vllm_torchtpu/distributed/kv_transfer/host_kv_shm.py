@@ -28,6 +28,8 @@ try:
     import numpy as np
 except ImportError:  # pragma: no cover - numpy is present in normal installs.
     np = None
+import contextlib
+
 import torch
 
 from vllm_torchtpu.logger import init_logger
@@ -412,7 +414,7 @@ class HostKVShmPool:
                 "HostKVShmPool close: error closing shm %s", self._shm.name
             )
         if self._owner:
-            try:
+            # TODO: Track whether the segment was already unlinked and stop
+            # ignoring FileNotFoundError, so a missing segment is reported.
+            with contextlib.suppress(FileNotFoundError):
                 self._shm.unlink()
-            except FileNotFoundError:
-                pass

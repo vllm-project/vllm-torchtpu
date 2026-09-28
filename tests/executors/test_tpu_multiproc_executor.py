@@ -215,6 +215,8 @@ def test_ray_executor_raises_on_real_disagreement():
     executor = _make_ray_executor(
         engine_override=None, worker_overrides=[6456, 8000] * 16
     )
-    with patch.object(RayExecutorV2, "get_kv_cache_specs", return_value=_SPECS):
-        with pytest.raises(ValueError, match="workers disagree"):
-            executor.get_kv_cache_specs()
+    with (
+        patch.object(RayExecutorV2, "get_kv_cache_specs", return_value=_SPECS),
+        pytest.raises(ValueError, match="workers disagree"),
+    ):
+        executor.get_kv_cache_specs()

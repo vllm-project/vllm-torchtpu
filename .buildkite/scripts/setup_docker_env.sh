@@ -19,8 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-# shellcheck source=.buildkite/scripts/ci_image.sh
-source "${SCRIPT_DIR}/ci_image.sh"
+IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 # Resolve the target vLLM commit SHA from build metadata
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH" --default "")"
@@ -42,21 +41,7 @@ buildkite-agent meta-data set "CI_IMAGE_TAG" "${IMAGE_TAG}"
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"
 
-# A mirror push that fails is fatal, not a warning: the mirror exists for pulls
-# written down outside this tree, and those have no way to notice that what
-# they resolve is a week old. The tag is already pushed to IMAGE_REPO by here,
-# so a failure leaves the lane's own image intact and only this step red.
-MIRROR_TAGS=()
-# shellcheck disable=SC2086  # the list is space separated on purpose
-for MIRROR_REPO in ${CI_IMAGE_MIRROR_REPOS}; do
-  MIRROR_TAG="${MIRROR_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}"
-  MIRROR_TAGS+=("${MIRROR_TAG}")
-  echo "--- Mirroring Docker Image: ${MIRROR_TAG}"
-  docker tag "${IMAGE_TAG}" "${MIRROR_TAG}"
-  docker push "${MIRROR_TAG}"
-done
-
 echo "--- Cleaning up local built image"
-docker rmi "${IMAGE_TAG}" ${MIRROR_TAGS[@]+"${MIRROR_TAGS[@]}"} || true
+docker rmi "${IMAGE_TAG}" || true
 
 echo "--- Done setup_docker_env.sh"

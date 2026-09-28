@@ -10,7 +10,8 @@ def pytest_addoption(parser):
         "--expected-value",
         type=float,
         default=None,
-        help="This value will be used to compare the measure value and determine if the test passes or fails.",
+        help="This value will be used to compare the measure value and determine if "
+        "the test passes or fails.",
     )
     parser.addoption(
         "--model-name",

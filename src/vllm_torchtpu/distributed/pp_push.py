@@ -42,6 +42,7 @@ reply ring, so the widening is installed in the engine process and, through
 widest any pipeline in the process asked for.
 """
 
+import contextlib
 from concurrent.futures import Future
 from typing import Any
 
@@ -142,10 +143,8 @@ class _PushFuture(Future):
         self._wave.before_waiting(self._executor, self._step, self._real_step)
         # The executor's future resolves only inside result(); a stored
         # exception raises there and is read back below.
-        try:
+        with contextlib.suppress(Exception):
             self._inner.result(timeout)
-        except Exception:
-            pass
         return self._inner.exception(timeout=0)
 
     def done(self):

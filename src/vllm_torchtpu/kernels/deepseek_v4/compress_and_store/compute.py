@@ -191,10 +191,7 @@ def pack_nope_tiled(
     scale_flat = scale_bytes.reshape(tile_n, -1)  # (tile_n, S * num_blocks)
 
     # Select NOPE parts
-    if nope_dim < q_flat.shape[1]:
-        q_nope = q_flat[:, :nope_dim]
-    else:
-        q_nope = q_flat
+    q_nope = q_flat[:, :nope_dim] if nope_dim < q_flat.shape[1] else q_flat
 
     nope_blocks = (nope_dim + block_size - 1) // block_size
     if nope_blocks < scale_flat.shape[1]:

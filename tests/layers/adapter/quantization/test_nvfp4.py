@@ -329,7 +329,9 @@ class TestNvfp4LinearMethod:
 
 
 class TestNvfp4MoEMethod:
-    """Tests for VllmNvfp4MoEMethod weight creation, processing, and forward execution."""
+    """Tests for VllmNvfp4MoEMethod weight creation, processing, and
+    forward execution.
+    """
 
     def test_moe_properties(self):
         moe_cfg = MagicMock(has_bias=False, is_act_and_mul=True)

@@ -217,8 +217,14 @@ def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     return build()
 
 
-def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
+def _dense_reference(
+    mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, hash_ids=None
+):
     """The plain MoE: softmax, top-k, dense per-expert FFN, weighted sum.
+
+    `hash_ids` [tokens, topk] replaces the top-k selection with ids the caller
+    chose, keeping the weights as the scores at those ids -- the reference
+    form of DeepSeek-V4's table router.
 
     Every expert is applied to every token in f32 and weighted by the router
     weight of the slots that chose it, which is zero for a token that did
@@ -236,10 +242,15 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
     inter = w1.shape[2] // 2
     scaled = w1_scale is not None
 
-    def local(x_g, gating_g, w1_l, w2_l, *scales):
-        s1, s2 = scales if scaled else (None, None)
+    def local(x_g, gating_g, w1_l, w2_l, *scales_and_ids):
+        s1, s2 = scales_and_ids[:2] if scaled else (None, None)
+        ids_g = scales_and_ids[-1] if hash_ids is not None else None
         scores = jax.nn.softmax(gating_g.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = lax.top_k(scores, topk)
+        if ids_g is None:
+            topk_weights, topk_idx = lax.top_k(scores, topk)
+        else:
+            topk_idx = ids_g
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
         first = lax.axis_index(axis) * g_local
         x32 = x_g.astype(jnp.float32)
@@ -264,8 +275,16 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
         mine = lax.fori_loop(0, g_local, expert, jnp.zeros_like(x32))
         return lax.psum(mine, axis)
 
-    in_specs = (P(), P(), P(axis), P(axis)) + ((P(axis),) * 2 if scaled else ())
-    args = (x, gating, w1, w2) + ((w1_scale, w2_scale) if scaled else ())
+    in_specs = (
+        (P(), P(), P(axis), P(axis))
+        + ((P(axis),) * 2 if scaled else ())
+        + ((P(),) if hash_ids is not None else ())
+    )
+    args = (
+        (x, gating, w1, w2)
+        + ((w1_scale, w2_scale) if scaled else ())
+        + ((hash_ids,) if hash_ids is not None else ())
+    )
     return jax.jit(
         jax.shard_map(
             local, mesh=mesh, in_specs=in_specs, out_specs=P(), check_vma=False
@@ -369,6 +388,81 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         batch_bound=FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
         token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND,
     )
+
+
+def _make_hash_ids(mesh, seed, *, tokens, topk, e_total):
+    """Per-token expert ids, as DeepSeek-V4's table would hand them over.
+
+    Distinct within a row, because the real table is: a repeated id would
+    weight one expert twice, which is a routing question rather than a
+    kernel one and would make the reference the only thing under test.
+    """
+    rng = np.random.default_rng(seed)
+    ids = np.stack(
+        [rng.choice(e_total, size=topk, replace=False) for _ in range(tokens)]
+    ).astype(np.int32)
+    return jax.device_put(ids, NamedSharding(mesh, P(AXIS)))
+
+
+def test_hash_routing_serves_the_ids_it_was_given():
+    """DeepSeek-V4's bottom layers select by a table indexed on token id, not
+    by the gate. The gate is still scored -- the weights are its scores at the
+    given ids -- so the only thing that changes is which experts are chosen.
+
+    The control is the same layer with the ids withheld: if the operand were
+    ignored the kernel would fall back to its own top-k, and the two runs
+    would agree.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        30,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        31,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    hash_ids = _make_hash_ids(
+        mesh, 32, tokens=SMALL["tokens"], topk=SMALL["topk"], e_total=SMALL["e_total"]
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+    out = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, hash_topk_ids=hash_ids, **common
+    )
+    assert out.shape == x.shape
+    assert out.sharding.spec == x.sharding.spec
+
+    want = _dense_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        hash_ids=hash_ids,
+    )
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"
+
+    selected = fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    assert _relative_l2(selected, want) > ROTATED_CONTROL_FACTOR * error
 
 
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():

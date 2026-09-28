@@ -44,7 +44,8 @@ def pack_fp4_to_uint8(x):
 
 def pack_kv_cache_fp4_to_uint8(kv_cache):
     assert kv_cache.dtype == jnp.float4_e2m1fn
-    # kv_cache shape: (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 8, 8, page_size)
+    # kv_cache shape:
+    # (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 8, 8, page_size)
     # Transpose dim 3 (kv_packing=8) and 4 (page_size)
     kv_cache = kv_cache.transpose(0, 1, 2, 4, 3)
     # Reshape (..., 8) to (..., 4, 2)
@@ -58,7 +59,8 @@ def pack_kv_cache_fp4_to_uint8(kv_cache):
 
 def unpack_kv_cache_uint8_to_fp4(kv_cache):
     assert kv_cache.dtype == jnp.uint8
-    # kv_cache shape: (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 4, 4, page_size)
+    # kv_cache shape:
+    # (num_pages, num_kv_heads * 2, aligned_kv_head_dim // 4, 4, page_size)
     # Transpose dim 3 (kv_packing=4) and 4 (page_size)
     kv_cache = kv_cache.transpose(0, 1, 2, 4, 3)
     # Bitcast to float4

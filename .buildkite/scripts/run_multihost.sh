@@ -64,8 +64,7 @@ REPO_ROOT="${REPO_DIR}"
 RUN_CLUSTER="${REPO_DIR}/scripts/multihost/run_cluster.sh"
 RUN_CLUSTER_MP="${REPO_DIR}/scripts/multihost/run_cluster_mp.sh"
 
-# shellcheck source=.buildkite/scripts/ci_image.sh
-source "${SCRIPT_DIR}/ci_image.sh"
+IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then

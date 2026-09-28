@@ -381,7 +381,8 @@ class Configs:
 
     @property
     def state_rows_per_token(self) -> int:
-        """Number of physical HBM rows occupied by one token's full state (kv + score)."""
+        """Number of physical HBM rows occupied by one token's full state
+        (kv + score)."""
         return state_rows_per_token(
             self.dims.mode, self.dims.head_dim, self.dims.overlap
         )

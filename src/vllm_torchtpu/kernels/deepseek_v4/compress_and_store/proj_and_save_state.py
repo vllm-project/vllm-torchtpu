@@ -65,7 +65,8 @@ class Configs:
 
 
 def load_from_acc_ref(ref, dtype=None):
-    """Loads data from VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Loads data from VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 
@@ -83,7 +84,8 @@ def load_from_acc_ref(ref, dtype=None):
 
 
 def store_to_acc_ref(ref, val, dtype=None):
-    """Stores data to VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Stores data to VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 
@@ -323,8 +325,7 @@ def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     for cand in range(cap, 0, -align):
         if size_k % cand == 0:
             return cand
-    # should not reach here.
-    assert False, f"Cannot find a tile_k that divides size_k={size_k}"
+    raise AssertionError(f"Cannot find a tile_k that divides size_k={size_k}")
 
 
 @functools.partial(

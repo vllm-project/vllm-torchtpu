@@ -233,8 +233,8 @@ def select_experts(
     1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
     2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
        config actually requires grouped selection).
-    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
-       and optional `e_score_correction_bias`.
+    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for
+       DeepSeek-V4) and optional `e_score_correction_bias`.
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.

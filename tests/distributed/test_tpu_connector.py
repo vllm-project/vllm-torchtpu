@@ -32,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
+from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     DEFAULT_LABEL_VALUE,
     METRIC_TYPE_COUNTER,
@@ -40,6 +42,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
 )
+
+from .raiden_test_utils import dsv4_kv_cache_groups, dsv4_materialization
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta,
@@ -56,7 +60,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _CoordSendEntry,
     _Stage3LoadMeta,
     _Stage3RegisteredSend,
+    _Stage3TransferGroup,
     _select_committed_mamba_blocks,
+    _stage3_transfer_groups,
     stage3_fa_raiden_id_fields,
 )
 
@@ -122,6 +128,78 @@ def _make_stage3_hybrid_kv_cache_config(
     groups = list(mamba_groups)
     groups.insert(fa_group_index, fa_group)
     return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=groups)
+
+
+def _make_stage3_dsv4_kv_cache_config() -> KVCacheConfig:
+    """A DeepSeek-V4-shaped config: several attention groups, no Mamba."""
+    return KVCacheConfig(
+        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=dsv4_kv_cache_groups()
+    )
+
+
+def _mamba_only_groups():
+    hybrid = _make_stage3_hybrid_kv_cache_config(fa_group_index=0)
+    return [
+        group
+        for group in hybrid.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+
+
+@pytest.mark.parametrize(
+    "groups,multi_group,expected",
+    [
+        # Mamba state rides the state-class tags, not the page transfer.
+        (
+            lambda: _make_stage3_hybrid_kv_cache_config(
+                fa_group_index=2
+            ).kv_cache_groups,
+            False,
+            [(2, 16)],
+        ),
+        # Group order is preserved and each group keeps its own page size.
+        (
+            lambda: _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
+            True,
+            [(0, 1024), (1, 1024), (2, 128)],
+        ),
+    ],
+)
+def test_stage3_transfer_groups_keeps_each_groups_page_size(
+    groups, multi_group, expected
+):
+    plan = _stage3_transfer_groups(groups(), multi_group=multi_group)
+    assert [(group.cache_group_index, group.page_tokens) for group in plan] == expected
+
+
+@pytest.mark.parametrize(
+    "groups,multi_group,match",
+    [
+        (
+            lambda: _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
+            False,
+            "exactly one",
+        ),
+        # DSv4 admission on a one-group model is rejected at startup: the
+        # scheduler builds per-group block tables only when the plan has more
+        # than one group, while the worker's DSv4 path needs them for every
+        # request. Unchecked, that disagreement surfaces as a mid-transfer
+        # RuntimeError that takes the engine down.
+        (
+            lambda: _make_stage3_hybrid_kv_cache_config(
+                fa_group_index=2
+            ).kv_cache_groups,
+            True,
+            "TPU_RAIDEN_DSV4_ADMISSION",
+        ),
+        (_mamba_only_groups, True, "at least one non-Mamba"),
+    ],
+)
+def test_stage3_transfer_groups_rejects_a_plan_it_cannot_serve(
+    groups, multi_group, match
+):
+    with pytest.raises(ValueError, match=match):
+        _stage3_transfer_groups(groups(), multi_group=multi_group)
 
 
 @pytest.mark.parametrize(("num_speculative_blocks", "expected"), ((0, 14), (3, 11)))
@@ -532,11 +610,81 @@ class TestTPUConnector:
             assert connector.get_block_ids_with_load_errors_group_index() == 2
 
         mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
-            request, [30, 31], mamba_block_ids=[[10], [20], [40]]
+            request, [30, 31], mamba_block_ids=[[10], [20], [40]], group_block_ids=None
         )
         assert (
             mock_raiden_sched_cls.return_value._stage3_mamba_num_speculative_blocks == 3
         )
+        mock_raiden_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    def test_stage3_dsv4_admission_plans_every_attention_group(
+        self, mock_raiden_sched_cls, mock_raiden_worker_cls
+    ):
+        cfg = _make_vllm_config(is_producer=True)
+        cache_config = _make_stage3_dsv4_kv_cache_config()
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True
+            ),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        ):
+            connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER, cache_config)
+
+            assert [
+                group.cache_group_index for group in connector._stage3_transfer_groups
+            ] == [0, 1, 2]
+            assert connector.get_block_ids_with_load_errors_group_index() == 0
+            assert (
+                mock_raiden_sched_cls.return_value._stage3_transfer_groups
+                is connector._stage3_transfer_groups
+            )
+
+            # Every attention group's pages reach the scheduler, in the
+            # transfer plan's order.
+            expected = (True, {"uuid": 11})
+            mock_raiden_sched_cls.return_value.request_finished.return_value = expected
+            request = MagicMock()
+            assert (
+                connector.request_finished_all_groups(request, ([1], [2], [3, 4]))
+                == expected
+            )
+
+        mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
+            request, [1], mamba_block_ids=None, group_block_ids=[[1], [2], [3, 4]]
+        )
+        mock_raiden_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    def test_stage3_multi_group_without_dsv4_admission_is_rejected(
+        self, mock_raiden_sched_cls, mock_raiden_worker_cls
+    ):
+        """Only DSv4 admission lowers per-group spans. Any other multi-group
+        model must fail rather than ship group 0's pages alone."""
+        cfg = _make_vllm_config(is_producer=True)
+        cache_config = _make_stage3_dsv4_kv_cache_config()
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True
+            ),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        ):
+            connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER, cache_config)
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", False, create=True),
+            pytest.raises(NotImplementedError, match="TPU_RAIDEN_DSV4_ADMISSION"),
+        ):
+            connector.request_finished_all_groups(MagicMock(), ([1], [2], [3, 4]))
+
+        mock_raiden_sched_cls.return_value.request_finished.assert_not_called()
         mock_raiden_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
@@ -1208,7 +1356,9 @@ class TestTPURaidenConnectorScheduler:
         assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
 
     def test_v3_stage3_finish_rejects_exceeding_max_transfer_tokens(self):
-        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer and free blocks."""
+        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer
+        and free blocks.
+        """
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         req = MagicMock()
         req.request_id = "too-long"
@@ -2119,13 +2269,24 @@ def _synthetic_qwen35_unified_pool_materialization(*, tp_size: int, pcp_size: in
 
 
 class TestTPURaidenConnectorWorker:
-    def test_pcp_tp1_transfer_rank_preserves_main_cache_ownership(self):
+    def test_pcp_tp1_transfer_rank_is_the_pcp_rank(self):
+        """At tp_size == 1 the transfer rank is the PCP rank.
+
+        This case used to assert the opposite -- that the rank came from
+        `get_pcp_cache_rank`, the device-id readback #554 added -- and was
+        named for it. That readback existed because Torchtpu built the kernel
+        DeviceAssignment from device enumeration rather than from the mesh, so
+        the chunk a worker's kernels computed was not its PCP rank.
+        google-pytorch/torch_tpu#3522 removed the enumeration, the readback
+        went with it, and `_local_raiden_transfer_rank` now reads the PCP rank
+        directly. Measured, not assumed: with the mesh built from the process
+        group, a rank's compiled partition index equals its rank in that group
+        even for a non-contiguous group (ring_probe.py, split [0,2,4,6],
+        8/8 match, job j-881f1c8f).
+        """
         worker = _make_raiden_worker(tp_size=1, pcp_size=8)
-        with (
-            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1),
-            patch("vllm_torchtpu.distributed.pcp.get_pcp_cache_rank", return_value=3),
-        ):
-            assert worker._local_raiden_transfer_rank() == 3
+        with patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1):
+            assert worker._local_raiden_transfer_rank() == 1
 
     @pytest.mark.parametrize(
         "pcp,tp,k,v",
@@ -2153,15 +2314,14 @@ class TestTPURaidenConnectorWorker:
         for pcp_rank in range(pcp):
             for tp_rank in range(tp):
                 worker = _make_raiden_worker(tp_rank=tp_rank, tp_size=tp, pcp_size=pcp)
-                with (
-                    patch(
-                        "vllm_torchtpu.distributed.pcp.get_pcp_rank",
-                        return_value=pcp_rank,
-                    ),
-                    patch(
-                        "vllm_torchtpu.distributed.pcp.get_pcp_cache_rank",
-                        return_value=pcp_rank,
-                    ),
+                # Only the PCP rank is patched: since torch_tpu#3522 the
+                # transfer rank IS the PCP rank, and `get_pcp_cache_rank` --
+                # the device-id readback that stood in for it -- is gone.
+                # Both patches set the same value here anyway, so nothing
+                # this case asserts changes.
+                with patch(
+                    "vllm_torchtpu.distributed.pcp.get_pcp_rank",
+                    return_value=pcp_rank,
                 ):
                     rank = worker._local_raiden_transfer_rank()
                 ranks.append(rank)
@@ -2215,6 +2375,7 @@ class TestTPURaidenConnectorWorker:
                 kv_caches=list(named.values()),
                 kv_cache_raw_tensors=raw_tensors,
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                bm_pool_layout=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine()
@@ -2307,6 +2468,7 @@ class TestTPURaidenConnectorWorker:
             kv_caches=list(named.values()),
             kv_cache_raw_tensors=raw_tensors,
             kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+            bm_pool_layout=None,
         )
         worker.named_kv_caches = named
         engine = _FakeAdmissionRaidenEngine()
@@ -2586,6 +2748,7 @@ class TestTPURaidenConnectorWorker:
                 kv_caches=list(named.values()),
                 kv_cache_raw_tensors=[],
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                bm_pool_layout=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine(
@@ -2813,6 +2976,78 @@ class TestTPURaidenConnectorWorker:
         assert ssm.block_ids == (17,)
         assert ssm.declared_bytes == 4096
         assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 4096, 4096),)
+
+    @pytest.mark.parametrize(
+        ("minor_to_major", "kv_layout", "admitted"),
+        [
+            ([5, 4, 3, 2, 1, 0], "block-major", True),
+            ([4, 3, 2, 1, 0], "layer-major", True),
+            ([4, 3, 2, 1, 0], "block-major", False),
+            ([5, 4, 3, 2, 1, 0], "layer-major", False),
+        ],
+    )
+    def test_stage3_gdn_registration_admits_the_fingerprinted_layout(
+        self, minor_to_major, kv_layout, admitted
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (  # noqa: E501
+            BINDING_ALIASED_RAW,
+            PoolEntry,
+            PoolManifest,
+            RegionSpec,
+        )
+
+        # In block-major layout, `block_stride_bytes` spans the full 10-region row
+        # (10 * 8192 B) while `base_offset_bytes` points to the region's page offset.
+        conv_regions = (
+            RegionSpec("gdn_conv_qk", 0, 2048, 1024, 3, 1),
+            RegionSpec("gdn_conv_v", 1024, 2048, 256, 3, 4),
+        )
+        ssm_regions = (RegionSpec("gdn_ssm", 0, 1024, 1024, 4),)
+        manifest = PoolManifest(
+            binding=BINDING_ALIASED_RAW,
+            storages=[],
+            pools=[
+                PoolEntry(
+                    "gdn.conv.g0",
+                    "linear.0",
+                    0,
+                    3 * 8192 + 2048,
+                    10 * 8192,
+                    32,
+                    conv_regions,
+                    "bfloat16",
+                ),
+                PoolEntry(
+                    "gdn.ssm.g0",
+                    "linear.0",
+                    0,
+                    3 * 8192,
+                    10 * 8192,
+                    32,
+                    ssm_regions,
+                    "float32",
+                ),
+            ],
+        )
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+        )
+        worker._raiden_manifest = manifest
+        worker._raiden_layout_fingerprint_payload = {
+            "minor_to_major": minor_to_major,
+            "tiles": [[4, 128], [4, 1]],
+            "element_size_in_bits": 8,
+            "kv_layout": kv_layout,
+        }
+        worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
+        worker._stage3_state_group_count = 1
+
+        if admitted:
+            conv, ssm = worker._stage3_state_pool_spans([17], 0, 8)
+            assert (conv.declared_bytes, ssm.declared_bytes) == (6144, 4096)
+        else:
+            with pytest.raises(RuntimeError, match="admitted physical layout"):
+                worker._stage3_state_pool_spans([17], 0, 8)
 
     def test_v3_stage3_producer_registers_rank_stripe_and_releases_on_done(self):
         worker = _make_raiden_worker(
@@ -3178,11 +3413,13 @@ class TestTPURaidenConnectorWorker:
 
         facade.start_transfer.reset_mock()
         facade.start_transfer.side_effect = RuntimeError("fingerprint mismatch")
-        with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0):
-            with pytest.raises(RuntimeError, match="fingerprint mismatch"):
-                TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry(
-                    facade, req_id="not-retryable", uuid=988
-                )
+        with (
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+            pytest.raises(RuntimeError, match="fingerprint mismatch"),
+        ):
+            TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry(
+                facade, req_id="not-retryable", uuid=988
+            )
         facade.start_transfer.assert_called_once()
 
     @pytest.mark.parametrize("hybrid", [False, True])
@@ -4906,16 +5143,19 @@ class TestTPUConnectorStats(unittest.TestCase):
         self, hist, num_buckets, non_zero_buckets
     ):
         assert len(hist._buckets) == num_buckets, (
-            f"Incorrect number of buckets returned: expected {num_buckets} actual {len(hist._buckets)}"
+            f"Incorrect number of buckets returned: expected {num_buckets} "
+            f"actual {len(hist._buckets)}"
         )
         for i in range(num_buckets):
             if i in non_zero_buckets:
                 assert hist._buckets[i].get() == non_zero_buckets[i], (
-                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} "
+                    f"actual: {hist._buckets[i].get()}"
                 )
             else:
                 assert hist._buckets[i].get() == 0, (
-                    f"Incorrect value for bucket {i}: expected 0 actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected 0 "
+                    f"actual: {hist._buckets[i].get()}"
                 )
 
     def test_tpu_stats_aggregation_d2h_transfer(self):
@@ -5344,6 +5584,273 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
         worker._raiden_glm_admission_topology()
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 worker plan and per-group span registration
+# ---------------------------------------------------------------------------
+
+
+def _dsv4_worker_plan(worker):
+    named, groups = dsv4_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    return worker._measure_dsv4_pool_plan(manifest, groups), groups
+
+
+def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True, dp_size=8)
+    plan, _ = _dsv4_worker_plan(worker)
+
+    # Byte geometry, per tag. Two tags of one group share a plan position and
+    # differ only in how many bytes a row carries.
+    assert [
+        (
+            pool.tag,
+            pool.plan_position,
+            pool.page_tokens,
+            pool.live_bytes_per_block,
+            pool.row_bytes,
+        )
+        for pool in plan
+    ] == [
+        ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
+        ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
+        ("dsv4.idx.g1", 1, 1024, 65536, 1024),
+        ("dsv4.hca.g2", 2, 256, 262144, 512),
+        ("dsv4.swa.g3", 3, 128, 131072, 512),
+        ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
+        ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
+        ("dsv4.state.hca.g6", 6, 256, 131072, 512),
+    ]
+    # Trim geometry lives on the groups instead, one entry per block table the
+    # scheduler sends. Only the SWA group has a window.
+    assert [
+        (group.cache_group_index, group.page_tokens, group.window_tokens)
+        for group in worker._stage3_dsv4_transfer_groups
+    ] == [
+        (0, 1024, None),
+        (1, 1024, None),
+        (2, 256, None),
+        (3, 128, 128),
+        (4, 1024, None),
+        (5, 1024, None),
+        (6, 256, None),
+    ]
+
+
+def _dsv4_trim_worker(*groups):
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    worker._stage3_dsv4_transfer_groups = tuple(
+        _Stage3TransferGroup(
+            cache_group_index=index,
+            page_tokens=page_tokens,
+            window_tokens=window_tokens,
+        )
+        for index, (page_tokens, window_tokens) in enumerate(groups)
+    )
+    return worker
+
+
+def test_dsv4_window_trim_keeps_only_the_live_pages():
+    """Each group is trimmed against its own page size and window.
+
+    1534 tokens over 128-token pages is 12 pages, and the window keeps the
+    last two, matching SlidingWindowManager's (1534 - 128 + 1) // 128 == 10
+    skip. The dropped entries are all the same null block, and Raiden rejects
+    a destination list that repeats an ID. The full-attention group beside it
+    keeps every page and every token.
+    """
+    worker = _dsv4_trim_worker((128, 128), (1024, None))
+    trimmed = worker._stage3_dsv4_group_blocks(
+        SimpleNamespace(group_block_ids=[[0] * 10 + [41, 42], [7, 8]]), 1534
+    )
+
+    assert [(group.pages, group.num_tokens) for group in trimmed] == [
+        ([41, 42], 1534 - 10 * 128),
+        ([7, 8], 1534),
+    ]
+
+
+def test_dsv4_window_trim_rejects_a_table_that_still_repeats_a_page():
+    worker = _dsv4_trim_worker((128, 128))
+    with pytest.raises(ValueError, match="still repeats a page"):
+        worker._stage3_dsv4_group_blocks(
+            SimpleNamespace(group_block_ids=[[0] * 10 + [41, 41]]), 1534
+        )
+
+
+def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    named, groups = dsv4_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    with pytest.raises(RuntimeError, match="not in the Stage-3 transfer plan"):
+        worker._measure_dsv4_pool_plan(manifest, groups[:3])
+
+
+def test_dsv4_group_blocks_must_match_the_admitted_plan():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    _dsv4_worker_plan(worker)
+
+    with pytest.raises(RuntimeError, match="the scheduler supplied none"):
+        worker._stage3_dsv4_group_blocks(SimpleNamespace(group_block_ids=None), 1024)
+    with pytest.raises(RuntimeError, match="do not match the admitted"):
+        worker._stage3_dsv4_group_blocks(
+            SimpleNamespace(group_block_ids=[[1], [2]]), 1024
+        )
+
+
+def test_dsv4_producer_registers_one_span_set_per_cache_group():
+    """Every tag replays over its own group's pages, and no page is shared."""
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=True, dp_size=8, block_size=1024
+    )
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    facade = _FakeRaidenControllerFacade()
+    unit = SimpleNamespace(
+        job_name="dsv4-prefill",
+        job_replica_id="producer-engine-rank0",
+        data_name="kv.dsv4",
+        data_replica_idx=0,
+    )
+    worker._raiden_transfer_engine = _FakeRaidenEngine()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "prefill-controller.test:27000"
+    worker._raiden_work_unit = unit
+
+    # 1024 tokens: one page for the 1024-token groups, four for HCA's
+    # 256-token pages, eight for SWA's 128-token pages. The tables are
+    # disjoint, which is the only thing keeping the aliased arrays apart.
+    # SWA's window is one page wide, so vLLM has already replaced its first
+    # seven entries with the null block.
+    group_block_ids = [
+        [10],
+        [20],
+        [30, 31, 32, 33],
+        [0, 0, 0, 0, 0, 0, 0, 47],
+        [50],
+        [60],
+        [70, 71, 72, 73],
+    ]
+    swa_live_pages = [47]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["dsv4-req"] = MagicMock(
+        uuid=99,
+        local_block_ids=[10],
+        group_block_ids=group_block_ids,
+        num_tokens=1024,
+        expiration_time=1e20,
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1, create=True),
+    ):
+        worker.process_send_load(meta)
+
+    assert len(facade.register_request_blocks_calls) == 1
+    call = facade.register_request_blocks_calls[0]
+    assert call["req_id"] == "dsv4-req"
+    assert call["uuid"] == 99
+    assert call["unit"] is unit
+    # D5 keys on one list per request; the per-tag pages ride in the spans.
+    assert call["block_ids"] == [10]
+    assert [(reg.tag, list(reg.block_ids)) for reg in call["pool_spans"]] == [
+        (
+            pool.tag,
+            swa_live_pages
+            if pool.tag == "dsv4.swa.g3"
+            else group_block_ids[pool.plan_position],
+        )
+        for pool in plan
+    ]
+    assert all(reg.dst_space_version == 1 for reg in call["pool_spans"])
+    # Each pool declares its whole request: full pages everywhere, because
+    # 1024 tokens divides every group's page size. SWA declares only the one
+    # page still inside its window.
+    declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
+    assert declared["dsv4.csa.nope.g0"] == 131072
+    assert declared["dsv4.hca.g2"] == 4 * 262144
+    assert declared["dsv4.swa.g3"] == 131072
+
+
+def test_dsv4_producer_trims_the_block_list_it_registers():
+    """The registered list is trimmed the same way the spans are.
+
+    On hardware the first plan position is windowed, so its table arrives with
+    a null-block prefix. Registering that table raw made the controller reject
+    the request with "block_ids must not contain duplicates" as soon as a
+    prompt ran long enough to push a page out of the window.
+    """
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=True, dp_size=8, block_size=1024
+    )
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    # Give the first position a window one page wide, as the served config
+    # does. Everything else keeps the geometry admission measured.
+    groups = list(worker._stage3_dsv4_transfer_groups)
+    groups[0] = _Stage3TransferGroup(
+        cache_group_index=0, page_tokens=1024, window_tokens=1024
+    )
+    worker._stage3_dsv4_transfer_groups = tuple(groups)
+
+    facade = _FakeRaidenControllerFacade()
+    unit = SimpleNamespace(
+        job_name="dsv4-prefill",
+        job_replica_id="producer-engine-rank0",
+        data_name="kv.dsv4",
+        data_replica_idx=0,
+    )
+    worker._raiden_transfer_engine = _FakeRaidenEngine()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "prefill-controller.test:27000"
+    worker._raiden_work_unit = unit
+
+    # 2048 tokens. Both windowed groups have already had their out-of-window
+    # entries replaced with the null block: one of group 0's two pages, and
+    # fifteen of group 3's sixteen.
+    group_block_ids = [
+        [0, 11],
+        [20, 21],
+        list(range(30, 38)),
+        [0] * 15 + [47],
+        [50, 51],
+        [60, 61],
+        list(range(70, 78)),
+    ]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["dsv4-req"] = MagicMock(
+        uuid=99,
+        local_block_ids=[11],
+        group_block_ids=group_block_ids,
+        num_tokens=2048,
+        expiration_time=1e20,
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1, create=True),
+    ):
+        worker.process_send_load(meta)
+
+    call = facade.register_request_blocks_calls[0]
+    assert call["block_ids"] == [11]
+    spans = {reg.tag: list(reg.block_ids) for reg in call["pool_spans"]}
+    assert spans["dsv4.csa.nope.g0"] == [11]
+    assert spans["dsv4.csa.rope.g0"] == [11]
+    assert spans["dsv4.swa.g3"] == [47]
+    # One live page, so one page of bytes, not the two the raw table spans.
+    declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
+    assert declared["dsv4.csa.nope.g0"] == 131072
+
+
 class TestPipelineParallelProducer:
     """Pipeline-parallel prefill (PP x TP1) as a Stage-3 source: each stage
     transfers every token of its own layers and pools pair up by layer."""
@@ -5595,3 +6102,88 @@ def test_maybe_host_reshard_store_passes_registry_ttl_from_lease():
         "data_name": "reshard_store",
         "data_replica_idx": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Block-major unified pool
+# ---------------------------------------------------------------------------
+
+_FINGERPRINT = "vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint"
+_BM_LAYOUT = BlockMajorPoolLayout(
+    num_blocks=4, num_pools=3, split=4, pool_index_by_layer={}
+)
+
+
+class _ManifestBuilt(Exception):
+    pass
+
+
+def _block_major_admission_worker():
+    """A Qwen3.5 producer worker whose runner reports a block-major pool."""
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True, pcp_size=8)
+    named, groups, raw_tensors = _synthetic_qwen35_unified_pool_materialization(
+        tp_size=1, pcp_size=8
+    )
+    runner = SimpleNamespace(
+        kv_caches=list(named.values()),
+        kv_cache_raw_tensors=raw_tensors,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        bm_pool_layout=_BM_LAYOUT,
+    )
+    worker.named_kv_caches = named
+    worker._raiden_stage3_enabled = lambda: False
+    return worker, runner
+
+
+def test_block_major_layout_reaches_the_qwen35_manifest(monkeypatch):
+    from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+    worker, runner = _block_major_admission_worker()
+    seen = {}
+
+    def fake_build(**kwargs):
+        seen.update(kwargs)
+        raise _ManifestBuilt
+
+    monkeypatch.setattr(rpm, "build_qwen35_pool_manifest", fake_build)
+    with pytest.raises(_ManifestBuilt):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+    assert seen["block_major"] is _BM_LAYOUT
+    assert seen["named_kv_caches"] is worker.named_kv_caches
+    assert seen["raw_tensors"] == tuple(runner.kv_cache_raw_tensors)
+
+
+def test_kimi_manifest_rejects_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    worker._stage3_kimi = True
+    worker._raiden_hybrid_admission_topology = lambda: "tp1_prefill"
+    with pytest.raises(NotImplementedError, match="Kimi K3"):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+
+def test_seq_on_lane_manifest_rejects_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    with (
+        patch(f"{_MOD}._raiden_seq_on_lane_layout", return_value=True),
+        pytest.raises(NotImplementedError, match="seq-on-lane"),
+    ):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+
+def test_stage3_layout_measures_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    worker.runner = runner
+    manifest = object()
+    payload = {"kv_layout": "block-major"}
+    with (
+        patch(
+            f"{_FINGERPRINT}.measured_fa_layout_fingerprint",
+            return_value=("fingerprint", payload),
+        ) as measure,
+        patch(f"{_FINGERPRINT}.fa_page_tokens", return_value=256),
+    ):
+        result = worker._measure_stage3_layout(manifest)
+
+    measure.assert_called_once_with(manifest, block_major=True)
+    assert result == ("fingerprint", payload, 256)

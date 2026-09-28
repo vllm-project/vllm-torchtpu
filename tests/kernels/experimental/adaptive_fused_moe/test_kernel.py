@@ -27,8 +27,8 @@ same arithmetic spread over the expert axis rather than replicated, which is
 what makes the 512-expert served shape affordable to check at all.
 
 The mesh axis carries the name the kernel body reads
-(``vllm_torchtpu.kernels.experimental.adaptive_fused_moe.AXIS``, "d") rather than a name of this
-test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
+(``vllm_torchtpu.kernels.experimental.adaptive_fused_moe.AXIS``, "d") rather than a name
+of this test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
 that constraint, which the layer's own signature does not state.
 """
 

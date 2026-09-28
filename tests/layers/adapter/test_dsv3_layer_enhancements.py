@@ -1,4 +1,6 @@
-"""Unit tests for DeepSeek V3 layer enhancements (Attention kwargs/reshape, Grouped Top-K MoE, Unaligned FP8)."""
+"""Unit tests for DeepSeek V3 layer enhancements (Attention kwargs/reshape,
+Grouped Top-K MoE, Unaligned FP8).
+"""
 
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +16,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 
 
 def test_pallas_attention_init_kwargs(vllm_config_context):
-    """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank without raising TypeError."""
+    """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank
+    without raising TypeError.
+    """
     backend = PallasAttentionBackendImpl(
         num_heads=16,
         head_size=256,
@@ -32,7 +36,9 @@ def test_pallas_attention_init_kwargs(vllm_config_context):
 
 
 def test_pallas_attention_forward_2d_reshape(vllm_config_context):
-    """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors to 3D and restores 2D output."""
+    """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors
+    to 3D and restores 2D output.
+    """
     q_len = 10
     num_heads = 4
     head_size = 64
@@ -97,7 +103,9 @@ def test_pallas_attention_forward_2d_reshape(vllm_config_context):
 # would only exercise whichever one TPU_MOE_ROUTER_TOPK happens to select.
 @patch("vllm_torchtpu.layers.adapter.moe_routing._topk")
 def test_moe_routing_select_experts_grouped_topk(mock_topk):
-    """Test that select_experts correctly delegates to grouped_topk when use_grouped_topk is True."""
+    """Test that select_experts correctly delegates to grouped_topk when
+    use_grouped_topk is True.
+    """
     hidden_states = torch.ones(2, 1024, dtype=torch.bfloat16)
     router_logits = torch.ones(2, 64, dtype=torch.float32)
 
@@ -144,7 +152,9 @@ def test_moe_routing_select_experts_grouped_topk(mock_topk):
 
 
 def test_dequantize_fp8_linear_unaligned_dims():
-    """Test that _dequantize_fp8_linear correctly handles unaligned weight tensor dimensions via repeat_interleave."""
+    """Test that _dequantize_fp8_linear correctly handles unaligned weight tensor
+    dimensions via repeat_interleave.
+    """
     # Create unaligned weight tensor (e.g., 10x10 with block size 4x4)
     weight = torch.ones(10, 10, dtype=torch.float32)
     weight_scale_inv = (

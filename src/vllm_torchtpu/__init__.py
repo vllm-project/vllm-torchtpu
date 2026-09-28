@@ -349,7 +349,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (  # noqa: E501
                 adaptive_fused_moe_supported,
             )
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
@@ -1042,11 +1042,12 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     # models imported after the first call also have their bindings updated.
     patched_fn = vllm_utils._merge_multimodal_embeddings
     for mod_name, mod in list(sys.modules.items()):
-        if mod_name.startswith("vllm.model_executor.models") and hasattr(
-            mod, "_merge_multimodal_embeddings"
+        if (
+            mod_name.startswith("vllm.model_executor.models")
+            and hasattr(mod, "_merge_multimodal_embeddings")
+            and mod._merge_multimodal_embeddings is not patched_fn
         ):
-            if mod._merge_multimodal_embeddings is not patched_fn:
-                mod._merge_multimodal_embeddings = patched_fn
+            mod._merge_multimodal_embeddings = patched_fn
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
@@ -1362,12 +1363,13 @@ if "proxy" in envs.JAX_PLATFORMS:
         vllm.platforms._current_platform = resolved_platform_instance
         vllm.platforms._init_trace = "".join(traceback.format_stack())
         logger.info(
-            f"vLLM platform resolved to: {resolved_platform_instance.__class__.__name__}"
+            "vLLM platform resolved to: %s",
+            resolved_platform_instance.__class__.__name__,
         )
 
     except Exception as e:
         logger.error(
-            f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
+            "Error occurred while importing pathwaysutils or logging TPU info: %s", e
         )
 
 
@@ -1603,5 +1605,6 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     vpe.VocabParallelEmbedding.forward = patched_forward
     vpe.VocabParallelEmbedding._tpu_vocab_parallel_embedding_patch = True
     logger.info(
-        "Applied TPU patch: register shard index bounds as buffers in VocabParallelEmbedding"
+        "Applied TPU patch: register shard index bounds as buffers in "
+        "VocabParallelEmbedding"
     )

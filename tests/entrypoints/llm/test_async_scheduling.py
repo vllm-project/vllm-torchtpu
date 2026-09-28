@@ -23,7 +23,8 @@ def force_multiple_forward_passes_init(self, *args, **kwargs):
     """
     A custom __init__ for TPUModelRunner that artificially limits the number of
     requests processed in a single forward pass.
-    This forces the runner to split a batch into multiple chunks during the same engine step.
+    This forces the runner to split a batch into multiple chunks during
+    the same engine step.
     """
     _ORIGINAL_TPU_RUNNER_INIT(self, *args, **kwargs)
     self.num_reqs_max_model_len = 2
@@ -102,7 +103,7 @@ def run_llm_generation_in_isolated_process(
 
 
 @pytest.mark.timeout(1200)
-def test_async_scheduling_preserves_output_when_chunked_prefill_requests_are_discarded():
+def test_async_scheduling_preserves_output_when_chunked_prefill_requests_are_discarded():  # noqa: E501
     """
     When a long prompt is processed over multiple forward passes, it is 'discarded' from
     the current step's output because no token is sampled.
@@ -142,7 +143,7 @@ def test_async_scheduling_preserves_output_when_chunked_prefill_requests_are_dis
 
 
 @pytest.mark.timeout(1200)
-def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_forward_passes():
+def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_forward_passes():  # noqa: E501
     """
     Ensure we are correctly offseting into the request batch when the batch is chunked
     into multiple forward passes.

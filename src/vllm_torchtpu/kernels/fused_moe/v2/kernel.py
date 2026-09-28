@@ -585,14 +585,15 @@ def _build_fused_ep_moe_kernel(
                 f"values pack into a 32-bit word and those words tile to "
                 f"{host.U32_SUBLANE_TILE} sublanes"
             )
-    if weight_format == host.WeightFormat.INT8:
-        # The widening chunk has to tile both contractions exactly.
-        if hidden % host.WIDEN_KCHUNK or inter % host.WIDEN_KCHUNK:
-            raise ValueError(
-                f"integer weights widen one {host.WIDEN_KCHUNK}-row "
-                f"contraction chunk at a time, which has to divide both "
-                f"hidden={hidden} and inter={inter}"
-            )
+    # The widening chunk has to tile both contractions exactly.
+    if weight_format == host.WeightFormat.INT8 and (
+        hidden % host.WIDEN_KCHUNK or inter % host.WIDEN_KCHUNK
+    ):
+        raise ValueError(
+            f"integer weights widen one {host.WIDEN_KCHUNK}-row "
+            f"contraction chunk at a time, which has to divide both "
+            f"hidden={hidden} and inter={inter}"
+        )
     # True-length remote pushes: out_vm, contrib and recv take the per-row
     # [rows, lane blocks, 128] geometry, which row-granular offsets require.
     if (

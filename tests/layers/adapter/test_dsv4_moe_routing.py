@@ -59,7 +59,8 @@ def test_grouped_softmax_delegates_to_vllm_grouped_topk():
 
 
 def test_classic_topk_sqrtsoftplus_scoring():
-    """DSV4 classic top-k selection with sqrtsoftplus scoring and e_score_correction_bias."""
+    """DSV4 classic top-k selection with sqrtsoftplus scoring and
+    e_score_correction_bias."""
     hidden = torch.randn(2, 4)
     logits = torch.zeros(2, 4)
     bias = torch.tensor([0.0, 0.5, 0.0, 1.0])
@@ -97,7 +98,8 @@ def test_classic_topk_sqrtsoftplus_renormalize_and_scaling():
     )
     assert weights.shape == (2, 2)
     assert ids.shape == (2, 2)
-    # With renormalize=True and scaling=2.5, sum across topk weights per token must equal 2.5
+    # With renormalize=True and scaling=2.5, sum across topk weights per token must
+    # equal 2.5
     torch.testing.assert_close(
         weights.sum(dim=-1), torch.full((2,), 2.5, dtype=weights.dtype)
     )

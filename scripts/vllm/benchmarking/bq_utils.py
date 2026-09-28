@@ -155,9 +155,7 @@ def run_insert(
     cmd = ["bq", "query", "--use_legacy_sql=false", f"--project_id={project}", sql]
     print(f"Executing: {' '.join(cmd)}")
     try:
-        proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         print(
             f"Failed to insert BigQuery record for {label}: 'bq' CLI not found.",

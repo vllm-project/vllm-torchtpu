@@ -44,7 +44,8 @@ from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
 
 def is_seq_along_lane_pool() -> bool:
-    """True if pool uses the SEQ_ON_LANE (nb, heads2, packed_d, pack, page_size) layout."""
+    """True if pool uses the SEQ_ON_LANE
+    (nb, heads2, packed_d, pack, page_size) layout."""
     return envs.VLLM_KV_CACHE_LAYOUT == "HND"
 
 

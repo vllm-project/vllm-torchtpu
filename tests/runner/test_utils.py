@@ -308,7 +308,8 @@ def test_phased_profiler_skip_only_affects_decode_heavy(profiler_fixture):
 def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     profiler_fixture,
 ):
-    """Tests that the profiler skips DECODE_ONLY steps until min KV len reaches threshold."""
+    """Tests that the profiler skips DECODE_ONLY steps until min KV len
+    reaches threshold."""
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
     mock_context = profiler_fixture["mock_context"]
@@ -348,7 +349,8 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
 def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
     profiler_fixture,
 ):
-    """Tests that the profiler skips PREFILL_ONLY steps until min KV len reaches threshold."""
+    """Tests that the profiler skips PREFILL_ONLY steps until min KV len
+    reaches threshold."""
     profiler = profiler_fixture["profiler"]
     mock_profile = profiler_fixture["mock_profile"]
     mock_context = profiler_fixture["mock_context"]
@@ -483,7 +485,8 @@ def test_resolve_canonical_dst_ts_non_zero_rank_falls_back_on_timeout(
 
 
 def test_merge_profile_directories_single_rank(tmp_path):
-    """Single rank, non-MPMD: capture moves from sandbox to <phase>/plugins/profile/<canonical_ts>/."""
+    """Single rank, non-MPMD: capture moves from sandbox to
+    <phase>/plugins/profile/<canonical_ts>/."""
     profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
     phase_dir = tmp_path / "prefill_heavy"
     rank_dir = phase_dir / "rank_0"

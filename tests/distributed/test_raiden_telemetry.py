@@ -28,7 +28,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 
 
 class TestRaidenTelemetryUtils:
-    """Tests for dist_utils.get_raiden_telemetry_module and configure_raiden_telemetry."""
+    """Tests for dist_utils.get_raiden_telemetry_module and
+    configure_raiden_telemetry.
+    """
 
     def test_get_raiden_telemetry_module_cached(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_MODULE", None)
@@ -200,7 +202,9 @@ class TestTpuKVConnectorStatsDynamicMetrics:
 
 
 class TestTpuKVConnectorPromMetricsDynamicMetrics:
-    """Tests for TpuKVConnectorPromMetrics dynamic metric registration and observations."""
+    """Tests for TpuKVConnectorPromMetrics dynamic metric
+    registration and observations.
+    """
 
     def _setup_prom_metrics(self, descriptors):
         registry = CollectorRegistry()

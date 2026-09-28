@@ -419,7 +419,7 @@ def test_loaded_tp_gdn_matches_tp1_spmd(
                     max_errors[name], float(np.max(np.abs(got - want)))
                 )
         print(
-            f"{quantization} K={num_key_heads} V={num_value_heads} TP={tp_size} {phase}: "
-            f"max_abs={max_errors}",
+            f"{quantization} K={num_key_heads} V={num_value_heads} "
+            f"TP={tp_size} {phase}: max_abs={max_errors}",
             flush=True,
         )

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
+    TPU_RAIDEN_DSV4_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
@@ -131,6 +132,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
 def env_with_choices(
@@ -436,6 +438,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must set it identically.
     "TPU_RAIDEN_POOL_TAGS_PER_LAYER": env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION": env_bool("TPU_RAIDEN_GLM_ADMISSION"),
+    # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
+    # indexer, HCA, SWA and the compressor states. Every other model here has
+    # exactly one.
+    "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.
@@ -814,6 +820,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Chunk the vision encoder over video frames to bound peak VMEM: encode at
+    # most this many patches (t*h*w) per vision forward, then concatenate the
+    # per-chunk outputs. 0 disables (encode the whole video in one batch).
+    "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
+        "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
+    ),
 }
 
 

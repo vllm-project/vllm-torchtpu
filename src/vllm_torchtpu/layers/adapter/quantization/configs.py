@@ -34,7 +34,8 @@ logger = init_logger(__name__)
 
 
 def should_quantize_on_load(prefix: str) -> bool:
-    """Return True if prefix matches any dot-bounded pattern in QUANTIZE_ON_LOAD_PREFIXES."""
+    """Return True if prefix matches any dot-bounded pattern in
+    QUANTIZE_ON_LOAD_PREFIXES."""
     padded = f".{prefix}."
     return any(f".{p.strip('.')}." in padded for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
 

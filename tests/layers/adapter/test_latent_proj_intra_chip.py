@@ -234,7 +234,8 @@ def test_declines_to_shard(monkeypatch, flag, group, output_size, why):
 
 
 def test_shards_when_everything_lines_up(monkeypatch):
-    """The one case that must *not* fall back, so the test above can't pass vacuously."""
+    """The one case that must *not* fall back, so the test above
+    can't pass vacuously."""
     from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 

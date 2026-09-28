@@ -87,8 +87,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
         )
 
         logger.info(
-            f"[mm_encoder_manager] Initialized XLA path_budgets={self.path_token_budgets} "
-            f"max_batch_size={self.max_batch_size}"
+            "[mm_encoder_manager] Initialized XLA path_budgets=%s max_batch_size=%s",
+            self.path_token_budgets,
+            self.max_batch_size,
         )
 
     def _pad_to_template(
@@ -131,7 +132,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
-        # Pass a copy of template so models calling values.pop() don't mutate the stored template.
+        # Pass a copy of template so models calling values.pop() don't mutate
+        # the stored template.
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)

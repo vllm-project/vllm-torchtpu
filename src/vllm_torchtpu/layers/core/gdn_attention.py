@@ -40,6 +40,20 @@ from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
+_GDN_TP_AXIS_NAME = "tp"
+
+
+def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
+    """Return the optional TP axis used by an op-local PCP mesh."""
+    return _GDN_TP_AXIS_NAME if _GDN_TP_AXIS_NAME in tuple(mesh.axis_names) else None
+
+
+def _gdn_pcp_tp_state_axis(pcp_axis: str, tp_axis: str | None) -> str | tuple[str, str]:
+    """Map TP-local, then PCP-local state slices to global shard order."""
+    if tp_axis is None:
+        return pcp_axis
+    return (tp_axis, pcp_axis)
+
 
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
@@ -552,26 +566,29 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     local_n_v = geometry.local_num_v_heads
     local_conv_state_dim = geometry.local_conv_dim(d_k, d_v)
 
-    token_spec = P(pcp_axis, None)
+    tp_axis = _gdn_tp_axis_name(mesh)
+    pcp_tp_state_axis = _gdn_pcp_tp_state_axis(pcp_axis, tp_axis)
+    token_spec = P(pcp_axis, tp_axis)
     replicated_spec = P()
-    conv_state_spec = P(None, None, pcp_axis)
-    recurrent_state_spec = P(None, pcp_axis, None, None)
+    tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
+    conv_state_spec = P(None, None, pcp_tp_state_axis)
+    recurrent_state_spec = P(None, pcp_tp_state_axis, None, None)
     in_specs = (
         token_spec,  # j_mixed_qkv
         token_spec,  # j_b
         token_spec,  # j_a
         conv_state_spec,  # conv_state
         recurrent_state_spec,  # recurrent_state
-        replicated_spec,  # j_conv_weight
-        replicated_spec if j_conv_bias is not None else None,  # j_conv_bias
-        replicated_spec,  # j_A_log
-        replicated_spec,  # j_dt_bias
+        tp_parameter_spec,  # j_conv_weight
+        tp_parameter_spec if j_conv_bias is not None else None,  # j_conv_bias
+        tp_parameter_spec,  # j_A_log
+        tp_parameter_spec,  # j_dt_bias
         replicated_spec,  # query_start_loc
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    output_spec = P(pcp_axis, None, None)
+    output_spec = P(pcp_axis, tp_axis, None)
     out_specs = ((conv_state_spec, recurrent_state_spec), output_spec)
 
     def _pcp_prefill_fn(
@@ -1098,26 +1115,30 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     local_n_v = geometry.local_num_v_heads
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
 
+    tp_axis = _gdn_tp_axis_name(mesh)
+    pcp_tp_state_axis = _gdn_pcp_tp_state_axis(pcp_axis, tp_axis)
     token_spec = P(pcp_axis, None)
+    token_head_spec = P(pcp_axis, tp_axis)
     replicated_spec = P()
-    pool_spec = P(pcp_axis)
+    tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
+    pool_spec = P(pcp_tp_state_axis)
     in_specs = (
         token_spec,  # hidden states
-        replicated_spec,  # QKVZ weight
-        replicated_spec if j_qkvz_weight_scale is not None else None,
-        token_spec,  # b
-        token_spec,  # a
+        tp_parameter_spec,  # QKVZ weight
+        tp_parameter_spec if j_qkvz_weight_scale is not None else None,
+        token_head_spec,  # b
+        token_head_spec,  # a
         pool_spec,  # rank-local unified pool
-        replicated_spec,  # conv weight
-        replicated_spec if j_conv_bias is not None else None,
-        replicated_spec,  # A_log
-        replicated_spec,  # dt_bias
+        tp_parameter_spec,  # conv weight
+        tp_parameter_spec if j_conv_bias is not None else None,
+        tp_parameter_spec,  # A_log
+        tp_parameter_spec,  # dt_bias
         replicated_spec,  # query_start_loc
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    output_spec = P(pcp_axis, None, None)
+    output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec, output_spec)
 
     def _pooled_pcp_prefill_fn(
@@ -1303,27 +1324,30 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     local_n_kq = geometry.local_num_kq_heads
     local_n_v = geometry.local_num_v_heads
 
-    token_spec = P(pcp_axis, None)
+    tp_axis = _gdn_tp_axis_name(mesh)
+    pcp_tp_state_axis = _gdn_pcp_tp_state_axis(pcp_axis, tp_axis)
+    token_spec = P(pcp_axis, tp_axis)
     replicated_spec = P()
+    tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
     # Rank-local pool: the op adapter presents the per-rank pools as one
     # logical array stacked on axis 0, so the shard_map body receives
     # exactly this rank's pool.
-    pool_spec = P(pcp_axis)
+    pool_spec = P(pcp_tp_state_axis)
     in_specs = (
         token_spec,  # j_mixed_qkv
         token_spec,  # j_b
         token_spec,  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        replicated_spec,  # j_conv_weight
-        replicated_spec if j_conv_bias is not None else None,  # j_conv_bias
-        replicated_spec,  # j_A_log
-        replicated_spec,  # j_dt_bias
+        tp_parameter_spec,  # j_conv_weight
+        tp_parameter_spec if j_conv_bias is not None else None,  # j_conv_bias
+        tp_parameter_spec,  # j_A_log
+        tp_parameter_spec,  # j_dt_bias
         replicated_spec,  # query_start_loc
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    output_spec = P(pcp_axis, None, None)
+    output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec)
 
     def _pooled_pcp_prefill_fn(

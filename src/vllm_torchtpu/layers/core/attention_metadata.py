@@ -6,7 +6,7 @@ from typing import Any
 
 import jax
 import torch
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
@@ -222,7 +222,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
             try:
-                cp_world_size = get_dcp_group().world_size * get_pcp_group().world_size
+                cp_world_size = get_pcp_group().world_size
             except Exception:
                 cp_world_size = 1
             self.target_block_size *= cp_world_size

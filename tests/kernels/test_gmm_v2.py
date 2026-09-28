@@ -139,10 +139,7 @@ def reference_gmm(
     elif jnp.isscalar(group_offset):
         group_offset = group_offset[None]
 
-    if rhs_scale is not None:
-        num_blocks = rhs_scale.shape[1]
-    else:
-        num_blocks = 1
+    num_blocks = rhs_scale.shape[1] if rhs_scale is not None else 1
     block_size = in_size // num_blocks
 
     start = 0

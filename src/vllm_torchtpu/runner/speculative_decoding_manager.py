@@ -16,17 +16,22 @@ if TYPE_CHECKING:
 
 @dataclass
 class SpecDecodeMetadata:
-    """Metadata for speculative decoding on Torch/TPU, containing all necessary indices."""
+    """Metadata for speculative decoding on Torch/TPU, containing all
+    necessary indices.
+    """
 
-    # [padded_logits_length] draft token id validated at each target_logits_indices slot.
+    # [padded_logits_length] draft token id validated at each
+    # target_logits_indices slot.
     draft_token_ids: torch.Tensor
     # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
     # [num_reqs] per-request draft-token count (host copy, unpadded).
     draft_lengths_cpu: np.ndarray
-    # [padded_logits_length] row into this step's logits/hidden-states for each draft token being validated.
+    # [padded_logits_length] row into this step's logits/hidden-states for each draft
+    # token being validated.
     target_logits_indices: torch.Tensor
-    # [padded_num_reqs] row into this step's logits/hidden-states for each request's bonus (last sampled) token.
+    # [padded_num_reqs] row into this step's logits/hidden-states for each request's
+    # bonus (last sampled) token.
     bonus_logits_indices: torch.Tensor
     # [padded_logits_length] row into the input batch for every draft + bonus
     # position the target model forward needs logits for.
@@ -39,7 +44,9 @@ class SpecDecodeMetadata:
 
 
 class SpeculativeDecodingManager:
-    """Manages speculative decoding operations, including draft proposal and metadata generation."""
+    """Manages speculative decoding operations, including draft proposal and
+    metadata generation.
+    """
 
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
@@ -199,7 +206,8 @@ class SpeculativeDecodingManager:
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
     ) -> SpecDecodeMetadata:
-        """Calculates indices for speculative decoding forward pass and rejection sampling.
+        """Calculates indices for speculative decoding forward pass and
+        rejection sampling.
 
         Args:
           num_draft_tokens: The number of draft tokens for each request.

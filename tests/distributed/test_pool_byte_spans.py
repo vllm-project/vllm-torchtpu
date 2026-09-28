@@ -14,6 +14,7 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
+    lower_dsv4_row_spans,
     lower_gdn_state_shard_spans,
     lower_glm_row_spans,
     lower_kda_state_shard_spans,
@@ -605,6 +606,96 @@ def test_glm_row_spans_union_partitions_request_bytes():
         total += registration.declared_bytes
     assert sorted(owners) == list(range(num_pages))
     assert total == (num_pages - 1) * _GLM_FA_LIVE + 2 * _GLM_FA_ROW_BYTES
+
+
+# DeepSeek-V4-Flash at block_size=1024 (T=256 compressed tokens per page),
+# uint8 with packing 4. CSA NoPE puts four logical tokens on one 512-byte
+# row; RoPE and the indexer put sixteen on theirs; HCA keeps raw bf16 latents
+# and spends two rows on every one of its 256 page tokens.
+_DSV4_CSA_NOPE = dict(page_tokens=1024, live_bytes_per_block=256 * 512, row_bytes=512)
+_DSV4_CSA_ROPE = dict(page_tokens=1024, live_bytes_per_block=64 * 512, row_bytes=512)
+_DSV4_IDX = dict(page_tokens=1024, live_bytes_per_block=64 * 1024, row_bytes=1024)
+_DSV4_HCA = dict(page_tokens=256, live_bytes_per_block=512 * 512, row_bytes=512)
+
+
+def _dsv4_row_spans(role, **overrides):
+    kwargs = dict(
+        tag="dsv4.csa.nope.g0",
+        num_tokens=1024,
+        transfer_rank=0,
+        parallelism=1,
+        block_ids=[10],
+        **role,
+    )
+    kwargs.update(overrides)
+    return lower_dsv4_row_spans(**kwargs)
+
+
+def test_dsv4_row_spans_cover_whole_pages_at_dp_parallelism_one():
+    for role in (_DSV4_CSA_NOPE, _DSV4_CSA_ROPE, _DSV4_IDX):
+        registration = _dsv4_row_spans(role, num_tokens=3072, block_ids=[7, 8, 9])
+        live = role["live_bytes_per_block"]
+        assert registration.dst_space_version == 1
+        assert registration.block_ids == (7, 8, 9)
+        assert registration.declared_bytes == 3 * live
+        assert registration.spans == tuple(
+            PoolByteSpan(
+                src_block_ordinal=page,
+                src_offset_bytes=0,
+                dst_block_index=0,
+                dst_offset_bytes=page * live,
+                size_bytes=live,
+            )
+            for page in range(3)
+        )
+
+
+def test_dsv4_row_spans_use_each_groups_own_block_table():
+    """The tags do not share pages: HCA's group is paged at 256 tokens where
+    CSA's is paged at 1024, so the same request is a different page count."""
+    csa = _dsv4_row_spans(
+        _DSV4_CSA_NOPE, tag="dsv4.csa.nope.g0", num_tokens=1024, block_ids=[3]
+    )
+    hca = _dsv4_row_spans(
+        _DSV4_HCA, tag="dsv4.hca.g2", num_tokens=1024, block_ids=[40, 41, 42, 43]
+    )
+
+    assert csa.block_ids == (3,)
+    assert hca.block_ids == (40, 41, 42, 43)
+    assert not set(csa.block_ids) & set(hca.block_ids)
+    assert hca.declared_bytes == 4 * _DSV4_HCA["live_bytes_per_block"]
+
+
+def test_dsv4_row_spans_trim_the_tail_to_whole_rows():
+    # Four logical tokens per row: 476 tail tokens need 119 rows.
+    csa = _dsv4_row_spans(_DSV4_CSA_NOPE, num_tokens=1500, block_ids=[1, 2])
+    assert csa.spans[-1].size_bytes == 119 * 512
+
+    # Two rows per token, the direction lower_glm_row_spans cannot express:
+    # 44 tail tokens need 88 rows.
+    hca = _dsv4_row_spans(
+        _DSV4_HCA, tag="dsv4.hca.g2", num_tokens=300, block_ids=[1, 2]
+    )
+    assert hca.spans[-1].size_bytes == 88 * 512
+    assert hca.declared_bytes == _DSV4_HCA["live_bytes_per_block"] + 88 * 512
+
+
+def test_dsv4_row_spans_validation_failures():
+    cases = (
+        (dict(block_ids=[10, 11]), "complete request page set"),
+        (dict(live_bytes_per_block=256 * 512 + 1), "whole rows"),
+        (dict(transfer_rank=1), "outside parallelism"),
+        (dict(num_tokens=0), "num_tokens must be positive"),
+        (dict(row_bytes=0), "row_bytes and live_bytes_per_block"),
+        (dict(tag=""), "pool tag must not be empty"),
+    )
+    for overrides, message in cases:
+        try:
+            _dsv4_row_spans(_DSV4_CSA_NOPE, **overrides)
+        except ValueError as exc:
+            assert message in str(exc), (overrides, exc)
+        else:
+            raise AssertionError(f"accepted invalid input: {overrides}")
 
 
 def test_glm_row_spans_validation_failures():

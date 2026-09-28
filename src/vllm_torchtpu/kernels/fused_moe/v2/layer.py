@@ -256,6 +256,7 @@ def fused_ep_moe_v2(
     sharded_plan=False,
     scoring_fn="softmax",
     score_bias=None,
+    hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
 ):
@@ -305,6 +306,15 @@ def fused_ep_moe_v2(
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    hash_topk_ids [tokens, topk] i32 replaces the router's selection with
+    expert ids the caller already chose -- DeepSeek-V4's bottom layers look
+    theirs up in a static table indexed by token id rather than scoring the
+    gate. The gate logits are still required and still scored: the selection
+    comes from the table but the WEIGHTS are the scores at the selected ids,
+    which is what the reference hash router does. Everything downstream of
+    selection -- renormalization, the routed scale, the empty-row mask,
+    dispatch, the matmuls and the combine -- is the top-k path unchanged.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -400,6 +410,7 @@ def fused_ep_moe_v2(
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
+    has_hash_ids = hash_topk_ids is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -407,6 +418,17 @@ def fused_ep_moe_v2(
             f"score_bias must be one value per global expert, [{e_total}]; "
             f"got {tuple(score_bias.shape)}"
         )
+    if has_hash_ids:
+        if hash_topk_ids.shape != (x.shape[0], topk):
+            raise ValueError(
+                f"hash_topk_ids must be one expert id per token slot, "
+                f"[{x.shape[0]}, {topk}]; got {tuple(hash_topk_ids.shape)}"
+            )
+        if not jnp.issubdtype(hash_topk_ids.dtype, jnp.integer):
+            raise ValueError(
+                "hash_topk_ids are expert ids and must be an integer dtype; "
+                f"got {jnp.dtype(hash_topk_ids.dtype).name}"
+            )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -431,6 +453,7 @@ def fused_ep_moe_v2(
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
+        hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
@@ -438,6 +461,8 @@ def fused_ep_moe_v2(
         me = rank_l[0, 0]
         x_l = token_layout.split(x_l, me)
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        if hash_l is not None:
+            hash_l = token_layout.split(hash_l, me)
         if len(token_layout.groups[0]) > 1 and form.quantized_activations:
             # Slicing fused into rowquant changes BF16 rounding on TPU.
             # Keep this boundary only for quantized replicated inputs.
@@ -460,7 +485,14 @@ def fused_ep_moe_v2(
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
-        if score_bias_l is None:
+        if hash_l is not None:
+            # The selection was made by the caller's table, so the selector
+            # does not run at all; the weights are still the scores at the
+            # selected ids, which is the only thing the selector would have
+            # contributed here.
+            topk_idx = hash_l.astype(jnp.int32)
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+        elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
                 scores, topk=topk, block_rows=select_rows
             )
@@ -686,12 +718,20 @@ def fused_ep_moe_v2(
     # Sharding it would give each shard a 1/ep slice of the experts and
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
+    hash_args = (hash_topk_ids,) if has_hash_ids else ()
     in_specs = (
-        (P(ax),) * (5 + len(scale_args))
+        (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),) * len(score_bias_args)
         + (P(ax),) * len(bias_args)
     )
-    args = (x, rank, w1, w2) + scale_args + (gating,) + score_bias_args + bias_args
+    args = (
+        (x, rank, w1, w2)
+        + scale_args
+        + (gating,)
+        + hash_args
+        + score_bias_args
+        + bias_args
+    )
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -722,6 +762,7 @@ def fused_ep_moe_v2(
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
         has_score_bias and score_bias.dtype,
+        has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
     )
     sm = _LAYER_SM_CACHE.get(key)
