@@ -17,8 +17,8 @@ import functools
 
 import jax
 import torch
-import torch.nn as nn
 from jax.sharding import PartitionSpec as P
+from torch import nn
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context

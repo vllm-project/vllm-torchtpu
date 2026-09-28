@@ -20,13 +20,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.layers.core.quantization import dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 @jax.tree_util.register_dataclass
@@ -167,6 +166,7 @@ def _rope_body(
     inverse: bool,
     out_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
+    head_dim: int | None = None,
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
@@ -175,6 +175,9 @@ def _rope_body(
     ``(q_ref, scale_ref)`` outputs instead.
     """
     x = x_ref[...].astype(jnp.float32)
+    if x.ndim == 2 and quant_dtype is not None:
+        assert head_dim is not None
+        x = x.reshape(x.shape[0], -1, head_dim)
     cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
     if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
         cos = cos[:, None, :]
@@ -207,8 +210,10 @@ def _kernel(
     *out_hbm_refs: jax.Ref,
     num_tiles: int,
     tile_n: int,
-    x_block_shape: tuple[int, ...],
+    in_block_shape: tuple[int, ...],
+    out_block_shape: tuple[int, ...],
     scale_block_shape: tuple[int, ...],
+    head_dim: int,
     lane_block: int,
     rotary_dim: int,
     inverse: bool,
@@ -217,13 +222,13 @@ def _kernel(
     cos_sin_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
 ) -> None:
-    def x_index_map(i):
-        if len(x_block_shape) == 3:
+    def in_index_map(i):
+        if len(in_block_shape) == 3:
             return (i, 0, lane_block)
-        return (i, lane_block)
+        return (i, lane_block if quant_dtype is None else 0)
 
-    x_spec = pl.BlockSpec(
-        block_shape=x_block_shape, memory_space=pltpu.VMEM, index_map=x_index_map
+    in_spec = pl.BlockSpec(
+        block_shape=in_block_shape, memory_space=pltpu.VMEM, index_map=in_index_map
     )
 
     cos_sin_spec = pl.BlockSpec(
@@ -242,25 +247,30 @@ def _kernel(
         out_ref_args = ()
         out_specs = []
         # input_output since we only update the last rope_dim channels in place.
-        x_alloc = pltpu.BufferedRef.input_output(x_spec, out_dtype, buffer_count=2)
+        x_alloc = pltpu.BufferedRef.input_output(in_spec, out_dtype, buffer_count=2)
         out_allocs = ()
     else:
         q_hbm_ref, scale_hbm_ref = out_hbm_refs
         x_ref_args = (x_hbm_ref,)
         out_ref_args = (q_hbm_ref, scale_hbm_ref)
+        out_index_map = (
+            (lambda i: (i, 0, 0)) if len(out_block_shape) == 3 else (lambda i: (i, 0))
+        )
         q_spec = pl.BlockSpec(
-            block_shape=x_block_shape,
+            block_shape=out_block_shape,
             memory_space=pltpu.VMEM,
-            index_map=x_index_map,
+            index_map=out_index_map,
+        )
+        scale_index_map = (
+            (lambda i: (i, 0)) if len(scale_block_shape) == 2 else (lambda i: (i,))
         )
         scale_spec = pl.BlockSpec(
             block_shape=scale_block_shape,
             memory_space=pltpu.VMEM,
-            # Same block as ``q``, minus the channel axis it reduces away.
-            index_map=lambda i: x_index_map(i)[:-1],
+            index_map=scale_index_map,
         )
         out_specs = [q_spec, scale_spec]
-        x_alloc = pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2)
+        x_alloc = pltpu.BufferedRef.input(in_spec, in_dtype, buffer_count=2)
         out_allocs = (
             pltpu.BufferedRef.output(q_spec, quant_dtype, buffer_count=2),
             pltpu.BufferedRef.output(scale_spec, jnp.float32, buffer_count=2),
@@ -273,9 +283,10 @@ def _kernel(
             inverse=inverse,
             out_dtype=out_dtype,
             quant_dtype=quant_dtype,
+            head_dim=head_dim,
         ),
         grid=(num_tiles,),
-        in_specs=[x_spec, cos_sin_spec],
+        in_specs=[in_spec, cos_sin_spec],
         out_specs=out_specs,
     )
 
@@ -296,17 +307,16 @@ def _qnorm_rope_body(
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
     *,
+    head_dim: int,
     rotary_dim: int,
     eps: float,
     inverse: bool,
     out_dtype: jnp.dtype,
 ) -> None:
-    """Process one ``(tile_n, num_heads, head_dim)`` chunk.
-
-    Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
-    rotation ``_rope_body`` applies.
-    """
+    """Process one token block: per-head RMSNorm over head_dim then RoPE."""
     x = x_ref[...].astype(jnp.float32)
+    if x.ndim == 2:
+        x = x.reshape(x.shape[0], -1, head_dim)
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
 
@@ -319,7 +329,10 @@ def _qnorm_rope_body(
     sin = sin[:, None, :]
     roped = tail * cos + _rotate_gptj(tail) * sin
 
-    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
+    out = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
+    if out_ref.ndim == 2:
+        out = out.reshape(out.shape[0], -1)
+    out_ref[...] = out
 
 
 def _qnorm_rope_kernel(
@@ -328,22 +341,35 @@ def _qnorm_rope_kernel(
     # HBM inputs
     x_hbm_ref: jax.Ref,
     cos_sin_cache_hbm_ref: jax.Ref,
-    # HBM output, aliased onto x_hbm_ref
+    # HBM output
     out_hbm_ref: jax.Ref,
     *,
     num_tiles: int,
     tile_n: int,
-    x_block_shape: tuple[int, ...],
+    in_block_shape: tuple[int, ...],
+    out_block_shape: tuple[int, ...],
+    head_dim: int,
     rotary_dim: int,
     eps: float,
     inverse: bool,
     in_dtype: jnp.dtype,
     cos_sin_dtype: jnp.dtype,
 ) -> None:
-    x_spec = pl.BlockSpec(
-        block_shape=x_block_shape,
+    in_index_map = (
+        (lambda i: (i, 0, 0)) if len(in_block_shape) == 3 else (lambda i: (i, 0))
+    )
+    out_index_map = (
+        (lambda i: (i, 0, 0)) if len(out_block_shape) == 3 else (lambda i: (i, 0))
+    )
+    in_spec = pl.BlockSpec(
+        block_shape=in_block_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0),
+        index_map=in_index_map,
+    )
+    out_spec = pl.BlockSpec(
+        block_shape=out_block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=out_index_map,
     )
     cos_sin_spec = pl.BlockSpec(
         block_shape=(tile_n, rotary_dim),
@@ -357,19 +383,20 @@ def _qnorm_rope_kernel(
     pipeline = pltpu.emit_pipeline(
         functools.partial(
             _qnorm_rope_body,
+            head_dim=head_dim,
             rotary_dim=rotary_dim,
             eps=eps,
             inverse=inverse,
             out_dtype=in_dtype,
         ),
         grid=(num_tiles,),
-        in_specs=[x_spec, cos_sin_spec],
-        out_specs=[x_spec],
+        in_specs=[in_spec, cos_sin_spec],
+        out_specs=[out_spec],
     )
     allocations = (
-        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
+        pltpu.BufferedRef.input(in_spec, in_dtype, buffer_count=2),
         cos_sin_alloc,
-        pltpu.BufferedRef.output(x_spec, in_dtype, buffer_count=2),
+        pltpu.BufferedRef.output(out_spec, in_dtype, buffer_count=2),
     )
 
     @pl.with_scoped(allocations=allocations)
@@ -392,6 +419,7 @@ def _rope_call(
     inverse: bool,
     quant_dtype: jnp.dtype | None,
     name: str,
+    head_dim: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Builds the ``pallas_call``; see the public wrappers for the contract."""
     if x.ndim not in (2, 3):
@@ -400,10 +428,64 @@ def _rope_call(
     assert cos_sin_cache.ndim == 2
 
     num_tokens = x.shape[0]
-    head_dim = x.shape[-1]
-    rows_per_token = x.shape[1] if x.ndim == 3 else 1
-    rotary_dim = cos_sin_cache.shape[1]
+    tile_n = largest_divisor(num_tokens, cap=128)
+    assert num_tokens % tile_n == 0
 
+    if x.ndim == 3:
+        head_dim = x.shape[-1] if head_dim is None else head_dim
+        rows_per_token = x.shape[1]
+        in_block_shape = (tile_n, rows_per_token, LANE)
+        out_block_shape = in_block_shape
+        scale_block_shape = (tile_n, rows_per_token)
+        lane_block = head_dim // LANE - 1
+        if quant_dtype is None:
+            out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+            out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+            input_output_aliases = {1: 0}  # x (after the scalar prefetch) -> out
+        else:
+            out_shape = (
+                jax.ShapeDtypeStruct(x.shape, quant_dtype),
+                jax.ShapeDtypeStruct(x.shape[:-1], jnp.float32),
+            )
+            out_specs = (
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            )
+            input_output_aliases = {}
+    else:  # x.ndim == 2
+        if quant_dtype is None:
+            head_dim = x.shape[-1] if head_dim is None else head_dim
+            rows_per_token = 1
+            in_block_shape = (tile_n, LANE)
+            out_block_shape = in_block_shape
+            scale_block_shape = (tile_n,)
+            lane_block = head_dim // LANE - 1
+            out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+            out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+            input_output_aliases = {1: 0}  # x (after the scalar prefetch) -> out
+        else:
+            head_dim = LANE if head_dim is None else head_dim
+            assert x.shape[1] % head_dim == 0, (
+                f"channels {x.shape[1]} must be divisible by head_dim {head_dim}"
+            )
+            rows_per_token = x.shape[1] // head_dim
+            in_block_shape = (tile_n, x.shape[1])
+            out_block_shape = (tile_n, rows_per_token, head_dim)
+            scale_block_shape = (tile_n, rows_per_token)
+            lane_block = 0
+            out_shape = (
+                jax.ShapeDtypeStruct(
+                    (num_tokens, rows_per_token, head_dim), quant_dtype
+                ),
+                jax.ShapeDtypeStruct((num_tokens, rows_per_token), jnp.float32),
+            )
+            out_specs = (
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            )
+            input_output_aliases = {}
+
+    rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
     if quant_dtype is not None and head_dim != LANE:
@@ -412,19 +494,15 @@ def _rope_call(
         # is exactly LANE).
         raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
 
-    tile_n = largest_divisor(num_tokens, cap=128)
-    assert num_tokens % tile_n == 0
-
-    x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
-    # One scale per row: x.shape minus the channel axis.
-    scale_block_shape = x_block_shape[:-1]
     kernel = functools.partial(
         _kernel,
         num_tiles=num_tokens // tile_n,
         tile_n=tile_n,
-        x_block_shape=x_block_shape,
+        in_block_shape=in_block_shape,
+        out_block_shape=out_block_shape,
         scale_block_shape=scale_block_shape,
-        lane_block=head_dim // LANE - 1,  # last lane block has the roped channels
+        head_dim=head_dim,
+        lane_block=lane_block,
         rotary_dim=rotary_dim,
         inverse=inverse,
         in_dtype=x.dtype,
@@ -432,21 +510,6 @@ def _rope_call(
         cos_sin_dtype=cos_sin_cache.dtype,
         quant_dtype=quant_dtype,
     )
-
-    if quant_dtype is None:
-        out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
-        input_output_aliases = {1: 0}  # x (after the scalar prefetch) -> out
-    else:
-        out_shape = (
-            jax.ShapeDtypeStruct(x.shape, quant_dtype),
-            jax.ShapeDtypeStruct(x.shape[:-1], jnp.float32),
-        )
-        out_specs = (
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        )
-        input_output_aliases = {}
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
@@ -463,7 +526,7 @@ def _rope_call(
         grid_spec=grid_spec,
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.compiler_vmem_limit_bytes(),
             disable_bounds_checks=True,
         ),
         name=name,
@@ -510,37 +573,59 @@ def rope(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("eps", "inverse", "name"),
+    static_argnames=("eps", "inverse", "head_dim", "name"),
     donate_argnames=("x",),
 )
 def qnorm_rope(
-    x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, head_dim]
+    x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, channels]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
     eps: float = 1e-6,
     inverse: bool = False,
+    head_dim: int | None = None,
     name: str = "qnorm_rope",
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with DeepSeek-V4 RoPE."""
-    assert x.ndim == 3
+    if x.ndim not in (2, 3):
+        raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
     assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
     assert cos_sin_cache.ndim == 2
 
     num_tokens = x.shape[0]
-    head_dim = x.shape[-1]
-    rows_per_token = x.shape[1]
+    tile_n = largest_divisor(num_tokens, cap=64)
+
+    if x.ndim == 3:
+        head_dim = x.shape[-1] if head_dim is None else head_dim
+        rows_per_token = x.shape[1]
+        in_block_shape = (tile_n, rows_per_token, head_dim)
+        out_block_shape = in_block_shape
+        out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+        input_output_aliases = {1: 0}
+    else:
+        assert head_dim is not None, "head_dim must be provided when x is 2D"
+        assert x.shape[1] % head_dim == 0, (
+            f"channels {x.shape[1]} must be divisible by head_dim {head_dim}"
+        )
+        rows_per_token = x.shape[1] // head_dim
+        in_block_shape = (tile_n, x.shape[1])
+        out_block_shape = (tile_n, rows_per_token, head_dim)
+        out_shape = jax.ShapeDtypeStruct(
+            (num_tokens, rows_per_token, head_dim), x.dtype
+        )
+        input_output_aliases = {}
+
     rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-    tile_n = largest_divisor(num_tokens, cap=64)
 
-    x_block_shape = (tile_n, rows_per_token, head_dim)
     kernel = functools.partial(
         _qnorm_rope_kernel,
         num_tiles=num_tokens // tile_n,
         tile_n=tile_n,
-        x_block_shape=x_block_shape,
+        in_block_shape=in_block_shape,
+        out_block_shape=out_block_shape,
+        head_dim=head_dim,
         rotary_dim=rotary_dim,
         eps=eps,
         inverse=inverse,
@@ -559,25 +644,32 @@ def qnorm_rope(
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=out_shape,
         grid_spec=grid_spec,
-        input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
+        input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.compiler_vmem_limit_bytes(),
             disable_bounds_checks=True,
         ),
         name=name,
     )(positions, x, cos_sin_cache)
 
 
-@functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
+@functools.partial(
+    jax.jit,
+    static_argnames=("inverse", "quant_dtype", "head_dim", "name"),
+    donate_argnames=("x",),
+)
 def rope_quant(
-    x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
+    # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
+    # | [num_tokens, channels]
+    x: jax.Array,
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+    head_dim: int | None = None,
     name: str = "rope_quant",
 ) -> tuple[jax.Array, jax.Array]:
     """RoPE fused with per-row dynamic quantization of the rotated values.
@@ -592,4 +684,5 @@ def rope_quant(
         inverse=inverse,
         quant_dtype=quant_dtype,
         name=name,
+        head_dim=head_dim,
     )

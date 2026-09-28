@@ -341,7 +341,16 @@ def compress_norm_rope_store(
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
+    tile_n = 4
     num_tokens = positions.shape[0]
+    pad_len = (tile_n - (num_tokens % tile_n)) % tile_n
+    if pad_len > 0:
+        positions = jnp.pad(positions, (0, pad_len), constant_values=0)
+        token_to_req_indices = jnp.pad(
+            token_to_req_indices, (0, pad_len), constant_values=0
+        )
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad_len), constant_values=-1)
+        num_tokens = positions.shape[0]
     head_dim = rms_weight.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
 

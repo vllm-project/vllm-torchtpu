@@ -70,8 +70,8 @@ def calculate_moe_chunks(
     num_chunks = (total_tokens + chunk_size - 1) // chunk_size
     if seq_len % num_chunks != 0:
         raise ValueError(
-            f"Local sequence length ({seq_len}) is not divisible by chunk count "
-            f"({num_chunks})."
+            f"Local sequence length ({seq_len}) is not divisible by "
+            f"chunk count ({num_chunks})."
         )
 
     chunk_size_local = seq_len // num_chunks
@@ -110,6 +110,78 @@ def _log_active_chunk_pipeline() -> None:
     )
 
 
+# Largest integer every smaller integer of which is exactly representable in
+# the given float type, i.e. 2**(mantissa_bits + 1).
+_EXACT_INT_LIMIT = {
+    torch.float64: 2**53,
+    torch.float32: 2**24,
+    torch.float16: 2048,
+    torch.bfloat16: 256,
+}
+
+
+def _can_pack_routing(
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    num_experts: int | None,
+) -> bool:
+    """Whether the two routing tensors may share one all-gather.
+
+    Packing casts `topk_ids` into the float dtype of `topk_weights` so the two
+    can be concatenated. That is lossless only while every expert id is exactly
+    representable in that dtype, so the expert count is checked against the
+    mantissa rather than assumed. The check matters: `bfloat16` carries 8 bits
+    of significand and tops out at 256, which is exactly the expert count of
+    DeepSeek-V4-Flash, so the margin there is zero.
+    """
+    if not envs.TPU_MOE_PACK_ROUTING_ALLGATHER:
+        return False
+    if topk_weights is None or topk_ids is None:
+        return False
+    if topk_weights.dim() != 2 or topk_ids.dim() != 2:
+        return False
+    if topk_weights.shape != topk_ids.shape:
+        return False
+    limit = _EXACT_INT_LIMIT.get(topk_weights.dtype)
+    if limit is None:
+        return False
+    # num_experts unknown -> refuse rather than guess.
+    return num_experts is not None and num_experts <= limit
+
+
+def _all_gather_routing_packed(
+    collective_group, topk_weights: torch.Tensor, topk_ids: torch.Tensor, dim: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-gather `topk_weights` and `topk_ids` in a single collective.
+
+    Concatenating along the topk axis keeps the gather axis (0) intact, so the
+    gathered result splits back by simple column slicing.
+    """
+    topk = topk_weights.shape[1]
+    packed = torch.cat([topk_weights, topk_ids.to(topk_weights.dtype)], dim=1)
+    gathered = collective_group.all_gather(packed, dim=dim)
+    return (gathered[:, :topk], gathered[:, topk:].to(topk_ids.dtype))
+
+
+def _all_gather_routing(
+    collective_group, topk_weights, topk_ids, num_experts, dim: int = 0
+):
+    """All-gather the routing tensors, packed into one call when allowed."""
+    if _can_pack_routing(topk_weights, topk_ids, num_experts):
+        return _all_gather_routing_packed(
+            collective_group, topk_weights, topk_ids, dim=dim
+        )
+    ag_weights = (
+        collective_group.all_gather(topk_weights, dim=dim)
+        if topk_weights is not None
+        else None
+    )
+    ag_ids = (
+        collective_group.all_gather(topk_ids, dim=dim) if topk_ids is not None else None
+    )
+    return ag_weights, ag_ids
+
+
 def pipelined_fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -137,7 +209,7 @@ def pipelined_fused_moe_gmm(
     world size is greater than one, the sequence is partitioned into balanced
     chunks and executed via a 3-stage pipelined schedule:
       ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done)
-        -> rs1_start || rs0_done -> rs1_done -> concat
+      -> rs1_start || rs0_done -> rs1_done -> concat
 
     Args:
         hidden_states: Local input activations [S, H].
@@ -145,8 +217,8 @@ def pipelined_fused_moe_gmm(
             (concatenated gate W1 and up W3 projections with intermediate dimension
             2*I for gated activations like SwiGLU when activation="silu").
         w2: Second expert projection weights [E, H, I] or [E, I, H]
-            (down projection W2 from intermediate dimension I back to
-            hidden dimension H).
+            (down projection W2 from intermediate dimension I back to hidden
+            dimension H).
         w1_scale: Optional first projection scale tensor.
         w2_scale: Optional second projection scale tensor.
         w1_bias: Optional first projection bias tensor.
@@ -173,18 +245,17 @@ def pipelined_fused_moe_gmm(
         seq_len, parallel_size, chunk_size
     )
 
+    # Upper bound on the global expert count, used only to prove that expert
+    # ids survive the cast performed when routing tensors share a gather.
+    # w1 is sharded over the same group the collective spans, so local experts
+    # times world size bounds the global count.
+    num_experts_bound = int(w1.shape[0]) * parallel_size
+
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
+            ag_topk_weights, ag_topk_ids = _all_gather_routing(
+                collective_group, topk_weights, topk_ids, num_experts_bound
             )
         else:
             ag_hidden_states = hidden_states
@@ -238,15 +309,8 @@ def pipelined_fused_moe_gmm(
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
+    ag_tw_curr, ag_ti_curr = _all_gather_routing(
+        collective_group, weights_slices[0], ids_slices[0], num_experts_bound
     )
 
     rs_outputs = []
@@ -255,15 +319,11 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (
-                collective_group.all_gather(weights_slices[i + 1], dim=0)
-                if weights_slices[i + 1] is not None
-                else None
-            )
-            ag_ti_next = (
-                collective_group.all_gather(ids_slices[i + 1], dim=0)
-                if ids_slices[i + 1] is not None
-                else None
+            ag_tw_next, ag_ti_next = _all_gather_routing(
+                collective_group,
+                weights_slices[i + 1],
+                ids_slices[i + 1],
+                num_experts_bound,
             )
 
         # Compute MoE kernel for current gathered chunk

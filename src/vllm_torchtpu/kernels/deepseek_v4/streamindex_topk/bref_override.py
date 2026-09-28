@@ -44,7 +44,10 @@ def _token_window(
     lo = jnp.maximum(cu_q_lens_ref[seq_idx], chunk_start)
 
     if seq_batch_size > 1:
-        return lo, seq_batch_size
+        end_seq_idx = start_end_seq_idx_ref[1]
+        hi_seq = jnp.minimum(seq_idx + seq_batch_size, end_seq_idx)
+        hi = jnp.minimum(cu_q_lens_ref[hi_seq], chunk_start + chunk_tokens)
+        return lo, jnp.maximum(0, jnp.minimum(seq_batch_size, hi - lo))
     token_start = lo + meta_ref.bq_idx[p_id] * bq_sz
     if bq_sz == 1:
         return token_start, 1

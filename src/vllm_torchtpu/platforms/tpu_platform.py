@@ -392,6 +392,11 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        # Change the Pallas attention block sizes, so they change the
+        # generated code and must participate in the compile-cache key.
+        "TPU_DSV4_MLA_BKVP_DECODE",
+        "TPU_DSV4_SWA_BKVP_DECODE",
+        "TPU_DSV4_IDX_BKVP_DECODE",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

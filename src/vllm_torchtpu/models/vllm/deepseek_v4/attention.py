@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
@@ -47,6 +48,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
+    decode_bkvp_op_tag,
     get_packed_mla_head_size,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
@@ -78,9 +80,12 @@ def _qnorm_rope_jax(
     cos_sin_cache: jax.Array,
     *,
     eps: float,
+    head_dim: int,
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
-    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+    return rope_kernel.qnorm_rope(
+        x, positions, cos_sin_cache, eps=eps, head_dim=head_dim
+    )
 
 
 def _rope_jax(
@@ -370,11 +375,19 @@ class VllmDeepseekV4MLAAttention(
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, block
         # causality, and profiling stage.
+        # The block-size tag must be here: the lowered Pallas artifact is cached
+        # under this name, so without it a changed decode block size reuses the
+        # previously traced kernel and the override does nothing.
+        bkvp_tag = decode_bkvp_op_tag(
+            ("m", envs.TPU_DSV4_MLA_BKVP_DECODE),
+            ("s", envs.TPU_DSV4_SWA_BKVP_DECODE),
+        )
         op_name = (
             f"pallas::deepseek_v4_attention_{op_type}"
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
+            f"{bkvp_tag}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
@@ -460,20 +473,30 @@ class VllmDeepseekV4MLAAttention(
             return op
 
         eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        head_dim = int(self.mla_attn.head_dim)
+        n_local_heads = int(self.mla_attn.n_local_heads)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}_h{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
+                functools.partial(_qnorm_rope_jax, eps=eps, head_dim=head_dim),
                 mesh=get_vllm_model_wrapper_context().mesh,
                 input_partition_specs=(
-                    P(None, "model", None),  # q
+                    P(None, "model"),  # q is 2D: [tokens, n_heads * head_dim]
                     P(),  # positions
                     P(),  # cos_sin_cache
                 ),
             )
-            op.register_fake(_fake_rope)
+
+            def _fake_qnorm_rope(x, positions, cos_sin_cache, *args, **kwargs):
+                return torch.empty(
+                    (x.shape[0], n_local_heads, head_dim),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+
+            op.register_fake(_fake_qnorm_rope)
             _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_qnorm_rope_op_instance", op)
         return op
@@ -529,9 +552,9 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        q = self.wq_b(qr)
+        if isinstance(q, tuple):
+            q = q[0]
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 

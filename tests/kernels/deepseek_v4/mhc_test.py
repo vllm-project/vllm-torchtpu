@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,7 +22,8 @@ import torch
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
+from vllm_torchtpu.kernels import vmem_budget
+from vllm_torchtpu.kernels.deepseek_v4.mhc import tuning, utils
 
 HC_MULT = 4
 # Values from the official DeepSeek-V4 config.json: rms_norm_eps=1e-6,
@@ -250,6 +254,126 @@ class MhcPreParityTest(parameterized.TestCase):
         )
         for out in (got_post, got_comb, got_layer):
             self.assertTrue(bool(jnp.isfinite(out.astype(jnp.float32)).all()))
+
+
+class SelectTokenBlockTest(parameterized.TestCase):
+    def test_adaptive_grid_default_off(self):
+        old = os.environ.pop("TPU_DSV4_MHC_ADAPTIVE_GRID", None)
+        try:
+            self.assertEqual(utils.select_token_block(32, 128), (32, 32))
+            self.assertEqual(utils.select_token_block(64, 128), (64, 64))
+            self.assertEqual(utils.select_token_block(128, 128), (128, 128))
+            self.assertEqual(utils.select_token_block(256, 128), (128, 256))
+        finally:
+            if old is not None:
+                os.environ["TPU_DSV4_MHC_ADAPTIVE_GRID"] = old
+
+    def test_adaptive_grid_enabled_via_env(self):
+        old = os.environ.get("TPU_DSV4_MHC_ADAPTIVE_GRID")
+        os.environ["TPU_DSV4_MHC_ADAPTIVE_GRID"] = "1"
+        try:
+            # c=64 (64 tokens): capped at tb=32 so grid = 64 // 32 = 2
+            self.assertEqual(utils.select_token_block(64, 128), (32, 64))
+            # c=256 (128 tokens): capped at tb=64 so grid = 128 // 64 = 2
+            self.assertEqual(utils.select_token_block(128, 128), (64, 128))
+            # c=2048 (256 tokens per DP rank): tb=128 so grid = 256 // 128 = 2
+            self.assertEqual(utils.select_token_block(256, 128), (128, 256))
+            # Small token count <= SUBLANE stays at SUBLANE=16
+            self.assertEqual(utils.select_token_block(8, 128), (16, 16))
+            self.assertEqual(utils.select_token_block(32, 128), (16, 32))
+        finally:
+            if old is not None:
+                os.environ["TPU_DSV4_MHC_ADAPTIVE_GRID"] = old
+            else:
+                os.environ.pop("TPU_DSV4_MHC_ADAPTIVE_GRID", None)
+
+    def test_vmem_ceiling_shrinks_tb256_to_128(self):
+        hidden_size = 4096
+        hc_hidden = 4 * hidden_size
+        hc_mult3 = 24
+
+        def _vmem_need(tb: int) -> int:
+            return (
+                tb * (4 * (hc_hidden + hidden_size) * 2 + hc_hidden * 6)
+                + 3 * hc_mult3 * hc_hidden * 2
+            )
+
+        # At 4096 tokens the adaptive grid alone would allow tb=256, but
+        # _vmem_need(256) = 66.25 MiB exceeds a v7x-sized budget, so the
+        # block halves to tb=128 (33.13 MiB) instead of OOMing at compile.
+        self.assertEqual(
+            utils.select_token_block(
+                4096, 256, vmem_need=_vmem_need, vmem_limit_bytes=60 * tuning.MIB
+            ),
+            (128, 4096),
+        )
+        # A v6e-sized budget has room for the full tb=256 block.
+        self.assertEqual(
+            utils.select_token_block(
+                4096, 256, vmem_need=_vmem_need, vmem_limit_bytes=100 * tuning.MIB
+            ),
+            (256, 4096),
+        )
+
+
+class MhcTuningTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        for name in (
+            "TPU_DSV4_MHC_VMEM_LIMIT_BYTES",
+            "TPU_DSV4_MHC_TOKEN_BLOCK",
+            "TPU_DSV4_MHC_ADAPTIVE_GRID",
+            "TPU_KERNEL_VMEM_LIMIT_BYTES",
+        ):
+            self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+            os.environ.pop(name, None)
+
+    def test_budget_never_exceeds_physical_vmem(self):
+        # Whatever the host, the budget must fit the reported capacity with
+        # headroom, and must not exceed the historic 100 MiB convention.
+        limit = tuning.vmem_limit_bytes()
+        self.assertGreater(limit, 0)
+        self.assertLessEqual(limit, tuning.LEGACY_VMEM_LIMIT_BYTES)
+        self.assertLessEqual(limit, vmem_budget.physical_vmem_bytes())
+
+    @parameterized.named_parameters(
+        # v6e: 128 MiB capacity. 94% of it (120 MiB) is above the historic
+        # 100 MiB convention, so the clamp keeps the pre-existing behaviour.
+        ("v6e_128mib", 128 * tuning.MIB, True),
+        # v7x: ~64 MiB capacity. 94% of it is below 100 MiB, so the budget
+        # tracks the hardware and stays under the physical ceiling.
+        ("v7x_64mib", 67043328, False),
+    )
+    def test_budget_is_derived_per_generation(self, capacity, expect_clamped):
+        with (
+            mock.patch.object(
+                vmem_budget, "physical_vmem_bytes", return_value=capacity
+            ),
+            mock.patch.object(
+                tuning, "_tuning", return_value=tuning.MhcTuning(token_block_size=128)
+            ),
+        ):
+            limit = tuning.vmem_limit_bytes()
+        if expect_clamped:
+            self.assertEqual(limit, tuning.LEGACY_VMEM_LIMIT_BYTES)
+        else:
+            self.assertEqual(limit, int(capacity * tuning.DEFAULT_VMEM_SAFETY_FRACTION))
+        # The invariant that Trial F violated: never budget past the chip.
+        self.assertLess(limit, capacity)
+
+    def test_env_overrides_win(self):
+        os.environ["TPU_DSV4_MHC_VMEM_LIMIT_BYTES"] = str(7 * tuning.MIB)
+        os.environ["TPU_DSV4_MHC_TOKEN_BLOCK"] = "64"
+        os.environ["TPU_DSV4_MHC_ADAPTIVE_GRID"] = "0"
+        self.assertEqual(tuning.vmem_limit_bytes(), 7 * tuning.MIB)
+        self.assertEqual(tuning.default_token_block_size(), 64)
+        self.assertFalse(tuning.adaptive_grid_enabled())
+
+    def test_explicit_limit_beats_hardware_default(self):
+        self.assertEqual(tuning.resolve_vmem_limit_bytes(1234), 1234)
+        self.assertEqual(
+            tuning.resolve_vmem_limit_bytes(None), tuning.vmem_limit_bytes()
+        )
 
 
 class MhcPostParityTest(parameterized.TestCase):

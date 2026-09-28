@@ -23,6 +23,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     sparsecore_topk,
@@ -36,7 +37,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
@@ -316,10 +316,13 @@ def kernel(
                 jnp.int32, s_summed.shape, 1
             )
             k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
-            seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
+            seq_i = batch_start_seq_idx + batch_idx
+            is_valid_seq = seq_i < start_end_seq_idx_ref[1]
+            safe_seq_i = jnp.minimum(seq_i, max_num_seqs - 1)
+            seq_len = seq_lens_ref[safe_seq_i]
             kv_len = seq_len >> shift_comp
 
-            valid_mask = k_span < kv_len
+            valid_mask = jnp.logical_and(is_valid_seq, k_span < kv_len)
             causal_mask = k_span <= bq_pos_compressed[:, None]
             mask = jnp.logical_and(valid_mask, causal_mask)
             s_summed = jnp.where(mask, s_summed, -jnp.inf)
@@ -354,9 +357,10 @@ def kernel(
         chunk_start = start_end_seq_idx_ref[2]
         bq_pos_compressed_vec = []
         for batch_idx in range(seq_batch_size):
-            s_l = seq_lens_ref[batch_start_seq_idx + batch_idx]
-            q_s = cu_q_lens_ref[batch_start_seq_idx + batch_idx]
-            q_e = cu_q_lens_ref[batch_start_seq_idx + batch_idx + 1]
+            safe_seq_i = jnp.minimum(batch_start_seq_idx + batch_idx, max_num_seqs - 1)
+            s_l = seq_lens_ref[safe_seq_i]
+            q_s = cu_q_lens_ref[safe_seq_i]
+            q_e = cu_q_lens_ref[safe_seq_i + 1]
             q_l = q_e - q_s
             # Offset of this block's first token within the sequence.
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
@@ -621,6 +625,8 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "has_decode_seqs",
+        "has_prefill_seqs",
     ),
 )
 def streamindex_topk(
@@ -640,7 +646,7 @@ def streamindex_topk(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     decode_req_batch_size: int = 4,
     enable_early_exit: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
@@ -649,6 +655,8 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    has_decode_seqs: bool = True,
+    has_prefill_seqs: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -708,11 +716,20 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      has_decode_seqs: whether the batch can contain decode sequences. False skips
+        emitting the decode pallas_call launch entirely.
+      has_prefill_seqs: whether the batch can contain prefill/mixed sequences.
+        False skips emitting the prefill/mixed pallas_call launch entirely.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
       `return_scores`. Unfilled slots are `-1` with score `-inf`.
     """
+    vmem_limit_bytes = vmem_budget.resolve_compiler_limit(vmem_limit_bytes)
+    assert has_decode_seqs or has_prefill_seqs, (
+        "At least one of has_decode_seqs / has_prefill_seqs must be True."
+    )
+
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
@@ -946,40 +963,36 @@ def streamindex_topk(
             )
         return scores
 
-    def _pass_specs(decode_batch_end):
-        """`run_scores_kernel` kwargs for the three passes over the batch."""
-        decode_cfg = dict(
-            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
-            buffer_count=buffer_counts[0],
-            static_q_len=1,
-            case=MlaCase.DECODE,
-        )
-        return (
-            dict(
-                start_seq_idx=jnp.array(0),
-                end_seq_idx=decode_batch_end,
-                seq_batch_size=decode_req_batch_size,
-                **decode_cfg,
-            ),
-            # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-            dict(
-                start_seq_idx=decode_batch_end,
-                end_seq_idx=distribution[1],
-                seq_batch_size=1,
-                **decode_cfg,
-            ),
-            dict(
-                num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-                num_queries_per_block=num_queries_per_blocks[2],
-                buffer_count=buffer_counts[2],
-                start_seq_idx=distribution[1],
-                end_seq_idx=distribution[2],
-                static_q_len=None,
-                seq_batch_size=1,
-                case=MlaCase.MIXED,
-            ),
-        )
+    def _pass_specs():
+        """`run_scores_kernel` kwargs for the active passes over the batch."""
+        specs = []
+        if has_decode_seqs:
+            specs.append(
+                dict(
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+                    num_queries_per_block=num_queries_per_blocks[0],
+                    buffer_count=buffer_counts[0],
+                    start_seq_idx=jnp.array(0),
+                    end_seq_idx=distribution[0],
+                    static_q_len=1,
+                    seq_batch_size=decode_req_batch_size,
+                    case=MlaCase.DECODE,
+                )
+            )
+        if has_prefill_seqs:
+            specs.append(
+                dict(
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+                    num_queries_per_block=num_queries_per_blocks[2],
+                    buffer_count=buffer_counts[2],
+                    start_seq_idx=distribution[0],
+                    end_seq_idx=distribution[2],
+                    static_q_len=None,
+                    seq_batch_size=1,
+                    case=MlaCase.MIXED,
+                )
+            )
+        return tuple(specs)
 
     def _pass_metadata(spec, chunk_starts, chunk_tokens):
         """One schedule per pass, holding every chunk's steps back to back."""
@@ -1046,14 +1059,6 @@ def streamindex_topk(
         out_dtype = jnp.int32
         max_num_tokens = q.shape[0]
 
-        # TODO: we shall sort the sequences by length, so that multiple decode
-        # sequences in one batch have similar lengths to reduce waste of compute.
-        # With the same batch size, the longest sequence will determine number of
-        # blocks to run computation for.
-        decode_batch_end = (
-            distribution[0] // decode_req_batch_size * decode_req_batch_size
-        )
-
         num_positions = max(num_sublanes_total * 128, k)
         eff_row_lengths = _effective_row_lengths(
             seq_lens=seq_lens,
@@ -1087,7 +1092,7 @@ def streamindex_topk(
         )
         passes = tuple(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
+            for spec in _pass_specs()
         )
         topk_idxs = []
         topk_scores_list = []
@@ -1260,7 +1265,7 @@ def streamindex_topk_dcp(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     decode_req_batch_size: int = 4,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,

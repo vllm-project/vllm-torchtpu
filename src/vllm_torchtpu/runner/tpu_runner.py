@@ -4429,11 +4429,14 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
+        from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+            VllmMxfp4MoEMethod,
+        )
 
         uses_mxfp4_moe = any(
             isinstance(
                 getattr(module, "quant_method", None),
-                VllmCompressedTensorsW4ANMxfp4MoEMethod,
+                (VllmCompressedTensorsW4ANMxfp4MoEMethod, VllmMxfp4MoEMethod),
             )
             for module in self.model.modules()
         )

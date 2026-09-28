@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_PACK_ROUTING_ALLGATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -133,6 +134,16 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_DSV4_MLA_BKVP_DECODE: int | None = None
+    TPU_DSV4_SWA_BKVP_DECODE: int | None = None
+    TPU_DSV4_IDX_BKVP_DECODE: int | None = None
+    TPU_DSV4_MLA_BKVP_MIXED: int | None = None
+    TPU_DSV4_SWA_BKVP_MIXED: int | None = None
+    TPU_DSV4_IDX_BKVP_MIXED: int | None = None
+    TPU_DSV4_MHC_TOKEN_BLOCK: int | None = None
+    TPU_DSV4_MHC_ADAPTIVE_GRID: bool | None = None
+    TPU_DSV4_MHC_VMEM_LIMIT_BYTES: int | None = None
+    TPU_KERNEL_VMEM_LIMIT_BYTES: int | None = None
 
 
 def env_with_choices(
@@ -396,9 +407,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     # Runtime block size for dense linear weight requantization.
-    "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # Runtime dtype for dense linear weight requantization.
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -412,9 +425,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
     # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
-    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -567,9 +582,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_MASKED_DENSE_MAX_KV_LEN"
     ),
     # Most model length cap for TPU compile bucketing
-    "VLLM_TPU_MOST_MODEL_LEN": lambda: int(val)
-    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
-    else None,
+    "VLLM_TPU_MOST_MODEL_LEN": lambda: (
+        int(val) if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None
+    ),
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
@@ -659,19 +674,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Combines the topk_weights and topk_ids all-gathers into a single
+    # collective. Both are tiny -- at DP8 / 256 local tokens / topk 6 they are
+    # 3 KB and 6 KB -- so their cost is per-call latency, not bandwidth. A
+    # decode xprof on DSv4-Flash measured them at 1.02% and 1.21% of device
+    # time against 6.42% for the 2 MB hidden-state gather they accompany.
+    # Off by default until the win is confirmed end to end.
+    "TPU_MOE_PACK_ROUTING_ALLGATHER": env_bool(
+        "TPU_MOE_PACK_ROUTING_ALLGATHER", default=False
+    ),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
-    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1")
-    .strip()
-    .lower()
-    not in ("0", "false", "off", "no"),
+    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: (
+        os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower()
+        not in ("0", "false", "off", "no")
+    ),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
-    "USE_RPA_PIPELINED_DMA_STAGING": lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_PIPELINED_DMA_STAGING")(),
-    "USE_PIPELINED_DMA_STAGING": lambda: env_bool("USE_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    "USE_RPA_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_PIPELINED_DMA_STAGING")()
+    ),
+    "USE_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+    ),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.
@@ -826,6 +854,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # DeepSeek-V4 decode-path attention block sizes (num_kv_pages_per_block).
+    #
+    # The in-tree values were picked from microbenchmarks and are applied
+    # uniformly across the decode/prefill/mixed cases, even though decode runs
+    # at bq=1 and prefill at bq=32 -- very different KV streaming patterns. A
+    # v7x-8 decode trace at 8k/1k puts MLA at ~31% and the StreamIndex top-k
+    # indexer at ~24% of device busy time, both HBM-bound, so these are worth
+    # tuning per deployment.
+    #
+    # Unset leaves the in-tree defaults untouched. Only the DECODE (index 0)
+    # and MIXED (index 2) elements are overridable; the PREFILL element is
+    # never read, because its call site is gated behind a chunk_prefill_size
+    # this deployment does not use.
+    #
+    # NOTE: registering these in TpuPlatform.additional_env_vars is NOT what
+    # makes them effective. That list is consumed only by
+    # executors/ray_distributed_executor.py, and TpuMultiprocExecutor is what
+    # runs here. What actually defeats the stale-artifact problem is folding
+    # the values into the Pallas `op_name` via decode_bkvp_op_tag(); without
+    # that, a changed block size hits a cached lowered kernel, the Python body
+    # is never re-traced, and the sweep silently measures the old value.
+    "TPU_DSV4_MLA_BKVP_DECODE": env_optional_int("TPU_DSV4_MLA_BKVP_DECODE"),
+    "TPU_DSV4_SWA_BKVP_DECODE": env_optional_int("TPU_DSV4_SWA_BKVP_DECODE"),
+    "TPU_DSV4_IDX_BKVP_DECODE": env_optional_int("TPU_DSV4_IDX_BKVP_DECODE"),
+    "TPU_DSV4_MLA_BKVP_MIXED": env_optional_int("TPU_DSV4_MLA_BKVP_MIXED"),
+    "TPU_DSV4_SWA_BKVP_MIXED": env_optional_int("TPU_DSV4_SWA_BKVP_MIXED"),
+    "TPU_DSV4_IDX_BKVP_MIXED": env_optional_int("TPU_DSV4_IDX_BKVP_MIXED"),
+    # Token block for the mHC gates/Sinkhorn Pallas kernels. Same stale-artifact
+    # hazard as the bkvp knobs above, and the same remedy: the value is folded
+    # into the mHC `op_name`, so a changed block size cannot alias a cached
+    # lowered kernel.
+    "TPU_DSV4_MHC_TOKEN_BLOCK": env_optional_int("TPU_DSV4_MHC_TOKEN_BLOCK"),
+    "TPU_DSV4_MHC_ADAPTIVE_GRID": env_optional_bool("TPU_DSV4_MHC_ADAPTIVE_GRID"),
+    "TPU_DSV4_MHC_VMEM_LIMIT_BYTES": env_optional_int("TPU_DSV4_MHC_VMEM_LIMIT_BYTES"),
+    "TPU_KERNEL_VMEM_LIMIT_BYTES": env_optional_int("TPU_KERNEL_VMEM_LIMIT_BYTES"),
 }
 
 

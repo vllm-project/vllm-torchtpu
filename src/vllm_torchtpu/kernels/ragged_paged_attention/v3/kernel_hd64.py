@@ -11,6 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes_hd64 import (
     get_tuned_block_sizes,
 )
@@ -21,8 +22,6 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 # TODO(chengjiyao): refactor this hd64 variant and the original kernel to make
@@ -1489,7 +1488,7 @@ def ragged_paged_attention_hd64(
     if vmem_limit_bytes is None:
         # TODO (jevinjiang/jacobplatin): change this to use
         # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
+        vmem_limit_bytes = vmem_budget.compiler_vmem_limit_bytes()
     grid = (distribution[2],)
 
     in_specs = [

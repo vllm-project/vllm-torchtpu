@@ -19,8 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
+from vllm_torchtpu.kernels.deepseek_v4.mhc import tuning, utils
 
 
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
@@ -49,7 +48,7 @@ def mhc_post_2d(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
     """2D-native entry: the kernel's own layout as public API.
 
@@ -86,6 +85,7 @@ def mhc_post_2d(
             tb * hidden_size * (2 + 2 * hc_mult * 2) * 2 + tb * hidden_size * 4 * 2
         )
 
+    vmem_limit_bytes = tuning.resolve_vmem_limit_bytes(vmem_limit_bytes)
     tb, padded_tokens = utils.select_token_block(
         num_tokens,
         token_block_size,
@@ -127,7 +127,7 @@ def mhc_post(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
     """Pallas replacement for vLLM's ``mhc_post_torch``.
 

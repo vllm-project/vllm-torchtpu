@@ -17,8 +17,8 @@ import functools
 import jax
 import jax.numpy as jnp
 import torch
-import torch.nn as nn
 from jax.sharding import PartitionSpec as P
+from torch import nn
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
@@ -26,8 +26,12 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+    deepseek_v4_attention_op,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -36,6 +40,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.utils import align_to
+
+_with_decode_bkvp = deepseek_v4_attention_op._with_decode_bkvp
+decode_bkvp_op_tag = deepseek_v4_attention_op.decode_bkvp_op_tag
 
 logger = init_logger(__name__)
 
@@ -60,6 +67,7 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    head_dim: int,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -82,7 +90,11 @@ def _indexer_jax(
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
         q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+            q,
+            positions,
+            cos_sin_cache,
+            quant_dtype=jnp.float8_e4m3fn,
+            head_dim=head_dim,
         )
 
         # Fold the query quantization scales into the weights.
@@ -99,7 +111,9 @@ def _indexer_jax(
             k=k,
             compression_ratio=compression_ratio,
             # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(3, 2, 2),
+            num_kv_pages_per_block=_with_decode_bkvp(
+                (3, 2, 2), envs.TPU_DSV4_IDX_BKVP_DECODE, "StreamIndex"
+            ),
             num_queries_per_block=(1, 128, 128),
         )
 
@@ -157,6 +171,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            head_dim=self.head_dim,
         )
 
         _scale = (
@@ -164,9 +179,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             .replace("-", "m")
             .replace("+", "")
         )
+        # The block-size tag must be part of the name: the lowered Pallas
+        # artifact is cached under it, so without it a changed decode block
+        # size would reuse the previously traced kernel.
         op_name = (
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
-            f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
+            f"_c{self.compress_ratio}_h{self.n_head}_d{self.head_dim}_s{_scale}"
+            f"{decode_bkvp_op_tag(('i', envs.TPU_DSV4_IDX_BKVP_DECODE))}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
@@ -180,7 +199,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
+                P(
+                    attn_data_axis, attn_head_axis
+                ),  # q is 2D: [tokens, n_head * head_dim]
                 P(attn_data_axis),  # positions
                 P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
@@ -211,8 +232,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(query)
-        q = q.view(-1, self.n_head, self.head_dim)
+        q = self.wq_b(query)
+        if isinstance(q, tuple):
+            q = q[0]
+        # Keep q 2D [tokens, n_head * head_dim] to eliminate layout copy in HBM.
 
         self.compressor(hidden_states, positions, rotary_emb)
 

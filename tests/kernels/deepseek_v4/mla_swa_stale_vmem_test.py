@@ -28,6 +28,7 @@ from absl.testing import absltest, parameterized
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla_swa
 
 # DeepSeek-V4-Flash geometry: window 128, page 128, 2 pages per block, so
@@ -93,7 +94,7 @@ def _decode(
         sm_scale=HEAD_DIM**-0.5,
         sliding_window=WINDOW,
         logical_page_size=PAGE,
-        vmem_limit_bytes=mla_swa.DEFAULT_VMEM_LIMIT_BYTES,
+        vmem_limit_bytes=vmem_budget.compiler_vmem_limit_bytes(),
         unnormalized_output=True,
         seq_batch_sz=32,
     )

@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+from vllm_torchtpu.kernels import vmem_budget
 
 
 def cdiv(a, b):
@@ -1422,7 +1422,7 @@ def mla_sliding_window_ragged_paged_attention(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     q_compute_block_size: int | None = None,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     unnormalized_output: bool = False,
     # Draft (DSpark/DFlash) block mode: the last q_len positions of each
     # sequence attend bidirectionally within themselves (window still bounds
@@ -1468,6 +1468,7 @@ def mla_sliding_window_ragged_paged_attention(
     Returns:
       The output of attention and the updated kv cache.
     """
+    vmem_limit_bytes = vmem_budget.resolve_compiler_limit(vmem_limit_bytes)
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError(
             "num_kv_pages_per_block and num_queries_per_block must be specified."

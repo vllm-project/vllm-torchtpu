@@ -194,6 +194,43 @@ class RopeQuantTest(parameterized.TestCase):
         )
         assert_bits_equal(q, q_expected)
 
+    @parameterized.product(
+        num_tokens=(8, 64, 256),
+        inverse=(False, True),
+    )
+    def test_matches_reference_2d_input(self, num_tokens, inverse):
+        """Indexer query 2D input: [tokens, index_n_heads * index_head_dim]."""
+        indexer_head_dim = 128
+        indexer_num_heads = 64
+        shape = (num_tokens, indexer_num_heads, indexer_head_dim)
+        seed = 0
+        rng = np.random.default_rng(seed)
+        x_3d = rng.normal(size=shape).astype(jnp.bfloat16)
+        x_2d = x_3d.reshape(num_tokens, indexer_num_heads * indexer_head_dim)
+        positions = rng.integers(0, 4096, size=(shape[0],)).astype(np.int32)
+        cos_sin_cache = make_cos_sin_cache(4096, ROTARY_DIM, seed)
+
+        q_expected, scales_expected = quant_ref_impl(
+            rope_ref_impl(
+                x_3d.astype(np.float32), positions, cos_sin_cache, inverse=inverse
+            ),
+            jnp.float8_e4m3fn,
+        )
+        q, scales = rope_quant(
+            jnp.asarray(x_2d),
+            jnp.asarray(positions),
+            jnp.asarray(cos_sin_cache),
+            inverse=inverse,
+            quant_dtype=jnp.float8_e4m3fn,
+            head_dim=indexer_head_dim,
+        )
+        self.assertEqual(q.shape, (num_tokens, indexer_num_heads, indexer_head_dim))
+        self.assertEqual(scales.shape, (num_tokens, indexer_num_heads))
+        np.testing.assert_allclose(
+            np.asarray(scales), np.asarray(scales_expected), rtol=1e-6, atol=1e-6
+        )
+        assert_bits_equal(q, q_expected)
+
 
 class QNormRopeTest(parameterized.TestCase):
     """RoPE fused with the per-head RMSNorm that precedes it on ``q``."""
@@ -226,6 +263,41 @@ class QNormRopeTest(parameterized.TestCase):
             eps=eps,
             inverse=False,
         )
+        np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+    @parameterized.product(
+        num_tokens=(8, 64, 256),
+    )
+    def test_matches_reference_2d_input(self, num_tokens):
+        """``qnorm_rope`` 2D shape: [tokens, heads * head_dim]."""
+        num_heads = 128
+        head_dim = 512
+        seed = 42
+        shape = (num_tokens, num_heads, head_dim)
+        max_position = 4096
+        dtype = jnp.bfloat16
+        rng = np.random.default_rng(seed)
+        x = rng.normal(size=shape).astype(np.float32)
+        positions = rng.integers(0, max_position, size=(shape[0],)).astype(np.int32)
+        cos_sin_cache = make_cos_sin_cache(max_position, ROTARY_DIM, seed)
+        eps = 1e-6
+        x_3d = jnp.asarray(x, dtype=dtype)
+        x_2d = x_3d.reshape(num_tokens, num_heads * head_dim)
+        positions = jnp.asarray(positions)
+        cos_sin_cache = jnp.asarray(cos_sin_cache)
+
+        expected = qnorm_rope_ref_impl(
+            x_3d, positions, cos_sin_cache, eps, inverse=False
+        )
+        actual = qnorm_rope(
+            x_2d,
+            positions,
+            cos_sin_cache,
+            eps=eps,
+            inverse=False,
+            head_dim=head_dim,
+        )
+        self.assertEqual(actual.shape, (num_tokens, num_heads, head_dim))
         np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
 
 

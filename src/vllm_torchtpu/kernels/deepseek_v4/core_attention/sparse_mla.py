@@ -21,9 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def cdiv(a, b):
@@ -636,7 +635,7 @@ def sparse_ragged_paged_attention(
     # Kernel optimization params.
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -658,6 +657,8 @@ def sparse_ragged_paged_attention(
     Returns:
       The output of attention.
     """
+    vmem_limit_bytes = vmem_budget.resolve_compiler_limit(vmem_limit_bytes)
+
     # The cache is DSV4 FP8 format.
     # nope_cache contains 448 fp8 + 7 fp8 scales,
     # rope_cache contains 64 bf16

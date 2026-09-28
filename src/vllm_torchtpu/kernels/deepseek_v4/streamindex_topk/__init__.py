@@ -25,7 +25,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     DCP_AXIS_NAME,
-    DEFAULT_VMEM_LIMIT_BYTES,
     _select_owned_winners,
     cp_global_to_local,
     cp_local_length,
@@ -43,7 +42,6 @@ __all__ = [
     "MlaCase",
     "KVLayout",
     "DEFAULT_BUFFER_COUNT",
-    "DEFAULT_VMEM_LIMIT_BYTES",
     "DCP_AXIS_NAME",
     "cp_local_to_global",
     "cp_local_length",

@@ -59,7 +59,7 @@ class _BufferedRef(pltpu.BufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CosSinRef(_BufferedRef):
     def copy_in(self, src_ref, grid_indices):
-        cos_sin_cache_ref, positions_ref = src_ref
+        cos_sin_cache_ref, positions_ref, kv_slot_mapping_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
@@ -67,25 +67,46 @@ class CosSinRef(_BufferedRef):
         dest_ref = self.window_ref.at[slot]  # (tile_n, rope_head_dim)
 
         tile_n = self.cfgs.tile_sizes.tile_n
+        size_n = self.cfgs.dims.size_n
         compress_ratio = self.cfgs.dims.compress_ratio
 
         @pl.loop(0, tile_n, unroll=True)
         def loop_body(i):
             global_idx = pid * tile_n + i
-            position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
+            safe_idx = jnp.minimum(global_idx, size_n - 1)
+            valid = (global_idx < size_n) & (kv_slot_mapping_ref[safe_idx] >= 0)
 
-            src = cos_sin_cache_ref.at[
-                compressed_pos, pl.ds(0, self.window_ref.shape[-1])
-            ]
-            dest = dest_ref.at[i, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+            @pl.when(valid)
+            def _fetch_cos_sin():
+                position = positions_ref[safe_idx]
+                compressed_pos = (position // compress_ratio) * compress_ratio
+
+                src = cos_sin_cache_ref.at[
+                    compressed_pos, pl.ds(0, self.window_ref.shape[-1])
+                ]
+                dest = dest_ref.at[i, :]
+                pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
+        _, _, kv_slot_mapping_ref = src_ref
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        pid = grid_indices[0]
+
+        tile_n = self.cfgs.tile_sizes.tile_n
+        size_n = self.cfgs.dims.size_n
+
+        @pl.loop(0, tile_n, unroll=True)
+        def loop_body(i):
+            global_idx = pid * tile_n + i
+            safe_idx = jnp.minimum(global_idx, size_n - 1)
+            valid = (global_idx < size_n) & (kv_slot_mapping_ref[safe_idx] >= 0)
+
+            @pl.when(valid)
+            def _wait_cos_sin():
+                dest = vmem_ref.at[i, :]
+                pltpu.make_async_copy(dest, dest, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -105,9 +126,11 @@ class PageBufferRef(_BufferedRef):
             block_table_ref,
             block_table_stride,
             token_to_req_indices_ref,
+            kv_slot_mapping_ref,
         ) = src_ref
 
         tile_n = self.cfgs.tile_sizes.tile_n
+        size_n = self.cfgs.dims.size_n
         pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
         block_size = self.cfgs.state_block_size
 
@@ -119,23 +142,46 @@ class PageBufferRef(_BufferedRef):
             n = idx // pages_to_buffer_per_token
             p = idx % pages_to_buffer_per_token
             idx_n = global_idx + n
+            safe_idx_n = jnp.minimum(idx_n, size_n - 1)
+            valid = (idx_n < size_n) & (kv_slot_mapping_ref[safe_idx_n] >= 0)
 
-            position = positions_ref[idx_n]
-            req_idx = token_to_req_indices_ref[idx_n]
+            @pl.when(valid)
+            def _fetch_page():
+                position = positions_ref[safe_idx_n]
+                req_idx = token_to_req_indices_ref[safe_idx_n]
 
-            block_idx = position // block_size - (pages_to_buffer_per_token - 1) + p
-            safe_block_idx = jnp.maximum(block_idx, 0)
-            page = block_table_ref[req_idx * block_table_stride + safe_block_idx]
+                block_idx = position // block_size - (pages_to_buffer_per_token - 1) + p
+                safe_block_idx = jnp.maximum(block_idx, 0)
+                page = block_table_ref[req_idx * block_table_stride + safe_block_idx]
 
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+                src = state_cache_ref.at[page, :, :, :]
+                dest = page_buffer_ref.at[n, p, :, :, :]
+                pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        pid = grid_indices[0]
+
+        _, _, _, _, _, kv_slot_mapping_ref = src_ref
+        tile_n = self.cfgs.tile_sizes.tile_n
+        size_n = self.cfgs.dims.size_n
+        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
+        global_idx = pid * tile_n
+
+        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
+        def loop_body(idx):
+            n = idx // pages_to_buffer_per_token
+            p = idx % pages_to_buffer_per_token
+            idx_n = global_idx + n
+            safe_idx_n = jnp.minimum(idx_n, size_n - 1)
+            valid = (idx_n < size_n) & (kv_slot_mapping_ref[safe_idx_n] >= 0)
+
+            @pl.when(valid)
+            def _wait_page():
+                dest = vmem_ref.at[n, p, :, :, :]
+                pltpu.make_async_copy(dest, dest, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -444,7 +490,7 @@ def create_allocs_and_specs(
             use_lookahead=False,
             cfgs=cfgs,
         )
-        cos_sin_args = (cos_sin_cache_ref, positions_ref)
+        cos_sin_args = (cos_sin_cache_ref, positions_ref, kv_slot_mapping_ref)
     else:
         cos_sin_alloc = cos_sin_spec = cos_sin_args = None
 
@@ -491,6 +537,7 @@ def create_allocs_and_specs(
         block_table_ref,
         block_table_stride,
         token_to_req_indices_ref,
+        kv_slot_mapping_ref,
     )
 
     # rope

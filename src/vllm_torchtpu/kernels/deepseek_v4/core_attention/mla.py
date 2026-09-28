@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+from vllm_torchtpu.kernels import vmem_budget
 
 
 def cdiv(a, b):
@@ -717,7 +717,7 @@ def mla_ragged_paged_attention(
     # If passsed in as int, all cases are the same.
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 8,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
@@ -747,6 +747,7 @@ def mla_ragged_paged_attention(
     Returns:
       The output of attention.
     """
+    vmem_limit_bytes = vmem_budget.resolve_compiler_limit(vmem_limit_bytes)
     assert cache_kv.dtype == jnp.uint8
 
     if num_kv_pages_per_block is None or num_queries_per_block is None:

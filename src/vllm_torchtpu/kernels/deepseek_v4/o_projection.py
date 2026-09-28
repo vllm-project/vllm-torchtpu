@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
     CosSinRef,
@@ -26,8 +27,6 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     _rotate_gptj,
 )
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 SUBLANE = 8
 
@@ -153,7 +152,7 @@ def gather_cos_sin(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.compiler_vmem_limit_bytes(),
             disable_bounds_checks=True,
         ),
         name=name,
@@ -317,7 +316,7 @@ def wo_a_projection(
             (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.compiler_vmem_limit_bytes(),
             disable_bounds_checks=True,
         ),
         name=name,

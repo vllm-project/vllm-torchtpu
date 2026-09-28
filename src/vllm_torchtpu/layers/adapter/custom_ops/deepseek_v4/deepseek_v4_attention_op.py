@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -40,6 +41,58 @@ from vllm_torchtpu.utils import align_to
 logger = init_logger(__name__)
 
 BATCH_AXIS = None
+
+
+def _with_decode_bkvp(
+    blocks: tuple[int, int, int],
+    override: int | None,
+    what: str = "",
+) -> tuple[int, int, int]:
+    """Replace the DECODE element of a num_kv_pages_per_block tuple.
+
+    The tuple is indexed (decode, prefill, mixed) -- see the three
+    `run_mla_kernel` call sites in core_attention/mla.py, which pass
+    `[0]` with `MlaCase.DECODE`, `[1]` with PREFILL and `[2]` with MIXED.
+
+    Only decode is overridable: it is the case that dominates a serving
+    profile, and it is the one the in-tree tuples least plausibly fit, since
+    they carry the same value for every case despite decode running at bq=1
+    and prefill at bq=32.
+
+    > WHY THE OP NAME MUST CARRY THIS VALUE
+    Block sizes are baked into the Pallas kernel when `wrapped_fn` is traced,
+    and the lowered artifact is cached under the `op_name` built in
+    models/vllm/deepseek_v4/attention.py. That name encodes page size and
+    overlay status but not the block sizes, so on a warm cache the Python body
+    is never re-traced and an override silently does nothing. Measured: with
+    TPU_DSV4_MLA_BKVP_DECODE=32 the benchmark reproduced baseline throughput to
+    0.02%, no re-trace log was emitted, and no new cache artifacts appeared.
+    `decode_bkvp_op_tag()` below closes that hole.
+
+    (`additional_env_vars` in tpu_platform.py does NOT help here: its only
+    consumer is executors/ray_distributed_executor.py, and this deployment uses
+    TpuMultiprocExecutor. The env var itself does reach the workers -- the
+    start method is fork -- it is the artifact cache that defeats it.)
+    """
+    effective = blocks[0] if override is None else override
+    # Logged unconditionally, and from inside the process that actually traces
+    # the kernel, so a sweep can always prove which block size was compiled
+    # rather than inferring it from the value that was requested.
+    logger.info_once("DSV4 %s decode num_kv_pages_per_block = %d", what, effective)
+    if override is None:
+        return blocks
+    return (override, blocks[1], blocks[2])
+
+
+def decode_bkvp_op_tag(*knobs: tuple[str, int | None]) -> str:
+    """Suffix encoding decode block-size overrides, for Pallas op cache keys.
+
+    Returns the empty string when nothing is overridden, so default
+    deployments keep their existing cache entries and are bit-for-bit
+    unaffected by this mechanism.
+    """
+    parts = [f"{label}{value}" for label, value in knobs if value is not None]
+    return ("_bkvp" + "".join(parts)) if parts else ""
 
 
 def _run_swa(
@@ -84,7 +137,9 @@ def _run_swa(
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(2, 2, 2),
+        num_kv_pages_per_block=_with_decode_bkvp(
+            (2, 2, 2), envs.TPU_DSV4_SWA_BKVP_DECODE, "SWA"
+        ),
         num_queries_per_block=(1, 32, 32),
         q_compute_block_size=4,
         unnormalized_output=not swa_only,
@@ -163,7 +218,9 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(32, 32, 32),
+        num_kv_pages_per_block=_with_decode_bkvp(
+            (32, 32, 32), envs.TPU_DSV4_MLA_BKVP_DECODE, "MLA"
+        ),
         num_queries_per_block=(1, 32, 32),
     )
     return output, updated_sw_cache

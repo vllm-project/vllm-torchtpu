@@ -26,14 +26,18 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
     post_kernel,
     pre_kernel,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+
+logger = init_logger(__name__)
 
 # Every mHC tensor is token-major, so its leading axis is the attention-DP
 # token axis. As in the other DeepSeek-V4 ops, the mesh carries no such axis
@@ -63,6 +67,21 @@ def _gate_suffix(
     )
 
 
+def _token_block() -> int | None:
+    """The mHC gates token block, or None to use the kernel default."""
+    return envs.TPU_DSV4_MHC_TOKEN_BLOCK
+
+
+def _token_block_tag(token_block: int | None) -> str:
+    """Fold the token block into the op name.
+
+    Block size changes the generated kernel without changing any tensor
+    shape, so nothing else downstream distinguishes the two. Leaving the tag
+    empty when unset keeps the default op name stable.
+    """
+    return "" if token_block is None else f"_tb{token_block}"
+
+
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _mhc_pre_jax(
     residual: jax.Array,
@@ -75,8 +94,10 @@ def _mhc_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    token_block_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA."""
+    """Mix GEMM, stream collapse, and the gates/Sinkhorn, all in Pallas."""
+    extra = {} if token_block_size is None else {"token_block_size": token_block_size}
     return pre_kernel.mhc_pre(
         residual,
         fn,
@@ -87,6 +108,7 @@ def _mhc_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        **extra,
     )
 
 
@@ -114,8 +136,10 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    token_block_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
+    extra = {} if token_block_size is None else {"token_block_size": token_block_size}
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -129,6 +153,7 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        **extra,
     )
 
 
@@ -177,11 +202,26 @@ def _mhc_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    # v2: the Pallas kernel now computes the gates and Sinkhorn in-block, so
+    # its output contract differs from v1. The name must change with it --
+    # every cache between here and the executable is keyed on this string,
+    # and a stale v1 entry would silently serve the old graph.
+    tb = _token_block()
+    op_name = (
+        "pallas::deepseek_v4_mhc_pre_v2"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        + _token_block_tag(tb)
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
+        logger.info(
+            "DSV4 mHC gates: in-block Pallas, token_block=%s (op=%s)",
+            tb if tb is not None else "default",
+            op_name,
+        )
+
         op = pallas.jax_op(
             op_name,
             functools.partial(
@@ -191,6 +231,7 @@ def _mhc_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                token_block_size=tb,
             ),
             mesh=get_vllm_model_wrapper_context().mesh,
             input_partition_specs=(
@@ -237,11 +278,23 @@ def _mhc_fused_post_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    # v2: see `_mhc_pre_op`. This is the op that matters -- the seam runs
+    # twice per layer, so it carries almost all of the gate work.
+    tb = _token_block()
+    op_name = (
+        "pallas::deepseek_v4_mhc_fused_post_pre_v2"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        + _token_block_tag(tb)
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
+        logger.info(
+            "DSV4 mHC fused seam gates: in-block Pallas, token_block=%s (op=%s)",
+            tb if tb is not None else "default",
+            op_name,
+        )
         op = pallas.jax_op(
             op_name,
             functools.partial(
@@ -251,6 +304,7 @@ def _mhc_fused_post_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                token_block_size=tb,
             ),
             mesh=get_vllm_model_wrapper_context().mesh,
             input_partition_specs=(

@@ -270,7 +270,8 @@ def compute_batched_seq_metadata(
             bq_span = seq_batch_size * bq_sz
             tile_first_seq = jnp.minimum(starting_seq_tile_idx, max_num_seqs)
             tile_last_seq = jnp.minimum(
-                starting_seq_tile_idx + seq_batch_size, max_num_seqs
+                jnp.minimum(starting_seq_tile_idx + seq_batch_size, end_seq_idx),
+                max_num_seqs,
             )
             tile_tok_start = cu_q_lens[tile_first_seq][None, :]
             tile_tok_end = cu_q_lens[tile_last_seq][None, :]

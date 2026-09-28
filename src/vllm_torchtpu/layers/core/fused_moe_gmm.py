@@ -288,8 +288,6 @@ def prepare_routed_gmm_inputs(
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
-    token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
-
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
@@ -304,7 +302,7 @@ def prepare_routed_gmm_inputs(
     ragged_permute = (
         use_ep
         and use_sparse_core
-        and token_indices_flat.shape[0] > onehot_moe_permute_threshold
+        and topk_indices_flat.shape[0] > onehot_moe_permute_threshold
     )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
@@ -333,12 +331,13 @@ def prepare_routed_gmm_inputs(
         # Packing (key, token) into one int32 keeps the payload out of the sort
         # and drops the follow-up gather. Equal packed values carry the same
         # token id, so their order cannot matter.
+        token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
         packed = jax.lax.sort(
             jnp.left_shift(sort_keys, token_bits) | token_indices_flat, is_stable=False
         )
         token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
-        token_indices_sorted = token_indices_flat[sorted_indices]
+        token_indices_sorted = (sorted_indices // topk).astype(jnp.int32)
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:

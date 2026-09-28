@@ -30,6 +30,17 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
 export VLLM_NO_USAGE_STATS=1
 
+# XLA Latency Hiding Scheduler and async collective overlap verified on TPU v7x
+export LIBTPU_INIT_ARGS="--xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true --xla_tpu_dvfs_p_state=7"
+
+# MoE collective communication, destination-major ragged gather/reduce (v3), and owner-output combine
+export TPU_MOE_PACK_ROUTING_ALLGATHER=1
+export TPU_MOE_COLLECTION_CHUNK_SIZE=16384
+export TPU_MOE_SKIP_PADDED_TOKENS="1"
+export RAGGED_GATHER_REDUCE_VERSION=v3
+export TPU_MOE_OWNER_OUTPUT_MODE=on
+
+
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 # mmlu_llama prefills an assistant turn, which needs this to render
 # without a trailing eos_token.

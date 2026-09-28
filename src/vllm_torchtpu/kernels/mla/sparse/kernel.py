@@ -21,10 +21,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
 SPARSECORE_CACHE_LAYOUT = "sparsecore"
 
@@ -549,7 +549,7 @@ def sparse_ragged_paged_attention(
     # Kernel optimization params.
     gather_and_attention_chunk_size: int = 64,
     attention_kernel_batch_size: int = 16,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     return_lse: bool = False,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
     sparsecore_atoms_per_batch: int = 16,
@@ -590,6 +590,8 @@ def sparse_ragged_paged_attention(
       The output of attention, or `(output, lse)` when `return_lse` is set.
       `lse` is f32[max_num_tokens, actual_num_q_heads].
     """
+    vmem_limit_bytes = vmem_budget.resolve_compiler_limit(vmem_limit_bytes)
+
     if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
         raise ValueError(
             f"cache_layout must be {TENSORCORE_CACHE_LAYOUT!r} or "
