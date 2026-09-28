@@ -94,7 +94,8 @@ def _mla_ragged_paged_attention_kernel(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
     # Input
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     cache_kv_nope_hbm_ref,  # [total_num_pages, page_size, nope_dim]

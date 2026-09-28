@@ -57,16 +57,54 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
         "minor_to_major": [4, 3, 2, 1, 0],
         "tiles": [[4, 128], [4, 1]],
         "element_size_in_bits": 8,
+        "kv_layout": "layer-major",
         "gdn_conv_layout": "legacy-split-qk",
     }
     assert fingerprint == (
-        "0ddf18228f657fb11c8b6a5ddf0826b1f3020cf88fde96833832eedbd3cf9811"
+        "491e9b375a38f65d175e6e38919d29af59bf5149a2c617d0bea69872e3431b77"
     )
     assert (
         rlf.canonical_layout_fingerprint(dict(reversed(list(payload.items()))))
         == fingerprint
     )
     assert rlf.fa_page_tokens(manifest) == 4096
+
+
+def test_block_major_fingerprint_names_the_layout(monkeypatch):
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    manifest = _manifest()
+    versions = {"torch_tpu": "0.1.1.dev20260630090312", "libtpu": "0.0.42.1"}
+    row_layout = ([5, 4, 3, 2, 1, 0], [[4, 128], [4, 1]], 8)
+    page_layout = ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 8)
+    bm_fingerprint, bm_payload = rlf.measured_fa_layout_fingerprint(
+        manifest,
+        block_major=True,
+        layout_getter=lambda tensor: row_layout,
+        package_version=versions.__getitem__,
+    )
+    lm_fingerprint, lm_payload = rlf.measured_fa_layout_fingerprint(
+        manifest,
+        layout_getter=lambda tensor: page_layout,
+        package_version=versions.__getitem__,
+    )
+    assert bm_payload["kv_layout"] == "block-major"
+    assert bm_payload["minor_to_major"] == [5, 4, 3, 2, 1, 0]
+    assert lm_payload["kv_layout"] == "layer-major"
+    assert bm_fingerprint != lm_fingerprint
+    # Each layout accepts only its own rank.
+    with pytest.raises(RuntimeError, match="minor-to-major"):
+        rlf.measured_fa_layout_fingerprint(
+            manifest,
+            block_major=True,
+            layout_getter=lambda tensor: page_layout,
+            package_version=versions.__getitem__,
+        )
+    with pytest.raises(RuntimeError, match="minor-to-major"):
+        rlf.measured_fa_layout_fingerprint(
+            manifest,
+            layout_getter=lambda tensor: row_layout,
+            package_version=versions.__getitem__,
+        )
 
 
 def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):

@@ -90,6 +90,23 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: Nightly qwen35-block-major-disagg-offload"
+        key: "integration_nightly_qwen35_block_major_disagg_offload"
+        # Nightly only: VLLM_TPU_BLOCK_MAJOR_KV=1 is an opt-in layout that no
+        # default-path test reaches, and the P/D pair's boot dominates the step.
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "/perf_eval_results/qwen35_block_major_ci"
+        commands:
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: k3-pruned75-apc-offload-correctness"
         key: "integration_k3_pruned75_apc_offload_correctness"
         # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one

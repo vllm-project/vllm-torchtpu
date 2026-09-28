@@ -65,7 +65,8 @@ class Configs:
 
 
 def load_from_acc_ref(ref, dtype=None):
-    """Loads data from VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Loads data from VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 
@@ -83,7 +84,8 @@ def load_from_acc_ref(ref, dtype=None):
 
 
 def store_to_acc_ref(ref, val, dtype=None):
-    """Stores data to VMEM accumulator with strided access, handling 128-lane alignment."""
+    """Stores data to VMEM accumulator with strided access, handling
+    128-lane alignment."""
     tile_n, slots_per_m_tile, _, last_dim = ref.shape
     num_lanes = 128
 

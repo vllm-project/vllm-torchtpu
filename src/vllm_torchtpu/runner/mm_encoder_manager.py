@@ -132,7 +132,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
-        # Pass a copy of template so models calling values.pop() don't mutate the stored template.
+        # Pass a copy of template so models calling values.pop() don't mutate
+        # the stored template.
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)

@@ -58,7 +58,8 @@ def get_tpu_bundles_for_indices(
         return [bundle_map[idx] for idx in bundle_indices]
     except KeyError as e:
         raise ValueError(
-            f"Bundle index {e.args[0]} not found in placement group bundles: {list(bundle_map.keys())}"
+            f"Bundle index {e.args[0]} not found in placement group bundles: "
+            f"{list(bundle_map.keys())}"
         ) from None
 
 
@@ -385,7 +386,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         slicebuilder_addresses = ",".join(sb_addresses)
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = slicebuilder_addresses
         logger.info(
-            "RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s",
+            "RayDistributedExecutorV2 | "
+            "Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s",
             slicebuilder_addresses,
         )
 
@@ -545,7 +547,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
             logger.debug(
-                "RayDistributedExecutorV2 | Worker %s (slice rank %s) environment variables: %s",
+                "RayDistributedExecutorV2 | Worker %s (slice rank %s) "
+                "environment variables: %s",
                 i,
                 slice_rank,
                 combined_env,

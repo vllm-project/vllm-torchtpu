@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     DEFAULT_LABEL_VALUE,
@@ -1355,7 +1356,9 @@ class TestTPURaidenConnectorScheduler:
         assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
 
     def test_v3_stage3_finish_rejects_exceeding_max_transfer_tokens(self):
-        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer and free blocks."""
+        """Tokens exceeding TPU_RAIDEN_MAX_TRANSFER_TOKENS must bypass transfer
+        and free blocks.
+        """
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         req = MagicMock()
         req.request_id = "too-long"
@@ -2372,6 +2375,7 @@ class TestTPURaidenConnectorWorker:
                 kv_caches=list(named.values()),
                 kv_cache_raw_tensors=raw_tensors,
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                bm_pool_layout=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine()
@@ -2464,6 +2468,7 @@ class TestTPURaidenConnectorWorker:
             kv_caches=list(named.values()),
             kv_cache_raw_tensors=raw_tensors,
             kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+            bm_pool_layout=None,
         )
         worker.named_kv_caches = named
         engine = _FakeAdmissionRaidenEngine()
@@ -2743,6 +2748,7 @@ class TestTPURaidenConnectorWorker:
                 kv_caches=list(named.values()),
                 kv_cache_raw_tensors=[],
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+                bm_pool_layout=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine(
@@ -2970,6 +2976,78 @@ class TestTPURaidenConnectorWorker:
         assert ssm.block_ids == (17,)
         assert ssm.declared_bytes == 4096
         assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 4096, 4096),)
+
+    @pytest.mark.parametrize(
+        ("minor_to_major", "kv_layout", "admitted"),
+        [
+            ([5, 4, 3, 2, 1, 0], "block-major", True),
+            ([4, 3, 2, 1, 0], "layer-major", True),
+            ([4, 3, 2, 1, 0], "block-major", False),
+            ([5, 4, 3, 2, 1, 0], "layer-major", False),
+        ],
+    )
+    def test_stage3_gdn_registration_admits_the_fingerprinted_layout(
+        self, minor_to_major, kv_layout, admitted
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (  # noqa: E501
+            BINDING_ALIASED_RAW,
+            PoolEntry,
+            PoolManifest,
+            RegionSpec,
+        )
+
+        # In block-major layout, `block_stride_bytes` spans the full 10-region row
+        # (10 * 8192 B) while `base_offset_bytes` points to the region's page offset.
+        conv_regions = (
+            RegionSpec("gdn_conv_qk", 0, 2048, 1024, 3, 1),
+            RegionSpec("gdn_conv_v", 1024, 2048, 256, 3, 4),
+        )
+        ssm_regions = (RegionSpec("gdn_ssm", 0, 1024, 1024, 4),)
+        manifest = PoolManifest(
+            binding=BINDING_ALIASED_RAW,
+            storages=[],
+            pools=[
+                PoolEntry(
+                    "gdn.conv.g0",
+                    "linear.0",
+                    0,
+                    3 * 8192 + 2048,
+                    10 * 8192,
+                    32,
+                    conv_regions,
+                    "bfloat16",
+                ),
+                PoolEntry(
+                    "gdn.ssm.g0",
+                    "linear.0",
+                    0,
+                    3 * 8192,
+                    10 * 8192,
+                    32,
+                    ssm_regions,
+                    "float32",
+                ),
+            ],
+        )
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+        )
+        worker._raiden_manifest = manifest
+        worker._raiden_layout_fingerprint_payload = {
+            "minor_to_major": minor_to_major,
+            "tiles": [[4, 128], [4, 1]],
+            "element_size_in_bits": 8,
+            "kv_layout": kv_layout,
+        }
+        worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
+        worker._stage3_state_group_count = 1
+
+        if admitted:
+            conv, ssm = worker._stage3_state_pool_spans([17], 0, 8)
+            assert (conv.declared_bytes, ssm.declared_bytes) == (6144, 4096)
+        else:
+            with pytest.raises(RuntimeError, match="admitted physical layout"):
+                worker._stage3_state_pool_spans([17], 0, 8)
 
     def test_v3_stage3_producer_registers_rank_stripe_and_releases_on_done(self):
         worker = _make_raiden_worker(
@@ -5065,16 +5143,19 @@ class TestTPUConnectorStats(unittest.TestCase):
         self, hist, num_buckets, non_zero_buckets
     ):
         assert len(hist._buckets) == num_buckets, (
-            f"Incorrect number of buckets returned: expected {num_buckets} actual {len(hist._buckets)}"
+            f"Incorrect number of buckets returned: expected {num_buckets} "
+            f"actual {len(hist._buckets)}"
         )
         for i in range(num_buckets):
             if i in non_zero_buckets:
                 assert hist._buckets[i].get() == non_zero_buckets[i], (
-                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected {non_zero_buckets[i]} "
+                    f"actual: {hist._buckets[i].get()}"
                 )
             else:
                 assert hist._buckets[i].get() == 0, (
-                    f"Incorrect value for bucket {i}: expected 0 actual: {hist._buckets[i].get()}"
+                    f"Incorrect value for bucket {i}: expected 0 "
+                    f"actual: {hist._buckets[i].get()}"
                 )
 
     def test_tpu_stats_aggregation_d2h_transfer(self):
@@ -6021,3 +6102,88 @@ def test_maybe_host_reshard_store_passes_registry_ttl_from_lease():
         "data_name": "reshard_store",
         "data_replica_idx": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Block-major unified pool
+# ---------------------------------------------------------------------------
+
+_FINGERPRINT = "vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint"
+_BM_LAYOUT = BlockMajorPoolLayout(
+    num_blocks=4, num_pools=3, split=4, pool_index_by_layer={}
+)
+
+
+class _ManifestBuilt(Exception):
+    pass
+
+
+def _block_major_admission_worker():
+    """A Qwen3.5 producer worker whose runner reports a block-major pool."""
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True, pcp_size=8)
+    named, groups, raw_tensors = _synthetic_qwen35_unified_pool_materialization(
+        tp_size=1, pcp_size=8
+    )
+    runner = SimpleNamespace(
+        kv_caches=list(named.values()),
+        kv_cache_raw_tensors=raw_tensors,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        bm_pool_layout=_BM_LAYOUT,
+    )
+    worker.named_kv_caches = named
+    worker._raiden_stage3_enabled = lambda: False
+    return worker, runner
+
+
+def test_block_major_layout_reaches_the_qwen35_manifest(monkeypatch):
+    from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+    worker, runner = _block_major_admission_worker()
+    seen = {}
+
+    def fake_build(**kwargs):
+        seen.update(kwargs)
+        raise _ManifestBuilt
+
+    monkeypatch.setattr(rpm, "build_qwen35_pool_manifest", fake_build)
+    with pytest.raises(_ManifestBuilt):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+    assert seen["block_major"] is _BM_LAYOUT
+    assert seen["named_kv_caches"] is worker.named_kv_caches
+    assert seen["raw_tensors"] == tuple(runner.kv_cache_raw_tensors)
+
+
+def test_kimi_manifest_rejects_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    worker._stage3_kimi = True
+    worker._raiden_hybrid_admission_topology = lambda: "tp1_prefill"
+    with pytest.raises(NotImplementedError, match="Kimi K3"):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+
+def test_seq_on_lane_manifest_rejects_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    with (
+        patch(f"{_MOD}._raiden_seq_on_lane_layout", return_value=True),
+        pytest.raises(NotImplementedError, match="seq-on-lane"),
+    ):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+
+
+def test_stage3_layout_measures_the_block_major_pool():
+    worker, runner = _block_major_admission_worker()
+    worker.runner = runner
+    manifest = object()
+    payload = {"kv_layout": "block-major"}
+    with (
+        patch(
+            f"{_FINGERPRINT}.measured_fa_layout_fingerprint",
+            return_value=("fingerprint", payload),
+        ) as measure,
+        patch(f"{_FINGERPRINT}.fa_page_tokens", return_value=256),
+    ):
+        result = worker._measure_stage3_layout(manifest)
+
+    measure.assert_called_once_with(manifest, block_major=True)
+    assert result == ("fingerprint", payload, 256)

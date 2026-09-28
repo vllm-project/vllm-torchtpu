@@ -73,7 +73,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
     with these major differences:
 
     1. self._init_executor():
-       VLLM_USE_RAY_SPMD_WORKER=1, in which the driver worker is the same as other workers.
+       VLLM_USE_RAY_SPMD_WORKER=1, in which the driver worker is the same as
+       other workers.
     2. self._initialize_ray_cluster():
        This sets placement_group_specs for TPU.
        In vLLM one GPU maps to one placement group.
@@ -267,8 +268,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 or self.parallel_config.world_size % len(bundle_indices) != 0
             ):
                 raise ValueError(
-                    f"world_size ({self.parallel_config.world_size}) must be divisible by "
-                    f"the number of placement group bundles ({len(bundle_indices)})."
+                    f"world_size ({self.parallel_config.world_size}) must be "
+                    "divisible by the number of placement group bundles "
+                    f"({len(bundle_indices)})."
                 )
             workers_per_bundle = self.parallel_config.world_size // len(bundle_indices)
             expanded_indices = []
@@ -277,8 +279,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             bundle_indices = expanded_indices
         elif len(bundle_indices) != self.parallel_config.world_size:
             raise ValueError(
-                f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
-                f"world_size ({self.parallel_config.world_size})."
+                f"Number of bundle indices ({len(bundle_indices)}) must be "
+                f"less than or equal to world_size ({self.parallel_config.world_size})."
             )
 
         worker_metadata: list[RayWorkerMetaData] = []
@@ -476,17 +478,20 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
             worker_vllm_config = self.vllm_config
 
-            # When using object storage (e.g., RunAI), the Leader updates `model` to its local
-            # cache path (e.g., /root/.cache/...) during ModelConfig initialization
-            # (maybe_pull_model_tokenizer_for_runai), while `model_weights` preserves the original URI after the model is pulled.
-            # (Standard HF downloads do not overwrite `model`, allowing workers to pull normally).
-            # Since workers on remote nodes cannot access the Leader's filesystem, we create a
-            # worker-specific config copy and restore the original GCS URI from `model_weights`.
-            # ModelConfig.__post_init__ does not re-run on the worker, so nothing pulls
-            # automatically from this state: TPUWorker.__init__ calls
-            # vllm_torchtpu.worker.runai_repull.ensure_runai_aux_files, which recognises the
-            # restored-URI state, invokes `maybe_pull_model_tokenizer_for_runai` under a
-            # per-host lock, and rewrites model/tokenizer/model_weights as the Leader did.
+            # When using object storage (e.g., RunAI), the Leader updates `model` to its
+            # local cache path (e.g., /root/.cache/...) during ModelConfig
+            # initialization (maybe_pull_model_tokenizer_for_runai), while
+            # `model_weights` preserves the original URI after the model is pulled.
+            # (Standard HF downloads do not overwrite `model`, allowing workers to pull
+            # normally). Since workers on remote nodes cannot access the Leader's
+            # filesystem, we create a worker-specific config copy and restore the
+            # original GCS URI from `model_weights`. ModelConfig.__post_init__ does not
+            # re-run on the worker, so nothing pulls automatically from this state:
+            # TPUWorker.__init__ calls
+            # vllm_torchtpu.worker.runai_repull.ensure_runai_aux_files, which recognises
+            # the restored-URI state, invokes `maybe_pull_model_tokenizer_for_runai`
+            # under a per-host lock, and rewrites model/tokenizer/model_weights as the
+            # Leader did.
             if (
                 node_id != driver_node_id
                 and self.vllm_config.model_config
@@ -496,7 +501,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 worker_vllm_config.model_config.model = (
                     worker_vllm_config.model_config.model_weights
                 )
-                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull the model.
+                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull
+                # the model.
                 worker_vllm_config.model_config.model_weights = None
 
             kwargs = dict(

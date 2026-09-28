@@ -296,9 +296,10 @@ def test_head_dim_64_delegates_whatever_the_layout(monkeypatch, layout):
     HEAD_ALONG_SUBLANE pages, so the shape comes from the base class.
 
     HND + head_dim 64 is refused at config time instead (#825): the pages are
-    fine for the hd64 kernel, but `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()` still answers "HND"
-    process-wide, so `forward` reads a head width of 2 for a 64-wide head and
-    skips the padding it owes."""
+    fine for the hd64 kernel, but
+    `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()` still
+    answers "HND" process-wide, so `forward` reads a head width of 2 for a 64-wide head
+    and skips the padding it owes."""
     with _layout_env(monkeypatch, layout):
         assert BATCHED.get_kv_cache_shape(
             7, 128, 2, 64, BF16
@@ -402,7 +403,8 @@ def test_page_carries_head_width_where_forward_reads_it(monkeypatch, layout, hea
 
 
 def test_no_layout_lookup_on_the_compiled_forward_path():
-    """Nothing on the forward path may call `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()`.
+    """Nothing on the forward path may call
+    `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()`.
 
     It asks the KV connector, which needs a current vLLM config; a compiled
     forward has none, and Dynamo traces into the accessor so its `lru_cache`
@@ -430,11 +432,8 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
 
 
 def test_raiden_geometry_resolves_the_layout_under_a_config():
-    """`resolve_kernel_geometry` runs in the EngineCore, where no config is set.
-
-    Both calls resolve the KV cache layout, which falls through to the KV
-    connector and asserts without one.
-    """
+    """Verify `resolve_attention_geometry` sets the vLLM config context before
+    querying KV cache layout in the EngineCore process."""
     import ast
     import inspect
     import textwrap
@@ -442,7 +441,7 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
     from vllm_torchtpu.offload import raiden_store
 
     tree = ast.parse(
-        textwrap.dedent(inspect.getsource(raiden_store.resolve_kernel_geometry))
+        textwrap.dedent(inspect.getsource(raiden_store.resolve_attention_geometry))
     )
     guarded = set()
     for node in ast.walk(tree):

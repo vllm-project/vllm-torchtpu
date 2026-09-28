@@ -72,7 +72,8 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
                 hbm_used = device.memory_stats()["bytes_in_use"]
                 hbm_limit = device.memory_stats()["bytes_limit"]
                 logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
+                    "Get memory stats for device %s. "
+                    "Assuming all devices have the same usage.",
                     device,
                 )
                 usage.extend([(hbm_used, hbm_limit)] * len(devices))
@@ -300,8 +301,9 @@ def synchronize_device() -> None:
 
     Differences vs. `synchronize_tensors(tensors=...)`:
     - `synchronize_device()` is equivalent to `torch.cuda.synchronize()`. It waits for
-      enqueued hardware stream operations to finish on PJRT, but does NOT trigger deferred
-      graph compilation or materialization for uninstantiated PyTorch Eager tensors.
+      enqueued hardware stream operations to finish on PJRT, but does NOT trigger
+      deferred graph compilation or materialization for uninstantiated
+      PyTorch Eager tensors.
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
@@ -312,17 +314,19 @@ def synchronize_tensors(
     tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,
 ) -> None:
-    """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).
+    """Synchronize TPU execution and force materialization of deferred tensors
+    (Graph Sync).
 
     Differences vs. `synchronize_device()`:
-    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the deferred tensor
-      graph producing `tensors`, compile and enqueue the graph to PJRT, and materialize the
-      resulting buffers in device memory.
-    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands without
-      building/compiling pending deferred graphs.
-    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should be synchronized
-      (e.g., weight materialization across multiple tensors). Prefer `synchronize_device()` when
-      synchronizing immediately after a computation or across the entire device.
+    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the
+      deferred tensor graph producing `tensors`, compile and enqueue the graph to PJRT,
+      and materialize the resulting buffers in device memory.
+    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands
+      without building/compiling pending deferred graphs.
+    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should
+      be synchronized (e.g., weight materialization across multiple tensors). Prefer
+      `synchronize_device()` when synchronizing immediately after a computation or
+      across the entire device.
     """
     from torch_tpu._internal import sync
 

@@ -457,7 +457,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             f"w13={list(layer.w13_weight.shape)} ({layer.w13_weight.dtype}), "
             f"w2={list(layer.w2_weight.shape)} ({layer.w2_weight.dtype}), "
             f"w13_scale={list(layer.w13_weight_scale.shape)}, "
-            f"w2_scale={list(layer.w2_weight_scale.shape)}, group_size={self.group_size}"
+            f"w2_scale={list(layer.w2_weight_scale.shape)}, "
+            f"group_size={self.group_size}"
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)

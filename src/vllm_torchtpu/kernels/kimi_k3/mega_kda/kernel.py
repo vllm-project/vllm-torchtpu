@@ -1340,7 +1340,8 @@ def _chunk_kda_fwd_native_segids_impl(
             segment_ids, ((0, 0), (0, T_PAD_S - segment_ids.shape[-1]))
         )
 
-    # Rebuild metadata with padded T (chunk_size still BT, but more chunks now due to padding)
+    # Rebuild metadata with padded T (chunk_size still BT, but more chunks now
+    # due to padding)
     # Metadata arrays need last dim >= 128 or == array dim. Pad NT to 128 if needed.
     NT_meta = T // BT  # original number of chunks
     NT_meta_PAD = max(int(align_up(NT_meta, 128)), 128)  # at least 128
@@ -1418,7 +1419,8 @@ def _chunk_kda_fwd_native_segids_impl(
             h0 = jnp.broadcast_to(h0, (B,) + h0.shape[1:])
 
         # Pass ALL N_max initial states for per-segment loading
-        # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad -> [N_max, H, B, K_PAD, V_ALIGNED]
+        # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad ->
+        #     [N_max, H, B, K_PAD, V_ALIGNED]
         h0 = h0[:, :, :, :, :].transpose(1, 2, 0, 3, 4)  # [N_max, H, B, K, V]
         if K_PAD > K:
             h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, 0)))
@@ -1456,10 +1458,12 @@ def _chunk_kda_fwd_native_segids_impl(
         db_in = jnp.zeros((H, 1, 1, K_PAD), dtype=jnp.float32)
 
     # Block specs -- index maps must accept all prefetch refs as args
-    # Note: index map returns block offset (in units of block size), not array element offset
+    # Note: index map returns block offset (in units of block size), not array
+    # element offset
     def _seg_map(h, b, c, *refs):
         # segment_ids has shape [B, T_PAD_S], block size is [B, 128]
-        # So we need to return (b_offset, seg_offset) where seg_offset is in units of 128
+        # So we need to return (b_offset, seg_offset) where seg_offset
+        # is in units of 128
         block_128 = (c * BT) // 128
         return (0, block_128)
 

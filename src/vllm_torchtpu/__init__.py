@@ -349,7 +349,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (  # noqa: E501
                 adaptive_fused_moe_supported,
             )
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
@@ -1605,5 +1605,6 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     vpe.VocabParallelEmbedding.forward = patched_forward
     vpe.VocabParallelEmbedding._tpu_vocab_parallel_embedding_patch = True
     logger.info(
-        "Applied TPU patch: register shard index bounds as buffers in VocabParallelEmbedding"
+        "Applied TPU patch: register shard index bounds as buffers in "
+        "VocabParallelEmbedding"
     )

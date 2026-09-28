@@ -5,11 +5,14 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import vllm.envs as vllm_envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from jax.sharding import PartitionSpec
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.attention import AttentionConfig
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout, flat_kernel_ids
+from vllm_torchtpu.distributed import pallas_shapes
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
@@ -79,7 +82,7 @@ def _tensors():
     return query, key, value, kv_cache
 
 
-def _metadata(*, pcp_streaming=False):
+def _metadata(*, pcp_streaming=False, block_tables=None):
     layout_kwargs = {}
     if pcp_streaming:
         layout_kwargs = {
@@ -88,7 +91,11 @@ def _metadata(*, pcp_streaming=False):
         }
     return AttentionMetadata(
         input_positions=torch.arange(3, dtype=torch.int32),
-        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        block_tables=(
+            torch.zeros(2, 4, dtype=torch.int32)
+            if block_tables is None
+            else block_tables
+        ),
         seq_lens=torch.tensor([3, 0], dtype=torch.int32),
         query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
@@ -108,6 +115,7 @@ def _capture_kernel(monkeypatch):
         skip_kv_update=False,
         use_pcp_streaming,
         cp_kv_cache_interleave_size,
+        block_major=False,
     ):
         captured["build"] = {
             "q_scale": q_scale,
@@ -116,6 +124,7 @@ def _capture_kernel(monkeypatch):
             "skip_kv_update": skip_kv_update,
             "use_pcp_streaming": use_pcp_streaming,
             "cp_kv_cache_interleave_size": cp_kv_cache_interleave_size,
+            "block_major": block_major,
         }
 
         def fake_kernel(*args):
@@ -249,6 +258,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
         skip_kv_update=False,
         use_pcp_streaming=False,
         cp_kv_cache_interleave_size=0,
+        block_major=False,
     ):
         calls.append((use_pcp_streaming, cp_kv_cache_interleave_size))
         return MagicMock()
@@ -282,6 +292,37 @@ def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
     no capacity, so no layer asks the runner to bound its schedule."""
     assert not _batched_impl().runs_batched_rpa_schedule()
     assert not _impl().runs_batched_rpa_schedule()
+
+
+def test_streaming_rpa_partition_specs_cover_pcp_and_tp_axes():
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+    ) == pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+    ) == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+
+
+def test_streaming_rpa_mesh_requests_full_pcp_tp_grid(monkeypatch):
+    captured = {}
+    mesh = object()
+
+    def fake_get_mesh(axis_name, *, tp_axis_name):
+        captured["axis_names"] = (axis_name, tp_axis_name)
+        return mesh
+
+    monkeypatch.setattr(pcp_adapter, "get_or_create_pcp_mesh", fake_get_mesh)
+
+    assert pcp_adapter.get_pcp_streaming_mesh() is mesh
+    assert captured["axis_names"] == ("pcp", "tp")
 
 
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
@@ -342,8 +383,9 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
+@pytest.mark.parametrize("block_major", [False, True])
 def test_build_streaming_kernel_registers_eight_tensor_custom_op(
-    monkeypatch, vllm_config_context
+    monkeypatch, vllm_config_context, block_major
 ):
     impl = _impl()
     fake_mesh = object()
@@ -370,6 +412,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     def fake_jax_op(_name, fn, **kwargs):
         captured["signature"] = inspect.signature(fn, follow_wrapped=False)
         captured["input_partition_specs"] = kwargs["input_partition_specs"]
+        captured["output_partition_specs"] = kwargs["output_partition_specs"]
         return FakeOp()
 
     monkeypatch.setattr(
@@ -388,12 +431,28 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
             None,
             use_pcp_streaming=True,
             cp_kv_cache_interleave_size=4,
+            block_major=block_major,
         )
 
     params = list(captured["signature"].parameters.values())
     assert len(params) == 8
     assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
     assert len(captured["input_partition_specs"]) == 8
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    local_cache = (8, 3, 16, 2, 1, 128) if block_major else (8, 16, 2, 1, 128)
+    global_cache = (32, 3, 16, 4, 1, 128) if block_major else (32, 16, 4, 1, 128)
+    assert (
+        pallas_shapes.get_global_shape(
+            local_cache, mesh, captured["input_partition_specs"][0]
+        )
+        == global_cache
+    )
+    assert (
+        pallas_shapes.get_local_shape(
+            global_cache, mesh, captured["output_partition_specs"][0]
+        )
+        == local_cache
+    )
 
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -659,6 +718,32 @@ def test_build_pcp_streaming_callable_defaults_output_specs(monkeypatch):
     )
 
 
+def test_adapter_converts_dimensions_sharded_over_pcp_and_tp():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    spec = PartitionSpec(None, ("tp", "pcp"), None)
+
+    global_shape = pallas_shapes._convert_partitioned_shape(
+        (3, 8, 16), mesh, spec, to_global=True
+    )
+    local_shape = pallas_shapes._convert_partitioned_shape(
+        global_shape, mesh, spec, to_global=False
+    )
+
+    assert global_shape == (3, 64, 16)
+    assert local_shape == (3, 8, 16)
+
+
+def test_adapter_rejects_nondivisible_compound_axis_output_shape():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    with pytest.raises(ValueError, match="not divisible by mesh factor 8"):
+        pallas_shapes._convert_partitioned_shape(
+            (3, 63, 16),
+            mesh,
+            PartitionSpec(None, ("tp", "pcp"), None),
+            to_global=False,
+        )
+
+
 def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     captured = {}
 
@@ -811,3 +896,113 @@ def test_kv_layout_kwarg_follows_the_bound_kernel_entry(
     assert ("kv_layout" in bound.keywords) is expects_kv_layout
     # The partial must be callable with what it was bound to.
     inspect.signature(bound.func).bind_partial(**bound.keywords)
+
+
+# --- block-major unified pool ---------------------------------------------------
+
+
+@pytest.fixture
+def cpu_vllm_config_context():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
+_BM_LAYOUT = BlockMajorPoolLayout(
+    num_blocks=8, num_pools=3, split=4, pool_index_by_layer={}
+)
+_BM_POOL_INDEX = 1
+
+
+def _reset_kernel_registry(monkeypatch):
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+
+
+@pytest.mark.parametrize("block_major", [True, False])
+def test_forward_remaps_block_tables_for_the_block_major_pool(
+    monkeypatch, cpu_vllm_config_context, block_major
+):
+    """Only a layer bound to a merged pool region hands the kernel remapped
+    block tables; a per-region pool passes the scheduler's tables through."""
+    captured = _capture_kernel(monkeypatch)
+    query, key, value, kv_cache = _tensors()
+    if block_major:
+        kv_cache = torch.zeros(8, 3 * 4, 4, 2, 1, 128)
+    block_tables = torch.arange(1, 9, dtype=torch.int32).reshape(2, 4)
+    metadata = _metadata(block_tables=block_tables)
+    impl = _impl()
+    if block_major:
+        impl._bm_kernel = True
+        impl.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+
+    with set_vllm_model_wrapper_context(
+        mesh=_mesh(), vllm_config=_vllm_config(pcp_size=1)
+    ):
+        impl.forward(_layer(), query, key, value, kv_cache, metadata)
+
+    assert captured["build"]["block_major"] is block_major
+    passed = captured["args"][5]
+    if block_major:
+        expected = flat_kernel_ids(block_tables, _BM_POOL_INDEX, 3, 4)
+        assert passed.tolist() == expected.tolist()
+        assert passed.tolist() != block_tables.tolist()
+    else:
+        assert passed is block_tables
+
+
+def test_build_rpa_kernel_rejects_an_entry_without_block_major(
+    monkeypatch, cpu_vllm_config_context
+):
+    impl = _impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    _reset_kernel_registry(monkeypatch)
+
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match="block-major"),
+    ):
+        impl._build_rpa_kernel(None, None, None, block_major=True)
+
+
+def test_build_rpa_kernel_keys_the_registry_on_block_major(
+    monkeypatch, cpu_vllm_config_context
+):
+    impl = _impl()
+    _reset_kernel_registry(monkeypatch)
+    registered = []
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+        def __call__(self, kv_cache, query, *_args, **_kwargs):
+            return kv_cache, query
+
+    def fake_jax_op(name, wrapped_fn, **_kwargs):
+        registered.append((name, wrapped_fn))
+        return FakeOp()
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        layer_major = impl._build_rpa_kernel(None, None, None)
+        block_major = impl._build_rpa_kernel(None, None, None, block_major=True)
+        again = impl._build_rpa_kernel(None, None, None, block_major=True)
+
+    assert layer_major is not block_major
+    assert again is block_major
+    assert len(PallasAttentionBackendImpl._kernel_registry) == 2
+    (lm_name, lm_fn), (bm_name, bm_fn) = registered
+    assert lm_name != bm_name
+    assert "block_major" not in lm_fn.keywords
+    assert bm_fn.keywords["block_major"] is True
+    assert bm_fn.func is impl._kernel_entry

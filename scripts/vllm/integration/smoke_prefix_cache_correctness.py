@@ -319,8 +319,8 @@ def run_long_shared_prefix_cross_query(
         for name, key in sequence:
             expected = answers[key]
             prompt = (
-                common_prefix
-                + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} and no other text."
+                common_prefix + f"\n\nUsing the fixture above, query key: {key}. "
+                f"Answer exactly {expected} and no other text."
             )
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
@@ -440,9 +440,8 @@ def run_mixed_query_correctness(
             if kind == "long":
                 key = prompt_or_key
                 prompt = (
-                    common_prefix
-                    + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
-                    "and no other text."
+                    common_prefix + f"\n\nUsing the fixture above, query key: {key}. "
+                    f"Answer exactly {expected} and no other text."
                 )
             else:
                 prompt = prompt_or_key
@@ -552,9 +551,8 @@ def run_concurrent_mixed_query_correctness(
                 key = keys[index % len(keys)]
                 expected = answers[key]
                 prompt = (
-                    common_prefix
-                    + f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
-                    "and no other text."
+                    common_prefix + f"\n\nUsing the fixture above, query key: {key}. "
+                    f"Answer exactly {expected} and no other text."
                 )
                 future = executor.submit(chat, url, model, prompt, max_tokens, timeout)
                 future_to_case[future] = (round_index, key, expected)
@@ -636,7 +634,8 @@ def run_concurrent_mixed_query_correctness(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="End-to-end correctness smoke for disaggregated serving with prefix caching."
+        description="End-to-end correctness smoke for disaggregated serving with "
+        "prefix caching."
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.environ.get("PROXY_PORT", "8000"))

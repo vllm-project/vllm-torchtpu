@@ -255,7 +255,9 @@ class TestTpuCompilerCache:
         assert factors == ["upstream", "tpu"]
 
     def test_env_override_mapping(self):
-        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets TORCH_TPU_TIER2_COMPILATION_CACHE default."""
+        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets
+        TORCH_TPU_TIER2_COMPILATION_CACHE default.
+        """
         env_mock = {
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/tmp/test_tier3_cache_env",
         }

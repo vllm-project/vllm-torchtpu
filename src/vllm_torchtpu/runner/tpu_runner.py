@@ -72,6 +72,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
@@ -86,6 +87,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
+    copy_mamba_state_rows,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -613,6 +615,10 @@ class TPUModelRunner(GPUModelRunner):
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+        # Populated by `_initialize_unified_kv_cache` when `VLLM_TPU_BLOCK_MAJOR_KV`
+        # merges unified pools into a single block-major pool; `None` when each
+        # layer region uses a separate pool (see `vllm_torchtpu.block_major_pool`).
+        self.bm_pool_layout: BlockMajorPoolLayout | None = None
         # Set by initialize_kv_cache; None until then (dummy runs check this).
         self.kv_cache_config: KVCacheConfig | None = None
         # Layout plan of the most recent prepared batch; None before the
@@ -1535,7 +1541,8 @@ class TPUModelRunner(GPUModelRunner):
     def _build_mamba_copy_plan(
         self,
         kv_cache_config: KVCacheConfig,
-        raw_tensors: list[torch.Tensor],
+        layer_to_raw: dict[str, torch.Tensor],
+        bm_pool_layout: BlockMajorPoolLayout | None,
     ) -> None:
         """Map each mamba kv-cache group to the raw pool buffers hosting its
         layers, for the per-step state-block seed copies.
@@ -1550,12 +1557,6 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
-
-        layer_to_raw = {
-            name: raw_tensors[index]
-            for name, index in layer_to_pool_index(kv_cache_config).items()
-        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -1575,7 +1576,13 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        for raw in raw_tensors:
+        if bm_pool_layout is not None:
+            # Merged block-major pool rows correspond 1:1 to manager blocks, so
+            # state seed copies index rows directly by manager block ID without
+            # kernel-block fan-out.
+            self._pool_block_split = 1
+            return
+        for raw in dict.fromkeys(layer_to_raw.values()):
             if raw.dim() > 1:
                 # Manager blocks span whole pool pages. Which axis of the
                 # pool tensor carries tokens is backend-dependent — shape[1]
@@ -1855,11 +1862,23 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pending_mamba_state_copies:
             return
         for raws, src_t, dst_t in self._pending_mamba_state_copies:
-            copy_mamba_state_blocks(raws, src_t, dst_t)
+            self._copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
+    def _copy_mamba_state_blocks(
+        self, raws: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
+    ) -> None:
+        layout = self.bm_pool_layout
+        if layout is None:
+            copy_mamba_state_blocks(raws, src, dst)
+            return
+        (pool,) = raws
+        copy_mamba_state_rows(pool, src, dst, layout.num_pools, layout.split)
+
     def is_unified_pool_used(self) -> bool:
-        """Whether the attention-shaped unified KV block pool is active and allocated."""
+        """Whether the attention-shaped unified KV block pool is active
+        and allocated.
+        """
         return bool(getattr(self, "kv_cache_raw_tensors", None))
 
     def _apply_kv_cache_block_copies(self, copies) -> None:
@@ -1902,7 +1921,7 @@ class TPUModelRunner(GPUModelRunner):
         dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+        self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -1994,8 +2013,10 @@ class TPUModelRunner(GPUModelRunner):
                 if len(next_tpu) >= len(input_ids):
                     return next_tpu[: len(input_ids)]
 
-            # Fast path 2: Cache persistent device indices to eliminate per-step H2D uploads
-            # Avoids Eager XLA overhead by relying on the compiled kernel + cached index tensors
+            # Fast path 2: Cache persistent device indices to eliminate per-step
+            # H2D uploads
+            # Avoids Eager XLA overhead by relying on the compiled kernel + cached
+            # index tensors
             subst_key = (
                 len(input_ids),
                 tuple(token_in_tpu_cur_input_indices),
@@ -2229,18 +2250,19 @@ class TPUModelRunner(GPUModelRunner):
 
             req_idx = self.input_batch.req_id_to_index[req_id]
 
-            # num_tokens_no_spec was advanced to (seq_len + n_placeholder)
+            # num_tokens_no_spec was advanced to (start_tok_idx + n_placeholder)
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
             start_idx = end_idx - n_placeholder
-            self.input_batch.num_tokens_no_spec[req_idx] = start_idx + len(sampled_ids)
+            end_tok_idx = start_idx + len(sampled_ids)
+            self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-            target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            target_slice = slice(start_idx, end_tok_idx)
             # The committed tokens must fit within token_ids_cpu
             # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
-            assert seq_len + 1 <= self.input_batch.token_ids_cpu.shape[1], (
-                f"req {req_id}: write end {seq_len + 1} exceeds max_model_len "
+            assert end_tok_idx <= self.input_batch.token_ids_cpu.shape[1], (
+                f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
@@ -2254,15 +2276,21 @@ class TPUModelRunner(GPUModelRunner):
     ):
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
-        for req_idx, req_state, seq_len, req_id in request_seq_lens:
+        for req_idx, req_state, _seq_len, req_id in request_seq_lens:
             if req_idx in discard_set:
                 continue
 
+            actual_idx = self.input_batch.req_id_to_index[req_id]
+            assert actual_idx == req_idx, (req_id, actual_idx, req_idx)
+
             # Async spec: optimistically advance by 1 (bonus) + num_draft;
-            # the over-count is corrected on-device next step by subtract_num_rejected_tokens.
-            n_new = 1 + (num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0)
-            end_idx = seq_len + n_new
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            # the over-count is rolled back in _modify_prev_results once true
+            # draft acceptance is sampled from the device.
+            n_draft = num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0
+            n_new = 1 + n_draft
+            start_tok_idx = self.input_batch.num_tokens_no_spec[actual_idx]
+            end_idx = start_tok_idx + n_new
+            self.input_batch.num_tokens_no_spec[actual_idx] = end_idx
 
             req_state.output_token_ids.extend([0] * n_new)
 
@@ -2765,7 +2793,8 @@ class TPUModelRunner(GPUModelRunner):
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
+            # no dedicated prefill-only bucket, and all remaining requests in
+            # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
@@ -3068,7 +3097,8 @@ class TPUModelRunner(GPUModelRunner):
         forwards.
         """
         # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
-        # run_dp_dummy_draft read _dp_target_bucket for the coordinated, equal-token shape.
+        # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
+        # equal-token shape.
         self._dp_target_bucket = bucket
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
@@ -3147,7 +3177,8 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output
         )
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
+        # Profile the current batch composition (prefill vs decode) if phased profiling
+        # is enabled.
         if self.phase_based_profiler:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
@@ -3205,8 +3236,8 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
         )
         # Retained for the spec-decode propose phase (sample_tokens): under
-        # EP-DP locksteps every rank must run the same number of draft forwards per step,
-        # and the coordinated chunk count from this one all-reduce is the shared
+        # EP-DP locksteps every rank must run the same number of draft forwards per
+        # step, and the coordinated chunk count from this one all-reduce is the shared
         # bound — no additional draft-side collective is needed.
         self._dp_step_num_chunks = target_num_chunks
 
@@ -3348,7 +3379,7 @@ class TPUModelRunner(GPUModelRunner):
                     "phase": "phase",
                     "batch_id": "batch_id",
                     "total_num_scheduled_tokens": "total_num_scheduled_tokens",
-                    "padded_total_num_scheduled_tokens": "padded_total_num_scheduled_tokens",
+                    "padded_total_num_scheduled_tokens": "padded_total_num_scheduled_tokens",  # noqa: E501
                     "min_kv_len": "min_kv_length",
                 }
                 for src_key, target_key in stats_map.items():
@@ -4319,10 +4350,15 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
 
+        # After the drafter: an MTP draft re-reads the target checkpoint.
+        from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
+
+        evict_loaded_weights_page_cache()
+
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
-        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
 
@@ -4375,7 +4411,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
-        pinned_draft_layers = []
+        layer_widths = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4385,32 +4421,35 @@ class TPUModelRunner(GPUModelRunner):
                 ):
                     is_draft = name in draft_attn_names
                     pre_w = attn_layer.impl.decode_query_size
-                    if is_draft:
-                        # A K+1-wide decode tile describes the TARGET's verify
-                        # step; a proposer runs one query token per draft step,
-                        # so pin it to 1. NOTE: on Gemma-4 the draft layers are
-                        # observed to already be 1 here, so this is a guard
-                        # rather than the fix for b/536992014.
+                    # Keep a sharded draft at its K+1 decode tile. The drafter's
+                    # first pass attends with the TARGET's request_distribution
+                    # (eagle3 `_build_draft_attn_metadata`, step_idx == 0), so
+                    # with reorder_batch_threshold > 1 its K+1-token verify
+                    # windows sit in the DECODE bucket, and a 1-wide DECODE tile
+                    # there drops all but one query token per sequence (MTP
+                    # acceptance ~0.5% on Qwen3.5 DCP4 + MTP3). Loop steps (one
+                    # token) are fine in a K+1 tile.
+                    # A REPLICATED (tp=1) draft moves to the LOCAL (non-shard_map)
+                    # kernel, which is 1-wide; its width is folded into the
+                    # threshold below.
+                    if (
+                        is_draft
+                        and self.speculative_config.draft_tensor_parallel_size == 1
+                    ):
                         attn_layer.impl.decode_query_size = 1
-                        # Relocate a REPLICATED (tp=1) draft's attention to the
-                        # LOCAL (non-shard_map) kernel. Independent of the tile
-                        # width above: this is about the draft's TP topology.
-                        if self.speculative_config.draft_tensor_parallel_size == 1:
-                            # Instance attrs shadow the ClassVars; unique prefix
-                            # keeps the local kernel op out of the sharded
-                            # registry.
-                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                            attn_layer.impl._kernel_op_prefix = (
-                                "pallas::rpa_kernel_local"
-                            )
-                            logger.info(
-                                "Draft attn %s -> LOCAL (non-shard_map) RPA "
-                                "kernel | DRAFT_KV_BLOCK_CAP=%d",
-                                name,
-                                _DRAFT_KV_BLOCK_CAP,
-                            )
+                        # Instance attrs shadow the ClassVars; unique prefix
+                        # keeps the local kernel op out of the sharded
+                        # registry.
+                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                        logger.info(
+                            "Draft attn %s -> LOCAL (non-shard_map) RPA "
+                            "kernel | DRAFT_KV_BLOCK_CAP=%d",
+                            name,
+                            _DRAFT_KV_BLOCK_CAP,
+                        )
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    pinned_draft_layers.append(
+                    layer_widths.append(
                         (
                             "draft" if is_draft else "target",
                             type(attn_layer.impl).__name__,
@@ -4419,17 +4458,12 @@ class TPUModelRunner(GPUModelRunner):
                             getattr(attn_layer.impl, "head_size", None),
                         )
                     )
-                    # Target layers only. `reorder_batch_threshold` is read in
-                    # exactly one place (`rpa_num_decode_reqs` in
-                    # `_prepare_inputs`), which shapes the TARGET's batch; the
-                    # draft never reads it and builds its own pure-decode
-                    # distribution instead (eagle3 `_propose_step`). So draft
-                    # widths have no business in this min() -- folding the
-                    # draft's necessary 1 in would drag the threshold to 1 and
-                    # silently disable #1008 for every spec config that has a
-                    # draft, which is every config it was written for.
-                    if not is_draft:
-                        decode_query_sizes.append(attn_layer.impl.decode_query_size)
+                    # Draft layers count too. `reorder_batch_threshold` shapes
+                    # the target's request_distribution, and the drafter's
+                    # first pass attends with that same distribution, so every
+                    # layer that consumes it needs a DECODE tile at least as
+                    # wide as the widest window the threshold puts there.
+                    decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels
@@ -4471,13 +4505,13 @@ class TPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         # State it, don't infer it: a target-only [4] and an undetected-draft
         # [4] print identically, so the draft count is the only way to tell
-        # whether the pinning below actually matched any layer.
+        # whether any draft layer was detected.
         from collections import Counter
 
         logger.info(
             "Attn layer census (role, impl, width_before_init, "
             "width_after_init, head_size) -> count: %s | draft names known=%d",
-            dict(Counter(pinned_draft_layers)),
+            dict(Counter(layer_widths)),
             len(draft_attn_names),
         )
         logger.info(
@@ -4937,9 +4971,8 @@ class TPUModelRunner(GPUModelRunner):
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
         return torch.zeros(
             (num_reqs, self.vocab_size),
-            device=self.device,
             dtype=self._hidden_states_dtype,
-        )
+        ).to(self.device)
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -4947,13 +4980,10 @@ class TPUModelRunner(GPUModelRunner):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
-                )
+                ).to(self.device)
                 for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
-                    )
+                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
@@ -4968,9 +4998,8 @@ class TPUModelRunner(GPUModelRunner):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
-                )
+                ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -5022,14 +5051,14 @@ class TPUModelRunner(GPUModelRunner):
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
                 dummy_temperatures = torch.ones(
-                    (num_reqs, 1), dtype=self._hidden_states_dtype, device=self.device
-                )
+                    (num_reqs, 1), dtype=self._hidden_states_dtype
+                ).to(self.device)
                 dummy_u = torch.rand_like(dummy_logits)
-                dummy_top_k = torch.zeros(
-                    (num_reqs, 1), dtype=torch.int32, device=self.device
+                dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
+                    self.device
                 )
-                dummy_top_p = torch.ones(
-                    (num_reqs, 1), dtype=torch.float32, device=self.device
+                dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
+                    self.device
                 )
                 for all_greedy in [False, True]:
                     out = self.sample_from_logits_func(
@@ -5067,21 +5096,17 @@ class TPUModelRunner(GPUModelRunner):
             )
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
-                input_ids = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
-                )
-                cur_input_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
                 # -1 sentinel marks every slot as padding so the precompiled
                 # program is byte-identical to the runtime JIT call.
                 pre_next_tokens_indices = torch.full(
-                    (num_tokens,), -1, dtype=torch.int32, device=self.device
-                )
+                    (num_tokens,), -1, dtype=torch.int32
+                ).to(self.device)
                 for nlen in next_lens:
-                    next_tokens = torch.zeros(
-                        nlen, dtype=torch.int64, device=self.device
-                    )
+                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -5135,31 +5160,28 @@ class TPUModelRunner(GPUModelRunner):
                 # get_spec_decode_metadata so the graph is byte-identical.
                 dummy_logits = torch.zeros(
                     (num_tokens, self.vocab_size),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
-                draft_token_ids = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                target_logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
-                target_logits_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
-                )
-                segment_ids = torch.zeros(
-                    num_tokens, dtype=torch.int64, device=self.device
-                )
-                group_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                segment_ids = torch.zeros(num_tokens, dtype=torch.int64).to(self.device)
+                group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
                 for num_reqs in self.num_reqs_paddings:
                     # padded_num_reqs-shaped inputs.
-                    draft_lengths = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
+                    draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
+                        self.device
                     )
-                    bonus_logits_indices = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
+                    bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(
+                        self.device
                     )
-                    warm_accept_u = torch.zeros(
-                        num_tokens, dtype=torch.float32, device=self.device
+                    warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
+                        self.device
                     )
                     # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
@@ -5189,19 +5211,17 @@ class TPUModelRunner(GPUModelRunner):
                     warm_temps = torch.zeros(
                         (num_tokens, 1),
                         dtype=self._hidden_states_dtype,
-                        device=self.device,
+                    ).to(self.device)
+                    warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
+                        self.device
                     )
-                    warm_top_k = torch.zeros(
-                        (num_tokens, 1), dtype=torch.int32, device=self.device
-                    )
-                    warm_top_p = torch.ones(
-                        (num_tokens, 1), dtype=torch.float32, device=self.device
+                    warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
+                        self.device
                     )
                     warm_recover_u = torch.zeros(
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
-                        device=self.device,
-                    )
+                    ).to(self.device)
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -5462,7 +5482,7 @@ class TPUModelRunner(GPUModelRunner):
                 src = torch.zeros(n, dtype=torch.int32).to(self.device)
                 dst = torch.zeros(n, dtype=torch.int32).to(self.device)
                 for raws in raw_sets.values():
-                    copy_mamba_state_blocks(raws, src, dst)
+                    self._copy_mamba_state_blocks(raws, src, dst)
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)
@@ -5494,8 +5514,8 @@ class TPUModelRunner(GPUModelRunner):
             limit = self._bucket_len(num_groups * self.max_num_reqs)
             n = 8
             while n <= limit:
-                src = torch.zeros(n, dtype=torch.long, device=offsets.device)
-                dst = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                src = torch.zeros(n, dtype=torch.long).to(offsets.device)
+                dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4

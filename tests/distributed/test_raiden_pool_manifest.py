@@ -739,6 +739,113 @@ def test_unified_pool_requires_a_complete_listed_raw_storage():
         )
 
 
+def _block_major_fixture():
+    """Build a 2-region x 4-block `(4, 2, 128, 1, 4, 256)` FP8 fixture.
+
+    Each page is 131,072 B. Region 0 hosts FA layer 1 and GDN layer 0; region 1
+    hosts FA layer 5 and GDN layer 4.
+    """
+    geometry = rpm.GdnHeadGeometry(
+        local_key_heads=4,
+        local_value_heads=8,
+        key_head_dim=64,
+        value_head_dim=32,
+        conv_kernel_size=3,
+    )
+    pool = FakeTensor((4, 2, 128, 1, 4, 256), 1, dtype="torch.float8_e4m3fn")
+    fa = ["model.layers.1.self_attn.attn", "model.layers.5.self_attn.attn"]
+    gdn = ["model.layers.0.linear_attn", "model.layers.4.linear_attn"]
+    named = {fa[0]: pool, fa[1]: pool, gdn[0]: [pool], gdn[1]: [pool]}
+    groups = (
+        _fa_group(fa, block_size=128, num_kv_heads=2, head_size=256),
+        _pooled_gdn_group(
+            gdn,
+            shapes=((2, 768), (8, 64, 32)),
+            dtypes=("torch.bfloat16", "torch.float32"),
+            page_size_bytes=131_072,
+        ),
+    )
+    layout = types.SimpleNamespace(
+        num_blocks=4,
+        num_pools=2,
+        split=1,
+        pool_index_by_layer={fa[0]: 0, gdn[0]: 0, fa[1]: 1, gdn[1]: 1},
+    )
+    return pool, named, groups, geometry, layout
+
+
+def test_block_major_pool_places_each_region_inside_the_row():
+    pool, named, groups, geometry, layout = _block_major_fixture()
+    ordinals = {name: 0 for name in named if "linear_attn" in name}
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(pool,),
+        gdn_geometry=geometry,
+        mamba_group_ordinal_by_layer=ordinals,
+        block_major=layout,
+    )
+
+    assert manifest.binding == rpm.BINDING_ALIASED_RAW
+    assert manifest.storages == [pool]
+    by_layer = {(pool_.tag, pool_.layer_name): pool_ for pool_ in manifest.pools}
+    assert len(by_layer) == 6
+    page = 131_072
+    ssm_bytes = 8 * 64 * 32 * 4
+    # Every pool spans the whole row per block and counts scheduler blocks.
+    assert all(entry.num_blocks == 4 for entry in manifest.pools)
+    assert all(entry.block_stride_bytes == 2 * page for entry in manifest.pools)
+    assert all(entry.storage_index == 0 for entry in manifest.pools)
+    for region, (fa, gdn) in enumerate(
+        (
+            ("model.layers.1.self_attn.attn", "model.layers.0.linear_attn"),
+            ("model.layers.5.self_attn.attn", "model.layers.4.linear_attn"),
+        )
+    ):
+        base = region * page
+        fa_pool = by_layer[(rpm.TAG_FA, fa)]
+        ssm_pool = by_layer[(f"{rpm.TAG_GDN_SSM}.g0", gdn)]
+        conv_pool = by_layer[(f"{rpm.TAG_GDN_CONV}.g0", gdn)]
+        assert fa_pool.base_offset_bytes == base
+        assert fa_pool.live_bytes_per_block == page
+        assert ssm_pool.base_offset_bytes == base
+        assert conv_pool.base_offset_bytes == base + ssm_bytes
+        assert (
+            conv_pool.base_offset_bytes
+            + max(r.extent_end_bytes for r in conv_pool.regions)
+        ) <= base + page
+    # The regions are the layer-major ones: only the placement moved.
+    (fa_region,) = by_layer[(rpm.TAG_FA, "model.layers.1.self_attn.attn")].regions
+    assert (
+        fa_region.num_units,
+        fa_region.units_per_stride,
+        fa_region.stride_bytes,
+    ) == (128, 2, 1024)
+    manifest.geometry_by_tag()
+    rpm.verify_storage_binding(manifest, named, raw_tensors=(pool,))
+
+
+def test_block_major_pool_manifest_rejects_a_foreign_layer_or_pool():
+    pool, named, groups, geometry, layout = _block_major_fixture()
+    with pytest.raises(rpm.ManifestError, match="exactly one raw pool"):
+        rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(pool, pool),
+            gdn_geometry=geometry,
+            block_major=layout,
+        )
+    del layout.pool_index_by_layer["model.layers.5.self_attn.attn"]
+    with pytest.raises(rpm.ManifestError, match="no region in the block-major"):
+        rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(pool,),
+            gdn_geometry=geometry,
+            block_major=layout,
+        )
+
+
 def test_mixed_binding_is_rejected():
     page = 4_268_032
     raw = FakeTensor((16 * page,), 1, dtype="torch.int8")

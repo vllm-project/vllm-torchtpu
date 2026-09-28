@@ -167,14 +167,15 @@ def subtract_num_rejected_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remove the previous async step's per-request rejected-token over-count.
 
-    In async spec decode the host advances ``num_computed_tokens`` optimistically, assuming *every* speculative
-    draft was accepted. The real acceptance is only known on-device, so this
-    subtracts the actual per-request rejection count here — on-device, before the
-    verify forward.
+    In async spec decode the host advances ``num_computed_tokens`` optimistically,
+    assuming *every* speculative draft was accepted. The real acceptance is only known
+    on-device, so this subtracts the actual per-request rejection count here —
+    on-device, before the verify forward.
 
     Args:
         seq_lens: ``[num_reqs]`` optimistic sequence lengths.
-        positions: ``[total_tokens]`` (or ``[3, total_tokens]`` mrope) optimistic positions.
+        positions: ``[total_tokens]`` (or ``[3, total_tokens]`` mrope)
+            optimistic positions.
         num_rejected: ``[num_placeholder_reqs]`` rejection count per source index.
         seq_lens_subtract_indices: ``[num_reqs]`` index into ``num_rejected`` for
             each seq_lens slot, ``-1`` to leave it unchanged.

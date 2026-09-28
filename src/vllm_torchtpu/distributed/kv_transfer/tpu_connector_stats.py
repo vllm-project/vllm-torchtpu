@@ -200,7 +200,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ]
         tpu_histogram_d2h_transfer_time = self._histogram_cls(
             name="vllm:tpu_d2h_transfer_time_ms",
-            documentation="Histogram of D2H transfer duration for TPU KV Cache transfers.",
+            documentation="Histogram of D2H transfer duration for "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -209,7 +210,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         )
         tpu_histogram_h2d_transfer_time = self._histogram_cls(
             name="vllm:tpu_h2d_transfer_time_ms",
-            documentation="Histogram of H2D transfer duration for TPU KV Cache transfers.",
+            documentation="Histogram of H2D transfer duration for "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -238,7 +240,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ]
         tpu_histogram_kv_megabytes_transferred = self._histogram_cls(
             name="vllm:tpu_kv_megabytes_transferred",
-            documentation="Histogram of megabytes transferred per TPU KV Cache transfers.",
+            documentation="Histogram of megabytes transferred per "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -285,7 +288,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         # Dynamically load TPU Raiden C++ metric schema descriptors
         metric_defs = {}
         try:
-            # Without this call, get_metric_metadata won't return the correct metrics definitions
+            # Without this call, get_metric_metadata won't return the correct
+            # metrics definitions
             dist_utils.configure_raiden_telemetry()
             telemetry = dist_utils.get_raiden_telemetry_module()
             descriptors = []

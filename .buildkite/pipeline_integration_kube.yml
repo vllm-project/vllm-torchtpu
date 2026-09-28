@@ -116,6 +116,21 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh
 
+      # Nightly only, as on bare metal: an opt-in layout no default-path test
+      # reaches, behind a P/D boot that dominates the step.
+      - label: ":kubernetes: Integration: Nightly qwen35-block-major-disagg-offload"
+        key: "integration_nightly_qwen35_block_major_disagg_offload"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_block_major_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
+
       - label: ":kubernetes: Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         env:

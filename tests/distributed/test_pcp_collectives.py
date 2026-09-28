@@ -292,3 +292,44 @@ def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     with pytest.raises(RuntimeError, match=r"ranks 0\.\.N-1"):
         pcp.get_or_create_pcp_mesh()
     assert pcp._MESH_CACHE == {}
+
+
+@pytest.mark.parametrize("pcp_size,tp_size", [(4, 2), (8, 1), (1, 8), (16, 2)])
+def test_pcp_tp_mesh_uses_runtime_rank_factorization(monkeypatch, pcp_size, tp_size):
+    for rank in range(pcp_size * tp_size):
+        pcp_rank, tp_rank = divmod(rank, tp_size)
+        ranks = tuple(range(tp_rank, pcp_size * tp_size, tp_size))
+        # Deliberately unrelated device IDs: logical order comes from ranks.
+        holder = [
+            pcp.PcpGroupLayout(ranks, tuple(100 - r for r in ranks), pcp_rank, pcp_size)
+        ]
+        native = _pcp_mesh_environment(monkeypatch, holder, pcp_size * tp_size)
+        tp_group = SimpleNamespace(
+            world_size=tp_size,
+            rank_in_group=tp_rank,
+            ranks=list(range(pcp_rank * tp_size, (pcp_rank + 1) * tp_size)),
+        )
+        monkeypatch.setattr(
+            parallel_state, "get_tp_group", lambda tp_group=tp_group: tp_group
+        )
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        mesh = pcp.get_or_create_pcp_mesh(tp_axis_name="tp")
+        native.assert_called_once_with(
+            axis_names=("pcp", "tp"), mesh_shape=(pcp_size, tp_size)
+        )
+        assert pcp.get_or_create_pcp_mesh(tp_axis_name="tp") is mesh
+        pcp._MESH_CACHE.clear()
+
+
+def test_pcp_tp_mesh_rejects_wrong_tp_rank_order(monkeypatch):
+    holder = [pcp.PcpGroupLayout((0, 2, 4, 6), (0, 4, 6, 2), 0, 4)]
+    native = _pcp_mesh_environment(monkeypatch, holder, 8)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0, ranks=[1, 0]),
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    with pytest.raises(RuntimeError, match="TP group coordinates"):
+        pcp.get_or_create_pcp_mesh(tp_axis_name="tp")
+    native.assert_not_called()

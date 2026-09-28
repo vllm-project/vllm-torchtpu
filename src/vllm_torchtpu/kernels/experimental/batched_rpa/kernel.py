@@ -230,7 +230,8 @@ def fetch_step_metadata(
     *,
     cfgs: configs.RpaConfigs,
 ) -> StepMetadata:
-    """Fetches metadata and handles scalar & mask interval values for the current step."""
+    """Fetches metadata and handles scalar & mask interval values for
+    the current step."""
     causal_offset_list = []
     bkv_sz_frm_cache_list = []
     bkv_sz_frm_new_list = []

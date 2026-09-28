@@ -228,8 +228,8 @@ def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
 
 
 # Generation horizon for eagle3 tests, pinned separately from the
-# shared one below. The horizon and the floor are one calibration: changing either without
-# re-measuring the other invalidates the test.
+# shared one below. The horizon and the floor are one calibration: changing either
+# without re-measuring the other invalidates the test.
 EAGLE3_PERF_MAX_TOKENS = 16
 
 

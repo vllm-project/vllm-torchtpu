@@ -56,7 +56,6 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
-# yapf: disable
 from benchmark_core import BenchmarkContext, SampleRequest
 from benchmark_dataset import (
     GPQADataset,
@@ -66,8 +65,6 @@ from benchmark_dataset import (
     RandomDataset,
     SonnetDataset,
 )
-
-# yapf: disable
 from benchmark_utils import eval_benchmark_dataset_result, sample_warmup_requests
 
 logger = logging.getLogger(__name__)
@@ -131,7 +128,8 @@ async def get_request(
 
     # Calculate scale parameter theta to maintain the desired request_rate.
     assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}.")
+        f"A positive burstiness factor is expected, but given {burstiness}."
+    )
     theta = 1.0 / (request_rate * burstiness)
 
     for request in input_requests:
@@ -168,7 +166,11 @@ def calculate_metrics(
     e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
-            logger.debug("Prompt: %s\nOutput: %s", input_requests[i].prompt, outputs[i].generated_text)
+            logger.debug(
+                "Prompt: %s\nOutput: %s",
+                input_requests[i].prompt,
+                outputs[i].generated_text,
+            )
             output_len = outputs[i].output_tokens
 
             if not output_len:
@@ -178,13 +180,14 @@ def calculate_metrics(
                 # bundled together
                 # Note : this may inflate the output token count slightly
                 output_len = len(
-                    tokenizer(outputs[i].generated_text,
-                              add_special_tokens=False).input_ids)
+                    tokenizer(
+                        outputs[i].generated_text, add_special_tokens=False
+                    ).input_ids
+                )
             actual_output_lens.append(output_len)
             # Prefer server-reported prompt_tokens (accounts for chat template
             # and multimodal tokens); fall back to client-side prompt_len.
-            input_len = (outputs[i].prompt_tokens
-                         or input_requests[i].prompt_len)
+            input_len = outputs[i].prompt_tokens or input_requests[i].prompt_len
             actual_input_lens.append(input_len)
             total_input += input_len
             tpot = 0
@@ -208,16 +211,19 @@ def calculate_metrics(
 
         if "ttft" in goodput_config_dict:
             valid_metrics.append(ttfts)
-            slo_values.append(goodput_config_dict["ttft"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(
+                goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
-            slo_values.append(goodput_config_dict["tpot"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(
+                goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
         if "e2el" in goodput_config_dict:
             valid_metrics.append(e2els)
-            slo_values.append(goodput_config_dict["e2el"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(
+                goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
 
         for req_metric in zip(*valid_metrics):
             is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
@@ -238,27 +244,31 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
+        mean_ttft_ms=np.mean(ttfts or 0)
+        * 1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
-                             for p in selected_percentiles],
+        percentiles_ttft_ms=[
+            (p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles
+        ],
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000)
-                             for p in selected_percentiles],
+        percentiles_tpot_ms=[
+            (p, np.percentile(tpots or 0, p) * 1000) for p in selected_percentiles
+        ],
         mean_itl_ms=np.mean(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
-                            for p in selected_percentiles],
+        percentiles_itl_ms=[
+            (p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles
+        ],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
         median_e2el_ms=np.median(e2els or 0) * 1000,
-        percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
-                             for p in selected_percentiles],
+        percentiles_e2el_ms=[
+            (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
+        ],
     )
 
     return metrics, actual_output_lens, actual_input_lens
@@ -306,12 +316,12 @@ async def benchmark(
     if warmup_requests:
         print(f"Warmup (mode: {args.warmup_mode}) is starting.")
         for warmup_request in tqdm(warmup_requests):
-
             test_output = await request_func(ctx=ctx, request_func_input=warmup_request)
             if not test_output.success:
                 raise ValueError(
                     "Warmup failed - Please make sure benchmark arguments "
-                    f"are correctly specified. Error: {test_output.error}")
+                    f"are correctly specified. Error: {test_output.error}"
+                )
         print(f"Warmup (mode: {args.warmup_mode}) has completed.")
 
     if profile:
@@ -327,8 +337,11 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) \
-                    if max_concurrency else contextlib.nullcontext()
+    semaphore = (
+        asyncio.Semaphore(max_concurrency)
+        if max_concurrency
+        else contextlib.nullcontext()
+    )
 
     async def limited_request_func(request_func_input, pbar):
         async with semaphore:
@@ -341,11 +354,11 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
-
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request,
-                                     pbar=pbar)))
+                limited_request_func(request_func_input=request, pbar=pbar)
+            )
+        )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -369,20 +382,30 @@ async def benchmark(
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
+    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
     if goodput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
-    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):",
-                                    metrics.total_token_throughput))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request goodput (req/s):", metrics.request_goodput
+            )
+        )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total token throughput (tok/s):", metrics.total_token_throughput
+        )
+    )
 
     result = {
         "duration": benchmark_duration,
@@ -390,8 +413,7 @@ async def benchmark(
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
-        "request_goodput:":
-        metrics.request_goodput if goodput_config_dict else None,
+        "request_goodput:": metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": input_lens,
@@ -411,30 +433,34 @@ async def benchmark(
         metric_header: str,
     ):
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms"),
-        ))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms"),
-        ))
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Mean {metric_name} (ms):",
+                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Median {metric_name} (ms):",
+                getattr(metrics, f"median_{metric_attribute_name}_ms"),
+            )
+        )
         result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
+            metrics, f"mean_{metric_attribute_name}_ms"
+        )
         result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
+            metrics, f"median_{metric_attribute_name}_ms"
+        )
         result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
+            metrics, f"std_{metric_attribute_name}_ms"
+        )
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
             p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
+            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
             result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT",
-                       "Time per Output Token (excl. 1st token)")
+    process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
@@ -454,12 +480,14 @@ def check_goodput_args(args):
                 raise ValueError(
                     f"Invalid metric name found, {slo_name}: {slo_val}. "
                     "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. ")
+                    f"{str(VALID_NAMES)}. "
+                )
             if slo_val < 0:
                 raise ValueError(
                     f"Invalid value found, {slo_name}: {slo_val}. "
                     "The service level objective value should be "
-                    "non-negative.")
+                    "non-negative."
+                )
     return goodput_config_dict
 
 
@@ -474,7 +502,8 @@ def parse_goodput(slo_pairs):
             "Invalid format found for service level objectives. "
             'Specify service level objectives for goodput as "KEY:VALUE" '
             "pairs, where the key is a metric name, and the value is a "
-            "number in milliseconds.") from err
+            "number in milliseconds."
+        ) from err
     return goodput_config_dict
 
 
@@ -517,7 +546,8 @@ def main(args: argparse.Namespace):
     if args.dataset_name is None:
         raise ValueError(
             "Please specify '--dataset-name' and the corresponding "
-            "'--dataset-path' if required.")
+            "'--dataset-path' if required."
+        )
 
     if args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
@@ -550,39 +580,40 @@ def main(args: argparse.Namespace):
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
-            "mmlu":
-            lambda: MMLUDataset(random_seed=args.seed,
-                                dataset_path=args.dataset_path,
-                                num_shots=args.mmlu_num_shots,
-                                mmlu_method=args.mmlu_method,
-                                use_chat_template=args.mmlu_use_chat_template).sample(
-                                    tokenizer=tokenizer,
-                                    num_requests=args.num_prompts,
-                                    input_len=args.mmlu_input_len,
-                                    output_len=args.mmlu_output_len,
-                                    chat_template_system_prompt=args.chat_template_system_prompt,
-                                    chat_template_kwargs=json.loads(args.chat_template_kwargs),
-                                    ),
-            "mlperf":
-            lambda: MLPerfDataset(random_seed=args.seed,
-                                  dataset_path=args.dataset_path).sample(
-                                      tokenizer=tokenizer,
-                                      num_requests=args.num_prompts,
-                                      input_len=args.mlperf_input_len,
-                                      output_len=args.mlperf_output_len,
-                                      ),
-            "gpqa":
-            lambda: GPQADataset(random_seed=args.seed,
-                                dataset_path=args.dataset_path,
-                                use_chat_template=args.gpqa_use_chat_template).sample(
-                                    tokenizer=tokenizer,
-                                    num_requests=args.num_prompts,
-                                    output_len=args.gpqa_output_len,
-                                    chat_template_system_prompt=args.chat_template_system_prompt,
-                                    chat_template_kwargs=json.loads(args.chat_template_kwargs),
-                                    ),
-            "mmmu_pro":
-            lambda: MMMUProDataset(
+            "mmlu": lambda: MMLUDataset(
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                num_shots=args.mmlu_num_shots,
+                mmlu_method=args.mmlu_method,
+                use_chat_template=args.mmlu_use_chat_template,
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                input_len=args.mmlu_input_len,
+                output_len=args.mmlu_output_len,
+                chat_template_system_prompt=args.chat_template_system_prompt,
+                chat_template_kwargs=json.loads(args.chat_template_kwargs),
+            ),
+            "mlperf": lambda: MLPerfDataset(
+                random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                input_len=args.mlperf_input_len,
+                output_len=args.mlperf_output_len,
+            ),
+            "gpqa": lambda: GPQADataset(
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                use_chat_template=args.gpqa_use_chat_template,
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                output_len=args.gpqa_output_len,
+                chat_template_system_prompt=args.chat_template_system_prompt,
+                chat_template_kwargs=json.loads(args.chat_template_kwargs),
+            ),
+            "mmmu_pro": lambda: MMMUProDataset(
                 random_seed=args.seed,
                 dataset_path=args.dataset_path,
                 subset=args.mmmu_pro_subset,
@@ -591,17 +622,17 @@ def main(args: argparse.Namespace):
                 num_requests=args.num_prompts,
                 output_len=args.mmmu_pro_output_len,
             ),
-            "random":
-            lambda: RandomDataset(random_seed=args.seed,
-                                  dataset_path=args.dataset_path).sample(
-                                      tokenizer=tokenizer,
-                                      num_requests=args.num_prompts,
-                                      prefix_len=args.random_prefix_len,
-                                      input_len=args.random_input_len,
-                                      output_len=args.random_output_len,
-                                      range_ratio=args.random_range_ratio,
-                                      request_id_prefix=args.request_id_prefix,
-                                      ),
+            "random": lambda: RandomDataset(
+                random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                prefix_len=args.random_prefix_len,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                range_ratio=args.random_range_ratio,
+                request_id_prefix=args.request_id_prefix,
+            ),
         }
 
         try:
@@ -618,7 +649,8 @@ def main(args: argparse.Namespace):
             "top_k": args.top_k,
             "min_p": args.min_p,
             "temperature": args.temperature,
-        }.items() if v is not None
+        }.items()
+        if v is not None
     }
 
     # Sampling parameters are only supported by openai-compatible backend.
@@ -653,22 +685,23 @@ def main(args: argparse.Namespace):
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
-            selected_percentiles=[
-                float(p) for p in args.metric_percentiles.split(",")
-            ],
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
             ignore_eos=args.ignore_eos,
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             extra_body=sampling_params,
-        ))
+        )
+    )
 
     # Run accuracy evaluation if required
     if args.run_eval:
         eval_benchmark_dataset_result(request_outputs, args.dataset_name)
 
+
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
-        description="Benchmark the online serving throughput.")
+        description="Benchmark the online serving throughput."
+    )
     parser.add_argument(
         "--backend",
         type=str,
@@ -695,8 +728,16 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
-            "sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "mmlu",
-            "mlperf", "gpqa", "mmmu_pro"
+            "sharegpt",
+            "burstgpt",
+            "sonnet",
+            "random",
+            "hf",
+            "custom",
+            "mmlu",
+            "mlperf",
+            "gpqa",
+            "mmmu_pro",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -730,8 +771,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        help=
-        "Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
+        help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
     )
     parser.add_argument("--use-beam-search", action="store_true")
     parser.add_argument(
@@ -744,11 +784,13 @@ if __name__ == "__main__":
         "--logprobs",
         type=int,
         default=None,
-        help=("Number of logprobs-per-token to compute & return as part of "
-              "the request. If unspecified, then either (1) if beam search "
-              "is disabled, no logprobs are computed & a single dummy "
-              "logprob is returned for each token; or (2) if beam search "
-              "is enabled 1 logprob per token is computed"),
+        help=(
+            "Number of logprobs-per-token to compute & return as part of "
+            "the request. If unspecified, then either (1) if beam search "
+            "is disabled, no logprobs are computed & a single dummy "
+            "logprob is returned for each token; or (2) if beam search "
+            "is enabled 1 logprob per token is computed"
+        ),
     )
     parser.add_argument(
         "--request-rate",
@@ -893,7 +935,6 @@ if __name__ == "__main__":
         "from the MLPerf dataset.",
     )
 
-
     gpqa_group = parser.add_argument_group("gpqa dataset options")
     gpqa_group.add_argument(
         "--gpqa-output-len",
@@ -984,22 +1025,19 @@ if __name__ == "__main__":
         "--top-p",
         type=float,
         default=None,
-        help=
-        "Top-p sampling parameter. Only has effect on openai-compatible backends.",
+        help="Top-p sampling parameter. Only has effect on openai-compatible backends.",
     )
     sampling_group.add_argument(
         "--top-k",
         type=int,
         default=None,
-        help=
-        "Top-k sampling parameter. Only has effect on openai-compatible backends.",
+        help="Top-k sampling parameter. Only has effect on openai-compatible backends.",
     )
     sampling_group.add_argument(
         "--min-p",
         type=float,
         default=None,
-        help=
-        "Min-p sampling parameter. Only has effect on openai-compatible backends.",
+        help="Min-p sampling parameter. Only has effect on openai-compatible backends.",
     )
     sampling_group.add_argument(
         "--temperature",
@@ -1034,8 +1072,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run-eval",
         action="store_true",
-        help=
-        "Whether to run evaluation script on the saved outputs (for MMLU and MLPerf datasets)",
+        help="Whether to run evaluation script on the saved outputs "
+        "(for MMLU and MLPerf datasets)",
     )
     parser.add_argument(
         "--warmup-mode",

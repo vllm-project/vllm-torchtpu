@@ -134,7 +134,9 @@ def _pallas_rpa_kernel_dcp(
     cp_group_size: int,
     cp_rank_val: int,
     attention_scope: _batched_rpa_configs.AttentionScope,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
     decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
@@ -231,7 +233,9 @@ def build_dcp_kernels(
     v_scale: float | None,
     cp_group_size: int,
     cp_rank: int,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
     decode_query_size: int = 1,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
@@ -319,7 +323,9 @@ def forward_with_dcp(
     kv_cache_quantized_dtype,
     dcp_world_size: int,
     dcp_rank: int,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
     decode_query_size: int = 1,
 ) -> torch.Tensor:
     """Orchestrate the two-pass DCP attention forward.

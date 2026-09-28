@@ -27,6 +27,12 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _empty_shared_gdn_ops(monkeypatch):
+    """Keep an op built from one test's mocks out of every other test."""
+    monkeypatch.setattr(gdn_attention_op, "_shared_gdn_ops", {})
+
+
 @pytest.fixture
 def make_gdn_attention(monkeypatch):
     """Keep construction/loading real while avoiding accelerator ownership."""

@@ -75,11 +75,13 @@ def _mla_ragged_paged_attention_kernel(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv_hbm_ref,
     swa_accumution_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     swa_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     swa_m_hbm_ref,  # [max_num_tokens, num_l_heads]
@@ -185,7 +187,8 @@ def _mla_ragged_paged_attention_kernel(
     def _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         for b in range(batch_size):
             sem = sems.at[0, b, bkv_sem_idx]
-            # bkv_x2_ref shape: [2, batch_size, bkv_sz, num_slots_per_token * kv_packing, lkv_dim]
+            # bkv_x2_ref shape:
+            # [2, batch_size, bkv_sz, num_slots_per_token * kv_packing, lkv_dim]
             bkv_vmem_ref = bkv_x2_ref.at[bkv_sem_idx, b]
 
             reshaped_cache_hbm_ref = cache_kv_hbm_ref.reshape(
@@ -214,8 +217,8 @@ def _mla_ragged_paged_attention_kernel(
                         0,
                         page_size,
                     )
-                    # If the page index is out of bound, we set page_idx to the last page.
-                    # And there will be no copy since sz will be 0.
+                    # If the page index is out of bound, we set page_idx to the last
+                    # page. And there will be no copy since sz will be 0.
                     page_idx = jnp.minimum(
                         page_indices_offset + i, num_page_indices - 1
                     )
@@ -232,8 +235,8 @@ def _mla_ragged_paged_attention_kernel(
                     )
 
             else:
-                # When we wait, we can use a dummy copy to wait for DMAs to complete where
-                # src == dst. However, the dma size must be correct.
+                # When we wait, we can use a dummy copy to wait for DMAs to complete
+                # where src == dst. However, the dma size must be correct.
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
                 _async_copy(
                     src=dst_kv,
