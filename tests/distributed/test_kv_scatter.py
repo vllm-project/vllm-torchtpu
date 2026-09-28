@@ -220,7 +220,8 @@ def _body_multi_layer_scatter_all_layers_updated():
         out_cpu = outs[layer_idx].cpu()
         for dest_idx in [1, 4]:
             assert torch.all(out_cpu[dest_idx] == float(layer_idx)), (
-                f"layer {layer_idx}, dest[{dest_idx}] not filled with {float(layer_idx)}"
+                f"layer {layer_idx}, dest[{dest_idx}] "
+                f"not filled with {float(layer_idx)}"
             )
 
 

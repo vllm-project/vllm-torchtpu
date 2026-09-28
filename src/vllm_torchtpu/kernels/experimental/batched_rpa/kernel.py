@@ -21,7 +21,6 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
-# yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     bref_override,
     configs,
@@ -30,8 +29,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     stitch_utils,
     utils,
 )
-
-# yapf: enable
 
 # Define inner kernel.
 
@@ -230,7 +227,8 @@ def fetch_step_metadata(
     *,
     cfgs: configs.RpaConfigs,
 ) -> StepMetadata:
-    """Fetches metadata and handles scalar & mask interval values for the current step."""
+    """Fetches metadata and handles scalar & mask interval values for
+    the current step."""
     causal_offset_list = []
     bkv_sz_frm_cache_list = []
     bkv_sz_frm_new_list = []
@@ -264,7 +262,20 @@ def fetch_step_metadata(
             local_k_end_list.append(kv_cache_len_val - k_id)
         # Stitching metadata
         kv_left = jnp.maximum(total_kv_len - k_id, 0)
-        kv_left_frm_cache = jnp.maximum(kv_cache_len_val - k_id, 0)
+        if cfgs.serve.skip_kv_update:
+            # MUST mirror the identical branch in `schedule.py`'s `k_loop`.
+            # With KV sharing the schedule loads every token -- including the
+            # current step's, already written by the source layer -- from the
+            # cache region and fetches nothing new. If we kept the non-skip
+            # formula here, `bkv_sz_frm_cache` would come up short by
+            # `kv_new_len`, and `stitch_new_kv_lane` would splice unfetched
+            # garbage over the newest real token (and zero the lanes after
+            # it). That is invisible under HEAD_ALONG_SUBLANE, which never
+            # stitches, and silently costs ~24 points of MTP acceptance under
+            # SEQ_ALONG_LANE.
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_cache_len_val - k_id, 0)
         kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
         new_kv_len_start = q_end - kv_left_frm_new

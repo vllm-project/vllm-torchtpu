@@ -228,8 +228,8 @@ def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
 
 
 # Generation horizon for eagle3 tests, pinned separately from the
-# shared one below. The horizon and the floor are one calibration: changing either without
-# re-measuring the other invalidates the test.
+# shared one below. The horizon and the floor are one calibration: changing either
+# without re-measuring the other invalidates the test.
 EAGLE3_PERF_MAX_TOKENS = 16
 
 
@@ -384,6 +384,10 @@ class _InProcessEngine:
     ) -> list[str]:
         outputs = self._llm.generate(prompts, sampling_config)
         return [output.outputs[0].text for output in outputs]
+
+    def generate_outputs(self, prompts: list[str], sampling_config: SamplingParams):
+        """The full RequestOutputs, for callers that need more than text."""
+        return self._llm.generate(prompts, sampling_config)
 
     def spec_counters(self) -> tuple[float, float, dict[str, float]]:
         num_draft_tokens = num_accepted_tokens = 0.0
@@ -646,6 +650,79 @@ def test_qwen35_mtp_correctness_greedy_multi_step(
         max_num_seqs=4,
         async_scheduling=False,
         extra_kwargs=QWEN35_KWARGS,
+    )
+
+
+def _generated_logprobs(output) -> list[tuple[int, float, int]]:
+    """(token id, its logprob, top-1 token id) for each generated token."""
+    completion = output.outputs[0]
+    assert completion.logprobs is not None
+    assert len(completion.logprobs) == len(completion.token_ids)
+    rows = []
+    for token_id, entry in zip(completion.token_ids, completion.logprobs):
+        # A logprobs row paired with the wrong slot or request shows up here:
+        # every entry must carry the token that was actually generated.
+        assert token_id in entry, f"token {token_id} missing from {entry}"
+        top1 = next(t for t, lp in entry.items() if lp.rank == 1)
+        rows.append((token_id, entry[token_id].logprob, top1))
+    return rows
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(4, False, id="bs4-sync", marks=pytest.mark.nightly),
+    ],
+)
+def test_qwen35_mtp_logprobs_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """MTP must return the logprobs a no-spec reference returns.
+
+    A verify step computes a logprobs row for every draft and bonus slot and
+    keeps each request's accepted rows once the tokens reach the host. K=2
+    gives every verify two draft slots plus the bonus. Rows whose greedy text
+    differs from the reference (batch-position near-ties, see
+    _assert_no_spec_divergence) are not compared, but most must match.
+    """
+    sampling = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True, logprobs=1)
+    prompts = get_mtp_test_prompts()
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_seqs": max_num_seqs,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": async_scheduling,
+        **QWEN35_KWARGS,
+    }
+    with monkeypatch.context():
+        with _engine(QWEN35_MTP_MODEL, None, kwargs) as ref_engine:
+            ref_outputs = ref_engine.generate_outputs(prompts, sampling)
+        with _engine(
+            QWEN35_MTP_MODEL,
+            _qwen35_mtp_speculative_config(num_speculative_tokens=2),
+            kwargs,
+        ) as spec_engine:
+            spec_outputs = spec_engine.generate_outputs(prompts, sampling)
+
+    compared = 0
+    for ref_output, spec_output in zip(ref_outputs, spec_outputs):
+        ref_rows = _generated_logprobs(ref_output)
+        spec_rows = _generated_logprobs(spec_output)
+        if [r[0] for r in ref_rows] != [s[0] for s in spec_rows]:
+            continue
+        compared += 1
+        for pos, ((_, ref_lp, ref_top), (_, spec_lp, spec_top)) in enumerate(
+            zip(ref_rows, spec_rows)
+        ):
+            # One bf16 step of the logsumexp around the logits' magnitude.
+            assert abs(ref_lp - spec_lp) <= 0.125, (pos, ref_lp, spec_lp)
+            assert ref_top == spec_top, (pos, ref_top, spec_top)
+    assert compared > len(prompts) // 2, (
+        f"only {compared}/{len(prompts)} outputs matched the reference text"
     )
 
 
@@ -1812,56 +1889,56 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     # Log to a file rather than a pipe. vLLM startup writes far more than a
     # pipe buffer holds, and nothing here drains it, so PIPE would block the
     # server mid-startup and the health poll would never succeed.
-    log = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".log", prefix="vllm_serve_dp_", delete=False
-    )
+    ) as log:
 
-    def _fail(message: str) -> RuntimeError:
-        log.flush()
-        with open(log.name) as fh:
-            tail = fh.read()[-4000:]
-        return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+        def _fail(message: str) -> RuntimeError:
+            log.flush()
+            with open(log.name) as fh:
+                tail = fh.read()[-4000:]
+            return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
 
-    # The first request against a fresh engine pair compiles the runtime
-    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
-    # worker-RPC deadline -- the engine is torn down mid-compile and every
-    # request 500s. Raise the deadline past the compile.
-    env = dict(
-        os.environ, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S)
-    )
+        # The first request against a fresh engine pair compiles the runtime
+        # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+        # worker-RPC deadline -- the engine is torn down mid-compile and every
+        # request 500s. Raise the deadline past the compile.
+        env = dict(
+            os.environ,
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
+        )
 
-    server = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
-    )
-    try:
-        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
-        while True:
-            if server.poll() is not None:
-                raise _fail(
-                    f"vllm serve exited with {server.returncode} during startup"
-                )
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=10).close()
-                break
-            except (urllib.error.URLError, OSError):
-                pass
-            if time.time() > deadline:
-                raise _fail(
-                    "vllm serve did not become healthy within "
-                    f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
-                )
-            time.sleep(10)
-        print(f"vllm serve ready at {base}; log: {log.name}")
-        yield _ServedEngine(base, model_name)
-    finally:
-        server.terminate()
+        server = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
+        )
         try:
-            server.wait(timeout=180)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=60)
-        log.close()
-        wait_for_tpu_release()
+            deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+            while True:
+                if server.poll() is not None:
+                    raise _fail(
+                        f"vllm serve exited with {server.returncode} during startup"
+                    )
+                try:
+                    urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                    break
+                except (urllib.error.URLError, OSError):
+                    pass
+                if time.time() > deadline:
+                    raise _fail(
+                        "vllm serve did not become healthy within "
+                        f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
+                    )
+                time.sleep(10)
+            print(f"vllm serve ready at {base}; log: {log.name}")
+            yield _ServedEngine(base, model_name)
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=60)
+            wait_for_tpu_release()
 
 
 def _qwen35_dp_kwargs() -> dict:

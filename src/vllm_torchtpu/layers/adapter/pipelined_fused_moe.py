@@ -70,7 +70,8 @@ def calculate_moe_chunks(
     num_chunks = (total_tokens + chunk_size - 1) // chunk_size
     if seq_len % num_chunks != 0:
         raise ValueError(
-            f"Local sequence length ({seq_len}) is not divisible by chunk count ({num_chunks})."
+            f"Local sequence length ({seq_len}) is not divisible by chunk count "
+            f"({num_chunks})."
         )
 
     chunk_size_local = seq_len // num_chunks
@@ -135,7 +136,8 @@ def pipelined_fused_moe_gmm(
     When `enable_pipelined_collective_and_compute()` is True and the collective
     world size is greater than one, the sequence is partitioned into balanced
     chunks and executed via a 3-stage pipelined schedule:
-      ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done) -> rs1_start || rs0_done -> rs1_done -> concat
+      ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done)
+        -> rs1_start || rs0_done -> rs1_done -> concat
 
     Args:
         hidden_states: Local input activations [S, H].
@@ -143,7 +145,8 @@ def pipelined_fused_moe_gmm(
             (concatenated gate W1 and up W3 projections with intermediate dimension
             2*I for gated activations like SwiGLU when activation="silu").
         w2: Second expert projection weights [E, H, I] or [E, I, H]
-            (down projection W2 from intermediate dimension I back to hidden dimension H).
+            (down projection W2 from intermediate dimension I back to
+            hidden dimension H).
         w1_scale: Optional first projection scale tensor.
         w2_scale: Optional second projection scale tensor.
         w1_bias: Optional first projection bias tensor.

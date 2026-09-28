@@ -489,7 +489,8 @@ def _process_fp8_moe_weights(
     )
     if w13_scale_param is None or w2_scale_param is None:
         raise ValueError(
-            "Missing MoE weight scale parameters (expected w13_weight_scale_inv or w13_weight_scale)"
+            "Missing MoE weight scale parameters (expected w13_weight_scale_inv or "
+            "w13_weight_scale)"
         )
 
     padded_intermediate = layer.moe_config.intermediate_size_per_partition
@@ -510,9 +511,9 @@ def _process_fp8_moe_weights(
             _, out_dim, in_dim = weight.shape
             if out_dim % block_h != 0 or in_dim % block_w != 0:
                 raise ValueError(
-                    "FP8 block quantized MoE weights must be divisible by the checkpoint "
-                    f"block size, got {name}.shape={tuple(weight.shape)} and "
-                    f"block_size={weight_block_size}."
+                    "FP8 block quantized MoE weights must be divisible by the "
+                    f"checkpoint block size, got {name}.shape={tuple(weight.shape)} "
+                    f"and block_size={weight_block_size}."
                 )
 
     zero_w13 = zero_w2 = None
@@ -939,9 +940,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
 
         # Remove placeholder checkpoint scales before assigning runtime inverse scales
-        # to prevent nn.Module parameter re-assignment errors and free state dict memory.
-        # Note: RoutedExperts universally names its parameters w13 (gate+up) and w2 (down);
-        # hasattr is True for serialized FP8 checkpoints and False for unquantized BF16.
+        # to prevent nn.Module parameter re-assignment errors and free
+        # state dict memory.
+        # Note: RoutedExperts universally names its parameters w13 (gate+up) and
+        # w2 (down); hasattr is True for serialized FP8 checkpoints and False for
+        # unquantized BF16.
         if hasattr(layer, f"w13_{self.weight_scale_name}"):
             delattr(layer, f"w13_{self.weight_scale_name}")
         if hasattr(layer, f"w2_{self.weight_scale_name}"):
@@ -1298,7 +1301,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             requant_dtype_name = "fp8"
         else:
-            # Respect configured TPU quantization settings (dtype, block size, kernel flags) on load.
+            # Respect configured TPU quantization settings
+            # (dtype, block size, kernel flags) on load.
             linear_quant_config = getattr(self, "_linear_quant_config", None)
             if linear_quant_config is None:
                 linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1353,9 +1357,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
-        # Derive weight_block_size explicitly from weight_scale layout when requant_block_size is unspecified.
-        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
-        # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
+        # Derive weight_block_size explicitly from weight_scale layout when
+        # requant_block_size is unspecified.
+        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream
+        # linear kernels and dequantization pipelines properly recognize scale broadcast
+        # granularity right across tensor-parallel shards.
         if requant_block_size is None:
             # Stated in checkpoint [n_out, n_in] terms, which is what the
             # downstream dequantization pipelines read; the transpose above

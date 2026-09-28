@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -32,7 +32,6 @@ from vllm_torchtpu.logger import init_logger
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
-QuantConfigT = TypeVar("QuantConfigT", bound=QuantizationConfig | None)
 
 logger = init_logger(__name__)
 
@@ -134,7 +133,9 @@ class OnlineFp8Policy:
         return all(choices), aliases
 
 
-def attach_online_fp8(config: QuantConfigT, vllm_config: VllmConfig) -> QuantConfigT:
+def attach_online_fp8[QuantConfigT: QuantizationConfig | None](
+    config: QuantConfigT, vllm_config: VllmConfig
+) -> QuantConfigT:
     """Keep the checkpoint config intact; attach independent per-model state."""
     policy = OnlineFp8Policy.from_dict(
         vllm_config.additional_config.get("tpu_online_fp8")

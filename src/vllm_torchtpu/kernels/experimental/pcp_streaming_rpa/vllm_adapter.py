@@ -4,7 +4,6 @@
 # you may not use this file except in compliance with the License.
 """vLLM custom-op adapter for PCP streaming RPA."""
 
-import hashlib
 import inspect
 from collections.abc import Callable, Sequence
 
@@ -23,134 +22,26 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME,
+    TP_AXIS_NAME,
     sharded_pcp_ragged_paged_attention,
 )
 
 _PCP_STREAMING_RPA_TENSOR_ARG_COUNT = 9
 
 PCP_STREAMING_RPA_INPUT_PARTITION_SPECS = (
-    PartitionSpec(PCP_AXIS_NAME),  # kv_cache: local cache blocks
-    PartitionSpec(PCP_AXIS_NAME),  # query: local prefill tokens
-    PartitionSpec(PCP_AXIS_NAME),  # key: local prefill tokens
-    PartitionSpec(PCP_AXIS_NAME),  # value: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, None, TP_AXIS_NAME),  # kv_cache
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # query: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # key: local prefill tokens
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # value: local prefill tokens
     PartitionSpec(),  # seq_lens
     PartitionSpec(),  # block_tables
     PartitionSpec(),  # query_start_loc
     PartitionSpec(),  # request_distribution
 )
 PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS = (
-    PartitionSpec(PCP_AXIS_NAME),  # new_kv_cache
-    PartitionSpec(PCP_AXIS_NAME),  # output
+    PartitionSpec(PCP_AXIS_NAME, None, TP_AXIS_NAME),  # new_kv_cache
+    PartitionSpec(PCP_AXIS_NAME, TP_AXIS_NAME),  # output
 )
-
-
-def _torch_placeholder_with_sharding(
-    aval: jax.core.ShapedArray | None,
-    sharding: jax.sharding.NamedSharding | None,
-    mesh: jax.sharding.Mesh | None,
-) -> torch.Tensor | None:
-    if not isinstance(aval, jax.core.ShapedArray):
-        return aval
-    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
-    if torch_dtype is None:
-        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
-    spec = getattr(sharding, "spec", None)
-    if spec is None:
-        spec = getattr(getattr(aval, "sharding", None), "spec", None)
-    return torch.empty(
-        pallas_impl.get_local_shape(aval.shape, mesh, spec),
-        dtype=torch_dtype,
-        device="tpu",
-    )
-
-
-class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
-    """JaxCallable variant that allocates shard-map outputs with out_shardings."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Per-specialization normalized-MLIR fingerprints (#549). Newer
-        # torch_tpu JaxCallable constructors create this map themselves;
-        # older builds (e.g. 0.1.1.dev20260804) do not, and __call__ below
-        # relies on it either way.
-        if getattr(self, "kernel_key_to_mlir_fingerprint", None) is None:
-            self.kernel_key_to_mlir_fingerprint = {}
-
-    def __call__(self, *args, **kwargs):
-        self._validate_args(*args)
-
-        kernel_key = pallas_impl._get_kernel_invocation_key(
-            self.trace_key, args, kwargs, self.static_argnums
-        )
-        output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
-        mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
-        kernel_exists = (
-            mlir_fingerprint is not None
-            and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-                self.name, mlir_fingerprint
-            )
-        )
-        if not output_shapes or not kernel_exists:
-            jax_args = pallas_impl.jax_placeholders(
-                args,
-                mesh=self.mesh,
-                partition_specs=self.input_partition_specs,
-            )
-            with jax._src.config.export_ignore_forward_compatibility(True):
-                lowered = self.exported(*jax_args, **kwargs)
-            # Normalize the MLIR module without location debug info so that
-            # differing caller stack frames produce the same deterministic fingerprint
-            # and reuse the compiled executable cache.
-            with jax.interpreters.mlir.make_ir_context():
-                ir_module = jax.interpreters.mlir.ir.Module.parse(lowered.mlir_module())
-                normalized_mlir = str(
-                    ir_module.operation.get_asm(enable_debug_info=False)
-                )
-            # BLAKE2 is significantly faster than SHA-256, and 128 bits (16 bytes)
-            # provides enough collision resistance before being fingerprinted down to
-            # 64 bits in lower layers.
-            mlir_fingerprint = hashlib.blake2b(
-                normalized_mlir.encode("utf-8"),
-                digest_size=16,
-            ).hexdigest()
-            self.kernel_key_to_mlir_fingerprint[kernel_key] = mlir_fingerprint
-
-            pallas_impl.tpu_torch_pallas.register_custom_kernel(
-                self.name,
-                mlir_fingerprint,
-                serialized_mlir_module=lowered.mlir_module_serialized,
-            )
-            out_shardings = getattr(lowered, "_out_named_shardings", None)
-            if out_shardings is None or len(out_shardings) != len(lowered.out_avals):
-                out_shardings = [None] * len(lowered.out_avals)
-            output_shapes = [
-                _torch_placeholder_with_sharding(aval, sharding, self.mesh)
-                for aval, sharding in zip(lowered.out_avals, out_shardings)
-            ]
-            out_tree = lowered.out_tree
-            self.output_shapes[kernel_key] = (output_shapes, out_tree)
-
-        tensor_args = [
-            arg
-            for i, arg in enumerate(args)
-            if arg is not None and i not in self.static_argnums
-        ]
-        results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
-            self.name,
-            mlir_fingerprint,
-            inputs=tensor_args,
-            output_shapes=output_shapes,
-            donate_argnums=self.donate_argnums,
-        )
-
-        for in_idx, out_idx in self.input_output_aliases.items():
-            tensor_args[in_idx].copy_(results[out_idx])
-
-        return out_tree.unflatten(results)
-
-
-def _named_shardings(mesh: jax.sharding.Mesh, partition_specs: Sequence[PartitionSpec]):
-    return tuple(jax.sharding.NamedSharding(mesh, spec) for spec in partition_specs)
 
 
 def build_pcp_streaming_callable(
@@ -161,12 +52,28 @@ def build_pcp_streaming_callable(
     mesh: jax.sharding.Mesh,
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Sequence[PartitionSpec] | None = None,
-) -> "_PcpStreamingJaxCallable":
+) -> pallas_impl.JaxCallable:
     """Build the eager JaxCallable for a PCP streaming kernel fn.
 
     Split out of ``pcp_streaming_jax_op`` so kernel-iteration hot-reload can
     rebuild the callable from freshly reloaded kernel modules and swap it in
     behind the already-registered torch op.
+
+    This assembles exactly what ``pallas.jax_op`` assembles internally, so a
+    hot-reloaded callable behaves like the one the normal path registers.
+
+    It used to return a local JaxCallable subclass that sized shard_map
+    outputs itself, because Torchtpu used to derive them from
+    ``lowered.out_avals`` and jax.export records shard_map outputs there as
+    replicated. Torchtpu now supports ``output_partition_specs``, which is
+    the same information by a shorter route, so a subclass is not needed.
+    The subclass had also overridden ``__call__`` outright, so it silently
+    missed whatever Torchtpu's own ``__call__`` did -- including, before
+    google-pytorch/torch_tpu#3522, the step that made the kernel's
+    DeviceAssignment follow the caller's mesh rather than PJRT enumeration
+    order. #3522 makes that assignment canonical, so there is no longer a
+    per-call argument to miss; using the base JaxCallable unmodified is what
+    keeps a future one from being missed the same way.
     """
     signature = inspect.signature(fn, follow_wrapped=False)
     pallas_impl._verify_signature(signature)
@@ -175,12 +82,13 @@ def build_pcp_streaming_callable(
     output_partition_specs_tuple = tuple(
         output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
     )
-    output_shardings = _named_shardings(mesh, output_partition_specs_tuple)
+    # No out_shardings on the jit, because pallas.jax_op does not set it
+    # either and this has to build the same callable it does. The shard_map
+    # body already declares its out_specs, so pinning them again only added an
+    # advisory sdy.sharding result attribute to the exported module -- and the
+    # partitioner is a no-op here because shard_map is already manual.
     jit_fn = jax.jit(
-        fn,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums_tuple,
-        out_shardings=output_shardings,
+        fn, static_argnums=static_argnums, donate_argnums=donate_argnums_tuple
     )
     trace_key = pallas_impl._get_kernel_invocation_key(
         f"{name}_{id(fn)}",
@@ -188,15 +96,15 @@ def build_pcp_streaming_callable(
         {
             "static_argnums": static_argnums,
             "donate_argnums": donate_argnums_tuple,
-            "output_partition_specs": tuple(map(str, output_partition_specs_tuple)),
         },
     )
-    return _PcpStreamingJaxCallable(
+    return pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
         input_partition_specs=tuple(input_partition_specs),
+        output_partition_specs=output_partition_specs_tuple,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums_tuple,
     )
@@ -211,12 +119,13 @@ def pcp_streaming_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Sequence[PartitionSpec] | None = None,
 ):
-    """Register a PCP streaming custom op with explicit output sharding.
+    """Register a PCP streaming custom op behind a hot-reload dispatcher.
 
-    TorchTPU's stock pallas.jax_op derives output placeholder shapes from
-    lowered.out_avals, but jax.export records shard_map outputs there as
-    replicated. Explicit out_shardings are preserved in _out_named_shardings;
-    the PCP-specific JaxCallable uses that to allocate local torch outputs.
+    Everything else here is what ``pallas.jax_op`` does; the one thing it
+    does not do is register the op against ``kernel_reload``'s dispatcher, so
+    that reload_kernels() can swap the callable without re-registering the
+    torch op. Callers that do not use TPU_KERNEL_ITER_MODE -- the GDN PCP ops,
+    for instance -- should call ``pallas.jax_op`` directly rather than this.
     """
     wrapped_fn = build_pcp_streaming_callable(
         name,
@@ -239,7 +148,14 @@ def pcp_streaming_jax_op(
 
     result = torch.library.custom_op(name, op_target, mutates_args=())
 
+    output_specs = tuple(
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
+
     def fake_fn(*args, **kwargs):
+        # Mirrors stock's fake kernel: size the outputs from the specs the
+        # caller declared, not from lowered.out_avals, which jax.export
+        # records as replicated for shard_map results.
         jax_args = pallas_impl.jax_placeholders(
             args,
             mesh=mesh,
@@ -247,12 +163,9 @@ def pcp_streaming_jax_op(
         )
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        out_shardings = getattr(lowered, "_out_named_shardings", None)
-        if out_shardings is None or len(out_shardings) != len(lowered.out_avals):
-            out_shardings = [None] * len(lowered.out_avals)
         return lowered.out_tree.unflatten(
-            _torch_placeholder_with_sharding(aval, sharding, mesh)
-            for aval, sharding in zip(lowered.out_avals, out_shardings)
+            pallas_impl.torch_placeholder(aval, mesh=mesh, partition_spec=spec)
+            for aval, spec in zip(lowered.out_avals, output_specs)
         )
 
     result.register_fake(fake_fn)
@@ -260,7 +173,7 @@ def pcp_streaming_jax_op(
 
 
 def get_pcp_streaming_mesh():
-    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME)
+    return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME, tp_axis_name=TP_AXIS_NAME)
 
 
 def make_pcp_streaming_rpa_kernel(
@@ -279,8 +192,14 @@ def make_pcp_streaming_rpa_kernel(
     kv_layout: batched_rpa_configs.KVLayout = (
         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
+    block_major: bool = False,
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
-    """Build a PCP streaming RPA entry with only tensor args in its signature."""
+    """Build a PCP streaming RPA entry with only tensor args in its signature.
+
+    When ``block_major`` is True, ``kv_cache`` is the merged block-major pool
+    ``(num_blocks, rows_per_block, *page)``, which the wrapper folds into flat
+    kernel blocks along dim 0 via zero-copy bitcasts before and after the kernel.
+    """
     if soft_cap is not None:
         raise NotImplementedError("PCP streaming RPA does not support logits soft cap.")
     if skip_kv_update:
@@ -296,12 +215,15 @@ def make_pcp_streaming_rpa_kernel(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        output, new_kv_cache = sharded_pcp_ragged_paged_attention(
+        # Fold the block-major pool so kernel blocks run along dim 0
+        # (zero-copy bitcast).
+        pool = kv_cache.reshape((-1,) + kv_cache.shape[2:]) if block_major else kv_cache
+        output, new_pool = sharded_pcp_ragged_paged_attention(
             mesh=mesh,
             q=query,
             k=key,
             v=value,
-            kv_cache=kv_cache,
+            kv_cache=pool,
             kv_lens=seq_lens,
             page_indices=block_tables,
             cu_q_lens=query_start_loc,
@@ -318,7 +240,9 @@ def make_pcp_streaming_rpa_kernel(
             q_compute_size=q_compute_size,
             kv_layout=kv_layout,
         )
-        return new_kv_cache, output
+        if block_major:
+            new_pool = new_pool.reshape(kv_cache.shape)
+        return new_pool, output
 
     return _pcp_streaming_rpa_kernel
 

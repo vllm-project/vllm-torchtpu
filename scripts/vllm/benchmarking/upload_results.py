@@ -167,10 +167,7 @@ def main():
         if queue:
             # map tpu_v7x_8_queue -> tpu7x-8
             m = re.match(r"tpu_v(\d+x)_(\d+)_queue", queue)
-            if m:
-                device = f"tpu{m.group(1)}-{m.group(2)}"
-            else:
-                device = queue
+            device = f"tpu{m.group(1)}-{m.group(2)}" if m else queue
         else:
             device = "unknown-device"
 
@@ -236,7 +233,9 @@ def main():
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
-            "CreatedBy": f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
+            "CreatedBy": (
+                f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'"
+            ),
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -247,7 +246,8 @@ def main():
             "CreatedTime": "CURRENT_TIMESTAMP()",
         }
 
-        # Optional metrics (omit from columns list if missing, so Spanner defaults to NULL)
+        # Optional metrics (omit from columns list if missing,
+        # so Spanner defaults to NULL)
         optional_metrics = {
             "Throughput": res.get("request_throughput"),
             "OutputTokenThroughput": res.get("output_throughput"),
@@ -297,7 +297,8 @@ def main():
         if args.skip_db_upload or args.skip_spanner:
             why = "--skip-db-upload" if args.skip_db_upload else "--skip-spanner"
             print(
-                f"=== Skipping Spanner DB Upload ({why} specified) ===. RecordId: {record_id}"
+                f"=== Skipping Spanner DB Upload ({why} specified) ===. "
+                f"RecordId: {record_id}"
             )
         else:
             cmd = [
@@ -312,9 +313,7 @@ def main():
             ]
 
             print(f"Executing: {' '.join(cmd)}")
-            res_proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            res_proc = subprocess.run(cmd, capture_output=True, text=True)
             if res_proc.returncode != 0:
                 print(
                     f"Failed to update Spanner record for {rf.name}!", file=sys.stderr
@@ -324,7 +323,8 @@ def main():
                 success = False
             else:
                 print(
-                    f"Successfully updated Spanner record for {rf.name}. RecordId: {record_id}"
+                    f"Successfully updated Spanner record for {rf.name}. "
+                    f"RecordId: {record_id}"
                 )
 
         # Dual write to BigQuery while dashboards migrate off Spanner. The

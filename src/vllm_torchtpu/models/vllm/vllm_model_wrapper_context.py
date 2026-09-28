@@ -39,7 +39,8 @@ _vllm_model_wrapper_context: VllmModelWrapperContext | None = None
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
     assert _vllm_model_wrapper_context is not None, (
         "VllmModelWrapperContext is not set. "
-        "Please use `set_vllm_model_wrapper_context` to set the VllmModelWrapperContext."
+        "Please use `set_vllm_model_wrapper_context` to set the "
+        "VllmModelWrapperContext."
     )
     return _vllm_model_wrapper_context
 

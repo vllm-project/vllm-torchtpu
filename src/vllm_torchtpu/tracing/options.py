@@ -26,7 +26,7 @@ def _parse_option_value(key: str, val: str) -> Any:
         if not _ALLOWED_VALUE_CHARS.match(val):
             raise ValueError(
                 f"Invalid characters in option value '{val}' for key '{key}'"
-            )
+            ) from None
         return val
 
 

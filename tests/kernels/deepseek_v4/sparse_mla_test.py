@@ -56,14 +56,16 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
-    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     topk_indices: jax.Array,  # i32[max_num_tokens, topk]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     attention_sinks: jax.Array,  # float32[actual_num_q_heads]
-    swa_accumution: jax.Array,  # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    # float32[num_tokens, actual_num_q_heads, actual_lkv_dim]
+    swa_accumution: jax.Array,
     swa_l: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     swa_m: jax.Array,  # float32[num_tokens, actual_num_q_heads]
     *,

@@ -355,7 +355,8 @@ def _write_schedule_to_hbm(
     *,
     cfgs: configs.RpaConfigs,
 ):
-    """Writes `num_steps` of metadata from `schedule_smem` to `schedule_hbm` at `hbm_offset`."""
+    """Writes `num_steps` of metadata from `schedule_smem` to
+    `schedule_hbm` at `hbm_offset`."""
     hbm_offset_aligned = pl.multiple_of(
         hbm_offset, 128
     )  # pytype: disable=bad-argument-type

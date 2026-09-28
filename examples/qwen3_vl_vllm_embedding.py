@@ -17,11 +17,11 @@ import numpy as np
 import torch
 
 # --- TPU MODEL REGISTRATION ---
-from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
+from vllm.model_executor.models.registry import ModelRegistry
 
 try:
     from vllm.model_executor.models.transformers import (
-        TransformersMultiModalEmbeddingModel,  # noqa: E402
+        TransformersMultiModalEmbeddingModel,
     )
 
     # Use generic TransformersMultiModalEmbeddingModel for embedding tasks
@@ -33,9 +33,9 @@ except ImportError:
     pass
 
 # --- MAIN ---
-from vllm import LLM  # noqa: E402
-from vllm.config import PoolerConfig  # noqa: E402
-from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
+from vllm import LLM
+from vllm.config import PoolerConfig
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 def parse_args():

@@ -118,10 +118,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             else state_page_capacity
         )
         cfgs = make_cfgs(state_block_size)
-        if mode is config.Mode.HCA:
-            separate_state = True
-        else:
-            separate_state = False
+        separate_state = mode is config.Mode.HCA
 
         state_width = cfgs.state_width
         state_dim = 2 * state_width

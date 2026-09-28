@@ -20,12 +20,27 @@ from vllm_torchtpu import envs as tpu_envs
 from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
 from .tags import class_tag
 
-EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
+
+def _row_major_minor_to_major(rank: int) -> tuple[int, ...]:
+    """Row-major order for a rank-``rank`` tensor.
+
+    XLA lists dimensions minor to major, so row-major counts down: (1, 0) for
+    a matrix, (3, 2, 1, 0) for the rank-4 page caches. Nothing here is
+    model-specific; the rank picks the value.
+    """
+    return tuple(range(rank - 1, -1, -1))
+
+
+# FA storages are rank 5, the packed-row page caches rank 4. Block-major pools
+# prepend the per-block region axis, adding a 6th major dimension.
+EXPECTED_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(5)
+EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(6)
+ROW_CACHE_MINOR_TO_MAJOR = _row_major_minor_to_major(4)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
-GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
+DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -69,6 +84,18 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
     return next(iter(page_tokens))
 
 
+def expected_fa_minor_to_major(kv_layout: str | None) -> tuple[int, ...]:
+    """Returns the expected FA minor-to-major dimension order for ``kv_layout``.
+
+    The block-major pool adds a leading region dimension while preserving the
+    two minor tiled dimensions, keeping the intra-page byte layout identical to
+    the layer-major pool.
+    """
+    if kv_layout == "block-major":
+        return EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR
+    return EXPECTED_FA_MINOR_TO_MAJOR
+
+
 def _default_layout_getter(tensor: Any) -> Any:
     from torch_tpu._internal.compile import tpu_torch_compile
 
@@ -78,10 +105,17 @@ def _default_layout_getter(tensor: Any) -> Any:
 def measured_fa_layout_fingerprint(
     manifest: PoolManifest,
     *,
+    block_major: bool = False,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Measure the admitted FA storage layout and return its E0' identity.
+
+    When ``block_major`` is True, the backing storage is the merged
+    block-major pool (which shares the same intra-page tiling under an extra
+    leading dimension). Recording ``kv_layout`` in the fingerprint payload
+    ensures disaggregated peers with mismatched pool layouts fail closed at
+    plan time.
 
     ``layout_getter`` and ``package_version`` are injectable so the canonical
     payload can be regression-tested on hosts without a TPU runtime.
@@ -105,11 +139,13 @@ def measured_fa_layout_fingerprint(
     minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
     tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
     element_bits = int(raw_element_bits or 8)
-    if minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR:
+    kv_layout = "block-major" if block_major else "layer-major"
+    expected_minor_to_major = expected_fa_minor_to_major(kv_layout)
+    if minor_to_major != expected_minor_to_major:
         raise RuntimeError(
             "FA layout failed E0' minor-to-major gate: "
             f"measured={minor_to_major} "
-            f"expected={EXPECTED_FA_MINOR_TO_MAJOR}"
+            f"expected={expected_minor_to_major}"
         )
     if tiles != EXPECTED_FA_TILES:
         raise RuntimeError(
@@ -130,6 +166,7 @@ def measured_fa_layout_fingerprint(
         "minor_to_major": list(minor_to_major),
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,
+        "kv_layout": kv_layout,
         # GDN conv state layout version.  Both sides of a disagg pair must
         # agree: the byte-span convention (pair-blocked whole-token QK
         # spans vs the legacy split Q/K) is baked into the transfer plan,
@@ -144,13 +181,17 @@ def measured_fa_layout_fingerprint(
 
 
 __all__ = [
+    "DSV4_LAYOUT_FINGERPRINT_SCHEMA",
+    "EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
+    "expected_fa_minor_to_major",
     "fa_page_tokens",
+    "measured_dsv4_layout_fingerprint",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
     "measured_kimi_k3_layout_fingerprint",
@@ -243,10 +284,34 @@ def measured_glm_layout_fingerprint(
     return canonical_layout_fingerprint(payload), payload
 
 
+def measured_dsv4_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fingerprint of the admitted DeepSeek-V4 cache layout.
+
+    No ``page_tokens``: each DSv4 role pages at its own size, so the page shape
+    is recorded per tag rather than checked against one number.
+    """
+    layouts = _measure_packed_row_layouts(
+        manifest, page_tokens=None, layout_getter=layout_getter, include_page_shape=True
+    )
+    version = package_version or importlib.metadata.version
+    payload = {
+        "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
+        "layouts": layouts,
+    }
+    return canonical_layout_fingerprint(payload), payload
+
+
 def _measure_packed_row_layouts(
     manifest: PoolManifest,
     *,
-    page_tokens: int,
+    page_tokens: int | None,
     layout_getter: Callable[[Any], Any] | None,
     include_page_shape: bool,
 ) -> dict[str, Any]:
@@ -256,10 +321,13 @@ def _measure_packed_row_layouts(
     prefix of the page. That only holds for the natural
     [blocks, rows, packing, width] physical order, so reject anything else --
     for every pool, since one odd layer would corrupt just that layer.
+
+    Pass ``page_tokens`` when every tag shares one page, which GLM and Kimi do
+    and DSv4 does not.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    if page_tokens <= 0:
+    if page_tokens is not None and page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     getter = layout_getter or _default_layout_getter
 
@@ -293,13 +361,14 @@ def _measure_packed_row_layouts(
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
         _, rows, packing, width = shape
-        page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
-        if page_rows_tokens != page_tokens:
-            raise RuntimeError(
-                f"{pool.tag} page geometry {rows}x{packing} does not match "
-                f"page_tokens {page_tokens}"
-            )
-        if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
+        if page_tokens is not None:
+            page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
+            if page_rows_tokens != page_tokens:
+                raise RuntimeError(
+                    f"{pool.tag} page geometry {rows}x{packing} does not "
+                    f"match page_tokens {page_tokens}"
+                )
+        if minor_to_major != ROW_CACHE_MINOR_TO_MAJOR:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "

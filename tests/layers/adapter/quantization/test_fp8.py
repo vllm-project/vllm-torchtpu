@@ -407,8 +407,11 @@ class TestFp8LinearRuntimeQuant:
         )
 
     def test_per_tensor_dequant_with_logical_widths(self, device):
-        """Per-tensor dequant with multiple scales should use logical_widths repeat_interleave."""
-        # Simulate QKVParallelLinear with logical_widths [64, 32, 32] (total out_dim = 128)
+        """Per-tensor dequant with multiple scales should use
+        logical_widths repeat_interleave.
+        """
+        # Simulate QKVParallelLinear with logical_widths [64, 32, 32]
+        # (total out_dim = 128)
         logical_widths = [64, 32, 32]
         out_dim = sum(logical_widths)
         in_dim = 128

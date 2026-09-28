@@ -42,7 +42,7 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
 )
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
     VllmDeepseekV4SWACache,
     _attention_csa,
@@ -172,16 +172,20 @@ class VllmDeepseekV4MLAAttention(
             self.custom_prefix = prefix
             object.__setattr__(self, "mla_attn", self)
             for module in self.modules():
-                if module is not self and hasattr(module, "get_kv_cache_spec"):
-                    if module.__class__.__name__ == "DeepseekV4Attention":
-                        module.get_kv_cache_spec = self.get_kv_cache_spec
+                if (
+                    module is not self
+                    and hasattr(module, "get_kv_cache_spec")
+                    and module.__class__.__name__ == "DeepseekV4Attention"
+                ):
+                    module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
             torch.cuda.Event = orig_cuda_event
 
-        # Bind compressor key-cache reference to SWA or main layer depending on compression ratio.
+        # Bind compressor key-cache reference to SWA or main layer depending on
+        # compression ratio.
         if hasattr(self, "compressor") and self.compressor is not None:
             if self.compress_ratio <= 1:
                 object.__setattr__(self.compressor, "k_cache", self.swa_cache_layer)
@@ -242,7 +246,7 @@ class VllmDeepseekV4MLAAttention(
         block_size = vllm_config.cache_config.block_size
         comp_ratio = max(1, self.compress_ratio)
         hf_config = vllm_config.model_config.hf_config
-        if comp_ratio == 4:
+        if comp_ratio == 4:  # noqa: SIM108 (one comment per branch)
             # CSA (`sparse_mla`) reads the NoPE record from this array and the
             # RoPE channels from the companion `{prefix}_rope` array; the
             # packed width here budgets for both.
@@ -263,7 +267,8 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def attn_op(self):
-        """The Pallas attention op, built lazily on first forward with final runtime geometry."""
+        """The Pallas attention op, built lazily on first forward
+        with final runtime geometry."""
         op = self.__dict__.get("_attn_op_instance")
         if op is not None:
             return op
@@ -411,7 +416,8 @@ class VllmDeepseekV4MLAAttention(
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
 
-        # Donate sw_cache to permit in-place updates by the Pallas sliding-window kernel.
+        # Donate sw_cache to permit in-place updates by the Pallas
+        # sliding-window kernel.
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
@@ -639,7 +645,8 @@ class VllmDeepseekV4MLAAttention(
         if not swa_only and main_attn_metadata is not None:
             main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
             if main_cache_kv is None:
-                # Clone tensor handle so XLA traces distinct operands for signature matching.
+                # Clone tensor handle so XLA traces distinct operands for
+                # signature matching.
                 main_cache_kv = sw_cache.clone()
             m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
             main_kv_lens = (

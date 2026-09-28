@@ -366,10 +366,7 @@ def is_pcp_streaming_sequence_layout(
     kind: str | SequenceLayoutKind,
     protocol: str,
 ) -> bool:
-    if isinstance(kind, SequenceLayoutKind):
-        kind_value = kind.value
-    else:
-        kind_value = str(kind)
+    kind_value = kind.value if isinstance(kind, SequenceLayoutKind) else str(kind)
     return (
         kind_value == SequenceLayoutKind.PARTIAL.value
         and protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL

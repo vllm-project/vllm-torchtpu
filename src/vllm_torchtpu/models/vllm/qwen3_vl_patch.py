@@ -36,10 +36,8 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
         architectures = getattr(hf_config, "architectures", [])
         if any("qwen3vl" in str(arch).lower() for arch in architectures):
             return True
-    model_name = getattr(model_config, "model", "")
-    if "qwen3-vl" in str(model_name).lower() or "qwen3vl" in str(model_name).lower():
-        return True
-    return False
+    model_name = str(getattr(model_config, "model", "")).lower()
+    return "qwen3-vl" in model_name or "qwen3vl" in model_name
 
 
 def _patched_masked_scatter_(
@@ -203,7 +201,8 @@ def _scoped_qwen3_vl_torch_ops():
 
 
 def _patch_qwen3_vl_get_rope_index(modeling) -> None:
-    """Patch Qwen3VLModel.get_rope_index with signature binding and CPU RoPE evaluation."""
+    """Patch Qwen3VLModel.get_rope_index with signature binding and
+    CPU RoPE evaluation."""
     target_cls = getattr(modeling, "Qwen3VLModel", None)
     if target_cls is None:
         return
@@ -371,13 +370,15 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
          lowering and device sync errors during 3D RoPE index construction.
     2. Qwen3VLVisionAttention.forward:
        - Moves `cu_seqlens` (cumulative visual patch sequence lengths) to CPU to avoid
-         device mismatch in vision attention kernels without fabricating fallback sequences.
+         device mismatch in vision attention kernels without fabricating
+         fallback sequences.
     3. Vision-encoder scoped PyTorch op overrides:
        - torch.masked_scatter / masked_scatter_: Replaces native TPU masked_scatter
          with strict 1D sequential indexing decomposition, validating source tensor size
          and eliminating unlowered XLA scan HLO nodes.
-       - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors on CPU
-         scoped strictly to vision-encoder execution instead of process-wide mutation.
+       - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors
+         on CPU scoped strictly to vision-encoder execution instead of
+         process-wide mutation.
     """
     if not _is_qwen3_vl_model(model_config):
         return False

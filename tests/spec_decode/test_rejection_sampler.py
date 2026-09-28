@@ -88,7 +88,8 @@ def test_rejection_sampler_greedy_all_accepted(device):
 
     # Expected output shape: [batch_size, max_draft_tokens + 1] -> [2, 4]
     # Request 0: 3 draft tokens accepted (10, 20, 30) + bonus (40) -> [10, 20, 30, 40]
-    # Request 1: 2 draft tokens accepted (100, 200) + bonus (300) + padding (-1) -> [100, 200, 300, -1]
+    # Request 1: 2 draft tokens accepted (100, 200) + bonus (300) + padding (-1)
+    # -> [100, 200, 300, -1]
     expected = torch.tensor(
         [[10, 20, 30, 40], [100, 200, 300, -1]], dtype=torch.int32, device=device
     )
@@ -131,7 +132,8 @@ def test_rejection_sampler_greedy_with_mismatches(device):
         max_draft_tokens=3,
     )
 
-    # Request 0: index 0 accepted (10), index 1 mismatched -> accept target argmax (99), subsequent masked.
+    # Request 0: index 0 accepted (10), index 1 mismatched -> accept target argmax (99),
+    # subsequent masked.
     # -> [10, 99, -1, -1]
     # Request 1: index 0 mismatched -> accept target argmax (888), subsequent masked.
     # -> [888, -1, -1, -1]

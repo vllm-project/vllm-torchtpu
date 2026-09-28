@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SPMD token-replica layout contract, including noncontiguous TP groups.
 
-Runs on an eight-device CPU mesh with XLA_FLAGS=--xla_force_host_platform_device_count=8;
-the fused FP8/FP4 TPU comparison is in test_fused_ep_moe_v2_tp_tokens.py.
+Runs on an eight-device CPU mesh with
+XLA_FLAGS=--xla_force_host_platform_device_count=8; the fused FP8/FP4 TPU comparison is
+in test_fused_ep_moe_v2_tp_tokens.py.
 """
 
 import jax

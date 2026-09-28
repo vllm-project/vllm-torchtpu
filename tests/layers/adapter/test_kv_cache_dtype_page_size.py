@@ -148,5 +148,5 @@ def test_capture_helper_actually_captures():
     list satisfies them however the code behaves, which is exactly how the
     `caplog` version stayed green in CI while capturing nothing."""
     with captured_warnings() as messages:
-        logging.getLogger("vllm.test").warning(f"x {WARNING_PHRASE} y")
+        logging.getLogger("vllm.test").warning("x %s y", WARNING_PHRASE)
     assert any(WARNING_PHRASE in m for m in messages)

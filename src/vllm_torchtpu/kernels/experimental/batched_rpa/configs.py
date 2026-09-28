@@ -238,7 +238,8 @@ class RpaConfigs:
         )
         bytes_per_step *= self.block.batch_size
         # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in, total_wait_kv_out,
-        # total_wait_q_in, total_wait_o_out, total_wait_lse_out) which are 1D arrays (not multiplied by batch_size).
+        # total_wait_q_in, total_wait_o_out, total_wait_lse_out) which are 1D arrays
+        # (not multiplied by batch_size).
         bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
