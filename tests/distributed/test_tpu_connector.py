@@ -2712,20 +2712,25 @@ class TestTPURaidenConnectorWorker:
         assert params["src_data_replica_idx"] == dp_rank
         assert params["src_parallelism"] == 8
 
+    @pytest.mark.parametrize(
+        ("kv_dtype", "block_size"), [("bfloat16", 162), ("float8_e4m3fn", 324)]
+    )
     @pytest.mark.parametrize("dst_shards", [32, 8])
-    def test_kimi_short_prefill_retains_state_until_native_done(self, dst_shards):
+    def test_kimi_short_prefill_retains_state_until_native_done(
+        self, dst_shards, kv_dtype, block_size
+    ):
         from .raiden_test_utils import kimi_pool_manifest
 
         worker = _make_raiden_worker(
             tp_rank=31,
             tp_size=32,
-            block_size=162,
+            block_size=block_size,
             architecture="KimiK3ForConditionalGeneration",
         )
         worker.vllm_config.model_config.hf_text_config.linear_attn_config.update(
             short_conv_kernel_size=4, head_dim=128
         )
-        worker._raiden_manifest = kimi_pool_manifest(3)
+        worker._raiden_manifest = kimi_pool_manifest(3, kv_dtype=kv_dtype)
         worker._stage3_row_geometry = {"fa": (207360, 2560)}
         worker._stage3_state_group_count = 1
         worker._raiden_transfer_engine = engine = _FakeRaidenEngine()
