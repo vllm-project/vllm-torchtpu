@@ -59,6 +59,13 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # same collectives; warmup, where every stage runs them, passes.
         unsupported = "tensor parallelism inside a stage"
         remedy = " Use --tensor-parallel-size 1."
+    elif (
+        parallel_config.prefill_context_parallel_size > 1
+        and vllm_config.kv_transfer_config is not None
+    ):
+        # The KV connectors pair a stage with its peer through one pool per
+        # device; a context-parallel stage spreads a request over several.
+        unsupported = "KV transfer connectors with context-parallel stages"
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async
         # placeholder substitution reads from the device.

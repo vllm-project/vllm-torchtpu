@@ -224,6 +224,12 @@ hidden states to the next stage with a collective-permute over ICI. Tensor
 parallelism inside a stage is not supported yet, so the worker count is
 `pipeline_parallel_size`.
 
+A stage may instead span a prefill context-parallel group
+(`--prefill-context-parallel-size`), which splits each chunk's attention over
+the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
+a torch_tpu that compiles a stage's kernels and collectives for the stage's
+devices only (google-pytorch/torch_tpu#4387).
+
 ```bash
 python3 examples/offline_inference.py \
   --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
