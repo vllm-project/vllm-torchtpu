@@ -37,7 +37,7 @@ steps:
     key: "typecheck_full"
     depends_on: "build_docker"
     agents:
-      queue: "cpu_64_core"
+      queue: "cpu"
     env:
       CPU_ONLY: "1"
     commands:
