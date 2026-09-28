@@ -9,19 +9,18 @@ sequence; ``pp_wave`` arranges that.
 """
 
 import inspect
-from typing import Any
 
 import jax
 import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 
 from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
     _get_current_global_rank,
     _get_tpu_global_device_id,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -101,7 +100,6 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
             )(x)
 
         name = "vllm_torchtpu::pp_permute"
-        output_specs: Any = spec
     else:
 
         def shift(*xs: jax.Array) -> tuple:
@@ -127,14 +125,14 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
             return_annotation=tuple[(jax.Array,) * num_tensors],
         )
         name = f"vllm_torchtpu::pp_permute{num_tensors}"
-        output_specs = (spec,) * num_tensors
 
-    op = sharded_jax_op(
+    op = jax_op(
         name,
         shift,
         mesh=mesh,
         input_partition_specs=(spec,) * num_tensors,
-        output_partition_specs=output_specs,
+        # One spec per output: torch_tpu sizes this stage's block from it.
+        output_partition_specs=(spec,) * num_tensors,
     )
     _OPS[key] = op
     return op
