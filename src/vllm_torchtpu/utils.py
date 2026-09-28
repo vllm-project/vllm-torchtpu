@@ -310,6 +310,25 @@ def synchronize_device() -> None:
     torch.accelerator.synchronize()
 
 
+def rank_rotated(items: Sequence[Any]) -> list[Any]:
+    """Order a per-bucket precompile loop so local ranks start apart.
+
+    Under TPU_PARALLEL_PRECOMPILE, rank r visits buckets r, r+8, r+1, r+9, ...
+    (the compile_all_ranges rotation), so each bucket is XLA-compiled by one
+    rank and the rest load it from the Tier-2 cache. Only for loops whose
+    programs have no collectives: ranks run different buckets concurrently.
+    """
+    items = list(items)
+    if not envs.TPU_PARALLEL_PRECOMPILE or len(items) < 2:
+        return items
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    padded = (len(items) + 7) // 8 * 8
+    order = sorted(range(padded), key=lambda x: (x % 8, x))
+    shift = local_rank % 8 * (padded // 8)
+    order = order[shift:] + order[:shift]
+    return [items[i] for i in order if i < len(items)]
+
+
 def synchronize_tensors(
     tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,

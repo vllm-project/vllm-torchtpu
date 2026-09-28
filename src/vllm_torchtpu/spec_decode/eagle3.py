@@ -30,7 +30,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_embeddings,
     maybe_share_lm_head,
 )
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import rank_rotated, synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -77,6 +77,36 @@ def _static_shape_args(fn):
         )
 
     return wrapper
+
+
+# Attributes torch._dynamo.mark_dynamic / mark_unbacked leave on a tensor
+# (plus any other `_dynamo_*` / `_has_dynamo_*` marker, e.g. the
+# `_has_dynamo_dim_marking` flag guards check for).
+_DYNAMO_DIM_MARKS = (
+    "_dynamo_dynamic_indices",
+    "_dynamo_unbacked_indices",
+    "_dynamo_hint_overrides",
+    "_dynamo_shape_ids",
+)
+
+
+def _clear_dynamo_dim_marks(*tensors: torch.Tensor) -> None:
+    """Drop dynamic-dim marks so a dynamic=False region sees static shapes.
+
+    support_torch_compile marks the draft forward's inputs dynamic on its cold
+    compile, on the tensor objects themselves. The same `positions` then feeds
+    _draft_gather_carries, where the mark overrides dynamic=False, and the tpu
+    backend rejects the SymInt it produces (the failed first spec-warmup
+    attempt and its retry). The marks only matter to the first trace, which
+    has already happened when this runs.
+    """
+    for t in tensors:
+        for attr in [
+            a
+            for a in t.__dict__
+            if a in _DYNAMO_DIM_MARKS or a.startswith(("_dynamo_", "_has_dynamo_"))
+        ]:
+            delattr(t, attr)
 
 
 def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -837,8 +867,6 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
-    @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
         self,
         hidden: torch.Tensor,
@@ -847,20 +875,27 @@ class Eagle3Proposer:
         indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # First-pass per-request carries: gather the last-token hidden, position,
-        # and pre-lm-head hidden in one compiled region. Run raw (advanced
-        # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
-        # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
+        # and pre-lm-head hidden as one isolated program. Left pending (advanced
+        # indexing), these gathers are eager ops the DEFER_AND_FUSE path fuses
+        # with the step's seq_lens/positions arithmetic into a per-context
+        # program; materializing them here pins the program to the gathers (and
+        # the pending clamp on indices). It is keyed on num_tokens, so it is
+        # enqueued without a host wait: as a compiled region its compile was
+        # synchronous, ~3 s per num_tokens bucket back to back in the spec
+        # warmup; eager, it compiles on the background pool while the next
+        # region compiles. index_select is value-identical to hidden[indices].
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
             else torch.index_select(positions, 0, indices)
         )
-        return (
+        out = (
             torch.index_select(hidden, 0, indices),
             pos_carry,
             torch.index_select(last_hidden, 0, indices),
         )
+        synchronize_tensors(list(out), wait=False)
+        return out
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -930,6 +965,18 @@ class Eagle3Proposer:
         # Zero the padded tail: the loop's seq_lens subtraction reads it.
         num_rejected = torch.where(row_meta[1] != 0, num_rejected, 0)
         return seed, last_token_indices, num_rejected.to(torch.int32)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_bootstrap_seed(
+        self, device_seed: torch.Tensor, row_meta: torch.Tensor
+    ) -> torch.Tensor:
+        # Prefill bootstrap: the [p] seed gathered from the just-sampled
+        # tokens, with partial-prefill rows overridden from the host request
+        # state. row_meta [3, p] int32: source row, override flag, override
+        # token. Eager, the gather and the override index_put compiled one
+        # program per (batch size, override count).
+        seed = torch.index_select(device_seed, 0, row_meta[0]).to(torch.int32)
+        return torch.where(row_meta[1] != 0, row_meta[2], seed)
 
     def propose(
         self,
@@ -1053,6 +1100,7 @@ class Eagle3Proposer:
                 saved_topk_per_chunk.append(
                     self._mtp_compact_and_save(safe_gather_indices)
                 )
+            _clear_dynamo_dim_marks(hidden, positions, last_hidden)
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(
                     hidden, positions, last_hidden, safe_gather_indices
@@ -1179,6 +1227,13 @@ class Eagle3Proposer:
             torch.stack(toks, dim=1) for toks in draft_tokens_per_chunk
         ]
         if return_device:
+            if getattr(runner, "_async_spec_rows", lambda: None)() is not None:
+                # Row-padded [n_chunks * p, K]: chunk c's request r is row
+                # c*p + r (the runner's padded async layout), so no
+                # per-num_reqs slice program.
+                if len(per_chunk_stacked) == 1:
+                    return per_chunk_stacked[0]
+                return torch.cat(per_chunk_stacked, dim=0)
             return torch.cat(
                 [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
             )
@@ -1331,26 +1386,24 @@ class Eagle3Proposer:
             # Gather the seed already padded to [p] (rows as in
             # last_token_indices) so the seed scatter below runs at a
             # precompiled [p] shape rather than compiling per real num_reqs.
-            next_token_ids = device_seed[
-                torch.from_numpy(start + pad_rows_np).to(runner.device)
-            ].to(torch.int32)
+            seed_meta = np.zeros((3, p), dtype=np.int32)
+            seed_meta[0] = start + pad_rows_np
             # Partial-prefill (discard) reqs: override seed from host req_state.
-            ov_j = [j for j, i in enumerate(pad_rows_np) if (start + i) in discard_set]
-            if ov_j:
-                ov_v = []
-                for j in ov_j:
-                    req_state = runner.requests[req_ids[pad_rows_np[j]]]
-                    ov_v.append(
-                        req_state.get_token_id(
-                            req_state.num_computed_tokens
-                            + scheduler_output.num_scheduled_tokens[
-                                req_ids[pad_rows_np[j]]
-                            ]
-                        )
+            ov_tok = {}
+            for j, i in enumerate(pad_rows_np):
+                if start + i not in discard_set:
+                    continue
+                if i not in ov_tok:
+                    req_state = runner.requests[req_ids[i]]
+                    ov_tok[i] = req_state.get_token_id(
+                        req_state.num_computed_tokens
+                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
                     )
-                next_token_ids[
-                    torch.tensor(ov_j, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+                seed_meta[1, j] = 1
+                seed_meta[2, j] = ov_tok[i]
+            next_token_ids = self._draft_bootstrap_seed(
+                device_seed, torch.from_numpy(seed_meta).to(runner.device)
+            )
         else:
             num_rejected_out = num_rejected_np
             next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
@@ -1804,7 +1857,8 @@ class Eagle3Proposer:
         # indexes with p=8 (pad rows repeat the last real row).
         p = self._loop_bucket(runner.max_num_reqs)
         with runner._precompile_timed("drafter seed_input_ids"):
-            for T in runner.num_tokens_paddings:
+            # Collective-free: rotate so the ranks share compiles via Tier-2.
+            for T in rank_rotated(runner.num_tokens_paddings):
                 ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
                 lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
                 nti = torch.zeros(p, dtype=torch.int32).to(runner.device)

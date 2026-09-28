@@ -56,7 +56,7 @@ class SpeculativeDecodingManager:
         # as (cpu_tensor, ready_event, req_ids snapshot). See
         # stage_draft_token_ids_for_host.
         self._staged_draft_copy: (
-            tuple[torch.Tensor, torch.Event | None, list[str]] | None
+            tuple[torch.Tensor, torch.Event | None, list[str], list[int] | None] | None
         ) = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
@@ -74,10 +74,12 @@ class SpeculativeDecodingManager:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the
             # deferred grammar-bitmask computation.
-            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            drafts_cpu, ready_event, req_ids, rows = self._staged_draft_copy
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
+            if rows is not None:
+                drafts_cpu = drafts_cpu[rows]
             return DraftTokenIds(req_ids, drafts_cpu.tolist())
         if self._draft_token_ids is None:
             return None
@@ -87,7 +89,9 @@ class SpeculativeDecodingManager:
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
-    def stage_draft_token_ids_for_host(self, drafts: torch.Tensor) -> None:
+    def stage_draft_token_ids_for_host(
+        self, drafts: torch.Tensor, rows: list[int] | None = None
+    ) -> None:
         """Starts a non-blocking D2H copy of drafts on device.
 
         Async scheduling keeps drafts on device (return_device=True), but the
@@ -98,16 +102,23 @@ class SpeculativeDecodingManager:
         is called after the next step's execute_model mutates input_batch.
         """
         num_reqs = self.runner.input_batch.num_reqs
-        assert drafts.shape[0] == num_reqs, (
-            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
-        )
+        # rows: the real requests' rows of a row-padded proposal (see
+        # TPUModelRunner._async_spec_rows), selected on the host at take time.
+        if rows is None:
+            assert drafts.shape[0] == num_reqs, (
+                f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
+            )
+        else:
+            assert len(rows) == num_reqs, (
+                f"draft rows {len(rows)} != num_reqs {num_reqs}"
+            )
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
         drafts_cpu = drafts.to("cpu", non_blocking=True)
         ready_event = None
         if drafts.device.type != "cpu":
             ready_event = torch.tpu.Event()
             ready_event.record()
-        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
+        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids, rows)
 
     def propose_draft_token_ids(
         self,

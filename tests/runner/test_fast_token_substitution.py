@@ -39,6 +39,9 @@ def test_substitution_disabled_by_default():
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
     )
+    runner._substitution_index_tensors = (
+        TPUModelRunner._substitution_index_tensors.__get__(runner)
+    )
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
     pre_indices = np.array([0, 1, 2, 3], dtype=np.int32)
