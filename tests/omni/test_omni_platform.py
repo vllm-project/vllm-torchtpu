@@ -84,6 +84,10 @@ def test_platform_attributes():
             platform.get_diffusion_attn_backend_cls(name, 64)
             == "vllm_torchtpu.omni.attention.TpuSDPABackend"
         )
+    assert (
+        platform.get_profiler_cls()
+        == "vllm_torchtpu.omni.profiler.TpuOmniTorchProfilerWrapper"
+    )
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
