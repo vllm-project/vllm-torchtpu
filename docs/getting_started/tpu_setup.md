@@ -35,6 +35,8 @@ The following TPU versions are compatible with `vllm-torchtpu`. Selecting a topo
 
 ### Experimental
 
+These generations are not covered by `vllm-torchtpu` CI. They may work, but expect rough edges; please [open an issue](https://github.com/vllm-project/vllm-torchtpu/issues) if you run into problems.
+
 <div class="grid cards" markdown>
 
 - __TPU v5e__
