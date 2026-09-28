@@ -253,7 +253,7 @@ import vllm_torchtpu
 assert seen == ["jax._src.pallas.mosaic"]
 assert "vllm" not in sys.modules
 assert "torch_tpu" not in sys.modules
-"""
+"""  # noqa: E501
     result = subprocess.run(
         [sys.executable, "-c", code],
         env=env,

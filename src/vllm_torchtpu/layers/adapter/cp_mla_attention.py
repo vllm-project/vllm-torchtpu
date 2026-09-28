@@ -76,15 +76,16 @@ def merge_lse_partials_scatter_heads(
       2. reduce-scatter the weighted outputs
 
     Args:
-      output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`, this rank's partial.
+      output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
+        this rank's partial.
       lse: `[num_tokens, tp_local_num_heads * dcp_size]`, the matching log-sum-exps.
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
 
     Returns:
-      `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` -- this rank's head
-      slice of the whole-context result.
+      `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
+      this rank's head slice of the whole-context result.
     """
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:

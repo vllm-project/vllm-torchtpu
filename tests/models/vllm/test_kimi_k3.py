@@ -1030,7 +1030,7 @@ def test_kda_construction_wires_projections_and_state(
     assert layer.fused_fa_ga_proj is not None
     assert layer.f_a_proj is None
     assert layer.g_proj is None
-    assert layer.get_state_shape() == ((2, 3, 2, 4), (2, 4, 4))
+    assert layer.get_state_shape() == ((2, 1, 24), (2, 4, 4))
     assert (
         vllm_config.compilation_config.static_forward_context["model.layers.0.kda"]
         is layer
@@ -1478,6 +1478,33 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(sconv_cache, torch.ones_like(sconv_cache))
     torch.testing.assert_close(recurrent_cache, torch.ones_like(recurrent_cache))
+
+
+def test_kda_state_shapes_use_the_fused_kernel_conv_layout() -> None:
+    """Both declaration sites hand vLLM the conv cache as (taps, 1, 3*H*D)."""
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    layer.conv_size, layer.num_heads, layer.head_dim = 4, 3, 128
+    layer.local_projection_size = layer.num_heads * layer.head_dim
+    conv_shape, recurrent_shape = layer.get_state_shape()
+    assert conv_shape == (3, 1, 1152)
+    assert recurrent_shape == (3, 128, 128)
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                linear_attn_config={
+                    "num_heads": 96,
+                    "head_dim": 128,
+                    "short_conv_kernel_size": 4,
+                }
+            )
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=32),
+    )
+    assert KimiLinearForCausalLM.get_mamba_state_shape_from_config(vllm_config) == (
+        conv_shape,
+        recurrent_shape,
+    )
 
 
 @pytest.mark.parametrize("num_blocks", [0, 8], ids=["prefix-only", "with-blocks"])
@@ -2306,6 +2333,8 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
     wrapper.qk_head_dim = 192
     wrapper.rotary_emb = None
     wrapper.is_sparse = False
+    wrapper.dcp_q_replicate = False
+    wrapper.dcp_group_size = 1
     wrapper.o_proj = object()
     calls = []
 

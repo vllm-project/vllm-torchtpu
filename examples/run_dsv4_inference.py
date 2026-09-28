@@ -26,7 +26,8 @@ def check_tpu_device_availability(timeout_seconds=60):
             if res.returncode != 0 or not res.stdout.strip():
                 break
             print(
-                "[PREFLIGHT_WAIT] TPU chips busy (locked by background processes). Waiting for teardown...",
+                "[PREFLIGHT_WAIT] TPU chips busy (locked by background processes). "
+                "Waiting for teardown...",
                 flush=True,
             )
             waited = True
@@ -36,7 +37,8 @@ def check_tpu_device_availability(timeout_seconds=60):
 
     if waited:
         print(
-            "[PREFLIGHT_SUCCESS] TPU chips released. Waiting 5s buffer for driver stabilization...",
+            "[PREFLIGHT_SUCCESS] TPU chips released. "
+            "Waiting 5s buffer for driver stabilization...",
             flush=True,
         )
         time.sleep(5)

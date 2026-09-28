@@ -26,6 +26,7 @@ pool plus ZMQ ROUTER/DEALER coordination.
     releases the slot once all ranks have copied.
 """
 
+import contextlib
 import hashlib
 import hmac
 import os
@@ -87,7 +88,8 @@ _IPC_AUTH_KEY: bytes = _get_default_ipc_key()
 
 
 def _secure_dumps(obj: Any) -> bytes:
-    """Serialize payload with an HMAC-SHA256 signature to prevent untrusted deserialization."""
+    """Serialize payload with an HMAC-SHA256 signature to prevent
+    untrusted deserialization."""
     raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     sig = hmac.new(_IPC_AUTH_KEY, raw, hashlib.sha256).digest()
     return sig + raw
@@ -909,10 +911,11 @@ class ZmqShmKvConnectorBase:
         self._stop_event.set()
         # Wake the stage waiter so it can observe _stop_event and exit.
         if hasattr(self, "_stage_pending_q"):
-            try:
+            # TODO: The queue is unbounded, so put_nowait cannot raise
+            # queue.Full. Remove this suppress once the teardown test stops
+            # injecting queue.Full.
+            with contextlib.suppress(queue.Full):
                 self._stage_pending_q.put_nowait(None)
-            except Exception:
-                pass
         if hasattr(self, "_coord_executor"):
             self._coord_executor.shutdown(wait=False)
         if hasattr(self, "_coord_channel_executor"):
@@ -1593,7 +1596,7 @@ class ZmqShmKvConnectorBase:
                 with self._coord_lock:
                     global_to_local = {
                         global_rank: local_rank
-                        for local_rank, global_rank in self._coord_local_to_global_rank.items()
+                        for local_rank, global_rank in self._coord_local_to_global_rank.items()  # noqa: E501
                     }
 
                 for _ in range(n_ranks):
@@ -2052,8 +2055,8 @@ class ZmqShmKvConnectorBase:
                     if len(self._coord_rank_to_identity) == self.ranks_per_host - 1:
                         self._coord_workers_ready.set()
                 logger.info(
-                    "TPUConnectorWorker(%d) rank0 --> HELLO from local_rank=%d global_rank=%d "
-                    "(%d/%d registered)",
+                    "TPUConnectorWorker(%d) rank0 --> HELLO from local_rank=%d "
+                    "global_rank=%d (%d/%d registered)",
                     self.node_id,
                     local_rank,
                     global_rank,

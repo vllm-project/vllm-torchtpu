@@ -89,8 +89,9 @@ def test_qkvz_checkpoint_load_preserves_whole_heads(
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail,
-            rank=rank: f"QKVZ checkpoint partition: TP={tp_size}, rank={rank}\n{detail}",
+            msg=lambda detail, rank=rank: (
+                f"QKVZ checkpoint partition: TP={tp_size}, rank={rank}\n{detail}"
+            ),
         )
 
 
@@ -107,8 +108,9 @@ def test_conv_checkpoint_uses_same_head_ownership(make_gdn_attention, tp_size):
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail,
-            rank=rank: f"Conv checkpoint partition: TP={tp_size}, rank={rank}\n{detail}",
+            msg=lambda detail, rank=rank: (
+                f"Conv checkpoint partition: TP={tp_size}, rank={rank}\n{detail}"
+            ),
         )
 
 

@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 try:
-    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (
+    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (  # noqa: E501
         KVLayout,
         convert_cache_to_seq_along_lane,
         streamindex_topk,

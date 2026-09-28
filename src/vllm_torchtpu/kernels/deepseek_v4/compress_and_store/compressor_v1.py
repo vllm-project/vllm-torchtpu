@@ -18,7 +18,7 @@ import jax.numpy as jnp
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
-import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel
+import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:

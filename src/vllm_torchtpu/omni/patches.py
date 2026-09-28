@@ -36,8 +36,7 @@ def apply_omni_tpu_patches() -> None:
     import os
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
-    logger.info(
-        "Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+    logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -48,9 +47,10 @@ def apply_omni_tpu_patches() -> None:
     # Used in temporal/audio diffusion alignment (Wan 2.2 S2V, LongCat, audio vocoders).
     #
     # UPSTREAM STATUS & REMOVAL CONDITION:
-    # Fixed upstream in torch_tpu commit a0b184ed27d ("Implement aten::upsample_linear1d.out",
-    # Sep 14, 2026). This CPU fallback patch can be deleted once vllm-torchtpu
-    # bumps to a torch_tpu development wheel >= 0.1.1.dev20260914 containing that commit.
+    # Fixed upstream in torch_tpu commit a0b184ed27d
+    # ("Implement aten::upsample_linear1d.out", Sep 14, 2026). This CPU fallback patch
+    # can be deleted once vllm-torchtpu bumps to a torch_tpu development wheel
+    # >= 0.1.1.dev20260914 containing that commit.
     # -------------------------------------------------------------------------
     orig_interpolate = torch.nn.functional.interpolate
 
@@ -63,10 +63,10 @@ def apply_omni_tpu_patches() -> None:
         **kwargs: Any,
     ) -> torch.Tensor:
         if input.device.type == "tpu" and mode == "linear":
-            return orig_interpolate(input.cpu(), size, scale_factor, mode,
-                                    *args, **kwargs).to(input.device)
-        return orig_interpolate(input, size, scale_factor, mode, *args,
-                                **kwargs)
+            return orig_interpolate(
+                input.cpu(), size, scale_factor, mode, *args, **kwargs
+            ).to(input.device)
+        return orig_interpolate(input, size, scale_factor, mode, *args, **kwargs)
 
     torch.nn.functional.interpolate = _safe_interpolate
     logger.info(
@@ -81,8 +81,9 @@ def apply_omni_model_specific_patches() -> None:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
     # 1. Pickling a device tensor aborts process: In torch_tpu, calling
-    #    pickle.dumps on a device tensor hits ABSL_CHECK(tensor.storage().allocator() == nullptr)
-    #    in csrc/eager/tensor_to_buffer.cc:260-261, terminating the worker process
+    #    pickle.dumps on a device tensor hits
+    #    ABSL_CHECK(tensor.storage().allocator() == nullptr) in
+    #    csrc/eager/tensor_to_buffer.cc:260-261, terminating the worker process
     #    with SIGABRT (exit code 134) with no Python traceback.
     # 2. libtpu per-process lockfile prevents cross-process init:
     #    Holding TPU tensors across process boundaries causes the CPU-only
@@ -105,8 +106,7 @@ def apply_omni_model_specific_patches() -> None:
         return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
-    logger.info(
-        "Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
+    logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:

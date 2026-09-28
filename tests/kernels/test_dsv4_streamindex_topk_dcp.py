@@ -22,11 +22,58 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     _select_owned_winners,
     cp_local_to_global,
+    cp_rank_as_data,
     streamindex_topk,
     streamindex_topk_dcp,
 )
 
 P = jax.sharding.PartitionSpec
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_candidate_all_gather_is_rank_major(dcp_size):
+    """The merge reads a winner's position in its own list as `slot % k`.
+
+    The source rank now travels as its own lane, so the chunk *order* no longer
+    matters -- but the chunk *width* still does, and nothing else in the merge
+    would notice it changing: every rank would resolve the wrong candidate and
+    still return a full, plausible, silently wrong list. Asserting the full
+    rank-major arange pins width and order together.
+    """
+    devices = jax.devices()
+    if len(devices) < dcp_size:
+        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
+
+    rows, k = 4, 8
+    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME,))
+
+    def _local(_):
+        rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
+        # Rank r writes r*k + j, so a rank-major gather reads back as arange.
+        mine = rank * k + jnp.arange(k, dtype=jnp.int32)
+        return jax.lax.all_gather(
+            jnp.broadcast_to(mine, (rows, k)), DCP_AXIS_NAME, axis=1, tiled=True
+        )
+
+    gathered = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(DCP_AXIS_NAME),
+            check_vma=False,
+        )
+    )(jnp.zeros((rows, 1), jnp.int32))
+
+    got = np.asarray(gathered).reshape(dcp_size, rows, dcp_size * k)
+    want = np.broadcast_to(
+        np.arange(dcp_size * k, dtype=np.int32), (rows, dcp_size * k)
+    )
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            got[r], want, err_msg=f"rank {r} saw a non-rank-major candidate axis"
+        )
 
 
 def _filter_all_ranks(merged, dcp_size, interleave_c):

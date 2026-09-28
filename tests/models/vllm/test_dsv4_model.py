@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import WeightsMapper
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     VllmDeepseekSparseSWABackend,
     VllmDeepseekV4SWACache,
 )

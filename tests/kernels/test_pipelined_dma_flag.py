@@ -62,14 +62,16 @@ def test_ragged_kv_cache_update_signature_and_wiring():
     mock_new_kv.shape = (10, 2, 128)
 
     # Verify when env var is False
-    with patch.dict(os.environ, {}, clear=True):
-        with patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update:
-            ragged_kv_cache_update.kv_cache_update.__wrapped__(
-                mock_new_kv, MagicMock(), mock_kv, MagicMock(), num_slices_per_block=4
-            )
-            mock_update.assert_called_once()
-            _, kwargs = mock_update.call_args
-            assert kwargs["pipelined_dma"] is False
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update,
+    ):
+        ragged_kv_cache_update.kv_cache_update.__wrapped__(
+            mock_new_kv, MagicMock(), mock_kv, MagicMock(), num_slices_per_block=4
+        )
+        mock_update.assert_called_once()
+        _, kwargs = mock_update.call_args
+        assert kwargs["pipelined_dma"] is False
 
     # Verify when env var is True
     with (

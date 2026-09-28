@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests verifying bitwise parity for ragged_paged_attention_bundled against layer-major RPA.
+"""Unit tests verifying bitwise parity for ragged_paged_attention_bundled against
+layer-major RPA.
 
 Tests confirm that:
-  - Numerical Parity: Outputs and updated cache states match the layer-major baseline bit-for-bit.
-  - Zero-Copy Isolation: Updating layer L in the bundle leaves all other layer slots (i != L) intact.
-  - Sequential Donation Chaining: Chaining across all model layers correctly threads JAX buffer donation.
-  - Attention Interface Compliance: Custom scaling, logits soft-capping, and causal masking flags are honored.
+  - Numerical Parity: Outputs and updated cache states match the layer-major
+    baseline bit-for-bit.
+  - Zero-Copy Isolation: Updating layer L in the bundle leaves all other layer slots
+    (i != L) intact.
+  - Sequential Donation Chaining: Chaining across all model layers correctly threads
+    JAX buffer donation.
+  - Attention Interface Compliance: Custom scaling, logits soft-capping, and causal
+    masking flags are honored.
 """
 
 from __future__ import annotations
@@ -152,7 +157,9 @@ def _rpa_bundled(
 
 @pytest.mark.parametrize("scenario", ["decode", "prefill", "mixed"])
 def test_bundled_matches_layer_major(scenario):
-    """Verifies bitwise output and KV cache update parity against layer-major RPA across scenarios."""
+    """Verifies bitwise output and KV cache update parity against layer-major RPA
+    across scenarios.
+    """
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
@@ -207,7 +214,9 @@ def test_bundled_matches_layer_major(scenario):
 
 
 def test_bundled_donation_chain():
-    """Verifies that sequentially chaining bundled attention calls across layers preserves in-place donation."""
+    """Verifies that sequentially chaining bundled attention calls across layers
+    preserves in-place donation.
+    """
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
@@ -259,7 +268,9 @@ def test_bundled_donation_chain():
 
 
 def test_bundled_does_not_touch_other_layers():
-    """Verifies that an update to layer L preserves all untouched layer slots (i != L) in the bundle."""
+    """Verifies that an update to layer L preserves all untouched layer slots (i != L)
+    in the bundle.
+    """
     _require_tpu()
     c = _cfg()
     pls = _per_layer_shape(c)
@@ -301,10 +312,12 @@ def test_bundled_does_not_touch_other_layers():
 
 
 def test_bundled_interface_forwards_scale_softcap_causal():
-    """Verifies that attention_bundled correctly forwards non-default attention parameters.
+    """Verifies that attention_bundled correctly forwards
+    non-default attention parameters.
 
-    Ensures non-default sm_scale, logits soft-capping, and causal masking flags are correctly
-    propagated down to the underlying Pallas kernel rather than falling back to default values.
+    Ensures non-default sm_scale, logits soft-capping, and causal masking flags are
+    correctly propagated down to the underlying Pallas kernel rather than falling back
+    to default values.
     """
     _require_tpu()
     from vllm_torchtpu.layers.core.attention_interface import (

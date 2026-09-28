@@ -73,7 +73,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
     with these major differences:
 
     1. self._init_executor():
-       VLLM_USE_RAY_SPMD_WORKER=1, in which the driver worker is the same as other workers.
+       VLLM_USE_RAY_SPMD_WORKER=1, in which the driver worker is the same as
+       other workers.
     2. self._initialize_ray_cluster():
        This sets placement_group_specs for TPU.
        In vLLM one GPU maps to one placement group.
@@ -148,7 +149,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # TPU topology (e.g., 4 bundles × 4 TPUs for v6e 4x4) and have vLLM reuse it.
         if self.parallel_config.placement_group is not None:
             logger.info(
-                f"Using existing placement group: {self.parallel_config.placement_group}"
+                "Using existing placement group: %s",
+                self.parallel_config.placement_group,
             )
             return
 
@@ -168,7 +170,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
-        logger.info(f"RayDistributedExecutor | ray_nodes={ray_nodes}")
+        logger.info("RayDistributedExecutor | ray_nodes=%s", ray_nodes)
 
         # Filter nodes that have the required TPU
         # This is necessary when the head node doesn't have TPU resources
@@ -177,8 +179,10 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             n for n in ray_nodes if device_str in n.get("Resources", {})
         ]
         logger.info(
-            f"RayDistributedExecutor | nodes_with_device={len(nodes_with_device)} "
-            f"(filtered from {len(ray_nodes)} total nodes)"
+            "RayDistributedExecutor | nodes_with_device=%s "
+            "(filtered from %s total nodes)",
+            len(nodes_with_device),
+            len(ray_nodes),
         )
 
         if pp_size == 1:
@@ -220,7 +224,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # node.
         placement_group_specs[0][f"node:{current_ip}"] = 0.001
         logger.info(
-            f"RayDistributedExecutor | placement_group_specs={placement_group_specs}"
+            "RayDistributedExecutor | placement_group_specs=%s", placement_group_specs
         )
 
         # By default, Ray packs resources as much as possible.
@@ -264,8 +268,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 or self.parallel_config.world_size % len(bundle_indices) != 0
             ):
                 raise ValueError(
-                    f"world_size ({self.parallel_config.world_size}) must be divisible by "
-                    f"the number of placement group bundles ({len(bundle_indices)})."
+                    f"world_size ({self.parallel_config.world_size}) must be "
+                    "divisible by the number of placement group bundles "
+                    f"({len(bundle_indices)})."
                 )
             workers_per_bundle = self.parallel_config.world_size // len(bundle_indices)
             expanded_indices = []
@@ -274,8 +279,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             bundle_indices = expanded_indices
         elif len(bundle_indices) != self.parallel_config.world_size:
             raise ValueError(
-                f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
-                f"world_size ({self.parallel_config.world_size})."
+                f"Number of bundle indices ({len(bundle_indices)}) must be "
+                f"less than or equal to world_size ({self.parallel_config.world_size})."
             )
 
         worker_metadata: list[RayWorkerMetaData] = []
@@ -307,7 +312,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         for each, ip in zip(worker_metadata, worker_ips):
             each.ip = ip
 
-        logger.debug(f"Initialized worker_metadata: {worker_metadata}")
+        logger.debug("Initialized worker_metadata: %s", worker_metadata)
 
         ip_counts: dict[str, int] = {}
         for ip in worker_ips:
@@ -335,7 +340,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         start_rank = 0
         for i, item in enumerate(sorted_worker_metadata):
             item.adjusted_rank = i + start_rank
-        logger.info(f"Initialized sorted worker_metadata: {sorted_worker_metadata}")
+        logger.info("Initialized sorted worker_metadata: %s", sorted_worker_metadata)
 
         self.workers = [item.worker for item in sorted_worker_metadata]
         rerank_mapping = {
@@ -376,10 +381,12 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         if n_nodes != n_ips:
             logger.warning(
-                f"Got {n_nodes} nodes but with {n_ips} IP addresses. "
+                "Got %s nodes but with %s IP addresses. "
                 "This is not a typical production setup whose "
                 "number of nodes and IPs is euqal. This setup may "
-                "lead to unexpected behaviors."
+                "lead to unexpected behaviors.",
+                n_nodes,
+                n_ips,
             )
 
         # Construct TORCH_TPU_SLICEBUILDER_ADDRESSES for multi-host
@@ -395,7 +402,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
         logger.info(
-            f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {os.environ['TORCH_TPU_SLICEBUILDER_ADDRESSES']}"
+            "Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s",
+            os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
         )
 
         # Set environment variables for the driver and workers.
@@ -446,7 +454,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 if name in os.environ:
                     args[name] = os.environ[name]
             logger.debug(
-                f"RayDistributedExecutor | Worker {i} environment variables: {args}"
+                "RayDistributedExecutor | Worker %s environment variables: %s", i, args
             )
 
         self._env_vars_for_all_workers = all_args_to_update_environment_variables
@@ -470,17 +478,20 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
             worker_vllm_config = self.vllm_config
 
-            # When using object storage (e.g., RunAI), the Leader updates `model` to its local
-            # cache path (e.g., /root/.cache/...) during ModelConfig initialization
-            # (maybe_pull_model_tokenizer_for_runai), while `model_weights` preserves the original URI after the model is pulled.
-            # (Standard HF downloads do not overwrite `model`, allowing workers to pull normally).
-            # Since workers on remote nodes cannot access the Leader's filesystem, we create a
-            # worker-specific config copy and restore the original GCS URI from `model_weights`.
-            # ModelConfig.__post_init__ does not re-run on the worker, so nothing pulls
-            # automatically from this state: TPUWorker.__init__ calls
-            # vllm_torchtpu.worker.runai_repull.ensure_runai_aux_files, which recognises the
-            # restored-URI state, invokes `maybe_pull_model_tokenizer_for_runai` under a
-            # per-host lock, and rewrites model/tokenizer/model_weights as the Leader did.
+            # When using object storage (e.g., RunAI), the Leader updates `model` to its
+            # local cache path (e.g., /root/.cache/...) during ModelConfig
+            # initialization (maybe_pull_model_tokenizer_for_runai), while
+            # `model_weights` preserves the original URI after the model is pulled.
+            # (Standard HF downloads do not overwrite `model`, allowing workers to pull
+            # normally). Since workers on remote nodes cannot access the Leader's
+            # filesystem, we create a worker-specific config copy and restore the
+            # original GCS URI from `model_weights`. ModelConfig.__post_init__ does not
+            # re-run on the worker, so nothing pulls automatically from this state:
+            # TPUWorker.__init__ calls
+            # vllm_torchtpu.worker.runai_repull.ensure_runai_aux_files, which recognises
+            # the restored-URI state, invokes `maybe_pull_model_tokenizer_for_runai`
+            # under a per-host lock, and rewrites model/tokenizer/model_weights as the
+            # Leader did.
             if (
                 node_id != driver_node_id
                 and self.vllm_config.model_config
@@ -490,7 +501,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 worker_vllm_config.model_config.model = (
                     worker_vllm_config.model_config.model_weights
                 )
-                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull the model.
+                # Unset model_weights so maybe_pull_model_tokenizer_for_runai will pull
+                # the model.
                 worker_vllm_config.model_config.model_weights = None
 
             kwargs = dict(

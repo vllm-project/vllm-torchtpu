@@ -1,0 +1,54 @@
+# Commits that only reformat code. GitHub's blame view skips them
+# automatically. Locally, run once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Format .buildkite, examples and tools with ruff instead of isort and yapf.
+a8c576e83f786dc950354b1a12ed7c6cbc659ff8
+
+# Use ruff instead of isort and yapf for scripts
+29c4a8ee03632ccdd0c67bf175002414a70e669d
+
+# Format src/vllm_torchtpu/kernels/experimental with ruff.
+2957c85f0de3f974347e4111cb4487955d362658
+
+# Format src/vllm_torchtpu/kernels/deepseek_v4 with ruff.
+d261321e45bb815a59f09e4f1f6bff3858133e81
+
+# Format the fused_moe, gdn and kimi_k3 kernels with ruff.
+7dcafec0fcbe31c51c2f0f0b43d0a790dd9a22df
+
+# Format tests/kernels with ruff.
+ca24f926497ebea4b59c789351d58299b09b7e84
+
+# Format src/vllm_torchtpu/layers/adapter with ruff.
+1925e991779f3aefb575aab481292eb770a864d4
+
+# Format the distributed code and its tests with ruff.
+b39d6af65b5caf89dfbd49188f73b9e8be2cde16
+
+# Format platforms, executors, worker, compilation and entrypoints with ruff.
+1b4d7d61b4d5797b3ba567ea79e33de2d7a005f9
+
+# Format tests/platforms/test_same_step_prefix_hits_patch.py with ruff.
+025159c288dbe321203beb5601f4dcc7b8e9bcb8
+
+# Format the remaining kernel directories with ruff.
+9cf7a76ae61bee80bdab07facfb660d727b9a1fc
+
+# Format tests/layers with ruff.
+44ef1f13ee28d9a1b28545dde98457104eb84e35
+
+# Format src/vllm_torchtpu/layers/core with ruff.
+ea4ece02abf3aa9f3fa51d4ca4637a9247cb55ad
+
+# Format the runner and its tests with ruff.
+37515cfde9c2f14df967d2c058d167a7a51c3501
+
+# Format models, spec_decode and offload with ruff.
+fde6c39944a4234e5c45863311df8ae535b9f598
+
+# Format core, tracing, omni, tools and the loose modules with ruff.
+6cf94fbea0b05a3e39701b4a1f10185ac5e2ad08
+
+# Apply ruff format to tpu_connector.py and test_check_regression.py
+f005b9f8e5b708cc17da2ba8155d9f394033cc1a

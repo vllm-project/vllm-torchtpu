@@ -4,7 +4,7 @@ import zlib
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
 
@@ -21,7 +21,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
     release_memory_to_os,
 )
@@ -184,7 +184,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             if hidden % requant_block != 0 or inter % requant_block != 0:
                 raise ValueError(
                     f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
-                    f"to be divisible by block ({requant_block}). Padding is not yet supported."
+                    f"to be divisible by block ({requant_block}). "
+                    "Padding is not yet supported."
                 )
 
             # Apply XLA fused requantization and kmajor layout shift

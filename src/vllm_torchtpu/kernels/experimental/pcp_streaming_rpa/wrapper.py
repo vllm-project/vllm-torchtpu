@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 )
 
 PCP_AXIS_NAME = "pcp"
+TP_AXIS_NAME = "tp"
 
 KVLayout = batched_rpa_configs.KVLayout
 
@@ -688,19 +689,24 @@ def sharded_pcp_ragged_paged_attention(
             f"evenly sharded across PCP ranks: "
             f"{kv_cache.shape[0]=} {pcp_size=}."
         )
-    qkv_spec = P(PCP_AXIS_NAME)
+    if TP_AXIS_NAME in mesh.axis_names:
+        qkv_spec = P(PCP_AXIS_NAME, TP_AXIS_NAME)
+        kv_cache_spec = P(PCP_AXIS_NAME, None, TP_AXIS_NAME)
+    else:
+        qkv_spec = P(PCP_AXIS_NAME)
+        kv_cache_spec = P(PCP_AXIS_NAME)
     metadata_spec = P()
     in_specs = (
         qkv_spec,
         qkv_spec,
         qkv_spec,
-        qkv_spec,
+        kv_cache_spec,
         metadata_spec,
         metadata_spec,
         metadata_spec,
         metadata_spec,
     )
-    out_specs = (qkv_spec, qkv_spec)
+    out_specs = (qkv_spec, kv_cache_spec)
     args = (
         q,
         k,

@@ -44,7 +44,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
 
     # Mock input batch:
     # num_draft_tokens = [3, 2] (batch_size = 2)
-    # cu_num_scheduled_tokens = [4, 7] (first request has 4 scheduled tokens, second has 3)
+    # cu_num_scheduled_tokens = [4, 7] (first request has 4 scheduled tokens,
+    # second has 3)
     num_draft_tokens = np.array([3, 2], dtype=np.int32)
     cu_num_scheduled_tokens = np.array([4, 7], dtype=np.int32)
     padded_num_reqs = 4
@@ -76,13 +77,15 @@ def test_speculative_decoding_manager_metadata_indices(device):
     )
     assert torch.equal(metadata.draft_lengths, expected_draft_lengths)
 
-    # 2. Bonus Logits Indices: [3, 6] (cu_num_sampled_tokens - 1) padded to padded_num_reqs (4) -> [3, 6, 0, 0]
+    # 2. Bonus Logits Indices: [3, 6] (cu_num_sampled_tokens - 1) padded to
+    # padded_num_reqs (4) -> [3, 6, 0, 0]
     expected_bonus_indices = torch.tensor(
         [3, 6, 0, 0], dtype=torch.int32, device=device
     )
     assert torch.equal(metadata.bonus_logits_indices, expected_bonus_indices)
 
-    # 3. Segment IDs: repeat request indices [0, 0, 0, 1, 1] padded to nearest static token bucket (8)
+    # 3. Segment IDs: repeat request indices [0, 0, 0, 1, 1] padded to nearest
+    # static token bucket (8)
     # Unpadded size: 3 + 2 = 5 tokens. Nearest static padding is 8.
     # Padded with total request count (2) -> [0, 0, 0, 1, 1, 2, 2, 2]
     expected_segment_ids = torch.tensor(
@@ -90,7 +93,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
     )
     assert torch.equal(metadata.segment_ids, expected_segment_ids)
 
-    # 4. Group Indices: range per segment [0, 1, 2, 0, 1] padded to static bucket (8) with 0 -> [0, 1, 2, 0, 1, 0, 0, 0]
+    # 4. Group Indices: range per segment [0, 1, 2, 0, 1] padded to static bucket (8)
+    # with 0 -> [0, 1, 2, 0, 1, 0, 0, 0]
     expected_group_indices = torch.tensor(
         [0, 1, 2, 0, 1, 0, 0, 0], dtype=torch.int32, device=device
     )

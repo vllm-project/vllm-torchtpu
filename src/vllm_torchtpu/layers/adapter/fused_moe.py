@@ -169,7 +169,8 @@ def _build_fused_moe_custom_op(
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
 
-    # Pass experts_start as a runtime tensor rather than static closure arg so every EP rank compiles an identical program.
+    # Pass experts_start as a runtime tensor rather than static closure arg so every EP
+    # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
         fused_moe_func,

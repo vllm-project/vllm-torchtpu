@@ -195,6 +195,8 @@ def test_dcp_hnd_rejects_backends_that_allocate_nhd(
     get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
     impl = _impl(cls, head_size)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
-    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
-        with pytest.raises(NotImplementedError, match="DCP with HND requires"):
-            impl.initialize_kernel(layer)
+    with (
+        set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()),
+        pytest.raises(NotImplementedError, match="DCP with HND requires"),
+    ):
+        impl.initialize_kernel(layer)

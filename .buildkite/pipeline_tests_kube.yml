@@ -20,13 +20,6 @@
 # bktec runs in the pod, and run.sh forwards that configuration across - see
 # common.sh for what happens to the credentials.
 
-env:
-  # The image is built into the fleet's own registry, which its nodes can pull
-  # from; the project default (inferact-vllm-tpu, see ci_image.sh) is outside
-  # it. The mirror is emptied because it is this same repository.
-  CI_IMAGE_REPO: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-  CI_IMAGE_MIRROR_REPOS: ""
-
 # Carries the launcher and the service account that may submit a workload.
 # Repeated per step rather than merged in, because a step's `plugins:` is a list
 # and a YAML merge key replaces it wholesale.

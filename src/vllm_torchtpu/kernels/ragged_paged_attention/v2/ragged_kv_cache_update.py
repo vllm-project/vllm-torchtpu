@@ -82,7 +82,8 @@ def _kv_cache_update_kernel(
         for async_copy in async_copies:
             async_copy.wait()
     else:
-        # Pipelined double-buffering: overlap reading slice i+1 with writing slice i to HBM
+        # Pipelined double-buffering: overlap reading slice i+1 with
+        # writing slice i to HBM
         offset_0 = block_idx * num_slices_per_block
         new_kv_start_0 = jax.lax.select(
             offset_0 < num_slices_ref[0], slices_ref[1, offset_0], 0
@@ -141,8 +142,8 @@ def _dynamic_validate_inputs(
     slices, new_token_num, kv_cache_token_num, page_size, num_slices
 ):
     slices = slices.tolist()
-    # NOTE: The padding part is unnecessary to check because kv_cache_start, new_kv_start,
-    # slice_len will be set to 0 in the kernel implementation.
+    # NOTE: The padding part is unnecessary to check because kv_cache_start,
+    # new_kv_start, slice_len will be set to 0 in the kernel implementation.
     for i in range(num_slices[0]):
         kv_cache_start = slices[0][i]
         new_kv_start = slices[1][i]
@@ -157,15 +158,18 @@ def _dynamic_validate_inputs(
             )
         if new_kv_start + slice_len > new_token_num:
             raise ValueError(
-                f"{new_kv_start=} + {slice_len=} must be less or equal to {new_token_num=}"
+                f"{new_kv_start=} + {slice_len=} "
+                f"must be less or equal to {new_token_num=}"
             )
         if kv_cache_start + slice_len > kv_cache_token_num:
             raise ValueError(
-                f"{kv_cache_start=} + {slice_len=} must be less or equal to {kv_cache_token_num=}"
+                f"{kv_cache_start=} + {slice_len=} "
+                f"must be less or equal to {kv_cache_token_num=}"
             )
         if kv_cache_start // page_size != (kv_cache_start + slice_len - 1) // page_size:
             raise ValueError(
-                f"Each slice must reside in the same page, but got {kv_cache_start=} and {slice_len=}"
+                "Each slice must reside in the same page, "
+                f"but got {kv_cache_start=} and {slice_len=}"
             )
 
     new_kv_intervals = []
@@ -181,14 +185,16 @@ def _dynamic_validate_inputs(
     for i in range(len(new_kv_intervals) - 1):
         if new_kv_intervals[i][1] != new_kv_intervals[i + 1][0]:
             raise ValueError(
-                f"{new_kv_intervals[i][1]=} is expeced to equal to {new_kv_intervals[i + 1][0]}"
+                f"{new_kv_intervals[i][1]=} "
+                f"is expeced to equal to {new_kv_intervals[i + 1][0]}"
             )
 
     # There should be no overlap among the kv cache slices
     for i in range(len(kv_cache_intervals) - 1):
         if kv_cache_intervals[i][1] > kv_cache_intervals[i + 1][0]:
             raise ValueError(
-                f"Overlap detected in kv_cache intervals: {kv_cache_intervals[i]} and {kv_cache_intervals[i + 1]}"
+                f"Overlap detected in kv_cache intervals: {kv_cache_intervals[i]} "
+                f"and {kv_cache_intervals[i + 1]}"
             )
 
 
@@ -320,7 +326,8 @@ def _get_num_slices_per_kv_cache_update_block(
 def kv_cache_update(
     new_kv: jax.Array,  # [total_num_token, num_combined_kv_heads, head_dim]
     slices: jax.Array,  # [3, slices], list of (kv_cache_start, new_kv_start, slice_len)
-    kv_cache: jax.Array,  # [total_num_pages * page_size, num_combined_kv_heads, head_dim]
+    # [total_num_pages * page_size, num_combined_kv_heads, head_dim]
+    kv_cache: jax.Array,
     num_slices: jax.Array,  # [1]
     *,
     page_size: int = 32,

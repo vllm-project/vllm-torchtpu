@@ -34,7 +34,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -72,6 +72,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
@@ -86,6 +87,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
+    copy_mamba_state_rows,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -109,6 +111,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -612,6 +615,10 @@ class TPUModelRunner(GPUModelRunner):
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+        # Populated by `_initialize_unified_kv_cache` when `VLLM_TPU_BLOCK_MAJOR_KV`
+        # merges unified pools into a single block-major pool; `None` when each
+        # layer region uses a separate pool (see `vllm_torchtpu.block_major_pool`).
+        self.bm_pool_layout: BlockMajorPoolLayout | None = None
         # Set by initialize_kv_cache; None until then (dummy runs check this).
         self.kv_cache_config: KVCacheConfig | None = None
         # Layout plan of the most recent prepared batch; None before the
@@ -676,7 +683,7 @@ class TPUModelRunner(GPUModelRunner):
             and self.input_batch is not None
             and hasattr(self.input_batch, "block_table")
         ):
-            try:
+            try:  # noqa: SIM105 (keep the default if the block table is not ready)
                 self.max_num_blocks_per_req = int(
                     self.input_batch.block_table[0].get_cpu_tensor().shape[1]
                 )
@@ -1258,13 +1265,16 @@ class TPUModelRunner(GPUModelRunner):
         fresh = self._fresh_xla_graphs(entries)
         new_compiled_graphs = total_graphs - self.num_xla_graphs
         if new_compiled_graphs == 0 and not fresh:
-            logger.info(f"No new compiled graphs for case: {case_str}")
+            logger.info("No new compiled graphs for case: %s", case_str)
             return
 
-        logger.info(f"Total Requests: {stats.num_cache_reqs}")
-        logger.info(f"Total Hits: {stats.num_cache_hits}")
+        logger.info("Total Requests: %s", stats.num_cache_reqs)
+        logger.info("Total Hits: %s", stats.num_cache_hits)
         logger.info(
-            f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
+            "Total number of cached graphs: %s, new: %s, case: %s",
+            total_graphs,
+            new_compiled_graphs,
+            case_str,
         )
 
         # A count says four graphs appeared; it does not say which op keeps
@@ -1531,7 +1541,8 @@ class TPUModelRunner(GPUModelRunner):
     def _build_mamba_copy_plan(
         self,
         kv_cache_config: KVCacheConfig,
-        raw_tensors: list[torch.Tensor],
+        layer_to_raw: dict[str, torch.Tensor],
+        bm_pool_layout: BlockMajorPoolLayout | None,
     ) -> None:
         """Map each mamba kv-cache group to the raw pool buffers hosting its
         layers, for the per-step state-block seed copies.
@@ -1546,12 +1557,6 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_copy_plan = []
             self._mamba_state_block_size = None
             return
-        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
-
-        layer_to_raw = {
-            name: raw_tensors[index]
-            for name, index in layer_to_pool_index(kv_cache_config).items()
-        }
         plan: list[tuple[int, list[torch.Tensor]]] = []
         state_block_size: int | None = None
         manager_page_bytes: int | None = None
@@ -1571,7 +1576,13 @@ class TPUModelRunner(GPUModelRunner):
                 manager_page_bytes = group.kv_cache_spec.page_size_bytes
         self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
-        for raw in raw_tensors:
+        if bm_pool_layout is not None:
+            # Merged block-major pool rows correspond 1:1 to manager blocks, so
+            # state seed copies index rows directly by manager block ID without
+            # kernel-block fan-out.
+            self._pool_block_split = 1
+            return
+        for raw in dict.fromkeys(layer_to_raw.values()):
             if raw.dim() > 1:
                 # Manager blocks span whole pool pages. Which axis of the
                 # pool tensor carries tokens is backend-dependent — shape[1]
@@ -1640,7 +1651,7 @@ class TPUModelRunner(GPUModelRunner):
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
         try:
-            cp_world_size = get_dcp_group().world_size * get_pcp_group().world_size
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
@@ -1851,11 +1862,23 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pending_mamba_state_copies:
             return
         for raws, src_t, dst_t in self._pending_mamba_state_copies:
-            copy_mamba_state_blocks(raws, src_t, dst_t)
+            self._copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
+    def _copy_mamba_state_blocks(
+        self, raws: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
+    ) -> None:
+        layout = self.bm_pool_layout
+        if layout is None:
+            copy_mamba_state_blocks(raws, src, dst)
+            return
+        (pool,) = raws
+        copy_mamba_state_rows(pool, src, dst, layout.num_pools, layout.split)
+
     def is_unified_pool_used(self) -> bool:
-        """Whether the attention-shaped unified KV block pool is active and allocated."""
+        """Whether the attention-shaped unified KV block pool is active
+        and allocated.
+        """
         return bool(getattr(self, "kv_cache_raw_tensors", None))
 
     def _apply_kv_cache_block_copies(self, copies) -> None:
@@ -1898,7 +1921,7 @@ class TPUModelRunner(GPUModelRunner):
         dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+        self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -1990,8 +2013,10 @@ class TPUModelRunner(GPUModelRunner):
                 if len(next_tpu) >= len(input_ids):
                     return next_tpu[: len(input_ids)]
 
-            # Fast path 2: Cache persistent device indices to eliminate per-step H2D uploads
-            # Avoids Eager XLA overhead by relying on the compiled kernel + cached index tensors
+            # Fast path 2: Cache persistent device indices to eliminate per-step
+            # H2D uploads
+            # Avoids Eager XLA overhead by relying on the compiled kernel + cached
+            # index tensors
             subst_key = (
                 len(input_ids),
                 tuple(token_in_tpu_cur_input_indices),
@@ -2225,18 +2250,19 @@ class TPUModelRunner(GPUModelRunner):
 
             req_idx = self.input_batch.req_id_to_index[req_id]
 
-            # num_tokens_no_spec was advanced to (seq_len + n_placeholder)
+            # num_tokens_no_spec was advanced to (start_tok_idx + n_placeholder)
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
             start_idx = end_idx - n_placeholder
-            self.input_batch.num_tokens_no_spec[req_idx] = start_idx + len(sampled_ids)
+            end_tok_idx = start_idx + len(sampled_ids)
+            self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-            target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            target_slice = slice(start_idx, end_tok_idx)
             # The committed tokens must fit within token_ids_cpu
             # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
-            assert seq_len + 1 <= self.input_batch.token_ids_cpu.shape[1], (
-                f"req {req_id}: write end {seq_len + 1} exceeds max_model_len "
+            assert end_tok_idx <= self.input_batch.token_ids_cpu.shape[1], (
+                f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
@@ -2250,15 +2276,21 @@ class TPUModelRunner(GPUModelRunner):
     ):
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
-        for req_idx, req_state, seq_len, req_id in request_seq_lens:
+        for req_idx, req_state, _seq_len, req_id in request_seq_lens:
             if req_idx in discard_set:
                 continue
 
+            actual_idx = self.input_batch.req_id_to_index[req_id]
+            assert actual_idx == req_idx, (req_id, actual_idx, req_idx)
+
             # Async spec: optimistically advance by 1 (bonus) + num_draft;
-            # the over-count is corrected on-device next step by subtract_num_rejected_tokens.
-            n_new = 1 + (num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0)
-            end_idx = seq_len + n_new
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            # the over-count is rolled back in _modify_prev_results once true
+            # draft acceptance is sampled from the device.
+            n_draft = num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0
+            n_new = 1 + n_draft
+            start_tok_idx = self.input_batch.num_tokens_no_spec[actual_idx]
+            end_idx = start_tok_idx + n_new
+            self.input_batch.num_tokens_no_spec[actual_idx] = end_idx
 
             req_state.output_token_ids.extend([0] * n_new)
 
@@ -2761,7 +2793,8 @@ class TPUModelRunner(GPUModelRunner):
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
+            # no dedicated prefill-only bucket, and all remaining requests in
+            # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
@@ -2905,6 +2938,31 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _execute_mm_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[torch.Tensor]:
+        """Run the vision encoder with optional video frame chunking.
+
+        A long video encoded in one shot makes the vision attention kernel
+        process every `t*h*w` patch in a single forward, which can exhaust
+        VMEM. `MM_ENCODER_FRAME_CHUNK_PATCH_SIZE` bounds each forward to that
+        many patches by splitting the clip on the temporal axis (bit-exact, see
+        `vllm_torchtpu.runner.mm_video_chunking`). Everything else — batching,
+        multimodal LoRA, `prompt_embeds`, the encoder cudagraph path and the
+        encoder cache — stays on the base `GPUModelRunner` implementation.
+
+        Args:
+            scheduler_output: Scheduler output containing the scheduled batch
+                and multimodal inputs.
+
+        Returns:
+            List of multimodal embedding tensors for inputs processed by the
+            encoder.
+        """
+        with chunked_video_encoding(self.model, self.model_config):
+            return super()._execute_mm_encoder(scheduler_output)
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -3039,7 +3097,8 @@ class TPUModelRunner(GPUModelRunner):
         forwards.
         """
         # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
-        # run_dp_dummy_draft read _dp_target_bucket for the coordinated, equal-token shape.
+        # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
+        # equal-token shape.
         self._dp_target_bucket = bucket
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
@@ -3118,7 +3177,8 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output
         )
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
+        # Profile the current batch composition (prefill vs decode) if phased profiling
+        # is enabled.
         if self.phase_based_profiler:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
@@ -3176,8 +3236,8 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
         )
         # Retained for the spec-decode propose phase (sample_tokens): under
-        # EP-DP locksteps every rank must run the same number of draft forwards per step,
-        # and the coordinated chunk count from this one all-reduce is the shared
+        # EP-DP locksteps every rank must run the same number of draft forwards per
+        # step, and the coordinated chunk count from this one all-reduce is the shared
         # bound — no additional draft-side collective is needed.
         self._dp_step_num_chunks = target_num_chunks
 
@@ -3319,7 +3379,7 @@ class TPUModelRunner(GPUModelRunner):
                     "phase": "phase",
                     "batch_id": "batch_id",
                     "total_num_scheduled_tokens": "total_num_scheduled_tokens",
-                    "padded_total_num_scheduled_tokens": "padded_total_num_scheduled_tokens",
+                    "padded_total_num_scheduled_tokens": "padded_total_num_scheduled_tokens",  # noqa: E501
                     "min_kv_len": "min_kv_length",
                 }
                 for src_key, target_key in stats_map.items():
@@ -4290,10 +4350,15 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
 
+        # After the drafter: an MTP draft re-reads the target checkpoint.
+        from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
+
+        evict_loaded_weights_page_cache()
+
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
-        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
 
@@ -4346,6 +4411,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
+        layer_widths = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4353,28 +4419,55 @@ class TPUModelRunner(GPUModelRunner):
                 if isinstance(
                     getattr(attn_layer, "impl", None), PallasAttentionBackendImpl
                 ):
-                    # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
-                    # (non-shard_map) kernel.
+                    is_draft = name in draft_attn_names
+                    pre_w = attn_layer.impl.decode_query_size
+                    # Keep a sharded draft at its K+1 decode tile. The drafter's
+                    # first pass attends with the TARGET's request_distribution
+                    # (eagle3 `_build_draft_attn_metadata`, step_idx == 0), so
+                    # with reorder_batch_threshold > 1 its K+1-token verify
+                    # windows sit in the DECODE bucket, and a 1-wide DECODE tile
+                    # there drops all but one query token per sequence (MTP
+                    # acceptance ~0.5% on Qwen3.5 DCP4 + MTP3). Loop steps (one
+                    # token) are fine in a K+1 tile.
+                    # A REPLICATED (tp=1) draft moves to the LOCAL (non-shard_map)
+                    # kernel, which is 1-wide; its width is folded into the
+                    # threshold below.
                     if (
-                        name in draft_attn_names
+                        is_draft
                         and self.speculative_config.draft_tensor_parallel_size == 1
                     ):
+                        attn_layer.impl.decode_query_size = 1
                         # Instance attrs shadow the ClassVars; unique prefix
-                        # keeps the local kernel op out of the sharded registry.
+                        # keeps the local kernel op out of the sharded
+                        # registry.
                         attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
                         attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
-                        attn_layer.impl.decode_query_size = 1
                         logger.info(
-                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
-                            " | DRAFT_KV_BLOCK_CAP=%d",
+                            "Draft attn %s -> LOCAL (non-shard_map) RPA "
+                            "kernel | DRAFT_KV_BLOCK_CAP=%d",
                             name,
                             _DRAFT_KV_BLOCK_CAP,
                         )
                     attn_layer.impl.initialize_kernel(attn_layer)
+                    layer_widths.append(
+                        (
+                            "draft" if is_draft else "target",
+                            type(attn_layer.impl).__name__,
+                            pre_w,
+                            attn_layer.impl.decode_query_size,
+                            getattr(attn_layer.impl, "head_size", None),
+                        )
+                    )
+                    # Draft layers count too. `reorder_batch_threshold` shapes
+                    # the target's request_distribution, and the drafter's
+                    # first pass attends with that same distribution, so every
+                    # layer that consumes it needs a DECODE tile at least as
+                    # wide as the widest window the threshold puts there.
                     decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
-            # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
+            # Pre-build custom attention, compressor, and indexer kernels
+            # (e.g. DeepSeek-V4 SWA/CSA/HCA)
             if hasattr(self, "model") and self.model is not None:
                 for module in self.model.modules():
                     if hasattr(module, "_build_attn_op") and hasattr(module, "attn_op"):
@@ -4403,9 +4496,24 @@ class TPUModelRunner(GPUModelRunner):
                             _ = getattr(module, op_name)
                             initialized_count += 1
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
+        # State it, don't infer it: a target-only [4] and an undetected-draft
+        # [4] print identically, so the draft count is the only way to tell
+        # whether any draft layer was detected.
+        from collections import Counter
+
         logger.info(
-            "Pre-built attention/indexing kernels for %d layers/modules.",
+            "Attn layer census (role, impl, width_before_init, "
+            "width_after_init, head_size) -> count: %s | draft names known=%d",
+            dict(Counter(layer_widths)),
+            len(draft_attn_names),
+        )
+        logger.info(
+            "Pre-built attention/indexing kernels for %d layers/modules. "
+            "decode_query_size=%s -> reorder_batch_threshold=%d "
+            "(>1 means speculative verify runs in the RPAd decode stage).",
             initialized_count,
+            sorted(set(decode_query_sizes)),
+            self.reorder_batch_threshold,
         )
         self._attention_kernels_initialized = True
 
@@ -5235,7 +5343,7 @@ class TPUModelRunner(GPUModelRunner):
             _suspend_kv_transfer_group(),
             self._precompile_timed("PCP MTP real prefill warmup"),
         ):
-            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):
+            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
                 if not self._warmup_one_pcp_mtp_prefill(P):
                     raise RuntimeError(
                         "PCP MTP prefill warmup failed after retry; refusing "
@@ -5381,7 +5489,7 @@ class TPUModelRunner(GPUModelRunner):
                 src = torch.zeros(n, dtype=torch.int32).to(self.device)
                 dst = torch.zeros(n, dtype=torch.int32).to(self.device)
                 for raws in raw_sets.values():
-                    copy_mamba_state_blocks(raws, src, dst)
+                    self._copy_mamba_state_blocks(raws, src, dst)
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)
@@ -5895,23 +6003,26 @@ class TPUModelRunner(GPUModelRunner):
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
         super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        if hasattr(self, "input_batch") and self.input_batch is not None:
-            if hasattr(self.input_batch, "block_table"):
-                try:
-                    self.max_num_blocks_per_req = int(
-                        self.input_batch.block_table[0].get_cpu_tensor().shape[1]
+        if (
+            hasattr(self, "input_batch")
+            and self.input_batch is not None
+            and hasattr(self.input_batch, "block_table")
+        ):
+            try:
+                self.max_num_blocks_per_req = int(
+                    self.input_batch.block_table[0].get_cpu_tensor().shape[1]
+                )
+                if (
+                    self.block_table_cpu.shape[0] != self.max_num_reqs
+                    or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
+                ):
+                    self.block_table_cpu = torch.zeros(
+                        (self.max_num_reqs, self.max_num_blocks_per_req),
+                        dtype=torch.int32,
+                        device="cpu",
                     )
-                    if (
-                        self.block_table_cpu.shape[0] != self.max_num_reqs
-                        or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
-                    ):
-                        self.block_table_cpu = torch.zeros(
-                            (self.max_num_reqs, self.max_num_blocks_per_req),
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                except (IndexError, TypeError, AttributeError, KeyError):
-                    pass
+            except (IndexError, TypeError, AttributeError, KeyError):
+                pass
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

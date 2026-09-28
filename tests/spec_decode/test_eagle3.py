@@ -33,6 +33,7 @@ from vllm_torchtpu.spec_decode.eagle3 import (
     Eagle3Proposer,
     _force_draft_tp1,
     _maybe_pad_dim0,
+    _static_shape_args,
 )
 
 
@@ -2033,3 +2034,241 @@ def test_index_share_turns_off_when_its_loop_step_program_cannot_be_built():
     # With sharing off, the toggle no longer reaches the model.
     proposer._mtp_set_skip_topk(True)
     assert proposer.draft_model.model.skip_topk is None
+
+
+def _fake_attn(with_impl: bool = True):
+    return SimpleNamespace(
+        kv_sharing_target_layer_name=None,
+        impl=(
+            SimpleNamespace(kv_sharing_target_layer_name=None) if with_impl else None
+        ),
+    )
+
+
+def _draft_layer(
+    is_shared: bool = True, with_impl: bool = True, with_attn: bool = True
+):
+    return SimpleNamespace(
+        self_attn=SimpleNamespace(
+            is_kv_shared_layer=is_shared,
+            attn=_fake_attn(with_impl) if with_attn else None,
+        )
+    )
+
+
+def _kv_sharing_proposer(
+    monkeypatch,
+    draft_layers,
+    draft_layer_types=None,
+    target_layer_types=("full_attention",),
+    target_num_kv_shared=0,
+    block_major=False,
+    pcp_enabled=False,
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3.envs, "VLLM_TPU_BLOCK_MAJOR_KV", block_major)
+    monkeypatch.setattr(
+        e3,
+        "PcpStaticSupportValidator",
+        SimpleNamespace(
+            from_vllm_config=lambda _cfg: SimpleNamespace(enabled=pcp_enabled)
+        ),
+    )
+
+    proposer = _make_proposer(method="mtp")
+    draft_text_config = SimpleNamespace(layer_types=list(draft_layer_types or []))
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(get_text_config=lambda: draft_text_config),
+        model=SimpleNamespace(layers=draft_layers),
+    )
+    target_text_config = SimpleNamespace(
+        layer_types=list(target_layer_types),
+        num_kv_shared_layers=target_num_kv_shared,
+    )
+    target = SimpleNamespace(
+        config=SimpleNamespace(get_text_config=lambda: target_text_config)
+    )
+    return proposer, target
+
+
+def test_kv_sharing_wires_both_module_and_impl(monkeypatch):
+    """The Pallas impl derives skip_kv_update from its own copy, so wiring
+    only the module attr leaves the draft writing dummy K/V over the target."""
+    layer = _draft_layer()
+    proposer, target = _kv_sharing_proposer(monkeypatch, [layer])
+
+    proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+    attn = layer.self_attn.attn
+    assert attn.kv_sharing_target_layer_name is not None
+    assert attn.impl.kv_sharing_target_layer_name == (attn.kv_sharing_target_layer_name)
+
+
+def test_kv_sharing_freezes_draft_positions(monkeypatch):
+    """A Q-only draft writes no KV slots, so positions must stay fixed."""
+    proposer, target = _kv_sharing_proposer(monkeypatch, [_draft_layer()])
+    assert proposer.advance_draft_positions is True
+
+    proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+    assert proposer._draft_kv_shared is True
+    assert proposer.advance_draft_positions is False
+
+
+def test_kv_sharing_noop_when_draft_owns_kv_cache(monkeypatch):
+    """DeepSeek-V4 MTP is also method='mtp' but owns its cache; method alone
+    cannot distinguish it, so participation follows is_kv_shared_layer."""
+    layer = _draft_layer(is_shared=False)
+    proposer, target = _kv_sharing_proposer(monkeypatch, [layer])
+
+    proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+    assert layer.self_attn.attn.kv_sharing_target_layer_name is None
+    assert layer.self_attn.attn.impl.kv_sharing_target_layer_name is None
+    assert proposer._draft_kv_shared is False
+    assert proposer.advance_draft_positions is True
+
+
+def test_kv_sharing_targets_last_layer_of_matching_type(monkeypatch):
+    """MTP shares the last target layer of its own attention type, excluding
+    the trailing layers that are themselves KV-shared."""
+    layer = _draft_layer()
+    proposer, target = _kv_sharing_proposer(
+        monkeypatch,
+        [layer],
+        draft_layer_types=["sliding_attention"],
+        target_layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        target_num_kv_shared=1,
+    )
+
+    proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+    assert (
+        layer.self_attn.attn.kv_sharing_target_layer_name
+        == "model.layers.2.self_attn.attn"
+    )
+
+
+def test_kv_sharing_derives_target_prefix_from_registry(monkeypatch):
+    """The prefix comes from the registered target names, not a hardcoded one."""
+    layer = _draft_layer()
+    proposer, target = _kv_sharing_proposer(monkeypatch, [layer])
+
+    proposer._setup_gemma4_kv_sharing(
+        target, {"language_model.model.layers.0.self_attn.attn"}
+    )
+
+    assert (
+        layer.self_attn.attn.kv_sharing_target_layer_name
+        == "language_model.model.layers.0.self_attn.attn"
+    )
+
+
+def test_kv_sharing_raises_when_no_matching_target_type(monkeypatch):
+    # An unwired declaring layer would write dummy K/V into the target's
+    # cache, so this must fail rather than warn.
+    proposer, target = _kv_sharing_proposer(
+        monkeypatch,
+        [_draft_layer()],
+        draft_layer_types=["sliding_attention"],
+        target_layer_types=["full_attention"],
+    )
+
+    with pytest.raises(RuntimeError, match="No target layer of type"):
+        proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+
+def test_kv_sharing_raises_when_attn_has_no_impl(monkeypatch):
+    proposer, target = _kv_sharing_proposer(
+        monkeypatch, [_draft_layer(with_impl=False)]
+    )
+
+    with pytest.raises(RuntimeError, match="has no `impl`"):
+        proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+
+def test_kv_sharing_raises_when_layer_exposes_no_attn(monkeypatch):
+    proposer, target = _kv_sharing_proposer(
+        monkeypatch, [_draft_layer(with_attn=False)]
+    )
+
+    with pytest.raises(RuntimeError, match="exposes no self_attn.attn"):
+        proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+
+@pytest.mark.parametrize(
+    "block_major,pcp_enabled,match",
+    [
+        (True, False, "block-major KV bundle"),
+        (False, True, "PCP streaming attention"),
+    ],
+)
+def test_kv_sharing_fails_closed_on_unsupported_backends(
+    monkeypatch, block_major, pcp_enabled, match
+):
+    # Both paths reject skip_kv_update when the kernel is built; surface it at
+    # startup instead of corrupting the target's cache mid-serving.
+    layer = _draft_layer()
+    proposer, target = _kv_sharing_proposer(
+        monkeypatch, [layer], block_major=block_major, pcp_enabled=pcp_enabled
+    )
+
+    with pytest.raises(NotImplementedError, match=match):
+        proposer._setup_gemma4_kv_sharing(target, {"model.layers.0.self_attn.attn"})
+
+    assert layer.self_attn.attn.kv_sharing_target_layer_name is None
+    assert proposer._draft_kv_shared is False
+
+
+def test_static_shape_args_strips_dynamo_dynamic_marks():
+    """A marked tensor must not reach a `dynamic=False` compiled region.
+
+    `@support_torch_compile` calls `torch._dynamo.mark_dynamic` on the model's
+    `positions`/`input_ids` on every forward, which stamps
+    `_dynamo_dynamic_indices` onto the tensor object. The stamp outlives that
+    forward and outranks `dynamic=False`, so passing the same object straight
+    into one of the draft's static regions made dynamo lift a SymInt and
+    torch-tpu reject the graph outright. Regression guard for that path.
+    """
+
+    seen: list[frozenset | None] = []
+
+    @_static_shape_args
+    def region(a, b, *, c):
+        for t in (a, b, c):
+            seen.append(getattr(t, "_dynamo_dynamic_indices", None))
+        return a
+
+    marked = torch.zeros(4, 8)
+    torch._dynamo.mark_dynamic(marked, 0)
+    plain = torch.zeros(4, 8)
+    marked_kw = torch.zeros(4)
+    torch._dynamo.mark_dynamic(marked_kw, 0)
+
+    out = region(marked, plain, c=marked_kw)
+
+    assert seen == [None, None, None], (
+        f"a dynamic-dim mark reached the compiled region: {seen}"
+    )
+    # Aliased, not copied, and the caller's own marks are left intact so the
+    # model's next forward still sees what it marked.
+    assert out.data_ptr() == marked.data_ptr()
+    assert getattr(marked, "_dynamo_dynamic_indices", None) == {0}
+    assert getattr(marked_kw, "_dynamo_dynamic_indices", None) == {0}
+
+
+def test_static_shape_args_passes_non_tensors_through():
+    """Ints, None and other non-tensor args must survive unchanged."""
+
+    @_static_shape_args
+    def region(t, step_idx, flag=None):
+        return t, step_idx, flag
+
+    t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
+    assert step_idx == 3 and flag is None and t.shape == (2,)

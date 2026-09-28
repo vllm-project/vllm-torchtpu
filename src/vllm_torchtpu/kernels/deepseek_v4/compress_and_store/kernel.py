@@ -272,7 +272,8 @@ def derive_aliases(
 
 
 def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
-    """Determines, for every token in a sequence, whether it is the first token within its execution tile to map to a particular physical HBM row.
+    """Determines, for every token in a sequence, whether it is the first token within
+    its execution tile to map to a particular physical HBM row.
 
     If multiple tokens in the same tile map to the same row, only the first one is
     responsible for writing the merged VMEM row buffer back to HBM. The

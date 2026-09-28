@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
     VllmCompressedTensorsW4A16MoEMethod,
 )
 
@@ -141,10 +141,13 @@ class FakeActivation:
 
 
 class FakeRoutedExperts(RoutedExperts):
-    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM config requirements."""
+    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM
+    config requirements.
+    """
 
     def __init__(self, experts_per_token=2):
-        # Call Module.__init__ to initialize parameters dictionary, bypassing RoutedExperts.__init__
+        # Call Module.__init__ to initialize parameters dictionary, bypassing
+        # RoutedExperts.__init__
         torch.nn.Module.__init__(self)
         self.moe_config = MagicMock()
         self.moe_config.experts_per_token = experts_per_token
@@ -179,7 +182,9 @@ class TestW4MoEWeightPreprocessing:
     """Verify CPU weight packing and sign-extension logic."""
 
     def test_xor_sign_conversion(self):
-        """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""
+        """Symmetric unsigned INT4 [0, 15] should be converted
+        to signed [-8, 7] via XOR.
+        """
         layer = FakeRoutedExperts(experts_per_token=2)
         layer.activation = FakeActivation("silu")
 
@@ -234,7 +239,8 @@ class TestW4MoEWeightPreprocessing:
             layer.w2_weight_packed.data.zero_()
 
             # 2. Simulate loading shards using the hook
-            # w13_weight_packed has shape [2, 1, 16] (num_experts, in_dim, out_dim_packed)
+            # w13_weight_packed has shape [2, 1, 16]
+            # (num_experts, in_dim, out_dim_packed)
             # Shards from loader: [weight_shard_size, ...]
             # We load shape [8, 1] filled with initial_carrier
             shard_w1_e0 = torch.tensor([[initial_carrier]] * 8, dtype=torch.int32)
@@ -256,7 +262,8 @@ class TestW4MoEWeightPreprocessing:
                 layer.w13_weight_packed, shard_w3_e1, "w13_weight_packed", "w3", 1
             )
 
-            # Call process_weights_after_loading to perform the H2D copy and cleanup scratchpad
+            # Call process_weights_after_loading to perform the H2D copy and
+            # cleanup scratchpad
             method.process_weights_after_loading(layer)
 
             # Expected output after XORing with 0x88888888: 0xF0F98710
@@ -437,7 +444,8 @@ class TestW4MoECorrectness:
             activation="silu",
         )
 
-        # 9. Verify close match (allowing small tolerances since dynamic TPU compiles kernel optimizations)
+        # 9. Verify close match (allowing small tolerances since dynamic TPU compiles
+        # kernel optimizations)
         torch.testing.assert_close(result_cpu, expected_cpu, rtol=0.03, atol=0.03)
 
     def test_fused_moe_fp4_requant_correctness(self, device):
@@ -540,8 +548,10 @@ class TestW4MoECorrectness:
 
 
 def test_w4a16_requantize_block():
-    """Verify that INT4 MoE weights are correctly requantized when MOE_REQUANTIZE_BLOCK_SIZE is set."""
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    """Verify that INT4 MoE weights are correctly requantized when
+    MOE_REQUANTIZE_BLOCK_SIZE is set.
+    """
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
         requantize_and_transpose_int4_weights,
     )
 
@@ -669,10 +679,12 @@ def test_w4a16_requantize_block():
 
 
 def test_w4a16_requantize_to_fp4():
-    """Verify that INT4 MoE weights are correctly requantized to FP4 (torch.float8_e4m3fn) when MOE_REQUANTIZE_WEIGHT_DTYPE is set."""
+    """Verify that INT4 MoE weights are correctly requantized to FP4
+    (torch.float8_e4m3fn) when MOE_REQUANTIZE_WEIGHT_DTYPE is set.
+    """
     import jax.numpy as jnp
 
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
         requantize_and_transpose_int4_to_fp4_weights,
     )
 

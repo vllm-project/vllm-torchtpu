@@ -186,12 +186,14 @@ def maybe_share_embeddings(
             )
         if tp_layout_matches:
             logger.info(
-                "Sharing the target's embed_tokens with the draft using the same TP layout."
+                "Sharing the target's embed_tokens with the draft using the "
+                "same TP layout."
             )
             draft_model.model.embed_tokens = target_embed
         else:
             logger.info(
-                "Populating draft's own embed_tokens with a host-gathered copy of target embedding."
+                "Populating draft's own embed_tokens with a host-gathered copy of "
+                "target embedding."
             )
             populate_draft_embed_from_target(draft_model, target_embed)
 
@@ -338,8 +340,9 @@ def maybe_share_lm_head(
             )
             populate_draft_lm_head_from_target(draft_model, target_lm_head)
 
-    # We must override _gather_logits for replicated draft models even if we don't share the lm_head,
-    # because the draft model's logits_processor will still try to gather logits across TP=1.
+    # We must override _gather_logits for replicated draft models even if we don't share
+    # the lm_head, because the draft model's logits_processor will still try to gather
+    # logits across TP=1.
     if draft_replicated:
         lp = resolve_draft_logits_processor(draft_model)
         if lp is None:

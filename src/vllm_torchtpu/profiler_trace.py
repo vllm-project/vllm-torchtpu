@@ -21,6 +21,7 @@ both the phased profiler (``runner/utils.py``) and the standard
 ``torch_profiler_dir`` flow (``worker/tpu_worker.py``).
 """
 
+import contextlib
 import datetime
 import os
 import shutil
@@ -122,15 +123,14 @@ def resolve_canonical_dst_ts(
     return fallback_ts
 
 
-def clear_canonical_ts_marker(dst_root: str,
-                              session_key: str | None = None) -> None:
+def clear_canonical_ts_marker(dst_root: str, session_key: str | None = None) -> None:
     """Drop the marker once the run it describes is merged (rank 0 only)."""
     if session_key is None:
         session_key = profile_session_id()
-    try:
+    # TODO: Ignore only FileNotFoundError (the marker was never written).
+    # Other OSErrors, such as permission errors, should not be hidden.
+    with contextlib.suppress(OSError):
         os.remove(canonical_ts_marker_path(dst_root, session_key))
-    except OSError:
-        pass
 
 
 def merge_rank_capture(
@@ -170,29 +170,27 @@ def merge_rank_capture(
                 # Mind the two spellings of the same idea: the capture
                 # sandbox is `rank_<N>` (see `rank_capture_dir`), the merged
                 # filename is `rank<N>_`.
-                new_fname = (f"rank{worker_rank}_{fname}"
-                             if multi_worker else fname)
+                new_fname = f"rank{worker_rank}_{fname}" if multi_worker else fname
                 shutil.move(
                     os.path.join(src_ts_dir, fname),
                     os.path.join(dst_ts_dir, new_fname),
                 )
-            try:
+            # TODO: Check that the directory is empty instead of ignoring every
+            # OSError, so real failures such as permission errors surface.
+            with contextlib.suppress(OSError):
                 os.rmdir(src_ts_dir)
-            except OSError:
-                pass
         # rmdir only succeeds on an empty directory, so the sandbox survives
         # when the caller left other artifacts (batch composition stats) in
         # it and is cleaned up when the trace was all it held.
         for cleanup in (
-                source_profile_path,
-                os.path.dirname(source_profile_path),
-                capture_dir,
+            source_profile_path,
+            os.path.dirname(source_profile_path),
+            capture_dir,
         ):
-            try:
+            # TODO: Check that the directory is empty instead of ignoring every
+            # OSError, so real failures such as permission errors surface.
+            with contextlib.suppress(OSError):
                 os.rmdir(cleanup)
-            except OSError:
-                pass
-        logger.info("Successfully merged profile directories into: %s",
-                    dst_ts_dir)
+        logger.info("Successfully merged profile directories into: %s", dst_ts_dir)
     except Exception as e:
         logger.warning("Failed to merge profile directories: %s", e)
