@@ -145,8 +145,8 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][0] == id(raw_tensors)
-    assert calls[0][1] == [18, 19, 20, 0, 0, 0, 0, 0]
-    assert calls[0][2] == [21, 22, 23, 0, 0, 0, 0, 0]
+    assert calls[0][1] == [18, 19, 20] + [0] * 29
+    assert calls[0][2] == [21, 22, 23] + [0] * 29
     for raw, old in zip(raw_tensors, before):
         torch.testing.assert_close(raw[21:24], old[18:21])
         torch.testing.assert_close(raw[24], old[24])
@@ -221,8 +221,8 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
     TPUModelRunner._apply_kv_cache_block_copies(fake, copies)
 
     assert len(migrated) == 1
-    assert migrated[0][0] == [3, 0, 0, 0, 0, 0, 0, 0]
-    assert migrated[0][1] == [5, 0, 0, 0, 0, 0, 0, 0]
+    assert migrated[0][0] == [3] + [0] * 31
+    assert migrated[0][1] == [5] + [0] * 31
     assert offsets[5].item() == 3
 
 
@@ -243,9 +243,10 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
         _mamba_copy_plan=copy_plan,
         kv_cache_raw_tensors=kv_raw,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
-        max_num_reqs=3,
+        max_num_reqs=10,
         _pool_block_split=2,
         _bucket_len=TPUModelRunner._bucket_len,
+        _bucket_ladder=TPUModelRunner._bucket_ladder,
         _precompile_timed=mock_timed,
         device="cpu",
         bm_pool_layout=None,
@@ -267,10 +268,12 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
 
     assert tuple(id(r) for r in [raw1]) in compiled_raws
     assert tuple(id(r) for r in kv_raw) in compiled_raws
-    # With len(copy_plan)=1, len(kv_groups)=2, max_num_reqs=3, split=2:
-    # Old single-group formula gave _bucket_len(1 * 3 * 2 = 6) = 8.
-    # New multi-group formula gives _bucket_len(2 * 3 * 2 = 12) = 32.
-    assert max(compiled_lens) == 32
+    # With len(copy_plan)=1, len(kv_groups)=2, max_num_reqs=10, split=2:
+    # a single-group formula would give _bucket_len(1 * 10 * 2 = 20) = 32;
+    # the multi-group formula gives _bucket_len(2 * 10 * 2 = 40) = 512.
+    assert max(compiled_lens) == 512
+    # One compile per ladder rung per raw set.
+    assert sorted(set(compiled_lens)) == [32, 512]
 
 
 def test_is_unified_pool_used():

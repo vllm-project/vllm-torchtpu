@@ -353,7 +353,7 @@ def test_multiple_mamba_groups_get_independent_copies():
 
 
 def test_pairs_padded_to_bucket_ladder():
-    # 3 real pairs pad up to the first bucket (8); 9 pairs to the next (32).
+    # 3 real pairs pad up to the first bucket (32).
     fake, _ = _make_self(
         ["a", "b", "c"],
         [2 * BLOCK_SIZE] * 3,
@@ -362,7 +362,7 @@ def test_pairs_padded_to_bucket_ladder():
     )
     _collect(fake, _sched({"a": BLOCK_SIZE, "b": BLOCK_SIZE, "c": BLOCK_SIZE}))
     _raws, src_t, _dst_t = fake._pending_mamba_state_copies[0]
-    assert len(src_t) == 8
+    assert len(src_t) == 32
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [
         (6, 7),
         (10, 11),

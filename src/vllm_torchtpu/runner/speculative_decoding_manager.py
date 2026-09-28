@@ -298,6 +298,11 @@ class SpeculativeDecodingManager:
         padded_logits_length = _get_padded_token_len(
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
+        # One verify length for every step (see _pinned_logits_rows), so the
+        # verify prelude and rejection sampler never compile per batch size.
+        pinned_rows = self.runner._pinned_logits_rows()
+        if pinned_rows is not None:
+            padded_logits_length = max(padded_logits_length, pinned_rows)
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices

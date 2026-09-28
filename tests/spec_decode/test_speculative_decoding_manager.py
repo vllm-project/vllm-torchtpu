@@ -30,6 +30,8 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
     mock_runner.device = device
+    # No async drafter: logits rows follow padded_num_reqs.
+    mock_runner._pinned_logits_rows.return_value = None
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
 
@@ -259,6 +261,8 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
 def _fresh_metadata_manager(device, input_ids):
     mock_runner = MagicMock()
     mock_runner.device = device
+    # No async drafter: logits rows follow padded_num_reqs.
+    mock_runner._pinned_logits_rows.return_value = None
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids

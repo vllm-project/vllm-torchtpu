@@ -155,6 +155,8 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    # No async drafter here, so non-spec steps select padded_num_reqs rows.
+    runner._pinned_logits_rows = lambda: None
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
