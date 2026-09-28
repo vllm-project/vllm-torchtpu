@@ -69,6 +69,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        per_request_params: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -84,6 +85,7 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+            per_request_params=per_request_params,
         )
 
     def forward(
@@ -101,6 +103,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        per_request_params: bool = False,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -122,6 +125,9 @@ class RejectionSampler:
           recover_u: Uniform random values used to sample recovered tokens.
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
+          per_request_params: temperatures / top_k / top_p are per-request
+            ([num_reqs, 1]) and are expanded to per-draft-token by segment_ids
+            inside the compiled region (padded segment ids are clamped).
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -154,6 +160,7 @@ class RejectionSampler:
                 recover_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+                per_request_params,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -354,12 +361,22 @@ def _random_rejection_sample_with_segment(
     recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    per_request_params: bool = False,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
+
+    if per_request_params:
+        # Expand the [num_reqs, 1] request params to per-draft-token here: run
+        # eager, the three [segment_ids] gathers fused with the neighboring
+        # rand draws into a different program per dispatch context.
+        rows = segment_ids.to(torch.int64).clamp(0, temperatures.shape[0] - 1)
+        temperatures = torch.index_select(temperatures, 0, rows)
+        top_k = torch.index_select(top_k, 0, rows)
+        top_p = torch.index_select(top_p, 0, rows)
 
     draft_token_ids = draft_token_ids.to(torch.int64)
     valid_draft_token_ids = draft_token_ids >= 0

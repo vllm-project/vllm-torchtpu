@@ -594,8 +594,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
-#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so _dummy_run and execute_model trace identically.
+#      (backbone, compute_logits_from_hidden_states, sample_from_logits/
+#      structured_decode, gather_logprobs) so _dummy_run and execute_model trace
+#      identically. compute_selected_logits' row gather is an isolated eager
+#      program in front of the lm-head subgraph.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -4152,7 +4154,24 @@ class TPUModelRunner(GPUModelRunner):
                         cur_start_idx, cur_end_idx, bonus_logits
                     )
                 )
+                # Draw all three uniform buffers back to back, ahead of any
+                # other eager op: interleaved with the bonus sample and the
+                # per-token param gathers, each rand fused into a different
+                # program per dispatch context.
                 bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                accept_u_ng = torch.rand(
+                    md.draft_token_ids.shape,
+                    dtype=torch.float32,
+                    device=target_logits.device,
+                    generator=sampling_generator,
+                )
+                recover_u = torch.rand_like(
+                    target_logits, dtype=torch.float32, generator=sampling_generator
+                )
+                # Materialize the draws now (enqueue only, no host wait) so they
+                # run as one fixed program instead of fusing into whatever eager
+                # op consumes them next.
+                synchronize_tensors([bonus_u, accept_u_ng, recover_u], wait=False)
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4162,13 +4181,16 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                 ).view(-1)
         accept_u = None
-        if self.rejection_sampler.synthetic_mode or not all_greedy:
+        if not all_greedy:
+            accept_u = accept_u_ng
+        elif self.rejection_sampler.synthetic_mode:
             accept_u = torch.rand(
                 md.draft_token_ids.shape,
                 dtype=torch.float32,
                 device=target_logits.device,
                 generator=sampling_generator,
             )
+            synchronize_tensors([accept_u], wait=False)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -4181,9 +4203,6 @@ class TPUModelRunner(GPUModelRunner):
                 accept_u=accept_u,
             )
         assert accept_u is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -4192,12 +4211,13 @@ class TPUModelRunner(GPUModelRunner):
             segment_ids=md.segment_ids,
             group_indices=md.group_indices,
             max_draft_tokens=self.speculative_config.num_speculative_tokens,
-            temperatures=req_temperatures[md.segment_ids],
-            top_k=req_top_k[md.segment_ids],
-            top_p=req_top_p[md.segment_ids],
+            temperatures=req_temperatures,
+            top_k=req_top_k,
+            top_p=req_top_p,
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            per_request_params=True,
         )
 
     def sample_tokens(
@@ -4309,6 +4329,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                         u = torch.rand_like(logits, generator=sampling_generator)
+                        synchronize_tensors([u], wait=False)
                         selected = self.sample_from_logits_func(
                             logits,
                             temperatures_tpu,
@@ -4361,6 +4382,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
                     u = torch.rand_like(logits, generator=sampling_generator)
+                    synchronize_tensors([u], wait=False)
                     selected_token_ids = self.sample_from_logits_func(
                         logits,
                         temperatures_tpu,
@@ -5394,6 +5416,9 @@ class TPUModelRunner(GPUModelRunner):
                             self._dummy_logits(pinned_rows), num_reqs
                         )
                         synchronize_tensors(out)
+            # No per-shape host wait: the gathers compile concurrently on the
+            # background pool. Wait once at the end.
+            outs = []
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -5401,8 +5426,7 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 for num_reqs in rows:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_logits(dummy_hidden, indices)
-                    synchronize_tensors(out)
+                    outs.append(self.compute_selected_logits(dummy_hidden, indices))
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5410,6 +5434,7 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens, self.max_num_reqs
                     ):
                         break
+            synchronize_tensors(outs)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -5698,14 +5723,16 @@ class TPUModelRunner(GPUModelRunner):
                     _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                         dummy_logits, bonus_logits_indices, target_logits_indices
                     )
+                    # Per-request [num_reqs, 1] params, expanded in-graph
+                    # (per_request_params=True), as _sample_spec_verify_chunk.
                     warm_temps = torch.zeros(
-                        (num_tokens, 1),
+                        (num_reqs, 1),
                         dtype=self._hidden_states_dtype,
                     ).to(self.device)
-                    warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
+                    warm_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                         self.device
                     )
-                    warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
+                    warm_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                         self.device
                     )
                     warm_recover_u = torch.zeros(
@@ -5726,6 +5753,7 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
+                        per_request_params=True,
                     )
                     synchronize_tensors(out)
                     logger.info(
@@ -6691,14 +6719,19 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
         if self.is_pooling_model:
             return torch.empty((0,), device=hidden_states.device)
+        # The row gather is the only part that depends on num_tokens. Run it
+        # as its own eager program (enqueued without a host wait, so its
+        # compile runs on the background compile pool), and keep the lm-head
+        # in a compiled region keyed on the row count alone. As one compiled
+        # region it was a synchronous ~4 s compile per num_tokens bucket.
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
-        return self.model.compute_logits(selected)
+        synchronize_tensors([selected], wait=False)
+        return self.compute_logits_from_hidden_states(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _leading_logits_rows(self, logits: torch.Tensor, n: int) -> torch.Tensor:
