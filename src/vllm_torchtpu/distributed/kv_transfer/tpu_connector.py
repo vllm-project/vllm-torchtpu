@@ -33,7 +33,6 @@ import concurrent.futures
 import dataclasses
 import importlib
 import json
-import os
 import queue
 import threading
 import time
@@ -150,19 +149,16 @@ _STAGE3_REGISTRY_STATUS_CANCELLED = 4
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
 _STAGE3_REGISTRATION_CANCELLED_ERROR = "Request block registration was cancelled"
 
-# Issue the producer's post-transfer complete_request_blocks RPC off the engine
-# thread (see _submit_stage3_async_complete). Off by default.
-_STAGE3_ASYNC_COMPLETE = os.getenv("TPU_RAIDEN_ASYNC_COMPLETE", "0") == "1"
+# Attempts per complete_request_blocks RPC under TPU_RAIDEN_ASYNC_COMPLETE (see
+# _submit_stage3_async_complete) before the failure is raised.
 _STAGE3_ASYNC_COMPLETE_MAX_ATTEMPTS = 5
-# complete_request_blocks calls slower than this are logged, sync or async.
-_STAGE3_COMPLETE_SLOW_MS = float(os.getenv("TPU_RAIDEN_COMPLETE_SLOW_MS", "100"))
 
 
 def _log_slow_stage3_complete(
     rank: int, req_id: str, start: float, *, asynchronous: bool
 ) -> None:
     elapsed_ms = (time.perf_counter() - start) * 1000
-    if elapsed_ms >= _STAGE3_COMPLETE_SLOW_MS:
+    if elapsed_ms >= tpu_envs.TPU_RAIDEN_COMPLETE_SLOW_MS:
         logger.info(
             "TPURaidenConnectorWorker rank%d --> complete_request_blocks "
             "took %.1f ms req_id=%s async=%s",
@@ -6932,7 +6928,7 @@ class TPURaidenConnectorWorker:
                 # release. Active ranks may race the idempotent aggregate
                 # cleanup RPC after genuine native completion.
                 if force_release:
-                    if _STAGE3_ASYNC_COMPLETE:
+                    if tpu_envs.TPU_RAIDEN_ASYNC_COMPLETE:
                         self._submit_stage3_async_complete(req_id, registration.uuid)
                     else:
                         start = time.perf_counter()
