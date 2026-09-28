@@ -74,8 +74,11 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   echo "${FILES_CHANGED}"
 
   # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE,
-  # .git-blame-ignore-revs)
-  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$)" || true)
+  # .git-blame-ignore-revs, .pyrefly-baseline.json). The pre-commit GitHub Action
+  # checks .pyrefly-baseline.json and no Buildkite step reads it.
+  # .pyrefly-baseline-full.json stays out of this list: only the Buildkite type
+  # check reads it.
+  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)" || true)
 
   if [[ -z "${NON_SKIPPABLE_FILES}" && -n "${FILES_CHANGED}" ]]; then
     echo "Only documentation/non-code files changed. Skipping CI build."
