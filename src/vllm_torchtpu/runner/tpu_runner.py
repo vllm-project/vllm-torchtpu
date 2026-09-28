@@ -907,6 +907,9 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
+        # Last upload per `_upload_unless_unchanged` slot:
+        # (key, device tensor, host source).
+        self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
         # Maximum query length to be considered a decode.
@@ -2937,8 +2940,12 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
-                torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
-                torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
+                self._upload_unless_unchanged(
+                    "rejected_seq_idx", torch.from_numpy(seq_idx_np)
+                ),
+                self._upload_unless_unchanged(
+                    "rejected_pos_idx", torch.from_numpy(pos_idx_np)
+                ),
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -2970,6 +2977,11 @@ class TPUModelRunner(GPUModelRunner):
                         num_draft_tokens,
                         self.query_start_loc_np[1 : num_reqs + 1],
                         padded_num_reqs,
+                        # Async: execute_model re-sources the drafts from the
+                        # device and uploads the host copy only as a fallback.
+                        defer_draft_token_ids=bool(
+                            self.scheduler_config.async_scheduling
+                        ),
                     )
                 )
 
@@ -2996,16 +3008,15 @@ class TPUModelRunner(GPUModelRunner):
             assert logits_indices is not None
             assert request_distribution is not None
         else:
-            # Compute and copy to device (first call or shape changed).
+            # Compute and copy to device (first call or shape changed). Spec
+            # steps miss the decode cache above but usually repeat the same
+            # query_start_loc, so reuse the last upload while it matches.
             if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_max_model_len + 1
-                ].to(self.device, non_blocking=True)
+                qsl_host = self.query_start_loc_cpu[: self.num_reqs_max_model_len + 1]
             else:
                 assert self.num_reqs_most_model_len is not None
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_most_model_len + 1
-                ].to(self.device, non_blocking=True)
+                qsl_host = self.query_start_loc_cpu[: self.num_reqs_most_model_len + 1]
+            query_start_loc = self._upload_unless_unchanged("query_start_loc", qsl_host)
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
@@ -3025,12 +3036,17 @@ class TPUModelRunner(GPUModelRunner):
             # no dedicated prefill-only bucket, and all remaining requests in
             # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
-            self._request_distribution_cpu[2] = num_reqs
-            request_distribution = self._request_distribution_cpu.to(
-                self.device, non_blocking=True
-            )
+            if self.mamba_slot_read_offsets is None:
+                self._request_distribution_cpu[0] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[2] = num_reqs
+                request_distribution = self._request_distribution_cpu.to(
+                    self.device, non_blocking=True
+                )
+            else:
+                # Replaced below by a view of the combined RPA + GDN upload;
+                # uploading it here as well would be thrown away.
+                request_distribution = None
 
             if can_cache_decode_metadata:
                 # Cache for future decode steps.
@@ -3081,6 +3097,7 @@ class TPUModelRunner(GPUModelRunner):
                 combined_device = combined.to(self.device, non_blocking=True)
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
+        assert request_distribution is not None
 
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -3166,6 +3183,24 @@ class TPUModelRunner(GPUModelRunner):
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+
+    def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
+        """`host.to(self.device)`, reusing `slot`'s previous upload when the
+        values have not changed.
+
+        Spec-decode steps miss the decode-only cache in `_prepare_inputs`, yet
+        in steady decode most of their small index tensors repeat step after
+        step. One entry per slot keeps memory bounded however the values vary.
+        The entry also holds `host`, so a temporary array stays alive while its
+        non-blocking upload may still be reading it.
+        """
+        key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
+        prev = self._h2d_reuse.get(slot)
+        if prev is not None and prev[0] == key:
+            return prev[1]
+        dev = host.to(self.device, non_blocking=True)
+        self._h2d_reuse[slot] = (key, dev, host)
+        return dev
 
     def _execute_mm_encoder(
         self,
@@ -3598,6 +3633,14 @@ class TPUModelRunner(GPUModelRunner):
                     input_ids,
                     spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices,
+                )
+            elif (
+                spec_decode_metadata is not None
+                and spec_decode_metadata.draft_token_ids is None
+            ):
+                # Nothing substituted this chunk, so the host drafts are real.
+                spec_decode_metadata.draft_token_ids = (
+                    spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
                 )
             draft_input_ids_src = input_ids
 
@@ -4055,6 +4098,7 @@ class TPUModelRunner(GPUModelRunner):
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
+        assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
         req_temperatures = req_top_k = req_top_p = None
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(

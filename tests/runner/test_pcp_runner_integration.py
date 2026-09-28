@@ -125,6 +125,10 @@ def _make_runner(
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
+    runner._h2d_reuse = {}
+    runner._upload_unless_unchanged = types.MethodType(
+        TPUModelRunner._upload_unless_unchanged, runner
+    )
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.

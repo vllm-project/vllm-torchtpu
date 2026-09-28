@@ -297,6 +297,27 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
 
 
+def test_spec_decode_metadata_deferred_draft_token_ids(device):
+    # Deferral leaves draft_token_ids unset and keeps its host copy, on the
+    # uncached and the cached path; uploading that copy gives the values the
+    # eager path uploads.
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
+    nd = np.array([3, 2], dtype=np.int32)
+    cu = np.array([4, 7], dtype=np.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    for step_ids in (input_ids, input_ids + 100):  # uncached, then cache hit
+        manager.runner.input_ids_cpu = step_ids
+        md = manager.get_spec_decode_metadata(nd, cu, 4, defer_draft_token_ids=True)
+        assert md.draft_token_ids is None
+        ref = _fresh_metadata_manager(device, step_ids).get_spec_decode_metadata(
+            nd, cu, 4
+        )
+        assert ref.deferred_draft_token_ids_cpu is None
+        uploaded = md.upload_deferred_draft_token_ids(device)
+        assert uploaded.device.type == device.type
+        assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+
+
 def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
     # Any change in the key inputs must rebuild, with values matching an
     # uncached build.

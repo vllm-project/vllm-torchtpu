@@ -2299,3 +2299,27 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+def test_upload_unless_unchanged_reuses_only_identical_values(device):
+    """Spec steps reuse the previous upload of a small tensor while its values
+    repeat. New values, dtype or shape upload again, and slots never share an
+    entry."""
+    runner = SimpleNamespace(device=device, _h2d_reuse={})
+
+    def upload(slot, host):
+        return TPUModelRunner._upload_unless_unchanged(runner, slot, host)
+
+    a = upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32))
+    assert upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32)) is a
+    b = upload("qsl", torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert b is not a
+    assert torch.equal(b.cpu(), torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert upload("idx", torch.tensor([0, 4, 8, 12], dtype=torch.int32)) is not b
+
+    # Same bytes, different dtype or shape: not a match.
+    z = upload("z", torch.zeros(4, dtype=torch.int32))
+    zf = upload("z", torch.zeros(4, dtype=torch.float32))
+    assert zf is not z and zf.dtype == torch.float32
+    z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
+    assert z22 is not zf and tuple(z22.shape) == (2, 2)
