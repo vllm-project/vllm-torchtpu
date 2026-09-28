@@ -73,6 +73,11 @@
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_hybrid_pcp_coordinator_patch`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `resolve_kv_cache_block_sizes`"
     },
     {
@@ -169,6 +174,11 @@
       "path": "src/vllm_torchtpu/core/pp_chunk_scheduler.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[int, ...] | None` is not assignable to parameter `schedule` with type `tuple[int, int, int] | None` in function `vllm_torchtpu.core.pp_chunks.StepCostModel.fit`"
+    },
+    {
+      "path": "src/vllm_torchtpu/core/prefix_aware_scheduler.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `RequestQueue` has no attribute `remove`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/ep_mesh.py",
@@ -2079,16 +2089,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/kernel.py",
       "name": "unbound-name",
       "concise_description": "`capture_active` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/schedule.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `consumer_rank` with type `int` in function `_rank_request_layout`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/schedule.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `consumer_rank` with type `int` in function `_rank_tile`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/vllm_adapter.py",
@@ -5681,6 +5681,56 @@
       "concise_description": "Object of class `Tensor` has no attribute `head_dim`"
     },
     {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `window_size`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `window_size`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `non_causal_multi_token_decode`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Module` has no attribute `non_causal_multi_token_decode`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Literal[True]` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `swa_cache_layer`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `fused_wqa_wkv`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Tensor` has no attribute `kv_norm`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Self@DSparkDeepseekV4Model` is not assignable to parameter `self` with type `DeepseekV4Model` in function `vllm_torchtpu.models.vllm.deepseek_v4.model.DeepseekV4Model.mhc_post_op`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `DSparkDeepseekV4Model` is not assignable to parameter `self` with type `DeepseekV4Model` in function `vllm_torchtpu.models.vllm.deepseek_v4.model.DeepseekV4Model.load_weights`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
       "name": "bad-return",
       "concise_description": "Returned type `Tensor` is not assignable to declared return type `Parameter`"
@@ -7026,14 +7076,79 @@
       "concise_description": "Argument `Tensor | None` is not assignable to parameter `grammar_bitmask` with type `Tensor` in function `StructuredDecodingManager.structured_decode`"
     },
     {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "bad-override",
+      "concise_description": "Class member `PromptTokenIdsTensor.__getitem__` overrides parent class `Tensor` in an inconsistent manner"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "bad-override",
+      "concise_description": "Class member `PromptTokenIdsTensor.values` overrides parent class `Tensor` in an inconsistent manner"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_sum`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_count`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_sum`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_count`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_sum`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_count`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_sum`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `PoolingStates` has no attribute `mean_pool_count`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `list[Tensor | None]` is not assignable to declared return type `Tensor | list[Tensor]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "bad-assignment",
+      "concise_description": "`(self: TPUMeanPool, hidden_states: Tensor, pooling_metadata: PoolingMetadata) -> SequencePoolingMethodOutput` is not assignable to attribute `forward` with type `(self: MeanPool, hidden_states: Tensor, pooling_metadata: PoolingMetadata) -> SequencePoolingMethodOutput`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
+      "name": "bad-assignment",
+      "concise_description": "`(self: Unknown, pooled_data: Unknown, pooling_metadata: Unknown) -> Tensor | list[Unknown | None] | list[Tensor]` is not assignable to attribute `forward` with type `(self: EmbeddingPoolerHead, pooled_data: SequencePoolingMethodOutput, pooling_metadata: PoolingMetadata) -> SequencePoolerHeadOutput`"
+    },
+    {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 0 positional arguments, got 2 in function `vllm.v1.pool.metadata.PoolingStates.__init__`"
+      "name": "bad-assignment",
+      "concise_description": "`(batch: Unknown) -> PoolingMetadata` is not assignable to attribute `get_pooling_metadata` with type `(self: InputBatch) -> PoolingMetadata`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7282,13 +7397,13 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `indices_do_sample` with type `Tensor` in function `TPUModelRunner.compute_selected_logits`"
+      "name": "missing-attribute",
+      "concise_description": "Object of type `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown | None` has no attribute `pooler`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown | None` has no attribute `pooler`"
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `indices_do_sample` with type `Tensor` in function `TPUModelRunner.compute_selected_logits`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7544,11 +7659,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `AttentionImpl` has no attribute `decode_query_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown` has no attribute `modules`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -8244,6 +8354,36 @@
       "path": "src/vllm_torchtpu/spec_decode/dspark.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `draft_sample_method`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `enable_adaptive_verification`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dspark_draft_topk`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `draft_sample_method`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `enable_adaptive_verification`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dspark_draft_topk`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dspark.py",

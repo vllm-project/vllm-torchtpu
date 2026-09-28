@@ -18,6 +18,11 @@
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_hybrid_pcp_coordinator_patch`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `resolve_kv_cache_block_sizes`"
     },
     {
