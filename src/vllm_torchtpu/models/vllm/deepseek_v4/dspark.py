@@ -119,6 +119,10 @@ def _insert_context_kv(
         metadata.request_distribution.clone(),
         attn.attn_sink,
     )
+    # TODO: this runs the full attention op to write the K/V rows into
+    # the SWA cache and throws the attention output away. Replace with
+    # a dedicated paged-cache insert kernel (like RPA's
+    # ragged_kv_cache_update) once one exists for the DSV4 SWA layout.
     _, new_sw_cache = attn.attn_op(*operands)
     if new_sw_cache is not None and new_sw_cache.numel() > 0:
         orig_sw_cache.copy_(new_sw_cache)
