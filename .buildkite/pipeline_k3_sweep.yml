@@ -79,6 +79,7 @@ steps:
   - label: "K3_SWEEP must be eval, perf or both"
     key: k3_sweep_bad_selector
     if: 'build.env("K3_SWEEP") != null && build.env("K3_SWEEP") != "eval" && build.env("K3_SWEEP") != "perf" && build.env("K3_SWEEP") != "both"'
+    timeout_in_minutes: 10
     agents:
       queue: cpu_64_core
     commands:
@@ -86,6 +87,7 @@ steps:
 
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
+    timeout_in_minutes: 60
     agents:
       queue: cpu_64_core
     commands:

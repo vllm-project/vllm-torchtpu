@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+echo "~~~ :broom: Cleaning up containers and host resources"
+
+# Force-kill all running/hung containers so TPU hardware locks are freed
+RUNNING_CONTAINERS=$(docker ps -q)
+if [ -n "${RUNNING_CONTAINERS}" ]; then
+  echo "Terminating running/hung containers..."
+  echo "${RUNNING_CONTAINERS}" | xargs -r docker rm -f || true
+fi
+
+# Prune stopped containers and dangling images (preserves BuildKit layer cache)
+docker container prune -f || true
+docker image prune -f || true
+
+# Clean temporary evaluation logs and results from workspace
+rm -rf perf_eval_results/* 2>/dev/null || true

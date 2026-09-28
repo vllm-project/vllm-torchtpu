@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -30,6 +31,7 @@ steps:
 
       - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_16_queue"
         env:
@@ -43,6 +45,7 @@ steps:
       - label: "Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
         if: "build.pull_request.id != null"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_8_queue"
         commands:
@@ -58,6 +61,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-correctness"
         key: "integration_qwen35_gpc_correctness"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_16_queue"
         commands:
@@ -67,7 +71,7 @@ steps:
 
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -80,6 +84,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -133,6 +138,7 @@ steps:
 
       - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
         key: "vllm_torchtpu_multihost_presubmit"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_16_queue"
         commands:
@@ -248,6 +254,7 @@ steps:
 
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
+        timeout_in_minutes: 45
         agents:
           queue: "tpu_v7x_2_queue"
         commands:

@@ -13,10 +13,12 @@
 # limitations under the License.
 
 x-unit-test-defaults: &unit_test_defaults
+  timeout_in_minutes: 60
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 
 x-cpu-unit-test-defaults: &cpu_unit_test_defaults
+  timeout_in_minutes: 60
   depends_on: "build_docker"
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run
@@ -117,6 +119,7 @@ steps:
       - label: "Unit Tests - Speculative Decoding Multichip (PR)"
         key: "unit_tests_spec_decode_multichip_pr"
         <<: *unit_test_defaults
+        timeout_in_minutes: 90
         if: 'build.env("NIGHTLY") != "1"'
         agents:
           queue: "tpu_v7x_8_queue"
@@ -148,6 +151,7 @@ steps:
       - label: "Unit Tests - Speculative Decoding Multichip (Nightly)"
         key: "unit_tests_spec_decode_multichip_nightly"
         <<: *unit_test_defaults
+        timeout_in_minutes: 90
         if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"

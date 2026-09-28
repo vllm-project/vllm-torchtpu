@@ -62,6 +62,7 @@ steps:
   # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
+    timeout_in_minutes: 60
     agents:
       queue: cpu_64_core
     commands:
@@ -75,6 +76,7 @@ steps:
   - label: "[demo] offline_inference.py (Qwen3-0.6B)"
     key: demo_offline_inference
     depends_on: build_docker
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_2_queue
     commands:
@@ -97,6 +99,7 @@ steps:
   - label: "[demo] pytest one file"
     key: demo_pytest
     depends_on: build_docker
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_2_queue
     commands:
@@ -117,6 +120,7 @@ steps:
   - label: "[demo] stress: pytest one file (run {{matrix}})"
     key: demo_stress
     depends_on: build_docker
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_2_queue
     matrix: ["1", "2", "3", "4", "5"]

@@ -18,6 +18,7 @@ steps:
     steps:
       - label: ":docker: Build and Push CI Image"
         key: "build_docker"
+        timeout_in_minutes: 60
         agents:
           queue: cpu_64_core
         commands:

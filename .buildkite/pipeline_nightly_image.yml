@@ -18,6 +18,7 @@ steps:
     steps:
       - label: ":docker: Build and Publish Nightly Images (ci, dev, prod)"
         key: "publish_nightly_images"
+        timeout_in_minutes: 60
         agents:
           queue: cpu_64_core
         commands:

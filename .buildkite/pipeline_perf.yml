@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
         key: "perf_eval_general_tpu_v7x_8"
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         parallelism: 3
@@ -47,6 +48,7 @@ steps:
 
       - label: "Perf/Eval: qwen3-0.6b-tp1"
         key: "perf_qwen3_0_6b_tp1"
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_2_queue"
         env:
@@ -59,6 +61,7 @@ steps:
       # Nightly runs
       - label: "Perf/Eval: Nightly general suite (TPU v7x-8)"
         key: "perf_eval_nightly_general_tpu_v7x_8"
+        timeout_in_minutes: 120
         if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"
@@ -80,6 +83,7 @@ steps:
       - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -100,6 +104,7 @@ steps:
       - label: "Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full (TPU v7x-8)"
         key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep_full"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -118,6 +123,7 @@ steps:
       - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp1_dp8_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -132,6 +138,7 @@ steps:
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp2_dp4_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -153,6 +160,7 @@ steps:
       - label: "Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_16_queue"
         env:
@@ -175,6 +183,7 @@ steps:
       - label: "Perf: Nightly glm-5.2-fp8-mp-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_16_queue"
         env:
@@ -239,6 +248,7 @@ steps:
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_5_397b_fp8_tp8_dp1_ep"
         if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_8_queue"
         env:
