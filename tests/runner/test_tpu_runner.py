@@ -1526,6 +1526,10 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
         kv_transfer_config=None,
     )
     resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
