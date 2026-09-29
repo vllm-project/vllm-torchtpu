@@ -45,10 +45,6 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
-from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
-    unified_kv_layout_enabled_for_architecture,
-)
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -67,6 +63,7 @@ from vllm_torchtpu.layers.core.gdn_attention import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -89,6 +86,9 @@ if TYPE_CHECKING:
         query_start_loc: torch.Tensor
         request_distribution: torch.Tensor
         mamba_state_indices: torch.Tensor | None
+
+
+logger = init_logger(__name__)
 
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -502,24 +502,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
-            conv_state_dtype = getattr(
-                torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
+        # TODO(kyuyeunk): Add support for performant bf16 conv state.
+        if conv_state_dtype != torch.float32:
+            logger.info(
+                "Overriding conv_state_dtype=%s to fp32 due to performance "
+                "implications.",
+                conv_state_dtype,
             )
-        else:
-            # TODO: Support bf16 conv state.
-            # Per-layer cache: unlike the pool, the declared dtype IS the
-            # storage dtype (vLLM strides the raw tensor with it), and this
-            # kernel path still reads fp32 conv state. Nothing pads this
-            # layout, so the wider declaration costs only its own bytes.
-            conv_state_dtype = torch.float32
+        conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:

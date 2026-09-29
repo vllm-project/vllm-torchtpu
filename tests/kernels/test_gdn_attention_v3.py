@@ -33,8 +33,7 @@ def gdn_attention_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -55,6 +54,7 @@ def gdn_attention_ref(
     sequence chunks directly in Python loop using query_start_loc boundaries.
     """
 
+    conv_state, recurrent_state = states
     num_tokens = qkv.shape[0]
     num_valid_seqs = int(distribution[2])
 
@@ -160,8 +160,7 @@ def gdn_attention_spec_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -183,6 +182,7 @@ def gdn_attention_spec_ref(
     `state_indices[s] + read_offsets[s]` and writes the state after window
     position t to slot `state_indices[s] + t`.
     """
+    conv_state, recurrent_state = states
     num_tokens = qkv.shape[0]
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
@@ -406,8 +406,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=A_log,
@@ -535,8 +534,7 @@ class GDNAttentionTest(parameterized.TestCase):
             mixed_qkv,
             b,
             a,
-            conv_state,
-            recurrent_state,
+            (conv_state, recurrent_state),
             conv_weight,
             conv_bias,
             A_log,
@@ -559,8 +557,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=A_log,
@@ -584,8 +581,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 qkv=mixed_qkv[spec_token_end:],
                 b=b[spec_token_end:],
                 a=a[spec_token_end:],
-                conv_state=ref_conv,
-                recurrent_state=ref_rec,
+                states=(ref_conv, ref_rec),
                 conv_weight=conv_weight,
                 conv_bias=conv_bias,
                 a_log=A_log,
@@ -720,8 +716,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         # Reference run: fresh-zero slots.
         (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-            conv_state=conv_state_fresh,
-            recurrent_state=recurrent_state_fresh,
+            states=(conv_state_fresh, recurrent_state_fresh),
             **common_kwargs,
         )
         # Stale-slot run: same inputs, but the slots already contain a
@@ -729,8 +724,7 @@ class GDNAttentionTest(parameterized.TestCase):
         # masks that out; outputs and the writeback at the active slots
         # must match the fresh-zero run.
         (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-            conv_state=conv_state_stale,
-            recurrent_state=recurrent_state_stale,
+            states=(conv_state_stale, recurrent_state_stale),
             **common_kwargs,
         )
 
@@ -820,8 +814,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_full,
             b=b,
             a=a,
-            conv_state=conv_state_zero,
-            recurrent_state=recurrent_state_zero,
+            states=(conv_state_zero, recurrent_state_zero),
             query_start_loc=jnp.array([0, full]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([full], dtype=jnp.int32),
@@ -833,8 +826,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_a,
             b=b[:half],
             a=a[:half],
-            conv_state=conv_state_zero,
-            recurrent_state=recurrent_state_zero,
+            states=(conv_state_zero, recurrent_state_zero),
             query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([half], dtype=jnp.int32),
@@ -848,8 +840,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_b,
             b=b[half:],
             a=a[half:],
-            conv_state=conv_after_a,
-            recurrent_state=rec_after_a,
+            states=(conv_after_a, rec_after_a),
             query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([full], dtype=jnp.int32),

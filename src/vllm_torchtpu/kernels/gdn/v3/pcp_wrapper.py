@@ -38,7 +38,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref, pcp_metadata, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    config,
+    legacy_unified,
+    memory_ref,
+    pcp_metadata,
+    wrapper,
+)
 from vllm_torchtpu.kernels.gdn.v3.projection_scale import normalize_projection_scale
 
 
@@ -1172,7 +1178,7 @@ def _scatter_compact_state_updates(
     num_active_seqs: jax.Array,
     *,
     state_stride: int,
-    region: config.StateRegion,
+    region: legacy_unified.StateRegion,
     whole_block_dma: bool,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
@@ -1216,7 +1222,7 @@ def _scatter_compact_state_updates(
 def _compact_state_updates_shape(
     state_source: jax.Array,
     num_sequences: int,
-    region: config.StateRegion,
+    region: legacy_unified.StateRegion,
     *,
     whole_block_dma: bool,
 ) -> jax.ShapeDtypeStruct:
@@ -1233,7 +1239,9 @@ def _compact_state_updates_shape(
     return jax.ShapeDtypeStruct((num_sequences, *region_shape), state_source.dtype)
 
 
-def _validate_compact_state_writeback_plan(state_plan: config.StateSourcePlan) -> None:
+def _validate_compact_state_writeback_plan(
+    state_plan: legacy_unified.StateSourcePlan,
+) -> None:
     """Reject whole-page state plans that cannot be scattered independently.
 
     The PCP kernel emits separate compact Conv and recurrent updates. With HND
@@ -1307,7 +1315,7 @@ def fused_qkvz_projection_pcp_gdn(
     comm_chunk_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    state_plan: config.StateSourcePlan,
+    state_plan: legacy_unified.StateSourcePlan,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:

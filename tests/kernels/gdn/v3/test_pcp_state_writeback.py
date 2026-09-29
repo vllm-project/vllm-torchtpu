@@ -17,11 +17,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.gdn.v3 import config, pcp_wrapper
+from vllm_torchtpu.kernels.gdn.v3 import legacy_unified, pcp_wrapper
 
 
-def _region(*, kb0: int, nblocks: int, row0: int, nrows: int) -> config.StateRegion:
-    return config.StateRegion(
+def _region(
+    *, kb0: int, nblocks: int, row0: int, nrows: int
+) -> legacy_unified.StateRegion:
+    return legacy_unified.StateRegion(
         kb0=kb0,
         nblocks=nblocks,
         row0=row0,
@@ -89,7 +91,7 @@ def test_hnd_compact_state_scatter_replaces_complete_page():
 
 
 def test_hnd_compact_state_writeback_accepts_disjoint_aligned_pages():
-    plan = config.StateSourcePlan(
+    plan = legacy_unified.StateSourcePlan(
         stride=3,
         conv=_region(kb0=2, nblocks=1, row0=0, nrows=16),
         recurrent=_region(kb0=0, nblocks=2, row0=0, nrows=256),
@@ -117,9 +119,11 @@ def test_hnd_compact_state_writeback_accepts_disjoint_aligned_pages():
     ],
 )
 def test_hnd_compact_state_writeback_rejects_unsafe_page_plans(
-    conv: config.StateRegion, recurrent: config.StateRegion, message: str
+    conv: legacy_unified.StateRegion,
+    recurrent: legacy_unified.StateRegion,
+    message: str,
 ):
-    plan = config.StateSourcePlan(
+    plan = legacy_unified.StateSourcePlan(
         stride=3,
         conv=conv,
         recurrent=recurrent,

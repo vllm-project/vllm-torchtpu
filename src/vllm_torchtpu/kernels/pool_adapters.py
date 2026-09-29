@@ -37,24 +37,14 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from vllm import envs
 
 from vllm_torchtpu.kernels import typed_ldst
-from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
-
-
-def is_seq_along_lane_pool() -> bool:
-    """True if pool uses the SEQ_ON_LANE
-    (nb, heads2, packed_d, pack, page_size) layout."""
-    return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+from vllm_torchtpu.kernels.gdn.v3 import legacy_unified
 
 
 def _pool_geometry(pool):
     """(block_size, payload dims between token and lane, lanes)."""
     assert pool.ndim >= 3, pool.shape
-    if is_seq_along_lane_pool():
-        page_size = pool.shape[-1]
-        return page_size, tuple(pool.shape[1:-1]), pool.shape[-1]
     return pool.shape[1], tuple(pool.shape[2:-1]), pool.shape[-1]
 
 
@@ -490,7 +480,7 @@ def v3_state_source(
     kernel_size: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     qk_pair_layout: bool = False,
-) -> gdn_v3_config.StateSourcePlan:
+) -> legacy_unified.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -513,10 +503,7 @@ def v3_state_source(
     independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
-    if is_seq_along_lane_pool():
-        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
-    else:
-        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+    tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
     recurrent_state_dtype = jnp.dtype(recurrent_state_dtype)
 
     ssm_rows = n_v * d_k
@@ -557,7 +544,7 @@ def v3_state_source(
     else:
         ssm_view_dtype = recurrent_state_dtype
 
-    ssm = gdn_v3_config.StateRegion(
+    ssm = legacy_unified.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
@@ -594,7 +581,7 @@ def v3_state_source(
         conv_rows_perm = _conv_qk_pair_rows_perm(
             kernel_size - 1, conv_dim, n_v, d_v, lanes
         )
-    conv = gdn_v3_config.StateRegion(
+    conv = legacy_unified.StateRegion(
         kb0=kb0,
         nblocks=1,
         row0=row0,
@@ -604,9 +591,5 @@ def v3_state_source(
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,
     )
-    return gdn_v3_config.StateSourcePlan(
-        stride=split,
-        conv=conv,
-        recurrent=ssm,
-        whole_block_dma=is_seq_along_lane_pool(),
-    )
+
+    return legacy_unified.StateSourcePlan(stride=split, conv=conv, recurrent=ssm)

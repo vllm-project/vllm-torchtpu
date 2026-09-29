@@ -48,51 +48,6 @@ class Dtypes:
     conv_state: jnp.dtype
 
 
-@dataclasses.dataclass(frozen=True)
-class StateRegion:
-    """Copy-plan for one state region of an indexed external state source.
-
-    A slot's region spans ``nblocks`` consecutive source blocks starting
-    ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
-    of each — one contiguous DMA per slot. The raw bytes are accessed
-    through a typed view (``view_dtype`` elements, ``lane_split``-way
-    128-lane split); the leading ``rows_used`` typed rows carry the
-    state, the rest is zero padding.
-    """
-
-    kb0: int
-    nblocks: int
-    row0: int
-    nrows: int
-    view_dtype: jnp.dtype
-    lane_split: int
-    rows_used: int
-    # Optional static typed-row permutation between the pool's stored row
-    # order and the kernel's logical row order: logical_rows[i] is stored
-    # at typed row rows_perm[i].  None or the identity means the stored
-    # order IS the logical order.  Used by the QK pair-blocked conv layout,
-    # where full-width states interleave Q and K row-pairs per tap so that
-    # one whole pool token holds one head-pair's Q and K rows.
-    rows_perm: tuple[int, ...] | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class StateSourcePlan:
-    """States live in an indexed external source instead of dense per-slot
-    tensors: each state index owns a window of ``stride`` consecutive
-    source blocks holding both state regions.
-
-    The plan describes one checkpoint's geometry. With speculative
-    decoding every checkpoint is an independent source block named by
-    ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
-    so nothing here varies with the verify window."""
-
-    stride: int
-    conv: StateRegion
-    recurrent: StateRegion
-    whole_block_dma: bool = False
-
-
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -111,7 +66,6 @@ class GDNConfig:
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
     num_buffers: int = 2
-    state_plan: StateSourcePlan | None = None
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The
     # kernel reads a sequence's initial state from
@@ -122,6 +76,27 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Indicate the use of unified pool.
+    is_shared: bool = False
+    # TODO: Delete this after unified pool migration completes.
+    state_plan: Any = None
+
+    @property
+    def conv_hbm_offset(self) -> int:
+        if self.is_shared:
+            # In Unified pool. Conv state is stored after recurrent state.
+            # Offset is calculated via recurrent state size.
+            lane_bytes = pltpu.get_tpu_info().num_lanes * 4
+            lane_elements = (
+                lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+            )
+            num_elements = self.v_dim_size * self.kq_head_dim
+            return num_elements // lane_elements
+        return 0
+
+    @property
+    def recurrent_hbm_offset(self) -> int:
+        return 0
 
     @property
     def chunk_size(self) -> int:

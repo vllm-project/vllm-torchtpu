@@ -123,8 +123,10 @@ def run_jax_gdn_attention(
         P(None, "model"),  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
-        P(None, None, "model"),  # conv_state
-        P(None, "model", None, None),  # recurrent_state
+        (
+            P(None, None, "model"),  # states: conv
+            P(None, "model", None, None),  # states: recurrent
+        ),
         P("model", None, None),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
@@ -185,8 +187,7 @@ def run_jax_gdn_attention(
         j_mixed_qkv,
         j_b,
         j_a,
-        conv_state,
-        recurrent_state,
+        (conv_state, recurrent_state),
         j_conv_weight,
         j_conv_bias,
         j_A_log,
@@ -713,8 +714,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                 qkv_shard,
                 b_shard,
                 a_shard,
-                conv_state_,
-                recurrent_state_,
+                (conv_state_, recurrent_state_),
                 weight_shard,
                 bias_shard,
                 A_shard,
@@ -879,30 +879,18 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    conv_dim = conv_weight.shape[0]
-    # Fused conv+GDN kernel: both state regions stream directly
-    # between the pool and the kernel's double-buffered pipeline (one
-    # contiguous DMA per slot per region) — no external gather/scatter
-    # round trip. The kernel masks fresh slots via has_initial_state,
-    # so a newly-allocated block's bytes are never read, and padded
-    # slots move no bytes in either direction.
-    plan = _build_v3_pool_state_plan(
-        recurrent_state,
-        conv_dim=conv_dim,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
-        recurrent_state_dtype=recurrent_state_dtype,
-    )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    # Pool's second dim refers to physical block size while pool_block_tokens
+    # refers to logical block size. Therefore, we perform reshape so that first
+    # dim can refer to number of logical blocks.
+    # NOTE: reshape along non last two dims is free.
+    pool_shape = recurrent_state.shape
+    pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
+
+    pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
-        None,
-        None,
+        pool,
         conv_weight,
         conv_bias,
         A_log,
@@ -918,11 +906,11 @@ def run_jax_gdn_attention_pooled_local(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        state_source=recurrent_state,
-        state_plan=plan,
+        recurrent_dtype=jnp.dtype(recurrent_state_dtype),
+        conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
     )
-    return recurrent_state, output
+    return pool.reshape(pool_shape), output
 
 
 def run_jax_gdn_attention_pooled(

@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.layers.core import gdn_attention
 
@@ -53,7 +52,11 @@ BENCH_PAYLOAD = (1, 4)
 BENCH_TOK_BYTES = int(np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(np.int8).itemsize)
 BENCH_SSM_NTOK = BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_TOK_BYTES
 BENCH_CONV_TOK0 = BENCH_SSM_NTOK
-BENCH_CONV_NTOK = 128
+BENCH_CONV_NTOK = 256  # fp32 conv: 3 * 12288 * 4 = 144 KiB
+# Granule coordinates of the two regions -- all the kernel is told.
+BENCH_GRANULE = 512
+BENCH_WORDS_PER_GRANULE = BENCH_GRANULE // 4
+BENCH_SSM_GRANULES = BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_GRANULE
 BENCH_MANAGER_TOKENS = 4352
 BENCH_SPLIT = BENCH_MANAGER_TOKENS // BENCH_KBS
 BENCH_NUM_MGR = 2  # null slot and one active request
@@ -72,56 +75,50 @@ BENCH_DISTRIBUTION = np.array([0, 1, 1], dtype=np.int32)
 BENCH_SEQ_LENS = np.array([BENCH_NUM_TOKENS + 1], dtype=np.int32)
 
 
+def _benchmark_mgr_words(pool):
+    """The pool the way the kernel addresses it: one uint32 row per state.
+
+    A ref's `bitcast(uint32)` packs along the *second-minor* (sublane) axis,
+    so for a pool row `(..., packing, lanes)` a word spans one lane's `packing`
+    sublanes, not `packing` adjacent elements. Moving that axis minormost
+    first is what makes the host view agree with the kernel's granule stream.
+    """
+    words = jnp.moveaxis(pool, -2, -1).view(jnp.uint32)
+    return words.reshape(pool.shape[0] // BENCH_SPLIT, -1)
+
+
+def _benchmark_unwords(words, pool):
+    """Inverse of `_benchmark_mgr_words`."""
+    moved = words.reshape(*pool.shape[:-2], pool.shape[-1], 1).view(pool.dtype)
+    return jnp.moveaxis(moved, -2, -1).reshape(pool.shape)
+
+
 def _benchmark_write_states(pool, recurrent, conv):
-    recurrent_rows = recurrent.reshape(1, BENCH_N_V * BENCH_D_K, BENCH_D_V)
-    pool = pool_adapters.scatter_region(
-        pool,
-        recurrent_rows,
-        BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-    )
-    conv_rows = conv.astype(jnp.bfloat16).reshape(1, -1, BENCH_LANES)
-    conv_capacity_rows = (
-        BENCH_CONV_NTOK
-        * BENCH_TOK_BYTES
-        // (jnp.dtype(jnp.bfloat16).itemsize * BENCH_LANES)
-    )
-    conv_rows = jnp.pad(
-        conv_rows,
-        ((0, 0), (0, conv_capacity_rows - conv_rows.shape[1]), (0, 0)),
-    )
-    return pool_adapters.scatter_region(
-        pool,
-        conv_rows,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-    )
+    words = _benchmark_mgr_words(pool)
+    for granule0, payload in (
+        (0, jnp.asarray(recurrent, jnp.float32)),
+        (BENCH_SSM_GRANULES, jnp.asarray(conv, jnp.float32)),
+    ):
+        body = payload.reshape(1, -1).view(jnp.uint32)
+        start = granule0 * BENCH_WORDS_PER_GRANULE
+        words = words.at[BENCH_STATE_IDX, start : start + body.shape[1]].set(body)
+    return _benchmark_unwords(words, pool)
 
 
 def _benchmark_read_states(pool):
-    recurrent = pool_adapters.gather_region(
-        pool,
-        BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.float32,
-        out_lanes=BENCH_D_V,
-    ).reshape(1, BENCH_N_V, BENCH_D_K, BENCH_D_V)
-    conv = pool_adapters.gather_region(
-        pool,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.bfloat16,
-    )
-    conv_rows = (BENCH_KERNEL_SIZE - 1) * BENCH_DIM // BENCH_LANES
-    conv = conv[:, :conv_rows].reshape(1, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
+    words = _benchmark_mgr_words(pool)
+
+    def take(granule0, shape):
+        start = granule0 * BENCH_WORDS_PER_GRANULE
+        nwords = int(np.prod(shape))
+        return (
+            words[BENCH_STATE_IDX, start : start + nwords]
+            .view(jnp.float32)
+            .reshape(1, *shape)
+        )
+
+    recurrent = take(0, (BENCH_N_V, BENCH_D_K, BENCH_D_V))
+    conv = take(BENCH_SSM_GRANULES, (BENCH_KERNEL_SIZE - 1, BENCH_DIM))
     return conv, recurrent
 
 
@@ -153,10 +150,7 @@ def _benchmark_dense_five(
 ):
     def step(states, _):
         new_states, output = wrapper.fused_conv1d_gdn(
-            conv_state=states[0],
-            recurrent_state=states[1],
-            state_source=None,
-            state_plan=None,
+            states=states,
             **_benchmark_common_args(qkv, b, a, conv_weight, conv_bias, a_log, dt_bias),
         )
         return new_states, output
@@ -263,7 +257,7 @@ class TestProductionShapeDenseVsUnifiedPool:
         dense_conv = (
             jnp.zeros(
                 (BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, BENCH_DIM),
-                dtype=jnp.bfloat16,
+                dtype=jnp.float32,
             )
             .at[1]
             .set(initial_conv[0])
