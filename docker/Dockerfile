@@ -26,6 +26,14 @@ ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 RUN ln -sf "$(command -v python)" /usr/bin/python3 && \
     pip install --no-cache-dir uv
 
+# uv gets the torch-tpu registry password from the keyring CLI
+# (keyring-provider = "subprocess" in pyproject.toml), and the Artifact Registry
+# backend mints it from Application Default Credentials: on a CI host, the VM's
+# service account, through the metadata server. Installed as a uv tool so its
+# dependencies stay out of the environment the project installs into.
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --no-cache \
+      keyring==25.7.0 --with keyrings.google-artifactregistry-auth==1.1.2
+
 WORKDIR /workspace/vllm-torchtpu
 
 # Copy pyproject.toml to extract dependencies and read settings
@@ -43,18 +51,29 @@ ENV CXX=g++
 ENV CC=gcc
 ENV VLLM_TARGET_DEVICE=empty
 
-# Install all dependencies from pyproject.toml. We mount the gcloud token secret
-# to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# Install all dependencies from pyproject.toml, from the private torch-tpu
+# registry with PyPI as a fallback. The registry password comes from keyring
+# (above) unless the build is given a gcloud_token secret. That is how a build
+# on a workstation authenticates, since its build container has no metadata
+# server to reach.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
-    TOKEN=""; \
-    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
-    if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
+    INDEX=https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/; \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
-    export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+    if [ -s /run/secrets/gcloud_token ]; then \
+      echo "torch-tpu registry: authenticating with the gcloud_token secret"; \
+      UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(cat /run/secrets/gcloud_token)"; \
+      export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD; \
+    else \
+      echo "torch-tpu registry: authenticating with Application Default Credentials"; \
+      keyring get "${INDEX}" oauth2accesstoken >/dev/null || { \
+        echo "No Application Default Credentials in the build container. Outside GCE, pass ACCESS_TOKEN to build_image.sh." >&2; \
+        exit 1; \
+      }; \
+    fi; \
     uv pip install --system \
-      --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
+      --index "${INDEX}" \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
       -r pyproject.toml

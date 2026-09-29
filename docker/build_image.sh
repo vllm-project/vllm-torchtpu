@@ -22,6 +22,12 @@ The Dockerfile copies <repo>/vllm into the image. The script stages that
 directory itself (a copy of --vllm-source, or an empty directory) and removes it
 when it exits. If <repo>/vllm already exists with content, the script refuses
 to touch it; pass it with --vllm-source to use it in place.
+
+The build reads the private torch-tpu registry with the Application Default
+Credentials of the host it runs on, which on a GCE VM come from the metadata
+server. On a workstation the build container cannot reach those, so pass a
+token instead:
+  ACCESS_TOKEN="\$(gcloud auth print-access-token)" ./docker/build_image.sh
 USAGE
 }
 
@@ -91,27 +97,6 @@ fi
 
 echo "vLLM Commit Hash: $VLLM_COMMIT_HASH"
 
-if [ -z "${ACCESS_TOKEN:-}" ]; then
-  if command -v gcloud >/dev/null 2>&1; then
-    ACCESS_TOKEN="$(gcloud auth print-access-token)"
-    export ACCESS_TOKEN
-  elif command -v curl >/dev/null 2>&1; then
-    METADATA_TOKEN_JSON="$(curl -sf -H "Metadata-Flavor: Google" \
-      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-      || true)"
-    ACCESS_TOKEN="$(printf '%s' "${METADATA_TOKEN_JSON}" | \
-      sed -nE 's/.*"access_token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
-    if [ -n "${ACCESS_TOKEN}" ]; then
-      export ACCESS_TOKEN
-    fi
-  fi
-fi
-
-if [ -z "${ACCESS_TOKEN:-}" ]; then
-  echo "Missing ACCESS_TOKEN and gcloud is unavailable. Private registry authentication will fail."
-  exit 1
-fi
-
 # The staged directory is removed only when this script created it. The EXIT
 # trap also runs after the INT and TERM handlers, so an interrupted or failed
 # docker build leaves nothing behind.
@@ -161,6 +146,8 @@ DOCKER_ARGS=(
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
 
+# Without ACCESS_TOKEN the build authenticates to the torch-tpu registry with
+# the build host's Application Default Credentials; see the usage text.
 if [ -n "${ACCESS_TOKEN:-}" ]; then
   DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
 fi

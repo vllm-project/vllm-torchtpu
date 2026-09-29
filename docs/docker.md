@@ -50,6 +50,16 @@ For example, to pull the Developer Image from May 23, 2026:
 docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20260523
 ```
 
+## Registry authentication for builds
+
+The build installs `torch-tpu` from a private Artifact Registry repository. It authenticates with the Application Default Credentials of the host it runs on. On a GCE VM, such as a CI agent, those come from the VM's service account through the metadata server, and no token is needed.
+
+A build on a workstation cannot reach those credentials from inside the build container, so pass an access token instead:
+
+```bash
+ACCESS_TOKEN="$(gcloud auth print-access-token)" ./docker/build_image.sh --target dev -t dev:latest
+```
+
 ## Image targets
 
 ### `ci:latest`
