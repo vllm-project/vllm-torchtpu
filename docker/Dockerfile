@@ -45,6 +45,8 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# vLLM is no longer a core dependency (see the [vllm] extra in pyproject.toml),
+# so it is pulled in explicitly with --extra vllm.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -57,7 +59,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      -r pyproject.toml \
+      --extra vllm
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -115,7 +118,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
       sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
     fi
 
-# Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
+# Scoped to the vllm-torchtpu-core dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \

@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm_torchtpu"
+name = "vllm-torchtpu-core"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
@@ -12,7 +12,7 @@ readme = "README.md"
 # unsatisfiable-requirements failure partway through a Docker build.
 requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm_torchtpu Contributors" }
+    { name = "vllm-torchtpu-core Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,9 +27,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    # vllm: see the [vllm] extra below.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -75,6 +73,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# vLLM for dev / CI / Docker. Deliberately NOT in `dependencies`: the combined
+# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
+# on top would overwrite it. Opt in with `pip install -e ".[vllm]"`.
+vllm = [
+    # Note: we **intentionally** build vllm from source, see README.
+    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+]
+
 # Required for running tests
 test = [
     # tests/kernels/ and tests/layers/ use absl.testing.

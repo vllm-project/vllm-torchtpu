@@ -79,8 +79,8 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
-# Install vLLM-TorchTPU and dependencies
-VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
+# Install vLLM-TorchTPU and dependencies ([vllm] pulls vLLM from source)
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e ".[vllm]"
 ```
 
 #### Option B: Using `pip`
@@ -96,8 +96,8 @@ pip install keyring keyrings.google-artifactregistry-auth
 # Set the PIP_INDEX_URL environment variable (using keyring)
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-# Install vLLM-TorchTPU and dependencies
-VLLM_TARGET_DEVICE="empty" pip install --pre -e .
+# Install vLLM-TorchTPU and dependencies ([vllm] pulls vLLM from source)
+VLLM_TARGET_DEVICE="empty" pip install --pre -e ".[vllm]"
 ```
 
 ### 3. \[Optional\] Install vLLM
