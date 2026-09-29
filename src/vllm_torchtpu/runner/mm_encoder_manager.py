@@ -21,7 +21,7 @@ def _pack_encoder_items(
         count = tokens[index]
         if not 0 < count <= budgets[-1]:
             raise ValueError(
-                f"Encoder TP with attention DP and EP requires each image to fit "
+                f"Coordinated encoding requires each image to fit "
                 f"an encoder graph bucket; got {count} tokens, maximum {budgets[-1]}"
             )
         if indices and (len(indices) == max_items or total + count > budgets[-1]):
@@ -220,20 +220,31 @@ class MMEncoderManager(EncoderCudaGraphManager):
     def execute_dp_coordinated(
         self, mm_kwargs: dict[str, Any] | None, input_error: str | None = None
     ) -> list[torch.Tensor]:
-        """Run encoder TP in lockstep across attention-DP engines sharing EP."""
-        from vllm.distributed.parallel_state import get_dp_group
+        """Run encoding in lockstep across attention-DP engines sharing EP."""
+        from vllm.distributed.parallel_state import (
+            get_dp_group,
+            get_ep_group,
+            get_tp_group,
+        )
 
-        if self.use_dp or tuple(self.path_token_budgets) != ("default",):
+        if tuple(self.path_token_budgets) != ("default",):
             raise ValueError(
-                "Coordinated encoding requires tensor-parallel encoder weights "
-                "and a single default encoder path"
+                "Coordinated encoding requires a single default encoder path"
             )
+        all_tokens: list[int] = []
+        assignment: list[int] = []
+        images_per_rank = [0] * get_tp_group().world_size if self.use_dp else []
         tokens: list[int] = []
         batches: list[tuple[list[int], int]] = []
         try:
             if input_error is not None:
                 raise ValueError(input_error)
             if mm_kwargs is not None:
+                if self.use_dp:
+                    all_tokens = self._get_per_item_out_tokens(mm_kwargs)
+                    mm_kwargs, assignment, images_per_rank, _ = self._dp_shard(
+                        mm_kwargs, all_tokens
+                    )
                 specs = self._get_item_specs(mm_kwargs)
                 tokens = [spec.output_tokens for spec in specs]
                 batches = _pack_encoder_items(
@@ -243,19 +254,19 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 )
         except (KeyError, TypeError, ValueError) as exc:
             input_error = str(exc)
-        group = get_dp_group()
+        group = get_ep_group() if self.use_dp else get_dp_group()
         plans: list[Any] = [None] * group.world_size
         torch.distributed.all_gather_object(
             plans,
-            (input_error, [budget for _, budget in batches]),
+            (input_error, [budget for _, budget in batches], sum(tokens)),
             group=group.cpu_group,
         )
-        errors = [error for error, _ in plans if error is not None]
+        errors = [error for error, _, _ in plans if error is not None]
         if errors:
             raise ValueError(f"Invalid coordinated encoder inputs: {errors}")
         outputs: dict[int, torch.Tensor] = {}
-        for step in range(max(len(plan) for _, plan in plans)):
-            budget = max(plan[step] if step < len(plan) else 0 for _, plan in plans)
+        for step in range(max(len(plan) for _, plan, _ in plans)):
+            budget = max(plan[step] if step < len(plan) else 0 for _, plan, _ in plans)
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
@@ -277,6 +288,48 @@ class MMEncoderManager(EncoderCudaGraphManager):
                     dict(self.budget_templates["default"][budget]), path="default"
                 )
             synchronize_tensors(output, wait=True)
+        local_outputs = [outputs[index] for index in range(len(tokens))]
+        if self.use_dp:
+            return self._gather_dp_outputs(
+                local_outputs,
+                all_tokens,
+                assignment,
+                images_per_rank,
+                max(count for _, _, count in plans),
+            )
+        return local_outputs
+
+    def _gather_dp_outputs(
+        self,
+        local_outputs: list[torch.Tensor],
+        tokens: list[int],
+        assignment: list[int],
+        images_per_rank: list[int],
+        max_tokens: int,
+    ) -> list[torch.Tensor]:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        padded = torch.zeros(
+            (max_tokens, self.config.out_hidden_size),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        offset = 0
+        for output in local_outputs:
+            padded[offset : offset + len(output)].copy_(output)
+            offset += len(output)
+        synchronize_tensors(padded, wait=True)
+        gathered = get_tp_group().all_gather(padded, dim=0)
+        # Empty engines must materialize the collective before discarding its output.
+        synchronize_tensors(gathered, wait=True)
+        outputs: dict[int, torch.Tensor] = {}
+        start = 0
+        for rank, count in enumerate(images_per_rank):
+            offset = rank * max_tokens
+            for index in assignment[start : start + count]:
+                outputs[index] = gathered[offset : offset + tokens[index]]
+                offset += tokens[index]
+            start += count
         return [outputs[index] for index in range(len(tokens))]
 
     def precompile_vision_encoder(self) -> None:

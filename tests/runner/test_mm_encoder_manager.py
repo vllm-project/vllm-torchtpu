@@ -248,8 +248,8 @@ def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
     )
 
     def gather(plans, local, *, group):
-        assert local == (None, [4, 4] if active else [])
-        plans[:] = [local, (None, [8, 8, 8]), (None, [])]
+        assert local == (None, [4, 4] if active else [], 8 if active else 0)
+        plans[:] = [local, (None, [8, 8, 8], 24), (None, [], 0)]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     synchronize = Mock()
@@ -294,12 +294,80 @@ def test_coordinated_encoder_propagates_peer_input_errors(manager, monkeypatch):
     )
 
     def gather(plans, local, *, group):
-        plans[:] = [local, ("image exceeds largest bucket", [])]
+        plans[:] = [local, ("image exceeds largest bucket", [], 0)]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     with pytest.raises(ValueError, match="image exceeds largest bucket"):
         manager.execute_dp_coordinated(None)
     manager._compiled_budget_forward.assert_not_called()
+
+
+@pytest.mark.parametrize("counts", [[3, 1, 4], [3], []])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
+    manager, monkeypatch, counts, rank
+):
+    manager.use_dp = True
+    manager.config.out_hidden_size = 2
+    manager.path_token_budgets = {"default": [4, 8]}
+    manager.budget_templates = {"default": manager.budget_templates["global"]}
+    tp = SimpleNamespace(world_size=2, rank_in_group=rank, all_gather=Mock())
+    ep = SimpleNamespace(world_size=4, cpu_group=object())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: ep)
+    synchronize = Mock()
+    monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
+    assignments = (
+        [[2], [0, 1]] if len(counts) == 3 else [[0], []] if counts else [[], []]
+    )
+
+    def plans_gather(plans, local, *, group):
+        assert group is ep.cpu_group
+        local_tokens = sum(counts[i] for i in assignments[rank])
+        assert local == (None, [4] if local_tokens else [], local_tokens)
+        plans[:] = [local, (None, [8, 8], 12), (None, [], 0), (None, [], 0)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", plans_gather)
+    manager.model.get_encoder_cudagraph_item_specs.side_effect = lambda kwargs: [
+        EncoderItemSpec(input_size=4 * counts[i], output_tokens=counts[i])
+        for i in kwargs["indices"]
+    ]
+    manager.model.select_encoder_cudagraph_items.side_effect = lambda kwargs, indices: {
+        "indices": [kwargs["indices"][i] for i in indices]
+    }
+    manager._run_budget_graph = Mock(return_value=torch.zeros(8, 2))
+    manager._compiled_budget_forward.return_value = torch.zeros(8, 2)
+
+    def postprocess(graphs, indices, tokens, outputs, *, batch_mm_kwargs, **kwargs):
+        for local, original in zip(indices, batch_mm_kwargs["indices"], strict=True):
+            outputs[local] = torch.full((tokens[local], 2), original + 1.0)
+
+    manager.model.postprocess_encoder_output.side_effect = postprocess
+    gathered = torch.zeros(24, 2)
+    for peer, assigned in enumerate(assignments):
+        offset = peer * 12
+        for index in assigned:
+            gathered[offset : offset + counts[index]] = index + 1
+            offset += counts[index]
+
+    def tensors_gather(padded, *, dim):
+        assert dim == 0
+        torch.testing.assert_close(padded, gathered[rank * 12 : (rank + 1) * 12])
+        assert synchronize.call_args == call(padded, wait=True)
+        return gathered
+
+    tp.all_gather.side_effect = tensors_gather
+    outputs = manager.execute_dp_coordinated(
+        {"indices": list(range(len(counts)))} if counts else None
+    )
+    assert [o.shape[0] for o in outputs] == counts
+    for index, output in enumerate(outputs):
+        torch.testing.assert_close(output, torch.full((counts[index], 2), index + 1.0))
+    assert manager._compiled_budget_forward.call_count == (
+        1 if assignments[rank] else 2
+    )
+    assert synchronize.call_args == call(gathered, wait=True)
+    tp.all_gather.assert_called_once()
 
 
 @pytest.mark.parametrize(

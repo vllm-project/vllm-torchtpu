@@ -3167,7 +3167,7 @@ class TPUModelRunner(GPUModelRunner):
                 if mm_kwargs:
                     if self.lora_config or any(m != "image" for m, _ in mm_kwargs):
                         raise ValueError(
-                            "Coordinated encoder TP supports images without LoRA"
+                            "Coordinated encoding supports images without LoRA"
                         )
                     batches = list(
                         group_and_batch_mm_kwargs(
