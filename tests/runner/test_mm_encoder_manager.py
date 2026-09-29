@@ -4,6 +4,8 @@ from unittest.mock import Mock, call
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
 from vllm_torchtpu.runner import mm_encoder_manager as mm
 
@@ -205,7 +207,10 @@ def test_replay_counts_items_and_passes_padded_values(manager):
     manager.model.encoder_eager_forward.assert_not_called()
 
 
-def test_replay_failure_uses_original_inputs_for_eager_fallback(manager):
+@pytest.mark.parametrize("allow_eager_fallback", [True, False])
+def test_replay_failure_uses_original_inputs_for_eager_fallback(
+    manager, allow_eager_fallback
+):
     mm_kwargs = {"images": object()}
     manager.model.prepare_encoder_cudagraph_replay_buffers.return_value = (
         SimpleNamespace(values={"pixels": torch.ones(2, 2)})
@@ -220,9 +225,81 @@ def test_replay_failure_uses_original_inputs_for_eager_fallback(manager):
         return output
 
     manager.model.encoder_eager_forward.side_effect = eager
+    if not allow_eager_fallback:
+        with pytest.raises(RuntimeError, match="execute"):
+            manager._run_budget_graph(mm_kwargs, 8, "local", allow_eager_fallback=False)
+        manager.model.encoder_eager_forward.assert_not_called()
+        return
     assert manager._run_budget_graph(mm_kwargs, 8, "local") is output
     assert manager.graph_hits == 0
     assert manager.graph_misses == 2
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
+    manager, monkeypatch, active
+):
+    manager.path_token_budgets = {"default": [4, 8]}
+    manager.budget_templates = {"default": manager.budget_templates["global"]}
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=3, cpu_group=None),
+    )
+
+    def gather(plans, local, *, group):
+        assert local == (None, [4, 4] if active else [])
+        plans[:] = [local, (None, [8, 8, 8]), (None, [])]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    synchronize = Mock()
+    monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
+    counts = [3, 1, 4]
+    manager.model.get_encoder_cudagraph_item_specs.return_value = [
+        EncoderItemSpec(input_size=4 * count, output_tokens=count) for count in counts
+    ]
+    manager.model.select_encoder_cudagraph_items.side_effect = lambda kwargs, indices: {
+        "indices": indices
+    }
+    manager._run_budget_graph = Mock(return_value=torch.zeros(8, 2))
+    manager._compiled_budget_forward.return_value = torch.zeros(8, 2)
+
+    def postprocess(graphs, indices, tokens, outputs, **kwargs):
+        for index in indices:
+            outputs[index] = torch.full((tokens[index], 2), index)
+
+    manager.model.postprocess_encoder_output.side_effect = postprocess
+    outputs = manager.execute_dp_coordinated({} if active else None)
+    assert [o.shape[0] for o in outputs] == (counts if active else [])
+    for index, output in enumerate(outputs):
+        assert (output == index).all()
+    assert manager._run_budget_graph.call_args_list == (
+        [
+            call({"indices": [1, 0]}, 8, allow_eager_fallback=False),
+            call({"indices": [2]}, 8, allow_eager_fallback=False),
+        ]
+        if active
+        else []
+    )
+    assert manager._compiled_budget_forward.call_count == (1 if active else 3)
+    assert synchronize.call_count == 3
+
+
+def test_coordinated_encoder_propagates_peer_input_errors(manager, monkeypatch):
+    manager.path_token_budgets = {"default": [4, 8]}
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=None),
+    )
+
+    def gather(plans, local, *, group):
+        plans[:] = [local, ("image exceeds largest bucket", [])]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="image exceeds largest bucket"):
+        manager.execute_dp_coordinated(None)
+    manager._compiled_budget_forward.assert_not_called()
 
 
 @pytest.mark.parametrize(

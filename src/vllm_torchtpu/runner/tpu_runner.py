@@ -51,6 +51,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -110,7 +111,10 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
-from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_encoder_manager import (
+    MMEncoderManager,
+    maybe_create_mm_encoder_manager,
+)
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
@@ -680,6 +684,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
+        self._dp_step_has_encoder_inputs = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3103,7 +3108,11 @@ class TPUModelRunner(GPUModelRunner):
         return num_chunks, max_chunk_reqs
 
     def _dp_coordinated_step(
-        self, local_num_tokens: int, local_num_chunks: int, local_num_reqs: int = 0
+        self,
+        local_num_tokens: int,
+        local_num_chunks: int,
+        local_num_reqs: int = 0,
+        has_encoder_inputs: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         if not self._dp_lockstep_enabled():
@@ -3115,7 +3124,12 @@ class TPUModelRunner(GPUModelRunner):
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
         t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
+            [
+                int(local_num_tokens),
+                int(local_num_chunks),
+                int(local_num_reqs),
+                int(has_encoder_inputs),
+            ],
             dtype=torch.int64,
             device="cpu",
         )
@@ -3128,7 +3142,56 @@ class TPUModelRunner(GPUModelRunner):
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
+        self._dp_step_has_encoder_inputs = bool(t[3].item())
         return bucket, int(t[1].item())
+
+    def _execute_dp_mm_encoder(
+        self, scheduler_output: "SchedulerOutput | None" = None
+    ) -> None:
+        if not self._dp_step_has_encoder_inputs:
+            return
+        manager = cast(MMEncoderManager | None, self.encoder_cudagraph_manager)
+        if manager is None:
+            raise ValueError(
+                "Multimodal attention DP with EP requires encoder graph replay "
+                "(cudagraph_mm_encoder=True) and a supported model"
+            )
+        mm_hashes: list[str] = []
+        kwargs = None
+        input_error = None
+        try:
+            if scheduler_output is not None:
+                mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(
+                    scheduler_output
+                )
+                if mm_kwargs:
+                    if self.lora_config or any(m != "image" for m, _ in mm_kwargs):
+                        raise ValueError(
+                            "Coordinated encoder TP supports images without LoRA"
+                        )
+                    batches = list(
+                        group_and_batch_mm_kwargs(
+                            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
+                        )
+                    )
+                    if len(batches) != 1:
+                        raise ValueError(
+                            "Coordinated encoding requires one image batch"
+                        )
+                    kwargs = batches[0][2]
+        except (KeyError, TypeError, ValueError) as exc:
+            input_error = str(exc)
+        synchronize_tensors()
+        outputs = manager.execute_dp_coordinated(kwargs, input_error=input_error)
+        synchronize_tensors()
+        if scheduler_output is not None:
+            for mm_hash, output in zip(mm_hashes, outputs, strict=True):
+                self._cache_encoder_output(
+                    mm_hash,
+                    output,
+                    scheduler_output.ec_manager_metadata,
+                    scheduler_output.free_encoder_mm_hashes,
+                )
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(
@@ -3140,11 +3203,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
-        """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
-        busy rank does — ALL target dummy forwards, then ALL draft dummy
-        forwards.
-        """
-        # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
+        """Pair encoder, target and draft collectives on an idle EP-DP rank."""
+        self._execute_dp_mm_encoder()
+        # Set before decoder dummies: both _run_dp_dummy_chunk and the draft
         # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
         # equal-token shape.
         self._dp_target_bucket = bucket
@@ -3209,21 +3270,34 @@ class TPUModelRunner(GPUModelRunner):
                         f"num_prompt_tokens={num_prompt}. "
                         "Set SamplingParams(max_tokens=1) at the service entry."
                     )
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output
+        )
+        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            local_num_reqs=local_max_chunk_reqs,
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+        )
+        self._dp_step_num_chunks = target_num_chunks
+
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs and self._pp_is_first:
-            has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
-            if has_encoder_inputs:
-                synchronize_tensors()
-            self._execute_mm_encoder(scheduler_output)
-            if has_encoder_inputs:
-                synchronize_tensors()
-
-        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
-            scheduler_output
-        )
+            if self._dp_lockstep_enabled():
+                self._execute_dp_mm_encoder(scheduler_output)
+            else:
+                has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+                if has_encoder_inputs:
+                    synchronize_tensors()
+                self._execute_mm_encoder(scheduler_output)
+                if has_encoder_inputs:
+                    synchronize_tensors()
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
@@ -3272,22 +3346,6 @@ class TPUModelRunner(GPUModelRunner):
                 mm_cumsum_np = np.concatenate(
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
                 )
-
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
-        )
-        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
-            local_num_chunks,
-            # Exact per-chunk request bound on this rank; the DP-wide MAX of
-            # it sizes every rank's draft forwards.
-            local_num_reqs=local_max_chunk_reqs,
-        )
-        # Retained for the spec-decode propose phase (sample_tokens): under
-        # EP-DP locksteps every rank must run the same number of draft forwards per
-        # step, and the coordinated chunk count from this one all-reduce is the shared
-        # bound — no additional draft-side collective is needed.
-        self._dp_step_num_chunks = target_num_chunks
 
         start_index = 0
         chunk_index = 0

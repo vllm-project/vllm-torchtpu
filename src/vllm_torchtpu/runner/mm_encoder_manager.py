@@ -11,6 +11,29 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 
+def _pack_encoder_items(
+    tokens: list[int], budgets: list[int], max_items: int
+) -> list[tuple[list[int], int]]:
+    batches: list[tuple[list[int], int]] = []
+    indices: list[int] = []
+    total = 0
+    for index in sorted(range(len(tokens)), key=tokens.__getitem__):
+        count = tokens[index]
+        if not 0 < count <= budgets[-1]:
+            raise ValueError(
+                f"Encoder TP with attention DP and EP requires each image to fit "
+                f"an encoder graph bucket; got {count} tokens, maximum {budgets[-1]}"
+            )
+        if indices and (len(indices) == max_items or total + count > budgets[-1]):
+            batches.append((indices, next(b for b in budgets if b >= total)))
+            indices, total = [], 0
+        indices.append(index)
+        total += count
+    if indices:
+        batches.append((indices, next(b for b in budgets if b >= total)))
+    return batches
+
+
 class MMEncoderManager(EncoderCudaGraphManager):
     """Per-budget PyTorch XLA-cache manager for the vision encoder forward.
 
@@ -153,6 +176,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        *,
+        allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
         num_items = len(self._get_item_specs(mm_kwargs))
@@ -177,6 +202,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_hits += num_items
             return out_tensor
         except Exception as e:
+            if not allow_eager_fallback:
+                raise
             logger.warning(
                 "[mm_encoder_manager] Compiled vision encoder forward failed "
                 "for budget=%d, path='%s': %s. Falling back to "
@@ -188,6 +215,69 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    @torch.no_grad()
+    def execute_dp_coordinated(
+        self, mm_kwargs: dict[str, Any] | None, input_error: str | None = None
+    ) -> list[torch.Tensor]:
+        """Run encoder TP in lockstep across attention-DP engines sharing EP."""
+        from vllm.distributed.parallel_state import get_dp_group
+
+        if self.use_dp or tuple(self.path_token_budgets) != ("default",):
+            raise ValueError(
+                "Coordinated encoding requires tensor-parallel encoder weights "
+                "and a single default encoder path"
+            )
+        tokens: list[int] = []
+        batches: list[tuple[list[int], int]] = []
+        try:
+            if input_error is not None:
+                raise ValueError(input_error)
+            if mm_kwargs is not None:
+                specs = self._get_item_specs(mm_kwargs)
+                tokens = [spec.output_tokens for spec in specs]
+                batches = _pack_encoder_items(
+                    [spec.get_path_output_tokens("default") for spec in specs],
+                    self.path_token_budgets["default"],
+                    self.max_batch_size,
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            input_error = str(exc)
+        group = get_dp_group()
+        plans: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            plans,
+            (input_error, [budget for _, budget in batches]),
+            group=group.cpu_group,
+        )
+        errors = [error for error, _ in plans if error is not None]
+        if errors:
+            raise ValueError(f"Invalid coordinated encoder inputs: {errors}")
+        outputs: dict[int, torch.Tensor] = {}
+        for step in range(max(len(plan) for _, plan in plans)):
+            budget = max(plan[step] if step < len(plan) else 0 for _, plan in plans)
+            if step < len(batches):
+                assert mm_kwargs is not None
+                indices, _ = batches[step]
+                kwargs = self._select_items(mm_kwargs, indices)
+                output = self._run_budget_graph(
+                    kwargs, budget, allow_eager_fallback=False
+                )
+                assert output is not None
+                self.model.postprocess_encoder_output(
+                    {"default": output},
+                    indices,
+                    tokens,
+                    outputs,
+                    clone=True,
+                    batch_mm_kwargs=kwargs,
+                )
+            else:
+                output = self._compiled_budget_forward(
+                    dict(self.budget_templates["default"][budget]), path="default"
+                )
+            synchronize_tensors(output, wait=True)
+        return [outputs[index] for index in range(len(tokens))]
 
     def precompile_vision_encoder(self) -> None:
         """Prime the XLA compilation cache for all configured token budgets."""

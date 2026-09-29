@@ -44,6 +44,21 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 
+def test_idle_dp_rank_encodes_before_decoder_pairing():
+    order = []
+    runner = SimpleNamespace(
+        _execute_dp_mm_encoder=lambda: order.append("encoder"),
+        _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        drafter=SimpleNamespace(
+            run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
+        ),
+    )
+    TPUModelRunner._run_dp_idle_pairing(runner, 8, 2)
+    assert runner._dp_target_bucket == 8
+    assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
+
+
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
         ["request-0", "request-1"], [7, 12]
