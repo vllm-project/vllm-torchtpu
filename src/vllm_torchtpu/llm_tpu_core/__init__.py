@@ -14,8 +14,11 @@ from vllm_torchtpu.llm_tpu_core import (
     distributed,
     kernels,
     kv_cache,
+    kv_transfer,
     layers,
     logger,
+    quantization,
+    runner,
 )
 
 __version__ = "0.1.0"
@@ -25,6 +28,9 @@ __all__ = [
     "distributed",
     "kernels",
     "kv_cache",
+    "kv_transfer",
     "layers",
     "logger",
+    "quantization",
+    "runner",
 ]

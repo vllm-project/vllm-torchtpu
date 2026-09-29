@@ -36,6 +36,15 @@ def is_block_major_enabled() -> bool:
     )
 
 
+def is_gdn_conv_qk_pair_layout_enabled() -> bool:
+    """Returns True if GDN conv QK pair layout is enabled via environment."""
+    return os.environ.get("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 @dataclass(frozen=True)
 class CoreCompilationConfig:
     """Minimal compilation parameters for hardware-adapted TPU kernels."""
