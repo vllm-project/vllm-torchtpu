@@ -20,6 +20,10 @@ from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.llm_tpu_core.layers.mamba_state_copy_op import (
+    copy_mamba_state_blocks,
+    copy_mamba_state_rows,
+)
 from vllm_torchtpu.llm_tpu_core.layers.moe import (
     NEG,
     MoERouter,
@@ -50,6 +54,8 @@ __all__ = [
     "_counting_sort_positions",
     "_select_ragged_gather_reduce",
     "apply_rotary_pos_emb",
+    "copy_mamba_state_blocks",
+    "copy_mamba_state_rows",
     "fused_moe_func",
     "gmm_wrapper",
     "moe_gmm",
