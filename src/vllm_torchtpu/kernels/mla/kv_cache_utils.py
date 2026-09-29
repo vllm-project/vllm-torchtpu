@@ -27,6 +27,7 @@ from vllm_torchtpu.llm_tpu_core.kernels.mla.kv_cache_utils import (
     pack_tokens,
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
+    update_sparse_mla_kv_cache_dcp_jax,
     update_sparse_mla_kv_cache_jax,
 )
 
@@ -51,5 +52,6 @@ __all__ = [
     "pack_tokens",
     "update_sparse_mla_kv_cache",
     "update_sparse_mla_kv_cache_dcp",
+    "update_sparse_mla_kv_cache_dcp_jax",
     "update_sparse_mla_kv_cache_jax",
 ]

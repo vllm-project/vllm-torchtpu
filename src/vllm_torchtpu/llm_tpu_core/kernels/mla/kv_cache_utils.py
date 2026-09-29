@@ -416,6 +416,98 @@ def update_sparse_mla_kv_cache_jax(
     )
 
 
+def update_sparse_mla_kv_cache_dcp_jax(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Pure-XLA `update_sparse_mla_kv_cache_dcp`, for every layout.
+
+    The DCP twin of `update_sparse_mla_kv_cache_jax`: runs on CPU, and is the
+    golden the SparseCore DCP writer is checked against. Same arguments and
+    returns as it.
+    """
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    page, slot = _get_dcp_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return (
+        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
+    )
+
+
+def _get_dcp_page_and_slot(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own."""
+    # `_check_inputs` asserts it equal to the rope page size, so one
+    # (page, slot) addresses both caches.
+    page_size = nope_spec.page_size
+    if interleave_size % WORD_BYTES:
+        raise ValueError(
+            f"interleave_size={interleave_size} must be a multiple of "
+            f"WORD_BYTES={WORD_BYTES}, or a rope tile -- which packs that many "
+            "consecutive tokens into one word -- would straddle two ranks."
+        )
+    if page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide "
+            f"page_size={page_size}. Otherwise an interleave chunk straddles "
+            "a page boundary and the local index a reader derives from the "
+            "global position stops agreeing with the (page, slot) written "
+            "here."
+        )
+
+    _, seq_id, pos, in_batch = _row_positions(num_tokens, seq_lens, query_start_loc)
+
+    virtual_page_size = jnp.int32(page_size * dcp_size)
+    cycle = jnp.int32(dcp_size * interleave_size)
+    interleave = jnp.int32(interleave_size)
+    offset = pos % virtual_page_size
+    owner = (offset % cycle) // interleave
+    slot = (offset // cycle) * interleave + (offset % interleave)
+
+    # Virtual ordinal -> physical block in this rank's own shard, exactly as
+    # the DCP readers resolve it.
+    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages)).reshape(
+        seq_lens.shape[0], -1
+    )
+    max_pages_per_seq = local_block_tables.shape[1]
+    virtual_page = jnp.clip(pos // virtual_page_size, 0, max_pages_per_seq - 1)
+
+    valid = jnp.logical_and(in_batch, owner == dcp_rank)
+    page = jnp.where(
+        valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
+    )
+    return page, slot
+
+
 def update_sparse_mla_kv_cache_dcp(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
