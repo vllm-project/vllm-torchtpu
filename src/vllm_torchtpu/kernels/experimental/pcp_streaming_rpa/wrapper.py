@@ -8,12 +8,14 @@ Re-exports core primitives from
 
 from vllm_torchtpu.llm_tpu_core.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME,
+    TP_AXIS_NAME,
     compute_pcp_local_mapping,
     sharded_pcp_ragged_paged_attention,
 )
 
 __all__ = [
     "PCP_AXIS_NAME",
+    "TP_AXIS_NAME",
     "compute_pcp_local_mapping",
     "sharded_pcp_ragged_paged_attention",
 ]

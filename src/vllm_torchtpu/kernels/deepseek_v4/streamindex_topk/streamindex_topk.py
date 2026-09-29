@@ -6,8 +6,16 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.kernels.deepseek_v4.streamindex_topk.streamindex_topk`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.deepseek_v4.streamindex_topk import (
-    streamindex_topk as _mod,
+import importlib
+
+_mod = importlib.import_module(
+    "vllm_torchtpu.llm_tpu_core.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
 )
 
-globals().update({k: getattr(_mod, k) for k in dir(_mod) if not k.startswith("_")})
+globals().update(
+    {
+        k: getattr(_mod, k)
+        for k in dir(_mod)
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+)
