@@ -52,8 +52,9 @@ class DFlashProposer:
     ):
         self.runner = runner
         self.vllm_config = vllm_config
-        self.speculative_config = vllm_config.speculative_config
-        assert self.speculative_config is not None
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.speculative_config = speculative_config
 
         # Read and normalize draft configurations
         hf_config = self.speculative_config.draft_model_config.hf_config
