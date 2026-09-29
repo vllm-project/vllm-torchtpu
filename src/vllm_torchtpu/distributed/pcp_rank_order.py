@@ -39,8 +39,6 @@ import contextlib
 import inspect
 from collections.abc import Iterator
 
-import numpy
-
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -134,28 +132,14 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
     # axis it is building. A ring is mesh[d, :, t] -- reading down the pcp
     # axis, hence the swap. A lane is mesh[d, p, :] -- along it, already
     # memory order. int() because these reach torch.distributed.new_group.
-    group_ranks_by_name = {
-        "pcp": [
-            [int(r) for r in ring]
-            for ring in numpy.swapaxes(mesh, 1, 2).reshape(-1, pcp_size)
-        ],
-        "tp": [
-            [int(r) for r in lane] for lane in numpy.asarray(mesh).reshape(-1, tp_size)
-        ],
-    }
+    from vllm_torchtpu.llm_tpu_core.distributed.pcp_rank_order import (
+        build_topology_mesh_groups,
+        validate_mesh_permutation,
+    )
 
-    # topology_aware_mesh promises a permutation of the global ranks. If it is
-    # not one, some rank is missing or duplicated and the groups we build from
-    # it would silently drop or double a worker.
+    group_ranks_by_name = build_topology_mesh_groups(mesh, pcp_size, tp_size)
     expected = list(range(dp_size * pcp_size * tp_size))
-    for axis, groups in group_ranks_by_name.items():
-        flat = sorted(r for group in groups for r in group)
-        if flat != expected:
-            raise RuntimeError(
-                f"topology_aware_mesh({mesh_shape}) produced {axis} groups "
-                f"{groups} whose ranks {flat} are not a permutation of "
-                f"{expected}."
-            )
+    validate_mesh_permutation(group_ranks_by_name, expected, mesh_shape)
 
     logger.info("Topology mesh | mesh_shape=%s -> %s", mesh_shape, group_ranks_by_name)
     return group_ranks_by_name

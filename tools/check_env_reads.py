@@ -49,6 +49,7 @@ BASELINE_PATH = REPO_ROOT / "tools" / "env_reads_baseline.txt"
 EXEMPT_PATHS = {
     PACKAGE / "envs.py",
     PACKAGE / "env_override.py",
+    PACKAGE / "llm_tpu_core" / "config.py",
 }
 
 # Process bootstrap, not user configuration. A name belongs here when this
