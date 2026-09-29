@@ -111,6 +111,7 @@ class SpecDecodeMetadataBuilder:
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             draft_flags_tensor, has_model_drafts = cls.build_draft_flags_tensor(
+                manager.runner,
                 num_draft_tokens,
                 padded_logits_length,
                 scheduled_spec_decode_flags,
