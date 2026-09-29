@@ -57,6 +57,11 @@ from vllm_torchtpu.llm_tpu_core.layers.rotary import (
 from vllm_torchtpu.llm_tpu_core.layers.swiglu import (
     SwiGLU,
 )
+from vllm_torchtpu.llm_tpu_core.layers.utils import (
+    inverse_reorder_for_sharding,
+    reorder_concatenated_tensor_for_sharding,
+    slice_sharded_tensor_for_concatenation,
+)
 
 __all__ = [
     "NEG",
@@ -93,4 +98,7 @@ __all__ = [
     "rowmax_topk",
     "run_jax_gdn_attention",
     "unpack_fp4_to_e2m1",
+    "inverse_reorder_for_sharding",
+    "reorder_concatenated_tensor_for_sharding",
+    "slice_sharded_tensor_for_concatenation",
 ]
