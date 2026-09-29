@@ -1858,6 +1858,11 @@
     {
       "path": "src/vllm_torchtpu/offload/raiden_store.py",
       "name": "missing-attribute",
+      "concise_description": "Object of type `object | None` has no attribute `set_eviction_callback`"
+    },
+    {
+      "path": "src/vllm_torchtpu/offload/raiden_store.py",
+      "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `lookup`"
     },
     {
@@ -1904,6 +1909,11 @@
       "path": "src/vllm_torchtpu/offload/raiden_store.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `status`"
+    },
+    {
+      "path": "src/vllm_torchtpu/offload/raiden_store.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `object | None` has no attribute `set_eviction_callback`"
     },
     {
       "path": "src/vllm_torchtpu/offload/raiden_store.py",
