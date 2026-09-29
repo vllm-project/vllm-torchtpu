@@ -64,6 +64,7 @@ head_ip() {
 # starts the engine's workers here; see warm_remote_code.py for why.
 warm_remote_code() {
   local uri
+  # shellcheck source=/dev/null
   uri=$(source "$REPO_DIR/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh" \
     >/dev/null && echo "$MODEL_URI") || return 1
   timeout 600 python3 "$HERE/warm_remote_code.py" "$uri"
@@ -134,6 +135,7 @@ kv_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\"
 # caching, and without prefix caching vLLM sizes a state block to the whole
 # max-model-len; with it the state blocks align to the attention blocks.
 # Exported, so the benchmark's config.json records what was served.
+# shellcheck disable=SC2031
 export KV_CACHE_DTYPE=auto
 export ENABLE_PREFIX_CACHING=true
 # As the nightly aggregated step: one untimed benchmark pass first.
