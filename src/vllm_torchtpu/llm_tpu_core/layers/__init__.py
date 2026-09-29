@@ -7,6 +7,19 @@ Strictly zero dependencies on vLLM.
 
 from __future__ import annotations
 
+from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
+    _counting_sort_positions,
+    _select_ragged_gather_reduce,
+    fused_moe_func,
+    gmm_wrapper,
+    moe_gmm,
+    prepare_routed_gmm_inputs,
+    quantize_to_native_fp4_kmajor,
+    ragged_gather_reduce,
+    requant_unpack_kmajor,
+    resolve_onehot_permute_threshold,
+    unpack_fp4_to_e2m1,
+)
 from vllm_torchtpu.llm_tpu_core.layers.moe import (
     NEG,
     MoERouter,
@@ -34,9 +47,20 @@ __all__ = [
     "RotaryEmbedding",
     "SwiGLU",
     "TopKResult",
+    "_counting_sort_positions",
+    "_select_ragged_gather_reduce",
     "apply_rotary_pos_emb",
+    "fused_moe_func",
+    "gmm_wrapper",
+    "moe_gmm",
+    "prepare_routed_gmm_inputs",
+    "quantize_to_native_fp4_kmajor",
+    "ragged_gather_reduce",
+    "requant_unpack_kmajor",
+    "resolve_onehot_permute_threshold",
     "rotate_gptj",
     "rotate_half",
     "rotate_neox",
     "rowmax_topk",
+    "unpack_fp4_to_e2m1",
 ]

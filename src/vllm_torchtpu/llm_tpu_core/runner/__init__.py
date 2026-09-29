@@ -14,6 +14,8 @@ from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
     rollback_offsets_seed,
     rollback_offsets_seed_impl,
     sample_from_logits,
+    staged_walk_products,
+    staged_walk_products_impl,
     substitute_placeholder_token,
 )
 from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
@@ -21,6 +23,9 @@ from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
 )
 from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
     rollback_offsets_seed_compiled as _rollback_offsets_seed_compiled,
+)
+from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
+    staged_walk_products_compiled as _staged_walk_products_compiled,
 )
 from vllm_torchtpu.llm_tpu_core.runner.padding import (
     MIN_NUM_SEQS,
@@ -46,6 +51,9 @@ __all__ = [
     "_rollback_offsets_seed_compiled",
     "rollback_offsets_seed_impl",
     "sample_from_logits",
+    "staged_walk_products",
+    "_staged_walk_products_compiled",
+    "staged_walk_products_impl",
     "substitute_placeholder_token",
     "MIN_NUM_SEQS",
     "get_num_slices_per_kv_cache_update_block",

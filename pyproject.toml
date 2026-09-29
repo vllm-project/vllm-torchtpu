@@ -166,6 +166,7 @@ ignore = [
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
 "src/vllm_torchtpu/llm_tpu_core/kernels/**" = ["B023", "E501"]
+"src/vllm_torchtpu/llm_tpu_core/layers/**" = ["E501"]
 
 [tool.ruff.format]
 docstring-code-format = true

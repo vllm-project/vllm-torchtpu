@@ -45,6 +45,36 @@ def is_gdn_conv_qk_pair_layout_enabled() -> bool:
     )
 
 
+def get_ragged_gather_reduce_version() -> str:
+    """Returns the configured SparseCore ragged gather reduce kernel version."""
+    return os.environ.get("RAGGED_GATHER_REDUCE_VERSION", "v2").lower()
+
+
+def get_tpu_moe_dense_expert_threshold() -> int:
+    """Tokens threshold above which dense matmuls replace ragged gathers in MoE."""
+    val = os.environ.get("TPU_MOE_DENSE_EXPERT_THRESHOLD", "0")
+    try:
+        return int(val)
+    except ValueError:
+        return 0
+
+
+def get_onehot_moe_permute_threshold() -> int | None:
+    """Explicit threshold for TensorCore one-hot MoE permute."""
+    val = os.environ.get("ONEHOT_MOE_PERMUTE_THRESHOLD")
+    if val is None or not val.strip():
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
+def get_tpu_moe_owner_output_mode() -> str:
+    """MoE owner output mode for EP combine."""
+    return os.environ.get("TPU_MOE_OWNER_OUTPUT_MODE", "off").lower()
+
+
 @dataclass(frozen=True)
 class CoreCompilationConfig:
     """Minimal compilation parameters for hardware-adapted TPU kernels."""

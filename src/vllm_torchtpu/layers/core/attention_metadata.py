@@ -20,6 +20,12 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.llm_tpu_core.runner import (
+    _staged_walk_products_compiled,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    staged_walk_products_impl as _staged_walk_products,
+)
 
 
 @functools.partial(
@@ -150,63 +156,6 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
-
-
-def _staged_walk_products(
-    staged_dev: torch.Tensor,
-    seq_lens: torch.Tensor,
-    table_geom: tuple,
-    mamba_geom: tuple,
-    ckpt_window: int,
-) -> tuple:
-    """Splits the staged flat block-table buffer into per-group tables and
-    derives unified-pool mamba state and checkpoint indices."""
-    outs = []
-    for off, n, t in table_geom:
-        outs.append(staged_dev[off : off + n * t].clone())
-    states = []
-    ckpts = []
-    if mamba_geom:
-        active = seq_lens > 0
-        for ti, t, bs in mamba_geom:
-            off, n, _ = table_geom[ti]
-            tbl = staged_dev[off : off + n * t].view(n, t)
-            state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
-                torch.int64
-            )
-            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
-            states.append(torch.where(active, gathered, torch.zeros_like(gathered)))
-            if ckpt_window > 1:
-                ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
-                    ckpt_window, device=seq_lens.device, dtype=torch.int64
-                ).unsqueeze(0)
-                in_row = (ckpt_offsets < t) & active.unsqueeze(1)
-                safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
-    return tuple(outs) + tuple(states) + tuple(ckpts)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _staged_walk_products_compiled(
-    staged_dev: torch.Tensor,
-    seq_lens: torch.Tensor,
-    table_geom: tuple,
-    mamba_geom: tuple,
-    ckpt_window: int,
-) -> tuple:
-    """One device program for everything the metadata walk consumes:
-    per-group block-table splits (graph outputs are distinct buffers, so no
-    per-group eager clone) plus the unified-pool mamba state/checkpoint
-    gathers. `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
-    order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
-    ...)`; both are static per padding bucket. Returns `tables... +
-    states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
-    (dummy runs included) so warmup and lockstep ranks dispatch the same
-    program sequence.
-    """
-    return _staged_walk_products(
-        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
-    )
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):

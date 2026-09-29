@@ -112,6 +112,59 @@ def rollback_offsets_migrate(
     fn(read_offsets, src_t, dst_t)
 
 
+def staged_walk_products_impl(
+    staged_dev: torch.Tensor,
+    seq_lens: torch.Tensor,
+    table_geom: tuple,
+    mamba_geom: tuple,
+    ckpt_window: int,
+) -> tuple:
+    """Splits the staged flat block-table buffer into per-group tables and
+    derives unified-pool mamba state and checkpoint indices."""
+    outs = []
+    for off, n, t in table_geom:
+        outs.append(staged_dev[off : off + n * t].clone())
+    states = []
+    ckpts = []
+    if mamba_geom:
+        active = seq_lens > 0
+        for ti, t, bs in mamba_geom:
+            off, n, _ = table_geom[ti]
+            tbl = staged_dev[off : off + n * t].view(n, t)
+            state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
+                torch.int64
+            )
+            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
+            states.append(torch.where(active, gathered, torch.zeros_like(gathered)))
+            if ckpt_window > 1:
+                ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
+                    ckpt_window, device=seq_lens.device, dtype=torch.int64
+                ).unsqueeze(0)
+                in_row = (ckpt_offsets < t) & active.unsqueeze(1)
+                safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
+                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
+    return tuple(outs) + tuple(states) + tuple(ckpts)
+
+
+staged_walk_products_compiled = _tpu_compile_op(staged_walk_products_impl)
+
+
+def staged_walk_products(
+    staged_dev: torch.Tensor,
+    seq_lens: torch.Tensor,
+    table_geom: tuple,
+    mamba_geom: tuple,
+    ckpt_window: int,
+) -> tuple:
+    """Dispatches staged_walk_products to compiled TPU op or eager CPU."""
+    fn = (
+        staged_walk_products_compiled
+        if staged_dev.device.type == "tpu"
+        else staged_walk_products_impl
+    )
+    return fn(staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window)
+
+
 def _substitute_placeholder_token_impl(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
