@@ -7,4 +7,18 @@ Re-exports core primitives from `llm_tpu_core.kernels.router_topk`.
 
 from __future__ import annotations
 
-from vllm_torchtpu.llm_tpu_core.kernels.router_topk import *  # noqa: F403
+from vllm_torchtpu.llm_tpu_core.kernels.router_topk import (
+    MAX_BLOCK_ROWS,
+    NEG,
+    _select_kernel,
+    router_topk,
+    select,
+)
+
+__all__ = [
+    "MAX_BLOCK_ROWS",
+    "NEG",
+    "_select_kernel",
+    "router_topk",
+    "select",
+]

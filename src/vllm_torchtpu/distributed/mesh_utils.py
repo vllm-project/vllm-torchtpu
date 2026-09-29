@@ -18,4 +18,26 @@ Re-exports core primitives from `llm_tpu_core.distributed.mesh_utils`.
 
 from __future__ import annotations
 
-from vllm_torchtpu.llm_tpu_core.distributed.mesh_utils import *  # noqa: F403
+from vllm_torchtpu.llm_tpu_core.distributed.mesh_utils import (
+    _LAYOUT_CACHE,
+    _MESH_CACHE,
+    CpGroupLayout,
+    _collect_rank_to_device_id,
+    _get_current_global_rank,
+    _get_tpu_global_device_id,
+    get_cp_group_layout,
+    get_or_create_cp_mesh,
+    logger,
+)
+
+__all__ = [
+    "CpGroupLayout",
+    "_LAYOUT_CACHE",
+    "_MESH_CACHE",
+    "_collect_rank_to_device_id",
+    "_get_current_global_rank",
+    "_get_tpu_global_device_id",
+    "get_cp_group_layout",
+    "get_or_create_cp_mesh",
+    "logger",
+]
