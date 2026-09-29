@@ -226,6 +226,8 @@ def _spec_logprob_row_tokens(
     out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
     out = out.scatter(0, rows.flatten(), tokens.flatten())
     return out[:num_rows, None]
+
+
 logger = init_logger(__name__)
 
 
