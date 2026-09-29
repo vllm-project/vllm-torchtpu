@@ -198,7 +198,7 @@ class TestVllmEngineBuilder(unittest.TestCase):
         self.assertEqual(kwargs["gpu_memory_utilization"], 0.88)
         self.assertEqual(kwargs["kv_cache_dtype"], "fp8")
         self.assertTrue(kwargs["disable_chunked_mm_input"])
-        self.assertIn("download_dir", kwargs)
+        self.assertEqual(kwargs["download_dir"], os.path.join(HF_HOME, "hub"))
 
     def test_build_engine_kwargs_with_tracing(self):
         """Arrange-Act-Assert: Verify PyTorch/JAX profiler hook configuration."""
