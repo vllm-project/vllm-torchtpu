@@ -10,8 +10,9 @@ All tests run in-memory without PNG writes.
 import numpy as np
 import pytest
 from PIL import Image
-from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+from ...conftest import OmniRunner
 
 pytestmark = [
     pytest.mark.nightly,
@@ -40,15 +41,16 @@ class TestFluxNightlyOnTpu:
     """Nightly regression test suite for FLUX models on TPU v7x."""
 
     @pytest.mark.parametrize(
-        "model_id,steps,guidance",
+        "omni_runner,steps,guidance",
         [
             ("black-forest-labs/FLUX.1-schnell", 4, 0.0),
             ("black-forest-labs/FLUX.1-dev", 10, 3.5),
             ("black-forest-labs/FLUX.2-klein-4B", 4, 1.0),
         ],
+        indirect=["omni_runner"],
     )
     def test_flux_tri_model_matrix_tpu(
-        self, model_id: str, steps: int, guidance: float
+        self, omni_runner: OmniRunner, steps: int, guidance: float
     ):
         """Validate common path execution across the three FLUX variants on TPU v7x.
 
@@ -59,32 +61,28 @@ class TestFluxNightlyOnTpu:
             "neon reflections"
         )
 
-        omni = Omni(model_id, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                seed=42,
-            )
+        sampling_params = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            seed=42,
+        )
 
-            outputs = omni.generate(prompt, sampling_params)
-            assert outputs, f"Failed generation for model {model_id}"
+        outputs = omni_runner.generate(prompt, sampling_params)
+        assert outputs, f"Failed generation for model {omni_runner.model_name}"
 
-            img = _extract_image(outputs[0])
-            assert isinstance(img, Image.Image)
-            assert img.size == (512, 512)
+        img = _extract_image(outputs[0])
+        assert isinstance(img, Image.Image)
+        assert img.size == (512, 512)
 
-            metrics = compute_distribution_metrics(img)
-            assert 0.10 < metrics["mean"] < 0.90, (
-                f"Unnatural pixel mean on {model_id}: {metrics['mean']:.4f}"
-            )
-            assert metrics["var"] > 0.01, (
-                f"Image variance too low on {model_id} ({metrics['var']:.4f})"
-            )
-            assert metrics["p90"] > metrics["p10"], (
-                f"Collapsed dynamic range on {model_id}"
-            )
-        finally:
-            omni.shutdown()
+        metrics = compute_distribution_metrics(img)
+        assert 0.10 < metrics["mean"] < 0.90, (
+            f"Unnatural pixel mean on {omni_runner.model_name}: {metrics['mean']:.4f}"
+        )
+        assert metrics["var"] > 0.01, (
+            f"Image variance too low on {omni_runner.model_name} ({metrics['var']:.4f})"
+        )
+        assert metrics["p90"] > metrics["p10"], (
+            f"Collapsed dynamic range on {omni_runner.model_name}"
+        )
