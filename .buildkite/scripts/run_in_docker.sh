@@ -74,8 +74,11 @@ if [[ "${CPU_ONLY:-0}" == "1" ]]; then
   HOST_CACHE_ROOT="${HOME}/.cache/vllm-torchtpu-ci"
 fi
 
-# Ensure cache directory exists on the host
-mkdir -p "${HOST_CACHE_ROOT}/models"
+# Ensure cache directory exists on the host. Create hub/ here too, as the agent
+# user: other jobs on these agents mount this cache into root containers without
+# `umask 000`, so if one of them creates hub/ first it is 0755 root-owned and
+# stage_model_snapshot.sh can no longer add models (#1052).
+mkdir -p "${HOST_CACHE_ROOT}/models/hub"
 
 # The container runs as root, so reset_results_dir.sh handles results the
 # agent cannot remove.
