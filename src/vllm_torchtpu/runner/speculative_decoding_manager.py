@@ -205,19 +205,53 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        scheduled_spec_decode_flags: dict[str, list[int]] | None = None,
+        start_index: int = 0,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
-
-        Args:
-          num_draft_tokens: The number of draft tokens for each request.
-          cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
-          padded_num_reqs: The padded number of requests.
-
-        Returns:
-          A SpecDecodeMetadata object containing the necessary indices for
-          speculative decoding.
         """
+        from vllm_torchtpu.structured_spec_decoding.execution.metadata_builder import (
+            SpecDecodeMetadataBuilder,
+        )
+
+        return SpecDecodeMetadataBuilder.build_metadata(
+            self,
+            num_draft_tokens,
+            cu_num_scheduled_tokens,
+            padded_num_reqs,
+            scheduled_spec_decode_flags,
+            start_index,
+        )
+
+    @staticmethod
+    def _build_draft_flags_tensor(
+        self_or_runner,
+        num_draft_tokens: np.ndarray,
+        padded_logits_length: int,
+        scheduled_spec_decode_flags: dict[str, list[int]] | None,
+        start_index: int = 0,
+    ) -> tuple[torch.Tensor | None, bool]:
+        """Compatibility shim delegating to SpecDecodeMetadataBuilder."""
+        from vllm_torchtpu.structured_spec_decoding.execution.metadata_builder import (
+            SpecDecodeMetadataBuilder,
+        )
+
+        runner = getattr(self_or_runner, "runner", self_or_runner)
+        return SpecDecodeMetadataBuilder.build_draft_flags_tensor(
+            runner=runner,
+            num_draft_tokens=num_draft_tokens,
+            padded_logits_length=padded_logits_length,
+            scheduled_spec_decode_flags=scheduled_spec_decode_flags,
+            start_index=start_index,
+        )
+
+    def _get_spec_decode_metadata_legacy(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        padded_num_reqs: int,
+    ) -> SpecDecodeMetadata:
         cache_key = (
             num_draft_tokens.tobytes(),
             cu_num_scheduled_tokens.tobytes(),

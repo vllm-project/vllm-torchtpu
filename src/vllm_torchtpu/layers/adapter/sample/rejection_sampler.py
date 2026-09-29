@@ -58,17 +58,18 @@ class RejectionSampler:
         self,
         draft_token_ids: torch.Tensor,
         num_draft_tokens: torch.Tensor,
-        target_logits: torch.Tensor,
-        bonus_token_ids: torch.Tensor,
-        segment_ids: torch.Tensor,
-        group_indices: torch.Tensor,
-        max_draft_tokens: int,
+        target_logits: torch.Tensor | None = None,
+        bonus_token_ids: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+        group_indices: torch.Tensor | None = None,
+        max_draft_tokens: int = 0,
         temperatures: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
         top_p: torch.Tensor | None = None,
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -84,23 +85,25 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+            draft_flags=draft_flags,
         )
 
     def forward(
         self,
         draft_token_ids: torch.Tensor,
         num_draft_tokens: torch.Tensor,
-        target_logits: torch.Tensor,
-        bonus_token_ids: torch.Tensor,
-        segment_ids: torch.Tensor,
-        group_indices: torch.Tensor,
-        max_draft_tokens: int,
+        target_logits: torch.Tensor | None = None,
+        bonus_token_ids: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
+        group_indices: torch.Tensor | None = None,
+        max_draft_tokens: int = 0,
         temperatures: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
         top_p: torch.Tensor | None = None,
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -109,7 +112,9 @@ class RejectionSampler:
         Args:
           draft_token_ids: The token IDs from the draft model.
           num_draft_tokens: The number of draft tokens per sequence in the batch.
-          target_logits: The logits from the target model.
+          target_logits: The logits from the target model. If None, assumes all valid
+            draft tokens are GRAMMAR (flag 2) and unconditionally accepted, completely
+            bypassing target logits gathering and argmax reduction.
           bonus_token_ids: The bonus token IDs to append if all draft tokens are
             accepted.
           segment_ids: Segment IDs to group tokens by batch item.
@@ -122,11 +127,30 @@ class RejectionSampler:
           recover_u: Uniform random values used to sample recovered tokens.
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
+          draft_flags: Optional per-token draft flags (0=EMPTY, 1=MODEL, 2=GRAMMAR).
+            Tokens with flag == 2 bypass rejection and are unconditionally accepted.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
+        if target_logits is None or target_logits.numel() == 0:
+            if draft_flags is not None and (draft_flags == 1).any():
+                raise ValueError(
+                    "target_logits cannot be None when model draft tokens (flag=1) require verification."  # noqa: E501
+                )
+            assert bonus_token_ids is not None
+            assert segment_ids is not None
+            assert group_indices is not None
+            return _all_grammar_rejection_sample_with_segment(
+                draft_token_ids,
+                num_draft_tokens,
+                bonus_token_ids,
+                segment_ids,
+                group_indices,
+                max_draft_tokens,
+            )
+
         if do_sampling:
             if (
                 temperatures is None
@@ -154,6 +178,7 @@ class RejectionSampler:
                 recover_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+                draft_flags,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -168,7 +193,68 @@ class RejectionSampler:
             accept_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
+            draft_flags,
         )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _all_grammar_rejection_sample_with_segment(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """Fast-path rejection sampling when all valid draft tokens are GRAMMAR (flag 2).
+
+    Every valid draft token is unconditionally accepted without materializing
+    or reducing target logits.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+
+    draft_token_ids = draft_token_ids.to(torch.int32)
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    match_mask = segment_ids.unsqueeze(0) == batch_indices
+    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
+    valid_slot_mask = torch.any(
+        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
+    )
+
+    selected_tokens = torch.full(
+        (batch_size + 1, max_draft_tokens + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    segment_ids = segment_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+    scatter_segment_ids = torch.where(
+        valid_slot_mask,
+        segment_ids,
+        torch.full_like(segment_ids, batch_size),
+    )
+    scatter_group_indices = torch.where(
+        valid_slot_mask, group_indices, torch.zeros_like(group_indices)
+    )
+
+    if total_tokens > 0:
+        main_tokens = torch.where(
+            valid_slot_mask & (draft_token_ids >= 0),
+            draft_token_ids,
+            torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+        )
+        selected_tokens[scatter_segment_ids, scatter_group_indices] = main_tokens
+
+    if batch_size > 0:
+        batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+        accepted_count = num_draft_tokens.to(torch.int64)
+        selected_tokens[batch_range, accepted_count] = bonus_token_ids.to(torch.int32)
+
+    return selected_tokens[:batch_size]
 
 
 def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
@@ -187,12 +273,7 @@ def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     # E.g., [0, 1, 2, 0, 1, 0, 1, 2, 3] for sequences [3, 2, 4].
     # We can use cumsum and subtraction.
     cum_draft_tokens = torch.cumsum(num_draft_tokens, dim=0)
-    segment_starts = torch.cat(
-        [
-            torch.zeros(1, dtype=num_draft_tokens.dtype, device=device),
-            cum_draft_tokens[:-1],
-        ]
-    )
+    segment_starts = cum_draft_tokens - num_draft_tokens
     broadcast_starts = torch.repeat_interleave(segment_starts, num_draft_tokens)
     group_indices = (torch.arange(total_tokens, device=device) - broadcast_starts).to(
         torch.int32
@@ -212,6 +293,7 @@ def _greedy_rejection_sample_with_segment(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -246,6 +328,13 @@ def _greedy_rejection_sample_with_segment(
             accepted = (accept_u < conditional_rates) & (draft_token_ids >= 0)
         else:
             accepted = draft_token_ids == target_logits_argmax
+        if draft_flags is not None:
+            # A GRAMMAR flag forces acceptance, but it must never resurrect a
+            # -1 padding slot: that would emit PLACEHOLDER_TOKEN_ID as a real
+            # output token. (The stochastic kernel below gets this for free by
+            # ANDing with ``valid_draft_token_ids`` right after the OR.)
+            is_grammar = (draft_flags.to(device) == 2) & (draft_token_ids >= 0)
+            accepted = is_grammar | accepted
         mismatch_indices = torch.where(
             valid_slot_mask & ~accepted,
             group_indices,
@@ -285,7 +374,9 @@ def _greedy_rejection_sample_with_segment(
             ),
         )
     else:
-        main_tokens = torch.tensor([], dtype=torch.int32, device=device)
+        main_tokens = torch.full(
+            (total_tokens,), PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device
+        )
 
     # Step 4: Handle Bonus Tokens
     all_accepted = first_mismatch_idx_per_segment == large_value
@@ -327,13 +418,14 @@ def _greedy_rejection_sample_with_segment(
         first_mismatch_idx_per_segment,
     ).to(torch.int64)
 
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
-        should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
-    )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
+    if batch_size > 0:
+        batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+        bonus_token_at_accepted_count = torch.where(
+            should_get_bonus,
+            bonus_token_ids.to(torch.int32),
+            selected_tokens[batch_range, accepted_count],
+        )
+        selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
 
@@ -354,6 +446,7 @@ def _random_rejection_sample_with_segment(
     recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -386,6 +479,9 @@ def _random_rejection_sample_with_segment(
         accepted = accept_u < conditional_rates
     else:
         accepted = target_token_probs >= accept_u
+    if draft_flags is not None:
+        is_grammar = draft_flags.to(device) == 2
+        accepted = is_grammar | accepted
     accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
@@ -477,7 +573,9 @@ def _random_rejection_sample_with_segment(
             ),
         )
     else:
-        main_tokens = torch.tensor([], dtype=torch.int32, device=device)
+        main_tokens = torch.full(
+            (total_tokens,), PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device
+        )
 
     all_accepted = first_rejection_idx_per_segment == large_value
     no_draft_tokens = num_draft_tokens == 0
@@ -509,12 +607,13 @@ def _random_rejection_sample_with_segment(
         first_rejection_idx_per_segment,
     ).to(torch.int64)
 
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
-        should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
-    )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
+    if batch_size > 0:
+        batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+        bonus_token_at_accepted_count = torch.where(
+            should_get_bonus,
+            bonus_token_ids.to(torch.int32),
+            selected_tokens[batch_range, accepted_count],
+        )
+        selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]

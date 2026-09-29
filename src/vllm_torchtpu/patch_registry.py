@@ -45,17 +45,15 @@ _ACTIVE: tuple[Stage, ...] = ("platform_activation", "worker_init")
 # do not affect that process.
 _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 
+from vllm_torchtpu.structured_spec_decoding.patches.registry import (  # noqa: E402
+    STRUCTURED_SPEC_DECODE_PATCHES,  # noqa: E402
+)
+
 # Tuple order is application order, including when several stages share a patch.
+
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
-    # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
-    # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
-    # in both get_global_shape and get_local_shape.
-    Patch(
-        "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
-        _ACTIVE,
-    ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
@@ -79,10 +77,13 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
-    Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_hybrid_producer_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
+    # Structured output. The grammar FSM lives in the engine-core process
+    # alongside the scheduler, so this patch is engine-core only: worker
+    # processes never see a Scheduler.
+    *STRUCTURED_SPEC_DECODE_PATCHES,
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
@@ -119,9 +120,8 @@ PATCHES = (
         _ACTIVE,
     ),
     # Model-specific patches.
-    # Append patches for new models here with
-    # stages=("platform_activation", "model_load") and model_config=True.
-    # See docs/tpu_patch_mechanism.md for details.
+    # Append patches for new models here with stages=("platform_activation", "model_load")  # noqa: E501
+    # and model_config=True. See docs/tpu_patch_mechanism.md for details.
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
         ("platform_activation", "model_load"),
