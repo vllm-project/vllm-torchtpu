@@ -7,11 +7,20 @@ from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
     compute_logits_from_hidden_states,
     compute_selected_logits,
     gather_logprobs,
+    reset_read_offsets,
     reset_read_offsets_impl,
+    rollback_offsets_migrate,
     rollback_offsets_migrate_impl,
+    rollback_offsets_seed,
     rollback_offsets_seed_impl,
     sample_from_logits,
     substitute_placeholder_token,
+)
+from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
+    rollback_offsets_migrate_compiled as _rollback_offsets_migrate_compiled,
+)
+from vllm_torchtpu.llm_tpu_core.runner.device_ops import (
+    rollback_offsets_seed_compiled as _rollback_offsets_seed_compiled,
 )
 from vllm_torchtpu.llm_tpu_core.runner.padding import (
     MIN_NUM_SEQS,
@@ -28,8 +37,13 @@ __all__ = [
     "compute_logits_from_hidden_states",
     "compute_selected_logits",
     "gather_logprobs",
+    "reset_read_offsets",
     "reset_read_offsets_impl",
+    "rollback_offsets_migrate",
+    "_rollback_offsets_migrate_compiled",
     "rollback_offsets_migrate_impl",
+    "rollback_offsets_seed",
+    "_rollback_offsets_seed_compiled",
     "rollback_offsets_seed_impl",
     "sample_from_logits",
     "substitute_placeholder_token",

@@ -4,7 +4,6 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
-import bisect
 import contextlib
 import copy
 import dataclasses
@@ -102,6 +101,32 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
     create_sequence_layout_planner,
 )
+from vllm_torchtpu.llm_tpu_core.runner import (
+    MIN_NUM_SEQS,
+    _rollback_offsets_migrate_compiled,
+    _rollback_offsets_seed_compiled,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    get_padded_num_reqs_with_upper_limit as _get_padded_num_reqs_with_upper_limit,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    get_padded_token_len as _get_padded_token_len,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    get_req_paddings as _get_req_paddings,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    reset_read_offsets as _reset_read_offsets,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    rollback_offsets_migrate as _rollback_offsets_migrate,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    rollback_offsets_seed as _rollback_offsets_seed,
+)
+from vllm_torchtpu.llm_tpu_core.runner import (
+    substitute_placeholder_token as _substitute_placeholder_token,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -161,82 +186,6 @@ class ExecuteModelState:
     )
 
 
-# Per-step mamba read-offset operations, consolidated into single cached
-# TPU programs (avoiding per-group eager launches). Each body is defined
-# once; the compiled variant is derived from it, and the dispatchers pick
-# eager on CPU (unit tests, pre-init paths) since the tpu backend cannot
-# trace CPU tensors.
-def _reset_read_offsets_impl(
-    read_offsets: torch.Tensor,
-    keep_dev: torch.Tensor,
-    stacked_groups: torch.Tensor,
-    null: torch.Tensor,
-) -> None:
-    """Scatter reset across all mamba groups in a single program.
-    `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
-    Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
-    targets = torch.where(keep_dev, stacked_groups, null)
-    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
-    read_offsets.index_put_((targets.reshape(-1).long(),), zero)
-
-
-def _rollback_offsets_seed_impl(
-    read_offsets: torch.Tensor, dst_t: torch.Tensor
-) -> None:
-    read_offsets.index_put_(
-        (dst_t,),
-        torch.zeros(
-            dst_t.shape[0], dtype=read_offsets.dtype, device=read_offsets.device
-        ),
-    )
-
-
-def _rollback_offsets_migrate_impl(
-    read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
-) -> None:
-    read_offsets.index_put_((dst_t,), read_offsets[src_t])
-
-
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
-_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
-_rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
-
-
-def _reset_read_offsets(
-    read_offsets: torch.Tensor,
-    keep_dev: torch.Tensor,
-    stacked_groups: torch.Tensor,
-    null: torch.Tensor,
-) -> None:
-    fn = (
-        _reset_read_offsets_compiled
-        if read_offsets.device.type == "tpu"
-        else _reset_read_offsets_impl
-    )
-    fn(read_offsets, keep_dev, stacked_groups, null)
-
-
-def _rollback_offsets_seed(read_offsets: torch.Tensor, dst_t: torch.Tensor) -> None:
-    fn = (
-        _rollback_offsets_seed_compiled
-        if read_offsets.device.type == "tpu"
-        else _rollback_offsets_seed_impl
-    )
-    fn(read_offsets, dst_t)
-
-
-def _rollback_offsets_migrate(
-    read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
-) -> None:
-    fn = (
-        _rollback_offsets_migrate_compiled
-        if read_offsets.device.type == "tpu"
-        else _rollback_offsets_migrate_impl
-    )
-    fn(read_offsets, src_t, dst_t)
-
-
 def _spec_logprob_row_tokens(
     next_tokens: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -277,51 +226,6 @@ def _spec_logprob_row_tokens(
     out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
     out = out.scatter(0, rows.flatten(), tokens.flatten())
     return out[:num_rows, None]
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _substitute_placeholder_token(
-    input_ids: torch.Tensor,
-    token_in_tpu_cur_input_indices: torch.Tensor,
-    token_in_tpu_pre_next_tokens_indices: torch.Tensor,
-    next_tokens: torch.Tensor,
-):
-    """Substitute placeholder tokens from TPU for async scheduler.
-
-    Padding scheme (set up by `_apply_async_token_substitution`):
-      - `token_in_tpu_cur_input_indices`: real-slot indices followed by all
-        other indices in ascending order; the tail entries re-target slots
-        that should keep their current values.
-      - `token_in_tpu_pre_next_tokens_indices`: real `next_tokens` indices
-        followed by `-1` sentinels at the padded positions.
-    The `-1` sentinel is the mask source; the program is shape-only so it
-    does not recompile when the active count changes.
-
-    Args:
-        input_ids: device tensor [N] where N is the bucketed input size.
-        token_in_tpu_cur_input_indices: int tensor [N], destination slots.
-        token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
-            in `next_tokens`; -1 marks a padding slot to leave unchanged.
-        next_tokens: int tensor of tokens from the previous async step.
-    Return:
-        input_ids with real placeholders replaced; padding slots untouched.
-    """
-    assert (
-        input_ids.shape[0]
-        == token_in_tpu_cur_input_indices.shape[0]
-        == token_in_tpu_pre_next_tokens_indices.shape[0]
-    )
-    mask = token_in_tpu_pre_next_tokens_indices > -1
-    # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
-    # slots; their gathered values are discarded by `mask` in `where`.
-    safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
-    original_values = input_ids[token_in_tpu_cur_input_indices]
-    update_values = torch.where(mask, new_token_values, original_values)
-    input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
-    return input_ids
-
-
 logger = init_logger(__name__)
 
 
@@ -388,7 +292,6 @@ def _build_kv_connector_output(
 
 
 # Smallest output size
-MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
@@ -6556,72 +6459,3 @@ class TPUModelRunner(GPUModelRunner):
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )
-
-
-def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
-    logger.info("Preparing request paddings:")
-    # assert min_req_size is power of 2
-    assert (min_req_size & (min_req_size - 1) == 0) and min_req_size > 0
-    paddings: list = []
-    num = max(MIN_NUM_SEQS, min_req_size)
-    while num <= max_req_size and (len(paddings) == 0 or paddings[-1] != num):
-        paddings.append(num)
-        logger.info("    %d", num)
-        num = _get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
-    return paddings
-
-
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
-    res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
-    return min(res, upper_limit)
-
-
-def _get_padded_token_len(paddings: list[int], x: int) -> int:
-    """Return the first element in paddings list greater or equal to x."""
-    index = bisect.bisect_left(paddings, x)
-    assert index < len(paddings)
-    return paddings[index]
-
-
-def _get_padded_num_kv_cache_update_slices(
-    num_tokens: int, max_num_reqs: int, page_size: int
-) -> int:
-    """Calculates the padded number of KV cache update slices to avoid
-    recompilation."""
-    # NOTE(chengjiyao): let's say R_i is the token num for i-th request,
-    # so it occupies most 2 + R_i // page_size pages. The total maximum
-    # possible number of pages needed is sum(2 + R_i // page_size), which
-    # is <= 2 * max_num_reqs + sum(R_i) // page_size
-    # = 2 * max_num_reqs + num_tokens // page_size
-    padded_num_slices = 2 * max_num_reqs + num_tokens // page_size
-    padded_num_slices = min(padded_num_slices, num_tokens)
-    return padded_num_slices
-
-
-def _prev_power_of_2(n: int) -> int:
-    """The previous power of 2 (inclusive)"""
-    if n <= 0:
-        return 0
-    return 1 << (n.bit_length() - 1)
-
-
-def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
-    """Find the optimum number of slices to copy per Pallas program instance.
-
-    Increasing the number of slices copied in one instance of the kernel program
-    will increase HBM bandwidth utilization via more in-flight DMAs.
-
-    However, it will also use more VMEM, and experimentally, we observed
-    performance regression at 128 slices on v6e, likely due to running
-    out of scalar registers. Thus this function will limit the number of
-    slices to 64.
-    """
-    # The default vmem_limit_bytes of a pallas kernel is 32MB. Here we
-    # calculate num_slices_per_block based on 16MB in case any register spills.
-    vmem_limit = 16 * 1024 * 1024
-    num_slices_per_block = vmem_limit // page_size_bytes
-    assert num_slices_per_block > 0, "Number of slices should be positive"
-    num_slices_per_block = _prev_power_of_2(num_slices_per_block)
-    if num_slices_per_block > 64:
-        num_slices_per_block = 64
-    return num_slices_per_block

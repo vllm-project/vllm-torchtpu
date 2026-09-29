@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_torchtpu.llm_tpu_core.runner.top_k_top_p import apply_top_k_top_p
+
 SAMPLING_EPS = 1e-5
 
 
@@ -43,10 +45,12 @@ def reset_read_offsets_impl(
     stacked_groups: torch.Tensor,
     null: torch.Tensor,
 ) -> None:
-    """Resets offsets for newly admitted requests."""
-    orig = read_offsets[stacked_groups]
-    reset = torch.where(keep_dev, orig, null)
-    read_offsets.index_put_((stacked_groups,), reset)
+    """Scatter reset across all mamba groups in a single program.
+    `stacked_groups` is [G, width]; `keep_dev` [width] broadcasts across G.
+    Non-new rows collapse onto the null slot, where writing 0 is a no-op."""
+    targets = torch.where(keep_dev, stacked_groups, null)
+    zero = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+    read_offsets.index_put_((targets.reshape(-1).long(),), zero)
 
 
 def rollback_offsets_seed_impl(read_offsets: torch.Tensor, dst_t: torch.Tensor) -> None:
@@ -64,6 +68,48 @@ def rollback_offsets_migrate_impl(
 ) -> None:
     """Migrates read offsets across slots."""
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
+
+
+_reset_read_offsets_compiled = _tpu_compile_op(reset_read_offsets_impl)
+rollback_offsets_seed_compiled = _tpu_compile_op(rollback_offsets_seed_impl)
+rollback_offsets_migrate_compiled = _tpu_compile_op(rollback_offsets_migrate_impl)
+
+
+def reset_read_offsets(
+    read_offsets: torch.Tensor,
+    keep_dev: torch.Tensor,
+    stacked_groups: torch.Tensor,
+    null: torch.Tensor,
+) -> None:
+    """Dispatches reset_read_offsets to compiled TPU op or eager CPU."""
+    fn = (
+        _reset_read_offsets_compiled
+        if read_offsets.device.type == "tpu"
+        else reset_read_offsets_impl
+    )
+    fn(read_offsets, keep_dev, stacked_groups, null)
+
+
+def rollback_offsets_seed(read_offsets: torch.Tensor, dst_t: torch.Tensor) -> None:
+    """Dispatches rollback_offsets_seed to compiled TPU op or eager CPU."""
+    fn = (
+        rollback_offsets_seed_compiled
+        if read_offsets.device.type == "tpu"
+        else rollback_offsets_seed_impl
+    )
+    fn(read_offsets, dst_t)
+
+
+def rollback_offsets_migrate(
+    read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
+) -> None:
+    """Dispatches rollback_offsets_migrate to compiled TPU op or eager CPU."""
+    fn = (
+        rollback_offsets_migrate_compiled
+        if read_offsets.device.type == "tpu"
+        else rollback_offsets_migrate_impl
+    )
+    fn(read_offsets, src_t, dst_t)
 
 
 def _substitute_placeholder_token_impl(
@@ -121,23 +167,35 @@ compute_logits_from_hidden_states = _tpu_compile_op(
 )
 
 
+def _apply_temperature(
+    logits: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+    return logits / safe_temperatures
+
+
 def _sample_from_logits_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     u: torch.Tensor,
+    top_k: torch.Tensor | None = None,
+    top_p: torch.Tensor | None = None,
     all_greedy: bool = False,
 ) -> torch.Tensor:
-    """Device-compiled greedy and Gumbel-noise sampling."""
+    """Device-compiled greedy, top-k/top-p, and Gumbel-noise sampling."""
     if all_greedy:
         return torch.argmax(logits, dim=-1, keepdim=True)
     is_greedy = temperatures <= SAMPLING_EPS
-    inv_t = torch.where(is_greedy, 1.0, 1.0 / temperatures)
-    scaled_logits = logits * inv_t
+    scaled_logits = _apply_temperature(logits, temperatures)
+    if top_k is not None and top_p is not None:
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+    else:
+        masked_logits = scaled_logits
     u_clamped = torch.clamp(
         u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
     )
     gumbel_noise = -torch.log(-torch.log(u_clamped))
-    noisy_logits = scaled_logits + gumbel_noise
+    noisy_logits = masked_logits + gumbel_noise
     final_logits = torch.where(is_greedy, logits, noisy_logits)
     return torch.argmax(final_logits, dim=-1, keepdim=True)
 
