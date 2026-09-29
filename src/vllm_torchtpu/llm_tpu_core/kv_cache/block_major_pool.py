@@ -86,3 +86,38 @@ def flat_kernel_ids(
         return ids * num_pools + pool_index
     manager = ids // split
     return (manager * num_pools + pool_index) * split + (ids - manager * split)
+
+
+BLOCK_MAJOR_LAYOUT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class BlockMajorContract:
+    """Immutable specification of the bundled KV layout agreed upon across ranks.
+
+    Attributes:
+        fragment_count: Number of physical fragments folded into the bundle's layer
+            dimension (dim 1).
+        fragment_row_bytes: Byte size of a single fragment's row for one kernel block.
+        bundle_row_bytes: Total contiguous byte length of one bundled kernel block
+            across all fragments (= F * fragment_row_bytes).
+        logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must
+            match across all serving peers.
+    """
+
+    fragment_count: int
+    fragment_row_bytes: int
+    bundle_row_bytes: int
+    logical_fingerprint: str
+
+
+def canonical_layout_fingerprint(value: Mapping[str, Any]) -> str:
+    """Computes a deterministic SHA-256 fingerprint from a canonical
+    JSON layout payload."""
+    import hashlib
+    import json
+
+    encoded = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()

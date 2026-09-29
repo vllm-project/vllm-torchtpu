@@ -8,7 +8,10 @@ Strictly zero dependencies on vLLM.
 from __future__ import annotations
 
 from vllm_torchtpu.llm_tpu_core.kv_cache.block_major_pool import (
+    BLOCK_MAJOR_LAYOUT_VERSION,
+    BlockMajorContract,
     BlockMajorPoolLayout,
+    canonical_layout_fingerprint,
     flat_kernel_ids,
     flat_manager_ids,
     is_block_major_layout_applicable,
@@ -36,6 +39,8 @@ from vllm_torchtpu.llm_tpu_core.kv_cache.specs import (
 __all__ = [
     "AttentionGroup",
     "AttentionSpec",
+    "BLOCK_MAJOR_LAYOUT_VERSION",
+    "BlockMajorContract",
     "BlockMajorPoolLayout",
     "EncoderOnlyAttentionSpec",
     "KVCacheConfig",
@@ -45,6 +50,7 @@ __all__ = [
     "MambaSpec",
     "MaterializedKVCache",
     "UniformTypeKVCacheSpecs",
+    "canonical_layout_fingerprint",
     "flat_kernel_ids",
     "flat_manager_ids",
     "format_kv_cache_layout_summary",

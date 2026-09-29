@@ -41,54 +41,22 @@ The contract feeds three primary consumers:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.llm_tpu_core.kv_cache import (
+    BLOCK_MAJOR_LAYOUT_VERSION,
+    BlockMajorContract,
+)
+from vllm_torchtpu.llm_tpu_core.kv_cache import (
+    canonical_layout_fingerprint as _canonical_layout_fingerprint,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Schema version of the bundle memory layout (distinct from model-specific parameters).
-# Included in the logical fingerprint and namespace salt to invalidate stale cache
-# entries across layout format changes.
-BLOCK_MAJOR_LAYOUT_VERSION = 1
-
-
-@dataclass(frozen=True)
-class BlockMajorContract:
-    """Immutable specification of the bundled KV layout agreed upon across ranks.
-
-    Attributes:
-        fragment_count: Number of physical fragments folded into the bundle's layer
-            dimension (dim 1).
-        fragment_row_bytes: Byte size of a single fragment's row for one kernel block.
-        bundle_row_bytes: Total contiguous byte length of one bundled kernel block
-            across all fragments (= F * fragment_row_bytes).
-        logical_fingerprint: Deterministic SHA-256 digest of layout parameters; must
-            match across all serving peers.
-    """
-
-    fragment_count: int
-    fragment_row_bytes: int
-    bundle_row_bytes: int
-    logical_fingerprint: str
-
-
-def _canonical_layout_fingerprint(value: Mapping[str, Any]) -> str:
-    """Computes a deterministic SHA-256 fingerprint from a canonical
-    JSON layout payload."""
-    encoded = json.dumps(
-        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def block_major_layer_indices(
