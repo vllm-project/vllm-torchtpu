@@ -1832,6 +1832,24 @@ class MaskedDenseAdmissionTest(parameterized.TestCase):
             self.assertIs(self._admit(runner).allow_masked_dense, True)
         self.assertIs(runner._masked_dense_groups_requests, True)
 
+    def test_admission_is_logged_once_per_outcome(self):
+        """Serving checks every rank for the admitted message and for the
+        absence of the rejection warning."""
+        with mock.patch.object(mla_dispatch, "logger") as logger:
+            runner = self._runner()
+            self._admit(runner)
+            self._admit(runner)
+        self.assertEqual(logger.info_once.call_count, 2)
+        messages = {c.args for c in logger.info_once.call_args_list}
+        self.assertLen(messages, 1)
+        self.assertIn("admitted", next(iter(messages))[0])
+        logger.warning_once.assert_not_called()
+
+        with mock.patch.object(mla_dispatch, "logger") as logger:
+            self._admit(self._runner(), num_heads=16)
+        logger.info_once.assert_not_called()
+        logger.warning_once.assert_called_once()
+
     def test_rejected_configuration_allows_neither(self):
         runner = self._runner()
         speculative = _glm52_vllm_config(speculative_config=object())
