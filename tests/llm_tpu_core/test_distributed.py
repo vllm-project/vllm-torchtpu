@@ -110,3 +110,16 @@ def test_pcp_mesh_rank_ordering():
     assert len(groups["tp"]) == 4  # 4 lanes of 2 ranks
 
     validate_mesh_permutation(groups, list(range(8)), (1, 4, 2))
+
+
+def test_pp_positions_standalone():
+    from vllm_torchtpu.llm_tpu_core.distributed.pp_shift import (
+        get_or_create_pp_mesh,
+        pp_positions,
+    )
+
+    mesh = get_or_create_pp_mesh()
+    assert mesh is not None
+    assert "pp" in mesh.axis_names
+    positions = pp_positions()
+    assert len(positions) >= 1

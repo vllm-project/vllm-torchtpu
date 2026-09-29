@@ -50,6 +50,14 @@ from vllm_torchtpu.llm_tpu_core.distributed.pcp_rank_order import (
     build_topology_mesh_groups,
     validate_mesh_permutation,
 )
+from vllm_torchtpu.llm_tpu_core.distributed.pp_shift import (
+    AXIS as PP_AXIS_NAME,
+)
+from vllm_torchtpu.llm_tpu_core.distributed.pp_shift import (
+    get_or_create_pp_mesh,
+    pp_permute_op,
+    pp_positions,
+)
 from vllm_torchtpu.llm_tpu_core.distributed.sharded_jax_op import (
     sharded_jax_op,
 )
@@ -60,6 +68,10 @@ __all__ = [
     "DefaultGroupProvider",
     "EP_AXIS_NAME",
     "ProcessGroupProvider",
+    "PP_AXIS_NAME",
+    "get_or_create_pp_mesh",
+    "pp_permute_op",
+    "pp_positions",
     "all_gather_tensor",
     "all_reduce_sum",
     "build_ep_mesh",
