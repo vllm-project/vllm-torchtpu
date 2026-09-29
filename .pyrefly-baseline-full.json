@@ -87,11 +87,6 @@
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_dcp_fine_prefix_patch`"
-    },
-    {
-      "path": "src/vllm_torchtpu/__init__.py",
       "name": "bad-assignment",
       "concise_description": "`(specs: Unknown) -> dict[Unknown, Unknown] | Unknown` is not assignable to attribute `_promote_local_kv_cache_specs` with type `(kv_cache_spec: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]`"
     },
@@ -99,6 +94,16 @@
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `_promote_local_kv_cache_specs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_dcp_fine_prefix_patch`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `ModuleType` has no attribute `resolve_kv_cache_block_sizes`"
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
@@ -6728,6 +6733,11 @@
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `num_blocks`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "missing-attribute",
       "concise_description": "Object of class `InputBatch` has no attribute `_tpu_spec_room_guard`"
     },
     {
@@ -7192,21 +7202,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
@@ -7232,16 +7227,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_blocks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown | None` is not assignable to parameter `model` with type `Module` in function `vllm_torchtpu.compilation.shape_variants.retrace`"
     },
@@ -7254,36 +7239,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `int | None` is not assignable to parameter `num_blocks` with type `int` in function `TPUModelRunner._dummy_run`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_blocks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_blocks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",

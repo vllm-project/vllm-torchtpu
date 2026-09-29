@@ -5401,6 +5401,7 @@ class TPUModelRunner(GPUModelRunner):
         sees, then `gather_logprobs` over padded_logits_length rows, which
         `_precompile_gather_logprobs` (num_reqs buckets) does not cover.
         """
+        assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
         max_logits_len = _get_padded_token_len(
             self.num_tokens_paddings,
@@ -5440,6 +5441,7 @@ class TPUModelRunner(GPUModelRunner):
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
         if self._is_async_drafter:
+            assert self.speculative_config is not None
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
@@ -5491,6 +5493,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not (self._is_async_drafter):
             return
+        assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
         # padded_logits_length sweep to the bucket that covers the full batch.
@@ -5706,6 +5709,7 @@ class TPUModelRunner(GPUModelRunner):
 
         rid = "__pcp_mtp_warmup__"
         max_pos = min(self.max_model_len, P + 1)
+        assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
@@ -6006,6 +6010,8 @@ class TPUModelRunner(GPUModelRunner):
             SchedulerOutput,
         )
 
+        assert self.speculative_config is not None
+        assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
@@ -6108,6 +6114,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         rid = f"__spec_warmup_{idx}__"
+        assert self.speculative_config is not None
+        assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         # The contexts (num_computed_tokens) to run decode steps at: a short walk
         # near the prefill.
