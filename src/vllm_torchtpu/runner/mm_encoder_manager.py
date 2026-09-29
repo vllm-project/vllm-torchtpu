@@ -221,11 +221,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         self, mm_kwargs: dict[str, Any] | None, input_error: str | None = None
     ) -> list[torch.Tensor]:
         """Run encoding in lockstep across attention-DP engines sharing EP."""
-        from vllm.distributed.parallel_state import (
-            get_dp_group,
-            get_ep_group,
-            get_tp_group,
-        )
+        from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
         if tuple(self.path_token_budgets) != ("default",):
             raise ValueError(
@@ -233,13 +229,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
             )
         all_tokens: list[int] = []
         assignment: list[int] = []
-        images_per_rank = [0] * get_tp_group().world_size if self.use_dp else []
+        images_per_rank: list[int] = []
         tokens: list[int] = []
         batches: list[tuple[list[int], int]] = []
         try:
-            if input_error is not None:
-                raise ValueError(input_error)
-            if mm_kwargs is not None:
+            if input_error is None and mm_kwargs is not None:
                 if self.use_dp:
                     all_tokens = self._get_per_item_out_tokens(mm_kwargs)
                     mm_kwargs, assignment, images_per_rank, _ = self._dp_shard(
