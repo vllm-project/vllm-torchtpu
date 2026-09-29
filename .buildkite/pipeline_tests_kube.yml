@@ -96,8 +96,6 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          # tests/omni/models needs the -omni image; only pipeline_tests.yml builds it.
-          test-file-exclude-pattern: "tests/omni/models/**"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -109,7 +107,6 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          test-file-exclude-pattern: "tests/omni/models/**"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -127,8 +124,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
         <<: *tpu_step
@@ -139,8 +136,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Representative correctness cases run on PRs; the full parameter matrix
       # and acceptance-rate tests run nightly. Split by example because the
@@ -215,8 +212,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
         <<: *tpu_step
@@ -227,5 +224,5 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip' --junit-xml={{resultPath}} {{testExamples}}"
