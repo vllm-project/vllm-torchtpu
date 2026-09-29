@@ -250,7 +250,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
     connector.get_kv_connector_stats.return_value = None
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner._stage_timing.take_samples.return_value = ([], [])
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
     with (
