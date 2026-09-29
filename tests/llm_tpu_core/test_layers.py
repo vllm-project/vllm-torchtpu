@@ -146,3 +146,34 @@ def test_rowmax_topk_and_router_integration():
     assert res.topk_weights.shape == (5, 2)
     assert res.topk_ids.shape == (5, 2)
     assert torch.allclose(res.topk_weights.sum(dim=-1), torch.ones(5), atol=1e-5)
+
+
+def test_pcp_sequence_layout_eligibility_and_decision():
+    from vllm_torchtpu.llm_tpu_core.layers.pcp_sequence_layout import (
+        PcpRequestSpan,
+        PcpSequenceLayoutEligibility,
+        PcpSequenceLayoutMode,
+    )
+
+    eligibility = PcpSequenceLayoutEligibility(pcp_size=4, interleave_size=16)
+    assert eligibility.enabled
+    assert eligibility.pcp_size == 4
+    assert eligibility.interleave_size == 16
+
+    decision = eligibility._evaluate_streaming_query(
+        spans=(
+            PcpRequestSpan(
+                computed_tokens=0,
+                scheduled_tokens=64,
+                prompt_tokens=64,
+                absolute_query_start=0,
+            ),
+        ),
+        num_tokens_paddings=(16, 32, 64),
+        max_num_tokens=128,
+        dp_target_bucket=None,
+    )
+    assert decision.mode is PcpSequenceLayoutMode.STREAMING
+    assert decision.local_required_tokens == 16
+    assert decision.local_padded_tokens == 16
+    assert decision.global_padded_tokens == 64

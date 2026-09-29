@@ -34,6 +34,16 @@ from vllm_torchtpu.llm_tpu_core.layers.moe import (
     TopKResult,
     rowmax_topk,
 )
+from vllm_torchtpu.llm_tpu_core.layers.pcp_sequence_layout import (
+    PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+    PcpPreparedBatch,
+    PcpRequestSpan,
+    PcpSequenceLayoutDecision,
+    PcpSequenceLayoutEligibility,
+    PcpSequenceLayoutMode,
+    PcpSequenceLayoutPlanner,
+    prepare_pcp_sequence_layout,
+)
 from vllm_torchtpu.llm_tpu_core.layers.rms_norm import (
     RMSNorm,
 )
@@ -51,6 +61,14 @@ from vllm_torchtpu.llm_tpu_core.layers.swiglu import (
 __all__ = [
     "NEG",
     "MoERouter",
+    "PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR",
+    "PcpPreparedBatch",
+    "PcpRequestSpan",
+    "PcpSequenceLayoutDecision",
+    "PcpSequenceLayoutEligibility",
+    "PcpSequenceLayoutMode",
+    "PcpSequenceLayoutPlanner",
+    "prepare_pcp_sequence_layout",
     "RMSNorm",
     "RotaryEmbedding",
     "SwiGLU",

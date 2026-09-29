@@ -115,3 +115,12 @@ class CoreCompilationConfig:
     backend: str = "openxla"
     use_pallas: bool = True
     fuse_layers: bool = True
+
+
+def is_pcp_layout_debug_enabled() -> bool:
+    """Returns True if PCP layout debugging is enabled."""
+    return os.environ.get("VLLM_TPU_DEBUG_PCP_LAYOUT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
