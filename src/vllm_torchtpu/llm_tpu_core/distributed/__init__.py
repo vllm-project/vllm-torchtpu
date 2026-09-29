@@ -29,7 +29,6 @@ from vllm_torchtpu.llm_tpu_core.distributed.group_provider import (
     ProcessGroupProvider,
     get_dcp_group,
     get_group_provider,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -45,6 +44,14 @@ from vllm_torchtpu.llm_tpu_core.distributed.pallas_shapes import (
     get_global_shape,
     get_local_shape,
     install_pallas_shape_conversion,
+)
+from vllm_torchtpu.llm_tpu_core.distributed.pcp import (
+    PcpGroupLayout,
+    all_gather_equal_tokens,
+    get_or_create_pcp_mesh,
+    get_pcp_group_layout,
+    get_pcp_rank,
+    get_pcp_world_size,
 )
 from vllm_torchtpu.llm_tpu_core.distributed.pcp_rank_order import (
     build_topology_mesh_groups,
@@ -69,6 +76,13 @@ __all__ = [
     "EP_AXIS_NAME",
     "ProcessGroupProvider",
     "PP_AXIS_NAME",
+    "PcpGroupLayout",
+    "all_gather_equal_tokens",
+    "get_or_create_pcp_mesh",
+    "get_pcp_group",
+    "get_pcp_group_layout",
+    "get_pcp_rank",
+    "get_pcp_world_size",
     "get_or_create_pp_mesh",
     "pp_permute_op",
     "pp_positions",

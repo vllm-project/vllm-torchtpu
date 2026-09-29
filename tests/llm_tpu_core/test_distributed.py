@@ -123,3 +123,17 @@ def test_pp_positions_standalone():
     assert "pp" in mesh.axis_names
     positions = pp_positions()
     assert len(positions) >= 1
+
+
+def test_pcp_standalone():
+    from vllm_torchtpu.llm_tpu_core.distributed.pcp import (
+        get_or_create_pcp_mesh,
+        get_pcp_rank,
+        get_pcp_world_size,
+    )
+
+    assert get_pcp_rank() == 0
+    assert get_pcp_world_size() == 1
+    mesh = get_or_create_pcp_mesh()
+    assert mesh is not None
+    assert "pcp" in mesh.axis_names
