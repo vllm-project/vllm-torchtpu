@@ -339,10 +339,15 @@ class RaidenOffloadingManager(OffloadingManager):
         self._evicted_keys_queue: list[OffloadKey] = []
         # `set_eviction_callback` landed in a recent Raiden wheel; on older
         # wheels the manager still works, it just never reports removals.
-        # Say so rather than silently dropping BlockRemoved events.
-        self._supports_eviction_callback = hasattr(self._store, "set_eviction_callback")
-        if self._supports_eviction_callback:
-            self._store.set_eviction_callback(self._on_eviction)
+        # Say so rather than silently dropping BlockRemoved events. Resolved
+        # once via getattr and kept, so shutdown() can unregister through the
+        # same bound method.
+        self._set_eviction_callback = getattr(
+            self._store, "set_eviction_callback", None
+        )
+        self._supports_eviction_callback = self._set_eviction_callback is not None
+        if self._set_eviction_callback is not None:
+            self._set_eviction_callback(self._on_eviction)
         else:
             logger.warning(
                 "Raiden store predates set_eviction_callback(); host LRU "
@@ -727,8 +732,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def shutdown(self) -> None:
         # Unregister first: the callback runs on a Raiden-owned thread and
         # must not fire into a half-torn-down manager while jobs drain.
-        if self._supports_eviction_callback:
-            self._store.set_eviction_callback(None)
+        if self._set_eviction_callback is not None:
+            self._set_eviction_callback(None)
         if self._admissions:
             self.drain_jobs(set(self._admissions.keys()))
 
