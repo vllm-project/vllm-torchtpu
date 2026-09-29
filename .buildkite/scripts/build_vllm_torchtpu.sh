@@ -88,7 +88,7 @@ if [[ "$1" == "--local" ]]; then
     if [ -z "${WHL_PATH}" ]; then
         echo "ERROR: no vllm_torchtpu_core-*.whl found in ${CORE_DIST_DIR}." >&2
         echo "Build the core wheel first, from the repo root:" >&2
-        echo "  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 uv build --wheel" >&2
+        echo "  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 uv build --wheel" >&2
         exit 1
     fi
 

@@ -121,7 +121,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 # Scoped to the vllm-torchtpu-core dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps -e .
 
 # Install vLLM from source if requested.
@@ -169,7 +169,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 
 # Use --no-deps to preserve layer caching since dependencies were already resolved and installed in base.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps .
 
 RUN if [ -z "$VLLM_SOURCE" ] && [ -d /workspace/vllm-torchtpu/vllm ]; then \
