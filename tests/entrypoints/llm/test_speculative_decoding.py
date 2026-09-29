@@ -19,6 +19,8 @@ import contextlib
 import json
 import os
 import random
+import re
+import shutil
 import socket
 import string
 import subprocess
@@ -1698,6 +1700,11 @@ DP_REQUEST_TIMEOUT_S = 1500
 DP_EXECUTE_MODEL_TIMEOUT_S = 1800
 DP_CONCURRENCY = 8
 
+# CI mounts this directory into the container and uploads it as a build
+# artifact, so a failed server's full log survives the job.
+DP_SERVE_LOG_DIR = "/perf_eval_results"
+_SERVE_ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL)\b|Traceback|Timed out")
+
 # Prometheus renders the same counters the in-process reader exposes, with a
 # `_total` suffix.
 _DRAFT_METRIC = SPEC_DRAFT_METRIC + "_total"
@@ -1896,16 +1903,32 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
         def _fail(message: str) -> RuntimeError:
             log.flush()
             with open(log.name) as fh:
-                tail = fh.read()[-4000:]
-            return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+                lines = fh.read().splitlines()
+            kept = log.name
+            if os.path.isdir(DP_SERVE_LOG_DIR):
+                kept = shutil.copy(log.name, DP_SERVE_LOG_DIR)
+            # Every DP worker logs each warmup step, so the end of the log is
+            # warmup chatter and the line saying why startup failed scrolls out
+            # of any short tail. Report the error lines from the whole log too.
+            errors = [line for line in lines if _SERVE_ERROR_LINE.search(line)]
+            return RuntimeError(
+                f"{message}\n--- full log: {kept} ---\n"
+                "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
+                "--- tail ---\n" + "\n".join(lines[-40:])
+            )
 
         # The first request against a fresh engine pair compiles the runtime
         # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
         # worker-RPC deadline -- the engine is torn down mid-compile and every
         # request 500s. Raise the deadline past the compile.
+        #
+        # vLLM also gives its engine processes only 600s by default to report
+        # ready, a third of the startup this test allows, and a cold DP engine
+        # pair can take longer than that. Wait as long as the health poll does.
         env = dict(
             os.environ,
             VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
+            VLLM_ENGINE_READY_TIMEOUT_S=str(DP_SERVER_STARTUP_TIMEOUT_S),
         )
 
         server = subprocess.Popen(

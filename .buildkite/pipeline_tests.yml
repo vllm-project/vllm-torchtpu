@@ -120,6 +120,8 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         agents:
           queue: "tpu_v7x_8_queue"
+        artifact_paths:
+          - "perf_eval_results/**/*"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
@@ -151,6 +153,8 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         agents:
           queue: "tpu_v7x_8_queue"
+        artifact_paths:
+          - "perf_eval_results/**/*"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
