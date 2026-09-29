@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -54,7 +54,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         super().__init__(
             vllm_config=vllm_config,
             device=device,
-            dtype=vllm_config.model_config.dtype,
+            dtype=cast(torch.dtype, vllm_config.model_config.dtype),
             model=vllm_model,
         )
 
@@ -94,7 +94,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
     def _pad_to_template(
         self,
-        replay_values: dict[str, torch.Tensor],
+        replay_values: dict[str, torch.Tensor | None],
         budget: int,
         path: str = "default",
     ) -> dict[str, torch.Tensor]:
