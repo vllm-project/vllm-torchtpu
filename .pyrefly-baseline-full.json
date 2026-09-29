@@ -517,11 +517,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `per_layer_tags` in function `vllm_torchtpu.llm_tpu_core.kv_transfer.raiden.pool_manifest.build_glm_mla_pool_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
     },
@@ -946,6 +941,11 @@
       "concise_description": "Object of class `NoneType` has no attribute `wait_for_init`"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/__init__.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `DEFAULT_BUFFER_COUNT` from `vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config`"
@@ -1126,6 +1126,11 @@
       "concise_description": "No attribute `WeightBufferPlan` in module `vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host`"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `PACK4` from `vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host`"
@@ -1212,11 +1217,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `Module`"
     },
@@ -1254,11 +1254,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch._C._VariableFunctions.empty` called with arguments: (tuple[Tensor | int | Unknown, Unknown, Literal[1], Tensor | int | Unknown], dtype=dtype, device=Literal['meta'])"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
@@ -2166,51 +2161,6 @@
       "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, ((x: Array, w1: Array, w2: Array, w1_scale: Array, w2_scale: Array, gating: Array, rank: Array) -> Array) | ((x: Array, w1: Array, w2: Array, w1_scale: Array, w2_scale: Array, gating: Array, rank: Array, hash_ids: Array) -> Array) | ((x: Array, w1: Array, w2: Array, w1_scale: Array, w2_scale: Array, gating: Array, rank: Array, score_bias: Array) -> Array), mesh=Unknown, input_partition_specs=tuple[P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P, P], output_partition_specs=P)"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor` is not assignable to parameter `weight_block_size` with type `tuple[int, ...] | None` in function `vllm.model_executor.layers.linear.adjust_block_scale_shard`"
@@ -2256,34 +2206,14 @@
       "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/latent_proj_intra_chip.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/linear_common.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `xla_quantized_matmul` from `vllm_torchtpu.kernels.quantized_matmul.util`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/moe_hierarchical.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/moe_hierarchical.py",
       "name": "bad-assignment",
       "concise_description": "`(num_experts: Unknown, _ep_size: Unknown, _ep_rank: Unknown, placement: str | Unknown = 'linear') -> set[int] | None` is not assignable to attribute `compute_local_expert_ids` with type `(num_experts: int, ep_size: int, ep_rank: int, placement: str = 'linear') -> set[int] | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/moe_hierarchical.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/moe_hierarchical.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/moe_routing.py",
@@ -2309,11 +2239,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/moe_routing.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `e_score_correction_bias`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py",
@@ -2419,11 +2344,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmCompressedTensorsConfig.get_name` overrides parent class `CompressedTensorsConfig` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors.py",
@@ -2787,11 +2707,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor` is not assignable to parameter `weight` with type `Tensor` in function `_dequantize_fp8_linear`"
     },
@@ -2904,11 +2819,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `list[Module | Tensor]` is not assignable to parameter `tensors` with type `Sequence[Tensor] | Tensor | None` in function `vllm_torchtpu.utils.synchronize_tensors`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
@@ -3092,11 +3002,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Size | Tensor` is not assignable to parameter `iterable` with type `Iterable[Any]` in function `list.__init__`"
     },
@@ -3124,16 +3029,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmMxfp4Config.get_name` overrides parent class `Mxfp4Config` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
@@ -3202,11 +3097,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor | device` is not assignable to parameter `device` with type `device` in function `vllm_torchtpu.layers.adapter.moe_routing.register_experts_start_buffer`"
     },
@@ -3259,11 +3149,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor` is not assignable to parameter `experts_start` with type `Tensor | None` in function `vllm_torchtpu.layers.adapter.fused_moe.fused_moe_gmm`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
@@ -3332,11 +3217,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor` is not assignable to parameter `w1` with type `Tensor` in function `vllm_torchtpu.layers.adapter.fused_moe_ep.fused_moe_ep`"
     },
@@ -3354,11 +3234,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/mxfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor` is not assignable to parameter `w2_scale` with type `Tensor` in function `vllm_torchtpu.layers.adapter.fused_moe_ep.fused_moe_ep`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
@@ -3412,11 +3287,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Size | Tensor` is not assignable to parameter `iterable` with type `Iterable[Any]` in function `list.__init__`"
     },
@@ -3449,16 +3319,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
@@ -3574,11 +3434,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `list[Module | Tensor]` is not assignable to parameter `tensors` with type `Sequence[Tensor] | Tensor | None` in function `vllm_torchtpu.utils.synchronize_tensors`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py",
@@ -3764,11 +3619,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/quantization/unquantized.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `list[Module | Tensor]` is not assignable to parameter `tensors` with type `Sequence[Tensor] | Tensor | None` in function `vllm_torchtpu.utils.synchronize_tensors`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/unquantized.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/unquantized.py",
@@ -6287,21 +6137,6 @@
     },
     {
       "path": "src/vllm_torchtpu/model_loader_patches.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/model_loader_patches.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/model_loader_patches.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `info_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/model_loader_patches.py",
       "name": "bad-assignment",
       "concise_description": "`(name: str, local_expert_ids: set[int] | None) -> bool` is not assignable to attribute `should_skip_weight` with type `(weight_name: str, local_expert_ids: set[int] | None) -> bool`"
     },
@@ -7397,16 +7232,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `type[AttentionBackend] | None` is not assignable to parameter `backend` with type `type[AttentionBackend]` in function `_warn_if_kv_cache_is_padded`"
     },
@@ -7562,11 +7387,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `(**mm_kwargs: object) -> MultiModalEmbeddings` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
     },
@@ -7574,16 +7394,6 @@
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `object` is not assignable to parameter `iterable` with type `Iterable[@_]` in function `list.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
     },
     {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
@@ -8034,11 +7844,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_pooling.py",
       "name": "bad-assignment",
       "concise_description": "`(self: Unknown, pooled_data: Unknown, pooling_metadata: Unknown) -> Tensor | list[Unknown | None] | list[Tensor]` is not assignable to attribute `forward` with type `(self: EmbeddingPoolerHead, pooled_data: SequencePoolingMethodOutput, pooling_metadata: PoolingMetadata) -> SequencePoolerHeadOutput`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Logger` has no attribute `warning_once`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -10054,6 +9859,28 @@
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `_sync_weights`"
+    }
+  ],
+  "items": [
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in "
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in "
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
     }
   ]
 }
