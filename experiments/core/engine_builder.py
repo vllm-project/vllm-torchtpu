@@ -32,7 +32,10 @@ class VllmEngineBuilder:
             "disable_chunked_mm_input": True,
             "enable_prefix_caching": False,
             "gpu_memory_utilization": 0.85,
-            "download_dir": HF_HOME,
+            # vLLM treats download_dir as a hub cache dir; point it at the
+            # same HF_HOME/hub that transformers uses, or every base model
+            # is downloaded twice (HF_HOME/models--* and HF_HOME/hub/models--*).
+            "download_dir": os.path.join(HF_HOME, "hub"),
         }
         # Apply max model context length if specified
         if context.max_model_len:
