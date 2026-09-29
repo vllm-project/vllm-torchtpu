@@ -16,8 +16,9 @@
 The router owns eligibility, selection and composition; each kernel package
 under `kernels/mla` owns only its implementation and does not import this
 module. The sparse kernel is the default path, which the sparse MLA layer
-calls directly. The layer enters this module only through its opt-in branch,
-after `applies` accepts the call's static shapes.
+calls directly. The layer enters this module only through its opt-in branch:
+`admit_layer` admits the layer when its KV cache is allocated, and `applies`
+then accepts each call's static shapes.
 
 The current routing policy is the opt-in GLM-5.2 TPU7x masked-dense
 experiment: the exact profile, the calibrated cost selection and the
@@ -52,6 +53,9 @@ from vllm_torchtpu.kernels.mla.masked_dense.kernel import (
     masked_dense_ragged_paged_attention,
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # This profile is deliberately exact. The opt-in is process-wide, while the
 # sparse MLA wrapper is generic to vLLM's DeepSeekV2-style model family. An
@@ -61,6 +65,8 @@ GLM52_NOPE_DIM = 512
 GLM52_ROPE_DIM = 64
 GLM52_INDEX_TOPK = 2048
 GLM52_PAGE_SIZE = 1024
+GLM52_MODEL_TYPE = "glm_moe_dsa"
+GLM52_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 
 MASKED_DENSE_ANALYTIC_MAX_KV_LEN = 2048
 MASKED_DENSE_MAX_KV_LEN = 6144
@@ -90,14 +96,23 @@ def _resolve_masked_dense_limit(name: str, default: int) -> int:
     return value
 
 
-# Process-static configuration: servers set the environment before importing
-# model code. Tests may override these module attributes directly.
-MASKED_DENSE_ANALYTIC_LIMIT = _resolve_masked_dense_limit(
-    "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN", MASKED_DENSE_ANALYTIC_MAX_KV_LEN
-)
-MASKED_DENSE_LIMIT = _resolve_masked_dense_limit(
-    "TPU_MLA_MASKED_DENSE_MAX_KV_LEN", MASKED_DENSE_MAX_KV_LEN
-)
+@functools.cache
+def masked_dense_limits() -> tuple[int, int]:
+    """(analytic, bitmap) KV-length limits; zero disables a tier.
+
+    Resolved on first use, which `admit_layer` reaches only after the opt-in
+    flag, the configuration and the layer pass, so a tuning value cannot fail a
+    process that never routes.
+    """
+    return (
+        _resolve_masked_dense_limit(
+            "TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN",
+            MASKED_DENSE_ANALYTIC_MAX_KV_LEN,
+        ),
+        _resolve_masked_dense_limit(
+            "TPU_MLA_MASKED_DENSE_MAX_KV_LEN", MASKED_DENSE_MAX_KV_LEN
+        ),
+    )
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -131,17 +146,17 @@ def applies(
     topk_indices: jax.Array,
     cache_layout: str,
 ) -> bool:
-    """Whether a sparse MLA call may take the masked-dense branch.
+    """Whether an admitted sparse MLA call may take the masked-dense branch.
 
-    Decided at trace time from static shapes and process-wide settings, so a
-    call that does not apply compiles exactly the original sparse graph.
+    Decided at trace time from static shapes, so a call that does not apply
+    compiles exactly the original sparse graph. The layer asks only when
+    `admit_layer` admitted it.
     """
     query = jax.ShapeDtypeStruct(
         (*ql_nope.shape[:-1], ql_nope.shape[-1] + q_pe.shape[-1]), ql_nope.dtype
     )
     return bool(
-        envs.TPU_MLA_MASKED_DENSE_ENABLED
-        and cache_layout == sparse_kernel.TENSORCORE_CACHE_LAYOUT
+        cache_layout == sparse_kernel.TENSORCORE_CACHE_LAYOUT
         and query.shape[0] >= MASKED_DENSE_MIN_TOKEN_BUCKET
         and matches_glm52_tpu7x_profile(
             query, kv_cache_nope, kv_cache_rope, topk_indices
@@ -363,7 +378,7 @@ def attention_from_parts(
 
     page_span = block_tables.shape[0] // seq_lens.shape[0] * kv_cache_nope.shape[1]
     branches, tier_limits = [], []
-    for slot, limit in enumerate((MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)):
+    for slot, limit in enumerate(masked_dense_limits()):
         max_kv_len = min(_align_to(limit, MASKED_DENSE_KV_BLOCK), page_span)
         if max_kv_len == 0 or (slot == 0 and max_kv_len > topk_indices.shape[-1]):
             tier_limits.append(0)
@@ -383,63 +398,132 @@ def attention_from_parts(
     return jax.lax.switch(tier, branches)
 
 
-def groups_requests(
-    attn_module,
-    kv_cache_specs,
-    page_size: int,
-    decode_context_parallel_size: int,
-) -> bool:
-    """Whether the runner should order a sparse MLA layer's requests by length.
+def configuration_rejection(vllm_config) -> str | None:
+    """Why this process may not route masked-dense MLA, or None if it may.
+
+    The routing is admitted positively: only the configuration it was
+    validated under passes, and a missing or unrecognized setting is a
+    rejection. Data and expert parallelism are allowed; every other form of
+    parallelism changes which rows or KV positions one rank sees.
+    """
+    if not envs.TPU_MLA_MASKED_DENSE_ENABLED:
+        return "TPU_MLA_MASKED_DENSE_ENABLED is off"
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if (
+        getattr(hf_config, "model_type", None) != GLM52_MODEL_TYPE
+        or GLM52_ARCHITECTURE not in architectures
+    ):
+        return "the model is not GLM-5.2"
+    geometry = tuple(
+        getattr(hf_config, name, None)
+        for name in (
+            "num_attention_heads",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "index_topk",
+        )
+    )
+    if geometry != (GLM52_NUM_HEADS, GLM52_NOPE_DIM, GLM52_ROPE_DIM, GLM52_INDEX_TOPK):
+        return f"model geometry {geometry} is not the calibrated GLM-5.2 profile"
+    if getattr(hf_config, "sliding_window", None) is not None:
+        return "sliding-window attention"
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    for name in (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        size = getattr(parallel_config, name, None)
+        if size != 1:
+            return f"{name}={size}"
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        return "speculative decoding"
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        return "KV transfer"
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if getattr(cache_config, "kv_offloading_size", None):
+        return "KV offloading"
+    return None
+
+
+def _layer_topk(attn_module) -> int | None:
+    """The layer's top-k width, if its indexer or shared buffer states it."""
+    topk = getattr(getattr(attn_module, "indexer", None), "topk_tokens", None)
+    if isinstance(topk, int):
+        return topk
+    shape = getattr(getattr(attn_module, "topk_indices_buffer", None), "shape", None)
+    if isinstance(shape, tuple) and len(shape) >= 2 and isinstance(shape[-1], int):
+        return shape[-1]
+    return None
+
+
+def layer_rejection(attn_module, kv_cache_specs, page_size: int) -> str | None:
+    """Why a sparse MLA layer may not route masked-dense, or None if it may.
 
     The static counterpart of `applies`, evaluated from the layer's
-    configuration when its KV cache is allocated. Ordering by KV length only
-    helps this routing, so other models keep their request order. The kernel
-    query is the `kv_lora_rank`-wide latent plus the rope part.
+    configuration when its KV cache is allocated. The kernel query is the
+    `kv_lora_rank`-wide latent plus the rope part. A layer that reuses an
+    earlier layer's indices has no indexer of its own, so its width comes from
+    the shared buffer; a layer that states neither is rejected.
     """
-    indexer = getattr(attn_module, "indexer", None)
-    topk = getattr(indexer, "topk_tokens", getattr(attn_module, "topk_tokens", None))
-    if not isinstance(topk, int):
-        buf = getattr(
-            attn_module,
-            "topk_indices_buffer",
-            getattr(getattr(attn_module, "impl", None), "topk_indices_buffer", None),
-        )
-        if buf is not None and getattr(buf, "ndim", 0) >= 2:
-            topk = int(buf.shape[-1])
-    topk_matches = (
-        topk == GLM52_INDEX_TOPK if isinstance(topk, int) else indexer is None
+    impl = getattr(attn_module, "impl", None)
+    if any(
+        getattr(module, "non_causal_multi_token_decode", False)
+        for module in (attn_module, impl)
+    ):
+        return "non-causal attention"
+    if not kv_cache_specs or any(
+        spec.layout.value != sparse_kernel.TENSORCORE_CACHE_LAYOUT
+        for spec in kv_cache_specs
+    ):
+        return "the KV caches are not in the TensorCore layout"
+    geometry = tuple(
+        getattr(attn_module, name, None)
+        for name in ("num_heads", "kv_lora_rank", "qk_rope_head_dim")
     )
-    return bool(
-        decode_context_parallel_size == 1
-        and all(
-            spec.layout.value == sparse_kernel.TENSORCORE_CACHE_LAYOUT
-            for spec in kv_cache_specs
-        )
-        and attn_module.num_heads == GLM52_NUM_HEADS
-        and attn_module.kv_lora_rank == GLM52_NOPE_DIM
-        and attn_module.qk_rope_head_dim == GLM52_ROPE_DIM
-        and topk_matches
-        and page_size == GLM52_PAGE_SIZE
-    )
+    if geometry != (GLM52_NUM_HEADS, GLM52_NOPE_DIM, GLM52_ROPE_DIM):
+        return f"layer geometry {geometry} is not the calibrated GLM-5.2 profile"
+    if page_size != GLM52_PAGE_SIZE:
+        return f"page size {page_size}"
+    topk = _layer_topk(attn_module)
+    if topk != GLM52_INDEX_TOPK:
+        return f"top-k {topk} is not {GLM52_INDEX_TOPK}"
+    return None
 
 
-def update_runner_profile(
-    runner,
-    attn_module,
-    kv_cache_specs,
-    page_size: int,
-) -> None:
-    """Update runner's static eligibility for masked-dense request ordering."""
-    if getattr(runner, "_masked_dense_groups_requests", None) is False:
+def admit_layer(runner, attn_module, kv_cache_specs, page_size: int) -> None:
+    """Records whether a sparse MLA layer routes masked-dense MLA.
+
+    Called when the layer's KV cache is allocated, before any step is traced.
+    Sets `attn_module.allow_masked_dense`, which the layer's sparse op reads
+    when it is traced, and folds the layer into the runner's
+    `_masked_dense_groups_requests`: requests are ordered by KV length only
+    when every sparse MLA layer is admitted. With the flag off nothing is
+    recorded, so the layer keeps its original sparse call and the runner its
+    request order.
+    """
+    if not envs.TPU_MLA_MASKED_DENSE_ENABLED:
         return
-    dcp_size = getattr(
-        getattr(runner, "parallel_config", None),
-        "decode_context_parallel_size",
-        1,
+    reason = configuration_rejection(runner.vllm_config) or layer_rejection(
+        attn_module, kv_cache_specs, page_size
     )
-    runner._masked_dense_groups_requests = groups_requests(
-        attn_module, kv_cache_specs, page_size, dcp_size
+    # Limits resolve only once everything else admits the layer, so a tuning
+    # value cannot fail a configuration that would not route anyway.
+    if reason is None and not any(masked_dense_limits()):
+        reason = "every masked-dense tier is disabled"
+    admitted = reason is None
+    attn_module.allow_masked_dense = admitted
+    runner._masked_dense_groups_requests = (
+        admitted and runner._masked_dense_groups_requests is not False
     )
+    if reason is not None:
+        logger.warning_once(
+            "Masked-dense MLA routing is enabled but not admitted: %s. "
+            "Using the sparse kernel.",
+            reason,
+        )
 
 
 def order_prefills_by_kv_len(
@@ -486,10 +570,8 @@ def maybe_order_prefills_by_kv_len(
     scheduler_output,
     spec_decode_tokens,
 ) -> None:
-    """Order non-speculative prefill requests by KV length when enabled."""
-    if (
-        not spec_decode_tokens
-        and getattr(runner, "_masked_dense_groups_requests", None)
-        and envs.TPU_MLA_MASKED_DENSE_ENABLED
+    """Order prefill requests by KV length when every layer was admitted."""
+    if not spec_decode_tokens and getattr(
+        runner, "_masked_dense_groups_requests", None
     ):
         order_prefills_by_kv_len(runner, num_decode, num_reqs, scheduler_output)

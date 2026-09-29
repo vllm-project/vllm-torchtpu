@@ -25,6 +25,7 @@ makes the first cases a dense-parity check of the full path
 import contextlib
 import math
 import os
+import types
 from unittest import mock
 
 import jax
@@ -89,7 +90,8 @@ ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(
     KV_PACKING,
 )
 
-_LIMIT_NAMES = ("MASKED_DENSE_ANALYTIC_LIMIT", "MASKED_DENSE_LIMIT")
+# The real resolver, before any test replaces it.
+_RESOLVE_LIMITS = mla_dispatch.masked_dense_limits
 
 # Pinned to the gather kernel: every masked-dense tier disabled.
 GATHER_ONLY = (0, 0)
@@ -99,20 +101,15 @@ GATHER_ONLY = (0, 0)
 def _masked_dense_limits(*limits: int):
     """Forces the tier the dispatch picks, for the duration of the block.
 
-    `limits` is (analytic, bitmap). These module constants are resolved from
-    the environment at import, so tests override them here rather than by
-    setting `os.environ`.
+    `limits` is (analytic, bitmap). `masked_dense_limits` resolves them from
+    the environment once per process, so tests override it here rather than
+    by setting `os.environ`.
     """
-    assert len(limits) == len(_LIMIT_NAMES)
-    module = mla_dispatch
-    saved = [getattr(module, n) for n in _LIMIT_NAMES]
-    for name, value in zip(_LIMIT_NAMES, limits):
-        setattr(module, name, value)
-    try:
+    assert len(limits) == 2
+    with mock.patch.object(
+        mla_dispatch, "masked_dense_limits", return_value=tuple(limits)
+    ):
         yield
-    finally:
-        for name, value in zip(_LIMIT_NAMES, saved):
-            setattr(module, name, value)
 
 
 @contextlib.contextmanager
@@ -900,9 +897,6 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
 
         routed = limits is not ORIGINAL_SPARSE
         with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", routed)
-            )
             if routed:
                 stack.enter_context(_masked_dense_limits(*limits))
                 stack.enter_context(
@@ -938,6 +932,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                 ROPE_SPEC,
                 sm_scale=self.sm_scale,
                 k_scale=self.k_scale,
+                allow_masked_dense=routed,
             )
         return (nope, rope), np.asarray(output.astype(jnp.float32))[:total]
 
@@ -1106,8 +1101,9 @@ class SparseMlaLayerBranchTest(parameterized.TestCase):
 
     K_SCALE = 1.5
     SM_SCALE = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-    # (flag, applies) for flag off, ineligible flag on and eligible flag on.
-    # The flag-off case mocks `applies` true to check the layer's own guard.
+    # (allowed, applies) for an unadmitted layer, an admitted layer whose call
+    # does not apply and an admitted layer whose call does. The unadmitted
+    # case mocks `applies` true to check the layer's own guard.
     CASES = ((False, True), (True, False), (True, True))
 
     def setUp(self):
@@ -1562,7 +1558,6 @@ class MaskedDenseProfileTest(parameterized.TestCase):
     def _applies(
         self,
         *,
-        enabled=True,
         nope=None,
         rope=None,
         cache_layout="tensorcore",
@@ -1572,21 +1567,17 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         tokens, heads, _ = q.shape
         ql_nope = jax.ShapeDtypeStruct((tokens, heads, 512), q.dtype)
         q_pe = jax.ShapeDtypeStruct((tokens, heads, 64), q.dtype)
-        with mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", enabled):
-            return mla_dispatch.applies(
-                ql_nope,
-                q_pe,
-                nope or default_nope,
-                rope or default_rope,
-                topk,
-                cache_layout,
-            )
+        return mla_dispatch.applies(
+            ql_nope,
+            q_pe,
+            nope or default_nope,
+            rope or default_rope,
+            topk,
+            cache_layout,
+        )
 
     def test_exact_profile_applies(self):
         self.assertTrue(self._applies())
-
-    def test_disabled_flag_keeps_sparse(self):
-        self.assertFalse(self._applies(enabled=False))
 
     @parameterized.parameters(16, 32, 64, 128, 256)
     def test_decode_sized_bucket_keeps_sparse(self, tokens):
@@ -1606,42 +1597,251 @@ class MaskedDenseProfileTest(parameterized.TestCase):
         )
 
 
-class MaskedDenseRequestGroupingTest(parameterized.TestCase):
-    """`groups_requests`: the runner's static eligibility per sparse layer."""
-
-    @staticmethod
-    def _groups(*, layout=KVCacheLayout.TENSORCORE, page_size=1024, dcp=1, **layer):
-        attrs = dict(
-            num_heads=64,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            indexer=mock.Mock(topk_tokens=2048),
-        )
-        attrs.update(layer)
-        specs = (mock.Mock(layout=layout), mock.Mock(layout=layout))
-        return mla_dispatch.groups_requests(mock.Mock(**attrs), specs, page_size, dcp)
-
-    def test_glm52_layer_groups_requests(self):
-        self.assertTrue(self._groups())
-
-    def test_glm52_shared_indexer_layer_groups_requests(self):
-        self.assertTrue(self._groups(indexer=None, topk_indices_buffer=None))
-        buf = mock.Mock(ndim=2, shape=(16, 2048))
-        self.assertTrue(self._groups(indexer=None, topk_indices_buffer=buf))
-        self.assertFalse(
-            self._groups(
-                indexer=None, topk_indices_buffer=mock.Mock(ndim=2, shape=(16, 1024))
+def _glm52_vllm_config(*, hf=(), parallel=(), cache=(), **top):
+    """The admitted configuration, GLM-5.2 on DP16/EP, with overrides."""
+    return types.SimpleNamespace(
+        model_config=types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(
+                **{
+                    "model_type": "glm_moe_dsa",
+                    "architectures": ["GlmMoeDsaForCausalLM"],
+                    "num_attention_heads": 64,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 64,
+                    "index_topk": 2048,
+                    **dict(hf),
+                }
             )
+        ),
+        parallel_config=types.SimpleNamespace(
+            **{
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "decode_context_parallel_size": 1,
+                "prefill_context_parallel_size": 1,
+                "data_parallel_size": 16,
+                "enable_expert_parallel": True,
+                **dict(parallel),
+            }
+        ),
+        cache_config=types.SimpleNamespace(
+            **{
+                "kv_offloading_size": None,
+                "kv_offloading_backend": "native",
+                **dict(cache),
+            }
+        ),
+        **{"speculative_config": None, "kv_transfer_config": None, **top},
+    )
+
+
+def _glm52_layer(**overrides):
+    """A GLM-5.2 sparse MLA layer with its own indexer, with overrides."""
+    attrs = dict(
+        num_heads=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        indexer=types.SimpleNamespace(topk_tokens=2048),
+        topk_indices_buffer=None,
+        impl=types.SimpleNamespace(non_causal_multi_token_decode=False),
+    )
+    attrs.update(overrides)
+    return types.SimpleNamespace(**attrs)
+
+
+def _specs(layout=KVCacheLayout.TENSORCORE):
+    return (mock.Mock(layout=layout), mock.Mock(layout=layout))
+
+
+class MaskedDenseAdmissionTest(parameterized.TestCase):
+    """`admit_layer` and its configuration and layer checks.
+
+    Admission is positive: only the validated GLM-5.2 configuration passes,
+    and anything missing or unrecognized is rejected.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.enter_context(
+            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", True)
         )
+        self.enter_context(_masked_dense_limits(2048, 6144))
+
+    def test_glm52_dp_ep_configuration_is_admitted(self):
+        self.assertIsNone(mla_dispatch.configuration_rejection(_glm52_vllm_config()))
+
+    @parameterized.named_parameters(
+        dict(testcase_name="model_type", hf={"model_type": "deepseek_v32"}),
+        dict(testcase_name="architecture", hf={"architectures": ["Other"]}),
+        dict(testcase_name="no_architecture", hf={"architectures": None}),
+        dict(testcase_name="heads", hf={"num_attention_heads": 128}),
+        dict(testcase_name="latent", hf={"kv_lora_rank": 448}),
+        dict(testcase_name="rope", hf={"qk_rope_head_dim": 32}),
+        dict(testcase_name="topk", hf={"index_topk": 1024}),
+        dict(testcase_name="no_topk", hf={"index_topk": None}),
+        dict(testcase_name="sliding_window", hf={"sliding_window": 4096}),
+        dict(testcase_name="tensor_parallel", parallel={"tensor_parallel_size": 2}),
+        dict(testcase_name="pipeline_parallel", parallel={"pipeline_parallel_size": 2}),
+        dict(
+            testcase_name="decode_context_parallel",
+            parallel={"decode_context_parallel_size": 2},
+        ),
+        dict(
+            testcase_name="prefill_context_parallel",
+            parallel={"prefill_context_parallel_size": 2},
+        ),
+        dict(
+            testcase_name="unknown_parallel_size",
+            parallel={"prefill_context_parallel_size": None},
+        ),
+        dict(testcase_name="speculative", speculative_config=object()),
+        dict(testcase_name="kv_transfer", kv_transfer_config=object()),
+        dict(testcase_name="kv_offloading", cache={"kv_offloading_size": 8.0}),
+    )
+    def test_other_configurations_are_rejected(self, **overrides):
+        self.assertIsNotNone(
+            mla_dispatch.configuration_rejection(_glm52_vllm_config(**overrides))
+        )
+
+    def test_missing_configuration_is_rejected(self):
+        self.assertIsNotNone(mla_dispatch.configuration_rejection(None))
+        config = _glm52_vllm_config()
+        del config.parallel_config
+        self.assertIsNotNone(mla_dispatch.configuration_rejection(config))
+
+    def test_glm52_layer_is_admitted(self):
+        self.assertIsNone(mla_dispatch.layer_rejection(_glm52_layer(), _specs(), 1024))
+
+    def test_shared_indexer_layer_needs_the_forwarded_buffer(self):
+        def rejection(buffer):
+            layer = _glm52_layer(indexer=None, topk_indices_buffer=buffer)
+            return mla_dispatch.layer_rejection(layer, _specs(), 1024)
+
+        self.assertIsNone(rejection(np.empty((16, 2048), np.int32)))
+        self.assertIsNotNone(rejection(None))
+        self.assertIsNotNone(rejection(np.empty((16, 1024), np.int32)))
 
     @parameterized.named_parameters(
         dict(testcase_name="heads", num_heads=16),
         dict(testcase_name="latent", kv_lora_rank=448),
         dict(testcase_name="rope", qk_rope_head_dim=32),
-        dict(testcase_name="topk", indexer=mock.Mock(topk_tokens=1024)),
-        dict(testcase_name="page_size", page_size=512),
-        dict(testcase_name="native_layout", layout=KVCacheLayout.SPARSECORE),
-        dict(testcase_name="decode_context_parallel", dcp=2),
+        dict(testcase_name="no_heads", num_heads=None),
+        dict(testcase_name="topk", indexer=types.SimpleNamespace(topk_tokens=1024)),
+        dict(testcase_name="unknown_topk", indexer=types.SimpleNamespace()),
+        dict(
+            testcase_name="non_causal_impl",
+            impl=types.SimpleNamespace(non_causal_multi_token_decode=True),
+        ),
+        dict(testcase_name="non_causal_layer", non_causal_multi_token_decode=True),
     )
-    def test_other_layers_keep_order(self, **overrides):
-        self.assertFalse(self._groups(**overrides))
+    def test_other_layers_are_rejected(self, **overrides):
+        self.assertIsNotNone(
+            mla_dispatch.layer_rejection(_glm52_layer(**overrides), _specs(), 1024)
+        )
+
+    def test_other_caches_are_rejected(self):
+        layer = _glm52_layer()
+        sparsecore = _specs(KVCacheLayout.SPARSECORE)
+        self.assertIsNotNone(mla_dispatch.layer_rejection(layer, sparsecore, 1024))
+        self.assertIsNotNone(mla_dispatch.layer_rejection(layer, (), 1024))
+        self.assertIsNotNone(mla_dispatch.layer_rejection(layer, _specs(), 512))
+
+    def _admit(self, runner, config=None, specs=None, page_size=1024, **layer):
+        module = _glm52_layer(**layer)
+        runner.vllm_config = config or _glm52_vllm_config()
+        mla_dispatch.admit_layer(runner, module, specs or _specs(), page_size)
+        return module
+
+    @staticmethod
+    def _runner():
+        return types.SimpleNamespace(_masked_dense_groups_requests=None)
+
+    def test_one_disabled_tier_is_admitted(self):
+        with _masked_dense_limits(0, 6144):
+            self.assertIs(self._admit(self._runner()).allow_masked_dense, True)
+
+    def test_every_tier_disabled_is_rejected(self):
+        """Both tiers off: no route preparation and no request ordering."""
+        runner = self._runner()
+        with _masked_dense_limits(0, 0):
+            self.assertIs(self._admit(runner).allow_masked_dense, False)
+        self.assertIs(runner._masked_dense_groups_requests, False)
+
+    def test_flag_off_records_nothing(self):
+        """An invalid tuning value cannot fail a process that never routes."""
+        runner = self._runner()
+        with (
+            mock.patch.object(envs, "TPU_MLA_MASKED_DENSE_ENABLED", False),
+            mock.patch.object(
+                mla_dispatch, "masked_dense_limits", side_effect=ValueError
+            ) as limits,
+        ):
+            layer = self._admit(runner)
+        limits.assert_not_called()
+        self.assertFalse(hasattr(layer, "allow_masked_dense"))
+        self.assertIsNone(runner._masked_dense_groups_requests)
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="decode_context_parallel",
+            config=_glm52_vllm_config(parallel={"decode_context_parallel_size": 2}),
+        ),
+        dict(
+            testcase_name="prefill_context_parallel",
+            config=_glm52_vllm_config(parallel={"prefill_context_parallel_size": 2}),
+        ),
+        dict(
+            testcase_name="speculative",
+            config=_glm52_vllm_config(speculative_config=object()),
+        ),
+        dict(
+            testcase_name="other_model",
+            config=_glm52_vllm_config(hf={"index_topk": 1024}),
+        ),
+        dict(testcase_name="sparsecore", specs=_specs(KVCacheLayout.SPARSECORE)),
+        dict(testcase_name="page_size", page_size=512),
+        dict(testcase_name="heads", num_heads=16),
+        dict(testcase_name="unknown_topk", indexer=None),
+        dict(testcase_name="non_causal", non_causal_multi_token_decode=True),
+    )
+    def test_ineligible_layers_do_not_resolve_limits(self, **case):
+        """A malformed tuning value cannot fail a flag-on process whose
+        configuration or layer is not admitted."""
+        runner = self._runner()
+        with mock.patch.object(
+            mla_dispatch, "masked_dense_limits", side_effect=ValueError
+        ) as limits:
+            self.assertIs(self._admit(runner, **case).allow_masked_dense, False)
+        limits.assert_not_called()
+        self.assertIs(runner._masked_dense_groups_requests, False)
+
+    def test_invalid_tuning_fails_an_admitted_layer(self):
+        """Once everything else admits the layer, a bad limit is an error."""
+        _RESOLVE_LIMITS.cache_clear()
+        self.addCleanup(_RESOLVE_LIMITS.cache_clear)
+        with (
+            mock.patch.object(mla_dispatch, "masked_dense_limits", _RESOLVE_LIMITS),
+            mock.patch.dict(os.environ, {"TPU_MLA_MASKED_DENSE_MAX_KV_LEN": "1000"}),
+            self.assertRaises(ValueError),
+        ):
+            self._admit(self._runner())
+
+    def test_admitted_layers_allow_routing_and_ordering(self):
+        runner = self._runner()
+        for _ in range(2):
+            self.assertIs(self._admit(runner).allow_masked_dense, True)
+        self.assertIs(runner._masked_dense_groups_requests, True)
+
+    def test_rejected_configuration_allows_neither(self):
+        runner = self._runner()
+        speculative = _glm52_vllm_config(speculative_config=object())
+        self.assertIs(self._admit(runner, speculative).allow_masked_dense, False)
+        self.assertIs(runner._masked_dense_groups_requests, False)
+
+    def test_mixed_layers_keep_request_order(self):
+        """A rejected layer keeps ordering off even if a later one passes."""
+        runner = self._runner()
+        self.assertTrue(self._admit(runner).allow_masked_dense)
+        self.assertFalse(self._admit(runner, num_heads=16).allow_masked_dense)
+        self.assertTrue(self._admit(runner).allow_masked_dense)
+        self.assertIs(runner._masked_dense_groups_requests, False)

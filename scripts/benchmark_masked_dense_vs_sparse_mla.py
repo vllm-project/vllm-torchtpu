@@ -393,8 +393,9 @@ def _run_point(
             k_scale=1.0,
         )
 
-    analytic_bound = min(mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN)
-    bitmap_bound = min(mla_dispatch.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
+    analytic_limit, bitmap_limit = mla_dispatch.masked_dense_limits()
+    analytic_bound = min(analytic_limit, MAX_MODEL_LEN)
+    bitmap_bound = min(bitmap_limit, MAX_MODEL_LEN)
 
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)

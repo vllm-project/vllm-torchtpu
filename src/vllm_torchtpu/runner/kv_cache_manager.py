@@ -1595,7 +1595,7 @@ class KVCacheManager:
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
                         )
-                        mla_dispatch.update_runner_profile(
+                        mla_dispatch.admit_layer(
                             self.runner, attn_module, specs, kv_cache_spec.block_size
                         )
                         attn_module.mla_kv_spec = specs
