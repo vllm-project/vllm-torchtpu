@@ -146,7 +146,9 @@ serve &
 serve_pid=$!
 proxy_pid=""
 cleanup() {
-  [[ -n "$proxy_pid" ]] && kill "$proxy_pid" 2>/dev/null || true
+  if [[ -n "$proxy_pid" ]]; then
+    kill "$proxy_pid" 2>/dev/null || true
+  fi
   kill "$serve_pid" 2>/dev/null || true
   wait "$serve_pid" 2>/dev/null || true
   kill "$tail_pid" 2>/dev/null || true
