@@ -62,7 +62,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -739,6 +739,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
     _moe_lowtok_scores_op: torch.library.CustomOpDef | None = None
+    _num_primary_experts: int | None = None
 
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -994,10 +995,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
+        self._num_primary_experts = expert_placement.num_primary_experts(
+            layer.layer_name
+        )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            num_primary_experts=self._num_primary_experts,
         )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
@@ -1093,6 +1098,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_ids = moe_lowtok_scores.lift_holders(
+            self._moe_lowtok_scores_op, layer, topk_ids
+        )
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
@@ -1114,6 +1122,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
             "experts_start": layer._experts_start,
+            "num_primary_experts": self._num_primary_experts,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }

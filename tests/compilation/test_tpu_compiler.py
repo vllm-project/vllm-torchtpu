@@ -73,6 +73,28 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_covers_the_expert_placement_contents(self, tmp_path):
+        """Two tables at one path must not share compiled executables."""
+        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        path = tmp_path / "placement.json"
+        keys = []
+        with (
+            patch(
+                "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                return_value=[],
+            ),
+            patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": str(path)}),
+        ):
+            for contents in ('{"slots_per_core": 64}', '{"slots_per_core": 80}'):
+                path.write_text(contents)
+                expert_placement._digest.cache_clear()
+                keys.append(compute_tpu_compilation_hash(self._config()))
+        expert_placement._digest.cache_clear()
+
+        assert keys[0] != keys[1]
+
     def test_tpu_hash_ignores_the_phased_profiler_switch(self):
         """Selecting a profiler must not bust the compile cache: otherwise a
         profiled run recompiles everything, and so does the next plain one."""

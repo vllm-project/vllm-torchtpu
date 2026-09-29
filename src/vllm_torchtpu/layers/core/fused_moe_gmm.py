@@ -564,6 +564,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -584,6 +585,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -594,6 +596,8 @@ def fused_moe_func(
     structurally different program under the same custom-op name, which
     desyncs the in-graph EP collectives). The kernel remaps global ids to
     local ids with an elementwise subtract and masks non-local experts.
+    ``num_primary_experts`` bounds that interval when the shard's trailing
+    weight slots hold copies of other shards' experts (default: all slots).
     ``use_ep`` is a static flag enabling EP routing (identical across ranks,
     safe to bind as a compile-time constant); ``use_sparse_core`` is a static
     flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
@@ -630,8 +634,10 @@ def fused_moe_func(
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and experts_start is not None:
+        num_local = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        assert 0 < num_local <= w1.shape[0], "primaries must fit the weight slots"
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < num_local)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 

@@ -27,7 +27,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_placement, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
@@ -277,6 +277,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        # The env var is only the table's path; its contents set the shapes.
+        "expert_placement": expert_placement.content_hash(),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

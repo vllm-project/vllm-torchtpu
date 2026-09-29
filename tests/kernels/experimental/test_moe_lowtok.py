@@ -208,6 +208,110 @@ def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_glo
     _assert_close(got, _reference(x, local, w, *weights), 2.5e-2)
 
 
+def _copies_case(seed, skew, ranks=8, local=8, copies=2, tokens=5, topk=4):
+    """Eight shards of 8 primaries plus 2 copy slots each: every hit expert
+    gets a copy on another shard while that shard has a free slot."""
+    rng = np.random.default_rng(seed)
+    n = ranks * local
+    x = jnp.asarray(rng.standard_normal((tokens, 512)), jnp.bfloat16)
+    weights = _weights(rng, n, 512, 256)
+    logits = rng.standard_normal((tokens, n)) * 3
+    if skew:
+        logits[:, :local] += 6.0  # most hits land on shard 0's primaries
+    scores = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
+    w, ids = _router(scores, topk)
+    hit = np.unique(np.asarray(ids))
+    copy = np.full(n, -1, np.int32)
+    slots = {r: list(range(r * local, (r + 1) * local)) for r in range(ranks)}
+    for e in hit:
+        r = (e // local + 1 + e % (ranks - 1)) % ranks
+        if len(slots[r]) < local + copies:
+            copy[e] = r
+            slots[r].append(int(e))
+    hot = [int(e) for e in hit if copy[e] >= 0]
+    return x, scores, weights, w, ids, slots, copy, hot
+
+
+def _servers(ids, copy, hot, local, ranks):
+    """The shard serving each hit expert: its primary, or for a copied expert,
+    in hot order, the holder with fewer hit experts so far (ties: primary)."""
+    hit = set(np.unique(np.asarray(ids)).tolist())
+    server = {e: e // local for e in hit if copy[e] < 0}
+    load = np.bincount(list(server.values()), minlength=ranks)
+    for e in hot:
+        if e in hit:
+            home, other = e // local, copy[e]
+            server[e] = other if load[other] < load[home] else home
+            load[server[e]] += 1
+    return server
+
+
+def _copies_outputs(x, scores, weights, slots, copy, hot, topk=4):
+    ranks = len(slots)
+    local = len(copy) // ranks
+    outs = []
+    for r, gid in slots.items():
+        holders = kernel.holder_tables(gid, copy, hot, local)
+        outs.append(
+            kernel.moe_lowtok(
+                x,
+                scores,
+                *(t[np.asarray(gid)] for t in weights),
+                jnp.int32(r * local),
+                topk=topk,
+                holders=kernel.Holders(*map(jnp.asarray, holders)),
+                ranks=ranks,
+            )
+        )
+    return outs
+
+
+def _check_copies(case, rel_l2):
+    x, scores, weights, w, ids, slots, copy, hot = case
+    local = len(copy) // len(slots)
+    server = _servers(ids, copy, hot, local, len(slots))
+    assert any(server[e] != e // local for e in server), "no copy is served"
+    outs = _copies_outputs(x, scores, weights, slots, copy, hot)
+    served = np.vectorize(lambda e: server[int(e)])(np.asarray(ids))
+    for r, out in enumerate(outs):
+        mine = jnp.where(served == r, ids, -1)
+        _assert_close(out, _reference(x, mine, w, *weights), rel_l2)
+    total = sum(o.astype(jnp.float32) for o in outs)
+    _assert_close(total, _reference(x, ids, w, *weights), rel_l2)
+
+
+@pytest.mark.parametrize("skew", [False, True])
+def test_copies_serve_every_hit_expert_once(skew):
+    _needs("tpu")
+    _check_copies(_copies_case(7, skew), 1e-2)
+
+
+@pytest.mark.parametrize("skew", [False, True])
+def test_interpreted_copies_serve_every_hit_expert_once(interpret, skew):
+    _check_copies(_copies_case(7, skew), 2.5e-2)
+
+
+def test_copies_without_a_hot_expert_match_the_primaries():
+    """Copy slots present but no copied expert: the primaries serve alone."""
+    _needs("tpu")
+    x, scores, weights, w, ids, slots, _, _ = _copies_case(11, False)
+    outs = _copies_outputs(x, scores, weights, slots, np.full(64, -1, np.int32), [])
+    total = sum(o.astype(jnp.float32) for o in outs)
+    _assert_close(total, _reference(x, ids, w, *weights))
+
+
+def test_holder_tables_index_the_copies():
+    gid = [0, 1, 5]
+    tables = kernel.holder_tables(gid, [1, -1, -1, -1, -1, 0, -1, -1], [5, 0], 2)
+    assert tables.slot[:8].tolist() == [0, 1, -1, -1, -1, 2, -1, -1]
+    assert tables.hot[:3].tolist() == [5, 0, -1]
+    assert tables.hprim[:3].tolist() == [2, 0, -1]
+    assert tables.hcopy[:3].tolist() == [0, 1, -1]
+    assert tables.hot1h.shape == (128, 128)
+    assert tables.hot1h[5, 0] == 1 and tables.hot1h[0, 1] == 1
+    assert tables.hot1h.sum() == 2
+
+
 def _shapes(m, h, i, e):
     return (
         jax.ShapeDtypeStruct((m, h), jnp.bfloat16),

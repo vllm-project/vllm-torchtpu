@@ -15,14 +15,18 @@
 
 from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
     MOE_LOWTOK_MAX_TOKENS,
+    Holders,
     can_use_moe_lowtok,
+    holder_tables,
     moe_lowtok,
     routing_table,
 )
 
 __all__ = [
     "MOE_LOWTOK_MAX_TOKENS",
+    "Holders",
     "can_use_moe_lowtok",
+    "holder_tables",
     "moe_lowtok",
     "routing_table",
 ]

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_LOWTOK: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -542,6 +543,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # calls of at most MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
     # a plain softmax top-k router into it. Exclusive with dense expert MoE.
     "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK"),
+    # Path or gs:// URI of a per-layer expert placement JSON applied at load
+    # (expert_placement.py). Empty keeps vLLM's linear placement.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Load-time selection and forward wiring of the small-batch MoE scores entry."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -42,6 +43,7 @@ def make_layer(experts=64, hidden=512, inter=256, use_ep=True):
         w13_weight_scale_inv=meta(experts, 1, 1, 2 * inter, dtype=torch.float32),
         w2_weight_scale_inv=meta(experts, 1, 1, hidden, dtype=torch.float32),
         _experts_start=torch.tensor(192, dtype=torch.int32),
+        _moe_lowtok_copies=False,
     )
 
 
@@ -211,6 +213,7 @@ def test_fp8_forward_takes_the_scores_entry_below_the_cap(monkeypatch, rows, low
         _tpu_activation_str="silu",
         _use_adaptive_fused_moe=False,
         _moe_lowtok_scores_op=Mock(),
+        _num_primary_experts=None,
     )
     layer = make_layer()
     layer.w13_bias = layer.w2_bias = None
@@ -240,3 +243,86 @@ def test_op_is_built_once_per_topk_and_fakes_the_row_shape():
         ]
         out = op(x, torch.empty(4, 512), *w, torch.empty((), dtype=torch.int32))
     assert tuple(out.shape) == (4, 512) and out.dtype == torch.bfloat16
+
+
+@pytest.fixture
+def copies_placement(tmp_path, monkeypatch):
+    """Two ranks of two primaries plus one copy slot; this layer is rank 1."""
+    from vllm_torchtpu import expert_placement
+
+    table = {
+        "shards": 2,
+        "experts": 4,
+        "owned_per_core": 2,
+        "slots_per_core": 3,
+        "copies": True,
+        "layers": {"0": {"cores": [[0, 1, 2], [2, 3, 0]], "copies": {"2": 0, "0": 1}}},
+    }
+    path = tmp_path / "placement.json"
+    path.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    expert_placement._load.cache_clear()
+    yield
+    expert_placement._load.cache_clear()
+
+
+def placed_layer(name):
+    layer = make_layer(experts=3)
+    layer.layer_name = name
+    layer.w13_weight = torch.empty_like(layer.w13_weight, device="cpu")
+    layer.moe_config.ep_rank, layer.moe_config.ep_size = 1, 2
+    layer.register_buffer = lambda n, t, persistent: setattr(layer, n, t)
+    return layer
+
+
+def test_copies_register_holder_tables_and_the_draft_keeps_the_ids_entry(
+    enabled, copies_placement, monkeypatch
+):
+    target = placed_layer("model.layers.0.mlp.experts")
+    assert scores.prebuild(method(), target, "silu") is enabled
+    scores._build_op.assert_called_once_with(10, 2)
+    assert target._moe_lowtok_copies
+    assert target._moe_lowtok_gid.tolist() == [2, 3, 0]
+    assert target._moe_lowtok_copy[:4].tolist() == [1, -1, 0, -1]
+    assert target._moe_lowtok_hot[:3].tolist() == [2, 0, -1]
+    assert target._moe_lowtok_hot1h.dtype == torch.bfloat16
+
+    # Under the draft's model tag neither the scores op nor holder tables are
+    # built, even for a name the placement table lists.
+    from vllm.compilation import backends
+
+    with backends.set_model_tag("eagle_head"):
+        for name in ("mtp.layers.0.mlp.experts", "model.layers.0.mlp.experts"):
+            draft = placed_layer(name)
+            assert scores.prebuild(method(), draft, "silu") is None
+            assert not draft._moe_lowtok_copies
+            assert not hasattr(draft, "_moe_lowtok_gid")
+    scores._build_op.assert_called_once_with(10, 2)
+
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith(
+        "moe_lowtok: 3/3 MoE layers armed (scores 1, ids 2, copies 1)"
+    )
+    assert "2 x scores declined, ids armed: the 'eagle_head' graph" in line
+
+
+def test_copies_pass_holder_tables_and_lift_them_on_the_grouped_side(
+    enabled, copies_placement, monkeypatch
+):
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False, raising=False)
+    layer = placed_layer("model.layers.0.mlp.experts")
+    op = scores.prebuild(method(), layer, "silu")
+    op.return_value = "out"
+    x = torch.randn(2, 512, dtype=torch.bfloat16)
+    assert scores.apply(op, layer, x, torch.randn(2, 4)) == "out"
+    holders = tuple(getattr(layer, n) for n in scores._HOLDER_BUFFERS)
+    assert op.call_args.args[7:] == holders
+
+    ids = torch.tensor([[0, 3], [2, 1]], dtype=torch.int32)
+    lifted = scores.lift_holders(op, layer, ids)
+    assert lifted.dtype == torch.int32 and torch.equal(lifted, ids)
+    assert scores.lift_holders(None, layer, ids) is ids
+    assert scores.lift_holders(op, make_layer(), ids) is ids

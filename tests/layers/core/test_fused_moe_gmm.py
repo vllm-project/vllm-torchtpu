@@ -793,6 +793,54 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+def test_fused_moe_copy_slots_are_outside_the_primary_interval():
+    """Ids past the primaries belong to the next shard, not to copy slots."""
+    _require_tpu()
+    primaries, copies, experts_start = 16, 4, 32
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk) = (
+        _make_ep_inputs(primaries)
+    )
+    global_ids = local_ids + experts_start
+    global_ids = global_ids.at[0, 0].set(experts_start + primaries)
+    global_ids = global_ids.at[1, 1].set(experts_start + primaries + copies - 1)
+    masked_weights = topk_weights.at[0, 0].set(0.0).at[1, 1].set(0.0)
+
+    def with_copies(w):  # copy slots that would dominate the output if served
+        return jnp.concatenate([w, jnp.full((copies, *w.shape[1:]), 8, w.dtype)])
+
+    common = dict(
+        hidden_states=hidden_states,
+        w1_scale=None,
+        w2_scale=None,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+    )
+    expected = fused_moe_func(
+        w1=w1,
+        w2=w2,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_weights=masked_weights,
+        topk_ids=local_ids,
+        **common,
+    )
+    actual = fused_moe_func(
+        w1=with_copies(w1),
+        w2=with_copies(w2),
+        w1_bias=with_copies(w1_bias),
+        w2_bias=with_copies(w2_bias),
+        topk_weights=topk_weights,
+        topk_ids=global_ids,
+        experts_start=experts_start,
+        num_primary_experts=primaries,
+        **common,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=1e-1, rtol=1e-1
+    )
+
+
 def test_fused_moe_func_int4_packed_matches_reference():
     _require_tpu()
 

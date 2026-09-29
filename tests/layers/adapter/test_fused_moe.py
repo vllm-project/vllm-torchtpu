@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.layers.adapter.fused_moe import get_fused_moe_activation
 
 
@@ -66,3 +67,23 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+def test_custom_op_cache_separates_primary_counts(monkeypatch):
+    built = []
+
+    def register(name, function):
+        op = SimpleNamespace(register_fake=lambda fn: None, function=function)
+        built.append(op)
+        return op
+
+    monkeypatch.setattr(fused_moe, "_fused_moe_kernel_cache", {})
+    monkeypatch.setattr(fused_moe.pallas, "jax_op", register)
+    opts = dict(topk=10, activation="silu", use_ep=True, skip_padded_tokens=True)
+    plain = fused_moe._get_fused_moe_custom_op(**opts)
+    copies = fused_moe._get_fused_moe_custom_op(**opts, num_primary_experts=64)
+    assert plain is not copies
+    assert copies is fused_moe._get_fused_moe_custom_op(**opts, num_primary_experts=64)
+    assert len(built) == 2
+    assert plain.function.keywords["num_primary_experts"] is None
+    assert copies.function.keywords["num_primary_experts"] == 64

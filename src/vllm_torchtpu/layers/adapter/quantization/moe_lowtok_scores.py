@@ -16,7 +16,9 @@
 With TPU_MOE_LOWTOK=1, a layer whose routing is a plain softmax top-k with
 renormalized weights hands its router scores to `moe_lowtok`, which selects
 the experts itself. Other layers keep vLLM-side routing and reach the same
-kernel with a routing table through `fused_moe_func`.
+kernel with a routing table through `fused_moe_func`. Under an expert
+placement with copies (TPU_EXPERT_PLACEMENT), the scores entry also picks one
+holder for every hit copied expert.
 
 The scores entry forks on the row count in torch, which leaves a shape guard
 in the trace. Only the backbone is re-traced per bucket group, so a layer
@@ -34,10 +36,12 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal.pallas import jax_op
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     MOE_LOWTOK_MAX_TOKENS,
+    Holders,
     can_use_moe_lowtok,
+    holder_tables,
     moe_lowtok,
 )
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
@@ -50,7 +54,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 logger = init_logger(__name__)
-_OPS: dict[int, torch.library.CustomOpDef] = {}
+_OPS: dict[tuple[int, int | None], torch.library.CustomOpDef] = {}
+_HOLDER_BUFFERS = tuple(f"_moe_lowtok_{name}" for name in Holders._fields)
 
 
 class _Verdict(NamedTuple):
@@ -58,6 +63,7 @@ class _Verdict(NamedTuple):
     layer_name: str
     entry: str | None  # "scores", "ids", or None when the kernel cannot serve it
     reason: str | None
+    copies: bool
 
 
 _LAYERS: list[_Verdict] = []
@@ -151,8 +157,9 @@ def _graph_unsupported_reason() -> str | None:
     return None
 
 
-def _build_op(topk: int) -> torch.library.CustomOpDef:
-    op = _OPS.get(topk)
+def _build_op(topk: int, ranks: int | None = None) -> torch.library.CustomOpDef:
+    """The scores op; with `ranks`, the variant that takes holder tables."""
+    op = _OPS.get((topk, ranks))
     if op is not None:
         return op
 
@@ -171,14 +178,61 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
             x, scores, w13, w13_scale, w2, w2_scale, experts_start, topk=topk
         )
 
-    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}", moe)
+    def moe_copies(
+        x: jax.Array,
+        scores: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        w13_scale: jax.Array,
+        w2_scale: jax.Array,
+        experts_start: jax.Array,
+        gid: jax.Array,
+        slot: jax.Array,
+        copy: jax.Array,
+        hot: jax.Array,
+        hprim: jax.Array,
+        hcopy: jax.Array,
+        hot1h: jax.Array,
+    ) -> jax.Array:
+        holders = Holders(gid, slot, copy, hot, hprim, hcopy, hot1h)
+        return moe_lowtok(
+            x,
+            scores,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            experts_start,
+            topk=topk,
+            holders=holders,
+            ranks=ranks,
+        )
+
+    if ranks is None:
+        op = jax_op(f"pallas::moe_lowtok_scores_k{topk}", moe)
+    else:
+        op = jax_op(f"pallas::moe_lowtok_scores_k{topk}_copies{ranks}", moe_copies)
 
     def _fake(x, *_args):
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    _OPS[topk] = op
+    _OPS[topk, ranks] = op
     return op
+
+
+def _register_holders(layer: RoutedExperts) -> bool:
+    """Put the layer's holder tables on it as buffers if it has copies."""
+    owned = expert_placement.num_primary_experts(layer.layer_name)
+    if owned is None:
+        return False
+    layout = expert_placement.copy_layout(layer.layer_name, layer.moe_config.ep_rank)
+    tables = holder_tables(layout.gid, layout.copy, layout.hot, owned)
+    for name, table in zip(_HOLDER_BUFFERS, tables, strict=True):
+        dtype = torch.bfloat16 if name.endswith("hot1h") else torch.int32
+        tensor = torch.tensor(table, dtype=dtype, device=layer.w13_weight.device)
+        layer.register_buffer(name, tensor, persistent=False)
+    return True
 
 
 def prebuild(
@@ -195,9 +249,20 @@ def prebuild(
     if not unsupported:
         routing = _graph_unsupported_reason() or _routing_unsupported_reason(layer)
     entry = None if unsupported else ("ids" if routing else "scores")
-    _LAYERS.append(_Verdict(method, layer.layer_name, entry, unsupported or routing))
+    layer._moe_lowtok_copies = entry == "scores" and _register_holders(layer)
+    _LAYERS.append(
+        _Verdict(
+            method,
+            layer.layer_name,
+            entry,
+            unsupported or routing,
+            layer._moe_lowtok_copies,
+        )
+    )
     if entry != "scores":
         return None
+    if layer._moe_lowtok_copies:
+        return _build_op(layer.moe_config.experts_per_token, layer.moe_config.ep_size)
     return _build_op(layer.moe_config.experts_per_token)
 
 
@@ -222,6 +287,7 @@ def log_summary() -> None:
     armed: Counter[str] = Counter()
     declined: Counter[str] = Counter()
     unservable = []
+    copies = 0
     for verdict in _LAYERS:
         owner = _owner(verdict.method)
         if owner is not None:
@@ -230,6 +296,7 @@ def log_summary() -> None:
             unservable.append(f"{verdict.layer_name}: {verdict.reason}")
         else:
             armed[verdict.entry] += 1
+            copies += verdict.copies
             if verdict.reason is not None:
                 declined[f"scores declined, ids armed: {verdict.reason}"] += 1
     total = len(_LAYERS)
@@ -242,11 +309,12 @@ def log_summary() -> None:
         )
     reasons = "".join(f"; {n} x {reason}" for reason, n in sorted(declined.items()))
     logger.info(
-        "moe_lowtok: %d/%d MoE layers armed (scores %d, ids %d)%s | rows<=%d",
+        "moe_lowtok: %d/%d MoE layers armed (scores %d, ids %d%s)%s | rows<=%d",
         armed.total(),
         total,
         armed["scores"],
         armed["ids"],
+        f", copies {copies}" if copies else "",
         reasons,
         MOE_LOWTOK_MAX_TOKENS,
     )
@@ -275,4 +343,28 @@ def apply(
         layer.w13_weight_scale_inv,
         layer.w2_weight_scale_inv,
         layer._experts_start,
+        *_holders(layer),
     )
+
+
+def _holders(layer: RoutedExperts) -> tuple[torch.Tensor, ...]:
+    if not layer._moe_lowtok_copies:
+        return ()
+    return tuple(getattr(layer, name) for name in _HOLDER_BUFFERS)
+
+
+def lift_holders(
+    op: torch.library.CustomOpDef | None, layer: RoutedExperts, topk_ids: torch.Tensor
+) -> torch.Tensor:
+    """Reference the holder tables on the grouped side of the row-count fork.
+
+    Both traces of a token bucket must lift the same inputs for its compiled
+    executable to be handed between them. The added zero folds away.
+    """
+    if op is None or not layer._moe_lowtok_copies:
+        return topk_ids
+    # int32 throughout: a tensor sum() would widen to int64.
+    zero = 0
+    for table in _holders(layer):
+        zero = zero + table.reshape(-1)[:1].to(torch.int32)
+    return topk_ids + zero * 0
