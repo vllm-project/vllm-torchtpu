@@ -262,10 +262,13 @@ class HostKVShmPool:
     # ---- Free-list (rank 0 only) ---------------------------------------
     def acquire_slot(self, timeout: float | None = None) -> int:
         assert self._owner, "acquire_slot: only rank 0 manages the free list"
+        assert self._free is not None
         return self._free.get(timeout=timeout)
 
     def release_slot(self, slot_idx: int) -> None:
         assert self._owner, "release_slot: only rank 0 manages the free list"
+        assert self._free is not None
+        assert self._lock is not None
         # Idempotent: tolerate double-release which can happen if a timeout
         # races a pull-done notification.
         with self._lock:
