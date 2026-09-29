@@ -12,7 +12,44 @@ from vllm import utils
 from vllm_torchtpu import envs
 from vllm_torchtpu.llm_tpu_core.utils import (
     GBYTES,
+    TPU_HEAD_SIZE_ALIGNMENT,
+    TPU_SECOND_LAST_MINOR,
+    align_to,
+    enable_megacore,
+    get_device_name,
+    get_dtype_packing,
+    get_megacore,
+    get_num_kv_heads_by_tp,
+    get_padded_head_dim,
+    get_padded_num_heads,
+    largest_divisor,
 )
+
+__all__ = [
+    "GBYTES",
+    "HbmBudget",
+    "TPU_HEAD_SIZE_ALIGNMENT",
+    "TPU_SECOND_LAST_MINOR",
+    "align_to",
+    "compute_hbm_budget",
+    "enable_megacore",
+    "estimate_kv_connector_hbm_reserve",
+    "get_device_name",
+    "get_dp_size",
+    "get_dtype_packing",
+    "get_hash_fn_by_name",
+    "get_megacore",
+    "get_num_kv_heads_by_tp",
+    "get_padded_head_dim",
+    "get_padded_num_heads",
+    "hbm_usage_bytes",
+    "hbm_usage_gb",
+    "largest_divisor",
+    "synchronize_device",
+    "synchronize_tensors",
+    "time_function",
+    "tpu_bind_kv_cache",
+]
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
