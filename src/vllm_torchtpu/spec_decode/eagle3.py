@@ -205,11 +205,12 @@ class Eagle3Proposer:
         # during the target verify forward.
         self.draft_chunks: list[DraftChunkInputs] | None = None
         # Per-propose-call cache of loop-step draft attention metadata, keyed
-        # by id(chunk). Between loop iterations of one step everything in the
-        # metadata is constant except seq_lens advancing by +1, so iterations
-        # >= 2 swap the seq_lens field on the cached objects instead of paying
-        # the full upstream builder walk per iteration.
-        self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        # by id(chunk): (metadata, seq_lens, seq_lens_delta) of the chunk's
+        # last loop step. Between loop steps everything in the metadata is
+        # constant except seq_lens, which moves with seq_lens_delta, so steps
+        # >= 2 swap the seq_lens field on the cached objects instead of
+        # recomputing it or paying the full upstream builder walk.
+        self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -1671,6 +1672,36 @@ class Eagle3Proposer:
         num_reqs = chunk.num_reqs
         chunk_ctx = chunk.attn_ctx
 
+        # Loop steps >= 2 reuse the chunk's previous loop step: qsl and
+        # request_distribution are hoisted, block tables can't change
+        # mid-propose and shapes are fixed, so only seq_lens differs. Both
+        # paths below cache a step only where that holds.
+        if step_idx >= 2:
+            cached = self._draft_md_cache.get(id(chunk))
+            if cached is not None:
+                md_dict, prev_seq_lens, prev_delta = cached
+                # base + prev_delta - rejected, moved by the delta's change, is
+                # base + seq_lens_delta - rejected: value-identical to building
+                # it. The change is +1 for a draft that appends a token per
+                # step and 0 for one that re-reads the target's prefix.
+                if seq_lens_delta == prev_delta:
+                    return md_dict
+                new_seq_lens = prev_seq_lens + (seq_lens_delta - prev_delta)
+                replaced: dict[int, object] = {}
+                new_md = {}
+                for lname, md in md_dict.items():
+                    if id(md) not in replaced:
+                        replaced[id(md)] = dataclasses.replace(
+                            md, seq_lens=new_seq_lens
+                        )
+                    new_md[lname] = replaced[id(md)]
+                self._draft_md_cache[id(chunk)] = (
+                    new_md,
+                    new_seq_lens,
+                    seq_lens_delta,
+                )
+                return new_md
+
         target_md = self._target_draft_attn_metadata(chunk)
         if target_md is not None:
             if step_idx == 0:
@@ -1685,46 +1716,28 @@ class Eagle3Proposer:
                     loop_request_distribution=loop_request_distribution,
                 )
             )
-            replaced: dict[int, AttentionMetadata] = {}
+            replaced_target: dict[int, AttentionMetadata] = {}
             result = {}
             for name, md in target_md.items():
-                if id(md) not in replaced:
-                    replaced[id(md)] = dataclasses.replace(
+                if id(md) not in replaced_target:
+                    replaced_target[id(md)] = dataclasses.replace(
                         md,
                         seq_lens=seq_lens,
                         query_start_loc=query_start_loc,
                         request_distribution=request_distribution,
                     )
-                result[name] = replaced[id(md)]
+                result[name] = replaced_target[id(md)]
+            self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
             return result
 
-        # Loop-step metadata reuse: between loop iterations of one step the
-        # metadata is identical except seq_lens (+1 per iteration) — qsl and
-        # request_distribution are hoisted, block tables can't change
-        # mid-propose, shapes are fixed.
+        # The rebuilt metadata is cached for the loop steps after it, except
+        # on hybrid models and EP-DP dummy chunks (fixed positions).
         cacheable = (
             step_idx >= 1
             and not runner._has_mamba_state
             and not runner._unified_kv_layout
             and chunk_ctx.position_ids_override is None
         )
-        if cacheable and step_idx >= 2:
-            cached = self._draft_md_cache.get(id(chunk))
-            if cached is not None:
-                md_dict, prev_seq_lens = cached
-                # base + (s-1) - rejected, advanced by 1 == base + s - rejected:
-                # value-identical to the full rebuild below.
-                new_seq_lens = prev_seq_lens + 1
-                replaced: dict[int, object] = {}
-                new_md = {}
-                for lname, md in md_dict.items():
-                    if id(md) not in replaced:
-                        replaced[id(md)] = dataclasses.replace(
-                            md, seq_lens=new_seq_lens
-                        )
-                    new_md[lname] = replaced[id(md)]
-                self._draft_md_cache[id(chunk)] = (new_md, new_seq_lens)
-                return new_md
 
         use_max_model_len = chunk_ctx.use_max_model_len
         kernel_num_reqs = (
@@ -1828,7 +1841,7 @@ class Eagle3Proposer:
             }
 
         if cacheable:
-            self._draft_md_cache[id(chunk)] = (result, seq_lens)
+            self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
 
         return result
 

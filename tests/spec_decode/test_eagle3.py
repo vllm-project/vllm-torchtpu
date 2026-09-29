@@ -1373,10 +1373,18 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
     )
     assert md0 == {"draft.attn.0": shared, "draft.attn.1": shared}
 
+    loop_input_deltas = []
+    loop_step_attn_inputs = proposer._loop_step_attn_inputs
+
+    def counting_loop_step_attn_inputs(*args, **kwargs):
+        loop_input_deltas.append(kwargs["seq_lens_delta"])
+        return loop_step_attn_inputs(*args, **kwargs)
+
+    proposer._loop_step_attn_inputs = counting_loop_step_attn_inputs
     loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
     loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
     rej = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device)
-    for step in (1, 2):
+    for step in (1, 2, 3):
         md = proposer._build_draft_attn_metadata(
             chunk,
             step_idx=step,
@@ -1396,6 +1404,8 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
         assert step_md.request_distribution is loop_rd
         expect = chunk_ctx.seq_lens + step - rej
         assert torch.equal(step_md.seq_lens.cpu(), expect.cpu()), step
+    # Steps >= 2 advance step 1's seq_lens rather than recomputing them.
+    assert loop_input_deltas == [1]
     # The target's own metadata is untouched.
     assert shared.seq_lens is chunk_ctx.seq_lens
     assert shared.query_start_loc is chunk_ctx.query_start_loc
@@ -1441,6 +1451,52 @@ def test_build_draft_attn_metadata_rebuilds_without_target_coverage(device, gap)
     )
     assert len(calls) == 1
     assert out == {"draft.attn.0": rebuilt}
+
+
+@pytest.mark.parametrize("kv_shared", [False, True], ids=["advancing", "kv_shared"])
+def test_build_draft_attn_metadata_loop_cache_follows_seq_lens_delta(device, kv_shared):
+    """A rebuilt loop step is reused by the steps after it, with seq_lens
+    moved by the change in seq_lens_delta: +1 per step for a draft that
+    appends a token, none for a KV-sharing draft (Gemma-4 MTP), whose
+    seq_lens stay at step 1's."""
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    proposer._draft_kv_shared = kv_shared
+    runner = _md_reuse_runner(device)
+    runner._has_mamba_state = False
+    runner._unified_kv_layout = False
+    proposer.runner = runner
+    chunk = _target_md_chunk(device, None)
+    rebuilds = []
+
+    def rebuild(**_kwargs):
+        seq_lens = runner._attn_metadata_builder_ctx.seq_lens
+        rebuilds.append(seq_lens)
+        md = AttentionMetadata(
+            input_positions=torch.zeros(8, device=device), seq_lens=seq_lens
+        )
+        return {"draft.attn.0": md}, None
+
+    runner._build_attention_metadata = rebuild
+    loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+    rej = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device)
+    for step in (1, 2, 3):
+        delta = 0 if kv_shared else step
+        md = proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=delta,
+            num_rejected_np=None,
+            num_rejected_dev=rej,
+            loop_query_start_loc=loop_qsl,
+            loop_request_distribution=loop_rd,
+        )
+        expect = chunk.attn_ctx.seq_lens + delta - rej
+        assert torch.equal(md["draft.attn.0"].seq_lens.cpu(), expect.cpu()), step
+    assert len(rebuilds) == 1
 
 
 def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
