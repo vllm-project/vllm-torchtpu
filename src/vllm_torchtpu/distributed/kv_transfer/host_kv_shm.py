@@ -64,7 +64,9 @@ def _shm_base_addr(shm: shared_memory.SharedMemory) -> int:
     `shm.buf` is a memoryview over the mmapped region; `c_char.from_buffer`
     on it produces a ctypes object aliasing the same memory, whose address
     is the mmap base."""
-    return ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+    buf = shm.buf
+    assert buf is not None
+    return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
@@ -318,9 +320,11 @@ class HostKVShmPool:
         used = self._used_per_layer(num_blocks)
         out = bytearray(used * spec.num_layers)
         pos = 0
+        buf = self._shm.buf
+        assert buf is not None
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
-            out[pos : pos + used] = self._shm.buf[layer_off : layer_off + used]
+            out[pos : pos + used] = buf[layer_off : layer_off + used]
             pos += used
         return bytes(out)
 
@@ -336,7 +340,9 @@ class HostKVShmPool:
         spec = self.spec
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
-        base = memoryview(self._shm.buf)
+        buf = self._shm.buf
+        assert buf is not None
+        base = memoryview(buf)
         out: list[memoryview] = []
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
@@ -376,7 +382,9 @@ class HostKVShmPool:
         Keep fallbacks for unusual environments without NumPy/libc memmove.
         """
         if np is None:
-            self._shm.buf[offset : offset + nbytes] = src
+            buf = self._shm.buf
+            assert buf is not None
+            buf[offset : offset + nbytes] = src
             return
 
         dst = np.ndarray((nbytes,), dtype=np.uint8, buffer=self._shm.buf, offset=offset)
@@ -399,11 +407,11 @@ class HostKVShmPool:
                 f"{expected} (num_blocks={num_blocks})"
             )
         mv = memoryview(payload)
+        buf = self._shm.buf
+        assert buf is not None
         for li in range(spec.num_layers):
             layer_off = rank_start + li * spec.per_layer_bytes
-            self._shm.buf[layer_off : layer_off + used] = mv[
-                li * used : (li + 1) * used
-            ]
+            buf[layer_off : layer_off + used] = mv[li * used : (li + 1) * used]
 
     # ---- Lifecycle ------------------------------------------------------
     def close(self) -> None:

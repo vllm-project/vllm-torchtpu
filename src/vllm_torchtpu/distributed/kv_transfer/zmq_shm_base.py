@@ -36,7 +36,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 import zmq
@@ -645,6 +645,7 @@ class ZmqShmKvConnectorBase:
             port = req_meta.remote_port[self.node_id]
         else:
             host = req_meta.remote_host
+            assert not isinstance(req_meta.remote_port, list)
             port = req_meta.remote_port
         side_channel_port = None
         if req_meta.remote_side_channel_port:
@@ -1387,6 +1388,7 @@ class ZmqShmKvConnectorBase:
                 self._coord_broadcast(_IPC_LOAD_SKIP, (req_meta.uuid,))
             return
 
+        assert req_meta.local_block_ids is not None
         num_blocks = self._blocks_token(req_meta.local_block_ids)
         # Preemption dedup: vLLM's scheduler re-emits update_state_after_alloc
         # for requests that were preempted and rescheduled. The LoadMeta
@@ -1541,12 +1543,15 @@ class ZmqShmKvConnectorBase:
             port = ports[h] + ch
             host = hosts[h]
             sock_path = make_zmq_path("tcp", host, port)
-            sock = make_zmq_socket(
-                ctx=self.zmq_cxt,
-                path=sock_path,
-                socket_type=zmq.DEALER,
-                bind=False,
-                linger=0,
+            sock = cast(
+                zmq.Socket,
+                make_zmq_socket(
+                    ctx=self.zmq_cxt,
+                    path=sock_path,
+                    socket_type=zmq.DEALER,
+                    bind=False,
+                    linger=0,
+                ),
             )
             timeout_ms = max(1, int(timeout_s * 1000))
             sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
@@ -1979,11 +1984,14 @@ class ZmqShmKvConnectorBase:
                 sock = self._coord_notif_sockets.get(sock_path)
                 new_sock = sock is None
                 if new_sock:
-                    sock = make_zmq_socket(
-                        ctx=self.zmq_cxt,
-                        path=sock_path,
-                        socket_type=zmq.DEALER,
-                        bind=False,
+                    sock = cast(
+                        zmq.Socket,
+                        make_zmq_socket(
+                            ctx=self.zmq_cxt,
+                            path=sock_path,
+                            socket_type=zmq.DEALER,
+                            bind=False,
+                        ),
                     )
                     self._coord_notif_sockets[sock_path] = sock
                 sock.send_string(str(uuid))
@@ -2275,8 +2283,11 @@ class ZmqShmKvConnectorBase:
         N parallel TCP streams end-to-end."""
         port = self._kv_transfer_ports[channel_idx]
         sock_path = make_zmq_path("tcp", "*", port)
-        sock = make_zmq_socket(
-            ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+        sock = cast(
+            zmq.Socket,
+            make_zmq_socket(
+                ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+            ),
         )
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.ROUTER_MANDATORY, 0)
@@ -2551,8 +2562,11 @@ class ZmqShmKvConnectorBase:
     # =========================================================
     def _coord_rank0_external_notif_loop(self) -> None:
         sock_path = make_zmq_path("tcp", "*", self.side_channel_port)
-        sock = make_zmq_socket(
-            ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+        sock = cast(
+            zmq.Socket,
+            make_zmq_socket(
+                ctx=self.zmq_cxt, path=sock_path, socket_type=zmq.ROUTER, bind=True
+            ),
         )
         logger.info(
             "TPUConnectorWorker(%d) rank0 --> side channel on %s",
