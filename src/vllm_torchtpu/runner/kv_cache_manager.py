@@ -1158,6 +1158,10 @@ class KVCacheManager:
         )
         if materialized.bm_pool_layout is not None:
             self._bind_block_major_pool_layers(materialized.bm_pool_layout)
+        if not self.runner._unified_kv_layout:
+            # No-op unless DCP fine-grained prefix hits can emit CoW copies
+            # on these per-layer caches; compile before any forward runs.
+            self.runner._precompile_dense_kv_cache_block_copies()
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()

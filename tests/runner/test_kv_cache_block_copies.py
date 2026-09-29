@@ -290,3 +290,98 @@ def test_is_unified_pool_used():
     # Raw tensors allocated (unified pool active)
     runner.kv_cache_raw_tensors = [torch.empty(1)]
     assert runner.is_unified_pool_used()
+
+
+def _dense_runner(kv_caches, num_blocks, has_mamba_layers=False):
+    runner = _runner_with_raw_tensors([])
+    runner.kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks, has_mamba_layers=has_mamba_layers
+    )
+    runner.kv_caches = kv_caches
+    runner.device = "cpu"
+    return runner
+
+
+def test_update_states_routes_dense_copies_for_attention_only(monkeypatch):
+    """Per-layer (non-pooled) attention caches bypass the generic copy.
+
+    DCP fine-grained prefix hits on an attention-only model (GLM-5 MLA +
+    indexer) emit CoW copies without a unified pool. The base advanced-index
+    copy must be hidden and the dense per-layer copy run after base zeroing.
+    """
+    events = []
+    base_outputs = []
+
+    def base_update(_runner, scheduler_output):
+        events.append("base")
+        base_outputs.append(scheduler_output)
+
+    monkeypatch.setattr(GPUModelRunner, "_update_states", base_update)
+    runner = _dense_runner([torch.zeros(8, 4)], num_blocks=8)
+    runner._apply_dense_kv_cache_block_copies = lambda c: events.append(("dense", c))
+    runner._apply_kv_cache_block_copies = lambda c: events.append(("pool", c))
+
+    scheduler_output = SchedulerOutput.make_empty()
+    copies = [KVCacheBlockCopy(src_block_id=2, dst_block_id=5)]
+    scheduler_output.kv_cache_block_copies = copies
+
+    TPUModelRunner._update_states(runner, scheduler_output)
+
+    assert base_outputs[0].kv_cache_block_copies is None
+    assert events == ["base", ("dense", copies)]
+
+
+def test_update_states_keeps_generic_copy_with_mamba_without_pool(monkeypatch):
+    base_outputs = []
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_update_states",
+        lambda _runner, scheduler_output: base_outputs.append(scheduler_output),
+    )
+    runner = _dense_runner([torch.zeros(8, 4)], num_blocks=8, has_mamba_layers=True)
+    runner._apply_dense_kv_cache_block_copies = pytest.fail
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_block_copies = [
+        KVCacheBlockCopy(src_block_id=2, dst_block_id=5)
+    ]
+    TPUModelRunner._update_states(runner, scheduler_output)
+
+    assert base_outputs == [scheduler_output]
+
+
+def test_dense_copy_fans_out_per_split_dedupes_and_pads(monkeypatch):
+    """Each unique cache is copied once, grouped by its manager-block split.
+
+    ``latent`` stands in for the MLA cache (kernel blocks == manager blocks)
+    and is aliased twice in ``kv_caches`` (shared KV); ``indexer`` stands in
+    for a uint8 DSA indexer cache with 2 kernel blocks per manager block.
+    """
+    num_blocks = 8
+    latent = torch.arange(num_blocks * 3, dtype=torch.float32).reshape(num_blocks, 3)
+    indexer = torch.arange(num_blocks * 2 * 5, dtype=torch.uint8).reshape(
+        num_blocks * 2, 5
+    )
+    before_latent, before_indexer = latent.clone(), indexer.clone()
+    runner = _dense_runner([latent, indexer, latent], num_blocks=num_blocks)
+    calls = []
+
+    def cpu_copy(pools, src, dst):
+        calls.append(([id(p) for p in pools], src.tolist(), dst.tolist()))
+        for pool in pools:
+            pool[dst.long()] = pool[src.long()]
+
+    monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks", cpu_copy)
+
+    TPUModelRunner._apply_dense_kv_cache_block_copies(
+        runner, [KVCacheBlockCopy(src_block_id=2, dst_block_id=5)]
+    )
+
+    assert calls == [
+        ([id(latent)], [2, 0, 0, 0, 0, 0, 0, 0], [5, 0, 0, 0, 0, 0, 0, 0]),
+        ([id(indexer)], [4, 5, 0, 0, 0, 0, 0, 0], [10, 11, 0, 0, 0, 0, 0, 0]),
+    ]
+    torch.testing.assert_close(latent[5], before_latent[2])
+    torch.testing.assert_close(latent[4], before_latent[4])
+    torch.testing.assert_close(indexer[10:12], before_indexer[4:6])
+    torch.testing.assert_close(indexer[12], before_indexer[12])

@@ -77,6 +77,12 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
     ),
+    # After hybrid PCP: wraps the resolve it installed and rebinds its refs.
+    Patch(
+        "vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
+    ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
