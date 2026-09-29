@@ -479,6 +479,21 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
+        # consecutive ranks (a two-device pipeline stage) can sit on different
+        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
+        order = envs.VLLM_TPU_DEVICE_ORDER
+        if order:
+            device = [int(x) for x in order.split(",")][binding.local_rank]
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+            logger.info(
+                "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                binding.local_rank,
+                device,
+                order,
+            )
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
