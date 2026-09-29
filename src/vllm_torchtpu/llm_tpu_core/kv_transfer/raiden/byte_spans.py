@@ -62,7 +62,7 @@ def owned_token_ranges(
     interleave_tokens: int,
 ) -> list[tuple[int, int]]:
     """Return this producer rank's PCP-owned destination token ranges."""
-    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
+    from vllm_torchtpu.llm_tpu_core.distributed.pcp_layout import pcp_layout
 
     if num_tokens <= 0:
         raise ValueError("num_tokens must be positive")

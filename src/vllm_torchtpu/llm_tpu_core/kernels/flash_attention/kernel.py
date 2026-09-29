@@ -18,7 +18,7 @@ from vllm_torchtpu.llm_tpu_core.kernels.flash_attention.tuned_params import (
     get_tuned_params,
     make_tuning_key,
 )
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.llm_tpu_core.utils import align_to
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128

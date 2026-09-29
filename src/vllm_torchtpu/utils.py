@@ -6,51 +6,17 @@ from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any, NamedTuple
 
-import jax
 import torch
-from jax._src import dtypes
 from jax.sharding import Mesh
 from vllm import utils
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.llm_tpu_core.utils import (
+    GBYTES,
+)
 from vllm_torchtpu.logger import init_logger
 
-GBYTES = 1024 * 1024 * 1024
-TPU_HEAD_SIZE_ALIGNMENT = 128
-TPU_SECOND_LAST_MINOR = 8
-
-_megacore = False
 logger = init_logger(__name__)
-
-
-def align_to(unpadded_dim, pad_multiple):
-    return (unpadded_dim + pad_multiple - 1) // pad_multiple * pad_multiple
-
-
-def enable_megacore() -> None:
-    global _megacore
-    _megacore = True
-
-
-def get_megacore() -> bool:
-    return _megacore
-
-
-def largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of `x` that is <= `cap`."""
-    for candidate in range(min(x, cap), 0, -1):
-        if x % candidate == 0:
-            return candidate
-    return 1
-
-
-def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
-    if tp_size <= num_kv_heads:
-        assert num_kv_heads % tp_size == 0
-        return num_kv_heads
-    else:
-        assert tp_size % num_kv_heads == 0
-        return tp_size
 
 
 def get_dp_size(parallel_config) -> int:
@@ -89,35 +55,6 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
             usage.append((hbm_used, hbm_limit))
 
     return usage
-
-
-def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
-        raise RuntimeError("Expected TPU devices")
-    suffix = ""
-    if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-        suffix = "e"
-    elif kind.endswith("e"):
-        kind = kind[:-1]
-        suffix = "e"
-    elif kind.endswith("p"):
-        kind = kind[:-1]
-        suffix = "p"
-    elif kind.endswith("i"):
-        kind = kind[:-1]
-        suffix = "i"
-
-    if kind.startswith("TPU7"):
-        kind = "TPU v7"
-    elif kind.startswith("TPU8"):
-        kind = "TPU v8"
-    assert kind[:-1] == "TPU v", kind
-    kind += suffix
-    if num_devices is not None:
-        kind += f"-{num_devices}"
-    return kind
 
 
 def get_mesh_shape_product(
@@ -214,29 +151,6 @@ def estimate_kv_connector_hbm_reserve(vllm_config: Any) -> int:
     if estimator is None:
         return 0
     return int(estimator(vllm_config))
-
-
-def get_padded_head_dim(head_dim: int) -> int:
-    """Pads head_dim up to the nearest multiple of 128 for kernel performance."""
-    # When head_dim == 64, we use kernel specificly optimized for it which does
-    # not require any padding.
-    if head_dim == 64:
-        return 64
-    return (head_dim + 127) // 128 * 128
-
-
-def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
-    if num_heads >= sharding_size:
-        assert num_heads % sharding_size == 0
-    else:
-        assert sharding_size % num_heads == 0
-        num_heads = sharding_size
-    return num_heads
-
-
-def get_dtype_packing(dtype):
-    bits = dtypes.itemsize_bits(dtype)
-    return 32 // bits
 
 
 def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:

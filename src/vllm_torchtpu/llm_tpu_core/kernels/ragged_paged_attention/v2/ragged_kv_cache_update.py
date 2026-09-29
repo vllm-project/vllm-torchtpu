@@ -10,8 +10,11 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.utils import TPU_HEAD_SIZE_ALIGNMENT, get_dtype_packing
+from vllm_torchtpu.llm_tpu_core.config import is_rpa_pipelined_dma_staging_enabled
+from vllm_torchtpu.llm_tpu_core.utils import (
+    TPU_HEAD_SIZE_ALIGNMENT,
+    get_dtype_packing,
+)
 
 
 def _ceil_div(a, b):
@@ -339,7 +342,7 @@ def kv_cache_update(
     pipelined_dma: bool | None = None,
 ):
     if pipelined_dma is None:
-        pipelined_dma = envs.USE_RPA_PIPELINED_DMA_STAGING
+        pipelined_dma = is_rpa_pipelined_dma_staging_enabled()
 
     if num_slices_per_block is None:
         _, num_combined_kv_heads, head_dim = new_kv.shape

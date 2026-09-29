@@ -8,8 +8,8 @@ from vllm_torchtpu.llm_tpu_core.kernels.ragged_paged_attention.v3.util import (
     get_tpu_version,
     next_power_of_2,
 )
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import get_device_name
+from vllm_torchtpu.llm_tpu_core.logger import init_logger
+from vllm_torchtpu.llm_tpu_core.utils import get_device_name
 
 logger = init_logger(__name__)
 

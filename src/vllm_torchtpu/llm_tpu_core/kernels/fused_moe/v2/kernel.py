@@ -47,7 +47,7 @@ from vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2 import (
     silu_and_mul_with_clamp,
     swigluoai,
 )
-from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.llm_tpu_core.logger import init_logger
 
 logger = init_logger(__name__)
 

@@ -23,7 +23,7 @@ from sympy import divisors
 from vllm_torchtpu.llm_tpu_core.kernels.ragged_paged_attention.v3.util import (
     get_dtype_packing,
 )
-from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.llm_tpu_core.logger import init_logger
 
 logger = init_logger(__name__)
 

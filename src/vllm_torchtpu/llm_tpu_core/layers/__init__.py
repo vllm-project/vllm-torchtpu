@@ -7,6 +7,7 @@ Strictly zero dependencies on vLLM.
 
 from __future__ import annotations
 
+from vllm_torchtpu.llm_tpu_core.layers import attention
 from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
     _counting_sort_positions,
     _select_ragged_gather_reduce,
@@ -51,6 +52,7 @@ __all__ = [
     "RotaryEmbedding",
     "SwiGLU",
     "TopKResult",
+    "attention",
     "_counting_sort_positions",
     "_select_ragged_gather_reduce",
     "apply_rotary_pos_emb",

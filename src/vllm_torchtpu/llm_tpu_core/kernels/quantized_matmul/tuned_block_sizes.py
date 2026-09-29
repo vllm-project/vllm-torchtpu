@@ -6,7 +6,7 @@ from typing import NamedTuple
 
 import jax
 
-from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.llm_tpu_core.logger import init_logger
 
 logger = init_logger(__name__)
 

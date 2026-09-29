@@ -75,6 +75,39 @@ def get_tpu_moe_owner_output_mode() -> str:
     return os.environ.get("TPU_MOE_OWNER_OUTPUT_MODE", "off").lower()
 
 
+def get_mixed_num_kv_pages_per_block() -> int | None:
+    val = os.environ.get("MIXED_NUM_KV_PAGES_PER_BLOCK")
+    return int(val) if val and val.strip() else None
+
+
+def get_mixed_num_queries_per_block() -> int | None:
+    val = os.environ.get("MIXED_NUM_QUERIES_PER_BLOCK")
+    return int(val) if val and val.strip() else None
+
+
+def get_mixed_q_split() -> int | None:
+    val = os.environ.get("MIXED_Q_SPLIT")
+    return int(val) if val and val.strip() else None
+
+
+def is_rpa_pipelined_dma_staging_enabled() -> bool:
+    """Returns True if RPA pipelined DMA staging is enabled."""
+    return os.environ.get("USE_RPA_PIPELINED_DMA_STAGING", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def get_mla_xpose_n_tile_size() -> int:
+    """Returns MLA transpose N tile size."""
+    val = os.environ.get("MLA_XPOSE_N_TILE_SIZE", "160")
+    try:
+        return int(val)
+    except ValueError:
+        return 160
+
+
 @dataclass(frozen=True)
 class CoreCompilationConfig:
     """Minimal compilation parameters for hardware-adapted TPU kernels."""

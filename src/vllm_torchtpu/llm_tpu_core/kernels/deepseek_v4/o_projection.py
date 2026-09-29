@@ -19,13 +19,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 from vllm_torchtpu.llm_tpu_core.kernels.deepseek_v4.rope import (
     LANE,
     CosSinRef,
     _cos_sin_lanes,
     _rotate_gptj,
 )
+from vllm_torchtpu.llm_tpu_core.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 

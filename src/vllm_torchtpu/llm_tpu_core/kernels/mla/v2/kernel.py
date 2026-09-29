@@ -23,14 +23,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-import vllm_torchtpu.envs as envs
+from vllm_torchtpu.llm_tpu_core.config import get_mla_xpose_n_tile_size
 from vllm_torchtpu.llm_tpu_core.kernels.mla.v2 import kv_utils
 from vllm_torchtpu.llm_tpu_core.kernels.mla.v2.transpose import xpose_pipeline
-from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.llm_tpu_core.logger import init_logger
 
 logger = init_logger(__name__)
 
-_XPOSE_N_TILE_SIZE = envs.MLA_XPOSE_N_TILE_SIZE
+_XPOSE_N_TILE_SIZE = get_mla_xpose_n_tile_size()
 
 
 def unsigned_mod(a, b):
