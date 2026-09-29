@@ -63,9 +63,13 @@ Key components and mechanisms:
 - Storage tier (optional): with a storage path configured, every save also
   writes the block to a POSIX directory behind the host DRAM pool, one file per
   TP rank, and the save completes only once the files are written. Raiden
-  reports a block found only in storage as `SHARED_STORAGE`. The connector
-  cannot read those back yet, so they count as misses and get recomputed.
-  Nothing deletes the files; the directory grows until an operator prunes it.
+  reports a block found only in storage as `SHARED_STORAGE`, whether or not the
+  global registry is enabled. The connector reads those back like a peer's
+  block: `read_remote` straight into HBM, no pin, no reserved capacity. Raiden
+  also publishes a landed block into host DRAM, unpinned, so the next lookup
+  finds it locally. A job's peer and storage blocks share one `read_remote`
+  call. Nothing deletes the files; the directory grows until an operator
+  prunes it.
 
 See `raiden_connector.py` for connector wiring, device fencing, and echo channels.
 """
@@ -205,10 +209,10 @@ class Admission:
     # through get_block_ids_with_load_errors on failure.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
-    # Loads only: the sub-hashes fetched from a peer via read_remote rather
-    # than the local host pool. Drives the remote poll, and marks the
-    # sub-hashes this job holds no pin for — a peer read neither takes one nor
-    # spends one.
+    # Loads only: the sub-hashes fetched via read_remote — from a peer or the
+    # storage tier — rather than from the local host pool. Drives the remote
+    # poll, and marks the sub-hashes this job holds no pin for — such a read
+    # neither takes one nor spends one.
     remote_sub_hashes: set[bytes] = field(default_factory=set)
     # Sub-hashes whose pin a completed transfer already spent. Releasing one of
     # these again would drop a pin the job no longer holds.
@@ -376,15 +380,15 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
-        # Peer location slices cached from global lookups and consumed during
-        # `prepare_load`.
+        # Peer and storage-tier location slices cached from lookups and
+        # consumed during `prepare_load`.
         self._remote_slices: dict[bytes, object] = {}
 
-        # Peer location slices `prepare_load` accepted, held until
+        # Peer and storage-tier slices `prepare_load` accepted, held until
         # `submit_load_job` hands them to read_remote. A peer read leaves no
-        # local directory entry, so the slice is the only record that a
-        # sub-hash lives elsewhere, and it must outlive the scheduler step that
-        # found it. An entry a job never claims is harmless: the next lookup
+        # local directory entry, so the slice is the only record of where the
+        # sub-hash lives, and it must outlive the scheduler step that found
+        # it. An entry a job never claims is harmless: the next lookup
         # re-resolves the hash, and a slice that has gone stale simply fails
         # its read and recomputes.
         self._pending_remote_slices: dict[bytes, object] = {}
@@ -434,8 +438,8 @@ class RaidenOffloadingManager(OffloadingManager):
         """The job's sub-hashes whose pin nothing has spent yet.
 
         A successful save or local load consumes the pin it was handed, and a
-        peer read never took one; releasing either would drop a pin the job
-        does not hold. What is left is what a terminal job owes back.
+        peer or storage read never took one; releasing either would drop a pin
+        the job does not hold. What is left is what a terminal job owes back.
         """
         return [
             sub_hash
@@ -553,7 +557,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 # the host, so a load could not serve it either. It is a miss
                 # -- recompute, and let `prepare_store` re-offer the key.
                 return LookupResult.MISS
-            if status == self._block_status.REMOTE and allow_remote:
+            # A peer's block (REMOTE) and a storage tier's block
+            # (SHARED_STORAGE) are both read with read_remote straight into
+            # HBM. The storage tier answers whether or not the global registry
+            # is enabled, so only a peer hit is gated on it.
+            if (
+                status == self._block_status.REMOTE and allow_remote
+            ) or status == self._block_status.SHARED_STORAGE:
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
                     # a second launch on the same hash must not race it.
@@ -561,10 +571,6 @@ class RaidenOffloadingManager(OffloadingManager):
                 all_local = False
                 remote_slices[sub_hash] = block
                 continue
-            # Anything else is a miss, SHARED_STORAGE included: the storage
-            # tier has the block's files, but this connector cannot read them
-            # back yet, so the block recomputes and `prepare_store` offers it
-            # again, which brings it back into host DRAM.
             return LookupResult.MISS
         if not all_local:
             self._remote_slices.update(remote_slices)
@@ -598,10 +604,10 @@ class RaidenOffloadingManager(OffloadingManager):
         keys = list(keys)
         sub_hashes = self._expand_keys(keys)
         # Split the batch by where the bytes are. A local sub-hash is pinned
-        # here so it survives until the load runs; a peer sub-hash carries its
-        # slice forward to submit_load_job instead, because a peer read borrows
-        # nothing from this store — there is no landing capacity to reserve and
-        # no local entry to pin.
+        # here so it survives until the load runs; a peer or storage sub-hash
+        # carries its slice forward to submit_load_job instead, because such a
+        # read borrows nothing from this store — there is no landing capacity
+        # to reserve and no local entry to pin.
         #
         # Residency decides, not the stash: a sub-hash the stash calls remote
         # but that is resident here — a concurrent fetch landed it, or another
@@ -617,9 +623,14 @@ class RaidenOffloadingManager(OffloadingManager):
         # hits hold no pin and say nothing about the host pool. Looking each of
         # them up again would re-check the whole remainder against storage
         # every time, so a storage run is taken from the stash in one pass: a
-        # sub-hash in it that the stash covers is read from the peer even if it
-        # is also resident here. The first one the stash does not cover gets a
-        # fresh lookup, which finds it if it is resident.
+        # sub-hash in it that the stash covers is read from where the stash
+        # says (a peer or the storage tier) even if it is also resident here.
+        # The first one the stash does not cover gets a fresh lookup, which
+        # finds it if it is resident.
+        #
+        # The first host-pool miss itself is known not to be resident, so when
+        # the stash does not cover it but this lookup found it in storage — it
+        # left the host pool after `lookup` — it is read from storage.
         remote_slices: dict[bytes, object] = {}
         local_hashes: list[bytes] = []
         idx = 0
@@ -643,15 +654,17 @@ class RaidenOffloadingManager(OffloadingManager):
             resolved_to = idx
             for pos in range(idx, run_end):
                 block = self._remote_slices.pop(sub_hashes[pos], None)
+                if block is None and pos == idx and local_run < len(matched):
+                    block = matched[local_run][1]
                 if block is None:
                     break
                 remote_slices[sub_hashes[pos]] = block
                 resolved_to = pos + 1
             if resolved_to == idx:
-                # Neither resident nor a peer's: the entry the lookup promised
-                # is gone. Give back the pins taken so far and return an
-                # unpinned spec so submit_load_job fails the job cleanly and
-                # the blocks recompute.
+                # Not resident, not a peer's, not in storage: the entry the
+                # lookup promised is gone. Give back the pins taken so far and
+                # return an unpinned spec so submit_load_job fails the job
+                # cleanly and the blocks recompute.
                 if local_hashes:
                     self._store.release(local_hashes)
                 logger.warning(
@@ -674,9 +687,12 @@ class RaidenOffloadingManager(OffloadingManager):
         # its whole sub-hash chain is host-resident (HOST/HOST_AND_HBM) or
         # cluster-resident (REMOTE — the data exists on a peer; no local
         # re-store). A key found only in the storage tier (SHARED_STORAGE) is
-        # offered again on purpose: while the connector cannot read storage,
-        # a store is the only way back into host DRAM, and the save rewrites
-        # the same files.
+        # offered again on purpose. A storage read that lands also publishes
+        # the block into host DRAM, so a key still storage-only here is one
+        # that was recomputed — typically because its storage read failed —
+        # or whose recall found no host room. The save puts it back in host
+        # DRAM and rewrites the files, which also repairs a copy that could
+        # not be read.
         keys_to_store: list[OffloadKey] = []
         resident_statuses = (
             self._block_status.HOST,
@@ -912,14 +928,15 @@ class RaidenOffloadingManager(OffloadingManager):
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_device_blocks(device_block_ids)
         # Partition by where prepare_load found each sub-hash: one that came
-        # with a peer slice is read from that peer, everything else is pinned
-        # in the local host pool. The slice is the only record of a peer block
-        # — read_remote writes nothing to the local directory, so no live probe
-        # could rediscover it. Only the BYTES are remote: every destination is
-        # one of this instance's HBM blocks. The two destination lists are
-        # disjoint subsequences of `device_ids`, each preserving its batch's
-        # hash-to-block pairing, because load() and read_remote() both require
-        # block_hashes[i] to line up with device_block_ids[i].
+        # with a peer or storage slice is read from there, everything else is
+        # pinned in the local host pool. The slice is the only record of a peer
+        # block — read_remote writes nothing to the local directory, so no live
+        # probe could rediscover it. Only the BYTES are non-local: every
+        # destination is one of this instance's HBM blocks. The two destination
+        # lists are disjoint subsequences of `device_ids`, each preserving its
+        # batch's hash-to-block pairing, because load() and read_remote() both
+        # require block_hashes[i] to line up with device_block_ids[i]. One
+        # read_remote call takes a peer's slices and storage slices together.
         remote_hashes: list[bytes] = []
         remote_slices: list[object] = []
         dst_device_ids_for_remote: list[int] = []

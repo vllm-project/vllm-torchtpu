@@ -32,8 +32,9 @@ physical TPU hardware or native C++ wheels:
    - Compatibility namespace: Generates deterministic 16-byte hashes to isolate entries.
 
 4. Storage Tier:
-   - SHARED_STORAGE answers: misses the connector re-offers; touch and
-     prepare_load never take them for pinned host-pool hits.
+   - SHARED_STORAGE answers: hits read back with read_remote, in the same call
+     as a peer's blocks, holding no pin; touch and prepare_load never take them
+     for pinned host-pool hits.
    - Settings: extra-config and env sources, and the fail-fast checks.
    - Plumbing: BackendConfigs reach the store and every worker, and nothing
      new is passed while the tier is off.
@@ -136,6 +137,9 @@ class FakeKVCacheStore:
         # With a storage tier, a failed save also drops the entry's pin,
         # which is what makes raiden refuse the caller's retry.
         self.failed_save_drops_pin = False
+        # Refuse to launch a read_remote call that includes storage slices;
+        # a call with only peer slices is unaffected.
+        self.fail_storage_read = False
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -147,6 +151,8 @@ class FakeKVCacheStore:
         self._loading: list[bytes] = []
         self._remote_reading: list[bytes] = []
         self._remote_device_ids: dict[bytes, int] = {}
+        # The in-flight read_remote hashes whose source is the storage tier.
+        self._storage_reading: set[bytes] = set()
 
     # -- store surface used by the manager -----------------------------
 
@@ -271,21 +277,37 @@ class FakeKVCacheStore:
         )
         if self.fail_read_remote:
             return False
-        # Mirror Raiden: a peer read consults nothing locally and needs no pin.
-        # It only needs a REMOTE slice naming the owner, and one destination
-        # device block per hash.
+        # Mirror Raiden: a peer or storage read consults nothing locally and
+        # needs no pin. It only needs a REMOTE or SHARED_STORAGE slice naming
+        # the source, and one destination device block per hash. One call may
+        # mix storage slices with REMOTE slices, but the REMOTE ones must all
+        # name the same peer.
         if len(slices) != len(block_hashes) or len(device_block_ids) != len(
             block_hashes
         ):
             return False
-        for h, sl in zip(block_hashes, slices):
-            if sl is None or sl.status != FakeBlockStatus.REMOTE:
-                return False
+        readable = (FakeBlockStatus.REMOTE, FakeBlockStatus.SHARED_STORAGE)
+        if any(sl is None or sl.status not in readable for sl in slices):
+            return False
+        peers = {
+            id(sl.raiden_id) for sl in slices if sl.status == FakeBlockStatus.REMOTE
+        }
+        if len(peers) > 1:
+            return False
+        storage = {
+            h
+            for h, sl in zip(block_hashes, slices)
+            if sl.status == FakeBlockStatus.SHARED_STORAGE
+        }
+        if storage and self.fail_storage_read:
+            return False
+        for h in block_hashes:
             if h in self._remote_reading:
                 return False
         self._remote_reading.extend(block_hashes)
         for h, d in zip(block_hashes, device_block_ids):
             self._remote_device_ids[h] = d
+        self._storage_reading.update(storage)
         return True
 
     def poll_save_status(self):
@@ -336,10 +358,20 @@ class FakeKVCacheStore:
                 self._load_failed.append(h)
 
     def complete_remote_read(self, block_hashes, success=True) -> None:
-        # The bytes land in the destination device blocks and nowhere else:
-        # a peer read records nothing locally either way.
+        # The bytes land in the destination device blocks. A peer read records
+        # nothing locally either way. A storage read that lands also publishes
+        # the block into the host pool, unpinned and under this store's own
+        # id, unless the hash is already there (raiden admits per block and
+        # declines duplicates).
         for h in block_hashes:
             self._remote_reading.remove(h)
+            from_storage = h in self._storage_reading
+            self._storage_reading.discard(h)
+            if success and from_storage and h not in self.entries:
+                self.entries[h] = _Entry(
+                    status=FakeBlockStatus.HOST_AND_HBM,
+                    device_block_id=self._remote_device_ids[h],
+                )
             (self._remote_done if success else self._remote_failed).append(h)
 
     def calls_named(self, name: str) -> list[_Call]:
@@ -422,11 +454,13 @@ def seed_global_entries(
     key_namespace: bytes = b"",
     ns: bytes = b"",
 ) -> None:
-    """Publish a peer's REMOTE slices for `key` in the fake registry."""
+    """Publish a peer's REMOTE slices for `key` in the fake registry: one peer
+    owns the whole key."""
     prefix = key_namespace or ns
+    peer = object()
     for i, sub_hash in enumerate(sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockId(
-            raiden_id=object(), host_block_id=100 + i, status=FakeBlockStatus.REMOTE
+            raiden_id=peer, host_block_id=100 + i, status=FakeBlockStatus.REMOTE
         )
 
 
@@ -1884,19 +1918,126 @@ class TestRemoteLanding(unittest.TestCase):
 
 class TestStorageTierLookups(unittest.TestCase):
     """A store with a storage tier answers past the first host-pool miss from
-    storage. Those SHARED_STORAGE hits hold no pin and this connector cannot
-    read them back, so they must never pass for host-pool hits."""
+    storage. Those SHARED_STORAGE hits hold no pin: they are read back with
+    read_remote like a peer's block, and never pass for host-pool hits."""
 
     def setUp(self):
         self.store = FakeKVCacheStore()
+        # No global registry: the storage tier answers regardless.
         self.manager = make_manager(self.store)
 
-    def test_storage_only_key_is_miss_and_stored_again(self):
+    def test_storage_only_key_is_hit_and_read_from_storage(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        seed_storage_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch)
+        self.assertEqual(
+            [sl.status for sl in rr.args[1]], [FakeBlockStatus.SHARED_STORAGE] * 4
+        )
+        self.assertEqual(rr.args[2], [20, 21, 22, 23])
+        self.store.complete_remote_read(batch)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        # A storage read held no pin, so nothing is released or left pinned.
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        # Raiden published the recalled blocks into host DRAM: the next load
+        # of the key is a local one.
+        self.store.calls.clear()
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(8, [key], [6], "req2")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch, [24, 25, 26, 27]))
+        self.assertEqual(self.store.calls_named("read_remote"), [])
+
+    def test_host_prefix_with_storage_remainder_is_one_job(self):
+        key = _key(0)
+        batch = sub_hashes(key)
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        # Every sub-hash is answered, two by the host pool, two by storage.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {h: 1 for h in batch[:2]})
+
+        self.manager.submit_load_job(7, [key], [5], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch[:2], [20, 21]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch[2:])
+        self.assertEqual(rr.args[2], [22, 23])
+        self.store.complete_load(batch[:2])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(batch[2:])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_lookup_is_pending_while_storage_read_in_flight(self):
         key = _key(0)
         seed_storage_entries(self.store, key)
-        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
-        # A store is the only way back into host DRAM: the key is offered,
-        # admitted, and saved like a new one.
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        # A second request must not launch a racing read of the same hashes.
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.store.complete_remote_read(sub_hashes(key))
+        self.manager.poll_finished_jobs()
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+
+    def test_storage_read_failure_fails_job_holding_nothing(self):
+        key = _key(0)
+        seed_storage_entries(self.store, key)
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.store.complete_remote_read(sub_hashes(key), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.entries, {})
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_storage_read_launch_failure_waits_for_local_load(self):
+        # The local load launched; the storage read did not. The job stays
+        # open until the local load resolves, then fails once, owing nothing.
+        self.store.fail_storage_read = True
+        key = _key(0)
+        batch = sub_hashes(key)
+        for h in batch[:2]:
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
+        seed_storage_entries(self.store, key)
+        self.manager.lookup(key, _ctx())
+        self.manager.prepare_load([key], _ctx())
+        self.manager.submit_load_job(7, [key], [5], "req")
+        self.assertEqual(len(self.store.calls_named("load")), 1)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertTrue(self.manager.is_job_launched(7))
+        self.store.complete_load(batch[:2])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_storage_only_key_is_still_offered_for_store(self):
+        # A key still storage-only at store time was recomputed (its read
+        # failed, or its recall found no host room); storing it again puts it
+        # back in host DRAM and rewrites its files.
+        key = _key(0)
+        seed_storage_entries(self.store, key)
         out = self.manager.prepare_store([key], _ctx())
         self.assertEqual(out.keys_to_store, [key])
         self.manager.submit_store_job(7, [key], [5])
@@ -1906,16 +2047,13 @@ class TestStorageTierLookups(unittest.TestCase):
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
         self.assertEqual(self.store.pinned_hashes(), {})
-        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
 
-    def test_host_prefix_with_storage_remainder_is_miss(self):
+    def test_host_prefix_with_storage_remainder_stores_the_remainder(self):
         key = _key(0)
         batch = sub_hashes(key)
         for h in batch[:2]:
             self.store.entries[h] = _Entry(status=FakeBlockStatus.HOST)
         seed_storage_entries(self.store, key)
-        # Every sub-hash is answered, but two only by storage.
-        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
         out = self.manager.prepare_store([key], _ctx())
         self.assertEqual(out.keys_to_store, [key])
         self.manager.submit_store_job(7, [key], [5])
@@ -1946,11 +2084,11 @@ class TestStorageTierLookups(unittest.TestCase):
         self.assertEqual(release.args[0], batch[:1])
         self.assertEqual(self.store.pinned_hashes(), {batch[2]: 1})
 
-    def test_prepare_load_storage_gap_fails_cleanly(self):
+    def test_prepare_load_reads_evicted_tail_from_storage(self):
         # lookup() found the key whole in the host pool; by prepare_load its
-        # tail has been evicted and survives only in storage, which this
-        # connector cannot read. The job fails before any transfer, holding
-        # nothing.
+        # tail has been evicted and survives only in storage. The stash has
+        # nothing for it, but prepare_load's own lookup found it in storage,
+        # so the tail is read from there instead of failing the job.
         key = _key(0)
         batch = sub_hashes(key)
         seed_host_entries(self.store, key)
@@ -1959,10 +2097,37 @@ class TestStorageTierLookups(unittest.TestCase):
             del self.store.entries[h]
         seed_storage_entries(self.store, key)
         spec = self.manager.prepare_load([key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {h: 1 for h in batch[:2]})
+        self.manager.submit_load_job(3, [key], [10], "req")
+        (ld,) = self.store.calls_named("load")
+        self.assertEqual(ld.args, (batch[:2], [40, 41]))
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], batch[2:])
+        self.assertEqual(rr.args[2], [42, 43])
+        self.store.complete_load(batch[:2])
+        self.store.complete_remote_read(batch[2:])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_prepare_load_gap_in_every_tier_fails_cleanly(self):
+        # The tail left the host pool and storage has only part of it: the
+        # sub-hash neither tier holds fails the job before any transfer,
+        # holding nothing.
+        key = _key(0)
+        batch = sub_hashes(key)
+        seed_host_entries(self.store, key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        for h in batch[2:]:
+            del self.store.entries[h]
+        self.store.storage_entries.add(batch[2])
+        spec = self.manager.prepare_load([key], _ctx())
         self.assertFalse(spec.pinned)
         self.assertEqual(self.store.pinned_hashes(), {})
         self.manager.submit_load_job(3, [key], [10], "req", pinned=spec.pinned)
         self.assertEqual(self.store.calls_named("load"), [])
+        self.assertEqual(self.store.calls_named("read_remote"), [])
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
@@ -2066,6 +2231,78 @@ class TestStorageTierRemoteReads(unittest.TestCase):
         (rr,) = self.store.calls_named("read_remote")
         self.assertEqual(rr.args[0], batch[:1])
         self.assertEqual(rr.args[2], [20])
+
+    def test_peer_and_storage_reads_share_one_call(self):
+        # One job: a peer's key and a storage-only key. The store takes a
+        # peer's slices and storage slices in the same read_remote call.
+        peer_key, storage_key = _key(1), _key(2)
+        seed_global_entries(self.store, peer_key)
+        seed_storage_entries(self.store, storage_key)
+        self.assertEqual(self.manager.lookup(peer_key, _ctx()), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(storage_key, _ctx()), LookupResult.HIT)
+        spec = self.manager.prepare_load([peer_key, storage_key], _ctx())
+        self.assertTrue(spec.pinned)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        self.manager.submit_load_job(7, [peer_key, storage_key], [5, 6], "req")
+        self.assertEqual(self.store.calls_named("load"), [])
+        (rr,) = self.store.calls_named("read_remote")
+        self.assertEqual(rr.args[0], sub_hashes(peer_key) + sub_hashes(storage_key))
+        self.assertEqual(
+            [sl.status for sl in rr.args[1]],
+            [FakeBlockStatus.REMOTE] * 4 + [FakeBlockStatus.SHARED_STORAGE] * 4,
+        )
+        self.assertEqual(rr.args[2], [20, 21, 22, 23, 24, 25, 26, 27])
+        self.store.complete_remote_read(sub_hashes(peer_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(storage_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.pinned_hashes(), {})
+        # Only the storage blocks were published locally.
+        self.assertEqual(set(self.store.entries), set(sub_hashes(storage_key)))
+
+    def test_storage_failure_in_shared_call_fails_job_once(self):
+        peer_key, storage_key = _key(1), _key(2)
+        seed_global_entries(self.store, peer_key)
+        seed_storage_entries(self.store, storage_key)
+        self.manager.lookup(peer_key, _ctx())
+        self.manager.lookup(storage_key, _ctx())
+        self.manager.prepare_load([peer_key, storage_key], _ctx())
+        self.manager.submit_load_job(7, [peer_key, storage_key], [5, 6], "req")
+        self.store.complete_remote_read(sub_hashes(storage_key), success=False)
+        # The peer blocks are still in flight, so the job cannot end yet.
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(peer_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
+        self.assertEqual(self.store.calls_named("release"), [])
+        self.assertEqual(self.store.entries, {})
+
+    def test_two_peers_in_one_job_fail_launch_cleanly(self):
+        # The store takes one peer per read_remote call, so a job whose blocks
+        # live on two peers has its read refused at launch. The local load it
+        # already launched keeps the job open until that lands; then the job
+        # fails once, owing nothing, and the blocks recompute.
+        local_key, key_a, key_b = _key(0), _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, key_a)
+        seed_global_entries(self.store, key_b)
+        for key in (local_key, key_a, key_b):
+            self.manager.lookup(key, _ctx())
+        keys = [local_key, key_a, key_b]
+        self.manager.prepare_load(keys, _ctx())
+        self.manager.submit_load_job(7, keys, [4, 5, 6], "req")
+        self.assertEqual(len(self.store.calls_named("read_remote")), 1)
+        self.assertEqual(self.store._remote_reading, [])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_load(sub_hashes(local_key))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [4, 5, 6])
+        self.assertEqual(self.store.pinned_hashes(), {})
 
 
 class TestNamespace(unittest.TestCase):
