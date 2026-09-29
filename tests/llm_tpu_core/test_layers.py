@@ -177,3 +177,19 @@ def test_pcp_sequence_layout_eligibility_and_decision():
     assert decision.local_required_tokens == 16
     assert decision.local_padded_tokens == 16
     assert decision.global_padded_tokens == 64
+
+
+def test_deepseek_v4_mhc_ops_standalone():
+    from vllm_torchtpu.llm_tpu_core.layers.deepseek_v4_mhc import get_mhc_ops
+
+    mhc_ops = get_mhc_ops(
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=3,
+        mesh=None,
+    )
+    assert mhc_ops.pre is not None
+    assert mhc_ops.post is not None
+    assert mhc_ops.fused is not None

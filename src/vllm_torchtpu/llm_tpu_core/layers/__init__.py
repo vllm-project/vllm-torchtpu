@@ -8,6 +8,11 @@ Strictly zero dependencies on vLLM.
 from __future__ import annotations
 
 from vllm_torchtpu.llm_tpu_core.layers import attention
+from vllm_torchtpu.llm_tpu_core.layers.deepseek_v4_mhc import (
+    MHCOps,
+    get_mhc_ops,
+    get_mhc_post_op,
+)
 from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
     _counting_sort_positions,
     _select_ragged_gather_reduce,
@@ -75,6 +80,9 @@ __all__ = [
     "PcpSequenceLayoutPlanner",
     "prepare_pcp_sequence_layout",
     "RMSNorm",
+    "MHCOps",
+    "get_mhc_ops",
+    "get_mhc_post_op",
     "RotaryEmbedding",
     "SwiGLU",
     "TopKResult",
