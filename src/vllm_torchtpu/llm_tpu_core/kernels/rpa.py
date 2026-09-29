@@ -7,7 +7,7 @@ Strictly zero dependencies on vLLM.
 
 from __future__ import annotations
 
-from vllm_torchtpu.kernels.experimental.batched_rpa.configs import (
+from vllm_torchtpu.llm_tpu_core.kernels.experimental.batched_rpa.configs import (
     AttentionScope,
     BlockSizes,
     KVLayout,

@@ -38,9 +38,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels import typed_ldst
-from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 from vllm_torchtpu.llm_tpu_core.config import is_hnd_layout
+from vllm_torchtpu.llm_tpu_core.kernels import typed_ldst
+from vllm_torchtpu.llm_tpu_core.kernels.gdn.v3 import config as gdn_v3_config
 
 
 def is_seq_along_lane_pool() -> bool:

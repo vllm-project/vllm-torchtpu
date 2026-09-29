@@ -165,6 +165,7 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+"src/vllm_torchtpu/llm_tpu_core/kernels/**" = ["B023", "E501"]
 
 [tool.ruff.format]
 docstring-code-format = true
