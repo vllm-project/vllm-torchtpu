@@ -1833,7 +1833,7 @@ class MaskedDenseAdmissionTest(parameterized.TestCase):
         self.assertIs(runner._masked_dense_groups_requests, True)
 
     def test_admission_is_logged_once_per_outcome(self):
-        """Serving checks every rank for the admitted message and for the
+        """Serving checks every worker for the admitted message and for the
         absence of the rejection warning."""
         with mock.patch.object(mla_dispatch, "logger") as logger:
             runner = self._runner()
@@ -1843,12 +1843,16 @@ class MaskedDenseAdmissionTest(parameterized.TestCase):
         messages = {c.args for c in logger.info_once.call_args_list}
         self.assertLen(messages, 1)
         self.assertIn("admitted", next(iter(messages))[0])
+        # Every worker reports, not only each host's first rank.
+        for call in logger.info_once.call_args_list:
+            self.assertEqual(call.kwargs, {"scope": "process"})
         logger.warning_once.assert_not_called()
 
         with mock.patch.object(mla_dispatch, "logger") as logger:
             self._admit(self._runner(), num_heads=16)
         logger.info_once.assert_not_called()
         logger.warning_once.assert_called_once()
+        self.assertEqual(logger.warning_once.call_args.kwargs, {"scope": "process"})
 
     def test_rejected_configuration_allows_neither(self):
         runner = self._runner()

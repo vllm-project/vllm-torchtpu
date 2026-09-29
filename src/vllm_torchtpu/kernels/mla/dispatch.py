@@ -518,16 +518,20 @@ def admit_layer(runner, attn_module, kv_cache_specs, page_size: int) -> None:
     runner._masked_dense_groups_requests = (
         admitted and runner._masked_dense_groups_requests is not False
     )
+    # Every worker reports, not just each host's first rank: admission is
+    # decided per process, and one rank rejecting must be visible.
     if admitted:
         logger.info_once(
             "Masked-dense MLA routing admitted for GLM-5.2 sparse MLA layers "
-            "with TensorCore KV caches."
+            "with TensorCore KV caches.",
+            scope="process",
         )
     else:
         logger.warning_once(
             "Masked-dense MLA routing is enabled but not admitted: %s. "
             "Using the sparse kernel.",
             reason,
+            scope="process",
         )
 
 
