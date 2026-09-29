@@ -568,9 +568,8 @@ def _build_rpa_kernel(impl, monkeypatch):
 
 
 def test_hnd_refuses_a_kernel_entry_that_ignores_the_layout(hnd, monkeypatch):
-    """A tp=1 speculative draft allocates SEQ_ALONG_LANE pages, then
-    `tpu_runner._initialize_attention_kernels` rebinds `_kernel_entry` to the
-    layout-blind `_pallas_rpa_kernel_local`."""
+    """A tp=1 speculative draft runs `_pallas_rpa_kernel_local`, which takes no
+    `kv_layout`."""
     from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
 
     impl = _batched_impl()
@@ -588,8 +587,7 @@ def test_hnd_binds_kv_layout_into_the_batched_kernel_entry(hnd, monkeypatch):
 
 
 def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
-    """`_pallas_rpa_kernel_local` reads HEAD_ALONG_SUBLANE, so the tp=1 draft
-    rebind is legal under the default layout."""
+    """`_pallas_rpa_kernel_local` reads HEAD_ALONG_SUBLANE, the default layout."""
     from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
 
     impl = _batched_impl()
@@ -597,16 +595,3 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     impl._kernel_op_prefix = "pallas::rpa_kernel_local"
     bound = _build_rpa_kernel(impl, monkeypatch)
     assert "kv_layout" not in bound.keywords
-
-
-def test_both_vllm_spellings_map_to_one_kernel_layout():
-    """Layer-major and block-major spell the same kernel layout, so callers
-    must ask `is_seq_along_lane` rather than compare against one member."""
-    from vllm.v1.kv_cache_layout import KVCacheLayout
-
-    from vllm_torchtpu.layers.adapter.attention import is_seq_along_lane
-
-    assert is_seq_along_lane(KVCacheLayout.LBHNC)
-    assert is_seq_along_lane(KVCacheLayout.BLHNC)
-    assert not is_seq_along_lane(KVCacheLayout.LBNHC)
-    assert not is_seq_along_lane(KVCacheLayout.BLNHC)

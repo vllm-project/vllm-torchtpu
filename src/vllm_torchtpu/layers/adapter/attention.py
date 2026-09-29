@@ -160,24 +160,14 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
-# vLLM's enum names logical axis order, where H is KV heads and N is tokens;
-# NHD and HND are its legacy aliases and the values `VLLM_KV_CACHE_LAYOUT`
-# takes. The kernel enum names what fills a 32-bit word instead. Each kernel
-# layout has two vLLM spellings that differ only in layer/block order, so test
-# the kernel enum rather than a single member.
+# HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
+# fp8 page is genuinely half a bf16 one (b/510425663).
 KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] = {
     VllmKVCacheLayout.LBNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     VllmKVCacheLayout.BLNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     VllmKVCacheLayout.LBHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
     VllmKVCacheLayout.BLHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
 }
-
-
-def is_seq_along_lane(layout: VllmKVCacheLayout) -> bool:
-    """True when this vLLM layout selects the SEQ_ALONG_LANE kernel layout."""
-    return (
-        KV_LAYOUT_BY_VLLM_LAYOUT[layout] is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-    )
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
@@ -766,11 +756,11 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        """Page sizes this kernel accepts. Needs a current vLLM config."""
-        vllm_config = get_current_vllm_config()
         if (
-            is_seq_along_lane(vllm_config.cache_config.get_resolved_kv_cache_layout())
-            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            is VllmKVCacheLayout.LBHNC
+            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
+            > 1
         ):
             return [128, 256, 512, 1024, 2048, 4096]
         return [128, 256]

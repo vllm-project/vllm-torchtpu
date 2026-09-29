@@ -631,11 +631,11 @@ class TpuPlatform(Platform):
             get_flashinfer_layout_string,
             resolve_kv_cache_layout,
         )
+        from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
             PallasBatchedRPAAttentionBackend,
-            is_seq_along_lane,
         )
 
         backend = (
@@ -650,12 +650,9 @@ class TpuPlatform(Platform):
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
-        # head_dim 64 routes to the hd64 kernel, which allocates
-        # HEAD_ALONG_SUBLANE whatever the backend declares, so `forward` would
-        # read the head width off the wrong dims. `supported_kv_cache_layouts`
-        # cannot express it, having no head size.
+        # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
         if (
-            is_seq_along_lane(layout)
+            layout is VllmKVCacheLayout.LBHNC
             and vllm_config.model_config is not None
             and vllm_config.model_config.get_head_size() == 64
         ):

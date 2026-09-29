@@ -413,12 +413,7 @@ class TestTpuPlatform:
         head_size,
         refused,
     ):
-        """head_dim 64 routes to the hd64 kernel, which allocates
-        HEAD_ALONG_SUBLANE even on the batched-RPA backend.
-
-        `supported_kv_cache_layouts` cannot express it: it is a classmethod on
-        the backend with no head size, so it offers HND either way.
-        """
+        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
