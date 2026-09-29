@@ -214,3 +214,32 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
 
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+def get_mesh_shape_product(
+    mesh: Any,
+    axes: str | list[str] | None,
+) -> int:
+    """Get the product of mesh dimensions for one or more axes.
+
+    Examples:
+        # Single axis (defaults to 1 if not present)
+        get_mesh_shape_product(mesh, "model")
+
+        # Multiple axes - computes product of their sizes
+        get_mesh_shape_product(mesh, ["model", "attn_dp"])
+
+        # None means no sharding on this dimension
+        get_mesh_shape_product(mesh, None)  # returns 1
+    """
+    if axes is None:
+        return 1
+
+    if isinstance(axes, str):
+        axes = [axes]
+
+    product = 1
+    for axis in axes:
+        product *= mesh.shape.get(axis, 1)
+
+    return product

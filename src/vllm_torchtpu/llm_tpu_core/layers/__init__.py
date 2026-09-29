@@ -21,6 +21,9 @@ from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.llm_tpu_core.layers.gdn_attention import (
+    run_jax_gdn_attention,
+)
 from vllm_torchtpu.llm_tpu_core.layers.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -70,5 +73,6 @@ __all__ = [
     "rotate_half",
     "rotate_neox",
     "rowmax_topk",
+    "run_jax_gdn_attention",
     "unpack_fp4_to_e2m1",
 ]

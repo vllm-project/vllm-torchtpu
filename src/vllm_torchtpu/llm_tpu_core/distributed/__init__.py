@@ -38,6 +38,7 @@ from vllm_torchtpu.llm_tpu_core.distributed.group_provider import (
 from vllm_torchtpu.llm_tpu_core.distributed.mesh_utils import (
     CpGroupLayout,
     get_cp_group_layout,
+    get_mesh_shape_product,
     get_or_create_cp_mesh,
 )
 from vllm_torchtpu.llm_tpu_core.distributed.pallas_shapes import (
@@ -64,6 +65,7 @@ __all__ = [
     "build_ep_mesh",
     "build_topology_mesh_groups",
     "get_cp_group_layout",
+    "get_mesh_shape_product",
     "get_or_create_cp_mesh",
     "ep_device_ids",
     "ep_mesh_index",
