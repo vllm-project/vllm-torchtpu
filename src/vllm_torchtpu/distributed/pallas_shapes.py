@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shape conversion for native Pallas ops with multi-axis PartitionSpecs.
+# Copyright 2026 Google LLC
+"""Compatibility wrapper.
 
-Re-exports core primitives from `llm_tpu_core.distributed.pallas_shapes`.
+Re-exports core primitives from
+`vllm_torchtpu.llm_tpu_core.distributed.pallas_shapes`.
 """
 
-from __future__ import annotations
-
 from vllm_torchtpu.llm_tpu_core.distributed.pallas_shapes import (
-    _convert_partitioned_shape,
     get_global_shape,
     get_local_shape,
     install_pallas_shape_conversion,
 )
 
 __all__ = [
-    "_convert_partitioned_shape",
     "get_global_shape",
     "get_local_shape",
     "install_pallas_shape_conversion",

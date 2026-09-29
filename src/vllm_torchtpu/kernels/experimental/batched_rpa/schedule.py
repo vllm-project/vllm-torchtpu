@@ -6,4 +6,16 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.kernels.experimental.batched_rpa.schedule`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.experimental.batched_rpa.schedule import *  # noqa: F403
+import importlib
+
+_mod = importlib.import_module(
+    "vllm_torchtpu.llm_tpu_core.kernels.experimental.batched_rpa.schedule"
+)
+
+globals().update(
+    {
+        k: getattr(_mod, k)
+        for k in dir(_mod)
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+)

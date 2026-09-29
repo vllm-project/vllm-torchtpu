@@ -6,4 +6,16 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.kernels.experimental.adaptive_fused_moe.host`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.experimental.adaptive_fused_moe.host import *  # noqa: F403
+import importlib
+
+_mod = importlib.import_module(
+    "vllm_torchtpu.llm_tpu_core.kernels.experimental.adaptive_fused_moe.host"
+)
+
+globals().update(
+    {
+        k: getattr(_mod, k)
+        for k in dir(_mod)
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+)

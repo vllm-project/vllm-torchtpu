@@ -6,4 +6,16 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.kernels.mla.v2.tuned_params`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.mla.v2.tuned_params import *  # noqa: F403
+from vllm_torchtpu.llm_tpu_core.kernels.mla.v2.tuned_params import (
+    TunableParams,
+    TuningKey,
+    get_tuned_params,
+    logger,
+)
+
+__all__ = [
+    "TunableParams",
+    "TuningKey",
+    "get_tuned_params",
+    "logger",
+]

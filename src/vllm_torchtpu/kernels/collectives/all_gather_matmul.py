@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
-"""All-gather matmul kernel.
+"""Compatibility wrapper.
 
-Re-exports core primitives from `llm_tpu_core.kernels.collectives`.
+Re-exports core primitives from
+`vllm_torchtpu.llm_tpu_core.kernels.collectives.all_gather_matmul`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.collectives.all_gather_matmul import (
-    all_gather_matmul,
-    get_kernel_name,
+import importlib
+
+_mod = importlib.import_module(
+    "vllm_torchtpu.llm_tpu_core.kernels.collectives.all_gather_matmul"
 )
 
-__all__ = [
-    "all_gather_matmul",
-    "get_kernel_name",
-]
+globals().update(
+    {
+        k: getattr(_mod, k)
+        for k in dir(_mod)
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+)

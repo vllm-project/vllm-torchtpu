@@ -2,7 +2,74 @@
 # Copyright 2026 Google LLC
 """Compatibility wrapper.
 
-Re-exports core primitives from `llm_tpu_core.kernels.megablox.gmm_v2`.
+Re-exports core primitives from
+`vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2 import *  # noqa: F403
+from vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    FusedWeightsRef,
+    GmmConfigs,
+    IndexMaps,
+    InputConfigs,
+    MetadataRef,
+    RhsRef,
+    TileFn,
+    TileSizes,
+    WeightsRef,
+    align_to,
+    apply_act_fn,
+    calculate_tiling,
+    deinterleave_lane,
+    fill_metadata,
+    generate_block_specs,
+    get_cost_estimate,
+    get_metadata,
+    get_packing_factor,
+    get_scope_name,
+    gmm_v2,
+    inner_kernel,
+    interleave_lane,
+    kernel_main,
+    make_gmm_configs,
+    silu_and_mul_with_clamp,
+    situ_and_mul,
+    swigluoai,
+    validate_inputs,
+    zero_out_end,
+    zero_out_start,
+)
+
+__all__ = [
+    "Dimensions",
+    "FusedWeightsRef",
+    "GmmConfigs",
+    "IndexMaps",
+    "InputConfigs",
+    "MetadataRef",
+    "RhsRef",
+    "TileFn",
+    "TileSizes",
+    "WeightsRef",
+    "align_to",
+    "apply_act_fn",
+    "calculate_tiling",
+    "deinterleave_lane",
+    "fill_metadata",
+    "generate_block_specs",
+    "get_cost_estimate",
+    "get_metadata",
+    "get_packing_factor",
+    "get_scope_name",
+    "gmm_v2",
+    "inner_kernel",
+    "interleave_lane",
+    "kernel_main",
+    "make_gmm_configs",
+    "silu_and_mul_with_clamp",
+    "situ_and_mul",
+    "swigluoai",
+    "validate_inputs",
+    "zero_out_end",
+    "zero_out_start",
+]

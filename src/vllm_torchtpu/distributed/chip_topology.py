@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Functions for finding which devices share a physical chip.
+# Copyright 2026 Google LLC
+"""Compatibility wrapper.
 
-Re-exports core primitives from `llm_tpu_core.distributed.chip_topology`.
+Re-exports core primitives from
+`vllm_torchtpu.llm_tpu_core.distributed.chip_topology`.
 """
 
-from __future__ import annotations
+from vllm_torchtpu.llm_tpu_core.distributed.chip_topology import (
+    ChipTopology,
+    get_chip_topology,
+    hierarchical_moe_split,
+    logger,
+)
 
-from vllm_torchtpu.llm_tpu_core.distributed.chip_topology import *  # noqa: F403
+__all__ = [
+    "ChipTopology",
+    "get_chip_topology",
+    "hierarchical_moe_split",
+    "logger",
+]

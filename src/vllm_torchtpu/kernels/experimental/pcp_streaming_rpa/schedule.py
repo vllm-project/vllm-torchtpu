@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
-"""Runtime schedules for PCP streaming prefill RPA.
+"""Compatibility wrapper.
 
 Re-exports core primitives from
-`llm_tpu_core.kernels.experimental.pcp_streaming_rpa.schedule`.
+`vllm_torchtpu.llm_tpu_core.kernels.experimental.pcp_streaming_rpa.schedule`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.experimental.pcp_streaming_rpa.schedule import (
-    RuntimeScheduleField,
-    TilePlanField,
-    build_pcp_streaming_schedule_inputs_from_metadata_jax,
+import importlib
+
+_mod = importlib.import_module(
+    "vllm_torchtpu.llm_tpu_core.kernels.experimental.pcp_streaming_rpa.schedule"
 )
 
-__all__ = [
-    "RuntimeScheduleField",
-    "TilePlanField",
-    "build_pcp_streaming_schedule_inputs_from_metadata_jax",
-]
+globals().update(
+    {
+        k: getattr(_mod, k)
+        for k in dir(_mod)
+        if not (k.startswith("__") and k.endswith("__"))
+    }
+)
