@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
+from vllm import envs
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
@@ -786,6 +787,12 @@ def run_jax_gdn_attention_pcp_tp_prefill(
 # ---------------------------------------------------------------
 
 
+def _is_seq_along_lane_pool() -> bool:
+    """True if pool uses the SEQ_ON_LANE
+    (nb, heads2, packed_d, pack, page_size) layout."""
+    return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+
+
 def _build_v3_pool_state_plan(
     pool: jnp.ndarray,
     *,
@@ -807,7 +814,7 @@ def _build_v3_pool_state_plan(
             f"{block_size}."
         )
     split = pool_block_tokens // block_size
-    if pool_adapters.is_seq_along_lane_pool():
+    if _is_seq_along_lane_pool():
         tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
     else:
         tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
@@ -879,12 +886,21 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    # Pool's second dim refers to physical block size while pool_block_tokens
-    # refers to logical block size. Therefore, we perform reshape so that first
-    # dim can refer to number of logical blocks.
-    # NOTE: reshape along non last two dims is free.
+    # Reshape so dim 0 is `num_logical_blocks` while keeping `*pool_shape[-2:]`
+    # untouched for a free 0-copy reshape.
     pool_shape = recurrent_state.shape
-    pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
+    if _is_seq_along_lane_pool():
+        # HND shape is (num_blocks, Kx2, D // P, P, kernel_block_size) with
+        # `kernel_block_size` at dim -1; fold `split` into dim 1 since the
+        # kernel only requires `dim 0 == num_logical_blocks`.
+        split = pool_block_tokens // pool_shape[-1]
+        pool = recurrent_state.reshape(
+            pool_shape[0] // split,
+            pool_shape[1] * split,
+            *pool_shape[2:],
+        )
+    else:
+        pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
 
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
