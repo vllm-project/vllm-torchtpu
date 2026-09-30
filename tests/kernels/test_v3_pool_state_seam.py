@@ -629,6 +629,220 @@ class TestPooledSpecWindows:
             )
 
 
+def _pack_bf16_rows(ssm):
+    """bf16 [..., D_K, D_V] -> uint32 [..., D_K // 2, D_V], packed the way a
+    ref bitcast packs it: word (r, l) holds row 2r (low half) and row 2r + 1
+    (high half) of lane l."""
+    pairs = ssm.astype(jnp.bfloat16).reshape(
+        *ssm.shape[:-2], ssm.shape[-2] // 2, 2, ssm.shape[-1]
+    )
+    return jax.lax.bitcast_convert_type(jnp.moveaxis(pairs, -2, -1), jnp.uint32)
+
+
+def _unpack_bf16_rows(words):
+    """Inverse of `_pack_bf16_rows`."""
+    pairs = jax.lax.bitcast_convert_type(words, jnp.bfloat16)
+    rows = jnp.moveaxis(pairs, -1, -2)
+    return rows.reshape(*words.shape[:-2], words.shape[-2] * 2, words.shape[-1])
+
+
+def _write_states_bf16(pool, ssm, conv, idx, split=SPLIT):
+    """bf16 SSM at granule 0, fp32 conv right after it (recurrent-first)."""
+
+    def build(pool, ssm, conv, idx):
+        words = _mgr_words(pool, split)
+        body = _pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
+        words = words.at[idx, : body.shape[1]].set(body)
+        words = _put(
+            words, idx, _ssm_granules(jnp.bfloat16), jnp.asarray(conv, jnp.float32)
+        )
+        return _unwords(words, pool)
+
+    return _on_cpu(build, pool, ssm, conv, idx)
+
+
+def _read_states_bf16(pool, idx, split=SPLIT):
+    def take(pool, idx):
+        words = _mgr_words(pool, split)
+        nwords = N_V * D_K * D_V // 2
+        ssm = _unpack_bf16_rows(
+            words[idx, :nwords].reshape(idx.shape[0], N_V, D_K // 2, D_V)
+        )
+        conv = _take(
+            words,
+            idx,
+            _ssm_granules(jnp.bfloat16),
+            (KERNEL_SIZE - 1, DIM),
+            jnp.float32,
+        )
+        return ssm, conv
+
+    return _on_cpu(take, pool, idx)
+
+
+def _bits(x):
+    return np.asarray(jax.lax.bitcast_convert_type(x, jnp.int16))
+
+
+@pytest.mark.tpu_test
+class TestPooledBf16Recurrent:
+    """bf16 recurrent state with an fp32 conv state.
+
+    The kernel upcasts the recurrent state once on load and rounds it once on
+    store. Against the fp32 kernel fed the same bf16-representable values, the
+    recurrent state is bit-exact; against the tuple path it stays within 32
+    bf16 ULPs, and conv state and output stay within standard float tolerance.
+    """
+
+    def _states(self, seed, n):
+        keys = iter(jax.random.split(jax.random.key(seed), 2))
+        ssm = jax.random.normal(next(keys), (n, N_V, D_K, D_V)).astype(jnp.bfloat16)
+        conv = jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM))
+        return ssm, conv
+
+    def _tuple(self, ssm, conv, kwargs):
+        ident = jnp.arange(ssm.shape[0], dtype=jnp.int32)
+        (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+            states=(conv, ssm), state_indices=ident, **kwargs
+        )
+        return new_ssm, new_conv, out
+
+    def _pooled(self, ssm, conv, idx, kwargs, write=_write_states_bf16):
+        pool = write(_garbage_pool(0), ssm, conv, idx)
+        out_pool, out = wrapper.fused_conv1d_gdn(
+            states=_merge(pool),
+            state_indices=idx,
+            conv_dtype=jnp.float32,
+            recurrent_dtype=jnp.bfloat16,
+            **kwargs,
+        )
+        new_ssm, new_conv = _read_states_bf16(_split(out_pool, pool.shape), idx)
+        return new_ssm, new_conv, out
+
+    def _assert_same(self, got, want, ssm_ulps=0):
+        # Recurrent state: bf16 bit patterns may differ by at most `ssm_ulps`
+        # units in the last place; 0 means bit-exact.
+        diff = np.abs(_bits(got[0]).astype(np.int32) - _bits(want[0]).astype(np.int32))
+        assert int(diff.max()) <= ssm_ulps
+        np.testing.assert_allclose(
+            np.asarray(got[1]), np.asarray(want[1]), rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(got[2]), np.asarray(want[2]), rtol=2e-2, atol=2e-2
+        )
+
+    def _mixed_kwargs(self, seed):
+        # Two decodes (BATCHED) plus two 64-token continuations (PER_SEQ).
+        return _rand_inputs(seed, 130) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 66, 130]),
+            distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([7, 9, 96, 80], dtype=jnp.int32),
+        )
+
+    def test_pooled_bf16_recurrent_matches_tuple_path(self):
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        ssm, conv = self._states(40, 4)
+        kwargs = self._mixed_kwargs(41)
+        # The pooled and tuple paths compile to different programs, so their
+        # fp32 results can differ in the last bits and round to adjacent bf16
+        # values. Conv state and output stay within standard tolerance.
+        self._assert_same(
+            self._pooled(ssm, conv, idx, kwargs),
+            self._tuple(ssm, conv, kwargs),
+            ssm_ulps=32,
+        )
+
+    def test_bf16_recurrent_matches_fp32_on_bf16_values(self):
+        ssm, conv = self._states(42, 4)
+        kwargs = self._mixed_kwargs(43)
+        # The kernel donates `states`, so each call gets its own buffers.
+        ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+        got = self._tuple(ssm, conv, kwargs)
+        new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+        self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+    def test_multi_tile_prefill_with_bf16_recurrent_keeps_fp32_carry(self):
+        # 200 tokens span 4 PER_SEQ tiles of 64: the carry between tiles must
+        # stay fp32, so only the final state is rounded.
+        ssm, conv = self._states(44, 1)
+        kwargs = _rand_inputs(45, 200) | dict(
+            query_start_loc=jnp.array([0, 200]),
+            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([230], dtype=jnp.int32),
+        )
+        ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+        got = self._tuple(ssm, conv, kwargs)
+        new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+        self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+    def test_spec_windows_with_bf16_recurrent_match_fp32_on_bf16_values(self):
+        # Reuses the pooled spec schedule on the tuple path. Rounding the
+        # fp32 arm between steps mirrors the bf16 store/load round trip.
+        spec = TestPooledSpecWindows
+        n, window = spec.N, spec.WINDOW
+        base = jnp.array([1 + i * window for i in range(n)], dtype=jnp.int32)
+        rng = np.random.default_rng(46)
+        num_slots = 1 + n * window
+        conv = jnp.asarray(
+            rng.standard_normal((num_slots, KERNEL_SIZE - 1, DIM)), jnp.float32
+        )
+        rec = jnp.asarray(rng.standard_normal((num_slots, N_V, D_K, D_V)), jnp.bfloat16)
+        conv16, rec16 = conv, rec
+        conv32, rec32 = conv.copy(), rec.astype(jnp.float32)
+        for step_num, step in enumerate(spec._steps(spec)):
+            kwargs = _rand_inputs(47 + step_num, step["num_tokens"]) | dict(
+                query_start_loc=step["query_start_loc"],
+                distribution=step["distribution"],
+                seq_lens=step["seq_lens"],
+                num_spec_tokens=spec.NUM_SPEC,
+                read_offsets=step["read_offsets"],
+            )
+            (conv16, rec16), out16 = wrapper.fused_conv1d_gdn(
+                states=(conv16, rec16), state_indices=base, **kwargs
+            )
+            (conv32, rec32), out32 = wrapper.fused_conv1d_gdn(
+                states=(conv32, rec32), state_indices=base, **kwargs
+            )
+            rec32 = rec32.astype(jnp.bfloat16)
+            self._assert_same((rec16, conv16, out16), (rec32, conv32, out32))
+            rec32 = rec32.astype(jnp.float32)
+
+    def test_conv_first_pool_layout_is_detected(self):
+        """Negative control: regions written in the other order must not match."""
+
+        def write_conv_first(pool, ssm, conv, idx, split=SPLIT):
+            def build(pool, ssm, conv, idx):
+                words = _mgr_words(pool, split)
+                words = _put(words, idx, 0, jnp.asarray(conv, jnp.float32))
+                body = _pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
+                start = CONV_GRANULES * WORDS_PER_GRANULE
+                words = words.at[idx, start : start + body.shape[1]].set(body)
+                return _unwords(words, pool)
+
+            return _on_cpu(build, pool, ssm, conv, idx)
+
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        ssm, conv = self._states(48, 4)
+        kwargs = _rand_inputs(49, 4) | dict(
+            query_start_loc=jnp.arange(5),
+            distribution=jnp.array([4, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.full((4,), 9, dtype=jnp.int32),
+        )
+        got = self._pooled(ssm, conv, idx, kwargs, write=write_conv_first)
+        want = self._tuple(ssm, conv, kwargs)
+        assert not np.array_equal(np.asarray(got[2]), np.asarray(want[2]))
+
+    def test_bf16_conv_state_is_rejected(self):
+        ssm, conv = self._states(50, 1)
+        kwargs = _rand_inputs(51, 1) | dict(
+            query_start_loc=jnp.arange(2),
+            distribution=jnp.array([1, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([3], dtype=jnp.int32),
+        )
+        with pytest.raises(NotImplementedError, match="fp32 conv state"):
+            self._tuple(ssm, conv.astype(jnp.bfloat16), kwargs)
+
+
 @pytest.mark.tpu_test
 class TestPooledCallerV3:
     def test_fp32_ssm_round_trips_through_fp8_pool(self):
@@ -654,6 +868,7 @@ class TestPooledCallerV3:
             seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
 
+        conv_init, recurrent_init = conv.copy(), recurrent.copy()
         (_, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
             states=(conv, recurrent), state_indices=dense_idx, **kwargs
         )
@@ -695,10 +910,39 @@ class TestPooledCallerV3:
             np.asarray(pooled_ssm), np.asarray(dense_ssm), rtol=5e-2, atol=5e-2
         )
 
-        # A narrower SSM cache would need the state unpacked in registers on
-        # every use; the fused path refuses rather than silently mis-reading.
-        with pytest.raises(NotImplementedError, match="fp32 SSM state"):
-            pooled(recurrent_state=pool, recurrent_state_dtype=jnp.bfloat16)
+        # A bf16 SSM cache takes the same caller path, two rows per word.
+        recurrent16 = recurrent_init.astype(jnp.bfloat16)
+
+        def _seed16(pool, recurrent16, pool_idx):
+            body = _pack_bf16_rows(recurrent16).reshape(n, -1)
+            words = _mgr_words(pool).at[pool_idx, 0 : body.shape[1]].set(body)
+            return _unwords(words, pool)
+
+        def _read16(new_pool, pool_idx):
+            words = _mgr_words(new_pool)[pool_idx, 0 : nwords // 2]
+            return _unpack_bf16_rows(words.reshape(n, N_V, D_K // 2, D_V))
+
+        pool16 = _on_cpu(_seed16, jnp.zeros_like(pool), recurrent16, pool_idx)
+        (_, dense_ssm16), dense_out16 = wrapper.fused_conv1d_gdn(
+            states=(conv_init, recurrent16), state_indices=dense_idx, **kwargs
+        )
+        new_pool16, pooled_out16 = pooled(
+            recurrent_state=pool16, recurrent_state_dtype=jnp.bfloat16
+        )
+        pooled_ssm16 = _on_cpu(_read16, new_pool16, pool_idx)
+
+        np.testing.assert_allclose(
+            np.asarray(pooled_out16, np.float32),
+            np.asarray(dense_out16, np.float32),
+            rtol=5e-2,
+            atol=5e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(pooled_ssm16, np.float32),
+            np.asarray(dense_ssm16, np.float32),
+            rtol=5e-2,
+            atol=5e-2,
+        )
 
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")

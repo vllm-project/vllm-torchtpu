@@ -71,7 +71,7 @@ def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
     state_shape = ((3, 3, heads, 128), (heads, 128, 128))
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=heads * 128 * 128 * 4,
-        conv_bytes=3 * 3 * heads * 128 * 2,
+        conv_bytes=3 * 3 * heads * 128 * 4,
         token_bytes=2560,
     )
     rows = layout.required_tokens

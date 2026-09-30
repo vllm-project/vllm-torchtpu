@@ -466,11 +466,14 @@ def create_allocs(
             1,
             cfg.dim_size,
         )
+        # The window stores the state as uint32 words; `packing` state
+        # values share one word, so it has kq_head_dim // packing rows.
+        packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
         recurrent_shape = (
             cfg.seq_tile_size,
             cfg.window_size,
             cfg.num_v_heads,
-            cfg.kq_head_dim,
+            cfg.kq_head_dim // packing,
             cfg.v_head_dim,
         )
         state_buffered_partial = functools.partial(
@@ -487,7 +490,7 @@ def create_allocs(
         )
         recurrent_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=cfg.dtypes.recurrent_state,
+            dtype_or_type=jnp.uint32,
             offset=cfg.recurrent_hbm_offset,
         )
     else:

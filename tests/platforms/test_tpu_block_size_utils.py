@@ -375,7 +375,7 @@ def test_pcp_kimi_pool_keeps_model_state_geometry(vllm_config, architecture):
     ):
         layout = _hybrid_mamba_state_layout(vllm_config, 1024)
     assert layout.ssm_bytes == 4 * 128 * 128 * 4
-    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 2
+    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 4
     assert vllm_config.parallel_config.tensor_parallel_size == 2
 
 
@@ -397,10 +397,10 @@ def test_pcp_gdn_pool_sizes_replicated_kq_state(vllm_config):
     )
 
     # Local SSM: 4*128*128*4 = 256 KiB (256 rows). Local Conv:
-    # 3*(1Q+1K+4V)*128*2 = 4608 B, rounded to 8 physical rows.
-    assert vllm_config.cache_config.block_size == 264
-    assert vllm_config.cache_config.mamba_block_size == 264
-    assert vllm_config.cache_config.mamba_page_size_padded == 264 * 1024
+    # 3*(1Q+1K+4V)*128*4 = 9216 B, rounded to 16 physical rows.
+    assert vllm_config.cache_config.block_size == 272
+    assert vllm_config.cache_config.mamba_block_size == 272
+    assert vllm_config.cache_config.mamba_page_size_padded == 272 * 1024
 
 
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):

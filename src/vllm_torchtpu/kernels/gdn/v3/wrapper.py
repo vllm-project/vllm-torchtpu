@@ -207,7 +207,10 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
+        # Round to the state dtype, then pack into the uint32 window.
+        recurrent_slot_ref[...] = pltpu.bitcast(
+            new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+        )
     else:
         # TODO: Delete this after unified pool migration completes.
         legacy_unified.store_external_state(
@@ -446,10 +449,15 @@ def fused_conv1d_gdn(
         assert len(states) == 2
         recurrent_dtype = states[1].dtype
         conv_dtype = states[0].dtype
-    if conv_dtype != jnp.float32 or recurrent_dtype != jnp.float32:
+    # Conv1D reads the compact layout, which needs fp32. The recurrent state
+    # may be bf16: it is upcast once on load and rounded once on store.
+    if jnp.dtype(conv_dtype) != jnp.float32 or jnp.dtype(recurrent_dtype) not in (
+        jnp.dtype(jnp.float32),
+        jnp.dtype(jnp.bfloat16),
+    ):
         raise NotImplementedError(
-            f"GDN v3 state must be fp32; got conv={conv_dtype} "
-            f"recurrent={recurrent_dtype}."
+            "GDN v3 needs an fp32 conv state and an fp32 or bf16 recurrent "
+            f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
     qkv = qkv.astype(jnp.float32)
@@ -518,9 +526,11 @@ def fused_conv1d_gdn(
         # weights, activations scratch and compiler temporaries).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
+        recurrent_bytes_per_seq = (
+            window * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+        )
         bytes_per_seq = (
-            # Recurrent checkpoints (fp32) — the dominant term.
+            # Recurrent checkpoints — the dominant term.
             recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
             + window * (kernel_size - 1) * dim * 4
@@ -564,9 +574,14 @@ def fused_conv1d_gdn(
 
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     conv_state_shape = None
+    recurrent_state_shape = None
     if not is_shared:
         conv_state_shape = states[0].shape
-        states = (states[0].reshape(-1, kernel_size - 1, 1, dim), states[1])
+        rec_state = states[1]
+        if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
+            recurrent_state_shape = rec_state.shape
+            rec_state = rec_state.reshape(-1, n_v * (d_k // 2), 2, d_v)
+        states = (states[0].reshape(-1, kernel_size - 1, 1, dim), rec_state)
 
     # Step 3: Weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
@@ -712,4 +727,6 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
         out_states = (out_states[0].reshape(conv_state_shape), out_states[1])
+    if recurrent_state_shape is not None:
+        out_states = (out_states[0], out_states[1].reshape(recurrent_state_shape))
     return out_states, out_act
