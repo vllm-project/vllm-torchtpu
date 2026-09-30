@@ -641,7 +641,9 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
             layer.weight_scale.data.to(torch.float32) * global_scale
         )  # [N, K/group]
         # gmm_v2 rhs scale layout for a single group: [1, num_blocks, 1, N].
-        scale_4d = _to_kernel_scale(weight_scale).unsqueeze(0)  # [1, K/group, 1, N]
+        scale_4d = _fresh(
+            _to_kernel_scale(weight_scale).unsqueeze(0)
+        )  # [1, K/group, 1, N]
 
         # Unpack to native fp4 in the kernel's K-major layout once at load (see
         # load_kmajor_fp4); the forward then runs native fp4 with no per-forward

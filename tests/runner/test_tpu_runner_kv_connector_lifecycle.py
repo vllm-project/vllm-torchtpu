@@ -107,7 +107,9 @@ def _fake_runner(method, is_async, verify, propose):
         _assemble_async_spec_substitution=lambda *_args: async_source,
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
+        _stage_timing=MagicMock(),
     )
+    runner._stage_timing.take_samples.return_value = ([], [])
     for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner

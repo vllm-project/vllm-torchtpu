@@ -72,7 +72,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
@@ -245,8 +245,8 @@ class RaidenOffloadingManager(OffloadingManager):
         kv_pool_group: str = "",
         key_namespace: bytes = b"",
         # Test overrides: allow injecting mock store instance and type bindings.
-        store: object | None = None,
-        store_types: object | None = None,
+        store: Any = None,
+        store_types: Any = None,
     ):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
@@ -398,7 +398,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def _probe(
         self, sub_hashes: list[bytes], *, enable_global: bool = False
-    ) -> list[tuple[bytes, object]]:
+    ) -> list[tuple[bytes, Any]]:
         """Read the directory without laying claim to what it reports.
 
         `lookup` pins its hits by default so the answer cannot be evicted
@@ -1342,7 +1342,7 @@ def resolve_attention_geometry(
         with set_current_vllm_config(vllm_config):
             attn_backend = get_attn_backend(
                 head_size=model_config.get_head_size(),
-                dtype=model_config.dtype,
+                dtype=cast("torch.dtype", model_config.dtype),
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
                 use_mla=model_config.use_mla,
             )
@@ -1463,6 +1463,8 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             )
             return
 
+        assert isinstance(per_block_shape, tuple)
+        assert isinstance(kv_dtype, torch.dtype)
         bytes_per_kernel_block = (
             int(np.prod(per_block_shape))
             * torch.empty(0, dtype=kv_dtype).element_size()
