@@ -5310,6 +5310,7 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens]. E.g. with K=3, num_reqs=8 covers at most 32 positions, so
         padded_logits_length=768 never pairs with it.
         """
+        assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
         tokens_paddings = sorted(self.num_tokens_paddings)
         idx = bisect.bisect_left(tokens_paddings, num_tokens)
