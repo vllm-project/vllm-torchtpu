@@ -1766,6 +1766,7 @@ class TPUModelRunner(GPUModelRunner):
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
             state_srcs: list[int] = []
+            new_owners: list[bool] = []
             ckpt_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
@@ -1775,6 +1776,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     state_srcs.append(src)
+                    new_owners.append(req_ids[row] not in self._mamba_offset_seeded)
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
@@ -1792,7 +1794,7 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows)
+                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -1899,7 +1901,10 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _spec_seed_sources(
-        self, state_srcs: list[int], ckpt_rows: list[list[int]]
+        self,
+        state_srcs: list[int],
+        ckpt_rows: list[list[int]],
+        new_owners: list[bool],
     ) -> torch.Tensor:
         """Seed source per crossing: the checkpoint being resumed from.
 
@@ -1917,6 +1922,15 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        # PD and prefix-cache restores provide committed state in checkpoint 0.
+        # A recycled source block can retain another request's MTP offset.
+        # The first-forward reset clears the destination, after this source
+        # selection, so ignore that stale offset here without mutating the
+        # source block (which may be shared). Live requests retain their offset.
+        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
+            self.device, non_blocking=True
+        )
+        off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
