@@ -46,7 +46,11 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
     cp_rank_as_data,
+    kv_cache_append,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -63,7 +67,10 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -71,6 +78,99 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+_INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
+
+
+def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
+    key = (mode, reason)
+    if key in _INDEXER_KV_CACHE_FALLBACK_LOGGED:
+        return
+    _INDEXER_KV_CACHE_FALLBACK_LOGGED.add(key)
+    logger.warning(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r falling back to 'xla': %s",
+        mode,
+        reason,
+    )
+
+
+def _unsupported_indexer_kv_cache_reason(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    mode: str,
+) -> str | None:
+    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use `mode`."""
+    backend = jax.default_backend()
+    if backend != "tpu":
+        return f"backend={backend!r} is not 'tpu'"
+    if cache_kv.dtype != jnp.uint8 or k_packed.ndim != 2 or k_packed.dtype != jnp.uint8:
+        return (
+            f"cache_kv dtype={cache_kv.dtype} or k_packed shape={k_packed.shape} "
+            f"dtype={k_packed.dtype} is not uint8"
+        )
+    layout = KVLayout.SEQ_ALONG_LANE if mode == "sal" else KVLayout.HEAD_ALONG_SUBLANE
+    try:
+        page_size = kv_cache_append.cache_page_size(cache_kv, layout)
+    except ValueError as exc:
+        return str(exc)
+    if layout == KVLayout.SEQ_ALONG_LANE:
+        head_dim = (int(cache_kv.shape[1]) - 1) * 4
+        if head_dim <= 0 or head_dim % 64 != 0:
+            return (
+                f"SAL cache_kv shape={cache_kv.shape} does not match "
+                "(num_blocks, head_dim // 4 + 1, 4, page_size) with head_dim % 64 == 0"
+            )
+    num_tokens = int(k_packed.shape[0])
+    if num_tokens > kv_cache_append._MAX_TOKENS:
+        return (
+            f"num_tokens={num_tokens} exceeds max supported tokens "
+            f"{kv_cache_append._MAX_TOKENS}"
+        )
+    if num_tokens > 0:
+        launch = (
+            kv_cache_append._sal_launch
+            if layout == KVLayout.SEQ_ALONG_LANE
+            else kv_cache_append._has_launch
+        )
+        try:
+            launch(
+                cache_kv,
+                kv_cache_append._format_rows(k_packed, cache_kv, layout),
+                page_size=page_size,
+                wave=min(num_tokens, kv_cache_append._MAX_WAVE),
+            )
+        except ValueError as exc:
+            return str(exc)
+    return None
+
+
+def _resolve_indexer_kv_cache_mode(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    *,
+    mode: str | None = None,
+) -> tuple[str, KVLayout]:
+    """Resolves the effective indexer K-cache mode and `KVLayout`.
+
+    Returns `("xla", KVLayout.HEAD_ALONG_SUBLANE)` when `mode == "xla"` or when
+    CPU / unsupported cache geometry triggers a one-time fallback.
+    """
+    raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE if mode is None else mode
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if resolved == "xla":
+        return "xla", KVLayout.HEAD_ALONG_SUBLANE
+    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, resolved)
+    if reason is not None:
+        _warn_indexer_kv_cache_fallback_once(resolved, reason)
+        return "xla", KVLayout.HEAD_ALONG_SUBLANE
+    if resolved == "sal":
+        return "sal", KVLayout.SEQ_ALONG_LANE
+    return "has", KVLayout.HEAD_ALONG_SUBLANE
 
 
 def _cp_scatter_indexer_k(
@@ -84,6 +184,7 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
+    mode: str | None = None,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -102,7 +203,23 @@ def _cp_scatter_indexer_k(
     """
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
+        effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
+            cache_kv, k_packed, mode=mode
+        )
         rank = cp_rank_as_data(axis_name, cp_size)
+        if effective_mode != "xla":
+            return coalesced_kv_append_dcp(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                rank,
+                dcp_size=cp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+            )
+
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -194,6 +311,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -207,28 +325,45 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
-            # Cache rows are padded to the 128-lane HBM width; pad the packed
-            # fp8+scale rows to match before scattering.
-            k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+            effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
+            if effective_mode == "xla":
+                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+                block_size = block_size_per_kv_packing * kv_packing
+                # Cache rows are padded to the 128-lane HBM width; pad the packed
+                # fp8+scale rows to match before scattering.
+                k_packed = jnp.pad(
+                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
+                )
 
-            # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
-            )
+                # Insert this step's K rows into the KV cache.
+                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
+                    jnp.int32
+                )
+                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+                page = jnp.where(
+                    tok < cu_q_lens[-1],
+                    page_indices.reshape(seq_lens.shape[0], -1)[
+                        seq_id, pos // block_size
+                    ],
+                    jnp.int32(2**30),
+                )
+                slot = pos % block_size
+                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+                    k_packed
+                )
+            else:
+                cache_kv = coalesced_kv_append(
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    kv_layout=kv_layout,
+                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -246,6 +381,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
@@ -281,6 +417,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -292,8 +429,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's 128-lane width itself.
+            # the cache's record width itself.
             cache_kv = _cp_scatter_indexer_k(
                 cache_kv,
                 k_packed,
@@ -304,6 +444,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
+                mode=effective_mode,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -322,6 +463,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, local_topk

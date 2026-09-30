@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "xla"
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -675,6 +676,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
+    #   "xla" (default): XLA .at[].set scatter in HEAD_ALONG_SUBLANE layout.
+    #   "has": Pallas coalesced_kv_append(_dcp) in HEAD_ALONG_SUBLANE layout.
+    #   "sal": Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout.
+    "VLLM_TPU_INDEXER_KV_CACHE_MODE": lambda: (
+        env_with_choices(
+            "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+            "xla",
+            ["xla", "has", "sal"],
+            case_sensitive=False,
+        )()
+        or "xla"
+    ).lower(),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

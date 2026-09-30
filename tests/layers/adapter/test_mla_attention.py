@@ -994,3 +994,280 @@ def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention.impl.forward.assert_called_once()
     assert attention.impl.forward.call_args.kwargs["attn_metadata"] == "meta"
     assert attention.impl.forward.call_args.kwargs["kv_cache"] == "cache"
+
+
+def test_indexer_kv_cache_mode_env_validation(monkeypatch):
+    """VLLM_TPU_INDEXER_KV_CACHE_MODE defaults to 'xla', normalizes case, and
+    rejects unknown modes."""
+    assert "VLLM_TPU_INDEXER_KV_CACHE_MODE" in TpuPlatform.additional_env_vars
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "xla"
+
+    for raw, expected in [("HAS", "has"), ("SAL", "sal"), ("Xla", "xla")]:
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raw)
+        assert (
+            envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == expected
+        )
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "invalid_mode")
+    with pytest.raises(ValueError, match="VLLM_TPU_INDEXER_KV_CACHE_MODE"):
+        envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]()
+
+
+def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):
+    """Unsupported backend or cache geometry falls back to 'xla' and logs once."""
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
+    cache_has = jnp.zeros((4, 256, 4, 256), dtype=jnp.uint8)
+    cache_sal = jnp.zeros((4, 33, 4, 1024), dtype=jnp.uint8)
+    k_packed = jnp.zeros((8, 129), dtype=jnp.uint8)
+
+    # 'xla' never warns regardless of backend.
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="xla"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+
+    # On CPU, 'has' and 'sal' fall back to 'xla' and warn once per (mode, reason).
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "falling back to 'xla'" in warnings[0]
+
+    # On TPU, valid HAS and SAL shapes resolve to their Pallas modes; mismatched
+    # geometry (e.g., HAS-shaped cache with mode='sal') falls back to 'xla'.
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("has", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_sal, k_packed, mode="sal"
+    ) == ("sal", KVLayout.SEQ_ALONG_LANE)
+
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="sal"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
+    """_build_streamidx_op produces bit-identical cache updates and top-k args
+    across xla, has, and sal."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        kv_cache_append,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    # Capture the inner JAX function passed to pallas.jax_op and run the writer
+    # in interpret mode when executing on CPU so the full HAS/SAL paths run.
+    captured = {}
+
+    def _fake_jax_op(name, fn, donate_argnums=()):
+        captured["name"] = name
+        captured["fn"] = fn
+        captured["donate_argnums"] = donate_argnums
+        op = MagicMock(side_effect=fn)
+        op.register_fake = MagicMock()
+        return op
+
+    monkeypatch.setattr(mla_attention_op.pallas, "jax_op", _fake_jax_op)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    orig_append = kv_cache_append.coalesced_kv_append
+    monkeypatch.setattr(
+        mla_attention_op,
+        "coalesced_kv_append",
+        lambda *a, **kw: orig_append(*a, **kw, interpret=True),
+    )
+
+    recorded_topk_calls = []
+
+    def _fake_streamindex_topk(
+        q,
+        weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        *,
+        k,
+        kv_layout,
+        **kwargs,
+    ):
+        recorded_topk_calls.append((kv_layout, np.asarray(cache_kv)))
+        return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+
+    monkeypatch.setattr(mla_attention_op, "streamindex_topk", _fake_streamindex_topk)
+
+    rng = np.random.default_rng(42)
+    num_pages, page_size, head_dim, lkv_dim = 4, 128, 128, 256
+    num_tokens, num_heads, topk = 6, 32, 16
+    init_has = jnp.asarray(
+        rng.integers(
+            0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
+        )
+    )
+    init_sal = st_lib.convert_cache_to_seq_along_lane(init_has, head_dim=head_dim)
+    q_bytes = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, num_heads, head_dim), dtype=np.uint8)
+    )
+    weights = jnp.ones((num_tokens, num_heads), dtype=jnp.bfloat16)
+    k_packed = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, head_dim + 1), dtype=np.uint8)
+    )
+    seq_lens = jnp.array([5, 67], dtype=jnp.int32)
+    page_indices = jnp.array([2, 0, 1, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 6], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    results = {}
+    for mode, init_cache in [
+        ("xla", init_has),
+        ("has", init_has),
+        ("sal", init_sal),
+    ]:
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        indexer = mla_attention_op.VllmTPUSparseAttnIndexer.__new__(
+            mla_attention_op.VllmTPUSparseAttnIndexer
+        )
+        indexer.topk_tokens = topk
+        indexer.k_cache = SimpleNamespace(prefix="model.layers.0.indexer")
+        indexer._build_streamidx_op()
+        assert captured["donate_argnums"] == (2,)
+        new_cache, topk_out = captured["fn"](
+            q_bytes,
+            weights,
+            jnp.copy(init_cache),
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+        )
+        results[mode] = (new_cache, np.asarray(topk_out))
+
+    assert recorded_topk_calls[0][0] == KVLayout.HEAD_ALONG_SUBLANE
+    assert recorded_topk_calls[1][0] == KVLayout.HEAD_ALONG_SUBLANE
+    assert recorded_topk_calls[2][0] == KVLayout.SEQ_ALONG_LANE
+
+    # HAS Pallas cache update matches XLA cache update bit-for-bit.
+    np.testing.assert_array_equal(
+        np.asarray(results["has"][0]), np.asarray(results["xla"][0])
+    )
+    # SAL Pallas cache update matches converted XLA cache update bit-for-bit.
+    expected_sal = st_lib.convert_cache_to_seq_along_lane(
+        results["xla"][0], head_dim=head_dim
+    )
+    np.testing.assert_array_equal(
+        np.asarray(results["sal"][0]), np.asarray(expected_sal)
+    )
+    np.testing.assert_array_equal(results["has"][1], results["xla"][1])
+    np.testing.assert_array_equal(results["sal"][1], results["xla"][1])
+
+
+def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
+    """_cp_scatter_indexer_k updates the DCP shard identically across xla, has,
+    and sal."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        DCP_AXIS_NAME,
+        kv_cache_append,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    orig_append_dcp = kv_cache_append.coalesced_kv_append_dcp
+    monkeypatch.setattr(
+        mla_attention_op,
+        "coalesced_kv_append_dcp",
+        lambda *a, **kw: orig_append_dcp(*a, **kw, interpret=True),
+    )
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), (DCP_AXIS_NAME,))
+    rng = np.random.default_rng(99)
+    num_pages, page_size, head_dim, lkv_dim = 4, 128, 128, 256
+    num_tokens = 8
+    init_has = jnp.asarray(
+        rng.integers(
+            0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
+        )
+    )
+    init_sal = st_lib.convert_cache_to_seq_along_lane(init_has, head_dim=head_dim)
+    k_packed = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, head_dim + 1), dtype=np.uint8)
+    )
+    seq_lens = jnp.array([6, 70], dtype=jnp.int32)
+    page_indices = jnp.array([1, 3, 0, 2], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 3, 8], dtype=jnp.int32)
+
+    common_kw = dict(
+        mesh=mesh,
+        cp_size=1,
+        interleave_size=1,
+        axis_name=DCP_AXIS_NAME,
+    )
+    out_xla = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_has),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        mode="xla",
+        **common_kw,
+    )
+    out_has = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_has),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        mode="has",
+        **common_kw,
+    )
+    out_sal = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_sal),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        mode="sal",
+        **common_kw,
+    )
+
+    np.testing.assert_array_equal(np.asarray(out_has), np.asarray(out_xla))
+    np.testing.assert_array_equal(
+        np.asarray(out_sal),
+        np.asarray(st_lib.convert_cache_to_seq_along_lane(out_xla, head_dim=head_dim)),
+    )
+
