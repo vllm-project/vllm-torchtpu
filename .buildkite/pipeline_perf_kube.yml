@@ -325,9 +325,10 @@ steps:
     commands:
       - .buildkite/kubernetes/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep
 
-  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips: the tpu7x-32 pod the
-  # bare-metal step runs on. That shape has a queue and chips of its own, so
-  # this waits only for the image, not for the v7x-8 and v7x-16 steps above.
+  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips. This is the only
+  # nightly of it: pipeline_perf.yml has no bare-metal counterpart. That shape
+  # has a queue and chips of its own, so this waits only for the image, not for
+  # the v7x-8 and v7x-16 steps above.
   #
   # Only in a K3=1 build, scheduled nightly at 03:00 PT behind the 02:00
   # Kimi-K3 1P1D in pipeline_disagg_kube.yml: the 2x2x4 slices also serve

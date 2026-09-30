@@ -403,7 +403,7 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
       "name": "bad-assignment",
-      "concise_description": "`list[float | int]` is not assignable to dict value type `float | int`"
+      "concise_description": "`list[float | int | tuple[str, str, float]]` is not assignable to dict value type `float | int`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",

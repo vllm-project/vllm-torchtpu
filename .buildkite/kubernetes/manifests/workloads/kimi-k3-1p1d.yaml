@@ -55,7 +55,7 @@ spec:
           # Indexed because enableDNSHostnames requires it.
           completionMode: Indexed
           # Over the fleet's default: two cold Kimi-K3 boots stream 1.5 TB each
-          # and compile, then the benchmark and lm_eval take about 80 minutes.
+          # and compile, then the correctness stages and lm_eval run.
           activeDeadlineSeconds: 28800
           backoffLimit: 0
           template:
@@ -93,8 +93,9 @@ spec:
                       value: /cache/jax/xla
                     - name: VLLM_CACHE_ROOT
                       value: /cache/jax/vllm
-                    # run_eval_flow.sh writes the benchmark and lm_eval results
-                    # here, and multihost_entry.sh uploads it from the head.
+                    # The correctness stages and run_eval_flow.sh write their
+                    # results here, and multihost_entry.sh uploads it from the
+                    # head.
                     - name: ARTIFACTS_DIR
                       value: perf_eval_results
                   ports:
