@@ -50,18 +50,10 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptLinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
-
-try:
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4LinearMethod,
-    )
-except ImportError:
-    from vllm.model_executor.layers.quantization.modelopt import (  # type: ignore[no-redef]
-        ModelOptLinearMethod as ModelOptNvFp4LinearMethod,
-    )
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
@@ -582,7 +574,7 @@ class _NullInputQuantKernel:
         return None
 
 
-class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
+class VllmNvfp4LinearMethod(ModelOptLinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
     Reuses upstream create_weights for parameter registration; fuses the block
@@ -594,7 +586,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     def __init__(
         self, quant_config: VllmNvfp4Config, linear_config: VllmQuantLinearConfig
     ):
-        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
+        # Skip ModelOptLinearMethod.__init__ (it builds a GPU NVFP4 kernel
         # unavailable on TPU). create_weights only needs kernel.input_quant_key.
         self.quant_config = quant_config
         self.linear_config = linear_config
@@ -611,7 +603,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         params_dtype,
         **extra_weight_attrs,
     ):
-        ModelOptNvFp4LinearMethod.create_weights(
+        ModelOptLinearMethod.create_weights(
             self,
             layer,
             input_size_per_partition,

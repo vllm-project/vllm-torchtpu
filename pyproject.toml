@@ -28,8 +28,7 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -84,7 +83,7 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "parameterized",
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d#subdirectory=tests/vllm_test_utils",
 ]
 
 # These are required for running any benchmarking

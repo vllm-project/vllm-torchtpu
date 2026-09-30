@@ -231,14 +231,10 @@ class TestNvfp4LinearMethod:
             lyr.input_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
             lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
 
-        import vllm.model_executor.layers.quantization.modelopt as modelopt_mod
-
-        patch_target = (
-            "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.create_weights"
-            if hasattr(modelopt_mod, "ModelOptLinearMethod")
-            else "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights"
-        )
-        with patch(patch_target, mock_base_create_weights):
+        with patch(
+            "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.create_weights",
+            mock_base_create_weights,
+        ):
             method.create_weights(layer, 64, [32], 64, 32, torch.bfloat16)
 
         assert hasattr(layer.input_scale, "weight_loader")
