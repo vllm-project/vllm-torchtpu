@@ -38,7 +38,11 @@ Both boxes drop (map to `OOB_PAGE`) any token that:
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, SKIP_ROW
+# Page id that marks a token as "do not write". Any value >= num_pages works;
+# a large constant keeps it recognizable when debugging.
+OOB_PAGE = 2**30
+# Flat destination row that marks a token as "do not write".
+SKIP_ROW = -1
 
 __all__ = [
     "OOB_PAGE",

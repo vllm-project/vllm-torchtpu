@@ -40,7 +40,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk as st_lib,
 )
-from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache_utils
 
 _KV_PACKING = 4
 _HAS = "head_along_sublane"
@@ -1059,6 +1058,15 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         self, dcp_size, interleave_size
     ):
         """`streamindex_topk.kv_cache_utils` matches `kernels.mla.kv_cache_utils`."""
+        try:
+            from vllm_torchtpu.kernels.mla import (
+                kv_cache_utils as mla_kv_cache_utils,
+            )
+        except ImportError:
+            self.skipTest("requires torch / torch_tpu")
+
+        self.assertEqual(kv_cache_utils.OOB_PAGE, mla_kv_cache_utils.OOB_PAGE)
+        self.assertEqual(kv_cache_utils.SKIP_ROW, mla_kv_cache_utils.SKIP_ROW)
         page_size, num_pages = 256, 32
         q_lens = np.array([1, 0, 64, 7, 1, 40], np.int32)
         seq_lens = jnp.array([5, 0, 512, 23, 300, 90], jnp.int32)
