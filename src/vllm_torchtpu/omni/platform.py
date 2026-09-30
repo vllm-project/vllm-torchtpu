@@ -95,6 +95,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
         list is derived from it.
         """
+        # TODO: Remove once vLLM-Omni calls a platform hook in the parent before
+        # spawning diffusion workers, so every rank inherits one address list, or
+        # torch_tpu allows more than one addressable device per process.
+        #
         addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         if addresses and len(addresses.split(",")) == world_size:
             return
