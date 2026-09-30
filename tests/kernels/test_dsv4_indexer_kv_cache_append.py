@@ -1233,6 +1233,214 @@ class CoalescedKvAppendTest(parameterized.TestCase):
                 )
 
     # ---------------------------------------------------------------------------
+    # Reader top-k parity across xla / has / sal (R9).
+    # ---------------------------------------------------------------------------
+
+    @parameterized.named_parameters(
+        ("decode_b8", [1] * 8, [512, 640, 768, 896, 1024, 1152, 1280, 1408], 8, 8),
+        ("mixed_4x1_plus_60", [1, 1, 1, 1, 60], [512, 640, 768, 896, 1024], 4, 5),
+    )
+    def test_reader_topk_matches_across_xla_has_and_sal(
+        self, active_q_lens, active_seq_lens, num_decodes, total_seqs
+    ):
+        """`streamindex_topk` returns identical top-k indices for xla, has, and sal."""
+        if jax.default_backend() != "tpu":
+            self.skipTest("streamindex_topk Pallas kernel requires TPU backend")
+        page_size, max_seqs, pages_per_seq, topk = 256, 8, 8, 128
+        num_pages = max_seqs * pages_per_seq
+        num_tokens = int(sum(active_q_lens))
+        rng = np.random.default_rng(3141 + num_tokens)
+
+        q_lens = np.zeros(max_seqs, np.int32)
+        q_lens[: len(active_q_lens)] = active_q_lens
+        seq_lens_np = np.zeros(max_seqs, np.int32)
+        seq_lens_np[: len(active_seq_lens)] = active_seq_lens
+        seq_lens = jnp.asarray(seq_lens_np, jnp.int32)
+        cu_q_lens = _cu_q_lens(q_lens)
+        distribution = jnp.asarray(
+            [num_decodes, num_decodes, total_seqs], dtype=jnp.int32
+        )
+        page_indices = jnp.arange(num_pages, dtype=jnp.int32)
+
+        cache_has = _random_cache(rng, num_pages, page_size)
+        cache_sal = _in_layout(cache_has, _SAL)
+        k_rows = _random_rows(rng, num_tokens)
+        q = jnp.asarray(rng.standard_normal((num_tokens, 64, 128)), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((num_tokens, 64)), jnp.bfloat16)
+
+        def score(cache, layout):
+            return st_lib.streamindex_topk(
+                q,
+                w,
+                cache,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=1,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 64, 64),
+                kv_layout=layout,
+            )
+
+        c_xla = _has_append_4d(
+            jnp.copy(cache_has),
+            k_rows,
+            seq_lens,
+            page_indices.reshape(max_seqs, pages_per_seq),
+            cu_q_lens,
+        )
+        c_has = _append(
+            cache_has,
+            k_rows,
+            seq_lens,
+            page_indices.reshape(max_seqs, pages_per_seq),
+            cu_q_lens,
+            layout=_HAS,
+        )
+        c_sal = _append(
+            cache_sal,
+            k_rows,
+            seq_lens,
+            page_indices.reshape(max_seqs, pages_per_seq),
+            cu_q_lens,
+            layout=_SAL,
+        )
+
+        topk_xla = np.asarray(score(c_xla, _HAS))
+        topk_has = np.asarray(score(c_has, _HAS))
+        topk_sal = np.asarray(score(c_sal, _SAL))
+
+        np.testing.assert_array_equal(topk_has, topk_xla)
+        for row in range(num_tokens):
+            np.testing.assert_array_equal(
+                np.sort(topk_sal[row]),
+                np.sort(topk_xla[row]),
+                err_msg=f"token row {row}",
+            )
+
+    @parameterized.parameters((2, 4), (4, 4))
+    def test_dcp_reader_topk_matches_across_xla_has_and_sal(
+        self, dcp_size, interleave_size
+    ):
+        """`streamindex_topk_dcp` matches across xla, has, and sal scatters."""
+        if jax.default_backend() != "tpu" or len(jax.devices()) < dcp_size:
+            self.skipTest(f"Requires TPU with at least {dcp_size} devices")
+        page_size, max_seqs, pages_per_seq, topk = 256, 4, 4, 128
+        local_pages = max_seqs * pages_per_seq
+        num_tokens = 64
+        rng = np.random.default_rng(2718 + dcp_size)
+
+        q_lens = np.array([1, 1, 62, 0], np.int32)
+        seq_lens = jnp.array([512, 520, 768, 0], jnp.int32)
+        cu_q_lens = _cu_q_lens(q_lens)
+        distribution = jnp.array([2, 2, 3], jnp.int32)
+        page_indices = jnp.arange(local_pages, dtype=jnp.int32)
+
+        mesh = jax.sharding.Mesh(
+            np.asarray(jax.devices()[:dcp_size]), (st_lib.DCP_AXIS_NAME,)
+        )
+        sharded = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(st_lib.DCP_AXIS_NAME)
+        )
+        replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+        shards_has = [
+            _random_cache(np.random.default_rng(100 + r), local_pages, page_size)
+            for r in range(dcp_size)
+        ]
+        shards_sal = [_in_layout(s, _SAL) for s in shards_has]
+        global_has = jax.device_put(jnp.concatenate(shards_has, axis=0), sharded)
+        global_sal = jax.device_put(jnp.concatenate(shards_sal, axis=0), sharded)
+
+        k_rows = jax.device_put(_random_rows(rng, num_tokens), replicated)
+        q = jax.device_put(
+            jnp.asarray(rng.standard_normal((num_tokens, 64, 128)), jnp.bfloat16),
+            replicated,
+        )
+        w = jax.device_put(
+            jnp.asarray(rng.standard_normal((num_tokens, 64)), jnp.bfloat16),
+            replicated,
+        )
+        seq_lens_r = jax.device_put(seq_lens, replicated)
+        page_indices_r = jax.device_put(page_indices, replicated)
+        cu_q_lens_r = jax.device_put(cu_q_lens, replicated)
+        distribution_r = jax.device_put(distribution, replicated)
+
+        def run_dcp(cache_global, mode: str, layout: str):
+            def _scatter(c, k, sl, pi, cu):
+                rank = st_lib.cp_rank_as_data(st_lib.DCP_AXIS_NAME, dcp_size)
+                if mode == "xla":
+                    page, slot = kv_cache_utils.get_dcp_page_and_slot(
+                        k.shape[0],
+                        sl,
+                        pi,
+                        cu,
+                        rank,
+                        page_size=page_size,
+                        num_pages=c.shape[0],
+                        dcp_size=dcp_size,
+                        interleave_size=interleave_size,
+                    )
+                    k_pad = jnp.pad(k, ((0, 0), (0, c.shape[-1] - k.shape[-1])))
+                    return c.at[page, slot // _KV_PACKING, slot % _KV_PACKING].set(
+                        k_pad
+                    )
+                return kv_cache_append.coalesced_kv_append_dcp(
+                    c,
+                    k,
+                    sl,
+                    pi,
+                    cu,
+                    rank,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                    kv_layout=layout,
+                )
+
+            p_sharded = jax.sharding.PartitionSpec(st_lib.DCP_AXIS_NAME)
+            p_rep = jax.sharding.PartitionSpec()
+            updated = jax.shard_map(
+                _scatter,
+                mesh=mesh,
+                in_specs=(p_sharded, p_rep, p_rep, p_rep, p_rep),
+                out_specs=p_sharded,
+                check_vma=False,
+            )(cache_global, k_rows, seq_lens_r, page_indices_r, cu_q_lens_r)
+            out = st_lib.streamindex_topk_dcp(
+                q,
+                w,
+                updated,
+                seq_lens_r,
+                page_indices_r,
+                cu_q_lens_r,
+                distribution_r,
+                mesh=mesh,
+                k=topk,
+                compression_ratio=1,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 64, 64),
+                kv_layout=layout,
+            )
+            return np.asarray(updated), np.asarray(out)
+
+        c_xla, topk_xla = run_dcp(global_has, "xla", _HAS)
+        c_has, topk_has = run_dcp(global_has, "has", _HAS)
+        _, topk_sal = run_dcp(global_sal, "sal", _SAL)
+
+        np.testing.assert_array_equal(c_has, c_xla)
+        np.testing.assert_array_equal(topk_has, topk_xla)
+        for row in range(topk_xla.shape[0]):
+            np.testing.assert_array_equal(
+                np.sort(topk_sal[row]),
+                np.sort(topk_xla[row]),
+                err_msg=f"sharded row {row}",
+            )
+
+    # ---------------------------------------------------------------------------
     # Argument validation.
     # ---------------------------------------------------------------------------
 
