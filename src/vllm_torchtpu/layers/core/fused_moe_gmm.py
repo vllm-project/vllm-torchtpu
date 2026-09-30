@@ -16,6 +16,10 @@
 Re-exports core primitives from `llm_tpu_core.layers.fused_moe_gmm`.
 """
 
+import sys
+from typing import Any
+
+from vllm_torchtpu.llm_tpu_core.layers import fused_moe_gmm as _core_fused_moe_gmm
 from vllm_torchtpu.llm_tpu_core.layers.fused_moe_gmm import (
     _counting_sort_positions,
     _select_ragged_gather_reduce,
@@ -43,3 +47,26 @@ __all__ = [
     "resolve_onehot_permute_threshold",
     "unpack_fp4_to_e2m1",
 ]
+
+_this_module = sys.modules[__name__]
+
+for _k in dir(_core_fused_moe_gmm):
+    if not (_k.startswith("__") and _k.endswith("__")):
+        setattr(_this_module, _k, getattr(_core_fused_moe_gmm, _k))
+
+
+class _FusedMoeGmmModuleWrapper:
+    def __init__(self, wrapped_module):
+        self.__dict__["_wrapped_module"] = wrapped_module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped_module, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self.__dict__[name] = value
+        setattr(self._wrapped_module, name, value)
+        if hasattr(_core_fused_moe_gmm, name):
+            setattr(_core_fused_moe_gmm, name, value)
+
+
+sys.modules[__name__] = _FusedMoeGmmModuleWrapper(_this_module)

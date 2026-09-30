@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,33 +13,7 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
-@dataclass
-class SpecDecodeMetadata:
-    """Metadata for speculative decoding on Torch/TPU, containing all
-    necessary indices.
-    """
-
-    # [padded_logits_length] draft token id validated at each
-    # target_logits_indices slot.
-    draft_token_ids: torch.Tensor
-    # [padded_num_reqs] per-request draft-token count (device copy).
-    draft_lengths: torch.Tensor
-    # [num_reqs] per-request draft-token count (host copy, unpadded).
-    draft_lengths_cpu: np.ndarray
-    # [padded_logits_length] row into this step's logits/hidden-states for each draft
-    # token being validated.
-    target_logits_indices: torch.Tensor
-    # [padded_num_reqs] row into this step's logits/hidden-states for each request's
-    # bonus (last sampled) token.
-    bonus_logits_indices: torch.Tensor
-    # [padded_logits_length] row into the input batch for every draft + bonus
-    # position the target model forward needs logits for.
-    final_logits_indices: torch.Tensor
-    # [padded_logits_length] request index each position belongs to; padding
-    # uses the out-of-range sentinel num_reqs (not 0).
-    segment_ids: torch.Tensor
-    # [padded_logits_length] within-request draft-slot index of each position.
-    group_indices: torch.Tensor
+from vllm_torchtpu.structured_spec_decoding.types import SpecDecodeMetadata
 
 
 class SpeculativeDecodingManager:

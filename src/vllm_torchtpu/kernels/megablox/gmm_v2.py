@@ -6,70 +6,32 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2`.
 """
 
-from vllm_torchtpu.llm_tpu_core.kernels.megablox.gmm_v2 import (
-    Dimensions,
-    FusedWeightsRef,
-    GmmConfigs,
-    IndexMaps,
-    InputConfigs,
-    MetadataRef,
-    RhsRef,
-    TileFn,
-    TileSizes,
-    WeightsRef,
-    align_to,
-    apply_act_fn,
-    calculate_tiling,
-    deinterleave_lane,
-    fill_metadata,
-    generate_block_specs,
-    get_cost_estimate,
-    get_metadata,
-    get_packing_factor,
-    get_scope_name,
-    gmm_v2,
-    inner_kernel,
-    interleave_lane,
-    kernel_main,
-    make_gmm_configs,
-    silu_and_mul_with_clamp,
-    situ_and_mul,
-    swigluoai,
-    validate_inputs,
-    zero_out_end,
-    zero_out_start,
+import sys
+from typing import Any
+
+from vllm_torchtpu.llm_tpu_core.kernels.megablox import (
+    gmm_v2 as _core_module,
 )
 
-__all__ = [
-    "Dimensions",
-    "FusedWeightsRef",
-    "GmmConfigs",
-    "IndexMaps",
-    "InputConfigs",
-    "MetadataRef",
-    "RhsRef",
-    "TileFn",
-    "TileSizes",
-    "WeightsRef",
-    "align_to",
-    "apply_act_fn",
-    "calculate_tiling",
-    "deinterleave_lane",
-    "fill_metadata",
-    "generate_block_specs",
-    "get_cost_estimate",
-    "get_metadata",
-    "get_packing_factor",
-    "get_scope_name",
-    "gmm_v2",
-    "inner_kernel",
-    "interleave_lane",
-    "kernel_main",
-    "make_gmm_configs",
-    "silu_and_mul_with_clamp",
-    "situ_and_mul",
-    "swigluoai",
-    "validate_inputs",
-    "zero_out_end",
-    "zero_out_start",
-]
+_this_module = sys.modules[__name__]
+
+for _k in dir(_core_module):
+    if not (_k.startswith("__") and _k.endswith("__")):
+        setattr(_this_module, _k, getattr(_core_module, _k))
+
+
+class _GmmV2ModuleWrapper:
+    def __init__(self, wrapped_module):
+        self.__dict__["_wrapped_module"] = wrapped_module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped_module, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self.__dict__[name] = value
+        setattr(self._wrapped_module, name, value)
+        if hasattr(_core_module, name):
+            setattr(_core_module, name, value)
+
+
+sys.modules[__name__] = _GmmV2ModuleWrapper(_this_module)

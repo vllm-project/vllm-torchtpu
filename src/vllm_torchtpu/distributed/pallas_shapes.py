@@ -7,12 +7,14 @@ Re-exports core primitives from
 """
 
 from vllm_torchtpu.llm_tpu_core.distributed.pallas_shapes import (
+    _convert_partitioned_shape,
     get_global_shape,
     get_local_shape,
     install_pallas_shape_conversion,
 )
 
 __all__ = [
+    "_convert_partitioned_shape",
     "get_global_shape",
     "get_local_shape",
     "install_pallas_shape_conversion",

@@ -7,6 +7,7 @@ Re-exports core primitives from `llm_tpu_core.layers.attention.interface`.
 
 from vllm_torchtpu.llm_tpu_core.layers.attention.interface import (
     MAX_ALLOWED_PAGE_INDICES_N,
+    AttentionMetadata,
     apply_splash,
     attention,
     attention_bundled,
@@ -30,6 +31,7 @@ from vllm_torchtpu.llm_tpu_core.layers.attention.interface import (
 
 __all__ = [
     "MAX_ALLOWED_PAGE_INDICES_N",
+    "AttentionMetadata",
     "apply_splash",
     "attention",
     "attention_bundled",

@@ -111,6 +111,26 @@
       "concise_description": "Argument `tuple[int, ...] | None` is not assignable to parameter `schedule` with type `tuple[int, int, int] | None` in function `vllm_torchtpu.core.pp_chunks.StepCostModel.fit`"
     },
     {
+      "path": "src/vllm_torchtpu/distributed/dcp.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `CpGroupLayout` from `vllm_torchtpu.distributed.mesh_utils`"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/dcp.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `get_cp_group_layout` from `vllm_torchtpu.distributed.mesh_utils`"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/dcp.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `get_or_create_cp_mesh` from `vllm_torchtpu.distributed.mesh_utils`"
+    },
+    {
+      "path": "src/vllm_torchtpu/distributed/ep_mesh.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/host_kv_shm.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `memoryview | None` is not assignable to parameter `obj` with type `Buffer` in function `_ctypes._PyCSimpleType.from_buffer`"
@@ -456,6 +476,11 @@
       "concise_description": "Object of class `NoneType` has no attribute `release_slot`"
     },
     {
+      "path": "src/vllm_torchtpu/distributed/mesh_utils.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/distributed/utils.py",
       "name": "bad-return",
       "concise_description": "Returned type `list[str]` is not assignable to declared return type `str`"
@@ -668,6 +693,31 @@
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
       "name": "missing-module-attribute",
+      "concise_description": "Could not import `EP_AXIS_NAME` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `build_ep_mesh` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_mesh_index` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_rank_order` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_token_replica_groups` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
+      "name": "missing-module-attribute",
       "concise_description": "Could not import `PACK4` from `vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host`"
     },
     {
@@ -791,6 +841,21 @@
       "concise_description": "No attribute `KVLayout` in module `vllm_torchtpu.kernels.experimental.batched_rpa.configs`"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/__init__.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `fused_ep_moe_v2` from `vllm_torchtpu.kernels.fused_moe.v2.layer`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_metadata.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/collectives.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, ModuleType]`"
@@ -799,6 +864,21 @@
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/__init__.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `_chunk_kda_fwd_native_segids` from `vllm_torchtpu.kernels.kimi_k3.mega_kda.kernel`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/mla/dispatch.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/pool_adapters.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -1091,6 +1171,11 @@
       "concise_description": "`None` is not subscriptable"
     },
     {
+      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mamba_state_copy_op.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
+    },
+    {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `cp_kv_cache_interleave_size`"
@@ -1129,6 +1214,41 @@
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "unbound-name",
       "concise_description": "`key_pass` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `EP_AXIS_NAME` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `build_ep_mesh` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_mesh_index` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_rank_order` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_token_replica_groups` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `SCORING_FNS` from `vllm_torchtpu.kernels.fused_moe.v2.layer`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/linear_common.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `gmm_v2` from `vllm_torchtpu.kernels.megablox.gmm_v2`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/linear_common.py",
@@ -1274,6 +1394,11 @@
       "path": "src/vllm_torchtpu/layers/adapter/vision_attention.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/gdn_attention.py",
@@ -2127,11 +2252,6 @@
     },
     {
       "path": "src/vllm_torchtpu/llm_tpu_core/kv_transfer/raiden/byte_spans.py",
-      "name": "missing-module-attribute",
-      "concise_description": "Could not import `pcp_layout` from `vllm_torchtpu.llm_tpu_core.distributed.pcp_layout`"
-    },
-    {
-      "path": "src/vllm_torchtpu/llm_tpu_core/kv_transfer/raiden/byte_spans.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, tuple[int, int, int, int, int]]`"
     },
@@ -2297,8 +2417,18 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `build_ep_mesh` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `ep_rank_order` from `vllm_torchtpu.distributed.ep_mesh`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `get_ep_group` from `vllm_torchtpu.distributed.ep_mesh`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
@@ -2317,13 +2447,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
@@ -2756,9 +2881,14 @@
       "concise_description": "Object of class `NoneType` has no attribute `propose`"
     },
     {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `vllm_torchtpu.structured_spec_decoding.types.SpecDecodeMetadata` is not assignable to declared return type `vllm_torchtpu.runner.speculative_decoding_manager.SpecDecodeMetadata`"
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `copy_mamba_state_blocks` from `vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `copy_mamba_state_rows` from `vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -3264,28 +3394,6 @@
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `str | None` is not assignable to parameter `dst_root` with type `str` in function `vllm_torchtpu.profiler_trace.clear_canonical_ts_marker`"
-    }
-  ],
-  "items": [
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in "
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in "
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, ModuleType]`"
     }
   ]
 }

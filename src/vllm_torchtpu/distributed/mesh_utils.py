@@ -6,18 +6,30 @@ Re-exports core primitives from
 `vllm_torchtpu.llm_tpu_core.distributed.mesh_utils`.
 """
 
-from vllm_torchtpu.llm_tpu_core.distributed.mesh_utils import (
-    CpGroupLayout,
-    get_cp_group_layout,
-    get_mesh_shape_product,
-    get_or_create_cp_mesh,
-    logger,
-)
+import sys
+from typing import Any
 
-__all__ = [
-    "CpGroupLayout",
-    "get_cp_group_layout",
-    "get_mesh_shape_product",
-    "get_or_create_cp_mesh",
-    "logger",
-]
+from vllm_torchtpu.llm_tpu_core.distributed import mesh_utils as _core_mesh_utils
+
+_this_module = sys.modules[__name__]
+
+for _k in dir(_core_mesh_utils):
+    if not (_k.startswith("__") and _k.endswith("__")):
+        setattr(_this_module, _k, getattr(_core_mesh_utils, _k))
+
+
+class _MeshUtilsModuleWrapper:
+    def __init__(self, wrapped_module):
+        self.__dict__["_wrapped_module"] = wrapped_module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped_module, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self.__dict__[name] = value
+        setattr(self._wrapped_module, name, value)
+        if hasattr(_core_mesh_utils, name):
+            setattr(_core_mesh_utils, name, value)
+
+
+sys.modules[__name__] = _MeshUtilsModuleWrapper(_this_module)

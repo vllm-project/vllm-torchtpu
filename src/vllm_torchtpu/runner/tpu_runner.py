@@ -1915,9 +1915,12 @@ class TPUModelRunner(GPUModelRunner):
             src_start = self._pre_async_results.req_id_to_index_copy[req_id] * stride
             for j in range(n_sched):
                 # When GaaD grammar jump top-up (flag == 2) or empty padding
-                # (flag == 0) is present on host, do not overwrite input_ids[j]
-                # with stale unvalidated device draft tokens from next_tokens_tpu.
-                if req_flags is not None and j < len(req_flags) and req_flags[j] != 1:
+                if (
+                    req_flags is not None
+                    and j > 0
+                    and (j - 1) < len(req_flags)
+                    and req_flags[j - 1] != 1
+                ):
                     continue
 
                 request_major_index = acc_cur_len - n_sched + j
@@ -2987,9 +2990,11 @@ class TPUModelRunner(GPUModelRunner):
         # EP combine reduces partial expert outputs across DP engines; those
         # ranks must enter the same collectives with matching token buckets.
         # Non-EP DP engines remain independently schedulable.
-        return (
-            utils.get_dp_size(self.parallel_config) > 1
-            and self.parallel_config.enable_expert_parallel
+        parallel_config = getattr(self, "parallel_config", None)
+        if parallel_config is None:
+            return False
+        return utils.get_dp_size(parallel_config) > 1 and getattr(
+            parallel_config, "enable_expert_parallel", False
         )
 
     def _count_input_chunks(

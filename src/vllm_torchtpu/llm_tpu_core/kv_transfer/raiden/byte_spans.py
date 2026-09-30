@@ -62,7 +62,9 @@ def owned_token_ranges(
     interleave_tokens: int,
 ) -> list[tuple[int, int]]:
     """Return this producer rank's PCP-owned destination token ranges."""
-    from vllm_torchtpu.llm_tpu_core.distributed.pcp_layout import pcp_layout
+    from vllm_torchtpu.llm_tpu_core.distributed.pcp_layout import (
+        pcp_query_chunk_ranges,
+    )
 
     if num_tokens <= 0:
         raise ValueError("num_tokens must be positive")
@@ -77,7 +79,7 @@ def owned_token_ranges(
     if interleave_tokens <= 0:
         raise ValueError("interleave_tokens must be positive")
     return list(
-        pcp_layout.pcp_query_chunk_ranges(
+        pcp_query_chunk_ranges(
             num_tokens, 0, transfer_rank, parallelism, interleave_tokens
         )
     )
