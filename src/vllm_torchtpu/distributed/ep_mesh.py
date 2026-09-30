@@ -149,46 +149,54 @@ def ep_device_ids() -> tuple[int, ...] | None:
 
 
 def ep_rank_order() -> tuple[int, ...] | None:
-    """EP rank at each mesh index -- the identity, or None when EP is off.
+    """EP rank at each mesh index, for a mesh in ascending device-id order.
 
-    It was not always the identity. Before google-pytorch/torch_tpu#3522 a
-    Mosaic kernel resolved a `DeviceIdType.MESH` coordinate positionally
-    against the runtime device list rather than through the device array the
-    mesh was built with, so the mesh had to be built in ascending device-id
-    order to address the right peer, and mesh index i then held the experts of
-    a different EP rank. #3522 makes partition index p bind to PyTorch rank p,
-    `build_ep_mesh` orders the mesh by rank to match, and mesh index i holds EP
-    rank i's experts again.
+    Since google-pytorch/torch_tpu#3522 the kernel's DeviceAssignment is the
+    mesh's device order, so any order addresses the right peers; ascending
+    device id is chosen for speed (see `build_ep_mesh`). Mesh index i is then
+    no longer EP rank i on a host whose PCI enumeration differs from its device
+    ids -- every tpu7x host, where local ranks 0..7 land on devices
+    `[0, 1, 4, 5, 6, 7, 2, 3]` -- so the shard at mesh index i owns the experts
+    of EP rank `ep_rank_order()[i]`. The caller has to say so -- see
+    `fused_moe_ep._mesh_expert_order` -- because the kernel reads a token's
+    expert id as `mesh_index * experts_per_shard + j`.
 
-    Kept rather than deleted so `fused_moe_ep._mesh_expert_order` keeps a
-    single place to ask, and so a future ordering change has somewhere to live.
+    Returns None when EP is off.
     """
     group = get_ep_group()
-    if group is None:
+    device_ids = ep_device_ids()
+    if group is None or device_ids is None:
         return None
-    return tuple(range(len(tuple(group.ranks))))
+    ranks = tuple(int(r) for r in group.ranks)
+    by_device = dict(zip(device_ids, ranks))
+    if len(by_device) != len(ranks):
+        raise RuntimeError(
+            "Two EP ranks report the same TPU global device id: "
+            f"ranks={ranks}, device_ids={device_ids}"
+        )
+    ep_rank_of_group_rank = {r: i for i, r in enumerate(ranks)}
+    return tuple(ep_rank_of_group_rank[by_device[d]] for d in sorted(device_ids))
 
 
 def ep_mesh_index() -> int | None:
-    """This rank's index into the mesh `build_ep_mesh` builds, or None.
-
-    The mesh is rank-ordered since #3522, so the index is this worker's EP
-    rank rather than a position reconstructed from device ids.
-    """
-    group = get_ep_group()
-    if group is None:
+    """This rank's index into the mesh `build_ep_mesh` builds, or None."""
+    device_ids = ep_device_ids()
+    if device_ids is None:
         return None
-    ranks = tuple(int(r) for r in group.ranks)
-    return ranks.index(_get_current_global_rank())
+    return sorted(device_ids).index(_get_tpu_global_device_id())
 
 
 def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
-    Torchtpu's ``get_pallas_mesh`` orders the mesh by PyTorch rank, which is
-    what google-pytorch/torch_tpu#3522 binds partition indices to. Mesh index
-    i therefore owns EP rank i's experts, with no permutation for the caller
-    to carry.
+    Devices go in ascending id order rather than the rank order Torchtpu's
+    ``get_pallas_mesh`` returns. Both are correct since
+    google-pytorch/torch_tpu#3522, but the order is the kernel's
+    DeviceAssignment, and XLA's SparseCore-offloaded all-gathers inside the
+    fused MoE are much slower over the rank-ordered one: on a tpu7x 2x2x2
+    DSv4-Pro run the fp8 activation all-gather (identical HLO and bytes) went
+    from 178 to 321 us and end-to-end throughput dropped 4.5%. `ep_rank_order`
+    has the permutation this introduces and the consequence for the caller.
 
     Cached per (axis, device ids): the ids come from a collective, so this must
     not be called for the first time inside a traced region.
@@ -217,11 +225,27 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
             "out."
         )
 
+    import numpy as np
+    from jax.sharding import Mesh
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    mesh = get_pallas_mesh(axis_names=(axis_name,))
+    ranked = get_pallas_mesh(axis_names=(axis_name,))
+    devices = sorted(ranked.devices.flat, key=lambda d: int(d.id))
+    if tuple(int(d.id) for d in devices) != device_ids:
+        # The ids become the DeviceAssignment, and ep_rank_order/ep_mesh_index
+        # index into them assuming they are the ids gathered above.
+        raise RuntimeError(
+            "get_pallas_mesh device ids do not match the EP group's: "
+            f"pallas={[int(d.id) for d in ranked.devices.flat]}, "
+            f"ep_device_ids={unordered}"
+        )
+    mesh = Mesh(np.asarray(devices), axis_names=(axis_name,))
     logger.info(
-        "Built EP mesh | axis=%s | size=%d | rank-ordered", axis_name, world_size
+        "Built EP mesh | axis=%s | size=%d | device_ids=%s | ep_rank_order=%s",
+        axis_name,
+        world_size,
+        list(device_ids),
+        ep_rank_order(),
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
