@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
+    VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
@@ -815,6 +816,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sync the device every N tensors during sharded EP weight loading so
     # queued host copies are released; 0 disables the periodic sync.
     "TPU_SHARDED_LOAD_SYNC_EVERY": env_int("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    # Dequantize and pad MXFP4 expert weights on the TPU, where they already
+    # sit after loading, instead of round-tripping them through host memory.
+    "VLLM_TPU_MXFP4_DEVICE_DEQUANT": env_bool("VLLM_TPU_MXFP4_DEVICE_DEQUANT", True),
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
     # Added to every worker's local rank when it binds to a physical chip.
