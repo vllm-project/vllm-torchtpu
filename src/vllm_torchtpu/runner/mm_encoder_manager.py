@@ -58,6 +58,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
             model=vllm_model,
         )
 
+        encoder_use_dp = getattr(vllm_model, "use_data_parallel", None)
+        if isinstance(encoder_use_dp, bool):
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            self.use_dp = encoder_use_dp and tp_size > 1
+
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
         self.budget_templates: dict[str, dict[int, dict[str, torch.Tensor]]] = {
