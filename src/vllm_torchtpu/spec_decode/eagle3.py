@@ -507,15 +507,17 @@ class Eagle3Proposer:
         positions and seq_lens fixed across steps where the program advances
         them.
         """
+        draft_model = self.draft_model
         if (
-            not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            draft_model is None
+            or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
             or self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or not self.advance_draft_positions
-            or getattr(self.draft_model, "draft_id_to_target_id", None) is not None
+            or getattr(draft_model, "draft_id_to_target_id", None) is not None
         ):
             return
-        draft_dims = getattr(self.draft_model, "_dynamic_arg_dims", None)
+        draft_dims = getattr(draft_model, "_dynamic_arg_dims", None)
         if draft_dims is None:
             return
         K = self.speculative_config.num_speculative_tokens
@@ -534,7 +536,7 @@ class Eagle3Proposer:
                 self._mtp_fused_loop = build_mtp_fused_loop(
                     vllm_config=self.draft_vllm_config,
                     prefix=f"mtp_fused_loop_k{K}",
-                    mtp=self.draft_model,
+                    mtp=draft_model,
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
                 )
@@ -1083,6 +1085,9 @@ class Eagle3Proposer:
         hidden_carry_per_chunk = []
         positions_carry_per_chunk = []
         rejected_per_chunk = []
+        # The same counts as host arrays for the draft metadata builds; None
+        # when async, where they stay on device.
+        rejected_np_per_chunk: list[np.ndarray | None] = []
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
         is_async = next_tokens_per_chunk is not None
@@ -1124,6 +1129,9 @@ class Eagle3Proposer:
                 )
             )
             rejected_per_chunk.append(num_rejected)
+            rejected_np_per_chunk.append(
+                None if isinstance(num_rejected, torch.Tensor) else num_rejected
+            )
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -1131,7 +1139,7 @@ class Eagle3Proposer:
                 target_hidden_states=target_hidden_states,
                 step_idx=0,
                 seq_lens_delta=0,
-                num_rejected_np=(None if is_async else num_rejected),
+                num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
@@ -1235,7 +1243,7 @@ class Eagle3Proposer:
                     target_hidden_states=loop_hidden[ci],
                     step_idx=step,
                     seq_lens_delta=(step if self.advance_draft_positions else 0),
-                    num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
+                    num_rejected_np=rejected_np_per_chunk[ci],
                     num_tokens_padded=padded_nr_per_chunk[ci],
                     num_rejected_dev=rejected_dev_per_chunk[ci],
                     loop_query_start_loc=loop_qsl_per_chunk[ci],
@@ -1258,7 +1266,7 @@ class Eagle3Proposer:
                         input_ids=draft_tokens_per_chunk[ci][-1],
                         positions=loop_positions[ci] + 1,
                         hidden_states=loop_hidden[ci],
-                        num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
+                        num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],

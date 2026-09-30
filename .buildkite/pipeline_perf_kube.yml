@@ -72,8 +72,12 @@ steps:
   # Keyed so the v7x-16 step below can depend on the whole group. A `wait`
   # barrier cannot order it: Buildkite exempts any step with its own depends_on
   # from wait, and that step needs one for the image.
+  #
+  # Not in a K3=1 build, which runs the Kimi-K3 step at the bottom and nothing
+  # else.
   - group: ":kubernetes: Perf and Eval on TPU"
     key: "perf_tpu"
+    if: build.env("K3") != "1"
     steps:
       - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
         <<: *perf_step
@@ -87,16 +91,9 @@ steps:
           - *kube_plugin
         commands:
           - |
-            # qwen3-30b-a3b-nvfp4-tp8-ep is temporarily out of this list.
-            # Updating torch_tpu from dev20260912075415 to dev20260924000658
-            # cut NVFP4 W4A16 decode throughput on this config by 20.5%
-            # (10330 -> 8208 tok/s), so the 5% gate fails on every run. The
-            # cause is in the wheel, not here -- a PR that changes only the
-            # `torch-tpu==` pin reproduces it, and qwen3-coder-30b-fp8-tp8-ep,
-            # same TP8 + EP topology, is unaffected on it. b/566000496 is
-            # with the torchtpu team. Put the line back when that lands.
             .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
               qwen3-coder-30b-fp8-tp8-ep \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
               qwen3.5-35b-fp8-tp4-ep \
               deepseek-v2-tp8-ep \
               gemma-4-31b-fp8-dp4-tp2-multimodal \
@@ -253,7 +250,7 @@ steps:
       - "build_docker"
       - step: "perf_tpu"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -276,7 +273,7 @@ steps:
       - "build_docker"
       - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -308,7 +305,7 @@ steps:
       - "build_docker"
       - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -321,13 +318,18 @@ steps:
     commands:
       - .buildkite/kubernetes/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep
 
-  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips: the tpu7x-32 pod the
-  # bare-metal step runs on. That shape has a queue and chips of its own, so
-  # this waits only for the image, not for the v7x-8 and v7x-16 steps above.
+  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips. This is the only
+  # nightly of it: pipeline_perf.yml has no bare-metal counterpart. That shape
+  # has a queue and chips of its own, so this waits only for the image, not for
+  # the v7x-8 and v7x-16 steps above.
+  #
+  # Only in a K3=1 build, scheduled nightly at 03:00 PT behind the 02:00
+  # Kimi-K3 1P1D in pipeline_disagg_kube.yml: the 2x2x4 slices also serve
+  # Kimi-K3 development, and this keeps CI on them to that window.
   - label: ":kubernetes: Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
     key: "perf_nightly_kimi_k3_tp32_ep"
     depends_on: "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("K3") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
