@@ -1191,6 +1191,7 @@ def streamindex_topk(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
     ),
@@ -1214,6 +1215,7 @@ def streamindex_topk_dcp(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
@@ -1268,6 +1270,8 @@ def streamindex_topk_dcp(
       buffer_count: buffer count for pallas kernel.
       vmem_limit_bytes: vmem limit for pallas kernel.
       decode_req_batch_size: maximum decode batch size per iteration.
+      kv_layout: memory layout of `cache_kv` (`HEAD_ALONG_SUBLANE` or
+        `SEQ_ALONG_LANE`).
       chunk_tokens: forwarded to `streamindex_topk` for the per-rank local
         scoring pass; see there for the semantics. Chunking cuts the replicated
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
@@ -1329,6 +1333,7 @@ def streamindex_topk_dcp(
             buffer_count=buffer_count,
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
+            kv_layout=kv_layout,
             enable_early_exit=False,
             chunk_tokens=chunk_tokens,
             cp_size=dcp_size,
