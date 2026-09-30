@@ -622,13 +622,21 @@ def _raiden_dst_dcp_size(vllm_config: VllmConfig) -> int:
     return degree
 
 
-def _reshard_advertise_host() -> str:
-    host = str(tpu_envs.TPU_RAIDEN_ADVERTISE_HOST).strip()
-    if not host:
+def _reshard_advertise_host(dp_rank: int) -> str:
+    configured_hosts = str(tpu_envs.TPU_RAIDEN_ADVERTISE_HOST).strip()
+    hosts = [host.strip() for host in configured_hosts.split(",")]
+    if not configured_hosts or any(not host for host in hosts):
         raise ValueError(
             "TPU_RAIDEN_ADVERTISE_HOST is required when TPU_RAIDEN_RESHARD_IMPL=store"
         )
-    return host
+    if len(hosts) == 1:
+        return hosts[0]
+    if dp_rank < 0 or dp_rank >= len(hosts):
+        raise ValueError(
+            "TPU_RAIDEN_ADVERTISE_HOST has no host for data-parallel rank "
+            f"{dp_rank}: configured_hosts={len(hosts)}"
+        )
+    return hosts[dp_rank]
 
 
 def _reshard_service_port(dp_rank: int) -> int:
@@ -636,12 +644,12 @@ def _reshard_service_port(dp_rank: int) -> int:
 
 
 def _reshard_service_address(dp_rank: int) -> str:
-    return f"{_reshard_advertise_host()}:{_reshard_service_port(dp_rank)}"
+    return f"{_reshard_advertise_host(dp_rank)}:{_reshard_service_port(dp_rank)}"
 
 
 def _reshard_dispatch_address(dp_rank: int) -> str:
     port = int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(dp_rank)
-    return f"{_reshard_advertise_host()}:{port}"
+    return f"{_reshard_advertise_host(dp_rank)}:{port}"
 
 
 def _resolved_reshard_controller_address(dp_rank: int) -> str:
@@ -3267,7 +3275,7 @@ class TPURaidenConnectorWorker:
                 data_name="reshard_store",
                 data_replica_idx=self.dp_rank,
             ),
-            store_server_ip=_reshard_advertise_host(),
+            store_server_ip=_reshard_advertise_host(self.dp_rank),
             raiden_controller_port=(
                 int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(self.dp_rank)
             ),
@@ -3495,13 +3503,12 @@ class TPURaidenConnectorWorker:
             or pcp_size != 1
             or tp_size != expected_tp
             or pp_size != 1
-            or (self.is_producer and dp_size != 1)
             or source_parallelism % dst_shards
         ):
             raise ValueError(
                 "Kimi Stage-3 requires PCP1, producer TP equal to "
                 "TPU_RAIDEN_TRANSFER_PARALLELISM, destination TP equal "
-                "to TPU_RAIDEN_DST_SHARDS, PP1, and producer DP1: "
+                "to TPU_RAIDEN_DST_SHARDS, and PP1: "
                 f"tp={tp_size}, pcp={pcp_size}, pp={pp_size}, dp={dp_size}, "
                 f"source_parallelism={source_parallelism}, "
                 f"dst_shards={dst_shards}"

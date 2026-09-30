@@ -62,6 +62,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _Stage3LoadMeta,
     _Stage3RegisteredSend,
     _Stage3TransferGroup,
+    _reshard_advertise_host,
     _select_committed_mamba_blocks,
     _stage3_transfer_groups,
     stage3_fa_raiden_id_fields,
@@ -276,8 +277,10 @@ def _make_raiden_scheduler(
     block_size: int = 16,
     enable_prefix_caching: bool = False,
     dp_rank: int = 0,
+    dp_size: int = 1,
     tp_size: int = 1,
     pcp_size: int = 1,
+    architecture: str | None = None,
     kv_ips: Any = "127.0.0.1",
     kv_ports: Any = 9100,
 ):
@@ -286,7 +289,9 @@ def _make_raiden_scheduler(
         is_producer=is_producer,
         block_size=block_size,
         enable_prefix_caching=enable_prefix_caching,
+        architecture=architecture,
         dp_rank=dp_rank,
+        dp_size=dp_size,
         tp_size=tp_size,
         pcp_size=pcp_size,
     )
@@ -2657,6 +2662,55 @@ class TestTPURaidenConnectorWorker:
                     assert len(consumer._stage3_source_work_units(req_meta)) == 32
                     consumer._raiden_work_unit = SimpleNamespace(local=True)
                     assert len(consumer._raiden_destination_work_units()) == tp_size
+
+    @pytest.mark.parametrize(("dp_size", "dp_rank"), ((2, 1), (4, 3)))
+    def test_kimi_dp_prefill_handoff_targets_its_own_store(self, dp_size, dp_rank):
+        hosts = [f"10.20.0.{rank + 1}" for rank in range(dp_size)]
+        request = MagicMock()
+        request.request_id = f"dp{dp_rank}-request"
+        request.prompt_token_ids = [0] * 16
+        request.num_prompt_tokens = 16
+        request.num_computed_tokens = 16
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION", True),
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", 8),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", ",".join(hosts)),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_PORT_BASE", 27340),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", "prefill-job"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "prefill-engine"),
+            patch(f"{_MOD}.get_uuid", return_value=123),
+        ):
+            worker = _make_raiden_worker(
+                tp_rank=7,
+                tp_size=8,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                architecture="KimiK3ForConditionalGeneration",
+            )
+            assert worker._raiden_hybrid_admission_topology() == (
+                f"tp8dp{dp_size}_prefill"
+            )
+            assert worker._raiden_work_unit_fields(7)["data_replica_idx"] == dp_rank
+            assert _reshard_advertise_host(dp_rank) == hosts[dp_rank]
+
+            producer = _make_raiden_scheduler(
+                is_producer=True,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                tp_size=8,
+                architecture="KimiK3ForConditionalGeneration",
+            )
+            delay, params = producer.request_finished(request, [42])
+
+        assert delay
+        assert params["src_controller_address"] == f"{hosts[dp_rank]}:{27340 + dp_rank}"
+        assert params["src_data_replica_idx"] == dp_rank
+        assert params["src_parallelism"] == 8
 
     @pytest.mark.parametrize("dst_shards", [32, 8])
     def test_kimi_short_prefill_retains_state_until_native_done(self, dst_shards):
