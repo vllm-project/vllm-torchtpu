@@ -29,6 +29,7 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   # Resolved relative to the Buildkite org running the build.
   suite-slug: tpu-ci
   test-runner: pytest
+  test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
 
