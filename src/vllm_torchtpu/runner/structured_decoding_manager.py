@@ -195,6 +195,15 @@ class StructuredDecodingManager:
                 assert target_row_starts is not None, (
                     f"chunk without target_logits scheduled drafts for request {req_id}"
                 )
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "DIAGNOSTIC LOG: req_id=%s, num_drafts=%d, draft_lengths_cpu[%d]=%d",
+                    req_id,
+                    num_drafts,
+                    local_index,
+                    draft_lengths_cpu[local_index],
+                )
                 assert draft_lengths_cpu[local_index] == num_drafts
                 row = int(target_row_starts[local_index])
                 self.target_grammar_bitmask_cpu[row : row + num_drafts] = (

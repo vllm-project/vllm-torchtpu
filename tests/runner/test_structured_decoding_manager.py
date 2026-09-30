@@ -585,6 +585,29 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == [0, 0]
         assert bonus_bitmask[1].tolist() == row(31)
 
+    @pytest.mark.cpu_test
+    def test_issue_1012_repro_draft_length_mismatch(self):
+        # Reproduce the AssertionError from issue 1012 when draft_lengths_cpu != num_drafts.
+        manager = make_manager(num_spec_tokens=2, req_id_to_index={"req0": 0})
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [row(10), row(11), row(12)],
+        )
+        scheduled = {"req0": [101, 102]}  # num_drafts = 2
+        draft_lengths = np.array([1], dtype=np.int32)  # actual = 1
+        target_logits = torch.zeros(2, VOCAB_SIZE)
+        bonus_logits = torch.zeros(1, VOCAB_SIZE)
+
+        manager.prepare_spec_structured_decoding_input(
+            target_logits,
+            bonus_logits,
+            grammar_output,
+            scheduled,
+            draft_lengths,
+            0,
+            1,
+        )
+
 
 @contextlib.contextmanager
 def capture_trace():
