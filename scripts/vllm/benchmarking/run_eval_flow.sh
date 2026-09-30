@@ -12,6 +12,8 @@ RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
 SKIP_PERF_CHECK=0
+SKIP_BENCHMARK=0
+BASELINE_CONFIG=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,10 +57,23 @@ while [[ $# -gt 0 ]]; do
             SKIP_PERF_CHECK=1
             shift
             ;;
+        # Runs the evals alone, for a server whose benchmark numbers would
+        # describe nothing a reader tracks.
+        --skip-benchmark)
+            SKIP_BENCHMARK=1
+            SKIP_PERF_CHECK=1
+            shift
+            ;;
+        # Gates against another config's baselines, for a config that serves
+        # that one's model another way and must answer the same.
+        --baseline-config)
+            BASELINE_CONFIG="$2"
+            shift 2
+            ;;
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -116,13 +131,14 @@ if [ -z "$RESULTS_DIR" ]; then
 fi
 mkdir -p "$RESULTS_DIR"
 
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.json"
+BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
+PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$BASELINE_CONFIG.baseline.json"
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
 run_lm_eval() {
     local task="$1"
-    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
     # --model_args is one comma-separated string, not a repeatable flag, so
@@ -207,7 +223,7 @@ run_lm_eval() {
 # MM_EVAL_LIMIT=10 means <=300 total samples, not 10.
 run_mm_eval() {
     local task="$1"
-    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${BASELINE_CONFIG}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
     local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
     local mm_limit="${MM_EVAL_LIMIT:-4}"
@@ -279,6 +295,10 @@ else
   BENCH_ARGS+=(--host "$HOST")
 fi
 BENCH_ARGS+=(--port "$PORT")
+# A dry run still writes the config.json the evals below read.
+if [ "$SKIP_BENCHMARK" = "1" ]; then
+  BENCH_ARGS+=(--dry-run)
+fi
 
 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
 

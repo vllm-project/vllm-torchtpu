@@ -33,6 +33,12 @@
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
 #   PROFILE_NUM_PROMPTS   prompts for that run (default: the cell's concurrency).
+#
+# Structured decoding:
+#   BENCHMARK_EXTRA_BODY  JSON merged into every request body via
+#                         --extra-body, e.g. a `structured_outputs` grammar.
+#                         Passed as one quoted argument; EXTRA_BENCH_ARGS is
+#                         word-split and globbed, which mangles JSON.
 
 set -euo pipefail
 
@@ -140,6 +146,9 @@ BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 # passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
 # E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# JSON for --extra-body, kept apart from EXTRA_BENCH_ARGS so it reaches the
+# client as one argument (see header). Empty => flag not passed.
+BENCHMARK_EXTRA_BODY="${BENCHMARK_EXTRA_BODY:-}"
 # Server async scheduling (--async-scheduling / --no-async-scheduling).
 # Resolution order: env > config > harness default (true). Left empty here
 # so a config can tell "unset" from "forced by the operator".
@@ -166,6 +175,18 @@ if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
     exit 1
 fi
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Fail on bad JSON here rather than after server startup and compile, at the
+# first `vllm bench serve`. The compact form goes into config.json so a
+# constrained run's metadata differs from an unconstrained one.
+if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+    benchmark_extra_body_json=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1])))' "$BENCHMARK_EXTRA_BODY") ||
+        {
+            echo "ERROR: BENCHMARK_EXTRA_BODY is not valid JSON" >&2
+            exit 1
+        }
+else
+    benchmark_extra_body_json=null
+fi
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
@@ -432,6 +453,11 @@ run_benchmark_once() {
         fi
     fi
 
+    local extra_body_arg=()
+    if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+        extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -453,6 +479,7 @@ run_benchmark_once() {
         --result-filename "$result_file" \
         $profile_arg \
         ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
+        "${extra_body_arg[@]}" \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
@@ -549,6 +576,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "benchmark_temperature": $benchmark_temperature_json,
+    "benchmark_extra_body": $benchmark_extra_body_json,
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,

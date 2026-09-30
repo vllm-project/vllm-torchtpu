@@ -668,7 +668,7 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
       "name": "bad-assignment",
-      "concise_description": "`list[float | int]` is not assignable to dict value type `float | int`"
+      "concise_description": "`list[float | int | tuple[str, str, float]]` is not assignable to dict value type `float | int`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
@@ -7051,26 +7051,6 @@
       "concise_description": "`Tensor | list[list[int]] | tuple[Tensor, Tensor]` is not assignable to attribute `_draft_token_ids` with type `list[list[int]] | None`"
     },
     {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/structured_decoding_manager.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/structured_decoding_manager.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `x` with type `int` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/structured_decoding_manager.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
       "path": "src/vllm_torchtpu/runner/structured_decoding_manager.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
@@ -7164,11 +7144,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-override-mutable-attribute",
       "concise_description": "Class member `TPUModelRunner.kv_cache_config` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-assignment",
-      "concise_description": "`int | str | Unknown` is not assignable to attribute `max_num_tokens` with type `int`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7352,18 +7327,8 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `_get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of type `DFlashProposer | DraftModelProposer | EagleProposer | ExtractHiddenStatesProposer | Gemma4Proposer | MedusaProposer | NgramProposer | NgramProposerGPU | Step3p5MTPProposer | SuffixDecodingProposer` has no attribute `run_dp_dummy_draft`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `_get_padded_token_len`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7727,21 +7692,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `iterable` with type `Iterable[int | str]` in function `set.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `iterable` with type `Iterable[int | str]` in function `set.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `buckets` with type `list[int]` in function `vllm_torchtpu.core.pp_chunks.profile_points`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-specialization",
       "concise_description": "`float | None` is not assignable to upper bound `SupportsDunderGT[Any] | SupportsDunderLT[Any]` of type variable `SupportsRichComparisonT`"
     },
@@ -7762,38 +7712,13 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>=` is not supported between `int` and `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_reqs` with type `int` in function `TPUModelRunner._dummy_logits`"
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7807,33 +7732,8 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `_get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `x` with type `int` in function `_get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype, device=device)"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7842,48 +7742,13 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_reqs` with type `int` in function `TPUModelRunner._dummy_logits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.full` called with arguments: (tuple[int | str | Unknown], Literal[-1], dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `_get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `x` with type `int` in function `_get_padded_token_len`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7892,68 +7757,13 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `str` and `int`"
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, Literal[1]], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, Literal[1]], dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.ones` called with arguments: (tuple[int | str | Unknown, Literal[1]], dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, int], dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>=` is not supported between `int` and `str`"
+      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, Literal[1]], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -7987,28 +7797,8 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `size` with type `int` in function `vllm_torchtpu.compilation.shape_variants.BucketExecutables.needs_retrace`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown | None` is not assignable to parameter `model` with type `Module` in function `vllm_torchtpu.compilation.shape_variants.retrace`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `TPUModelRunner._dummy_run`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `TPUModelRunner._dummy_run`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -8019,11 +7809,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `int | None` is not assignable to parameter `num_blocks` with type `int` in function `TPUModelRunner._dummy_run`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -8222,38 +8007,8 @@
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>=` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `int | str | Unknown` is not assignable to declared return type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `DFlashProposer._dummy_precompute_and_update_kv_cache`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `DFlashProposer._dummy_precompute_and_update_kv_cache`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
@@ -8264,26 +8019,6 @@
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `int | None` is not assignable to parameter `num_blocks` with type `int` in function `DFlashProposer._dummy_precompute_and_update_kv_cache`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<=` is not supported between `int` and `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<=` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `DFlashProposer._dummy_draft_forward`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `DFlashProposer._dummy_draft_forward`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
@@ -8463,11 +8198,6 @@
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Unknown | None` is not assignable to parameter `mtp` with type `Module` in function `vllm_torchtpu.spec_decode.mtp_loop_model.MtpLoopStepModel.__init__`"
     },
     {
@@ -8548,11 +8278,6 @@
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | ndarray | None` is not assignable to parameter `num_rejected_np` with type `ndarray | None` in function `Eagle3Proposer._forward_draft`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Tensor | ndarray` is not assignable to parameter `t` with type `Tensor` in function `_maybe_pad_dim0`"
     },
     {
@@ -8574,11 +8299,6 @@
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unsupported-operation",
       "concise_description": "`+` is not supported between `None` and `Literal[1]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | ndarray | None` is not assignable to parameter `num_rejected_np` with type `ndarray | None` in function `Eagle3Proposer._forward_draft`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
@@ -8662,88 +8382,18 @@
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `method`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<=` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `int` and `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (int | str | Unknown, dtype=dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `paddings` with type `list[int]` in function `vllm_torchtpu.runner.tpu_runner._get_padded_token_len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<=` is not supported between `str` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int | str | Unknown, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
+      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.zeros` called with arguments: (tuple[int, int], dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

@@ -63,6 +63,7 @@ def _make_runner(
     max_num_tokens = max(token_paddings)
 
     runner = SimpleNamespace()
+    runner._stage_timing = MagicMock()
     runner.device = torch.device("cpu")
     runner.most_model_len = None
     runner.num_reqs_max_model_len = target_num_reqs
