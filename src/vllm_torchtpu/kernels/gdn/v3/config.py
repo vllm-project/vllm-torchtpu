@@ -167,12 +167,20 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
+        # Within-block forward substitution issues head_groups * B / 2 broadcasts
+        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+        #   B inversely with head_groups (head_groups * B <= 16).
+        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        if self.is_kda:
+            for b in (16, 8, 4):
+                if head_groups * b * b <= 256:
+                    return b
             return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # GDN: between-block updates scale as 1 / B.
+        return max(2, min(16, 16 // head_groups))
 
     @property
     def use_recurrent(self) -> bool:
