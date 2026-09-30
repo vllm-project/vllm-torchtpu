@@ -1138,6 +1138,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
 
     The physical block size and allocation are unchanged.
     """
+    import functools
     import inspect
     import sys
 
@@ -1150,6 +1151,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
     if not getattr(resolve, "_tpu_dcp_fine_prefix_patch", False):
         previous_resolve = resolve
 
+        @functools.wraps(previous_resolve)
         def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
             unit = _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config)
             if unit is None:
@@ -1178,7 +1180,6 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             return scheduler_block_size, unit
 
         resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
-        resolve_kv_cache_block_sizes.__wrapped__ = previous_resolve
         kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
         resolve = resolve_kv_cache_block_sizes
     for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
@@ -1199,6 +1200,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
     # upstream parameter is forwarded rather than breaking this wrapper.
     init_signature = inspect.signature(original_init)
 
+    @functools.wraps(original_init)
     def __init__(self, *args, **kwargs):
         bound = init_signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
@@ -1250,6 +1252,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         # hash-unit boundaries.
         manager.cache_hit_alignment_tokens = hash_block_size
 
+    @functools.wraps(original_find)
     def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
         if not self.enable_partial_hash_hits:
             return original_find(self, block_hashes, max_cache_hit_length)
@@ -1269,8 +1272,6 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         )
         return hit_blocks, hit_length, 0
 
-    __init__.__wrapped__ = original_init
-    find_longest_cache_hit.__wrapped__ = original_find
     cls.__init__ = __init__
     cls.find_longest_cache_hit = find_longest_cache_hit
     cls._tpu_dcp_fine_prefix_patch = True

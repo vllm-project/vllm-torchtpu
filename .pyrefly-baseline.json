@@ -33,6 +33,11 @@
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_dcp_fine_prefix_patch`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `_promote_local_kv_cache_specs`"
     },
     {

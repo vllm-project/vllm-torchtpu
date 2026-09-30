@@ -87,6 +87,11 @@
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_dcp_fine_prefix_patch`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
       "name": "bad-assignment",
       "concise_description": "`(specs: Unknown) -> dict[Unknown, Unknown] | Unknown` is not assignable to attribute `_promote_local_kv_cache_specs` with type `(kv_cache_spec: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]`"
     },
