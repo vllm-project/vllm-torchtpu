@@ -79,6 +79,7 @@ EXEMPT_PATHS = {
 # read fails this hook with a message pointing here, which is the moment to
 # decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
+    "LIBTPU_INIT_ARGS",
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
     "MASTER_PORT",

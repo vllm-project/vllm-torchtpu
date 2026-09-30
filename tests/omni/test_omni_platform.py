@@ -77,6 +77,21 @@ def test_shared_slicebuilder_addresses(monkeypatch):
     )
 
 
+def test_offload_dense_all_to_all(monkeypatch):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+    # An explicit user setting wins.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", f"{flag}=false")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=false"
+    monkeypatch.delenv("LIBTPU_INIT_ARGS")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
+
+
 def test_dist_backend_after_world_size_pop(monkeypatch):
     # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
     # size set_device recorded must keep multi-rank groups on tpu_dist.

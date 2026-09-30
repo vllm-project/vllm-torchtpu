@@ -85,10 +85,33 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                     world_size - 1,
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
+            cls._offload_dense_all_to_all()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _offload_dense_all_to_all() -> None:
+        """Run dense all-to-alls on SparseCore in multi-rank diffusion workers.
+
+        Ulysses sequence parallelism moves q, k, v and the attention output
+        through dense all-to-alls in every transformer block. By default XLA
+        runs them on the TensorCore, which waits for them. With the SparseCore
+        offload, Wan2.2-I2V-A14B at 480x832x81 on 8 v7x cores (CFG 2 x
+        Ulysses 4) went from 0.927 to 0.906 and from 0.926 to 0.909 s per step
+        in two A/B runs, with bit-identical output. It is set here, before
+        PjRt initializes below, so it only affects diffusion workers; LLM
+        serving keeps the default. An explicit user setting wins.
+        """
+        # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
+        # default.
+        #
+        flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+        args = os.environ.get("LIBTPU_INIT_ARGS", "")
+        if any(token.split("=", 1)[0] == flag for token in args.split()):
+            return
+        os.environ["LIBTPU_INIT_ARGS"] = f"{args} {flag}=true".strip()
 
     @staticmethod
     def _set_shared_slicebuilder_addresses(world_size: int) -> None:
