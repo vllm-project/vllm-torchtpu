@@ -5055,6 +5055,26 @@ class TPUModelRunner(GPUModelRunner):
             "schedule": schedule,
         }
 
+    def _spec_verify_bucket_reachable(self, num_tokens: int, num_reqs: int) -> bool:
+        """Whether a spec-decode verify step can land in this bucket pair.
+
+        get_spec_decode_metadata samples num_draft_tokens + 1 positions per
+        request with 0 <= num_draft_tokens <= K, so n real requests give
+        n <= logits length <= n * (K + 1). A (padded_logits_length,
+        padded_num_reqs) pair is reachable only if the ranges it pads overlap:
+        n in (prev_num_reqs, num_reqs] and length in (prev_num_tokens,
+        num_tokens]. E.g. with K=3, num_reqs=8 covers at most 32 positions, so
+        padded_logits_length=768 never pairs with it.
+        """
+        k = self.speculative_config.num_speculative_tokens
+        tokens_paddings = sorted(self.num_tokens_paddings)
+        idx = bisect.bisect_left(tokens_paddings, num_tokens)
+        prev_num_tokens = tokens_paddings[idx - 1] if idx > 0 else 0
+        idx = bisect.bisect_left(self.num_reqs_paddings, num_reqs)
+        prev_num_reqs = self.num_reqs_paddings[idx - 1] if idx > 0 else 0
+        max_positions = num_reqs * (k + 1)
+        return prev_num_reqs < num_tokens and prev_num_tokens < max_positions
+
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
         """Common boilerplate for each AOT bucket precompile pass."""
@@ -5198,7 +5218,10 @@ class TPUModelRunner(GPUModelRunner):
                 final_logits_indices = torch.zeros(
                     num_tokens, dtype=torch.int32, device=self.device
                 )
+                row_tokens = None
                 for num_reqs in self.num_reqs_paddings:
+                    if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
+                        continue
                     row_tokens = self.spec_logprob_row_tokens(
                         torch.zeros(
                             (num_reqs, k + 1), dtype=torch.int32, device=self.device
@@ -5207,6 +5230,8 @@ class TPUModelRunner(GPUModelRunner):
                         torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
                         final_logits_indices,
                     )
+                if row_tokens is None:
+                    continue
                 synchronize_tensors(row_tokens)
                 out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
                 synchronize_tensors(out.logprobs)
@@ -5302,6 +5327,8 @@ class TPUModelRunner(GPUModelRunner):
                     self.device
                 )
                 for num_reqs in self.num_reqs_paddings:
+                    if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
+                        continue
                     # padded_num_reqs-shaped inputs.
                     draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
                         self.device

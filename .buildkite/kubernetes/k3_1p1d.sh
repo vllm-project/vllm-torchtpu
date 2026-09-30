@@ -49,8 +49,8 @@ esac
 # waits for its Ray port.
 head_ip() {
   local deadline=$((SECONDS + 1800)) ip
-  until ip=$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' \
-      "$HEAD_HOST" 2>/dev/null); do
+  until ip=$(getent ahostsv4 "$HEAD_HOST" | awk 'NR == 1 { print $1 }') \
+      && [[ -n "$ip" ]]; do
     if [[ "$SECONDS" -ge "$deadline" ]]; then
       echo "ERROR: ${HEAD_HOST} did not resolve in 30 minutes" >&2
       return 1
@@ -60,10 +60,26 @@ head_ip() {
   echo "$ip"
 }
 
+# warm_remote_code: import the model's remote code once on this host before Ray
+# starts the engine's workers here; see warm_remote_code.py for why.
+warm_remote_code() {
+  local uri
+  # The subshell keeps the config's variables, KV_CACHE_DTYPE among them, out
+  # of this script. Followed, shellcheck reports them as lost (SC2031).
+  # shellcheck source=/dev/null
+  uri=$(source "$REPO_DIR/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh" \
+    >/dev/null && echo "$MODEL_URI") || return 1
+  timeout 600 python3 "$HERE/warm_remote_code.py" "$uri"
+}
+
 if [[ "$head" == "0" ]]; then
   # Set before Ray starts on every host: the engine's workers are Ray actors on
   # all four, and they inherit the raylet's environment, not the head's.
   export VLLM_HOST_IP="${POD_IP}"
+  # Best effort: without it the workers pull and import as they always have.
+  if [[ "${JOB_COMPLETION_INDEX:-0}" != "0" ]]; then
+    warm_remote_code || echo "WARNING: could not warm the model's remote code"
+  fi
   # The engine's Raiden store runs in its rank-0 worker, on index 0, and every
   # worker dials it at this host - so it is index 0's address on all four.
   if [[ "${JOB_COMPLETION_INDEX:-0}" == "0" ]]; then
@@ -192,42 +208,8 @@ if ! timeout 120 bash -c "until curl -sf -o /dev/null http://127.0.0.1:${PROXY_P
 fi
 
 echo "--- Completions through the proxy"
-PROXY_URL="http://127.0.0.1:${PROXY_PORT}/v1/completions" python3 - <<'PY'
-import json
-import os
-import sys
-import urllib.request
-
-# Prompts whose greedy continuation is not in doubt, so a wrong or empty answer
-# means the decode engine did not get the prefill's KV, not that the model
-# phrased something differently.
-cases = [
-    ("The capital of France is", "paris"),
-    ("1, 2, 3, 4, 5, 6,", "7"),
-    ("The chemical symbol for gold is", "au"),
-]
-failed = 0
-for prompt, expected in cases:
-    body = json.dumps({
-        "model": "moonshotai/Kimi-K3",
-        "prompt": prompt,
-        "max_tokens": 16,
-        "temperature": 0,
-    }).encode()
-    request = urllib.request.Request(os.environ["PROXY_URL"], data=body,
-                                     headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=600) as response:
-            text = json.load(response)["choices"][0]["text"]
-    except Exception as error:  # noqa: BLE001 - report every case
-        print(f"FAIL {prompt!r}: {error}")
-        failed += 1
-        continue
-    ok = expected in text.lower()
-    print(f"{'PASS' if ok else 'FAIL'} {prompt!r} -> {text!r}")
-    failed += not ok
-sys.exit(1 if failed else 0)
-PY
+python3 "$HERE/check_completions.py" \
+  "http://127.0.0.1:${PROXY_PORT}/v1/completions" moonshotai/Kimi-K3
 
 # The config's perf baseline is the aggregated engine's, so these numbers are
 # reported rather than gated, and kept out of the shared results table, where
