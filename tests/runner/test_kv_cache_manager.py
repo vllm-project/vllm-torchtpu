@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_torchtpu import utils
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -269,6 +270,23 @@ class TestKVCacheManager:
         mock_mem_info.assert_called_once()
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
+
+    def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
+        """Pinned block counts must be sized from the DP-wide minimum budget."""
+        local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+        budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+        monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+        self.runner.vllm_config.parallel_config.enable_expert_parallel = True
+        monkeypatch.setattr(
+            "vllm.distributed.parallel_state.get_dp_group",
+            lambda: SimpleNamespace(cpu_group=None),
+        )
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda t, **_: t.clamp_(max=peer)
+        )
+
+        assert self.runner.kv_cache_manager._available_kv_cache_hbm() == peer
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",

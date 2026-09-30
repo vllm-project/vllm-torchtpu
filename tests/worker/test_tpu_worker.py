@@ -25,7 +25,7 @@ from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import patch_registry
+from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -290,6 +290,44 @@ def test_initialize_from_config_updates_num_gpu_blocks():
 
     assert worker.cache_config.num_gpu_blocks == 2048
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
+
+
+@pytest.mark.parametrize(
+    "dp_size, expert_parallel, coupled",
+    [(2, True, True), (1, True, False), (2, False, False)],
+)
+def test_determine_available_memory_is_min_across_ep_dp(
+    monkeypatch, dp_size, expert_parallel, coupled
+):
+    """EP-coupled DP engines bake their KV extent into the compiled programs,
+    so they must all size the cache from the smallest per-engine budget."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", str(dp_size))
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    def all_reduce(t, op, group):
+        assert (op, group) == (torch.distributed.ReduceOp.MIN, cpu_group)
+        t.clamp_(max=peer)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+    )
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=expert_parallel
+    )
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    worker.devices = []
+    worker.model_runner = MagicMock(is_pooling_model=False)
+
+    assert worker.determine_available_memory() == (peer if coupled else local)
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")

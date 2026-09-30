@@ -547,7 +547,7 @@ class TPUWorker(WorkerBase):
                 (available - cap) / utils.GBYTES,
             )
             available = cap
-        return available
+        return utils.min_across_ep_dp(self.parallel_config, available)
 
     def _pooling_kv_cache_cap_bytes(self) -> int | None:
         """Deterministic KV budget for pure pooling models, or None.

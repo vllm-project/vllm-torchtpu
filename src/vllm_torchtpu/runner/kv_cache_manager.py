@@ -835,8 +835,10 @@ class KVCacheManager:
         budget = utils.compute_hbm_budget(
             [self.runner.device], self.runner.cache_config.gpu_memory_utilization
         )
-        return budget.available - utils.estimate_kv_connector_hbm_reserve(
-            self.runner.vllm_config
+        return utils.min_across_ep_dp(
+            self.runner.vllm_config.parallel_config,
+            budget.available
+            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
