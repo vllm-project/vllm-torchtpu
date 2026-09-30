@@ -13,11 +13,12 @@
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp32-ep.sh"
 
 # ---- serve flags --------------------------------------------------------------
-# Raiden's Kimi pool manifest admits only a bf16 cache whose KDA state blocks
-# are the attention block size. The nightly serves fp8 without prefix caching,
-# and without it vLLM sizes a state block to the whole max-model-len; with it
-# the state blocks align to the attention blocks.
-KV_CACHE_DTYPE="${K3_1P1D_KV_CACHE_DTYPE:-auto}"
+# The nightly's fp8 cache, which is what the pair is meant to serve and what
+# halves the pool against bf16. Raiden's Kimi pool manifest requires the KDA
+# state blocks to be the attention block size: the nightly serves without
+# prefix caching, and without it vLLM sizes a state block to the whole
+# max-model-len; with it the state blocks align to the attention blocks.
+KV_CACHE_DTYPE="${K3_1P1D_KV_CACHE_DTYPE:-fp8}"
 ENABLE_PREFIX_CACHING=true
 
 # One prefill chunk is one KV block, the nightly's --block-size 256. K3's
