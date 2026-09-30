@@ -14,6 +14,7 @@ import torch
 from vllm import SamplingParams
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -177,6 +178,7 @@ def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False):
         ),
         parallel_config=ParallelConfig(),
         speculative_config=speculative_config,
+        device_config=DeviceConfig(device="cpu"),
     )
     vllm_config.parallel_config.decode_context_parallel_size = DCP
     vllm_config.cache_config.prefix_match_unit = prefix_match_unit
