@@ -48,7 +48,7 @@ _KV_PACKING = 4
 _HAS = "head_along_sublane"
 _SAL = "seq_along_lane"
 _LAYOUTS = (_HAS, _SAL)
-_SHORT, _LONG, _REPS, _NUM_CACHES = 4, 36, 5, 4
+_SHORT, _LONG, _REPS, _NUM_CACHES = 2, 10, 3, 2
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +223,12 @@ def _per_call_us(step, cache: jax.Array, args: tuple[jax.Array, ...]) -> float:
 
         return jax.jit(run, donate_argnums=0)
 
+    caches = jax.block_until_ready([jnp.copy(cache) for _ in range(_NUM_CACHES)])
+
     def seconds(fn):
-        caches = jax.block_until_ready([jnp.copy(cache) for _ in range(_NUM_CACHES)])
+        nonlocal caches
         start = time.perf_counter()
-        jax.block_until_ready(fn(caches, args))
+        caches = jax.block_until_ready(fn(caches, args))
         return time.perf_counter() - start
 
     short, long = chain(_SHORT), chain(_LONG)
@@ -238,7 +240,7 @@ def _per_call_us(step, cache: jax.Array, args: tuple[jax.Array, ...]) -> float:
 
 
 def _batch(q_lens, seq_lens, *, page_size, num_pages, seed):
-    """Random cache, K rows and metadata; pages written this step are distinct."""
+    """Cache, K rows and metadata; pages written this step are distinct."""
     rng = np.random.default_rng(seed)
     q_lens = np.asarray(q_lens, np.int32)
     seq_lens = np.asarray(seq_lens, np.int32)
@@ -250,11 +252,9 @@ def _batch(q_lens, seq_lens, *, page_size, num_pages, seed):
             first, last = (seq_len - q_len) // page_size, (seq_len - 1) // page_size
             for ordinal in range(first, last + 1):
                 table[s, ordinal] = next(free)
-    cache = rng.integers(
-        0, 256, size=(num_pages, page_size // 4, 4, 256), dtype=np.uint8
-    )
+    cache = jnp.zeros((num_pages, page_size // 4, 4, 256), dtype=jnp.uint8)
     k = rng.integers(0, 256, size=(max(int(q_lens.sum()), 1), 129), dtype=np.uint8)
-    return jnp.asarray(cache), (
+    return cache, (
         jnp.asarray(k),
         jnp.asarray(seq_lens),
         jnp.asarray(table, jnp.int32),
@@ -318,10 +318,8 @@ def _agentx_batch(q_lens, num_tokens, offset):
         seq_lens[i] = base + i * _AGENTX_INTERLEAVE + q_len
     rng = np.random.default_rng(2026 + num_tokens + offset)
     num_pages = max_seqs * pages_per_seq
-    cache = rng.integers(
-        0, 256, size=(num_pages, _AGENTX_PAGE_SIZE // 4, 4, 256), dtype=np.uint8
-    )
-    return jnp.asarray(cache), (
+    cache = jnp.zeros((num_pages, _AGENTX_PAGE_SIZE // 4, 4, 256), dtype=jnp.uint8)
+    return cache, (
         jnp.asarray(rng.integers(0, 256, (num_tokens, 129), dtype=np.uint8)),
         jnp.asarray(seq_lens),
         jnp.arange(num_pages, dtype=jnp.int32).reshape(max_seqs, pages_per_seq),
@@ -384,13 +382,12 @@ def run_append_benchmark() -> None:
 
 
 def _time_best(fn, make_cache, args, iters: int) -> float:
-    jax.block_until_ready(fn(make_cache(), *args))
+    buf = make_cache()
+    buf, _ = jax.block_until_ready(fn(buf, *args))
     best = float("inf")
     for _ in range(iters):
-        buf = make_cache()
-        buf.block_until_ready()
         t0 = time.perf_counter()
-        jax.block_until_ready(fn(buf, *args))
+        buf, _ = jax.block_until_ready(fn(buf, *args))
         best = min(best, time.perf_counter() - t0)
     return best
 

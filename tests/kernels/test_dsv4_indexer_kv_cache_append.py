@@ -1049,7 +1049,7 @@ class CoalescedKvAppendTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
         ("unsharded", 1, 1),
-        ("dcp2_il1", 2, 1),
+        ("dcp2_il4", 2, 4),
         ("dcp4_il4", 4, 4),
         ("dcp16_il4", 16, 4),
     )
