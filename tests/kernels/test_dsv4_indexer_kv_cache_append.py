@@ -27,18 +27,17 @@ Performance lives in `scripts/benchmark_indexer_kv_cache_append.py`.
 """
 
 import functools
+import types
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     kv_cache_append,
     kv_cache_utils,
-)
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    streamindex_topk as st_lib,
 )
 
 _KV_PACKING = 4
@@ -1111,11 +1110,12 @@ class CoalescedKvAppendTest(parameterized.TestCase):
                     seq_lens,
                     table,
                     cu_q_lens,
-                    page_size,
-                    num_pages,
                     jnp.int32(rank),
-                    dcp_size,
-                    interleave_size,
+                    nope_spec=types.SimpleNamespace(
+                        page_size=page_size, num_pages=num_pages
+                    ),
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
                 )
                 mla_dst_rows = mla_kv_cache_utils._dst_rows(
                     mla_page, mla_slot, page_size

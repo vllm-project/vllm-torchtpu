@@ -38,12 +38,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     kv_cache_append,
     kv_cache_utils,
-)
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    streamindex_topk as st_lib,
 )
 
 _KV_PACKING = 4
