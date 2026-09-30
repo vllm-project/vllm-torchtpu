@@ -58,6 +58,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-correctness"
         key: "integration_qwen35_gpc_correctness"
+        skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
         agents:
           queue: "tpu_v7x_16_queue"
         commands:
@@ -80,6 +81,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
+        skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
