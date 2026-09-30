@@ -4,7 +4,9 @@
 from functools import cache as run_once
 from typing import Any
 
+import jax
 import torch
+from torch_tpu._internal import pallas
 
 from vllm_torchtpu.logger import init_logger
 
@@ -76,6 +78,21 @@ def apply_omni_tpu_patches() -> None:
 
 
 @run_once
+def _optimization_barrier_op() -> Any:
+    """Torch op wrapping ``jax.lax.optimization_barrier`` (an XLA fusion fence).
+
+    Built on first use from a TPU forward.
+    """
+
+    def optimization_barrier(x: jax.Array) -> jax.Array:
+        return jax.lax.optimization_barrier(x)
+
+    op = pallas.jax_op("vllm_torchtpu::optimization_barrier", optimization_barrier)
+    op.register_fake(lambda x: torch.empty_like(x))
+    return op
+
+
+@run_once
 def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
 
@@ -141,6 +158,7 @@ def apply_omni_model_specific_patches() -> None:
 
     _patch_qwen_image_rope_txt_freqs_clone()
     _patch_wan_pair_swap_rope()
+    _patch_wan_ffn_gelu_fence()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
@@ -200,3 +218,34 @@ def _patch_wan_pair_swap_rope() -> None:
 
     RotaryEmbeddingWan.forward = rotary_embedding_wan_forward
     logger.info("Applied TPU patch: pair-swap matmul RotaryEmbeddingWan.")
+
+
+def _patch_wan_ffn_gelu_fence() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once XLA stops duplicating the elementwise producer
+    # into the matmul operand fusion here, or torch_tpu exposes a fusion fence.
+    #
+    # XLA fuses the Wan FFN up-projection's bias add and tanh-GELU into the
+    # operand fusion of the down-projection matmul, so the GELU of the
+    # (tokens, 13824) activation is recomputed for every output tile of the
+    # down-projection instead of once. torch_tpu has no way to stop a
+    # producer fusion. An XLA optimization barrier on the GELU output (an
+    # identity that fusion passes cannot see through) makes XLA materialize
+    # it once, in bf16, which is also the value eager PyTorch produces.
+    # Measured on v7x, Wan2.2-I2V-A14B: 72.72 -> 71.39 ms per block at
+    # 32,760 tokens on one core; 0.939 -> 0.927 s/step end to end at
+    # 480x832x81 on 8 cores (CFG 2 x Ulysses 4).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        ColumnParallelGELU,
+    )
+
+    orig_forward = getattr(ColumnParallelGELU, "_tpu_orig_forward", ColumnParallelGELU.forward)
+    ColumnParallelGELU._tpu_orig_forward = orig_forward
+
+    def _fenced_gelu_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
+        return _optimization_barrier_op()(x)
+
+    ColumnParallelGELU.forward = _fenced_gelu_forward
+    logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
