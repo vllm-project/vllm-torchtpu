@@ -385,25 +385,6 @@ def run_append_benchmark() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _hal_update(cache, k_packed, page, slot):
-    return cache.at[page, slot // _KV_PACKING, slot % _KV_PACKING].set(k_packed)
-
-
-def _hal_quad_jax_update(cache, k_packed, quad_row):
-    orig_shape = cache.shape
-    c3 = cache.reshape(-1, _KV_PACKING, orig_shape[-1])
-    k3 = k_packed.reshape(-1, _KV_PACKING, orig_shape[-1])
-    return c3.at[quad_row].set(k3).reshape(orig_shape)
-
-
-def _sal_update(cache_sal, k_packed, page, slot, head_dim):
-    kv_sublane_groups = head_dim // _KV_PACKING + 1
-    k_rec = jnp.pad(
-        k_packed[:, : head_dim + 1], ((0, 0), (0, _KV_PACKING - 1))
-    ).reshape(-1, kv_sublane_groups, _KV_PACKING)
-    return cache_sal.at[page, :, :, slot].set(k_rec)
-
-
 def _time_best(fn, make_cache, args, iters: int) -> float:
     jax.block_until_ready(fn(make_cache(), *args))
     best = float("inf")
@@ -464,22 +445,44 @@ def run_region_benchmark_for_tokens(
     pages_per_seq = max(128, (seq_len // max(1, dcp_size)) // page_size + 2)
     assert pages >= pages_per_seq
 
-    page_table_np = np.zeros((max_num_seqs, pages_per_seq), dtype=np.int32)
-    seq_pages = rng.choice(pages, size=pages_per_seq, replace=False)
-    page_table_np[0] = seq_pages.astype(np.int32)
-    page_indices_d = jnp.asarray(page_table_np.reshape(-1), dtype=jnp.int32)
+    is_decode = num_tokens <= 8
+    num_active_seqs = num_tokens if is_decode else 1
 
     seq_lens_np = np.zeros((max_num_seqs,), dtype=np.int32)
-    seq_lens_np[0] = seq_len
-    seq_lens_d = jnp.asarray(seq_lens_np, dtype=jnp.int32)
-
     cu_q_lens_np = np.zeros((max_num_seqs + 1,), dtype=np.int32)
-    cu_q_lens_np[1:] = num_tokens
-    cu_q_lens_d = jnp.asarray(cu_q_lens_np, dtype=jnp.int32)
-    if num_tokens == 1:
-        distribution_d = jnp.asarray([1, 0, 0], dtype=jnp.int32)
+    if is_decode:
+        for s in range(num_active_seqs):
+            if dcp_size > 1:
+                cycle = dcp_size * interleave_size
+                base_seq = seq_len - (seq_len % cycle) - cycle
+                seq_lens_np[s] = base_seq + 1 + (s % interleave_size)
+            else:
+                seq_lens_np[s] = seq_len
+            cu_q_lens_np[s + 1] = s + 1
+        cu_q_lens_np[num_active_seqs + 1 :] = num_active_seqs
+        distribution_d = jnp.asarray(
+            [num_active_seqs, num_active_seqs, num_active_seqs], dtype=jnp.int32
+        )
     else:
+        seq_lens_np[0] = seq_len
+        cu_q_lens_np[1:] = num_tokens
         distribution_d = jnp.asarray([0, 0, 1], dtype=jnp.int32)
+
+    seq_lens_d = jnp.asarray(seq_lens_np, dtype=jnp.int32)
+    cu_q_lens_d = jnp.asarray(cu_q_lens_np, dtype=jnp.int32)
+
+    page_table_np = np.zeros((max_num_seqs, pages_per_seq), dtype=np.int32)
+    reserved_tail_pages = rng.choice(pages, size=num_active_seqs, replace=False)
+    remaining_pool = np.setdiff1d(np.arange(pages, dtype=np.int32), reserved_tail_pages)
+    virtual_page_size = page_size * max(1, dcp_size)
+    for s in range(num_active_seqs):
+        seq_pages = rng.choice(
+            remaining_pool, size=pages_per_seq, replace=False
+        ).astype(np.int32)
+        tail_ord = (int(seq_lens_np[s]) - 1) // virtual_page_size
+        seq_pages[tail_ord] = int(reserved_tail_pages[s])
+        page_table_np[s] = seq_pages
+    page_indices_d = jnp.asarray(page_table_np.reshape(-1), dtype=jnp.int32)
 
     k_all = jnp.asarray(
         rng.integers(1, 255, size=(layers, num_tokens, width)).astype(np.uint8)
@@ -520,7 +523,7 @@ def run_region_benchmark_for_tokens(
             k=topk,
             compression_ratio=1,
             num_kv_pages_per_block=(2, 2, 2),
-            num_queries_per_block=(1, 64, 64) if num_tokens == 1 else (16, 64, 64),
+            num_queries_per_block=(1, 64, 64),
             kv_layout=kv_layout,
             cp_size=dcp_size,
             cp_rank=dcp_rank_d if dcp_size > 1 else 0,
@@ -528,14 +531,9 @@ def run_region_benchmark_for_tokens(
         )
 
     if dcp_size == 1:
-        pos_np = np.arange(seq_len - num_tokens, seq_len, dtype=np.int32)
-        phys_page_np = seq_pages[pos_np // page_size].astype(np.int32)
-        slot_np = (pos_np % page_size).astype(np.int32)
-        page_d = jnp.asarray(phys_page_np)
-        slot_d = jnp.asarray(slot_np)
 
         def v0_xla_has(cache, k_p):
-            cache = _hal_update(cache, k_p, page_d, slot_d)
+            cache = has_append_4d(cache, k_p, seq_lens_d, page_indices_d, cu_q_lens_d)
             return cache, _score(cache, _HAS)
 
         def v2_pallas_has(cache, k_p):
@@ -545,7 +543,9 @@ def run_region_benchmark_for_tokens(
             return cache, _score(cache, _HAS)
 
         def v3a_xla_sal(cache_sal, k_p):
-            cache_sal = _sal_update(cache_sal, k_p, page_d, slot_d, head_dim)
+            cache_sal = sal_append_4d(
+                cache_sal, k_p, seq_lens_d, page_indices_d, cu_q_lens_d
+            )
             return cache_sal, _score(cache_sal, _SAL)
 
         def v3b_pallas_sal(cache_sal, k_p):
@@ -559,11 +559,15 @@ def run_region_benchmark_for_tokens(
             )
             return cache_sal, _score(cache_sal, _SAL)
 
-        c_ref = _hal_update(mk_cache(), k_all[0], page_d, slot_d)
+        c_ref = has_append_4d(
+            mk_cache(), k_all[0], seq_lens_d, page_indices_d, cu_q_lens_d
+        )
         c_has = kv_cache_append.coalesced_kv_append(
             mk_cache(), k_all[0], seq_lens_d, page_indices_d, cu_q_lens_d
         )
-        c_sal_ref = _sal_update(mk_cache_sal(), k_all[0], page_d, slot_d, head_dim)
+        c_sal_ref = sal_append_4d(
+            mk_cache_sal(), k_all[0], seq_lens_d, page_indices_d, cu_q_lens_d
+        )
         c_sal = kv_cache_append.coalesced_kv_append(
             mk_cache_sal(),
             k_all[0],
@@ -703,7 +707,7 @@ def run_region_benchmark_for_tokens(
     ]
 
     _print_row(
-        f"Variant (T={num_tokens})",
+        f"Variant (T={num_tokens}, dcp={dcp_size})",
         ["1-layer (us)", f"{layers}-layer (us)", "slope (us/layer)", "HLO relayouts"],
     )
     _print_row("---", ["--:", "--:", "--:", "--:"])
@@ -737,7 +741,12 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=2048, help="Top-K retrieved.")
     parser.add_argument("--layers", type=int, default=4, help="Chained layers.")
     parser.add_argument("--iters", type=int, default=10, help="Timed iterations.")
-    parser.add_argument("--dcp-size", type=int, default=16, help="DCP size for region.")
+    parser.add_argument(
+        "--dcp-sizes",
+        type=str,
+        default="1,16",
+        help="Comma-separated DCP sizes for region benchmark.",
+    )
     parser.add_argument(
         "--interleave-size", type=int, default=4, help="DCP interleave size."
     )
@@ -753,21 +762,23 @@ def main() -> None:
     if args.mode in ("all", "append"):
         run_append_benchmark()
     if args.mode in ("all", "region"):
-        for tok_str in args.region_tokens.split(","):
-            tok = int(tok_str.strip())
-            run_region_benchmark_for_tokens(
-                num_tokens=tok,
-                pages=args.pages,
-                page_size=args.page_size,
-                head_dim=args.head_dim,
-                num_q_heads=args.num_q_heads,
-                seq_len=args.seq_len,
-                topk=args.topk,
-                layers=args.layers,
-                iters=args.iters,
-                dcp_size=args.dcp_size,
-                interleave_size=args.interleave_size,
-            )
+        for dcp_str in args.dcp_sizes.split(","):
+            dcp_size = int(dcp_str.strip())
+            for tok_str in args.region_tokens.split(","):
+                tok = int(tok_str.strip())
+                run_region_benchmark_for_tokens(
+                    num_tokens=tok,
+                    pages=args.pages,
+                    page_size=args.page_size,
+                    head_dim=args.head_dim,
+                    num_q_heads=args.num_q_heads,
+                    seq_len=args.seq_len,
+                    topk=args.topk,
+                    layers=args.layers,
+                    iters=args.iters,
+                    dcp_size=dcp_size,
+                    interleave_size=args.interleave_size,
+                )
 
 
 if __name__ == "__main__":
