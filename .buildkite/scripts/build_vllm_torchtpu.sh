@@ -74,13 +74,12 @@ VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 VLLM_SRC_DIR="${VLLM_SRC_DIR:-${TORCHTPU_ROOT}/build/vllm-torchtpu-src}"
 CORE_DIST_DIR="${CORE_DIST_DIR:-${TORCHTPU_ROOT}/dist}"
 
-# The vLLM ref pinned by the [vllm] extra in pyproject.toml. Keeping the
-# combined wheel on the same vLLM that core is tested against avoids silently
-# shipping core on top of an untested vLLM.
+# The vLLM ref pinned by the [vllm] extra in pyproject.toml. Used as the default
+# [vllm-ref] so the combined wheel ships core on the vLLM it is tested against.
 PINNED_VLLM_REF="$(sed -nE \
-    's|.*"vllm @ git\+https://github\.com/vllm-project/vllm\.git@([^"#]+)".*|\1|p' \
-    "${TORCHTPU_ROOT}/pyproject.toml" | head -n 1)"
-DEFAULT_VLLM_REF="${PINNED_VLLM_REF:-main}"
+    '\|.*"vllm @ git\+https://github\.com/vllm-project/vllm\.git@([^"#]+)".*|{s||\1|p;q;}' \
+    "${TORCHTPU_ROOT}/pyproject.toml")"
+DEFAULT_VLLM_REF="${PINNED_VLLM_REF}"
 
 usage() {
     echo "Usage: $0 <core-version> <wheel-version> [vllm-ref]"
@@ -89,7 +88,7 @@ usage() {
     echo "  <core-version>   Published vllm-torchtpu-core version to depend on."
     echo "  <wheel-version>  Version stamped onto the produced vllm-torchtpu wheel."
     echo "  [vllm-ref]       vLLM branch, tag or commit to build"
-    echo "                   (default: ${DEFAULT_VLLM_REF}, pinned in pyproject.toml)."
+    echo "                   (default: ${DEFAULT_VLLM_REF:-<not found>}, pinned in pyproject.toml)."
     echo ""
     echo "  --local          Depend on a locally built core wheel: \$CORE_WHEEL if"
     echo "                   set, otherwise the single core wheel in ${CORE_DIST_DIR}."
@@ -155,6 +154,10 @@ else
     VLLM_REF=${3:-"${DEFAULT_VLLM_REF}"}
 fi
 
+[ -n "${VLLM_REF}" ] || die "no vLLM ref pinned in ${TORCHTPU_ROOT}/pyproject.toml" \
+    "(expected a 'vllm @ git+https://github.com/vllm-project/vllm.git@<ref>' entry);" \
+    "pass [vllm-ref] explicitly."
+
 echo "--- Starting vllm-torchtpu wheel build ---"
 echo "Mode                   : $([[ "${WHL_PATH}" ]] && echo "Local wheel (${WHL_PATH})" || echo "PyPI")"
 echo "vllm-torchtpu-core ver : ${CORE_VERSION}"
@@ -216,6 +219,9 @@ TMP_FILE="${REQUIREMENTS_FILE}.tmp"
 
 if [[ "${WHL_PATH}" ]]; then
     REQUIRED_LINE="vllm-torchtpu-core @ file://${WHL_PATH}"
+    echo "WARNING: --local embeds '${REQUIRED_LINE}' in the wheel metadata." >&2
+    echo "         The resulting wheel is for local testing only: it will not" >&2
+    echo "         install on other machines and PyPI rejects direct references." >&2
 else
     REQUIRED_LINE="vllm-torchtpu-core==${CORE_VERSION}"
 fi

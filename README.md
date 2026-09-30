@@ -71,13 +71,17 @@ source during this process.
 > `vllm-torchtpu-core`), see [Build the combined `vllm-torchtpu` wheel](#4-optional-build-the-combined-vllm-torchtpu-wheel).
 >
 > **Migrating an existing environment:** if this repo was installed before the
-> rename (distribution name `vllm_torchtpu`), uninstall it first. Otherwise the
-> stale `vllm_torchtpu` metadata stays behind next to `vllm-torchtpu-core`, and
-> pip treats the combined `vllm-torchtpu` wheel as an upgrade of the old plugin:
+> rename (distribution name `vllm_torchtpu`), uninstall it first:
 >
 > ```bash
 > pip uninstall -y vllm_torchtpu   # or: uv pip uninstall vllm_torchtpu
 > ```
+>
+> pip normalizes `vllm_torchtpu` and `vllm-torchtpu` to the same project, so the
+> old plugin would be "upgraded" by the combined `vllm-torchtpu` wheel. For
+> non-editable installs, that removal can delete `vllm_torchtpu/` files now
+> owned by `vllm-torchtpu-core`. If this already happened, repair it with
+> `pip install --force-reinstall --no-deps vllm-torchtpu-core`.
 
 #### Option A: Using `uv` (Recommended)
 
