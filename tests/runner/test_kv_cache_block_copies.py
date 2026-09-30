@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
@@ -292,13 +293,20 @@ def test_is_unified_pool_used():
     assert runner.is_unified_pool_used()
 
 
-def _dense_runner(kv_caches, num_blocks, has_mamba_layers=False):
+def _dense_runner(
+    monkeypatch, kv_caches, num_blocks, has_mamba_layers=False, fine_unit=256
+):
+    """A non-pooled runner; ``fine_unit`` fakes the DCP fine-prefix gate."""
     runner = _runner_with_raw_tensors([])
     runner.kv_cache_config = SimpleNamespace(
         num_blocks=num_blocks, has_mamba_layers=has_mamba_layers
     )
+    runner.vllm_config = None
     runner.kv_caches = kv_caches
     runner.device = "cpu"
+    monkeypatch.setattr(
+        vllm_torchtpu, "_dcp_fine_prefix_match_unit", lambda *_: fine_unit
+    )
     return runner
 
 
@@ -317,7 +325,7 @@ def test_update_states_routes_dense_copies_for_attention_only(monkeypatch):
         base_outputs.append(scheduler_output)
 
     monkeypatch.setattr(GPUModelRunner, "_update_states", base_update)
-    runner = _dense_runner([torch.zeros(8, 4)], num_blocks=8)
+    runner = _dense_runner(monkeypatch, [torch.zeros(8, 4)], num_blocks=8)
     runner._apply_dense_kv_cache_block_copies = lambda c: events.append(("dense", c))
     runner._apply_kv_cache_block_copies = lambda c: events.append(("pool", c))
 
@@ -338,7 +346,35 @@ def test_update_states_keeps_generic_copy_with_mamba_without_pool(monkeypatch):
         "_update_states",
         lambda _runner, scheduler_output: base_outputs.append(scheduler_output),
     )
-    runner = _dense_runner([torch.zeros(8, 4)], num_blocks=8, has_mamba_layers=True)
+    runner = _dense_runner(
+        monkeypatch, [torch.zeros(8, 4)], num_blocks=8, has_mamba_layers=True
+    )
+    runner._apply_dense_kv_cache_block_copies = pytest.fail
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_block_copies = [
+        KVCacheBlockCopy(src_block_id=2, dst_block_id=5)
+    ]
+    TPUModelRunner._update_states(runner, scheduler_output)
+
+    assert base_outputs == [scheduler_output]
+
+
+def test_update_states_keeps_generic_copy_without_fine_prefix_hits(monkeypatch):
+    """Copies from any other emitter keep the generic path.
+
+    The dense copy is precompiled only for DCP fine-grained prefix hits, so
+    it must not pick up copies when that feature is inactive.
+    """
+    base_outputs = []
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_update_states",
+        lambda _runner, scheduler_output: base_outputs.append(scheduler_output),
+    )
+    runner = _dense_runner(
+        monkeypatch, [torch.zeros(8, 4)], num_blocks=8, fine_unit=None
+    )
     runner._apply_dense_kv_cache_block_copies = pytest.fail
 
     scheduler_output = SchedulerOutput.make_empty()
@@ -363,7 +399,9 @@ def test_dense_copy_fans_out_per_split_dedupes_and_pads(monkeypatch):
         num_blocks * 2, 5
     )
     before_latent, before_indexer = latent.clone(), indexer.clone()
-    runner = _dense_runner([latent, indexer, latent], num_blocks=num_blocks)
+    runner = _dense_runner(
+        monkeypatch, [latent, indexer, latent], num_blocks=num_blocks
+    )
     calls = []
 
     def cpu_copy(pools, src, dst):
@@ -371,7 +409,7 @@ def test_dense_copy_fans_out_per_split_dedupes_and_pads(monkeypatch):
         for pool in pools:
             pool[dst.long()] = pool[src.long()]
 
-    monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks", cpu_copy)
+    monkeypatch.setattr(runner_mod, "copy_pool_blocks", cpu_copy)
 
     TPUModelRunner._apply_dense_kv_cache_block_copies(
         runner, [KVCacheBlockCopy(src_block_id=2, dst_block_id=5)]

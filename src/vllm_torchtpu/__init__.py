@@ -1080,7 +1080,7 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
 
     cache_config = vllm_config.cache_config
     parallel_config = vllm_config.parallel_config
-    unit = getattr(cache_config, "prefix_match_unit", None)
+    unit = cache_config.prefix_match_unit
     dcp = parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
     if (
@@ -1138,6 +1138,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
 
     The physical block size and allocation are unchanged.
     """
+    import inspect
     import sys
 
     from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
@@ -1194,67 +1195,36 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
     original_init = cls.__init__
     original_find = cls.find_longest_cache_hit
     base_init = kv_cache_coordinator.KVCacheCoordinator.__init__
+    # Bind by name instead of restating upstream's parameter list, so a new
+    # upstream parameter is forwarded rather than breaking this wrapper.
+    init_signature = inspect.signature(original_init)
 
-    def __init__(
-        self,
-        kv_cache_config,
-        max_model_len,
-        max_in_flight_tokens,
-        use_eagle,
-        enable_caching,
-        enable_kv_cache_events,
-        dcp_world_size,
-        pcp_world_size,
-        scheduler_block_size,
-        hash_block_size,
-        metrics_collector=None,
-        num_prefill_lookahead=0,
-    ):
+    def __init__(self, *args, **kwargs):
+        bound = init_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        init_args = dict(bound.arguments)
+        del init_args["self"]
+        kv_cache_config = init_args["kv_cache_config"]
+        hash_block_size = init_args["hash_block_size"]
+        num_prefill_lookahead = init_args.get("num_prefill_lookahead", 0)
         fine = (
-            enable_caching
-            and dcp_world_size > 1
-            and pcp_world_size == 1
+            init_args["enable_caching"]
+            and init_args["dcp_world_size"] > 1
+            and init_args["pcp_world_size"] == 1
             and len(kv_cache_config.kv_cache_groups) == 1
-            and hash_block_size < scheduler_block_size
+            and hash_block_size < init_args["scheduler_block_size"]
         )
         if not fine:
-            original_init(
-                self,
-                kv_cache_config,
-                max_model_len,
-                max_in_flight_tokens,
-                use_eagle,
-                enable_caching,
-                enable_kv_cache_events,
-                dcp_world_size,
-                pcp_world_size,
-                scheduler_block_size,
-                hash_block_size,
-                metrics_collector=metrics_collector,
-                num_prefill_lookahead=num_prefill_lookahead,
-            )
+            original_init(self, *args, **kwargs)
             return
-        # Mirror UnitaryKVCacheCoordinator.__init__ minus its
+        # Upstream's __init__ forwards all of its arguments to the base
+        # __init__, then sets the attributes below. Mirror that minus its
         # hash_block_size == block_size assert.
-        base_init(
-            self,
-            kv_cache_config,
-            max_model_len,
-            max_in_flight_tokens,
-            use_eagle,
-            enable_caching,
-            enable_kv_cache_events,
-            dcp_world_size=dcp_world_size,
-            pcp_world_size=pcp_world_size,
-            scheduler_block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
-            metrics_collector=metrics_collector,
-            num_prefill_lookahead=num_prefill_lookahead,
-        )
+        base_init(self, **init_args)
         manager = self.single_type_managers[0]
         self.kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.dcp_world_size = manager.dcp_world_size
-        self.pcp_world_size = pcp_world_size
+        self.pcp_world_size = init_args["pcp_world_size"]
         self.block_size = manager.block_size
         self.hash_block_size = hash_block_size
         manager.use_eagle = 0 in self.eagle_group_ids

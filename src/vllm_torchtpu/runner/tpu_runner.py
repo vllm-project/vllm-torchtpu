@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
+    copy_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -1989,19 +1990,32 @@ class TPUModelRunner(GPUModelRunner):
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
     def _dense_kv_copy_supported(self) -> bool:
-        """Whether CoW copies can run on the per-layer KV cache tensors.
+        """Whether CoW copies run on the per-layer KV cache tensors.
 
+        Only when DCP fine-grained prefix hits are active (see
+        ``_patch_vllm_dcp_fine_prefix_hits``), the one config whose copies
+        this path precompiles; any other emitter keeps the generic path.
         Attention-only models outside the unified pool bind one tensor per
         layer whose dim 0 is the (kernel-granular) block axis. Mamba state
-        without the unified pool is not block-indexed that way, so it keeps
-        the generic path.
+        without the unified pool is not block-indexed that way.
         """
+        from vllm_torchtpu import _dcp_fine_prefix_match_unit
+
         kv_cache_config = getattr(self, "kv_cache_config", None)
-        return (
-            kv_cache_config is not None
-            and not kv_cache_config.has_mamba_layers
-            and bool(getattr(self, "kv_caches", None))
-        )
+        if (
+            kv_cache_config is None
+            or kv_cache_config.has_mamba_layers
+            or self.is_unified_pool_used()
+            or not getattr(self, "kv_caches", None)
+        ):
+            return False
+        # Fixed once the KV cache config is set; cache it per config.
+        cached = getattr(self, "_dense_kv_copy_cache", None)
+        if cached is None or cached[0] is not kv_cache_config:
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, self.vllm_config)
+            cached = (kv_cache_config, unit is not None)
+            self._dense_kv_copy_cache = cached
+        return cached[1]
 
     def _dense_kv_copy_pool_sets(self) -> dict[int, list[torch.Tensor]]:
         """Group the unique per-layer caches by manager-block split.
@@ -2047,7 +2061,7 @@ class TPUModelRunner(GPUModelRunner):
             dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
                 self.device, non_blocking=True
             )
-            copy_mamba_state_blocks(pools, src_t, dst_t)
+            copy_pool_blocks(pools, src_t, dst_t)
 
     def _precompile_dense_kv_cache_block_copies(self) -> None:
         """Warm the dense CoW copy program at every bucket length.
@@ -2057,11 +2071,7 @@ class TPUModelRunner(GPUModelRunner):
         are quiescent, like the seed-copy precompile. All-zero indices copy
         the null block onto itself.
         """
-        from vllm_torchtpu import _dcp_fine_prefix_match_unit
-
-        if self.is_unified_pool_used() or not self._dense_kv_copy_supported():
-            return
-        if _dcp_fine_prefix_match_unit(self.kv_cache_config, self.vllm_config) is None:
+        if not self._dense_kv_copy_supported():
             return
         pool_sets = self._dense_kv_copy_pool_sets()
         # At most one CoW pair per newly scheduled request per step.
@@ -2073,7 +2083,7 @@ class TPUModelRunner(GPUModelRunner):
                 while n <= limit:
                     src = torch.zeros(n, dtype=torch.int32).to(self.device)
                     dst = torch.zeros(n, dtype=torch.int32).to(self.device)
-                    copy_mamba_state_blocks(pools, src, dst)
+                    copy_pool_blocks(pools, src, dst)
                     n *= 4
                 synchronize_tensors(pools)
 

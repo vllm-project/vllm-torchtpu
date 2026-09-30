@@ -298,6 +298,17 @@ def test_coordinator_rejects_unit_below_mtp_lookahead():
         )
 
 
+def test_base_init_accepts_every_unitary_init_parameter():
+    """The fine path forwards UnitaryKVCacheCoordinator.__init__'s bound
+    arguments to KVCacheCoordinator.__init__ by name; fail loudly on a vLLM
+    bump that makes the two signatures diverge."""
+    unitary = inspect.signature(
+        kv_cache_coordinator.UnitaryKVCacheCoordinator.__init__.__wrapped__
+    ).parameters
+    base = inspect.signature(kv_cache_coordinator.KVCacheCoordinator.__init__)
+    assert set(unitary) <= set(base.parameters)
+
+
 def test_patch_is_idempotent():
     resolve = kv_cache_utils.resolve_kv_cache_block_sizes
     init = kv_cache_coordinator.UnitaryKVCacheCoordinator.__init__
