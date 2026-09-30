@@ -64,7 +64,7 @@ pre-commit install --hook-type pre-commit --hook-type commit-msg
 pre-commit run --all-files
 ```
 
-The pre-commit `pyrefly` hook type-checks without third-party packages. CI also runs a full-environment check that resolves torch, jax and vllm. Run it locally with `bash tools/typecheck_full.sh`; outside a container it runs inside the nightly `torchtpu-vllm-dev` image, so it needs Docker and `gcloud auth configure-docker us-central1-docker.pkg.dev`. See [AGENTS.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/AGENTS.md#type-checking) for how to fix new errors.
+The pre-commit `pyrefly` hook type-checks without third-party packages. CI also runs a full-environment check that resolves torch, jax and vllm; run it locally with `bash tools/typecheck_full.sh`. [Type checking](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/developers_guide/type_checking.md) covers both checks, what the local run needs, and how to fix new errors.
 
 ## Building the documentation
 

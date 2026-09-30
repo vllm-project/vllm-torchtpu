@@ -58,8 +58,9 @@ Two meta-principles organize this document set:
 - **R-1.5** Use modern typing: PEP 604 unions (`int | None`, not
   `Optional[int]`), builtin generics (`list[int]`), `StrEnum` for string
   enums. Type-annotate public function signatures. The repo runs `pyrefly`
-  at the `default` preset in pre-commit and in CI (see "Type checking" in
-  `AGENTS.md`); code must pass both checks.
+  at the `default` preset in pre-commit and in CI (see
+  [Type checking](developers_guide/type_checking.md)); code must pass both
+  checks.
 - **R-1.6** Every new file carries the Apache 2.0 license header (copy from a
   sibling file).
 - **R-1.7** No `print` in library code — use `vllm_torchtpu.logger.init_logger`.
