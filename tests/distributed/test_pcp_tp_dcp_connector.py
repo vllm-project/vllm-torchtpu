@@ -221,7 +221,11 @@ def test_consumer_rejects_invalid_geometry_before_transfer(monkeypatch, field, v
 
 
 @pytest.mark.parametrize("tp,dcp", [(8, 8), (8, 2), (2, 1)])
-def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, dcp):
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("misaligned", [False, True])
+def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(
+    monkeypatch, tp, dcp, queued, misaligned
+):
     _environment(monkeypatch, dtp=tp)
     worker = _make_raiden_worker(
         is_producer=False, tp_rank=0, tp_size=tp, block_size=384
@@ -239,9 +243,11 @@ def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, d
     )
     monkeypatch.setattr(worker, "_raiden_hbm_memory_type", lambda: 3)
     req = SimpleNamespace(
-        src_controller_address="localhost:27000", skip_tokens=384 * dcp
+        src_controller_address="localhost:27000",
+        skip_tokens=384 * dcp - int(misaligned),
+        mamba_state_block_ids=None,
     )
-    outcome = worker._submit_stage3_load_as_leader(
+    args = dict(
         req_meta=req,
         source_req_id="p",
         destination_req_id="d",
@@ -251,7 +257,22 @@ def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, d
         dst_controller_address="localhost:27001",
         dst_units=[worker._raiden_work_unit],
     )
-    assert outcome[0] == "accepted", outcome
+    if queued:
+        pending = tc._Stage3PendingSubmit(
+            **args, defer_deadline=None, first_attempt_s=0
+        )
+        task = worker._stage_stage3_submit_task(pending, synchronous=False)
+        if misaligned:
+            assert task is None
+        else:
+            assert task is not None
+            assert worker._execute_stage3_submit(task).error is None
+    else:
+        outcome = worker._submit_stage3_load_as_leader(**args)
+        assert outcome[0] == ("failed" if misaligned else "accepted"), outcome
+    if misaligned:
+        facade.start_transfer.assert_not_called()
+        return
     assert facade.start_transfer.call_args.kwargs["dst_skip_bytes"] == [384 * 512]
 
 
