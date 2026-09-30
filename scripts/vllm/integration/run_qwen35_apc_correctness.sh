@@ -23,6 +23,11 @@ PORT="${PORT:-8000}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-2700}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Enable HLO dumps for compiler triage (b/566202578)
+DUMP_DIR="/perf_eval_results/shardy_segfault_hlo"
+mkdir -p "$DUMP_DIR"
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${DUMP_DIR} --xla_dump_hlo_as_text --xla_dump_hlo_as_proto"
+
 # max_num_seqs=1 removes batching nondeterminism, so a cold/warm difference is
 # the cache and nothing else. mamba_cache_mode resolves to align on its own.
 vllm serve "$MODEL" \
@@ -47,6 +52,10 @@ deadline=$((SECONDS + STARTUP_TIMEOUT_S))
 until curl -sf "localhost:$PORT/health" >/dev/null; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "APC_CORRECTNESS_FAIL: server exited during startup"
+    if [ -d "$DUMP_DIR" ]; then
+      echo "Packaging HLO dumps from $DUMP_DIR..."
+      tar -czvf /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz -C /perf_eval_results shardy_segfault_hlo || true
+    fi
     exit 1
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then

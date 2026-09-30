@@ -173,23 +173,23 @@ echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
 
-if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
-  # Upload promote step FIRST so Buildkite places it LAST after test steps (Step 8)
-  echo "Uploading Promotion Pipeline Fragment"
-  upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
-fi
+# In repro branch, only upload integration tests (APC) and build
+# if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+#   echo "Uploading Promotion Pipeline Fragment"
+#   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
+# fi
 
-echo "Uploading Nightly Verification and Model Pipeline"
-upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
+# echo "Uploading Nightly Verification and Model Pipeline"
+# upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
 
-echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
+# echo "Uploading Perf and Eval Pipeline"
+# upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 
 echo "Uploading Integration Tests Pipeline"
 upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
 
-echo "Uploading Unit Tests Pipeline"
-upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
+# echo "Uploading Unit Tests Pipeline"
+# upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"

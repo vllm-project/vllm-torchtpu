@@ -68,7 +68,8 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.47",
+    # libtpu 0.0.48 for Shardy segfault reproduction (b/566202578)
+    "libtpu==0.0.48",
     "ray[default]",
     "ray[data]",
 ]
