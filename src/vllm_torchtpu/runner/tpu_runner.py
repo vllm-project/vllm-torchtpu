@@ -41,7 +41,6 @@ from vllm.distributed.kv_transfer import (
     kv_transfer_state,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
-    MultiConnector,
     MultiKVConnectorStats,
 )
 from vllm.forward_context import set_forward_context
@@ -1078,17 +1077,15 @@ class TPUModelRunner(GPUModelRunner):
         kv_connector_stats = kv_connector.get_kv_connector_stats()
         cpu_samples, device_samples = self._stage_timing.take_samples()
         if cpu_samples or device_samples:
-            if isinstance(kv_connector, MultiConnector):
-                if kv_connector_stats is None:
-                    kv_connector_stats = MultiKVConnectorStats()
-                tpu_stats = kv_connector_stats.data.setdefault(
-                    "TPURaidenConnector", TpuKVConnectorStats()
-                )
-            else:
-                if kv_connector_stats is None:
-                    kv_connector_stats = TpuKVConnectorStats()
-                tpu_stats = kv_connector_stats
-            tpu_stats.record_runner_timings(cpu_samples, device_samples)
+            # Preserve connector-owned stats; discard timings without a TPU sink.
+            stats_to_visit = [kv_connector_stats]
+            while stats_to_visit:
+                stats = stats_to_visit.pop()
+                if isinstance(stats, TpuKVConnectorStats):
+                    stats.record_runner_timings(cpu_samples, device_samples)
+                    break
+                if isinstance(stats, MultiKVConnectorStats):
+                    stats_to_visit.extend(stats.data.values())
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()

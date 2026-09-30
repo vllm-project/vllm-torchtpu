@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,9 +29,18 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiKVConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    TpuKVConnectorStats,
+)
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -243,15 +253,41 @@ def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
     }
 
 
-def test_get_finished_kv_transfers_drains_invalid_block_ids():
+@pytest.mark.parametrize(
+    "stats_type", [None, OffloadingConnectorStats, TpuKVConnectorStats]
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("has_samples", [False, True])
+def test_get_finished_kv_transfers_drains_invalid_block_ids(
+    stats_type, nested, has_samples
+):
+    leaf_stats = stats_type() if stats_type is not None else None
+    if isinstance(leaf_stats, OffloadingConnectorStats):
+        leaf_stats.increase_counter("offload_transfers", 1)
+    unrelated_stats = OffloadingConnectorStats()
+    unrelated_stats.increase_counter("offload_transfers", 2)
+    original_unrelated_data = copy.deepcopy(unrelated_stats.data)
+    stats = leaf_stats
+    if nested:
+        stats = MultiKVConnectorStats(
+            data={
+                "MultiConnector": MultiKVConnectorStats(
+                    data={"child": leaf_stats} if leaf_stats is not None else {}
+                ),
+                "OffloadingConnector": unrelated_stats,
+            }
+        )
+    original_stats = copy.deepcopy(stats)
+    cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
+    device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
     connector.get_finished.return_value = ({"sent"}, {"loaded"})
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
-    connector.get_kv_connector_stats.return_value = None
+    connector.get_kv_connector_stats.return_value = stats
     runner = SimpleNamespace(_stage_timing=MagicMock())
-    runner._stage_timing.take_samples.return_value = ([], [])
+    runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
     with (
@@ -265,7 +301,15 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, None)
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
+    assert result[-1] is stats
+    if isinstance(leaf_stats, TpuKVConnectorStats):
+        assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
+        assert leaf_stats.data["runner_device_elapsed_seconds"] == device_samples
+    else:
+        assert stats == original_stats
+    assert unrelated_stats.data == original_unrelated_data
+    runner._stage_timing.take_samples.assert_called_once_with()
     connector.get_finished.assert_called_once_with({"finished"})
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
