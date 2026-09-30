@@ -26,13 +26,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     MlaCase,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
+    cache_page_size,
     coalesced_kv_append,
     coalesced_kv_append_dcp,
     scatter_rows,
     scatter_rows_reference,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_utils import (
-    cache_page_size,
     get_dcp_page_and_slot,
     get_dst_rows,
     get_page_and_slot,
