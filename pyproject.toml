@@ -12,7 +12,7 @@ readme = "README.md"
 # unsatisfiable-requirements failure partway through a Docker build.
 requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm-torchtpu-core Contributors" }
+    { name = "vLLM TorchTPU Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

@@ -45,8 +45,7 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
-# vLLM is no longer a core dependency (see the [vllm] extra in pyproject.toml),
-# so it is pulled in explicitly with --extra vllm.
+# vLLM comes from the [vllm] extra (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -102,9 +101,12 @@ FROM ci AS dev
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
+# --extra vllm keeps vLLM (already installed in base) in this resolution, so
+# the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
+      --extra vllm \
       --extra test \
       --extra benchmarking
 
