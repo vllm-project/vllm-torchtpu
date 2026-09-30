@@ -1441,6 +1441,16 @@
       "concise_description": "Class member `StreamIndexOBufferedRef.output` overrides parent class `BufferedRef` in an inconsistent manner"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `(i: Unknown, woff: Unknown) -> Unknown` is not assignable to parameter with type `(Array) -> None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `reshape`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/streamindex_topk.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `reshape`"
@@ -5469,6 +5479,16 @@
       "path": "src/vllm_torchtpu/layers/core/quantization.py",
       "name": "not-iterable",
       "concise_description": "Type `int` is not iterable"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `size`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
