@@ -29,6 +29,7 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 # not reliably produce upstream's answer (see VllmMoERunner.
 # _fused_output_is_reduced).
 _upstream_fused_output_is_reduced = MoERunner._fused_output_is_reduced.fget
+assert _upstream_fused_output_is_reduced is not None
 
 
 @MoERunner.register_oot
