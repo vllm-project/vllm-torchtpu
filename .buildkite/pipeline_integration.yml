@@ -18,7 +18,7 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
-        skip: "Temporarily disabled: known Raiden DMA uprev / StableHLO issue (b/561774581)"
+        skip: "Disabled: known Raiden DMA issue (b/561774581)"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -31,7 +31,7 @@ steps:
 
       - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
-        skip: "Temporarily disabled: known Raiden DMA uprev / StableHLO issue (b/561774581)"
+        skip: "Disabled: known Raiden DMA issue (b/561774581)"
         agents:
           queue: "tpu_v7x_16_queue"
         env:
@@ -60,7 +60,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-correctness"
         key: "integration_qwen35_gpc_correctness"
-        skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
+        skip: "Disabled: b/561774581 (StableHLO compiler issue)"
         agents:
           queue: "tpu_v7x_16_queue"
         commands:
@@ -83,7 +83,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
-        skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
+        skip: "Disabled: b/561774581 (StableHLO compiler issue)"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -113,7 +113,7 @@ steps:
 
       - label: "Integration: k3-pruned75-apc-offload-correctness"
         key: "integration_k3_pruned75_apc_offload_correctness"
-        skip: "Temporarily disabled: known Raiden DMA uprev / DmaMap issue"
+        skip: "Disabled: known Raiden DMA issue (b/561774581)"
         # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
         # boot: HBM hits, multi-turn hits, and recall from the Raiden host
         # store after both a cache reset and a real HBM eviction, each gated on

@@ -107,7 +107,7 @@ steps:
 
       - label: ":kubernetes: Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
-        skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
+        skip: "Disabled: b/561774581 (StableHLO compiler issue)"
         env:
           SHAPE: *shape_8_core
           RUN_ROOT: "perf_eval_results/qwen35_gpc_dram_pool_ci"
@@ -270,7 +270,7 @@ steps:
 
   - label: ":kubernetes: Integration: qwen35-gpc-correctness"
     key: "integration_qwen35_gpc_correctness"
-    skip: "Temporarily disabled: b/561774581 (torch-tpu StableHLO compiler issue)"
+    skip: "Disabled: b/561774581 (StableHLO compiler issue)"
     depends_on:
       - "build_docker"
       - step: "integration_qwen35_pcp8_dp8_disagg_correctness"
