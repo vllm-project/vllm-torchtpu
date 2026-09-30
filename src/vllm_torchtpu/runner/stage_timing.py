@@ -10,14 +10,14 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-import torch
+from torch_tpu._internal.stream.streams import TpuEvent
 
 
 @dataclass
 class _PendingTiming:
     stage: str
-    start: torch.tpu.Event
-    end: torch.tpu.Event
+    start: TpuEvent
+    end: TpuEvent
     end_recorded: threading.Event = field(default_factory=threading.Event)
 
 
@@ -30,7 +30,7 @@ class RunnerStageTiming:
         self._device_samples: list[tuple[str, str, float]] = []
         # Check Event support before serving; synchronization stays off the
         # serving thread after startup.
-        event = torch.tpu.Event()
+        event = TpuEvent()
         event.record()
         event.synchronize()
         self._pending: queue.Queue[_PendingTiming] = queue.Queue()
@@ -64,8 +64,8 @@ class RunnerStageTiming:
                 yield
             return
 
-        start = torch.tpu.Event()
-        end = torch.tpu.Event()
+        start = TpuEvent()
+        end = TpuEvent()
         start.record()
         pending = _PendingTiming(stage, start, end)
         self._pending.put_nowait(pending)
