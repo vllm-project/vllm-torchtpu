@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -352,6 +353,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    # Set by `gated_norm_quant_op.install` under TPU_GDN_FUSED_NORM_QUANT.
+    fused_norm_quant: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1055,6 +1058,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        if self.fused_norm_quant:
+            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)

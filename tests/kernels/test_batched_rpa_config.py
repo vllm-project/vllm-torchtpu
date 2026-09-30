@@ -82,3 +82,34 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize("decode_batch_size", [8, 4, 1])
+def test_calculate_block_sizes_caps_the_decode_batch(decode_batch_size):
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=32, num_kv_heads=8, head_dim=128, mask_value=-1e9
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=16,
+        total_q_tokens=64,
+        num_page_indices=1024,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+    )
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg,
+            serve_cfg,
+            32 * 1024 * 1024,
+            decode_batch_size=decode_batch_size,
+        )
+        default_prefill = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, 32 * 1024 * 1024
+        )[1]
+    assert decode_blocks.batch_size == decode_batch_size
+    assert prefill_blocks == default_prefill

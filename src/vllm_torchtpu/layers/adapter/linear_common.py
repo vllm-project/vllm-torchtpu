@@ -145,6 +145,73 @@ def quantized_matmul(
     return out_2d.reshape(orig_out_shape)
 
 
+def _prequant_matmul_jax(
+    x_q: jax.Array, x_s: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    """`xla_quantized_matmul`'s per-channel path on pre-quantized rows.
+
+    `x_q` [m, k] fp8 with its per-row scales `x_s` [m, 1]; `w_q` the (k, n)
+    weight with its per-channel scale `w_s` [n]. bf16 out.
+    """
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    out = out * x_s * jnp.expand_dims(w_s, 0)
+    return out.astype(jnp.bfloat16)
+
+
+_prequant_matmul_op: Callable | None = None
+_prequant_matmul_op_lock = Lock()
+
+
+def _get_prequant_matmul_op() -> Callable:
+    global _prequant_matmul_op
+    if _prequant_matmul_op is not None:
+        return _prequant_matmul_op
+
+    with _prequant_matmul_op_lock:
+        if _prequant_matmul_op is not None:
+            return _prequant_matmul_op
+
+        op = pallas.jax_op("pallas::prequant_matmul", _prequant_matmul_jax)
+
+        def _fake_prequant_matmul(
+            x_q: torch.Tensor, x_s: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+        ):
+            del x_s, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[-1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake_prequant_matmul)
+        _prequant_matmul_op = op
+        return op
+
+
+def quantized_matmul_prequant(
+    x_q: torch.Tensor, x_s: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """`quantized_matmul` for rows already quantized per row to fp8.
+
+    Per-channel weight scales only. Call `_get_prequant_matmul_op` before the
+    trace; building the op inside a traced forward is not allowed.
+    """
+    if w_s.shape != (w_q.shape[-1],):
+        raise ValueError(
+            f"The pre-quantized matmul takes per-channel weight scales [n], got "
+            f"{tuple(w_s.shape)} for a weight of {tuple(w_q.shape)}."
+        )
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    return _get_prequant_matmul_op()(x_q, x_s, w_q, w_s)
+
+
 def _quantized_matmul_fp4_jax(
     x: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:

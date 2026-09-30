@@ -109,6 +109,11 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Attention layers.
+    Patch(
+        "vllm_torchtpu.layers.adapter.fused_qk_norm_rope:install_qk_norm_rope_patch",
+        _ACTIVE,
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE

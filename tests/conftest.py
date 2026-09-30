@@ -35,7 +35,9 @@ import torch
 
 # Test files that need no chip, by path from the repo root. A session of
 # nothing but these runs with JAX pinned to the CPU.
-HOST_ONLY_TEST_FILES: tuple[str, ...] = ()
+HOST_ONLY_TEST_FILES: tuple[str, ...] = (
+    "tests/kernels/experimental/test_gated_norm_quant.py",
+)
 
 
 def _needs_no_chip(item):
