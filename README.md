@@ -148,26 +148,6 @@ git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ..
 VLLM_TARGET_DEVICE="empty" pip install --no-deps -e ../vllm
 ```
 
-### 4. \[Optional\] Build the combined `vllm-torchtpu` wheel
-
-`vllm-torchtpu` is vLLM repackaged under that distribution name, with a
-dependency on `vllm-torchtpu-core` added. Install it **instead of** `vllm`;
-installing both would make them overwrite each other's files.
-
-```bash
-# Against a published vllm-torchtpu-core release:
-.buildkite/scripts/build_vllm_torchtpu.sh <core-version> <wheel-version> [vllm-ref]
-
-# Against a locally built core wheel:
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 uv build --wheel
-.buildkite/scripts/build_vllm_torchtpu.sh --local <wheel-version> [vllm-ref]
-```
-
-`[vllm-ref]` defaults to the vLLM ref pinned in `pyproject.toml`. The build
-needs `tools/vllm-torchtpu/build.sh` in the vLLM tree being built, which
-upstream vLLM does not ship yet; point `VLLM_REPO` / `[vllm-ref]` at a fork or
-branch that has it. See the script header for all options.
-
 ---
 
 ## 🌐 Online Serving
