@@ -19,11 +19,11 @@
 #   k3_1p1d.sh prefill|decode          every pod of the role's slice
 #   k3_1p1d.sh --head prefill|decode   what multihost_entry.sh runs on index 0
 #
-# Both engines serve the nightly kimi-k3-tp32-ep config, with a bf16 KV cache
-# and prefix caching, and TPURaidenConnector as producer or consumer. The
-# prefill head then fronts the pair with the toy proxy, checks a few greedy
-# completions through it, runs the config's benchmark and lm_eval through it,
-# and exits; the JobSet's success policy tears decode down.
+# Both engines serve the kimi-k3-tp32-ep-1p1d config, which holds the serve
+# flags and the Raiden environment of each. The prefill head then fronts the
+# pair with the toy proxy, checks a few greedy completions through it, runs the
+# correctness stages and the MMLU-Pro eval through it, and exits; the JobSet's
+# success policy tears decode down.
 #
 # Environment, from manifests/workloads/kimi-k3-1p1d.yaml: POD_IP,
 # DECODE_HOST (decode's index 0), and what multihost_entry.sh reads.
@@ -31,6 +31,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
+CONFIG=kimi-k3-tp32-ep-1p1d
 PORT=8000
 PROXY_PORT=8100
 
@@ -88,38 +89,10 @@ if [[ "$head" == "0" ]]; then
     TPU_RAIDEN_ADVERTISE_HOST="$(head_ip)" || exit 1
   fi
   export TPU_RAIDEN_ADVERTISE_HOST
-  export TPU_KV_RESHARD_TRANSPORT=raiden
-  export TPU_RAIDEN_RESHARD_IMPL=store
-  export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
-  export TPU_RAIDEN_KIMIK3_ADMISSION=1
-  export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
-  # Kimi admission requires the producer's TP and the decode's TP here, on
-  # both roles: TP32 into TP32.
-  export TPU_RAIDEN_TRANSFER_PARALLELISM=32
-  export TPU_RAIDEN_DST_SHARDS=32
-  export TPU_KV_TRANSFER_PORT=9100
-  export TPU_SIDE_CHANNEL_PORT=9600
-  export TPU_KV_SHM_POOL_GB=8
-  export TPU_P2P_WAIT_PULL_TIMEOUT=600
-  export TPU_PREMAPPED_BUFFER_SIZE=17179869184
-  export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
-  # Identity and ports, which must differ so the two engines do not collide.
-  case "$role" in
-    prefill)
-      export TPU_KV_TRANSFER_NAMESPACE=k3_prefill
-      export TPU_RAIDEN_ENGINE_ID=k3-prefill-engine
-      export TPU_RAIDEN_JOB_NAME=prefill
-      export TPU_RAIDEN_RESHARD_PORT_BASE=27000
-      export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100
-      ;;
-    decode)
-      export TPU_KV_TRANSFER_NAMESPACE=k3_decode
-      export TPU_RAIDEN_ENGINE_ID=k3-decode-engine
-      export TPU_RAIDEN_JOB_NAME=decode
-      export TPU_RAIDEN_RESHARD_PORT_BASE=28000
-      export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
-      ;;
-  esac
+  # The rest of the Raiden environment is the config's.
+  export K3_1P1D_ROLE="$role"
+  # shellcheck source=/dev/null
+  source "$HERE/../../scripts/vllm/benchmarking/configs/${CONFIG}.sh"
   exec bash "$HERE/multihost_entry.sh" bash "$HERE/k3_1p1d.sh" --head "$role"
 fi
 
@@ -127,25 +100,9 @@ cd "$REPO_DIR"
 run_dir="/tmp/k3_1p1d/${role}"
 mkdir -p "$run_dir"
 
-kv_role=kv_producer
-[[ "$role" == "decode" ]] && kv_role=kv_consumer
-# No spaces: run_benchmarks.sh word-splits the command it builds.
-kv_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"${kv_role}\",\"kv_port\":14579}"
-
-# Raiden's Kimi pool manifest admits only a bf16 cache whose KDA state blocks
-# are the attention block size. The config's defaults are fp8 and no prefix
-# caching, and without prefix caching vLLM sizes a state block to the whole
-# max-model-len; with it the state blocks align to the attention blocks.
-# Exported, so the benchmark's config.json records what was served.
-export KV_CACHE_DTYPE=auto
-export ENABLE_PREFIX_CACHING=true
-# As the nightly aggregated step: one untimed benchmark pass first.
-export BENCHMARK_WARMUP_RUNS=1
-
 serve() {
-  EXTRA_SERVE_ARGS="--kv-transfer-config ${kv_config}" \
-    bash scripts/vllm/benchmarking/run_benchmarks.sh \
-    --config kimi-k3-tp32-ep --serve-only --port "$PORT" --results-dir "$run_dir"
+  bash scripts/vllm/benchmarking/run_benchmarks.sh \
+    --config "$CONFIG" --serve-only --port "$PORT" --results-dir "$run_dir"
 }
 
 # The server writes to a file; follow it here so the pod's log carries it.
@@ -161,6 +118,7 @@ fi
 serve &
 serve_pid=$!
 proxy_pid=""
+# shellcheck disable=SC2317  # invoked via the EXIT trap
 cleanup() {
   if [[ -n "$proxy_pid" ]]; then
     kill "$proxy_pid" 2>/dev/null || true
@@ -211,12 +169,40 @@ echo "--- Completions through the proxy"
 python3 "$HERE/check_completions.py" \
   "http://127.0.0.1:${PROXY_PORT}/v1/completions" moonshotai/Kimi-K3
 
-# The config's perf baseline is the aggregated engine's, so these numbers are
-# reported rather than gated, and kept out of the shared results table, where
-# they would read as the aggregated config's. The eval gate still applies:
-# splitting prefill from decode must not change the answers.
-echo "--- Benchmark and lm_eval through the proxy"
+# served <key>: what the prefill engine was started with, from the config.json
+# run_benchmarks.sh wrote beside its log.
+served() {
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' \
+    "$run_dir/config.json" "$1"
+}
+
+# The eval runs even if a stage fails: the pair holds 32 chips, and there is no
+# sense spending them to learn one fact. Not if the stages could not start,
+# though, which is this script's fault or the config's and not the pair's.
+stages_rc=0
+
+echo "--- Correctness stages through the proxy"
+PROXY_PORT="$PROXY_PORT" \
+PREFILL_URL="http://127.0.0.1:${PORT}" \
+DECODE_URL="http://${DECODE_HOST}:${PORT}" \
+PREFILL_CHUNK_TOKENS="$(served max_num_batched_tokens)" \
+LOG_DIR="${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness" \
+  bash scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh || stages_rc=$?
+if [[ "$stages_rc" -gt 1 ]]; then
+  echo "ERROR: the correctness stages did not start (exit ${stages_rc})"
+  exit 1
+fi
+rc="$stages_rc"
+
+# No benchmark: what the pair serves is set by the stages above, one KV block
+# to a prefill chunk, and its latency describes nothing a reader tracks. The
+# eval is gated on the aggregated config's baseline, since splitting prefill
+# from decode must not change the answers, and kept out of the shared results
+# table, where its rows would read as that config's.
+echo "--- lm_eval through the proxy"
 bash scripts/vllm/benchmarking/run_eval_flow.sh \
-  --config kimi-k3-tp32-ep --run-lm-eval \
+  --config "$CONFIG" --baseline-config kimi-k3-tp32-ep --run-lm-eval \
   --host 127.0.0.1 --port "$PROXY_PORT" \
-  --skip-perf-check --skip-db-upload
+  --skip-benchmark --skip-db-upload || rc=1
+
+exit "$rc"
