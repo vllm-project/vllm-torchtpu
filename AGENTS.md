@@ -1,5 +1,10 @@
 # Agent Instructions for vLLM TPU
 
+## Repository standards
+
+- `docs/coding_guidance.md` (R-1.x through R-8.x coding style and hygiene)
+- `docs/optimization_best_practices.md` (TPU performance and memory invariants)
+
 ## Duplicate-work checks
 
 Before proposing a PR, run these checks:
