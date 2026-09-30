@@ -21,11 +21,11 @@ then chunks are cut by token count alone.
 
 from typing import Any
 
-from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
