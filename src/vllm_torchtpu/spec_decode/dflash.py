@@ -609,6 +609,7 @@ class DFlashProposer:
                     sync=True,
                 )
                 if runner.most_model_len is not None:
+                    assert runner.num_reqs_most_model_len is not None
                     self._dummy_precompute_and_update_kv_cache(
                         num_tokens=num_tokens,
                         num_reqs=runner.num_reqs_most_model_len,

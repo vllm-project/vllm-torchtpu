@@ -59,6 +59,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -96,6 +97,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
+    attention_block_table_width,
     stage_block_table_uploads,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -815,24 +817,12 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         # Pallas SMEM-aware num_reqs caps.
-        self.num_reqs_most_model_len = (
-            min(
-                PallasAttentionBackend.get_max_num_seqs(
-                    self.most_model_len, self.block_size
-                ),
-                self.max_num_reqs,
-                self.max_num_tokens,
-            )
-            if self.most_model_len is not None
-            else None
-        )
-        self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs(
-                self.max_model_len, self.block_size
-            ),
-            self.max_num_reqs,
-            self.max_num_tokens,
-        )
+        # Capacity state exists before the first refresh; subsequent refreshes
+        # run after the input batch is rebuilt during KV cache initialization.
+        self._attention_capacity: dict[
+            tuple[int, int], dict[str, tuple[int, int, int]]
+        ] = {}
+        self._refresh_smem_request_caps()
 
         self.sample_from_logits_func = self.sample_from_logits
 
@@ -898,12 +888,6 @@ class TPUModelRunner(GPUModelRunner):
         # Token granule the pipeline chunk scheduler cuts at; set with the
         # extra buckets once the KV block size is final.
         self._pp_chunk_granularity: int | None = None
-        # (pairs, bq, bkv) per kernel mode for the batched attention
-        # kernel, per (sequences, pages per sequence) it is called with;
-        # computed once the KV block size is final.
-        self._attention_capacity: dict[
-            tuple[int, int], dict[str, tuple[int, int, int]]
-        ] = {}
         # Whether an attention layer runs the batched kernel; None until
         # asked.
         self._attention_runs_batched_kernel: bool | None = None
@@ -4951,7 +4935,16 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             num_seqs = self.num_reqs_most_model_len
-            pages_per_seq = cdiv(self.most_model_len, page_size)
+            group_id = self._attention_kv_cache_group_id
+            if group_id is not None and getattr(self, "kv_cache_config", None):
+                pages_per_seq = attention_block_table_width(
+                    self.input_batch.block_table[group_id],
+                    self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec,
+                    self.vllm_config,
+                    self.most_model_len,
+                )
+            else:
+                pages_per_seq = cdiv(self.most_model_len, page_size)
         return num_seqs, pages_per_seq, page_size
 
     def _check_attention_schedule(
@@ -5610,6 +5603,7 @@ class TPUModelRunner(GPUModelRunner):
                     use_max_model_len=True,
                 )
                 if self.most_model_len is not None:
+                    assert self.num_reqs_most_model_len is not None
                     self._dummy_run(
                         num_tokens,
                         self.num_reqs_most_model_len,
@@ -6159,6 +6153,67 @@ class TPUModelRunner(GPUModelRunner):
             return cast(type[Any], PallasAttentionBackend)
         raise NotImplementedError(f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
+    def _refresh_smem_request_caps(
+        self, kv_cache_config: KVCacheConfig | None = None
+    ) -> None:
+        """Use the widest attention table each kernel invocation will prefetch.
+
+        Startup initially has a placeholder table. Refresh after vLLM installs
+        the final cache groups so DCP and kernel block splitting are reflected.
+        """
+        groups = (
+            kv_cache_config
+            if kv_cache_config is not None
+            else getattr(self, "kv_cache_config", None)
+        )
+        attention_groups = (
+            [
+                (gid, group.kv_cache_spec)
+                for gid, group in enumerate(groups.kv_cache_groups)
+                if isinstance(
+                    group.kv_cache_spec.first_spec
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else group.kv_cache_spec,
+                    AttentionSpec,
+                )
+            ]
+            if groups is not None
+            else []
+        )
+
+        def widest_table(model_len: int | None) -> int:
+            if attention_groups:
+                return max(
+                    attention_block_table_width(
+                        self.input_batch.block_table[gid],
+                        spec,
+                        self.vllm_config,
+                        model_len,
+                    )
+                    for gid, spec in attention_groups
+                )
+            # Before final specs are available, retain the conservative budget.
+            if model_len is None:
+                return self.max_num_blocks_per_req
+            return cdiv(model_len, self.block_size)
+
+        self.num_reqs_max_model_len = min(
+            PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
+            self.max_num_reqs,
+            self.max_num_tokens,
+        )
+        self.num_reqs_most_model_len = None
+        if self.most_model_len is not None:
+            pages = widest_table(self.most_model_len)
+            self.num_reqs_most_model_len = min(
+                PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
+                self.max_num_reqs,
+                self.max_num_tokens,
+            )
+            self.num_blocks_per_most_len_req = pages
+        self._attention_capacity.clear()
+        self._decode_device_cache_key = None
+
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
@@ -6175,26 +6230,20 @@ class TPUModelRunner(GPUModelRunner):
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
         super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        if (
-            hasattr(self, "input_batch")
-            and self.input_batch is not None
-            and hasattr(self.input_batch, "block_table")
-        ):
-            try:
-                self.max_num_blocks_per_req = int(
-                    self.input_batch.block_table[0].get_cpu_tensor().shape[1]
+        if self.input_batch.block_table:
+            self.max_num_blocks_per_req = self.input_batch.block_table[
+                0
+            ].max_num_blocks_per_req
+            if self.block_table_cpu.shape != (
+                self.max_num_reqs,
+                self.max_num_blocks_per_req,
+            ):
+                self.block_table_cpu = torch.zeros(
+                    (self.max_num_reqs, self.max_num_blocks_per_req),
+                    dtype=torch.int32,
+                    device="cpu",
                 )
-                if (
-                    self.block_table_cpu.shape[0] != self.max_num_reqs
-                    or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
-                ):
-                    self.block_table_cpu = torch.zeros(
-                        (self.max_num_reqs, self.max_num_blocks_per_req),
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-            except (IndexError, TypeError, AttributeError, KeyError):
-                pass
+        self._refresh_smem_request_caps(kv_cache_config)
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

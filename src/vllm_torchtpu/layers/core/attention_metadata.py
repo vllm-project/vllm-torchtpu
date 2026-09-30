@@ -12,7 +12,12 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -20,6 +25,22 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+
+
+def attention_block_table_width(
+    block_table: Any,
+    spec: KVCacheSpec,
+    vllm_config: Any,
+    model_len: int | None = None,
+) -> int:
+    """Match allocated, rank-local kernel page ordinals, including block splits."""
+    if model_len is None:
+        return block_table.max_num_blocks_per_req
+    pages = spec.max_num_blocks_per_req(vllm_config, model_len)
+    return min(
+        pages * getattr(block_table, "blocks_per_kv_block", 1),
+        block_table.max_num_blocks_per_req,
+    )
 
 
 @functools.partial(
@@ -295,7 +316,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             target_num_blocks = block_table_obj.max_num_blocks_per_req
         else:
             assert runner.most_model_len is not None
-            target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
+            spec = self.kv_cache_spec
+            first_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            if isinstance(first_spec, AttentionSpec):
+                target_num_blocks = attention_block_table_width(
+                    block_table_obj,
+                    self.kv_cache_spec,
+                    self.vllm_config,
+                    runner.most_model_len,
+                )
+            else:
+                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
             if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
                 # Speculative decoding: the manager appends
                 # `num_speculative_blocks` (= window - 1) checkpoint blocks

@@ -1189,6 +1189,7 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 if is_async:
                     rejected_dev_per_chunk.append(
                         _maybe_pad_dim0(nr, knr) if nr is not None else None
@@ -1578,6 +1579,7 @@ class Eagle3Proposer:
             if use_max_model_len
             else runner.num_reqs_most_model_len
         )
+        assert kernel_num_reqs is not None
 
         if step_idx == 0:
             seq_lens = chunk_ctx.seq_lens
