@@ -13,23 +13,24 @@
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp32-ep.sh"
 
 # ---- serve flags --------------------------------------------------------------
-# The nightly's fp8 cache, which is what the pair is meant to serve and what
-# halves the pool against bf16. Raiden's Kimi pool manifest requires the KDA
-# state blocks to be the attention block size: the nightly serves without
-# prefix caching, and without it vLLM sizes a state block to the whole
-# max-model-len; with it the state blocks align to the attention blocks.
+# fp8, as the nightly serves; K3_1P1D_KV_CACHE_DTYPE=auto selects bf16.
 KV_CACHE_DTYPE="${K3_1P1D_KV_CACHE_DTYPE:-fp8}"
+# The Kimi pool manifest needs KDA state blocks to match attention blocks,
+# which only prefix caching gives.
 ENABLE_PREFIX_CACHING=true
 
-# One prefill chunk is one KV block, the nightly's --block-size 256. K3's
-# greedy output moves with prefill chunk geometry, and hybrid prefix caching
-# cuts chunks at block boundaries, so only with chunk == block does a request
-# resumed from a prefix hit run the chunk shapes of the cold one - which is
-# what lets the correctness stages compare their tokens.
-MAX_NUM_BATCHED_TOKENS=256
+# One prefill chunk is one KV block, so a request resumed from a prefix hit
+# runs the cold run's chunk shapes and the stages can compare tokens. The block
+# is the one the engine settles on: 256 for bf16, 324 for fp8 (81 packed rows
+# of four tokens); the stages verify it against /metrics.
+if [ "$KV_CACHE_DTYPE" = "fp8" ]; then
+    MAX_NUM_BATCHED_TOKENS=324
+else
+    MAX_NUM_BATCHED_TOKENS=256
+fi
 
 _before="$EXTRA_SERVE_ARGS"
-EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed 's/"compile_sizes":\[1,8,8192\]/"compile_sizes":[1,8,256]/')
+EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed "s/\"compile_sizes\":\[1,8,8192\]/\"compile_sizes\":[1,8,${MAX_NUM_BATCHED_TOKENS}]/")
 if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
     echo "ERROR: kimi-k3-tp32-ep-1p1d.sh: the nightly config no longer sets compile_sizes [1,8,8192]; update the substitution above" >&2
     return 1
