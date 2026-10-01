@@ -64,6 +64,8 @@ pre-commit install --hook-type pre-commit --hook-type commit-msg
 pre-commit run --all-files
 ```
 
+The pre-commit `pyrefly` hook type-checks without third-party packages. CI also runs a full-environment check that resolves torch, jax and vllm; run it locally with `bash tools/typecheck_full.sh`. [Type checking](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/developers_guide/type_checking.md) covers both checks, what the local run needs, and how to fix new errors.
+
 ## Building the documentation
 
 The documentation site is built with [MkDocs](https://www.mkdocs.org/) and the Material theme from the sources in `docs/`, using the same setup as [tpu-inference](https://github.com/vllm-project/tpu-inference). Read the Docs builds it from `mkdocs.yml` on every push. To preview it locally:

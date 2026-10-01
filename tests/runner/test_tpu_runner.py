@@ -1536,6 +1536,7 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
         req_ids = [f"r{i}" for i in range(len(computed))]
+        runner._mamba_offset_seeded = set(req_ids)
         runner.input_batch.req_ids = req_ids
         runner.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         runner.input_batch.num_computed_tokens_cpu = np.array(computed)

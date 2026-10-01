@@ -1784,6 +1784,7 @@ class TPUModelRunner(GPUModelRunner):
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
             state_srcs: list[int] = []
+            new_owners: list[bool] = []
             ckpt_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
@@ -1793,6 +1794,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     state_srcs.append(src)
+                    new_owners.append(req_ids[row] not in self._mamba_offset_seeded)
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
@@ -1810,7 +1812,7 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows)
+                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -1917,7 +1919,10 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _spec_seed_sources(
-        self, state_srcs: list[int], ckpt_rows: list[list[int]]
+        self,
+        state_srcs: list[int],
+        ckpt_rows: list[list[int]],
+        new_owners: list[bool],
     ) -> torch.Tensor:
         """Seed source per crossing: the checkpoint being resumed from.
 
@@ -1935,6 +1940,15 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        # PD and prefix-cache restores provide committed state in checkpoint 0.
+        # A recycled source block can retain another request's MTP offset.
+        # The first-forward reset clears the destination, after this source
+        # selection, so ignore that stale offset here without mutating the
+        # source block (which may be shared). Live requests retain their offset.
+        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
+            self.device, non_blocking=True
+        )
+        off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
@@ -4806,6 +4820,7 @@ class TPUModelRunner(GPUModelRunner):
         use_max_model_len: bool = True,
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
+        through_handoff: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -4813,6 +4828,11 @@ class TPUModelRunner(GPUModelRunner):
         ``num_tokens`` tokens behind that many computed tokens (the same
         program: only the metadata values differ), and the forward's wall
         time in ms is returned once its outputs have materialized.
+
+        With ``through_handoff`` a pipeline stage takes its input from the
+        hand-off and passes its output on, as a serving step does; every
+        stage must then run the same sequence of forwards, and the caller
+        settles the hand-off afterwards.
         """
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
@@ -4952,7 +4972,11 @@ class TPUModelRunner(GPUModelRunner):
             # step is a real token.
             padding_state.update(num_tokens if profiling else 0, num_tokens)
         intermediate_tensors = None
-        if not self._pp_is_first:
+        if through_handoff:
+            assert self._pp_wave is not None and not profiling
+            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling
             )
@@ -4993,10 +5017,20 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
             )
             if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    # The output leaves padded to the hand-off buffer; it is
+                    # submitted without waiting, as between serving steps.
+                    self._pp_wave.end_forward(
+                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
                 # A stage before the last produces no logits; nothing
                 # consumes its output in a warmup.
                 synchronize_tensors(list(out.tensors.values()))
                 return (time.perf_counter() - started) * 1000.0 if profiling else None
+            if through_handoff:
+                self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
@@ -5778,6 +5812,45 @@ class TPUModelRunner(GPUModelRunner):
                 raise shape_variants.ShapeSpecializationError(
                     f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
                 )
+        if self._pp_wave is not None:
+            self._warmup_handoff_forwards()
+
+    def _warmup_handoff_forwards(self) -> None:
+        """Run every token bucket once through the pipeline hand-off.
+
+        A stage's serving forward reads a slice of the received buffer and
+        pads its output into the sent one, and those ops fuse with the
+        forward's first and last programs; the standalone pass above leaves
+        them to compile at the first serving step of each bucket, with every
+        stage waiting. The stages run this pass in step, so it comes after
+        the standalone pass, where each stage compiles its backbone on its
+        own.
+        """
+        assert self._pp_wave is not None
+        started = time.perf_counter()
+        for num_tokens in self.num_tokens_paddings:
+            self._dummy_run(
+                num_tokens,
+                self.num_reqs_max_model_len,
+                self.max_num_blocks_per_req,
+                use_max_model_len=True,
+                through_handoff=True,
+            )
+            if self.most_model_len is not None:
+                self._dummy_run(
+                    num_tokens,
+                    self.num_reqs_most_model_len,
+                    self.num_blocks_per_most_len_req,
+                    use_max_model_len=False,
+                    through_handoff=True,
+                )
+        self._pp_wave.settle()
+        synchronize_device()
+        logger.info(
+            "Pipeline hand-off warmup: %d buckets in %.1f s",
+            len(self.num_tokens_paddings),
+            time.perf_counter() - started,
+        )
 
     def _precompile_mamba_state_seed_copies(self) -> None:
         """Warm the seed-copy program for every raw-pool set at every bucket
