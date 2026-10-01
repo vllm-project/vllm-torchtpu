@@ -41,6 +41,13 @@ def main_kernel(
     num_streams: int,
     top_k: int,
 ):
+    # Keep both cache operands in 128-word rows at the custom-call boundary.
+    # They may alias one shared pool. Different operand shapes at that boundary
+    # make XLA deduplication bind the 32-word RoPE view to a 128-word argument.
+    # Reinterpret the untiled HBM reference inside the kernel instead.
+    rope_in_hbm_ref = rope_in_hbm_ref.reshape(
+        rope_in_hbm_ref.shape[0] * 4, csa_cache_layout.ROPE_WORDS
+    )
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None
@@ -255,12 +262,11 @@ def csa_gather(
     assert nope_cache.shape[2] == csa_cache_layout.ROW_WORDS
     assert rope_cache.shape[2] == csa_cache_layout.ROW_WORDS
 
-    # Free reshapes: a 128-lane int32 array's T(8,128) tiling is byte-identical
-    # to row-major, and the kernel takes its operands untiled
-    # (`use_tc_tiling_on_sc=False`), so token t's rope is words
-    # [32 t, 32 t + 32).
+    # A 128-lane int32 array's T(8,128) tiling is byte-identical to row-major.
+    # The kernel takes both operands untiled (`use_tc_tiling_on_sc=False`) and
+    # views RoPE as 32-word records internally, including when the pools alias.
     nope_cache = nope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
-    rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
+    rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
     out_size = indices.size
@@ -289,9 +295,9 @@ def csa_gather(
         num_tokens = nope_cache.shape[0]
         pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
-        rope_pad = (
-            jnp.arange(out_pad_size, dtype=rope_indices.dtype) * 104729
-        ) % rope_cache.shape[0]
+        rope_pad = (jnp.arange(out_pad_size, dtype=rope_indices.dtype) * 104729) % (
+            rope_cache.size // csa_cache_layout.ROPE_WORDS
+        )
         rope_indices = jnp.concatenate([rope_indices, rope_pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
