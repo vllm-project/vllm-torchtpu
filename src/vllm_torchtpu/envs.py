@@ -190,6 +190,7 @@ def env_with_choices(
 
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -683,11 +684,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_INDEXER_KV_CACHE_MODE": lambda: (
         env_with_choices(
             "VLLM_TPU_INDEXER_KV_CACHE_MODE",
-            "sal",
+            DEFAULT_INDEXER_KV_CACHE_MODE,
             ["xla", "has", "sal"],
             case_sensitive=False,
         )()
-        or "sal"
+        or DEFAULT_INDEXER_KV_CACHE_MODE
     ).lower(),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

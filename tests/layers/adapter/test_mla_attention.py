@@ -999,9 +999,20 @@ def test_mla_forward_uses_context_without_runtime_kv_scale_state():
 def test_indexer_kv_cache_mode_env_validation(monkeypatch):
     """VLLM_TPU_INDEXER_KV_CACHE_MODE defaults to 'sal', normalizes case, and
     rejects unknown modes."""
+    import importlib
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
     assert "VLLM_TPU_INDEXER_KV_CACHE_MODE" in TpuPlatform.additional_env_vars
+    assert (
+        envs.DEFAULT_INDEXER_KV_CACHE_MODE
+        == st_mod.DEFAULT_INDEXER_KV_CACHE_MODE
+        == "sal"
+    )
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
+    assert st_mod.indexer_kv_layout(256) == st_mod.KVLayout.SEQ_ALONG_LANE
 
     for raw, expected in [("HAS", "has"), ("SAL", "sal"), ("Xla", "xla")]:
         monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raw)

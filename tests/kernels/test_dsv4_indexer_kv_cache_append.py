@@ -27,6 +27,7 @@ Performance lives in `scripts/benchmark_indexer_kv_cache_append.py`.
 """
 
 import functools
+import os
 import types
 
 import jax
@@ -1658,6 +1659,12 @@ class CoalescedKvAppendTest(parameterized.TestCase):
     def test_indexer_kv_layout_and_check_scatter_rows_supported(self):
         has_enum = st_lib.KVLayout.HEAD_ALONG_SUBLANE
         sal_enum = st_lib.KVLayout.SEQ_ALONG_LANE
+        prev = os.environ.pop("VLLM_TPU_INDEXER_KV_CACHE_MODE", None)
+        try:
+            self.assertEqual(st_lib.indexer_kv_layout(256), sal_enum)
+        finally:
+            if prev is not None:
+                os.environ["VLLM_TPU_INDEXER_KV_CACHE_MODE"] = prev
         self.assertEqual(st_lib.indexer_kv_layout(256, mode="xla"), has_enum)
         self.assertEqual(st_lib.indexer_kv_layout(256, mode="has"), has_enum)
         self.assertEqual(st_lib.indexer_kv_layout(256, mode="sal"), sal_enum)

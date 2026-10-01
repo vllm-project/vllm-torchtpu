@@ -512,6 +512,7 @@ def prepare_outputs(out):
 # 8-bit KV data packs 4 values into every 32-bit sublane word.
 KV_PACKING = 4
 
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 _INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int]] = set()
 
 
@@ -532,7 +533,10 @@ def indexer_kv_layout(
 
             raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
         except ImportError:
-            raw_mode = os.getenv("VLLM_TPU_INDEXER_KV_CACHE_MODE") or "xla"
+            raw_mode = (
+                os.getenv("VLLM_TPU_INDEXER_KV_CACHE_MODE")
+                or DEFAULT_INDEXER_KV_CACHE_MODE
+            )
     else:
         raw_mode = mode
     resolved = raw_mode.strip().lower()
