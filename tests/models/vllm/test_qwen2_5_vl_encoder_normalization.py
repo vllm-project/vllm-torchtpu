@@ -5,10 +5,13 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.fusion.mm_input_norm import (
+    FusedMMInputNorm,
+    IdentityInputNorm,
+)
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration as Model,
 )
-from vllm.model_executor.models.vision import FusedInputNorm
 
 from vllm_torchtpu.models.vllm.qwen2_5_vl_patch import maybe_patch_qwen2_5_vl
 
@@ -19,7 +22,12 @@ class RecordingVisionEncoder:
     dtype = torch.float32
     spatial_merge_size = 1
 
+    def __init__(self, input_norm=None):
+        self.input_norm = input_norm or IdentityInputNorm()
+
     def __call__(self, pixels, *args, **kwargs):
+        if self.input_norm is not None:
+            pixels = self.input_norm(pixels, self.dtype)
         return pixels
 
 
@@ -39,12 +47,17 @@ def test_encoder_protocol_normalizes_like_ordinary_image_path(
     )
 
     normalizer = (
-        FusedInputNorm([0.5] * 3, [0.25] * 3, 1 / 255)
+        FusedMMInputNorm(
+            mean=torch.tensor([0.5, 0.5, 0.5]),
+            std=torch.tensor([0.25, 0.25, 0.25]),
+            scale=1 / 255,
+        )
         if device_normalization
-        else FusedInputNorm.identity()
+        else IdentityInputNorm()
     )
+    visual = RecordingVisionEncoder(input_norm=normalizer)
     model = SimpleNamespace(
-        visual=RecordingVisionEncoder(), input_norm=normalizer, use_data_parallel=False
+        visual=visual, input_norm=normalizer, use_data_parallel=False
     )
     for name in (
         "get_input_modality",

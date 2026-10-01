@@ -1,3 +1,4 @@
+from collections.abc import Hashable
 from typing import Any
 
 import torch
@@ -128,7 +129,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+    def _capture_budget_graph(
+        self,
+        token_budget: int,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
+    ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
@@ -137,6 +143,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
+            # pyrefly: ignore[unsupported-operation]
             self._get_graph_set(path)[token_budget] = template
         except Exception as e:
             logger.warning(

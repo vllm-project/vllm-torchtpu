@@ -592,6 +592,7 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
         self.kernel = _NullInputQuantKernel()
+        self.wkey = "weight"
 
     def create_weights(
         self,
