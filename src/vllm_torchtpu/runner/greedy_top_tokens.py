@@ -72,6 +72,18 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
     return tokens.to(torch.int64).view(-1, 1)
 
 
+def log_step_path(is_spec_step: bool) -> None:
+    """Logs, once per path, that a step's tokens came from the top tokens."""
+    if is_spec_step:
+        logger.info_once(
+            "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens"
+        )
+    else:
+        logger.info_once(
+            "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens"
+        )
+
+
 def step_eligible(
     input_batch: InputBatch, requests: Mapping[str, CachedRequestState]
 ) -> bool:

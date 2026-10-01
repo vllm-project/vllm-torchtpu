@@ -2,6 +2,7 @@
 """TPU_GREEDY_TOP_TOKENS: the vocabulary-parallel argmax against the
 full-logits argmax, and when a step may take it."""
 
+import logging
 import math
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm import logger as vllm_logger
 from vllm.model_executor.layers import logits_processor as lp_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sampling_params import StructuredOutputsParams
@@ -321,3 +323,24 @@ def test_rejection_sampler_refuses_argmax_for_sampling():
             do_sampling=True,
             target_argmax=torch.zeros(1, dtype=torch.int64),
         )
+
+
+def test_log_step_path_logs_each_path_once():
+    vllm_logger._print_info_once.cache_clear()
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = greedy_top_tokens.logger
+    level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        for is_spec_step in (True, False, True, False, False):
+            greedy_top_tokens.log_step_path(is_spec_step)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    assert [r.getMessage() for r in records] == [
+        "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens",
+        "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens",
+    ]
