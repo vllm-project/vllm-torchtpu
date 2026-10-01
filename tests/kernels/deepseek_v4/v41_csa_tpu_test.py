@@ -14,6 +14,19 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import csa_gath
 from vllm_torchtpu.models.vllm.deepseek_v41 import cache, csa
 
 
+def test_torchtpu_bridge_registration():
+    _require_tpu()
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+    with set_vllm_model_wrapper_context(mesh=mesh):
+        csa.initialize_csa()
+
+
 def _require_tpu():
     if jax.default_backend() != "tpu":
         pytest.skip("Requires a physical TPU with SparseCore")

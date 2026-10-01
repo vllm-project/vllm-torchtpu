@@ -39,7 +39,12 @@ def pack_csa_values(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     )
 
 
-def write_csa_values(pool, nope_records, rope_records, values):
+def write_csa_values(
+    pool: jax.Array,
+    nope_records: jax.Array,
+    rope_records: jax.Array,
+    values: jax.Array,
+) -> jax.Array:
     nope, rope = pack_csa_values(values)
     pool = scatter_cache_words(pool, nope_records, nope)
     return scatter_cache_words(pool, rope_records, rope)
@@ -142,8 +147,15 @@ def compact_csa_records(nope_records, rope_records):
 
 
 def csa_attention_jax(
-    q, swa, main, swa_records, nope_records, rope_records, sink, scale
-):
+    q: jax.Array,
+    swa: jax.Array,
+    main: jax.Array,
+    swa_records: jax.Array,
+    nope_records: jax.Array,
+    rope_records: jax.Array,
+    sink: jax.Array,
+    scale: float,
+) -> jax.Array:
     from .attention_kernels import paged_attention_state_jax
 
     maximum, denominator, numerator = paged_attention_state_jax(
@@ -192,7 +204,16 @@ def initialize_csa():
         check_vma=False,
     )
 
-    def attend(q, swa, main, swa_records, nope_records, rope_records, sink, scale):
+    def attend(
+        q: jax.Array,
+        swa: jax.Array,
+        main: jax.Array,
+        swa_records: jax.Array,
+        nope_records: jax.Array,
+        rope_records: jax.Array,
+        sink: jax.Array,
+        scale: float,
+    ) -> jax.Array:
         return jax.shard_map(
             functools.partial(csa_attention_jax, scale=scale),
             mesh=mesh,
