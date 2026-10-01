@@ -335,8 +335,12 @@ def test_log_step_path_logs_each_path_once():
     logger = logging.getLogger("vllm")
     logger.addHandler(handler)
     try:
+        # The runner's warmup steps hold only synthetic "__..__" requests.
+        greedy_top_tokens.log_step_path(True, ["__spec_warmup_0__", None])
+        greedy_top_tokens.log_step_path(False, ["__spec_warmup_b2_0__"])
+        assert records == []
         for is_spec_step in (True, False, True, False, False):
-            greedy_top_tokens.log_step_path(is_spec_step)
+            greedy_top_tokens.log_step_path(is_spec_step, ["__spec_warmup_1__", "r0"])
     finally:
         logger.removeHandler(handler)
     assert [r.getMessage() for r in records] == [

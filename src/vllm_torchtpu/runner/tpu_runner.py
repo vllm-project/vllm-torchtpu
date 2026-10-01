@@ -4287,7 +4287,7 @@ class TPUModelRunner(GPUModelRunner):
         # configured but no drafts exist yet, so is_spec_step is False there.
         is_spec_step = any(md is not None for md in state.spec_decode_metadata_list)
         if state.top_tokens:
-            greedy_top_tokens.log_step_path(is_spec_step)
+            greedy_top_tokens.log_step_path(is_spec_step, self.input_batch.req_ids)
         # Per-chunk mamba slot ids (hybrid + spec decode only; None entries
         # otherwise) for the read-offset scatter after sampling.
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(

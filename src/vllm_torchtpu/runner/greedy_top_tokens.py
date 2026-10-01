@@ -13,7 +13,7 @@ lower ids.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -73,8 +73,14 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
     return tokens.to(torch.int64).view(-1, 1)
 
 
-def log_step_path(is_spec_step: bool) -> None:
-    """Logs, once per path, that a step's tokens came from the top tokens."""
+def log_step_path(is_spec_step: bool, req_ids: Sequence[str | None]) -> None:
+    """Logs, once per path, that a step's tokens came from the top tokens.
+
+    Steps holding only the runner's synthetic warmup requests (ids
+    ``__..__``) are skipped, so the line marks served traffic.
+    """
+    if all(req_id is None or req_id.startswith("__") for req_id in req_ids):
+        return
     if is_spec_step:
         logger.info_once(
             "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens"
