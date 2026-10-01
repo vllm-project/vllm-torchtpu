@@ -6,13 +6,24 @@ as test_pool_adapters.py).
 """
 
 import functools
-import math
 import pathlib
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from kernels.gdn.v3.gdn_pool_state_utils import (
+    GRANULE,
+    WORDS_PER_GRANULE,
+    on_cpu,
+    pack_bf16_rows,
+    put_words,
+    read_states,
+    state_words,
+    unpack_bf16_rows,
+    words_to_pool,
+    write_states,
+)
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
@@ -38,15 +49,9 @@ POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES,)
 # them -- it rederives the conv region's start from the pool's own geometry --
 # so these exist for the tests to place and read bytes with. Both regions are
 # plain byte ranges, so their extents follow from the state dtypes alone.
-GRANULE = 512
-WORDS_PER_GRANULE = GRANULE // 4
 CONV_GRANULES = (KERNEL_SIZE - 1) * DIM * 4 // GRANULE  # 36
 # Pool tokens the conv region covers, from the start of its kernel block.
 CONV_END_TOK = CONV_GRANULES * GRANULE // TOK_BYTES  # 18
-
-
-def _ssm_granules(dtype=jnp.float32) -> int:
-    return N_V * D_K * D_V * jnp.dtype(dtype).itemsize // GRANULE
 
 
 def _plan(pool=None, **overrides):
@@ -137,86 +142,17 @@ def _garbage_pool(seed, num_mgr: int = NUM_MGR):
     return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
 
 
-def _on_cpu(fn, *args):
-    """Run a pure bit-shuffle on CPU, then hand the result back to the TPU.
-
-    TPU canonicalises NaN payloads whenever float bytes pass through a vector
-    register, so bitcasting or transposing a bf16/fp8 pool on device silently
-    rewrites about a percent of its words -- measured on v7/jax 0.10.2: 71 of
-    4096 uint32 words through bfloat16, 77 through float8_e4m3fn, 0 through
-    int8. The kernel never meets this, because its granule DMA moves the pool
-    as uint32 and no float register ever sees it; a host-side harness that
-    builds or reads the pool *through the pool's own dtype* does. CPU bitcasts
-    are exact, so the byte layout these tests assert on is the real one.
-    """
-    cpu = jax.devices("cpu")[0]
-    with jax.default_device(cpu):
-        out = jax.jit(fn)(*jax.device_put(args, cpu))
-    return jax.device_put(out, jax.devices()[0])
-
-
-def _mgr_words(pool, split=SPLIT):
-    """The pool the way the kernel addresses it: one uint32 row per state.
-
-    A ref's `bitcast(uint32)` packs along the *second-minor* (sublane) axis,
-    which for a pool row `(..., packing, lanes)` means one word per lane, not
-    one word per adjacent pair. Moving that axis minormost first is what makes
-    the host view agree with the kernel's granule stream.
-    """
-    words = jnp.moveaxis(pool, -2, -1).view(jnp.uint32)
-    return words.reshape(pool.shape[0] // split, -1)
-
-
-def _unwords(words, pool):
-    """Inverse of `_mgr_words`, back to `pool`'s shape and dtype."""
-    moved = words.reshape(*pool.shape[:-2], pool.shape[-1], 1).view(pool.dtype)
-    return jnp.moveaxis(moved, -2, -1).reshape(pool.shape)
-
-
-def _put(words, idx, granule0, payload):
-    """Drop `payload`'s raw bytes at a granule offset of each named state."""
-    body = payload.reshape(idx.shape[0], -1).view(jnp.uint32)
-    start = granule0 * WORDS_PER_GRANULE
-    return words.at[idx, start : start + body.shape[1]].set(body)
-
-
-def _take(words, idx, granule0, shape, dtype):
-    nwords = math.prod(shape) * jnp.dtype(dtype).itemsize // 4
-    start = granule0 * WORDS_PER_GRANULE
-    return words[idx, start : start + nwords].view(dtype).reshape(idx.shape[0], *shape)
+_STATE_SHAPES = dict(recurrent_shape=(N_V, D_K, D_V), conv_shape=(KERNEL_SIZE - 1, DIM))
 
 
 def _write_states(pool, ssm, conv, idx, split=SPLIT, ssm_dtype=jnp.float32):
-    """Place both regions at their granule offsets (the byte layout the
-    seam must reproduce exactly). Region tails are left alone -- the kernel
-    moves live granules only, and nothing reads the padding."""
-
-    def build(pool, ssm, conv, idx):
-        words = _mgr_words(pool, split)
-        words = _put(words, idx, 0, jnp.asarray(ssm, ssm_dtype))
-        words = _put(
-            words, idx, _ssm_granules(ssm_dtype), jnp.asarray(conv, jnp.float32)
-        )
-        return _unwords(words, pool)
-
-    return _on_cpu(build, pool, ssm, conv, idx)
+    return write_states(pool, ssm, conv, idx, split=split, recurrent_dtype=ssm_dtype)
 
 
 def _read_states(pool, idx, split=SPLIT, ssm_dtype=jnp.float32):
-    def take(pool, idx):
-        words = _mgr_words(pool, split)
-        return (
-            _take(words, idx, 0, (N_V, D_K, D_V), ssm_dtype),
-            _take(
-                words,
-                idx,
-                _ssm_granules(ssm_dtype),
-                (KERNEL_SIZE - 1, DIM),
-                jnp.float32,
-            ),
-        )
-
-    return _on_cpu(take, pool, idx)
+    return read_states(
+        pool, idx, split=split, recurrent_dtype=ssm_dtype, **_STATE_SHAPES
+    )
 
 
 def _rand_inputs(seed, num_tokens):
@@ -629,55 +565,8 @@ class TestPooledSpecWindows:
             )
 
 
-def _pack_bf16_rows(ssm):
-    """bf16 [..., D_K, D_V] -> uint32 [..., D_K // 2, D_V], packed the way a
-    ref bitcast packs it: word (r, l) holds row 2r (low half) and row 2r + 1
-    (high half) of lane l."""
-    pairs = ssm.astype(jnp.bfloat16).reshape(
-        *ssm.shape[:-2], ssm.shape[-2] // 2, 2, ssm.shape[-1]
-    )
-    return jax.lax.bitcast_convert_type(jnp.moveaxis(pairs, -2, -1), jnp.uint32)
-
-
-def _unpack_bf16_rows(words):
-    """Inverse of `_pack_bf16_rows`."""
-    pairs = jax.lax.bitcast_convert_type(words, jnp.bfloat16)
-    rows = jnp.moveaxis(pairs, -1, -2)
-    return rows.reshape(*words.shape[:-2], words.shape[-2] * 2, words.shape[-1])
-
-
-def _write_states_bf16(pool, ssm, conv, idx, split=SPLIT):
-    """bf16 SSM at granule 0, fp32 conv right after it (recurrent-first)."""
-
-    def build(pool, ssm, conv, idx):
-        words = _mgr_words(pool, split)
-        body = _pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
-        words = words.at[idx, : body.shape[1]].set(body)
-        words = _put(
-            words, idx, _ssm_granules(jnp.bfloat16), jnp.asarray(conv, jnp.float32)
-        )
-        return _unwords(words, pool)
-
-    return _on_cpu(build, pool, ssm, conv, idx)
-
-
-def _read_states_bf16(pool, idx, split=SPLIT):
-    def take(pool, idx):
-        words = _mgr_words(pool, split)
-        nwords = N_V * D_K * D_V // 2
-        ssm = _unpack_bf16_rows(
-            words[idx, :nwords].reshape(idx.shape[0], N_V, D_K // 2, D_V)
-        )
-        conv = _take(
-            words,
-            idx,
-            _ssm_granules(jnp.bfloat16),
-            (KERNEL_SIZE - 1, DIM),
-            jnp.float32,
-        )
-        return ssm, conv
-
-    return _on_cpu(take, pool, idx)
+_write_states_bf16 = functools.partial(_write_states, ssm_dtype=jnp.bfloat16)
+_read_states_bf16 = functools.partial(_read_states, ssm_dtype=jnp.bfloat16)
 
 
 def _bits(x):
@@ -812,14 +701,14 @@ class TestPooledBf16Recurrent:
 
         def write_conv_first(pool, ssm, conv, idx, split=SPLIT):
             def build(pool, ssm, conv, idx):
-                words = _mgr_words(pool, split)
-                words = _put(words, idx, 0, jnp.asarray(conv, jnp.float32))
-                body = _pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
+                words = state_words(pool, split)
+                words = put_words(words, idx, 0, jnp.asarray(conv, jnp.float32))
+                body = pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
                 start = CONV_GRANULES * WORDS_PER_GRANULE
                 words = words.at[idx, start : start + body.shape[1]].set(body)
-                return _unwords(words, pool)
+                return words_to_pool(words, pool)
 
-            return _on_cpu(build, pool, ssm, conv, idx)
+            return on_cpu(build, pool, ssm, conv, idx)
 
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         ssm, conv = self._states(48, 4)
@@ -858,10 +747,10 @@ class TestPooledCallerV3:
 
         def _seed(pool, recurrent, pool_idx):
             body = recurrent.reshape(n, -1).view(jnp.uint32)
-            words = _mgr_words(pool).at[pool_idx, 0:nwords].set(body)
-            return _unwords(words, pool)
+            words = state_words(pool, SPLIT).at[pool_idx, 0:nwords].set(body)
+            return words_to_pool(words, pool)
 
-        pool = _on_cpu(_seed, pool, recurrent, pool_idx)
+        pool = on_cpu(_seed, pool, recurrent, pool_idx)
         kwargs = _rand_inputs(42, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
@@ -896,12 +785,12 @@ class TestPooledCallerV3:
 
         def _read(new_pool, pool_idx):
             return (
-                _mgr_words(new_pool)[pool_idx, 0:nwords]
+                state_words(new_pool, SPLIT)[pool_idx, 0:nwords]
                 .view(jnp.float32)
                 .reshape(n, N_V, D_K, D_V)
             )
 
-        pooled_ssm = _on_cpu(_read, new_pool, pool_idx)
+        pooled_ssm = on_cpu(_read, new_pool, pool_idx)
 
         np.testing.assert_allclose(
             np.asarray(pooled_out), np.asarray(dense_out), rtol=5e-2, atol=5e-2
@@ -914,22 +803,22 @@ class TestPooledCallerV3:
         recurrent16 = recurrent_init.astype(jnp.bfloat16)
 
         def _seed16(pool, recurrent16, pool_idx):
-            body = _pack_bf16_rows(recurrent16).reshape(n, -1)
-            words = _mgr_words(pool).at[pool_idx, 0 : body.shape[1]].set(body)
-            return _unwords(words, pool)
+            body = pack_bf16_rows(recurrent16).reshape(n, -1)
+            words = state_words(pool, SPLIT).at[pool_idx, 0 : body.shape[1]].set(body)
+            return words_to_pool(words, pool)
 
         def _read16(new_pool, pool_idx):
-            words = _mgr_words(new_pool)[pool_idx, 0 : nwords // 2]
-            return _unpack_bf16_rows(words.reshape(n, N_V, D_K // 2, D_V))
+            words = state_words(new_pool, SPLIT)[pool_idx, 0 : nwords // 2]
+            return unpack_bf16_rows(words.reshape(n, N_V, D_K // 2, D_V))
 
-        pool16 = _on_cpu(_seed16, jnp.zeros_like(pool), recurrent16, pool_idx)
+        pool16 = on_cpu(_seed16, jnp.zeros_like(pool), recurrent16, pool_idx)
         (_, dense_ssm16), dense_out16 = wrapper.fused_conv1d_gdn(
             states=(conv_init, recurrent16), state_indices=dense_idx, **kwargs
         )
         new_pool16, pooled_out16 = pooled(
             recurrent_state=pool16, recurrent_state_dtype=jnp.bfloat16
         )
-        pooled_ssm16 = _on_cpu(_read16, new_pool16, pool_idx)
+        pooled_ssm16 = on_cpu(_read16, new_pool16, pool_idx)
 
         np.testing.assert_allclose(
             np.asarray(pooled_out16, np.float32),
