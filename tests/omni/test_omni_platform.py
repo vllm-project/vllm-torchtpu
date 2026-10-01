@@ -10,6 +10,7 @@ from .mock_omni import vllm_omni_mock  # isort: split
 
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
@@ -159,6 +160,28 @@ def test_ltx2_safe_decode_output():
     runtime.output = (None, None)
     res = runtime._decode_output(**decode_kwargs)
     assert res.output == (None, None)
+
+
+@pytest.mark.parametrize(
+    "rope_cls_name",
+    ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
+)
+def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
+    apply_omni_model_specific_patches()
+
+    rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    rope = rope_cls()
+
+    vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
+
+    assert not txt_freqs._is_view()
+    assert (
+        txt_freqs.untyped_storage().data_ptr()
+        != rope.pos_freqs.untyped_storage().data_ptr()
+    )
+    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    assert txt_freqs.dtype == torch.complex64
+    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
 
 
 def test_safe_pack_tensor_if_large():

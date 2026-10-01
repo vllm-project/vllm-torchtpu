@@ -137,3 +137,36 @@ def apply_omni_model_specific_patches() -> None:
 
     ltx2_runtime.LTXRuntime._decode_output = _safe_decode_output
     logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
+
+    _patch_qwen_image_rope_txt_freqs_clone()
+
+
+def _patch_qwen_image_rope_txt_freqs_clone() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once torch_tpu supports torch.real/torch.imag
+    # inside torch.inference_mode() on a complex tensor created outside it.
+    #
+    # Qwen-Image RoPE modules return txt_freqs as a slice of pos_freqs, which
+    # is created outside inference mode. The attention blocks take
+    # torch.real/torch.imag of that slice inside inference mode, which fails
+    # on TPU with "RuntimeError: Cannot set version_counter for inference
+    # tensor". vid_freqs comes from torch.cat inside inference mode and is not
+    # affected. Cloning txt_freqs once per transformer forward gives the
+    # attention blocks an inference tensor of the same values.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
+
+    for rope_cls in (
+        qwen_image_transformer.QwenEmbedRope,
+        qwen_image_transformer.QwenEmbedLayer3DRope,
+    ):
+        rope_cls.forward = _clone_txt_freqs(rope_cls.forward)
+    logger.info("Applied TPU patch: Qwen-Image RoPE txt_freqs clone.")
+
+
+def _clone_txt_freqs(forward: Any) -> Any:
+    def _forward(self: Any, *args: Any, **kwargs: Any):
+        vid_freqs, txt_freqs = forward(self, *args, **kwargs)
+        return vid_freqs, txt_freqs.clone()
+
+    return _forward
