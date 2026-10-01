@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -685,6 +686,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
+    # Add linear token buckets above a quarter of the token budget, for
+    # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
+    "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),

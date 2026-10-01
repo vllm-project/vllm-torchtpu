@@ -535,6 +535,45 @@ class TestTpuPlatform:
         )
 
     @pytest.mark.parametrize(
+        ("linear", "max_model_len", "added"),
+        [
+            (False, 32768, []),
+            # Every budget/32 = 64 rows above budget/4, up to the budget.
+            (True, 32768, [s for s in range(576, 2048, 64) if s != 1024]),
+            # Capped at the longest prompt pass, 1000 + 8 rounded up to 1024.
+            (True, 1000, list(range(576, 1024, 64))),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_linear_token_buckets(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        linear,
+        max_model_len,
+        added,
+    ):
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_seqs = 8
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
+    def test_linear_token_step_at_the_served_budget(self):
+        paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
+
+        assert paddings == list(range(4608, 16385, 512))
+
+    @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
         [
             # Hybrid CPU offloading transfers whole pool rows; without the

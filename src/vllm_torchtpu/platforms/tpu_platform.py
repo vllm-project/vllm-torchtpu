@@ -736,12 +736,20 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
+            budget = scheduler_config.max_num_batched_tokens
+            extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            if envs.TPU_TOKEN_BUCKET_LINEAR:
+                extra_bucket_sizes += _get_linear_token_paddings(
+                    budget,
+                    vllm_config.model_config.max_model_len
+                    + scheduler_config.max_num_seqs,
+                )
             compilation_config.compile_sizes = cast(
                 list[int | str],
                 _get_token_paddings(
                     min_token_size=16,
-                    max_token_size=scheduler_config.max_num_batched_tokens,
-                    extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+                    max_token_size=budget,
+                    extra_bucket_sizes=extra_bucket_sizes,
                 ),
             )
         else:
@@ -1139,6 +1147,33 @@ def _get_exponential_token_paddings(
         paddings.append(num)
         num *= 2
     paddings.append(max_token_size)
+    return paddings
+
+
+# Linear buckets above a quarter of the token budget, every budget/32 rows:
+# 512 at the 16384 budget the TP8 Qwen3.5 recipes serve. A pass there pads by
+# at most 1/8 instead of up to 1/2 with doubling, for at most 24 more buckets.
+_LINEAR_BUCKETS_FROM_BUDGET_FRACTION = 4
+_LINEAR_BUCKET_STEPS_PER_BUDGET = 32
+
+
+def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[int]:
+    """Multiples of the linear step above max_token_size / 4, up to the
+    longest pass one prompt can make (the model length plus the decode rows
+    riding along) and at most max_token_size. A prompt-sized pass costs per
+    row, so padding it to the next power of two wastes up to half of it."""
+    step = max(16, -(-max_token_size // _LINEAR_BUCKET_STEPS_PER_BUDGET // 16) * 16)
+    start = max_token_size // _LINEAR_BUCKETS_FROM_BUDGET_FRACTION // step + 1
+    stop = min(-(-longest_pass // step) * step, max_token_size)
+    paddings = list(range(start * step, stop + 1, step))
+    if paddings:
+        logger.info(
+            "Linear token buckets every %d rows from %d to %d (%d buckets)",
+            step,
+            paddings[0],
+            paddings[-1],
+            len(paddings),
+        )
     return paddings
 
 
