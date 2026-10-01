@@ -55,6 +55,7 @@ until curl -sf "localhost:$PORT/health" >/dev/null; do
     if [ -d "$DUMP_DIR" ]; then
       echo "Packaging HLO dumps from $DUMP_DIR..."
       tar -czvf /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz -C /perf_eval_results shardy_segfault_hlo || true
+      rm -rf "$DUMP_DIR"
     fi
     exit 1
   fi
