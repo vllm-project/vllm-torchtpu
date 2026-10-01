@@ -19,6 +19,7 @@ import pytest
 import torch
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -263,6 +264,22 @@ def _fresh_metadata_manager(device, input_ids):
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids
     return SpeculativeDecodingManager(mock_runner)
+
+
+def test_sharded_head_verify_steps_project_its_fixed_rows(monkeypatch):
+    # The sharded head's ranks pair only when every engine's logits graph has
+    # one shape: 2 requests with 5 verify rows would pad to 8, but under the
+    # head every verify step projects the head's rows (4 requests x 4 = 16).
+    monkeypatch.setattr(envs, "TPU_SHARDED_LM_HEAD", True)
+    input_ids = torch.arange(1, 21, dtype=torch.int32)
+    manager = _fresh_metadata_manager(torch.device("cpu"), input_ids)
+    manager.runner.max_num_reqs = 4
+    manager.runner.speculative_config = MagicMock(num_speculative_tokens=3)
+    metadata = manager.get_spec_decode_metadata(
+        np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), 4
+    )
+    assert metadata.final_logits_indices.shape[0] == 16
+    assert metadata.draft_token_ids.shape[0] == 16
 
 
 def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):

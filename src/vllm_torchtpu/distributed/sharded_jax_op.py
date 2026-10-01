@@ -50,6 +50,9 @@ _STOCK_PLACEHOLDER_LINE = """      output_shapes = [
 _SHARDED_PLACEHOLDER_LINE = (
     """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
 )
+_STOCK_TAKES_OUTPUT_SPECS = (
+    "output_partition_specs" in inspect.signature(pallas_impl.JaxCallable).parameters
+)
 
 
 def _sharded_output_placeholders(lowered, mesh):
@@ -103,6 +106,10 @@ def _build_sharded_callable_cls():
     """
     src = inspect.getsource(pallas_impl.JaxCallable.__call__)
     if _STOCK_PLACEHOLDER_LINE not in src:
+        if _STOCK_TAKES_OUTPUT_SPECS:
+            # Stock sizes each output from the output_partition_specs it is
+            # given, which sharded_jax_op passes.
+            return pallas_impl.JaxCallable
         logger.warning(
             "torch_tpu's JaxCallable.__call__ no longer builds its output "
             "placeholders the way this adapter expects; sharded outputs will "
@@ -191,6 +198,13 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
+    extra = {}
+    if _STOCK_TAKES_OUTPUT_SPECS:
+        # One spec per output leaf, as a list: stock iterates a bare
+        # PartitionSpec as its axis names.
+        extra["output_partition_specs"] = jax.tree.leaves(
+            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+        )
     wrapped_fn = _SHARDED_CALLABLE_CLS(
         name=name,
         jit_fn=jit_fn,
@@ -199,6 +213,7 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **extra,
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())

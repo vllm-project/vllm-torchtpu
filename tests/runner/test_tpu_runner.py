@@ -2166,3 +2166,62 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+class _StopAfterInstalls(Exception):
+    pass
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_load_model_shards_the_lm_head_only_when_enabled(monkeypatch, enabled):
+    monkeypatch.setenv("TPU_SHARDED_LM_HEAD", str(int(enabled)))
+    calls = []
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.device_config = SimpleNamespace(device=None)
+    runner.vllm_config = SimpleNamespace(device_config=None, quant_config=None)
+    runner.model_config = SimpleNamespace(quantization=None)
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner.load_config = None
+    runner.mesh = None
+    runner.max_num_reqs = 16
+    runner.num_tokens_paddings = [16, 32, 64, 128]
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner._is_async_drafter = True
+    runner.drafter = MagicMock()
+    runner.drafter.load_model.side_effect = lambda target: calls.append("drafter")
+    model = torch.nn.Module()
+    loader = MagicMock()
+    loader.load_model.return_value = model
+    # CPU torch has no "tpu" device type.
+    monkeypatch.setattr(torch, "device", MagicMock(return_value=torch.device("cpu")))
+    monkeypatch.setattr(tpu_runner, "get_tpu_quantization_config", MagicMock())
+    monkeypatch.setattr(tpu_runner, "get_model_loader", lambda _: loader)
+    monkeypatch.setattr(tpu_runner, "validate_online_fp8", MagicMock())
+    monkeypatch.setattr(tpu_runner, "set_vllm_model_wrapper_context", MagicMock())
+    monkeypatch.setattr(tpu_runner, "set_current_vllm_config", MagicMock())
+    monkeypatch.setattr(
+        tpu_runner.sharded_lm_head,
+        "install",
+        lambda *args, **kwargs: calls.append(("sharded_lm_head", args, kwargs)),
+    )
+
+    def stop():
+        raise _StopAfterInstalls
+
+    # load_model evicts the page cache right after the drafter and the head.
+    monkeypatch.setattr(
+        "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache", stop
+    )
+
+    with pytest.raises(_StopAfterInstalls):
+        TPUModelRunner.load_model(runner)
+
+    if not enabled:
+        assert calls == ["drafter"]
+        return
+    # The head is sharded after the drafter has taken what it needs of it,
+    # at the verify rows: 16 requests x (1 + 3) tokens.
+    assert calls == [
+        "drafter",
+        ("sharded_lm_head", (model, 64), {"drafter": runner.drafter}),
+    ]

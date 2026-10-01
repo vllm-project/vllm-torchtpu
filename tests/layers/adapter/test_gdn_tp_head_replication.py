@@ -19,6 +19,7 @@ from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 
 from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.platforms.tpu_block_size_utils import _hybrid_mamba_state_layout
 
 pytestmark = pytest.mark.cpu_test
@@ -237,6 +238,36 @@ def test_fp8_post_load_uses_local_projection_widths(make_gdn_attention, tp_size)
         )
     )
     torch.testing.assert_close(dequantized, expected)
+
+
+@pytest.mark.parametrize(
+    ("linear_layout", "pcp", "keeps_vllm_layout"),
+    [(False, False, True), (True, False, False), (True, True, True)],
+)
+# The bf16 fixture keeps vLLM's linear method, which never flips a weight.
+@pytest.mark.parametrize("quantization", QUANTIZATIONS[1:])
+def test_qkvz_linear_layout_outside_pcp(
+    make_gdn_attention,
+    monkeypatch,
+    linear_layout,
+    pcp,
+    keeps_vllm_layout,
+    quantization,
+):
+    monkeypatch.setenv("TPU_GDN_QKVZ_LINEAR_LAYOUT", str(int(linear_layout)))
+    monkeypatch.setattr(
+        gdn_attention_op.VllmGatedDeltaNetAttention,
+        "_pcp_streaming_enabled",
+        staticmethod(lambda: pcp),
+    )
+    attention, _ = make_gdn_attention(1, 0, quantization)
+    projection = attention.in_proj_qkvz
+    out_in = tuple(projection.weight.shape)
+    projection.quant_method.process_weights_after_loading(projection)
+
+    assert getattr(projection, KEEP_VLLM_LAYOUT_ATTR, False) is keeps_vllm_layout
+    expected = out_in if keeps_vllm_layout else out_in[::-1]
+    assert tuple(projection.weight.shape) == expected
 
 
 @pytest.mark.parametrize("tp_size", [4, 8, 16])

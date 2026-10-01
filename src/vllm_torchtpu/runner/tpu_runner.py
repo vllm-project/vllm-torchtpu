@@ -84,7 +84,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import sharded_lm_head, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -825,6 +825,8 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            self.num_reqs_paddings = sharded_lm_head.request_buckets(self.max_num_reqs)
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (
@@ -879,6 +881,10 @@ class TPUModelRunner(GPUModelRunner):
         self._input_staging_fence: Any = None
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
+        # Under TPU_SHARDED_LM_HEAD every target logits call on every DP
+        # engine projects exactly this many rows (set when the head installs).
+        self._sharded_head_rows: int | None = None
+        self._logit_row_arange: dict[int, torch.Tensor] = {}
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
@@ -2816,6 +2822,8 @@ class TPUModelRunner(GPUModelRunner):
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            padded_num_reqs = self.num_reqs_paddings[-1]
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -2980,9 +2988,16 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
+                logits_indices_cpu = (
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
+                )
+                if envs.TPU_SHARDED_LM_HEAD:
+                    head_rows = self._logits_call_rows(padded_num_reqs)
+                    # Dummy rows (index 0); select_logit_rows drops them.
+                    logits_indices_cpu = torch.nn.functional.pad(
+                        logits_indices_cpu, (0, head_rows - padded_num_reqs)
+                    )
+                logits_indices = logits_indices_cpu.to(self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -3685,6 +3700,15 @@ class TPUModelRunner(GPUModelRunner):
                         layout_plan,
                     )
                     logits = self.compute_selected_logits(hidden_states, logits_indices)
+                    if (
+                        spec_decode_metadata is None
+                        and logits.shape[0] > padded_num_reqs
+                    ):
+                        # Sharded head projected its fixed rows; keep the
+                        # request rows in a separate compiled region.
+                        logits = self.select_logit_rows(
+                            logits, self._logit_rows_index(padded_num_reqs)
+                        )
                 else:
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
@@ -4620,6 +4644,18 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
+        # After the drafter: a draft that copies the target head needs it whole.
+        if envs.TPU_SHARDED_LM_HEAD:
+            self._sharded_head_rows = sharded_lm_head.logits_rows(
+                self.max_num_reqs,
+                self.num_tokens_paddings,
+                self.speculative_config,
+            )
+            sharded_lm_head.install(
+                model,
+                self._sharded_head_rows,
+                drafter=self.drafter if self._is_async_drafter else None,
+            )
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
@@ -5018,7 +5054,12 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                head_rows = (
+                    self._logits_call_rows(num_reqs)
+                    if envs.TPU_SHARDED_LM_HEAD
+                    else num_reqs
+                )
+                _idx = torch.zeros(head_rows, dtype=torch.int32, device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
@@ -5294,8 +5335,14 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
                 for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    indices = torch.zeros(
+                        self._logits_call_rows(num_reqs), dtype=torch.int32
+                    ).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
+                    if out.shape[0] > num_reqs:
+                        out = self.select_logit_rows(
+                            out, self._logit_rows_index(num_reqs)
+                        )
                     synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
@@ -6604,6 +6651,29 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    def _logits_call_rows(self, num_rows: int) -> int:
+        """Rows a target logits call projects: the sharded head's fixed
+        rows when installed (every DP engine must pass the same count),
+        else `num_rows`."""
+        if self._sharded_head_rows is None:
+            return num_rows
+        return max(self._sharded_head_rows, num_rows)
+
+    def _logit_rows_index(self, num_rows: int) -> torch.Tensor:
+        idx = self._logit_row_arange.get(num_rows)
+        if idx is None:
+            idx = torch.arange(num_rows, dtype=torch.int32).to(self.device)
+            self._logit_row_arange[num_rows] = idx
+        return idx
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def select_logit_rows(
+        self, logits: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor:
+        # Its own compiled region, never the head's graph: a trim around the
+        # sharded head in one graph read the wrong positions (j-4caef4e0).
+        return torch.index_select(logits, 0, rows)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(

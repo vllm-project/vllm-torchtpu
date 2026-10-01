@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -358,7 +359,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
+        # That fusion runs only under PCP; TPU_GDN_QKVZ_LINEAR_LAYOUT gives the
+        # weight the linear method's (k, n) layout everywhere else.
+        if hasattr(self, "in_proj_qkvz") and (
+            not envs.TPU_GDN_QKVZ_LINEAR_LAYOUT or self._pcp_streaming_enabled()
+        ):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).

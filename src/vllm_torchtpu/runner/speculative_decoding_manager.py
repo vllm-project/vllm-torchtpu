@@ -10,6 +10,9 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import sharded_lm_head
+
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -298,6 +301,14 @@ class SpeculativeDecodingManager:
         padded_logits_length = _get_padded_token_len(
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            # The sharded head's ranks pair only when every engine's logits
+            # graph has one shape, so verify steps project its fixed rows.
+            padded_logits_length = sharded_lm_head.logits_rows(
+                self.runner.max_num_reqs,
+                self.runner.num_tokens_paddings,
+                self.runner.speculative_config,
+            )
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices
