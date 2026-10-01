@@ -733,6 +733,9 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
