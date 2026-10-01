@@ -36,6 +36,9 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
 
 # A barrier group distinct from the all-reduce kernel's.
 COLLECTIVE_ID = 7
+# Each block's rows are padded to this multiple: Mosaic refuses a row slice
+# of the input that is not aligned to the sublane tile.
+SUBLANES = 8
 
 
 def reference(blocks, core):
@@ -54,6 +57,17 @@ def small_reduce_scatter(x, *, num_cores, axis, rank=None, collective_id=COLLECT
         raise ValueError(f"hidden {hidden} is not a multiple of {LANES} lanes")
     if total % n:
         raise ValueError(f"{total} rows do not split over {n} cores")
+    rows = total // n
+    padded = -(-rows // SUBLANES) * SUBLANES
+    if padded == rows:
+        return _reduce_scatter(x, n, axis, rank, collective_id)
+    x = jnp.pad(x.reshape(n, rows, hidden), ((0, 0), (0, padded - rows), (0, 0)))
+    out = _reduce_scatter(x.reshape(n * padded, hidden), n, axis, rank, collective_id)
+    return out[:rows]
+
+
+def _reduce_scatter(x, n, axis, rank, collective_id):
+    total, hidden = x.shape
     rows = total // n
     dict_ids = rank is not None
 
