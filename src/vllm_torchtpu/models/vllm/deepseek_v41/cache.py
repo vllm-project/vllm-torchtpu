@@ -196,6 +196,10 @@ class NativeCacheView:
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
+        if raw is not None and getattr(self, "_tpu_fp8_csa_cache", False):
+            from .csa import PackedCSACache
+
+            return PackedCSACache(raw, self._tpu_cache_layout)
         if torch.compiler.is_compiling() and raw is not None:
             return PagedCacheRows(raw, self._tpu_cache_layout)
         return self._bound_cache
@@ -321,10 +325,12 @@ def initialize_cache_ops():
 
 def write_cache(cache, slots, values, valid):
     """Valid destinations must be unique; invalid rows have no side effects."""
+    from .csa import PackedCSACache
+
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
     slots = slots.masked_fill(~valid, -1).long()
-    if isinstance(cache, PagedCacheRows):
+    if isinstance(cache, (PagedCacheRows, PackedCSACache)):
         cache.write(slots, values)
         return
     if cache.device.type == "cpu":
@@ -361,7 +367,21 @@ def scatter_cache_values(
         else values,
         jnp.int32,
     )
+    return scatter_cache_words(cache, records, words)
+
+
+def scatter_cache_words(
+    cache: jax.Array, records: jax.Array, words: jax.Array
+) -> jax.Array:
+    """Publish packed words in full rows or independent sub-row records."""
+    import jax.numpy as jnp
+
+    assert cache.dtype == words.dtype == jnp.int32
+    assert cache.ndim == words.ndim == 2 and cache.shape[1] == ROW_WORDS
+    if not words.shape[0]:
+        return cache
     width = words.shape[1]
+    assert width % ROW_WORDS == 0 or ROW_WORDS % width == 0
     if width < ROW_WORDS or jax.default_backend() != "tpu":
         columns = jnp.arange(width)[None]
         if width < ROW_WORDS:

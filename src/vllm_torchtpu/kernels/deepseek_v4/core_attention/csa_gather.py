@@ -29,6 +29,7 @@ def main_kernel(
     nope_in_hbm_ref: Any,
     rope_in_hbm_ref: Any,
     indices_hbm_ref: Any,
+    rope_indices_hbm_ref: Any,
     valid_indices_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
@@ -78,7 +79,7 @@ def main_kernel(
                 jnp.bitwise_and(odd, jnp.int32(-65536)),  # 0xFFFF0000
             )
 
-    def outer_pipeline(idx_ref, valid_ref):
+    def outer_pipeline(idx_ref, rope_idx_ref, valid_ref):
         valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
         b = pl.program_id(0)
         out_row_base = (b * num_cores + core_index) * num_row_subchunks
@@ -91,8 +92,8 @@ def main_kernel(
         def subchunk(r, s):
             return r * num_streams + s
 
-        def idx_window(r, s):
-            return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
+        def idx_window(ref, r, s):
+            return ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
 
         # int32 rows produced per stream in the rope output (2 tokens per row).
         rope_rows_per_stream = row_subchunk_size // 2
@@ -141,7 +142,7 @@ def main_kernel(
         nope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), nope_in_cols),
-                lambda r, s=s: (idx_window(r, s), 0),
+                lambda r, s=s: (idx_window(idx_ref, r, s), 0),
             )
             for s in range(num_streams)
         )
@@ -149,7 +150,7 @@ def main_kernel(
         rope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), rope_in_cols),
-                lambda r, s=s: (idx_window(r, s), 0),
+                lambda r, s=s: (idx_window(rope_idx_ref, r, s), 0),
             )
             for s in range(num_streams)
         )
@@ -191,11 +192,15 @@ def main_kernel(
                 lambda b: (b * num_cores + core_index,),
             ),
             pl.BlockSpec(
+                (row_chunk_size,),
+                lambda b: (b * num_cores + core_index,),
+            ),
+            pl.BlockSpec(
                 (row_subchunk_size,),
                 lambda b: (0,),
             ),
         ),
-    )(indices_hbm_ref, valid_indices_ref)
+    )(indices_hbm_ref, rope_indices_hbm_ref, valid_indices_ref)
 
 
 @functools.partial(jax.jit, static_argnames=("top_k",))
@@ -206,6 +211,7 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    rope_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -222,6 +228,9 @@ def csa_gather(
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      rope_indices: Optional independent 32-word record addresses for RoPE.
+        Defaults to indices. Shared pools can place NoPE and RoPE in separate
+        page regions without materializing contiguous whole-cache views.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -237,6 +246,10 @@ def csa_gather(
         `jnp.concatenate([blk[:, :64], blk[:, 64:]], axis=0)`.
     """
     assert indices.ndim == 1, "Indices must be 1D."
+    assert top_k > 0 and top_k % 128 == 0
+    if rope_indices is None:
+        rope_indices = indices
+    assert rope_indices.shape == indices.shape
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
     assert nope_cache.dtype == jnp.int32, "Caches must be int32."
     assert nope_cache.shape[2] == csa_cache_layout.ROW_WORDS
@@ -276,6 +289,10 @@ def csa_gather(
         num_tokens = nope_cache.shape[0]
         pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
+        rope_pad = (
+            jnp.arange(out_pad_size, dtype=rope_indices.dtype) * 104729
+        ) % rope_cache.shape[0]
+        rope_indices = jnp.concatenate([rope_indices, rope_pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -310,5 +327,5 @@ def csa_gather(
         ),
         mesh=vector_mesh,
         name="sc_csa_gather",
-    )(nope_cache, rope_cache, indices, valid_indices)
+    )(nope_cache, rope_cache, indices, rope_indices, valid_indices)
     return nope_out[:out_size], rope_out[: out_size // 4]

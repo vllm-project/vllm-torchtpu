@@ -19,6 +19,7 @@ from .attention import DeepseekV41Attention, _block_table, _cache_slots
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import plan_decoder_replay
+from .csa import initialize_csa
 from .engram import Engram, NgramHashState
 from .mhc import (
     collapse,
@@ -417,6 +418,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_delayed_mhc()
         initialize_mhc_post()
         initialize_paged_attention()
+        initialize_csa()
         initialize_indexer()
         with (
             device_hooks(

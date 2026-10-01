@@ -642,6 +642,7 @@ def sparse_ragged_paged_attention(
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    physical_indices: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -660,12 +661,16 @@ def sparse_ragged_paged_attention(
         k is also the total number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      physical_indices: Optional (NoPE, RoPE) record indices with the same
+        shape as topk_indices. Bypasses logical page lookup for shared pools;
+        addresses are in 128-word NoPE and 32-word RoPE records respectively.
+        Invalid positions must be -1 and follow the valid prefix in each row.
 
     Returns:
       The output of attention.
     """
     # The cache is DSV4 FP8 format.
-    # nope_cache contains 448 fp8 + 7 fp8 scales,
+    # nope_cache contains 448 fp8 + 64 e8m0 scales,
     # rope_cache contains 64 bf16
     assert cache_kv_nope.dtype == jnp.int32
     assert cache_kv_rope.dtype == jnp.int32
@@ -813,39 +818,50 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
-    )
     assert topk_indices is not None
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-    )
+    rope_gather_indices = None
+    if physical_indices is None:
+        tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+        seq_ids_segment = jnp.repeat(
+            jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
+        )
 
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
-        q.shape[0], topk
-    )
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
+        seq_page_ids = topk_indices // page_size
+        token_offset = topk_indices % page_size
+        page_ids = gather_page_ids(
+            page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+        )
 
-    assert page_ids.shape == (q.shape[0], topk)
-    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
+        # For the "-1" padding elements in topk_indices, we scatter the corresponding
+        # page_ids and token_offset to avoid gather memory access hotspotting.
+        is_padding = topk_indices == -1
+        total_num_pages = cache_kv_nope.shape[0]
+        flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
+            q.shape[0], topk
+        )
+        # 104729 and 15485863 are randomly chosen large prime numbers.
+        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
+        scattered_token_offset = (flat_element_index * 15485863) % page_size
+        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+        token_offset = jnp.where(
+            is_padding,
+            scattered_token_offset,
+            token_offset,
+        )
+
+        assert page_ids.shape == (q.shape[0], topk)
+        gather_indices = (page_ids * page_size + token_offset).reshape(-1)
+    else:
+        nope_indices, rope_indices = physical_indices
+        assert nope_indices.shape == rope_indices.shape == topk_indices.shape
+        flat = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(q.shape[0], topk)
+        padding = topk_indices == -1
+        nope_padding = (flat * 104729) % (cache_kv_nope.size // 128)
+        rope_padding = (flat * 15485863) % (cache_kv_rope.size // 32)
+        gather_indices = jnp.where(padding, nope_padding, nope_indices).reshape(-1)
+        rope_gather_indices = jnp.where(padding, rope_padding, rope_indices).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
     for i in range(num_chunks):
@@ -891,6 +907,11 @@ def sparse_ragged_paged_attention(
             indices,
             num_valid_indices=num_valid_indices,
             top_k=topk,
+            rope_indices=(
+                None
+                if rope_gather_indices is None
+                else rope_gather_indices[start_pos * topk : end_pos * topk]
+            ),
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)

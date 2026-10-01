@@ -1,6 +1,7 @@
 """TPU MLA and compressor adapters with upstream cache ownership."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import cast
 
 import torch
@@ -11,8 +12,11 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
+
 from .attention_kernels import paged_attention, paged_indexer
 from .cache import NativeCacheView, PagedCacheRows, write_cache
+from .csa import CSA_RECORD_BYTES, PackedCSACache, csa_attention
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 
 
@@ -326,6 +330,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "TPU V4.1 currently supports BF16 KV cache; use "
                 "--kv-cache-dtype auto or bfloat16"
             )
+        self._tpu_fp8_csa_cache = bool(
+            envs.TPU_DEEPSEEK_V41_NATIVE_CSA and self.is_kv_source
+        )
+        if self._tpu_fp8_csa_cache and (
+            self.head_dim != 512
+            or vllm_config.model_config.hf_config.qk_rope_head_dim != 64
+        ):
+            raise ValueError("Native CSA requires 448 NoPE and 64 RoPE dimensions")
         self.register_buffer(
             "_tpu_rope_cache", self.rotary_emb.cos_sin_cache, persistent=False
         )
@@ -333,6 +345,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._max_model_len = vllm_config.model_config.max_model_len
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None or not self._tpu_fp8_csa_cache:
+            return spec
+        if spec.num_states % 4:
+            raise ValueError(
+                "Native CSA requires a multiple of four KV states per page"
+            )
+        return replace(spec, dtype=torch.uint8, state_content_bytes=CSA_RECORD_BYTES)
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
@@ -498,6 +520,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         valid_rows = valid_window
         main_cache = swa_cache
         main_records = positions.new_empty((count, 0))
+        rope_records = positions.new_empty((count, 0))
         if self.compress_ratio:
             source = self._static_forward_context[self.compressed_cache_prefix]
             source_meta = metadata[self.compressed_cache_prefix]
@@ -577,6 +600,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_records = main_cache.row_indices(slots).masked_fill(
                     ~valid_compressed, -1
                 )
+                if isinstance(main_cache, PackedCSACache):
+                    rope_records = main_cache.rope_indices(slots).masked_fill(
+                        ~valid_compressed, -1
+                    )
             else:
                 compressed_rows = _read_rows(
                     source.kv_cache,
@@ -589,15 +616,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if tiled:
             slots = _row_slots(swa_cache, swa_table, requests, logical)
             records = swa_cache.row_indices(slots).masked_fill(~valid_window, -1)
-            result = paged_attention(
-                q,
-                swa_cache,
-                main_cache,
-                records,
-                main_records,
-                self.attn_sink,
-                self.scale,
-            )
+            if isinstance(main_cache, PackedCSACache):
+                result = csa_attention(
+                    q,
+                    swa_cache,
+                    main_cache,
+                    records,
+                    main_records,
+                    rope_records,
+                    self.attn_sink,
+                    self.scale,
+                )
+            else:
+                result = paged_attention(
+                    q,
+                    swa_cache,
+                    main_cache,
+                    records,
+                    main_records,
+                    self.attn_sink,
+                    self.scale,
+                )
             output.copy_(result.masked_fill((swa_slots < 0)[:, None, None], 0))
             return
         rows = cast(torch.Tensor, rows)
