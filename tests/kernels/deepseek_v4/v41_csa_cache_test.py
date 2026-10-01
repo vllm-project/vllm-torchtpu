@@ -175,3 +175,122 @@ def test_csa_wiring_keeps_swa_state_and_shared_record_pairs():
     np.testing.assert_array_equal(n[0, :2], [1, 8])
     np.testing.assert_array_equal(r[0, :2], [200, 206])
     np.testing.assert_array_equal(result, q)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("largest_page", [16384, 65536])
+def test_upstream_page_unification_preserves_reserved_geometry(ratio, largest_page):
+    from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    main = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        tokens_per_state=ratio,
+        alignment=512,
+        model_version="deepseek_v4",
+    )
+    other = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=largest_page // 32,
+        dtype=torch.bfloat16,
+        alignment=512,
+    )
+    baseline = unify_kv_cache_spec_page_size({"main": main, "other": other})
+    packed = unify_kv_cache_spec_page_size(
+        {"main": csa.packed_csa_spec(main), "other": other}
+    )
+    for name in baseline:
+        assert packed[name].page_size_bytes == baseline[name].page_size_bytes
+        assert packed[name].block_size == baseline[name].block_size
+        assert packed[name].num_states == baseline[name].num_states
+    assert packed["main"].dtype == torch.uint8
+    assert packed["main"].state_content_size_bytes == 1024
+    assert packed["main"].head_size == 512
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("block_compact", [False, True])
+def test_upstream_allocator_binds_packed_main_beside_indexer(ratio, block_compact):
+    from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MLAAttentionSpec,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    specs = {
+        "main": csa.packed_csa_spec(
+            MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                tokens_per_state=ratio,
+                alignment=512,
+            )
+        ),
+        "indexer": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            tokens_per_state=ratio,
+            alignment=512,
+        ),
+    }
+    specs = unify_kv_cache_spec_page_size(specs)
+    blocks, page = 3, specs["main"].page_size_bytes
+    layout = KVCacheLayout.BLHNC if block_compact else KVCacheLayout.LBHNC
+    stride = page * 2 if block_compact else page
+    offset = page if block_compact else blocks * page
+    config = KVCacheConfig(
+        num_blocks=blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=blocks * page * 2,
+                layers=[name],
+                layer_stride=blocks * page,
+                block_stride=stride,
+                offset=position,
+            )
+            for name, position in [("main", 0), ("indexer", offset)]
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+            for name, spec in specs.items()
+        ],
+    )
+    actual = cache.materialize_upstream_kv_cache(
+        config,
+        torch.device("cpu"),
+        layout,
+        word_rows=True,
+    )
+    owner = csa.PackedCSACache(
+        actual.native_raw_cache["main"],
+        actual.native_cache_layouts["main"],
+    )
+    assert owner.shape == (blocks, specs["main"].num_states, 1024)
+    assert (owner.raw is actual.native_raw_cache["indexer"]) == block_compact
+    indexer_before = actual.kv_caches["indexer"].clone()
+    slots = torch.tensor(
+        [0, owner.shape[1] - 1, owner.shape[1], blocks * owner.shape[1] - 1],
+        dtype=torch.int32,
+    )
+    data = values(len(slots))
+    owner.write(slots, data)
+    nope, rope = reference_pack(data)
+    np.testing.assert_array_equal(owner.raw[owner.row_indices(slots).long()], nope)
+    np.testing.assert_array_equal(
+        owner.raw.reshape(-1, 32)[owner.rope_indices(slots).long()],
+        rope,
+    )
+    torch.testing.assert_close(
+        actual.kv_caches["indexer"], indexer_before, rtol=0, atol=0
+    )

@@ -2,10 +2,12 @@
 
 import functools
 import math
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
 import torch
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
@@ -16,6 +18,23 @@ CSA_RECORD_BYTES = 640  # 448 FP8 values, 64 E8M0 scales, 64 BF16 RoPE values.
 
 _write_op = None
 _attention_op = None
+
+
+def packed_csa_spec(spec: MLAAttentionSpec) -> MLAAttentionSpec:
+    """Reserve the upstream page geometry while storing 640-byte FP8 payloads.
+
+    MLA page unification scales block sizes by integer ratios. Natural FP8
+    pages (640 bytes/state) do not divide the BF16/state pages in V4.1. Keep
+    the original bytes/state reservation, including after block-size changes;
+    this adapter currently saves no physical cache allocation.
+    """
+    if spec.num_states % 4:
+        raise ValueError("Native CSA requires a multiple of four KV states per page")
+    if spec.state_content_size_bytes < CSA_RECORD_BYTES:
+        raise ValueError("Native CSA needs at least 640 bytes per reserved KV state")
+    return replace(
+        spec, dtype=torch.uint8, state_content_bytes=spec.state_content_size_bytes
+    )
 
 
 def pack_csa_values(values: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -54,8 +73,9 @@ class PackedCSACache:
     """Two packed regions per upstream-owned page in one shared word-row pool.
 
     A page with T compressed tokens stores T NoPE rows, followed by T/4 RoPE
-    rows. Page stride and offset still come from vLLM, including overlays with
-    indexer/state/SWA allocations. No strided whole-cache tensor is copied.
+    rows and any allocator padding. Page stride and offset still come from
+    vLLM, including overlays with indexer/state/SWA allocations. No strided
+    whole-cache tensor is copied.
     """
 
     def __init__(self, raw, layout):
@@ -63,8 +83,12 @@ class PackedCSACache:
         self.shape, self.dtype, stride_bytes, offset_bytes = layout
         if raw.dtype != torch.int32 or raw.ndim != 2 or raw.shape[1] != 128:
             raise ValueError("CSA cache requires int32 word rows with 128 lanes")
-        if self.dtype != torch.uint8 or self.shape[2:] != (CSA_RECORD_BYTES,):
-            raise ValueError("CSA cache requires 640 bytes per compressed token")
+        if (
+            self.dtype != torch.uint8
+            or len(self.shape) != 3
+            or self.shape[2] < CSA_RECORD_BYTES
+        ):
+            raise ValueError("CSA cache requires at least 640 bytes per KV state")
         if self.shape[1] % 4 or stride_bytes % 512 or offset_bytes % 512:
             raise ValueError("CSA pages require four-token and 512-byte alignment")
         if raw.shape[0] * 4 > torch.iinfo(torch.int32).max:

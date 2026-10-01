@@ -1,7 +1,6 @@
 """TPU MLA and compressor adapters with upstream cache ownership."""
 
 from collections.abc import Callable
-from dataclasses import replace
 from typing import cast
 
 import torch
@@ -16,7 +15,7 @@ from vllm_torchtpu import envs
 
 from .attention_kernels import paged_attention, paged_indexer
 from .cache import NativeCacheView, PagedCacheRows, write_cache
-from .csa import CSA_RECORD_BYTES, PackedCSACache, csa_attention
+from .csa import PackedCSACache, csa_attention, packed_csa_spec
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 
 
@@ -350,11 +349,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         spec = super().get_kv_cache_spec(vllm_config)
         if spec is None or not self._tpu_fp8_csa_cache:
             return spec
-        if spec.num_states % 4:
-            raise ValueError(
-                "Native CSA requires a multiple of four KV states per page"
-            )
-        return replace(spec, dtype=torch.uint8, state_content_bytes=CSA_RECORD_BYTES)
+        return packed_csa_spec(spec)
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)

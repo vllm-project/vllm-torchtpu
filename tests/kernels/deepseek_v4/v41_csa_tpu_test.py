@@ -95,16 +95,18 @@ def test_independent_rope_gather_and_legacy_default(shared_pool, separate):
 
 
 @pytest.mark.parametrize("tokens,topk", [(8, 71), (8, 1024), (128, 2048)])
-def test_shared_pool_csa_with_swa_and_holey_selection(tokens, topk):
+@pytest.mark.parametrize("reserved_bytes", [640, 1024])
+def test_shared_pool_csa_with_swa_and_holey_selection(tokens, topk, reserved_bytes):
     _require_tpu()
     rng = np.random.default_rng(132)
     count, dim, heads = 128, 512, 8
     values = torch.from_numpy(
         rng.normal(size=(count, dim)).astype(np.float32)
     ).bfloat16()
-    original = torch.full((320, 128), 0x7FC07FC0, dtype=torch.int32)
+    original = torch.full((384, 128), 0x7FC07FC0, dtype=torch.int32)
     owner = csa.PackedCSACache(
-        original.clone(), ((16, 8, 640), torch.uint8, 14 * 512, 3 * 512)
+        original.clone(),
+        ((16, 8, reserved_bytes), torch.uint8, 8 * reserved_bytes + 2048, 3 * 512),
     )
     slots = torch.arange(count, dtype=torch.int32)
     owner.write(slots, values)
