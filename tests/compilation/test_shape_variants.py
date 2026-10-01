@@ -143,7 +143,7 @@ def _small_collective_input(x: torch.Tensor) -> torch.Tensor:
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
 class SmallAllReduceModel(nn.Module):
-    """A TP all-reduce through the small-collective bridge (rows <= 64 take
+    """A TP all-reduce through the small-collective bridge (rows <= MAX_ROWS take
     the kernel), with ``wave`` as vLLM's all-reduce."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

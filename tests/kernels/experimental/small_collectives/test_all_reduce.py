@@ -52,7 +52,7 @@ def _check(got, per_core):
         assert ok.all(), f"core {core}: {np.count_nonzero(~ok)} elements off"
 
 
-@pytest.mark.parametrize("rows", [1, 3, 4, 8, 12, 16, 32, 64])
+@pytest.mark.parametrize("rows", [1, 3, 4, 8, 12, 16, 32, 64, 96])
 @pytest.mark.parametrize("rank_operand", [False, True])
 def test_matches_the_exact_sum(mesh, rows, rank_operand):
     per_core = blocks((N, rows, 4096), seed=rows)

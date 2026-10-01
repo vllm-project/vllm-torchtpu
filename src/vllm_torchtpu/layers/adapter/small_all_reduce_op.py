@@ -16,7 +16,8 @@
 
 ``prebuild`` builds both ops over the expert-parallel mesh at model load. The
 device communicator then hands a 2-D bf16 block of at most ``MAX_ROWS`` rows
-per core to a kernel and anything else to vLLM's collective.
+(an all-reduce) or ``COMBINE_MAX_ROWS`` rows per engine (a DP combine) to a
+kernel and anything else to vLLM's collective.
 
 The choice reads the token count, so it is taken only in a trace that the
 backbone warmup forks per token bucket (``compilation.shape_variants``). Any
@@ -47,9 +48,12 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Largest block, in rows per core, a kernel takes. The value #989 served
-# with (TP8 c64 decode); the kernel probe will derive it from the crossover.
-MAX_ROWS = 64
+# Largest TP all-reduce, in rows, the kernel takes: at H=4096 bf16 on 8 cores
+# two-shot beats XLA through 96 rows, loses from 128 (j-e6f25e61, j-de6349e8).
+MAX_ROWS = 96
+# Largest DP combine, in rows per engine, the reduce-scatter takes: it beats
+# XLA through 24 rows, ties at 32 and loses at 64 (j-de6349e8).
+COMBINE_MAX_ROWS = 24
 
 _AR_OP = None
 _RS_OP = None
@@ -142,11 +146,13 @@ def prebuild() -> None:
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
-        "one_shot_max_bytes=%d | tp_all_reduce=%s | dp_combine=%s | "
+        "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
+        "dp_combine=%s | "
         "backbone warmup traces only; the MTP drafter and eager steps keep "
         "vLLM's collectives",
         _CORES,
         MAX_ROWS,
+        COMBINE_MAX_ROWS,
         all_reduce.ONE_SHOT_MAX_BYTES,
         tp_all_reduce,
         _DP_COMBINE,
@@ -193,6 +199,6 @@ def dp_combine_or(x: torch.Tensor, fallback) -> torch.Tensor:
     ``fallback(x)`` otherwise."""
     if _RS_OP is None or not _DP_COMBINE or not _fits(x, LANES):
         return fallback(x)
-    if x.shape[0] <= _CORES * MAX_ROWS:
+    if x.shape[0] <= _CORES * COMBINE_MAX_ROWS:
         return _RS_OP(x, _RANK)
     return retain(fallback(x))

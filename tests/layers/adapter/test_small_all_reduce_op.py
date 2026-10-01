@@ -55,7 +55,7 @@ def _fallback(x):
     return x * 2
 
 
-@pytest.mark.parametrize("rows", [1, 8, 64])
+@pytest.mark.parametrize("rows", [1, 8, 64, 96])
 def test_small_block_takes_the_all_reduce_kernel(armed, rows):
     ar, _ = armed
     x = _block(rows)
@@ -64,7 +64,7 @@ def test_small_block_takes_the_all_reduce_kernel(armed, rows):
     assert block is x and rank is op._RANK
 
 
-@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("rows", [1, 16, 24])
 def test_small_combine_takes_the_reduce_scatter_kernel(armed, rows):
     _, rs = armed
     x = _block(rows * CORES)
@@ -77,7 +77,7 @@ def test_small_combine_takes_the_reduce_scatter_kernel(armed, rows):
     "call,rows",
     [
         (lambda x: op.all_reduce_or(x, MESH, _fallback), op.MAX_ROWS + 1),
-        (lambda x: op.dp_combine_or(x, _fallback), CORES * op.MAX_ROWS + CORES),
+        (lambda x: op.dp_combine_or(x, _fallback), CORES * op.COMBINE_MAX_ROWS + CORES),
     ],
     ids=["all_reduce", "dp_combine"],
 )
@@ -88,6 +88,20 @@ def test_large_block_falls_back_and_reads_the_rank(armed, call, rows):
     torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
     ar.assert_not_called()
     rs.assert_not_called()
+
+
+@pytest.mark.parametrize("rows_per_engine,armed_expected", [(24, True), (25, False)])
+def test_combine_cap_is_24_rows_per_engine(armed, rows_per_engine, armed_expected):
+    _, rs = armed
+    op.dp_combine_or(_block(rows_per_engine * CORES), _fallback)
+    assert rs.called is armed_expected
+
+
+@pytest.mark.parametrize("rows,armed_expected", [(96, True), (97, False)])
+def test_all_reduce_cap_is_96_rows(armed, rows, armed_expected):
+    ar, _ = armed
+    op.all_reduce_or(_block(rows), MESH, _fallback)
+    assert ar.called is armed_expected
 
 
 def test_large_block_fallback_depends_on_the_rank_buffer(armed, monkeypatch):

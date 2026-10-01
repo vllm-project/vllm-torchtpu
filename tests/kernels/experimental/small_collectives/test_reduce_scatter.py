@@ -54,7 +54,7 @@ def _own_blocks(per_core, core):
 
 # 1, 3 and 12 rows are not multiples of the sublane tile: Mosaic refused
 # them before the kernel padded each block.
-@pytest.mark.parametrize("rows", [1, 3, 4, 12, 16, 64])
+@pytest.mark.parametrize("rows", [1, 3, 4, 12, 16, 24, 64])
 @pytest.mark.parametrize("rank_operand", [False, True])
 def test_each_core_gets_the_exact_sum_of_its_block(mesh, rows, rank_operand):
     per_core = blocks((N, N * rows, 4096), seed=100 + rows)

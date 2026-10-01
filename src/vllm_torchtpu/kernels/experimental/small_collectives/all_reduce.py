@@ -37,9 +37,9 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     wait_bytes_of,
 )
 
-# One-shot up to this many bytes per core, two-shot above. One-shot sends
-# more bytes in one round; two-shot sends fewer in two. The value is the one
-# #989 served with; the kernel probe will derive it.
+# One-shot up to this many bytes per core, two-shot above: one-shot sends more
+# bytes in one round, two-shot fewer in two; they cross at ~5.9 rows of H=4096
+# bf16 on 8 cores (j-de6349e8).
 ONE_SHOT_MAX_BYTES = 32 * 1024
 # Barrier semaphore group. Every kernel compiled with the same id in one
 # program shares it; the fused EP MoE kernels use 0.
