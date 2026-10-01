@@ -396,3 +396,150 @@ def test_exempt_attention_does_not_trigger_hybrid_unification_with_mamba() -> No
     assert normalized["ds_v4"] is ds_v4_spec
     assert normalized["mamba"] is mamba_spec
     assert normalized["mamba"].page_size_padded is None
+
+
+def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) -> None:
+    """VllmTPUDeepseekV32IndexerBackend and normalize_kv_cache_specs_for_tpu
+    size the indexer K cache identically to PallasMLAttentionBackend under
+    'xla'/'has' (256 B/token), halve to 132 B/token under 'sal', and fall back
+    to HAS (256 B/token) with a one-time warning when block_size < 128."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        streamindex_topk as st_mod,
+    )
+    from vllm_torchtpu.layers.adapter.attention import VllmTPUDeepseekV32IndexerBackend
+
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    nb, block_size, head_size = 10, 256, 129
+    indexer_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.uint8,
+        page_size_padded=None,
+    )
+
+    for mode in ("xla", "has"):
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+            nb, block_size, 1, head_size, torch.uint8
+        )
+        mla_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+            nb, block_size, 1, head_size, torch.uint8
+        )
+        assert shape == (nb, block_size // 4, 4, 256)
+        assert shape == mla_shape
+
+        page_bytes = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes(
+            block_size, 1, head_size, torch.uint8
+        )
+        mla_page_bytes = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, 1, head_size, torch.uint8
+        )
+        assert page_bytes == block_size * 256
+        assert page_bytes == mla_page_bytes
+
+        norm = normalize_kv_cache_specs_for_tpu(
+            {"indexer": indexer_spec},
+            torch.float8_e4m3fn,
+            attention_backend=PallasAttentionBackend,
+        )["indexer"]
+        assert norm.dtype == torch.uint8
+        assert norm.state_content_bytes == 256
+        assert norm.page_size_bytes == block_size * 256
+
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    sal_shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        nb, block_size, 1, head_size, torch.uint8
+    )
+    assert sal_shape == (nb, 33, 4, block_size)
+    sal_page_bytes = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, head_size, torch.uint8
+    )
+    assert sal_page_bytes == block_size * 132
+
+    norm_sal = normalize_kv_cache_specs_for_tpu(
+        {"indexer": indexer_spec},
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )["indexer"]
+    assert norm_sal.dtype == torch.uint8
+    assert norm_sal.state_content_bytes == 132
+    assert norm_sal.page_size_bytes == block_size * 132
+
+    # block_size=64 + 'sal' falls back to HAS (256 B/token) with one-time warning.
+    caplog.clear()
+    spec_64 = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.uint8,
+        page_size_padded=None,
+    )
+    shape_64 = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        nb, 64, 1, head_size, torch.uint8
+    )
+    assert shape_64 == (nb, 16, 4, 256)
+    norm_64 = normalize_kv_cache_specs_for_tpu(
+        {"indexer": spec_64},
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )["indexer"]
+    assert norm_64.state_content_bytes == 256
+    assert norm_64.page_size_bytes == 64 * 256
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "requires block_size to be a positive multiple of 128" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_non_indexer_mla_specs_unaffected_by_indexer_kv_cache_mode(monkeypatch) -> None:
+    """Sparse-MLA, dense-MLA, and DSv4 specs normalize identically across
+    xla, has, and sal."""
+    from vllm_torchtpu import envs
+
+    dense_mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        page_size_padded=None,
+    )
+    sparse_mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=None,
+    )
+    dsv4_packed = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        page_size_padded=None,
+    )
+    specs = {
+        "dense_mla": dense_mla,
+        "sparse_mla": sparse_mla,
+        "dsv4_packed": dsv4_packed,
+    }
+
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "xla")
+    baseline = normalize_kv_cache_specs_for_tpu(
+        specs,
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )
+    for mode in ("has", "sal"):
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        current = normalize_kv_cache_specs_for_tpu(
+            specs,
+            torch.float8_e4m3fn,
+            attention_backend=PallasAttentionBackend,
+        )
+        assert current == baseline
+

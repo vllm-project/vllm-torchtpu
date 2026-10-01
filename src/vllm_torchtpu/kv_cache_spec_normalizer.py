@@ -1,5 +1,6 @@
 import math
 from dataclasses import replace
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -13,6 +14,7 @@ from vllm_torchtpu.gdn_pool_layout import pooled_gdn_state_dtypes
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 
 
@@ -92,6 +94,17 @@ def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
     return replace(spec, dtypes=dtypes)
 
 
+def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
+    """True for the packed uint8 DSA indexer K-cache spec (`DeepseekV32IndexerCache`)."""
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and not spec.dtype.is_floating_point
+        and spec.tokens_per_state == 1
+        and spec.cache_dtype_str != "fp8_ds_mla"
+        and getattr(spec, "model_version", None) != "deepseek_v4"
+    )
+
+
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: torch.dtype,
@@ -110,24 +123,17 @@ def _normalize_one_spec(
         # normalize to the TPU fp8 dtype below.
         kv_cache_dtype = spec.dtype
 
-    if isinstance(spec, MLAAttentionSpec):
-        page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
+    if _is_deepseek_v32_indexer_spec(spec):
+        backend: type[Any] = VllmTPUDeepseekV32IndexerBackend
+    elif isinstance(spec, MLAAttentionSpec):
+        backend = PallasMLAttentionBackend
     else:
-        page_size = attention_backend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
-    backend = (
-        PallasMLAttentionBackend
-        if isinstance(spec, MLAAttentionSpec)
-        else attention_backend
+        backend = attention_backend
+    page_size = backend.get_kv_cache_page_size_bytes(
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        kv_cache_dtype,
     )
     target_spec = backend.customize_spec(replace(spec, dtype=kv_cache_dtype))
     padded_page_size = spec.page_size_padded or 0

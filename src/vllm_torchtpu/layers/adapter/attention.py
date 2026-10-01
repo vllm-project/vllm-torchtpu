@@ -41,7 +41,13 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    indexer_kv_layout,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    get_kv_cache_shape as _get_indexer_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
@@ -1823,9 +1829,10 @@ class PallasMLAttentionBackend(AttentionBackend):
 class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     """Indexer backend for TPU.
 
-    The TPU materializer retains the native 3-D indexer K cache shape
-    `(num_blocks, block_size, head_size)` consumed by streamindex. vLLM 0.29
-    no longer owns this backend shape hook.
+    Sizes and allocates the 4-D packed `uint8` indexer K cache in either
+    `HEAD_ALONG_SUBLANE` (`(num_blocks, block_size // 4, 4, 256)`, 256 B/token)
+    or `SEQ_ALONG_LANE` (`(num_blocks, 33, 4, block_size)`, 132 B/token) layout,
+    decided once via `indexer_kv_layout(block_size)`.
 
     The page size hooks below delegate to `PallasMLAttentionBackend`. They are
     not the indexer's own page size: `cache_config.block_size` is global across
@@ -1845,7 +1852,47 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
+        del num_kv_heads, cache_dtype_str
+        kv_layout = indexer_kv_layout(block_size)
+        return _get_indexer_kv_cache_shape(
+            total_num_pages=num_blocks,
+            page_size=block_size,
+            actual_head_dim=head_size,
+            kv_layout=kv_layout,
+        )
+
+    @classmethod
+    def get_kv_cache_page_size_bytes(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        dtype = (
+            torch.uint8
+            if isinstance(cache_dtype_str, str)
+            and cache_dtype_str.lower().strip() == "auto"
+            else _resolve_kv_cache_dtype(cache_dtype_str)
+        )
+        shape = cls.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        page_bytes = cls.get_kv_cache_page_size_bytes(
+            spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+        )
+        return dataclasses.replace(
+            spec, num_head_slots=1, state_content_bytes=page_bytes // spec.block_size
+        )
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
