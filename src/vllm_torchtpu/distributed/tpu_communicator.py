@@ -97,4 +97,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return group.reduce_scatter(hidden_states, dim=0)
+        if is_sequence_parallel:
+            return group.reduce_scatter(hidden_states, dim=0)
+        # The kernel arms only when the DP group is the kernel's mesh.
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: group.reduce_scatter(x, dim=0)
+        )
