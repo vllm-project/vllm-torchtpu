@@ -4,10 +4,11 @@
 from functools import cache as run_once
 from typing import Any
 
-import jax
 import torch
-from torch_tpu._internal import pallas
 
+from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+    optimization_barrier_op as _optimization_barrier_op,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -75,21 +76,6 @@ def apply_omni_tpu_patches() -> None:
     logger.info(
         "Applied TPU patch: safe torch.nn.functional.interpolate for 1D linear TPU ops."
     )
-
-
-@run_once
-def _optimization_barrier_op() -> Any:
-    """Torch op wrapping ``jax.lax.optimization_barrier`` (an XLA fusion fence).
-
-    Built on first use from a TPU forward.
-    """
-
-    def optimization_barrier(x: jax.Array) -> jax.Array:
-        return jax.lax.optimization_barrier(x)
-
-    op = pallas.jax_op("vllm_torchtpu::optimization_barrier", optimization_barrier)
-    op.register_fake(lambda x: torch.empty_like(x))
-    return op
 
 
 @run_once

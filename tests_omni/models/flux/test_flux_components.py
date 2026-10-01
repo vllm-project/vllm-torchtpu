@@ -314,3 +314,19 @@ class TestFluxRoPEKernelApplication:
         # Numerical parity against CPU ground truth
         _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
         _assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)
+
+
+class TestOptimizationBarrierOnTpu:
+    """Verify pallas::optimization_barrier executes on TPU and preserves values."""
+
+    def test_optimization_barrier_on_tpu(self) -> None:
+        from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+            optimization_barrier,
+        )
+
+        torch.manual_seed(42)
+        x_tpu = torch.randn(16, 128, dtype=torch.bfloat16, device="tpu")
+        out = optimization_barrier(x_tpu)
+        assert out.device.type == "tpu"
+        assert out.dtype == torch.bfloat16
+        assert torch.equal(out.cpu(), x_tpu.cpu())
