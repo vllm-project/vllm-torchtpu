@@ -140,6 +140,7 @@ def sharded_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
+    fake: Callable[..., object] | None = None,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
 
@@ -154,6 +155,11 @@ def sharded_jax_op(
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
+
+    ``fake`` replaces the default fake implementation, which exports ``fn`` at
+    the operands' concrete shapes and so specializes a dynamic dimension of the
+    caller's trace. An op whose output shape follows a dynamic input dimension
+    passes one written in terms of the torch operands' shapes.
     """
     global _SHARDED_CALLABLE_CLS
     if _SHARDED_CALLABLE_CLS is None:
@@ -211,5 +217,5 @@ def sharded_jax_op(
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
         return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
 
-    op.register_fake(fake_fn)
+    op.register_fake(fake if fake is not None else fake_fn)
     return op
