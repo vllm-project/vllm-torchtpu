@@ -29,11 +29,6 @@
 #   avoiding local disk exhaustion on 100 GB CI boot disks.
 set -euo pipefail
 
-# Populate HF_TOKEN from GCP Secret Manager if not already configured in /etc/environment.
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true
