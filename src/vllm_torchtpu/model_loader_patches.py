@@ -63,8 +63,9 @@ logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
+# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
+_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
