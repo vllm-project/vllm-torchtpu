@@ -17,7 +17,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.logger import init_logger
+
+from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch

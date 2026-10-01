@@ -326,20 +326,19 @@ def test_rejection_sampler_refuses_argmax_for_sampling():
 
 
 def test_log_step_path_logs_each_path_once():
+    # Captured on the "vllm" logger at its configured level: a record that
+    # does not reach it never reaches the server log either.
     vllm_logger._print_info_once.cache_clear()
     records = []
     handler = logging.Handler()
     handler.emit = records.append
-    logger = greedy_top_tokens.logger
-    level = logger.level
-    logger.setLevel(logging.INFO)
+    logger = logging.getLogger("vllm")
     logger.addHandler(handler)
     try:
         for is_spec_step in (True, False, True, False, False):
             greedy_top_tokens.log_step_path(is_spec_step)
     finally:
         logger.removeHandler(handler)
-        logger.setLevel(level)
     assert [r.getMessage() for r in records] == [
         "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens",
         "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens",
