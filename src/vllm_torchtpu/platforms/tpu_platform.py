@@ -1152,20 +1152,34 @@ def _get_exponential_token_paddings(
 
 # Linear buckets above a quarter of the token budget, every budget/32 rows:
 # 512 at the 16384 budget the TP8 Qwen3.5 recipes serve. A pass there pads by
-# at most 1/8 instead of up to 1/2 with doubling, for at most 24 more buckets.
+# at most 1/8 instead of up to 1/2 with doubling.
 _LINEAR_BUCKETS_FROM_BUDGET_FRACTION = 4
 _LINEAR_BUCKET_STEPS_PER_BUDGET = 32
+# Each bucket is one more backbone (and MTP drafter) program per rank, and the
+# compiled programs stay resident in host memory: about 13 GB per bucket on
+# TP8 Qwen3.5-397B with MTP, so the 13 buckets at budget/32 drove that pod
+# past its 512 GiB while precompiling. The step widens by whole budget/32
+# multiples until the buckets fit under this cap.
+_MAX_LINEAR_BUCKETS = 7
 
 
 def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[int]:
     """Multiples of the linear step above max_token_size / 4, up to the
     longest pass one prompt can make (the model length plus the decode rows
     riding along) and at most max_token_size. A prompt-sized pass costs per
-    row, so padding it to the next power of two wastes up to half of it."""
-    step = max(16, -(-max_token_size // _LINEAR_BUCKET_STEPS_PER_BUDGET // 16) * 16)
-    start = max_token_size // _LINEAR_BUCKETS_FROM_BUDGET_FRACTION // step + 1
-    stop = min(-(-longest_pass // step) * step, max_token_size)
-    paddings = list(range(start * step, stop + 1, step))
+    row, so padding it to the next power of two wastes up to half of it.
+    At most _MAX_LINEAR_BUCKETS of them: the step is the smallest multiple
+    of budget/32 that keeps within the cap."""
+    base = max(16, -(-max_token_size // _LINEAR_BUCKET_STEPS_PER_BUDGET // 16) * 16)
+    floor = max_token_size // _LINEAR_BUCKETS_FROM_BUDGET_FRACTION
+    step = base
+    while True:
+        start = floor // step + 1
+        stop = min(-(-longest_pass // step) * step, max_token_size)
+        paddings = list(range(start * step, stop + 1, step))
+        if len(paddings) <= _MAX_LINEAR_BUCKETS:
+            break
+        step += base
     if paddings:
         logger.info(
             "Linear token buckets every %d rows from %d to %d (%d buckets)",
