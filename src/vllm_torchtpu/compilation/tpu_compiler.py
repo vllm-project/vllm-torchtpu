@@ -221,6 +221,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
 _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
     "vllm_torchtpu/omni/attention.py",
+    "vllm_torchtpu/omni/rope.py",
 )
 
 
