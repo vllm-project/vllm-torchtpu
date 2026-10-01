@@ -20,13 +20,13 @@ import torch
 from resolvers.base_resolver import BaseResolver
 from resolvers.base_sparsity_resolver import BaseSparsityResolver
 from resolvers.lrc_resolver import LrcResolver
+from sparsity.lrc import make_lrc_pruner
 from resolvers.model_splicer import ModelSplicer
 from resolvers.naive_magnitude_resolver import NaiveMagnitudeResolver
 from resolvers.registry import ResolverRegistry
 from resolvers.sparsegpt_resolver import SparseGptResolver
 from resolvers.weight_scaler_resolver import WeightScalerResolver
 from safetensors import safe_open
-from sparsity.lrc import make_lrc_pruner
 
 try:
     from tests.fixtures import create_synthetic_model
@@ -491,7 +491,45 @@ class TestResolversEndToEnd(unittest.TestCase):
             mock_sgpt.assert_called_once()
             self.assertEqual(
                 mock_sgpt.call_args.kwargs["sparse_layer_indices"], {1, 3})
+            self.assertEqual(mock_sgpt.call_args.kwargs["calibrator"], "cpu")
             self.assertNotIn("use_lrc", mock_sgpt.call_args.kwargs)
+
+    def test_sparsegpt_resolver_tpu_child_process_and_naming(self):
+        """Verify use_tpu_sparsegpt spawns child process and namespaces TPU checkpoints."""
+        import json
+
+        calls = []
+        with patch("resolvers.sparsegpt_resolver.prune_gemma4") as mock_prune, \
+                patch("resolvers.sparsegpt_resolver.subprocess.call",
+                      side_effect=lambda cmd, cwd=None, env=None: calls.append((cmd, cwd, env)) or 0):
+            SparseGptResolver().prune_in_memory(
+                base_model="/mock/base",
+                save_path="/mock/save",
+                min_layer=0,
+                max_layer=4,
+                prunen=2,
+                prunem=4,
+                resolver_config={"nsamples": 32, "use_tpu_sparsegpt": True},
+                sparse_layer_indices={3, 1},
+            )
+        mock_prune.assert_not_called()
+        self.assertEqual(len(calls), 1)
+        cmd, cwd, env = calls[0]
+        self.assertEqual(cmd[1:5], ["-u", "-m", "sparsity.tpu_gemma4", "--json"])
+        kw = json.loads(cmd[5])
+        self.assertEqual(kw["sparse_layer_indices"], [1, 3])
+        self.assertEqual(env.get("PYTHONUNBUFFERED"), "1")
+
+        with patch("resolvers.sparsegpt_resolver.subprocess.call", return_value=3):
+            with self.assertRaises(RuntimeError):
+                SparseGptResolver().prune_in_memory(
+                    "/mock/base", "/mock/save", 0, 4, 2, 4, {"use_tpu_sparsegpt": True})
+
+        r = SparseGptResolver()
+        cpu = r.generate_checkpoint_name("gemma4", 2, 4, "first_to_last", 0, 20, {"nsamples": 256})
+        tpu = r.generate_checkpoint_name("gemma4", 2, 4, "first_to_last", 0, 20, {"nsamples": 256}, tpu=True)
+        self.assertNotEqual(cpu, tpu)
+        self.assertIn("_256c4_tpu_", tpu)
 
         with patch("resolvers.lrc_resolver.prune_gemma4") as mock_lrc, \
              patch("resolvers.lrc_resolver.make_lrc_pruner", wraps=make_lrc_pruner) as mock_pruner:

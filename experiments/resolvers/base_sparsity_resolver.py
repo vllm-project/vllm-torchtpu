@@ -127,11 +127,25 @@ class BaseSparsityResolver(BaseResolver):
             return start, end
         raise ValueError(f"Unknown layer selection strategy: {strategy}")
 
-    def generate_checkpoint_name(self, arch_type: str, prunen: int,
-                                 prunem: int, strategy: str, min_layer: int,
+    @staticmethod
+    def _is_tpu_reference(reference_sparse_model: str) -> bool:
+        """True if the reference checkpoint was calibrated on TPU (``_tpu`` tag)."""
+        if not reference_sparse_model:
+            return False
+        base = os.path.basename(os.path.normpath(reference_sparse_model))
+        return "_tpu_" in base or base.endswith("_tpu")
+
+    def generate_checkpoint_name(self,
+                                 arch_type: str,
+                                 prunen: int,
+                                 prunem: int,
+                                 strategy: str,
+                                 min_layer: int,
                                  max_layer: int,
-                                 resolver_config: Dict[str, Any]) -> str:
+                                 resolver_config: Dict[str, Any],
+                                 tpu: bool = False) -> str:
         calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
+        calib_tag += "_tpu" if tpu else ""
         extra_tag = self._method_cache_tag(resolver_config)
         return (
             f"{arch_type}_{self.METHOD_NAME}_{prunen}of{prunem}{calib_tag}_"
@@ -258,8 +272,12 @@ class BaseSparsityResolver(BaseResolver):
                            or explicit_layer_indices is None):
             self._assert_spliceable(sparse_indices, strategy, resolver_config)
 
+        tpu_provenance = (self._is_tpu_reference(reference_sparse_model)
+                          if splice_from_reference else bool(
+                              resolver_config.get("use_tpu_sparsegpt", False)))
         if explicit_layer_indices is not None and not is_prefix:
             calib_tag = f"_{resolver_config.get('nsamples')}c4" if "nsamples" in resolver_config else ""
+            calib_tag += "_tpu" if tpu_provenance else ""
             extra_tag = self._method_cache_tag(merged_cfg)
             cache_payload = (f"{prunen}of{prunem}:" +
                              ",".join(str(x) for x in sorted(sparse_indices)) +
@@ -276,7 +294,8 @@ class BaseSparsityResolver(BaseResolver):
                 strategy=strategy,
                 min_layer=min_layer,
                 max_layer=max_layer,
-                resolver_config=merged_cfg)
+                resolver_config=merged_cfg,
+                tpu=tpu_provenance)
         ckpt_path = os.path.join(base_sparse_dir, ckpt_name)
 
         has_weights = os.path.exists(

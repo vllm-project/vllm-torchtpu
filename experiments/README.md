@@ -98,13 +98,15 @@ experiments/
 │   ├── README.md                                                # Sparsity package documentation
 │   ├── __init__.py                                              # Package initialization
 │   ├── datautils.py                                             # Calibration sequence tokenization utilities
-│   ├── gemma4.py                                                # Gemma 4 layer capture and Hessian orchestrator
+│   ├── gemma4.py                                                # Gemma 4 layer-0 capture and the CPU calibrator
 │   ├── llama.py                                                 # LLaMA architecture layer hooks
 │   ├── lrc.py                                                   # Low-Rank Compensated (LRC) alternating minimization
 │   ├── modelutils.py                                            # PyTorch module traversal & model structure helpers
 │   ├── naive_magnitude_pruner.py                                # Vectorized N:M magnitude pruner (dim=-1)
 │   ├── quant.py                                                 # Quantization helper routines
-│   └── sparsegpt.py                                             # PyTorch reference SparseGPT implementation
+│   ├── sparsegpt.py                                             # PyTorch reference SparseGPT implementation
+│   ├── tpu_gemma4.py                                            # TPU calibrator: Gemma 4 decoder layer in JAX
+│   └── tpu_sparsegpt.py                                         # SparseGPT OBS solver in JAX
 ├── tests/                                                       # Comprehensive unit, integration & TPU test suite
 │   ├── __init__.py                                              # Test package initialization
 │   ├── fixtures.py                                              # Synthetic multi-shard fixtures & dynamic path discovery
@@ -118,7 +120,8 @@ experiments/
 │   ├── test_resolvers.py                                        # Layer range strategies, ModelSplicer, integrity checks
 │   ├── test_runners.py                                          # TpuProfileRunner, TpuEvalRunner lifecycle
 │   ├── test_sparsity_algorithms.py                              # 2:4 / 1:4 magnitude math, SparseGPT Hessian, quant
-│   └── test_tpu_hardware.py                                     # Physical TPU v6e chip detection & on-chip pruning
+│   ├── test_tpu_hardware.py                                     # Physical TPU v6e chip detection & on-chip pruning
+│   └── test_tpu_sparsegpt_solver.py                             # TPU vs CPU SparseGPT solve on one matrix (needs a TPU)
 ├── .coveragerc                                                  # Coverage scoping configuration
 ├── pytest.ini                                                   # Pytest discovery configuration
 ├── rescore.py                                                   # Re-score stored lm_eval samples with new filters
@@ -149,6 +152,16 @@ prune_gemma4(
     save_path="/mnt/pd/sparse_checkpoints/my_gemma4_2of4_256c4_full"
 )
 ```
+
+Pass `calibrator="tpu"` (or `resolver_config: {use_tpu_sparsegpt: true}` in a
+sweep config) to run the same pipeline with the JAX calibrator in
+`sparsity/tpu_gemma4.py`: ~2.6 s per Gemma-4 31B layer instead of ~370 s, same
+checkpoint format. Because SparseGPT's top-k mask choice is discontinuous the
+two calibrators are separate lineages (~97% mask agreement, indistinguishable
+MMLU-Pro); cached checkpoints carry a `_tpu` tag so prefixes are only ever
+spliced within a lineage, and `SparseGptResolver` runs the TPU calibrator in a
+child process (`python -m sparsity.tpu_gemma4 --json ...`) because libtpu
+admits one process per TPU and vLLM needs the chips right afterwards.
 
 ### B. Standalone Naive Magnitude Pruning (Data-Free)
 Applies top-K magnitude pruning along the contracting dimension (dim=-1) across all linear projection weights without calibration:
