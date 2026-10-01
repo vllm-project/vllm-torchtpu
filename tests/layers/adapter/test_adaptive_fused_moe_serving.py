@@ -191,6 +191,63 @@ def test_single_selector_load_and_forward(setup, monkeypatch, fp4):
     setup[1].assert_not_called()
 
 
+def test_sequence_parallel_layer_prebuilds_grouped_not_v2(setup, monkeypatch):
+    """A sequence-parallel layer's replicated steps take the grouped path; the
+    v2 op is never built, since MOE_FUSED_EP_KERNEL_IMPL=adaptive owns fused EP."""
+    layer, method = make_layer(fp4=False), make_method(fp4=False)
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    mock_conversion(monkeypatch, fp4=False)
+    grouped = Mock()
+    monkeypatch.setattr(fp8, "prebuild_fused_moe_kernel", grouped)
+    method.process_weights_after_loading(layer)
+    grouped.assert_called_once()
+    setup[1].assert_not_called()
+    assert getattr(method, bridge.FUSED_MOE_EP_OP_ATTR) is setup[0]
+    assert not legacy.fused_moe_ep_supported(method)
+
+
+@pytest.mark.parametrize(
+    "sp_on,tp,declined",
+    [(True, 8, True), (True, 1, False), (False, 8, False)],
+    ids=["sp-tp8", "sp-tp1", "no-sp-tp8"],
+)
+def test_draft_outside_sequence_parallelism_takes_grouped(
+    setup, monkeypatch, sp_on, tp, declined
+):
+    """Next to a TP sequence-parallel target, the MTP draft's MoE layer runs
+    the plain TP form with its rows replicated: it keeps the grouped path and
+    leaves vLLM's dispatch and combine in place, as V3 declines it."""
+    from vllm.compilation import backends
+
+    monkeypatch.setenv("TPU_SEQUENCE_PARALLEL_PREFILL", "1" if sp_on else "0")
+    monkeypatch.setattr(
+        bridge,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp)
+        ),
+    )
+    layer, method = make_layer(fp4=False), make_method(fp4=False)
+    mock_conversion(monkeypatch, fp4=False)
+    grouped = Mock()
+    monkeypatch.setattr(fp8, "prebuild_fused_moe_kernel", grouped)
+    with backends.set_model_tag("eagle_head"):
+        method.process_weights_after_loading(layer)
+    setup[1].assert_not_called()
+    x = torch.ones(2, 512, dtype=torch.bfloat16)
+    if not declined:
+        grouped.assert_not_called()
+        assert method.supports_internal_mk
+        assert method.apply_monolithic(layer, x, torch.ones(2, 8)) is x
+        return
+    grouped.assert_called_once()
+    bridge._build_op.assert_not_called()
+    assert getattr(method, bridge.FUSED_MOE_EP_OP_ATTR, None) is None
+    assert not method.supports_internal_mk
+    method._apply_grouped = Mock(return_value="grouped")
+    assert method.apply_monolithic(layer, x, torch.ones(2, 8)) == "grouped"
+
+
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("failure", ["no_ep", "old_chip"])
 def test_admission_failure_never_falls_back(setup, monkeypatch, fp4, failure):

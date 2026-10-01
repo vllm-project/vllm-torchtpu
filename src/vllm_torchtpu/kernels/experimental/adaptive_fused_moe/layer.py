@@ -239,6 +239,7 @@ def adaptive_fused_moe(
     rank=None,
     mesh_ep_ranks=None,
     token_replica_groups=None,
+    padded=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -284,6 +285,10 @@ def adaptive_fused_moe(
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    padded [tokens], sharded like x, is optional; a nonzero row is padding.
+    A padded row routes nowhere, like a row whose gating carries no finite
+    value: it does no expert work and its output row is zero.
     """
     if weight_format is None:
         weight_format = weight_format_of_dtype(w1.dtype)
@@ -339,6 +344,8 @@ def adaptive_fused_moe(
         raise ValueError("W1/W2 dimensions do not match the input and gate/up layout")
     if gating.shape != (T, e_total):
         raise ValueError("gating must have shape [tokens, experts]")
+    if padded is not None and padded.shape != (T,):
+        raise ValueError("padded must have shape [tokens]")
     if not 1 <= topk <= e_total:
         raise ValueError("topk must be between one and the expert count")
     # Where the weight scales' layout is fixed: [E, N] per output channel,
@@ -412,6 +419,7 @@ def adaptive_fused_moe(
         )
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
+    has_padded = padded is not None
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -431,7 +439,9 @@ def adaptive_fused_moe(
         # The scales come before the gating logits and the biases after
         # them, which is the operand order the scaled formats have always
         # had: a format that supplies no scales drops them out of the middle
-        # rather than moving anything that stayed.
+        # rather than moving anything that stayed. The padding mask is last.
+        if has_padded:
+            *scales_gating_biases, padded_l = scales_gating_biases
         operands = iter(scales_gating_biases)
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
@@ -442,6 +452,8 @@ def adaptive_fused_moe(
         me = rank_l[0, 0]
         x_l = token_layout.split(x_l, me)
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        if has_padded:
+            padded_l = token_layout.split(padded_l[:, None], me, fill_value=1)
         if len(token_layout.groups[0]) > 1 and form.quantized_activations:
             # Preserve BF16 rounding at row quantization after slicing.
             x_l = lax.optimization_barrier(x_l)
@@ -479,6 +491,14 @@ def adaptive_fused_moe(
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
         row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        if has_padded:
+            # With the skip armed, a row that routes nowhere takes the expert
+            # id one past the last. Every count, table and slab bins over
+            # arange(e_total), so its pairs get none of them and no expert
+            # computes it. After the relabel, which would map this id onto
+            # expert 0.
+            row_routes = row_routes & (padded_l == 0)
+            topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         if renormalize:
             denom = topk_weights.sum(axis=-1, keepdims=True)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -638,6 +658,10 @@ def adaptive_fused_moe(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        if has_padded:
+            # Such a row indexes arrival rows nothing wrote this step, and a
+            # zero weight times a NaN there is NaN: select, not scale.
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -654,8 +678,9 @@ def adaptive_fused_moe(
     # default keeps the device tests and any JAX-native caller working.
     if rank is None:
         rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
-    in_specs = (P(ax),) * (5 + len(scale_args) + len(bias_args))
-    args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args
+    padded_args = (padded,) if has_padded else ()
+    in_specs = (P(ax),) * (5 + len(scale_args) + len(bias_args) + len(padded_args))
+    args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args + padded_args
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -683,6 +708,7 @@ def adaptive_fused_moe(
         gating.dtype,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
+        has_padded and padded.dtype,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

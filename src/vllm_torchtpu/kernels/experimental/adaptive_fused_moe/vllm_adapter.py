@@ -21,6 +21,8 @@ experimental path always builds sharded routing and never returns a GMM fallback
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -45,7 +47,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     PACK4,
     U32_SUBLANE_TILE,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, sequence_parallel, token_padding
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -84,7 +86,7 @@ def prebuild_adaptive_fused_moe(
     *,
     weights: PreparedWeights | None = None,
     rhs_qb: int | None = None,
-) -> torch.library.CustomOpDef:
+) -> Callable[..., torch.Tensor]:
     """Build the selected experimental path, raising on every refusal.
 
     Weights must already be in the K-major runtime layout. FP4 format and
@@ -163,8 +165,10 @@ def prebuild_adaptive_fused_moe(
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
-    op = _build_op(
+    # Decided here, at weight load, so the forward reads no env.
+    skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS) and _in_backbone_graph()
+    build = functools.partial(
+        _build_op,
         mesh,
         topk,
         renormalize,
@@ -172,11 +176,29 @@ def prebuild_adaptive_fused_moe(
         order,
         weight_format,
         rhs_qb,
-        token_replica_groups=groups,
+        skip_padded_tokens=skip_padded_tokens,
     )
+    if parallel.is_sequence_parallel:
+        if weight_format != "fp8":
+            raise ValueError(
+                "adaptive fused MoE serves a sequence-parallel layer with fp8 "
+                "weights only: its replicated steps take the fp8 grouped path"
+            )
+        # Only the sliced steps (each rank's own rows) run the kernel;
+        # `apply_adaptive_fused_moe` sends replicated steps to the grouped path.
+        op = build(
+            token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
+            sliced_rows=True,
+            experts_per_rank=local_experts,
+        )
+    else:
+        op = build(
+            token_replica_groups=ep_token_replica_groups(is_sequence_parallel=False)
+        )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
-        "hidden=%d inter=%d local_experts=%d rhs_qb=%s estimated_vmem_bytes=%d",
+        "hidden=%d inter=%d local_experts=%d rhs_qb=%s estimated_vmem_bytes=%d "
+        "skip_padded_tokens=%s",
         weight_format,
         plan.w1_nbuf,
         plan.w2_nbuf,
@@ -185,8 +207,34 @@ def prebuild_adaptive_fused_moe(
         local_experts,
         rhs_qb,
         plan.vmem_bytes,
+        skip_padded_tokens,
     )
     return op
+
+
+def _in_backbone_graph() -> bool:
+    """Whether this layer is loaded into the target model's graph.
+
+    The runner writes the padding mask once per target forward. A draft
+    forward (MTP or EAGLE, "eagle_head") reads that buffer without writing
+    it, so a real draft row can sit on a row the target step padded. Draft
+    layers keep computing every row.
+    """
+    # Read at call time: `set_model_tag` rebinds the module global.
+    from vllm.compilation import backends
+
+    return backends.model_tag == "backbone"
+
+
+def outside_sequence_parallelism(layer: RoutedExperts) -> bool:
+    """Whether this layer runs the plain TP form next to a TP sequence-parallel
+    target (the MTP draft's MoE layer). Its rows are replicated over TP, so it
+    keeps the grouped-matmul path, as below the V3 gate."""
+    if not sequence_parallel.enabled():
+        return False
+    if layer.moe_config.moe_parallel_config.is_sequence_parallel:
+        return False
+    return get_current_vllm_config().parallel_config.tensor_parallel_size > 1
 
 
 def adaptive_fused_moe_supported(owner: Any) -> bool:
@@ -417,8 +465,17 @@ def _build_op(
     rhs_qb: int | None = None,
     *,
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
-) -> torch.library.CustomOpDef:
-    """The op for this closure, built once per distinct closure and reused."""
+    skip_padded_tokens: bool = False,
+    sliced_rows: bool = False,
+    experts_per_rank: int = 1,
+) -> Callable[..., torch.Tensor]:
+    """The op for this closure, built once per distinct closure and reused.
+
+    `sliced_rows`: each rank holds a contiguous slice of the step's rows (a
+    sequence-parallel step), so it skips that slice of the step's padding mask.
+    Its rank operand is the layer's `experts_start`, divided here by
+    `experts_per_rank`.
+    """
     key = (
         mesh,
         topk,
@@ -428,6 +485,9 @@ def _build_op(
         weight_format,
         rhs_qb,
         token_replica_groups,
+        skip_padded_tokens,
+        sliced_rows,
+        experts_per_rank,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -438,17 +498,9 @@ def _build_op(
     # dispatch entry, and the second closure would then serve the first.
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
-    # Every operand is annotated jax.Array: torch_tpu infers static argnums
-    # from the signature and refuses an unannotated one.
-    def moe(
-        x: jax.Array,
-        w1: jax.Array,
-        w2: jax.Array,
-        w1_scale: jax.Array,
-        w2_scale: jax.Array,
-        gating: jax.Array,
-        rank: jax.Array,
-    ) -> jax.Array:
+    def run_kernel(x, w1, w2, w1_scale, w2_scale, gating, rank, padded):
+        if experts_per_rank > 1:
+            rank = rank // experts_per_rank
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -476,7 +528,33 @@ def _build_op(
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
             token_replica_groups=token_replica_groups,
+            padded=padded,
         )
+
+    # Every operand is annotated jax.Array: torch_tpu infers static argnums
+    # from the signature and refuses an unannotated one.
+    def moe(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        return run_kernel(x, w1, w2, w1_scale, w2_scale, gating, rank, None)
+
+    def moe_skip_padded(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        padded: jax.Array,
+    ) -> jax.Array:
+        return run_kernel(x, w1, w2, w1_scale, w2_scale, gating, rank, padded)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Stock jax_op. It used to size its outputs from the export's avals, where
@@ -488,11 +566,12 @@ def _build_op(
     # come loose the way a text match on someone else's source can.
     op = jax_op(
         name,
-        moe,
+        moe_skip_padded if skip_padded_tokens else moe,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
-        # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec,) * 7,
+        # x, w1, w2, w1_scale, w2_scale, gating, rank [, padded] -- every
+        # operand is sharded on axis 0 over the EP axis, and so is the single
+        # output.
+        input_partition_specs=(spec,) * (8 if skip_padded_tokens else 7),
         output_partition_specs=spec,
     )
 
@@ -503,8 +582,65 @@ def _build_op(
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    _OPS[key] = op
-    return op
+    run = op
+    if skip_padded_tokens:
+        ep = mesh.shape[EP_AXIS_NAME] if sliced_rows else None
+
+        def run(x, *args):
+            if sliced_rows:
+                # EP rank = mesh index = TP rank with sequence parallelism.
+                rank = (args[-1] // experts_per_rank).reshape(1)
+                padded = token_padding.rank_padding_mask(x.shape[0], ep, rank)
+            else:
+                # This rank's rows: the op takes each rank's own tokens.
+                padded = token_padding.local_padding_mask(x.shape[0])
+            if padded is None:
+                raise RuntimeError(
+                    "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "
+                    "install padding state"
+                )
+            return op(x, *args, padded.to(torch.int32))
+
+    _OPS[key] = run
+    return run
+
+
+def apply_adaptive_fused_moe(
+    owner: Any,
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    grouped: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """The FP8 layer's forward when the adaptive kernel owns its exchange.
+
+    A sequence-parallel layer runs the kernel only on a sliced step, where
+    each rank holds its own rows. A replicated step (below
+    sequence_parallel.MIN_ROWS rows) runs `grouped`, the method's
+    grouped-matmul path, between the dispatch and combine vLLM's MoERunner
+    would have issued. Each side is its own trace; both lift the weights,
+    `experts_start` and the padding mask, so a bucket compiled by one can be
+    handed to the other.
+    """
+    weights = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+    )
+    is_sequence_parallel = layer.moe_config.moe_parallel_config.is_sequence_parallel
+    if not is_sequence_parallel:
+        return run_adaptive_fused_moe(owner, x, *weights, router_logits)
+    if sequence_parallel.rows_are_sliced(is_sequence_parallel):
+        # The op divides `experts_start` into the rank inside the kernel
+        # program (EP rank = mesh index: ep_mesh.ep_rank_order is the identity).
+        rank = layer._experts_start.reshape(1, 1)
+        return run_adaptive_fused_moe(owner, x, *weights, router_logits, rank=rank)
+    from vllm.distributed.parallel_state import get_ep_group
+
+    ep = get_ep_group()
+    x, router_logits = ep.dispatch_router_logits(x, router_logits, True)
+    return ep.combine(grouped(layer, x, router_logits), True)
 
 
 def run_adaptive_fused_moe(
@@ -515,8 +651,16 @@ def run_adaptive_fused_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    *,
+    rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Execute a successfully prebuilt experimental op, or raise."""
+    """Execute a successfully prebuilt experimental op, or raise.
+
+    `rank` is the op's rank operand as device data (`experts_start` for a
+    sliced-rows op); the prebuild's mesh-index buffer by default.
+    """
+    if rank is None:
+        rank = _RANK_BUFFER
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
@@ -537,7 +681,7 @@ def run_adaptive_fused_moe(
             block_scale(w1_scale),
             block_scale(w2_scale),
             router_logits,
-            _RANK_BUFFER,
+            rank,
         )
     return op(
         hidden_states,
@@ -546,5 +690,5 @@ def run_adaptive_fused_moe(
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
-        _RANK_BUFFER,
+        rank,
     )

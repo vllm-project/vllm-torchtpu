@@ -48,6 +48,27 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def local_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """This rank's padding mask for `num_tokens` rows, or None without state."""
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
+def rank_padding_mask(
+    num_rows: int, num_ranks: int, rank: torch.Tensor
+) -> torch.Tensor | None:
+    """Rank `rank`'s slice of the step's padding mask when each of `num_ranks`
+    ranks holds `num_rows` contiguous rows of it (a sequence-parallel step).
+
+    `rank` is device data, so every rank runs one program. None without state.
+    """
+    if _padding_state is None:
+        return None
+    step = _padding_state.get_local_padding_mask(num_rows * num_ranks)
+    return step.reshape(num_ranks, num_rows).index_select(0, rank).squeeze(0)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -58,6 +58,9 @@ weight/routing contracts, insufficient SMEM/VMEM, or a deployment below
 `MOE_FUSED_EP_KERNEL_MIN_TOKENS`. It never returns a GMM fallback. Store the op
 on the quantization-method owner under `vllm_adapter.FUSED_MOE_EP_OP_ATTR`, then
 use `vllm_adapter.run_adaptive_fused_moe`; a missing op is an error.
+With `TPU_MOE_SKIP_PADDED_TOKENS` set at weight load, the op also takes the
+runner's padding mask and padded rows do no expert work (`adaptive_fused_moe`'s
+`padded`); a draft model's layers (MTP, EAGLE) keep computing every row.
 
 Select the experimental FP8/NVFP4 serving path with one variable:
 

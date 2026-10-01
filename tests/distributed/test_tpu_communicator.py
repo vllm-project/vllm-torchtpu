@@ -96,3 +96,36 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+@pytest.mark.parametrize("active", [False, True], ids=["replicated", "sliced"])
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+def test_a_sequence_parallel_layer_exchanges_over_the_ep_group(
+    monkeypatch, communicator, method, count, active
+):
+    """Sliced rows (a large step) are gathered and reduce-scattered; the
+    replicated rows of a small step pass through and are all-reduced."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setenv("TPU_SEQUENCE_PARALLEL_PREFILL", "1")
+    monkeypatch.setattr(sequence_parallel, "_active", active)
+    dp_group, ep_group = Mock(world_size=1), Mock(world_size=8)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    if method == "combine":
+        called = ep_group.reduce_scatter if active else ep_group.all_reduce
+        assert result is called.return_value
+        assert called.call_args.args[0] is tensors[0]
+    elif active:
+        assert len(result) == count
+        assert all(r is ep_group.all_gather.return_value for r in result)
+        assert [c.args[0] for c in ep_group.all_gather.call_args_list] == tensors
+    else:
+        assert all(r is t for r, t in zip(result, tensors, strict=True))
+        ep_group.all_gather.assert_not_called()
+    dp_group.all_gather.assert_not_called()
+    dp_group.reduce_scatter.assert_not_called()

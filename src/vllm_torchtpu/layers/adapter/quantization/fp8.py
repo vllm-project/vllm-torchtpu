@@ -81,6 +81,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import fused_moe_ep_v3_dispatch
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -779,6 +780,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or fused_moe_ep_v3_dispatch.supported(self)
         )
 
     def maybe_roundup_sizes(
@@ -914,7 +916,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        use_adaptive = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        self._use_adaptive_fused_moe = (
+            use_adaptive and not adaptive_moe.outside_sequence_parallelism(layer)
+        )
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
@@ -988,12 +993,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
-            return
+            if not layer.moe_config.moe_parallel_config.is_sequence_parallel:
+                return
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if use_adaptive:
+            # A sequence-parallel layer's replicated steps and a layer outside
+            # sequence parallelism take the grouped path; v2 never runs.
+            return
+        if fused_moe_ep_v3_dispatch.enabled():
+            fused_moe_ep_v3_dispatch.prebuild(self, layer, activation_str)
+            return
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1042,14 +1055,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
-            return adaptive_moe.run_adaptive_fused_moe(
-                self,
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                router_logits,
+            return adaptive_moe.apply_adaptive_fused_moe(
+                self, layer, x, router_logits, self._apply_grouped
+            )
+        if fused_moe_ep_v3_dispatch.supported(self):
+            return fused_moe_ep_v3_dispatch.apply(
+                self, layer, x, router_logits, self._apply_grouped
             )
 
         # `score_bias_operand` is not optional, and omitting it is silent on
@@ -1080,6 +1091,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        return self._apply_grouped(layer, x, router_logits)
+
+    def _apply_grouped(
+        self, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """The grouped-matmul path: route, then fused_moe_gmm."""
+        activation_str = self._tpu_activation_str
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

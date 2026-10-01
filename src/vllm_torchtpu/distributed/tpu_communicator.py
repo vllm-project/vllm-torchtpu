@@ -12,6 +12,11 @@ sums those matching-TP partials across DP and returns this DP rank's token
 slice. vLLM's existing ``reduce_results`` TP all-reduce remains responsible for
 the final TP-side reduction. Callers must pass equal token counts on each DP
 rank.
+
+A layer built for the row-gated sequence parallelism
+(layers/adapter/sequence_parallel) exchanges over the EP group instead: rank
+slices of a large step are gathered and reduce-scattered, and the replicated
+rows of a small step are passed through and all-reduced.
 """
 
 import torch
@@ -19,7 +24,9 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
 )
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+from vllm_torchtpu.layers.adapter import sequence_parallel
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -50,6 +57,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            return hidden_states, router_logits
+        if sequence_parallel.rows_are_sliced(is_sequence_parallel):
+            ep = get_ep_group()
+            return ep.all_gather(hidden_states, dim=0), ep.all_gather(
+                router_logits, dim=0
+            )
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, router_logits
@@ -69,6 +83,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            return hidden_states, topk_weights, topk_ids
+        if sequence_parallel.rows_are_sliced(is_sequence_parallel):
+            ep = get_ep_group()
+            return tuple(
+                ep.all_gather(x, dim=0) for x in (hidden_states, topk_weights, topk_ids)
+            )
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, topk_weights, topk_ids
@@ -80,6 +101,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            # Partial sums over each rank's experts; vLLM's MoE runner skips
+            # its own reduction for a sequence-parallel layer.
+            return get_ep_group().all_reduce(hidden_states)
+        if sequence_parallel.rows_are_sliced(is_sequence_parallel):
+            return get_ep_group().reduce_scatter(hidden_states, dim=0)
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states

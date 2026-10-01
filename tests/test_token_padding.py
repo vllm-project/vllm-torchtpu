@@ -19,6 +19,17 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
 
+def test_local_padding_mask_reads_the_installed_state():
+    state = TokenPaddingState.create(8, device="cpu")
+    token_padding.set_padding_state(state)
+    try:
+        state.update(3, 6)
+        assert token_padding.local_padding_mask(6).tolist() == [False] * 3 + [True] * 3
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.local_padding_mask(6) is None
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)

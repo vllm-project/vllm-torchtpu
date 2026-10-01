@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_SEQUENCE_PARALLEL_PREFILL: bool = False
+    TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -616,8 +618,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # v3 (kernels/fused_moe/v3) serves FP8 layers under DP+EP, TP=1, or
+    # under TP+EP on TPU_SEQUENCE_PARALLEL_PREFILL's sliced steps.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -655,6 +659,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Sequence parallelism for the TP prefill (layers/adapter/sequence_parallel):
+    # steps above a row threshold reduce-scatter the attention output and run
+    # the norms, router and shared expert on each rank's own rows. Qwen3-Next
+    # and Qwen3.5 MoE decoders under TP>1 + EP, DP=1.
+    "TPU_SEQUENCE_PARALLEL_PREFILL": env_bool("TPU_SEQUENCE_PARALLEL_PREFILL"),
+    # With it: gather the rows before the attention and GDN in-projections as
+    # fp8 with per-row scales, half the bytes. The fp8 projections compute the
+    # same result; an unquantized one (the GDN's b/a) sees fp8-rounded rows.
+    "TPU_SEQUENCE_PARALLEL_FP8_GATHER": env_bool("TPU_SEQUENCE_PARALLEL_FP8_GATHER"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
