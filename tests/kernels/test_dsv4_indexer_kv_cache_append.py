@@ -1232,6 +1232,186 @@ class CoalescedKvAppendTest(parameterized.TestCase):
                     np.asarray(out), np.asarray(cache), err_msg=f"{layout} {num_tokens}"
                 )
 
+    @parameterized.parameters(1, 2, 3, 4)
+    def test_sal_short_run_fast_path_slot_mod_128_boundaries(self, run_len):
+        """SAL short-run fast path at `run_len` 1..4 across `slot % 128` boundaries.
+
+        Checks `slot % 128` in `{0, 1, 2, 3, 124, 125, 126, 127}` (including
+        runs that cross a 4-lane column group or split across a 128-lane tile
+        boundary), with and without leading skipped tokens (`move_token`),
+        against both `scatter_rows_reference` and the general SAL path
+        (`short_run_fast_path=False`).
+        """
+        page_size, num_pages = 256, 4
+        rng = np.random.default_rng(700 + run_len)
+        cache_sal = _in_layout(_random_cache(rng, num_pages, page_size), _SAL)
+        cache_np = np.asarray(cache_sal)
+        num_tokens = 8  # fits `run_len <= 4` plus leading/trailing skip tokens
+
+        for width in (129, 256):
+            src = _random_rows(rng, num_tokens, width=width)
+            fast_fn = jax.jit(
+                functools.partial(
+                    kv_cache_append.scatter_rows,
+                    kv_layout=_SAL,
+                    short_run_fast_path=True,
+                ),
+                donate_argnums=0,
+            )
+            general_fn = jax.jit(
+                functools.partial(
+                    kv_cache_append.scatter_rows,
+                    kv_layout=_SAL,
+                    short_run_fast_path=False,
+                ),
+                donate_argnums=0,
+            )
+            for leading_skips in (0, 3):
+                for tile_base in (0, 128):
+                    for slot_mod_128 in (0, 1, 2, 3, 124, 125, 126, 127):
+                        start_row = 1 * page_size + tile_base + slot_mod_128
+                        dst = np.full(
+                            (num_tokens,), kv_cache_utils.SKIP_ROW, dtype=np.int32
+                        )
+                        dst[leading_skips : leading_skips + run_len] = (
+                            start_row + np.arange(run_len, dtype=np.int32)
+                        )
+                        dst_jnp = jnp.asarray(dst, jnp.int32)
+
+                        expected_ref = np.asarray(
+                            kv_cache_append.scatter_rows_reference(
+                                cache_sal, src, dst_jnp, _SAL
+                            )
+                        )
+                        self.assertFalse(
+                            np.array_equal(expected_ref, cache_np),
+                            msg=(
+                                f"vacuous reference at run_len={run_len}"
+                                f" slot_mod_128={slot_mod_128}"
+                            ),
+                        )
+                        actual_fast = np.asarray(
+                            fast_fn(jnp.copy(cache_sal), src, dst_jnp)
+                        )
+                        actual_general = np.asarray(
+                            general_fn(jnp.copy(cache_sal), src, dst_jnp)
+                        )
+                        label = (
+                            f"run_len={run_len} width={width}"
+                            f" skips={leading_skips} base={tile_base}"
+                            f" slot_mod_128={slot_mod_128}"
+                        )
+                        np.testing.assert_array_equal(
+                            actual_fast, expected_ref, err_msg=f"vs ref: {label}"
+                        )
+                        np.testing.assert_array_equal(
+                            actual_fast,
+                            actual_general,
+                            err_msg=f"vs general SAL: {label}",
+                        )
+
+    @parameterized.parameters(129, 132, 256)
+    def test_sal_short_and_long_runs_mixed_in_one_call(self, width):
+        """Mixed short (`1..4`) and long (`> 4`) runs in one SAL `scatter_rows` call.
+
+        Exercises:
+          - short runs (`run_len` 1..4) at `slot % 128` in `{0, 1, 2, 3, 124..127}`,
+          - a short run that splits across a 128-lane destination tile boundary,
+          - a short run whose compacted `src_tok` straddles a 128-token source
+            tile boundary (`src_tok` in `126..129`),
+          - long runs (`run_len` in `{5, 19, 64, 128}`), and
+          - interleaved skipped tokens (`SKIP_ROW` and `>= num_rows`),
+        asserting bit-exact parity vs `scatter_rows_reference` and vs the
+        general SAL path (`short_run_fast_path=False`).
+        """
+        page_size, num_pages = 256, 16
+        num_rows = num_pages * page_size
+        rng = np.random.default_rng(900 + width)
+        cache_sal = _in_layout(_random_cache(rng, num_pages, page_size), _SAL)
+        cache_np = np.asarray(cache_sal)
+
+        # Build destination rows on distinct pages/tiles so runs never alias:
+        # 1) Page 0..3: every `slot % 128` boundary `0, 1, 2, 3, 124, 125, 126, 127`
+        #    with `run_len` cycling through `1, 2, 3, 4` (36 valid tokens).
+        dst: list[int] = [-1]
+        boundary_slots = [0, 1, 2, 3, 124, 125, 126, 127]
+        for idx, slot_mod_128 in enumerate(boundary_slots):
+            run_len = (idx % 4) + 1
+            page = idx // 2
+            tile_base = (idx % 2) * 128
+            # Keep inside the 128-lane tile for the first pass; cross-tile is tested below.
+            slot = tile_base + min(slot_mod_128, 128 - run_len)
+            for r in range(run_len):
+                dst.append(page * page_size + slot + r)
+            dst.append(-1)
+
+        # 2) Page 4: a 4-token segment starting at `slot = 126`, splitting into
+        #    two `run_len = 2` short runs at `slot % 128 == 126` and `0`.
+        for r in range(4):
+            dst.append(4 * page_size + 126 + r)
+        dst.append(num_rows + 11)
+
+        # 3) Pad valid count to 126 with a long run on page 5 (`126 - valid_so_far`),
+        #    then add a `run_len = 4` short run on page 6 so its compacted
+        #    `src_tok` spans `126..129` (straddling source tile 0 and tile 1).
+        valid_so_far = sum(1 for x in dst if 0 <= x < num_rows)
+        fill_len = 126 - valid_so_far
+        for r in range(fill_len):
+            dst.append(5 * page_size + 10 + r)
+        dst.append(-1)
+        for r in range(4):
+            dst.append(6 * page_size + 3 + r)
+
+        # 4) Long runs of lengths 5, 19, 64, and 128 on pages 7..10, plus a
+        #    trailing `run_len = 1` at `slot % 128 == 127` on page 11.
+        for page, slot, length in [
+            (7, 2, 5),
+            (8, 37, 19),
+            (9, 128 + 3, 64),
+            (10, 0, 128),
+            (11, 127, 1),
+        ]:
+            dst.append(-1)
+            for r in range(length):
+                dst.append(page * page_size + slot + r)
+
+        dst_jnp = jnp.asarray(dst, jnp.int32)
+        src = _random_rows(rng, dst_jnp.shape[0], width=width)
+
+        expected_ref = np.asarray(
+            kv_cache_append.scatter_rows_reference(cache_sal, src, dst_jnp, _SAL)
+        )
+        self.assertFalse(np.array_equal(expected_ref, cache_np))
+
+        actual_fast = np.asarray(
+            jax.jit(
+                functools.partial(
+                    kv_cache_append.scatter_rows,
+                    kv_layout=_SAL,
+                    short_run_fast_path=True,
+                ),
+                donate_argnums=0,
+            )(jnp.copy(cache_sal), src, dst_jnp)
+        )
+        actual_general = np.asarray(
+            jax.jit(
+                functools.partial(
+                    kv_cache_append.scatter_rows,
+                    kv_layout=_SAL,
+                    short_run_fast_path=False,
+                ),
+                donate_argnums=0,
+            )(jnp.copy(cache_sal), src, dst_jnp)
+        )
+        np.testing.assert_array_equal(
+            actual_fast, expected_ref, err_msg=f"mixed vs ref width={width}"
+        )
+        np.testing.assert_array_equal(
+            actual_fast,
+            actual_general,
+            err_msg=f"mixed vs general SAL width={width}",
+        )
+
     # ---------------------------------------------------------------------------
     # Reader top-k parity across xla / has / sal (R9).
     # ---------------------------------------------------------------------------

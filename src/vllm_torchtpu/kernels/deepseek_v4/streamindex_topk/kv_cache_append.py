@@ -223,14 +223,23 @@ class _HasQuads:
 class _SalTiles:
     """`SEQ_ALONG_LANE` granule ops: a granule is one 128-lane tile.
 
-    The staged source (`k_ref`, `[sublane_groups, 4, padded_tokens]`) is already
+    The staged source (`k_ref`, `[sublane_groups, 4, padded_tokens]`) is
     transposed to the cache layout, so token `t` is lane `t` of the source and
     cache row `page * page_size + slot` is lane `slot` of page `page`.
     """
 
     granule = _LANES
 
-    def __init__(self, k_ref, cache_ref, rmw_ref, page_size):
+    def __init__(
+        self,
+        k_ref,
+        cache_ref,
+        rmw_ref,
+        page_size,
+        *,
+        ensure_blocks_transposed=None,
+        short_run_fast_path: bool = True,
+    ):
         _, self.sublane_groups, _, _ = cache_ref.shape
         self.cache = cache_ref
         self.k = k_ref
@@ -238,6 +247,8 @@ class _SalTiles:
         self.page_size = page_size
         self.padded_tokens = k_ref.shape[2]
         self.rec_dim = self.sublane_groups * _KV_PACKING
+        self._ensure_blocks_transposed = ensure_blocks_transposed
+        self.short_run_fast_path = short_run_fast_path
 
     def _cache_lanes(self, row, n):
         """Lanes `[row, row + n)` of the cache; `row` is 128-aligned."""
@@ -245,6 +256,11 @@ class _SalTiles:
         return self.cache.at[row // self.page_size, :, :, pl.ds(slot, n)]
 
     def _src_tile(self, src_ref, tok_aligned):
+        if self.short_run_fast_path and self.padded_tokens == _LANES:
+            return pltpu.bitcast(
+                src_ref[...].reshape(self.rec_dim, _LANES),
+                jnp.uint32,
+            )
         off = pl.multiple_of(
             jnp.clip(tok_aligned, 0, self.padded_tokens - _LANES), _LANES
         )
@@ -265,23 +281,59 @@ class _SalTiles:
         src_start = src_tok & 127
         tok_aligned = (src_tok >> 7) << 7
         delta = (dst_start - src_start) & 127
+        lane = lax.broadcasted_iota(jnp.int32, (self.sublane_groups, _LANES), 1)
+        dst = pltpu.bitcast(
+            self.rmw[rmw_slot].reshape(self.rec_dim, _LANES), jnp.uint32
+        )
+        mask = (lane >= dst_start) & (lane < dst_start + n)
+
+        def _write(src):
+            blended = jnp.where(mask, src, dst)
+            self.rmw[rmw_slot] = pltpu.bitcast(blended, jnp.uint8).reshape(
+                self.sublane_groups, _KV_PACKING, _LANES
+            )
+
+        if self.short_run_fast_path and self.padded_tokens == _LANES:
+            a = pltpu.roll(self._src_tile(self.k, 0), shift=delta, axis=1)
+            _write(a)
+            return
+
+        if self.short_run_fast_path:
+            # Fast path for short runs (`n <= 4`) within one 128-lane source
+            # tile: update the target lanes with a single tile roll + lane mask.
+            @pl.when((n <= _KV_PACKING) & (src_start + n <= _LANES))
+            def _():
+                a = pltpu.roll(
+                    self._src_tile(self.k, tok_aligned), shift=delta, axis=1
+                )
+                _write(a)
+
+            @pl.when((n > _KV_PACKING) | (src_start + n > _LANES))
+            def _():
+                a = pltpu.roll(
+                    self._src_tile(self.k, tok_aligned), shift=delta, axis=1
+                )
+                b = pltpu.roll(
+                    self._src_tile(self.k, tok_aligned + _LANES),
+                    shift=delta,
+                    axis=1,
+                )
+                _write(jnp.where(lane < dst_start + (_LANES - src_start), a, b))
+
+            return
+
         # The `n <= 128` source lanes span at most two source tiles.
         a = pltpu.roll(self._src_tile(self.k, tok_aligned), shift=delta, axis=1)
         b = pltpu.roll(
             self._src_tile(self.k, tok_aligned + _LANES), shift=delta, axis=1
         )
-        lane = lax.broadcasted_iota(jnp.int32, (self.sublane_groups, _LANES), 1)
         src = jnp.where(lane < dst_start + (_LANES - src_start), a, b)
-        dst = pltpu.bitcast(
-            self.rmw[rmw_slot].reshape(self.rec_dim, _LANES), jnp.uint32
-        )
-        blended = jnp.where((lane >= dst_start) & (lane < dst_start + n), src, dst)
-        self.rmw[rmw_slot] = pltpu.bitcast(blended, jnp.uint8).reshape(
-            self.sublane_groups, _KV_PACKING, _LANES
-        )
+        _write(src)
 
     def move_token(self, tok, dst_tok):
         """Copies staged token (lane) `tok` to lane `dst_tok` (`<= tok`)."""
+        if self._ensure_blocks_transposed is not None:
+            self._ensure_blocks_transposed((tok >> 7) + 1)
         src = pltpu.roll(
             self._src_tile(self.k, (tok >> 7) << 7),
             shift=(dst_tok - tok) & 127,
@@ -290,9 +342,14 @@ class _SalTiles:
         dst_off = pl.multiple_of((dst_tok >> 7) << 7, _LANES)
         lane = lax.broadcasted_iota(jnp.int32, (self.sublane_groups, _LANES), 1)
         out = jnp.where(lane == (dst_tok & 127), src, self._src_tile(self.k, dst_off))
-        self.k[:, :, pl.ds(dst_off, _LANES)] = pltpu.bitcast(out, jnp.uint8).reshape(
-            self.sublane_groups, _KV_PACKING, _LANES
-        )
+        if self.short_run_fast_path and self.padded_tokens == _LANES:
+            self.k[...] = pltpu.bitcast(out, jnp.uint8).reshape(
+                self.sublane_groups, _KV_PACKING, _LANES
+            )
+        else:
+            self.k[:, :, pl.ds(dst_off, _LANES)] = pltpu.bitcast(
+                out, jnp.uint8
+            ).reshape(self.sublane_groups, _KV_PACKING, _LANES)
 
 
 def _find_runs(
@@ -454,6 +511,7 @@ def _sal_kernel(
     cache_ref,
     run_src_ref,
     run_dst_ref,
+    transposed_ref,
     k_sal_ref,
     rmw_ref,
     sems,
@@ -461,6 +519,8 @@ def _sal_kernel(
     page_size: int,
     transpose_groups: int,
     wave: int,
+    mask_scale_tail: bool = False,
+    short_run_fast_path: bool = True,
 ) -> None:
     del cache_in_ref
     sublane_groups = cache_ref.shape[1]
@@ -471,11 +531,63 @@ def _sal_kernel(
         blk = jnp.swapaxes(k_ref[b], 0, 1).reshape(
             transpose_groups, _KV_PACKING, _LANES
         )[:sublane_groups]
-        k_sal_ref[:, :, pl.ds(pl.multiple_of(b * _LANES, _LANES), _LANES)] = blk
+        if mask_scale_tail:
+            grp = lax.broadcasted_iota(jnp.int32, blk.shape, 0)
+            sub = lax.broadcasted_iota(jnp.int32, blk.shape, 1)
+            blk = jnp.where((grp == sublane_groups - 1) & (sub > 0), 0, blk)
+        if short_run_fast_path and k_sal_ref.shape[2] == _LANES:
+            k_sal_ref[...] = blk
+        else:
+            k_sal_ref[:, :, pl.ds(pl.multiple_of(b * _LANES, _LANES), _LANES)] = blk
         return None
 
-    lax.fori_loop(0, k_ref.shape[0], _transpose, None)
-    ops = _SalTiles(k_sal_ref, cache_ref, rmw_ref, page_size)
+    if not short_run_fast_path:
+        lax.fori_loop(0, k_ref.shape[0], _transpose, None)
+        ops = _SalTiles(
+            k_sal_ref,
+            cache_ref,
+            rmw_ref,
+            page_size,
+            short_run_fast_path=False,
+        )
+        num_runs = _find_runs(
+            ops,
+            dst_ref,
+            run_src_ref,
+            run_dst_ref,
+            num_rows=cache_ref.shape[0] * page_size,
+        )
+        _write_runs(
+            ops,
+            num_runs,
+            run_src_ref,
+            run_dst_ref,
+            sems.at[0],
+            sems.at[1],
+            wave=wave,
+        )
+        return
+
+    def _ensure_blocks_transposed(target_blocks):
+        done = transposed_ref[0]
+
+        @pl.when(done < target_blocks)
+        def _():
+            if k_ref.shape[0] == 1:
+                _transpose(0, None)
+            else:
+                lax.fori_loop(done, target_blocks, _transpose, None)
+            transposed_ref[0] = target_blocks
+
+    transposed_ref[0] = 0
+    ops = _SalTiles(
+        k_sal_ref,
+        cache_ref,
+        rmw_ref,
+        page_size,
+        ensure_blocks_transposed=_ensure_blocks_transposed,
+        short_run_fast_path=True,
+    )
     num_runs = _find_runs(
         ops,
         dst_ref,
@@ -483,15 +595,20 @@ def _sal_kernel(
         run_dst_ref,
         num_rows=cache_ref.shape[0] * page_size,
     )
-    _write_runs(
-        ops,
-        num_runs,
-        run_src_ref,
-        run_dst_ref,
-        sems.at[0],
-        sems.at[1],
-        wave=wave,
-    )
+
+    @pl.when(num_runs > 0)
+    def _():
+        num_valid = run_src_ref[num_runs]
+        _ensure_blocks_transposed((num_valid + _LANES - 1) >> 7)
+        _write_runs(
+            ops,
+            num_runs,
+            run_src_ref,
+            run_dst_ref,
+            sems.at[0],
+            sems.at[1],
+            wave=wave,
+        )
 
 
 def _check_vmem(vmem_bytes: int, per_token_bytes: int, fixed_bytes: int, name):
@@ -535,10 +652,19 @@ def _has_launch(cache_kv: jax.Array, rows: jax.Array, *, page_size: int, wave: i
     return k_in, kernel, scratch_shapes
 
 
-def _sal_launch(cache_kv: jax.Array, rows: jax.Array, *, page_size: int, wave: int):
+def _sal_launch(
+    cache_kv: jax.Array,
+    rows: jax.Array,
+    *,
+    page_size: int,
+    wave: int,
+    short_run_fast_path: bool = True,
+):
     """`SEQ_ALONG_LANE`: `(staged source, kernel, scratch shapes)`."""
-    num_tokens, rec_dim = rows.shape
-    sublane_groups = rec_dim // _KV_PACKING
+    num_tokens, width = rows.shape
+    sublane_groups = cache_kv.shape[1]
+    head_dim = (sublane_groups - 1) * _KV_PACKING
+    rec_dim = sublane_groups * _KV_PACKING
     transpose_width = _align_to(rec_dim, _LANES)
     padded_tokens = _align_to(num_tokens, _LANES)
     rmw_bytes = wave * rec_dim * _LANES
@@ -550,17 +676,31 @@ def _sal_launch(cache_kv: jax.Array, rows: jax.Array, *, page_size: int, wave: i
         rmw_bytes,
         "SEQ_ALONG_LANE",
     )
-    k_in = jnp.pad(
-        rows, ((0, padded_tokens - num_tokens), (0, transpose_width - rec_dim))
-    ).reshape(padded_tokens // _LANES, _LANES, transpose_width)
+    row_pad = padded_tokens - num_tokens
+    if short_run_fast_path and width == transpose_width:
+        mask_scale_tail = width != rec_dim
+        k_2d = rows if row_pad == 0 else jnp.pad(rows, ((0, row_pad), (0, 0)))
+    elif width == rec_dim or width <= head_dim + 1:
+        mask_scale_tail = False
+        k_2d = jnp.pad(rows, ((0, row_pad), (0, transpose_width - width)))
+    else:
+        mask_scale_tail = False
+        k_2d = jnp.pad(
+            rows[:, : head_dim + 1],
+            ((0, row_pad), (0, transpose_width - (head_dim + 1))),
+        )
+    k_in = k_2d.reshape(padded_tokens // _LANES, _LANES, transpose_width)
     kernel = functools.partial(
         _sal_kernel,
         page_size=page_size,
         transpose_groups=transpose_width // _KV_PACKING,
         wave=wave,
+        mask_scale_tail=mask_scale_tail,
+        short_run_fast_path=short_run_fast_path,
     )
     tokens_shape = (sublane_groups, _KV_PACKING, padded_tokens)
     scratch_shapes = _run_table_shapes(num_tokens) + [
+        pltpu.SMEM((1,), jnp.int32),  # transposed block counter
         pltpu.VMEM(tokens_shape, cache_kv.dtype),  # transposed source
         pltpu.VMEM((wave, sublane_groups, _KV_PACKING, _LANES), cache_kv.dtype),
         pltpu.SemaphoreType.DMA((2,)),
@@ -628,6 +768,7 @@ def scatter_rows(
     kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
     *,
     interpret: bool = False,
+    short_run_fast_path: bool = True,
 ) -> jax.Array:
     """Writes `src[i]` into flat cache row `dst_rows[i]` of `cache_kv` in place.
 
@@ -642,6 +783,8 @@ def scatter_rows(
       kv_layout: Cache layout.
       interpret: When True (or when `jax.default_backend() != "tpu"`), falls back
         to `scatter_rows_reference` after argument and VMEM validation.
+      short_run_fast_path: When True (default), enables the SAL short-run and
+        on-demand transpose fast path.
 
     Returns:
       The updated `cache_kv`.
@@ -662,13 +805,22 @@ def scatter_rows(
             f" run table), got {num_tokens}."
         )
 
-    launch = _sal_launch if layout == KVLayout.SEQ_ALONG_LANE else _has_launch
-    k_in, kernel, scratch_shapes = launch(
-        cache_kv,
-        _format_rows(src, cache_kv, layout),
-        page_size=page_size,
-        wave=min(num_tokens, _MAX_WAVE),
-    )
+    wave = min(num_tokens, _MAX_WAVE)
+    if layout == KVLayout.SEQ_ALONG_LANE:
+        k_in, kernel, scratch_shapes = _sal_launch(
+            cache_kv,
+            src if short_run_fast_path else _format_rows(src, cache_kv, layout),
+            page_size=page_size,
+            wave=wave,
+            short_run_fast_path=short_run_fast_path,
+        )
+    else:
+        k_in, kernel, scratch_shapes = _has_launch(
+            cache_kv,
+            _format_rows(src, cache_kv, layout),
+            page_size=page_size,
+            wave=wave,
+        )
     if interpret or jax.default_backend() != "tpu":
         return scatter_rows_reference(cache_kv, src, dst_rows, layout)
 
