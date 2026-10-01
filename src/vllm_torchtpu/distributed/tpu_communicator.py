@@ -21,6 +21,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group
 
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -35,6 +37,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Every TP all-reduce (row-parallel output projections, GDN out-proj,
+        # vocab embedding, MoE reduce_results) comes through here.
+        return small_all_reduce_op.all_reduce_or(input_, self.ranks, super().all_reduce)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
@@ -83,4 +90,6 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: dp.reduce_scatter(x, dim=0)
+        )

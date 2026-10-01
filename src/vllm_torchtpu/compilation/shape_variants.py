@@ -319,6 +319,12 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
+def in_warmup() -> bool:
+    """Whether a trace now runs inside :func:`warmup`, where a token-count
+    branch gets one trace per side and buckets are handed between them."""
+    return _session is not None
+
+
 def runnable_for(
     cache_dir: str, key: str, graph: fx.GraphModule, size: int | None = None
 ) -> Callable[..., Any] | None:
