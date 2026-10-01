@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
     """TPU dispatcher for Compressed Tensors MoE schemes."""
 
+    # Ignored and FP8 layers get methods outside the compressed-tensors
+    # hierarchy, so the return type is their common base.
     @staticmethod
     def get_moe_method(
         quant_config: "VllmCompressedTensorsConfig",  # type: ignore

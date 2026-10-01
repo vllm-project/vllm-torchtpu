@@ -240,6 +240,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
+        # Same as `= None`, which torch's stubs reject.
         layer.register_parameter("w13_weight_scale", None)
         layer.register_parameter("w2_weight_scale", None)
 

@@ -368,6 +368,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
+    # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
     conv1d: GdnColumnParallelLinear
 
@@ -380,6 +381,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
+        # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
         # pyrefly: ignore[bad-assignment]
         self.kv_cache = None
         vllm_config = get_vllm_model_wrapper_context().vllm_config

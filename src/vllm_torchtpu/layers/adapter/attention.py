@@ -296,6 +296,7 @@ def _pallas_rpa_kernel_impl(
         kv_layout=kv_layout,
     )
     if len(pool_shape) == 4:
+        # A 4-D pool is never block-major, so the ndim == 4 branch set this.
         assert packed_pool_shape is not None
         new_kv_cache = _reshape_packed_kv_cache(
             new_kv_cache, packed_pool_shape
@@ -2165,6 +2166,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         mesh = self._dcp_mesh
+        # Set in __init__ when dcp_size > 1, the only case that builds this op.
         assert mesh is not None
 
         k_scale = None
@@ -2411,6 +2413,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     layer, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
                 )
 
+            # Only the sparse path receives a tuple of caches.
             assert isinstance(kv_cache, torch.Tensor)
             outputs = layer.mla_op(
                 kv_cache,
@@ -2455,6 +2458,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         attn_metadata: AttentionMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        # Unused; matches vLLM's forward_mha signature.
         output_scale: torch.Tensor | None = None,
     ) -> None:
         """Structural no-op. TPU Pallas MLA unifies projection and evaluation

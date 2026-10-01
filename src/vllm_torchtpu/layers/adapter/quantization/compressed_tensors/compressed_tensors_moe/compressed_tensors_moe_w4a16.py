@@ -80,6 +80,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.num_bits = int(getattr(weight_quant, "num_bits", 4))
+        # vLLM types packed_factor as Fraction; the TPU kernel uses an int.
         # pyrefly: ignore[bad-assignment]
         self.packed_factor = 32 // self.num_bits
         self.strategy = getattr(weight_quant, "strategy", "group")

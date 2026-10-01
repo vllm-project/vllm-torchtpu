@@ -145,6 +145,7 @@ def _compressor_jax_csa(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The CSA kernel always returns a rope cache.
     assert new_rope_cache is not None
     return new_cache, new_rope_cache
 
@@ -194,6 +195,7 @@ def _compressor_jax_hca(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The HCA kernel always returns a state cache.
     assert new_state_cache is not None
     return new_cache, new_state_cache
 

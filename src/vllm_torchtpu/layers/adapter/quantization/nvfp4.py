@@ -601,6 +601,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         self.quant_config = quant_config
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
+        # vLLM types this as an NvFp4LinearKernel; TPU installs a stand-in.
         # pyrefly: ignore[bad-assignment]
         self.kernel = _NullInputQuantKernel()
 

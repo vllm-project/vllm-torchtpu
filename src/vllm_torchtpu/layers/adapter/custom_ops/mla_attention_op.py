@@ -884,6 +884,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
+            # torch's stubs resolve this hasattr-guarded method as a Tensor.
             # pyrefly: ignore[not-callable]
             super().process_weights_after_loading(act_dtype)
         if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
@@ -953,6 +954,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q = self.q_proj(hidden_states)[0]
 
         if self.kimi_preprocess is None:
+            # Set by the earlier `kimi_preprocess is None` branch.
             assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

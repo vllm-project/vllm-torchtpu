@@ -152,6 +152,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     TPU-compatible methods for RoutedExperts and Linear layers.
     """
 
+    # "unquantized" is not one of vLLM's QuantizationMethods names.
     @classmethod
     # pyrefly: ignore[bad-override]
     def get_name(cls) -> str:
@@ -173,6 +174,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     def from_config(cls, config: dict[str, Any]) -> "VllmUnquantizedConfig":
         return cls()
 
+    # compressed-tensors also calls this with its own config as `self`.
     def get_quant_method(
         self: VllmQuantConfig,
         layer: torch.nn.Module,

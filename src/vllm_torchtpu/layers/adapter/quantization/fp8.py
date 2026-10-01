@@ -537,6 +537,7 @@ def _process_fp8_moe_weights(
         def zero_w2(w2_fp32: torch.Tensor) -> None:
             w2_fp32[:, :, local_real:padded_intermediate] = 0
 
+    # _requantize_expert_chunks types the scale as optional.
     if weight_block_size is not None:
 
         def dequantize_w13(
@@ -773,6 +774,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # pads to the checkpoint block grid instead of refining GPU scales.
         self.moe_block_shape = self.weight_block_size
         self.weight_scale_refine = None
+        # vLLM types this as a GPU MoE backend; TPU uses none.
         # pyrefly: ignore[bad-assignment]
         self.fp8_backend = None
 
@@ -1201,6 +1203,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.use_deep_gemm = False
         self.cutlass_block_fp8_supported = False
         self.is_scale_e8m0 = getattr(quant_config, "is_scale_e8m0", False)
+        # vLLM types these as QuantKey for its GPU kernels; TPU leaves them unset.
         # pyrefly: ignore[bad-assignment]
         self.activation_quant_key = None
         # pyrefly: ignore[bad-assignment]

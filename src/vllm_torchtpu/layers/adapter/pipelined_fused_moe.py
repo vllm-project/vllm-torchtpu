@@ -175,6 +175,7 @@ def pipelined_fused_moe_gmm(
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
+            # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
             ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
@@ -259,6 +260,7 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            # Locals let the None checks below narrow; subscripts do not.
             weights_next = weights_slices[i + 1]
             ag_tw_next = (
                 collective_group.all_gather(weights_next, dim=0)
