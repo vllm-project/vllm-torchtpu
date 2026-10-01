@@ -13,6 +13,8 @@
 # limitations under the License.
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 
+from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
+
 _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
 _KIMI_K3_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiK3ForConditionalGeneration"
 _DSV4_MODEL = "vllm_torchtpu.models.vllm.deepseek_v4:DeepseekV4ForCausalLM"
@@ -27,6 +29,17 @@ _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalL
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
     """Keep K3 MXFP4 checkpoints on TPU's packed-weight loader."""
+
+
+class _TPUQwen2Config(VerifyAndUpdateConfig):
+    """Pad Qwen2 GQA query heads per KV group when heads % tp_size != 0."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config) -> None:
+        update_gqa_head_padding_config(
+            vllm_config.model_config,
+            vllm_config.parallel_config,
+        )
 
 
 def register_models() -> None:
@@ -50,3 +63,4 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
+    MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
