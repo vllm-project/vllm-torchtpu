@@ -2165,3 +2165,39 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+def test_relayout_tables_reaches_the_draft_model(monkeypatch):
+    """The draft shares the target's cached Pallas ops, which are traced
+    against the target's relayouted tables; the draft's own tables must get
+    the same layout (a column-major draft rope cache fails the shared op
+    with RuntimeProgramInputMismatch while precompiling the draft buckets).
+    """
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
+    seen = []
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_rope_caches",
+        lambda model: seen.append(("rope", model)),
+    )
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_hash_tables",
+        lambda model: seen.append(("hash", model)),
+    )
+    runner = MagicMock(spec=TPUModelRunner)
+    draft_model = object()
+
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == [("rope", draft_model), ("hash", draft_model)]
+
+    # No draft (ngram) or flags off: nothing to relayout.
+    seen.clear()
+    TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == []

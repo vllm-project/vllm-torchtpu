@@ -572,3 +572,40 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
     assert input_ids.shape == (16,)
     assert position_ids.shape == (16,)
+
+
+class _FakeMoERunner(torch.nn.Module):
+    pass
+
+
+def _lockstep_proposer(draft_model):
+    """A replicated (tp=1) draft on an EP-DP lockstep runner: the only
+    configuration where the gate depends on detecting MoE in the draft."""
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = draft_model
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: True)
+    return proposer
+
+
+def test_dp_lockstep_sharded_detects_moe_draft_without_protocol(monkeypatch):
+    """The TPU DSV4/K3 drafts hold fused-MoE runners but do not implement
+    vLLM's MixtureOfExperts protocol; a replicated such draft must still
+    join the lockstep, or its EP all-to-alls hang against idle ranks."""
+    import vllm.model_executor.layers.fused_moe as fused_moe
+
+    monkeypatch.setattr(fused_moe, "MoERunner", _FakeMoERunner)
+    moe_draft = torch.nn.Module()
+    moe_draft.layer = torch.nn.Module()
+    moe_draft.layer.experts = _FakeMoERunner()
+    assert _lockstep_proposer(moe_draft)._dp_lockstep_sharded() is True
+
+    dense_draft = torch.nn.Module()
+    dense_draft.layer = torch.nn.Linear(2, 2)
+    assert _lockstep_proposer(dense_draft)._dp_lockstep_sharded() is False
+
+
+def test_dp_lockstep_sharded_off_without_lockstep():
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert proposer._dp_lockstep_sharded() is False

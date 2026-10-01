@@ -1155,6 +1155,19 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
+    def _relayout_tables(self, model: torch.nn.Module | None) -> None:
+        """Apply the row-major relayouts the env knobs ask for to ``model``.
+
+        Called for the target and, when one is loaded, the draft: both feed
+        the same cached Pallas ops, so their tables must share a layout.
+        """
+        if model is None:
+            return
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+            runner_utils.relayout_rope_caches(model)
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
+            runner_utils.relayout_hash_tables(model)
+
     def _truncate_rope_caches(self) -> None:
         """Slice rotary cos_sin caches to max_model_len which can reduce
         the overhead of xla layout data copy. Applicable to text-only.
@@ -4597,15 +4610,18 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
-            runner_utils.relayout_rope_caches(self.model)
-        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
-            runner_utils.relayout_hash_tables(self.model)
+        self._relayout_tables(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
+            # The draft reuses the target's Pallas ops (cached by op name),
+            # which were traced against the target's relayouted tables. Its
+            # own rope caches and hash tables need the same layout, or the
+            # shared op rejects them with RuntimeProgramInputMismatch while
+            # precompiling the draft buckets.
+            self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
