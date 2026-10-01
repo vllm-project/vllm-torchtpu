@@ -160,6 +160,10 @@ def test_fa_page_tokens_rejects_divergent_pool_geometry():
 
 
 def _glm_layout_getter(tensor):
+    if len(tensor.shape) == 3:
+        # DSv4's int32 word rows, as measured on TPU7x: one (8, 128) tile,
+        # shrunk to the row count on pages under 8 rows.
+        return ([2, 1, 0], [[min(8, tensor.shape[1]), 128]], 0)
     packing = tensor.shape[2]
     return ([3, 2, 1, 0], [[packing, 128], [packing, 1]], 0)
 
@@ -291,12 +295,13 @@ def test_measured_dsv4_layout_fingerprint_records_every_role():
         "dsv4.state.idx.g5",
         "dsv4.state.hca.g6",
     }
+    # CSA is int32 word rows: packing-1 rows of the same 512 bytes.
     assert payload["layouts"]["dsv4.csa.nope.g0"] == {
-        "page_shape": [256, 4, 128],
+        "page_shape": [256, 1, 128],
         "row_bytes": 512,
-        "minor_to_major": [3, 2, 1, 0],
-        "tiles": [[4, 128], [4, 1]],
-        "element_size_in_bits": 8,
+        "minor_to_major": [2, 1, 0],
+        "tiles": [[8, 128]],
+        "element_size_in_bits": 32,
     }
     assert payload["layouts"]["dsv4.hca.g2"]["page_shape"] == [512, 4, 128]
     assert payload["layouts"]["dsv4.idx.g1"]["row_bytes"] == 1024
@@ -317,7 +322,9 @@ def test_dsv4_fingerprint_matches_its_host_array_for_aliased_pools():
     ("layout", "message"),
     [
         (([2, 3, 1, 0], [[4, 128], [4, 1]], 0), "physical order"),
-        (([3, 2, 1, 0], [[8, 128], [4, 1]], 0), "tile shape"),
+        (([2, 1, 0], [[8, 128], [4, 1]], 0), "tile shape"),
+        # Taller than the 64-row RoPE page, so it would pad the page.
+        (([2, 1, 0], [[128, 128]], 0), "tile shape"),
         (None, "no materialized"),
     ],
 )
@@ -328,6 +335,16 @@ def test_measured_dsv4_layout_fingerprint_fails_closed(layout, message):
             layout_getter=lambda tensor: layout,
             package_version=lambda package: "unused",
         )
+
+
+def test_dsv4_fingerprint_admits_the_shrunk_tile_of_a_small_page():
+    """At 16 tokens per page RoPE has 4 rows, which XLA tiles (4, 128)."""
+    _, payload = rlf.measured_dsv4_layout_fingerprint(
+        _dsv4_manifest(tokens_per_page=16),
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+    assert payload["layouts"]["dsv4.csa.rope.g0"]["tiles"] == [[4, 128]]
 
 
 def test_dsv4_fingerprint_is_stable_across_pool_capacity():
@@ -343,3 +360,32 @@ def test_dsv4_fingerprint_is_stable_across_pool_capacity():
         package_version=_glm_versions,
     )
     assert small == large
+
+
+def test_glm_stage_without_indexer_fingerprints_like_every_layer():
+    # A pipeline stage holding only layer 1 has no indexer cache; with the
+    # indexer class left out of the hash it matches a peer holding all.
+    full = glm_named_kv_caches()
+    layer = "model.layers.1.self_attn.mla_attn"
+    stage = {layer: full[layer]}
+
+    def fingerprint(named, **kwargs):
+        manifest = rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=1024,
+            per_layer_tags=True,
+        )
+        return rlf.measured_glm_layout_fingerprint(
+            manifest,
+            page_tokens=1024,
+            layout_getter=_glm_layout_getter,
+            package_version=_glm_versions,
+            **kwargs,
+        )
+
+    stage_fp, stage_payload = fingerprint(stage, hash_indexer=False)
+    full_fp, full_payload = fingerprint(full, hash_indexer=False)
+    assert stage_fp == full_fp
+    assert set(full_payload["layouts"]) == {"mla.nope", "mla.rope"}
+    assert fingerprint(full)[0] != full_fp

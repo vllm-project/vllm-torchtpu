@@ -19,6 +19,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasBatchedRPAAttentionBackend,
     PallasBatchedRPAAttentionBackendImpl,
     _pallas_rpa_kernel_local,
+    get_tpu_min_page_size,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
@@ -1006,3 +1007,67 @@ def test_build_rpa_kernel_keys_the_registry_on_block_major(
     assert "block_major" not in lm_fn.keywords
     assert bm_fn.keywords["block_major"] is True
     assert bm_fn.func is impl._kernel_entry
+
+
+@pytest.mark.parametrize("pcp", [4, 16])
+@pytest.mark.parametrize("max_num_seqs", [32, 64, 128])
+def test_pcp_streaming_does_not_apply_smem_page_table_bound(pcp, max_num_seqs):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=1,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == 1
+
+
+@pytest.mark.parametrize(
+    "dcp,max_num_seqs,expected",
+    [
+        (2, 32, 128),
+        (2, 64, 256),
+        (2, 128, 512),
+        (8, 32, 32),
+        (8, 64, 64),
+        (8, 128, 128),
+    ],
+)
+def test_dcp_keeps_rank_local_smem_page_table_bound(dcp, max_num_seqs, expected):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=dcp,
+        ),
+    )
+    # A configured 384-token page is too small for DCP2 at 128 sequences,
+    # but remains valid for DCP8 under the same 512-KiB SMEM budget.
+    assert get_tpu_min_page_size(config) == expected
+
+
+def test_dcp_page_table_bound_rounds_up_incomplete_local_page():
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048577),
+        scheduler_config=SimpleNamespace(max_num_seqs=128),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == 1024
+
+
+@pytest.mark.parametrize("max_num_seqs,expected", [(32, 256), (64, 512), (128, 1024)])
+def test_non_cp_keeps_page_table_lower_bound(max_num_seqs, expected):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == expected

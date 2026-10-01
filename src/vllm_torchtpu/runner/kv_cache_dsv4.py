@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -130,15 +131,19 @@ class DsV4KVCacheAllocator:
         caches share it. TPU tensors cannot be byte views into a slab, so the
         overlay is rebuilt here from the specs.
 
-        Every array is uint8 and shaped for the kernel that reads it, rather
-        than by the generic `head_size` formula. With `T =
-        spec.num_states` compressed tokens per page:
+        Every array is shaped for the kernel that reads it, rather than by
+        the generic `head_size` formula. With `T = spec.num_states`
+        compressed tokens per page:
 
-            CSA `*.attn`      NoPE `(N, T, 4, 128)`     512B/token
-                              RoPE `(N, T/4, 4, 128)`   128B/token, in a
-                                                        companion array
-            indexer k_cache   `(N, T/4, 4, 256)`        256B/token
-            HCA `*.attn`      `(N, T*2, 4, 128)`       1024B/token (raw bf16)
+            CSA `*.attn`      NoPE int32 `(N, T, 128)`   512B/token
+                              RoPE int32 `(N, T/4, 128)` 128B/token, in a
+                                                         companion array
+            indexer k_cache   uint8 `(N, T/4, 4, 256)`   256B/token
+            HCA `*.attn`      uint8 `(N, T*2, 4, 128)`  1024B/token (raw bf16)
+
+        The CSA arrays are int32 so the SparseCore gather can fetch a token's
+        own 128 RoPE bytes; the TensorCore kernels view them as the uint8
+        slabs they hold (see `csa_cache_layout`).
 
         The overlays, all of which the specs' byte budgets already account
         for:
@@ -162,9 +167,13 @@ class DsV4KVCacheAllocator:
 
         packing = self._DS_V4_KV_PACKING
 
-        def _create_cache(shape: tuple[int, ...], tag: str) -> torch.Tensor:
-            cache = torch.zeros(shape, dtype=torch.uint8).to(self.runner.device)
-            logger.debug("DeepSeek-V4 KV array for %s: shape=%s", tag, shape)
+        def _create_cache(
+            shape: tuple[int, ...], tag: str, dtype: torch.dtype = torch.uint8
+        ) -> torch.Tensor:
+            cache = torch.zeros(shape, dtype=dtype).to(self.runner.device)
+            logger.debug(
+                "DeepSeek-V4 KV array for %s: shape=%s dtype=%s", tag, shape, dtype
+            )
             return cache
 
         # CSA NoPE tensors, in layer order; the SWA caches and the HCA
@@ -184,10 +193,19 @@ class DsV4KVCacheAllocator:
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.
-                nope = _create_cache((num_blocks, page_size, packing, 128), layer_name)
+                nope = _create_cache(
+                    (num_blocks, page_size, csa_cache_layout.ROW_WORDS),
+                    layer_name,
+                    torch.int32,
+                )
                 rope = _create_cache(
-                    (num_blocks, page_size // packing, packing, 128),
+                    (
+                        num_blocks,
+                        page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW,
+                        csa_cache_layout.ROW_WORDS,
+                    ),
                     f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}",
+                    torch.int32,
                 )
                 kv_caches[layer_name] = (nope, rope)
                 csa_nope_hosts.append(nope)
@@ -215,7 +233,9 @@ class DsV4KVCacheAllocator:
             while position >= len(hosts):
                 hosts.append(
                     _create_cache(
-                        tuple(csa_nope_hosts[0].shape), f"ds_v4_overflow.{len(hosts)}"
+                        tuple(csa_nope_hosts[0].shape),
+                        f"ds_v4_overflow.{len(hosts)}",
+                        csa_nope_hosts[0].dtype,
                     )
                 )
             return hosts[position]

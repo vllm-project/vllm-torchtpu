@@ -35,8 +35,8 @@ class SendMeta:
 @dataclass
 class LoadMeta:
     uuid: int
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    local_block_ids: list[int] | None
+    remote_block_ids: list[int] | None
     remote_host: str | list[str]
     remote_port: int | list[int]
     remote_side_channel_port: int | None = None

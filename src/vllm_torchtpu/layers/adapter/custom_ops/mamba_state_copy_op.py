@@ -69,6 +69,11 @@ def copy_mamba_state_blocks(
     return marker
 
 
+# The copy is layout-agnostic (any block-major pool); this name is for
+# callers that copy attention KV blocks, e.g. prefix-cache CoW.
+copy_pool_blocks = copy_mamba_state_blocks
+
+
 def _copy_step_budget_bytes() -> int:
     """Returns the per-step VMEM byte budget for `copy_blocks`.
 

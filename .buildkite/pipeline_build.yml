@@ -21,4 +21,11 @@ steps:
         agents:
           queue: cpu_64_core
         commands:
-          - bash .buildkite/scripts/setup_docker_env.sh
+          - bash .buildkite/scripts/setup_docker_env.sh dev
+
+      - label: ":docker: Build and Push Omni CI Image"
+        key: "build_docker_omni"
+        agents:
+          queue: cpu_64_core
+        commands:
+          - bash .buildkite/scripts/setup_docker_env.sh omni

@@ -15,6 +15,9 @@ def _legacy_ray_executor() -> bool:
     )
 
 
+_FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
+
+
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
     """Describe the first stage holding no full-attention layer, or None.
 
@@ -31,7 +34,7 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     for stage in range(stages):
         start, end = get_pp_indices(len(layer_types), stage, stages)
         kinds = layer_types[start:end]
-        if "full_attention" not in kinds:
+        if not any(kind in _FULL_ATTENTION_LAYER_TYPES for kind in kinds):
             return (
                 f"stage {stage} holds layers {start}-{end - 1}, "
                 f"{'/'.join(sorted(set(kinds)))} only"

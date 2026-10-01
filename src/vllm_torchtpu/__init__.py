@@ -386,26 +386,55 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
 
 def _patch_expert_map_host_lookup() -> None:
-    """Serve expert-map lookups from a host-side copy of the expert map.
+    """Build the expert map on the host and serve host readers from a copy.
 
-    ``ExpertMapManager.map_global_to_local`` reads the device-resident
-    expert map with ``.item()`` once per (expert, shard) tensor during MoE
-    weight loading. On TPU every ``.item()`` is a blocking sync that
-    flushes the deferred graph, so loading dispatches one tiny device
-    program per expert copy (~200k per worker on Qwen3.5-397B). Index a
-    cached host copy in Python instead; the cache follows reassignment
-    and in-place rebalance via the tensor's version counter.
+    ``ExpertMapManager`` builds its maps under the model-init device context,
+    so every op of ``determine_expert_map`` is a device op, and host readers
+    then read the map back:
+
+    - ``map_global_to_local`` reads it with ``.item()`` once per (expert,
+      shard) tensor during MoE weight loading (~200k per worker on
+      Qwen3.5-397B).
+    - ``get_compressed_map_string`` calls ``.item()`` on every element for
+      the per-layer EP log line; the ``info_once`` argument is evaluated for
+      every MoE layer, and each element index compiled its own slice module
+      (128 compiles, ~5.4 min serialized, at EP8).
+
+    On TPU every read is a blocking sync that flushes the deferred graph.
+    Build the maps on CPU, keep the host copy, move the tensors to the
+    device once, and index the host copy in Python. The cache follows
+    reassignment and in-place rebalance via the tensor's version counter.
     """
+    import torch
     from vllm.model_executor.layers.fused_moe import expert_map_manager as _em
 
     cls = _em.ExpertMapManager
     if getattr(cls, "_tpu_host_expert_map_patch", False):
         return
 
-    def map_global_to_local(self, global_id: int) -> int:
+    def _calculate_expert_maps(self) -> None:
+        device = torch.get_default_device()
+        with torch.device("cpu"):
+            local_num_experts, expert_map, expert_mask = _em.determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts,
+                expert_placement_strategy=self._placement_strategy,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                return_expert_mask=self.rocm_aiter_enabled,
+            )
+        self._local_num_experts = local_num_experts + self.num_fused_shared_experts
+        self._expert_map = None if expert_map is None else expert_map.to(device)
+        self._expert_mask = None if expert_mask is None else expert_mask.to(device)
+        # The device map as built; a fresh tensor starts at version 0.
+        self._tpu_expert_map_source = self._expert_map
+        self._tpu_expert_map_version = (
+            None if self._expert_map is None else self._expert_map._version
+        )
+        self._tpu_expert_map_host = None if expert_map is None else expert_map.tolist()
+
+    def _host_expert_map(self) -> list[int]:
         expert_map = self._expert_map
-        if expert_map is None:
-            return global_id
         if (
             self._tpu_expert_map_source is not expert_map
             or self._tpu_expert_map_version != expert_map._version
@@ -413,14 +442,30 @@ def _patch_expert_map_host_lookup() -> None:
             self._tpu_expert_map_source = expert_map
             self._tpu_expert_map_version = expert_map._version
             self._tpu_expert_map_host = expert_map.tolist()
-        return self._tpu_expert_map_host[global_id]
+        return self._tpu_expert_map_host
 
+    def map_global_to_local(self, global_id: int) -> int:
+        if self._expert_map is None:
+            return global_id
+        return _host_expert_map(self)[global_id]
+
+    def get_compressed_map_string(self) -> str:
+        if self._expert_map is None:
+            return f"[0..{self.global_num_experts - 1}]"
+        return ", ".join(
+            f"{local_index}->{global_index}"
+            for global_index, local_index in enumerate(_host_expert_map(self))
+            if local_index != -1
+        )
+
+    cls._calculate_expert_maps = _calculate_expert_maps
     cls.map_global_to_local = map_global_to_local
+    cls.get_compressed_map_string = get_compressed_map_string
     cls._tpu_expert_map_source = None
     cls._tpu_expert_map_version = None
     cls._tpu_expert_map_host = None
     cls._tpu_host_expert_map_patch = True
-    logger.info("Applied TPU patch: host-side expert-map lookup.")
+    logger.info("Applied TPU patch: host-built expert map with host-side reads.")
 
 
 def _patch_vllm_disable_compile_ranges() -> None:
@@ -732,13 +777,31 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     import sys
     from dataclasses import replace
 
+    from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
+        FullAttentionSpec,
         KVCacheSpec,
         MambaSpec,
         UniformTypeKVCacheSpecs,
     )
+
+    def full_attention_max_memory_usage_bytes(self, vllm_config):
+        # Specs describe physical, rank-local pages. Capacity admission and
+        # auto-fit run before the coordinator converts them to logical PCP
+        # pages, so account for context sharding here as well as for DCP.
+        parallel = vllm_config.parallel_config
+        cp_size = max(
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        )
+        num_pages = cdiv(
+            vllm_config.model_config.max_model_len, self.block_size * cp_size
+        )
+        return num_pages * self.page_size_bytes
+
+    FullAttentionSpec.max_memory_usage_bytes = full_attention_max_memory_usage_bytes
 
     already_patched = getattr(
         kv_cache_utils, "_tpu_hybrid_pcp_block_sizes_patch", False
@@ -854,12 +917,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
         kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
 
-    hybrid_coordinator = kv_cache_coordinator.HybridKVCacheCoordinator
-    if not getattr(hybrid_coordinator, "_tpu_hybrid_pcp_coordinator_patch", False):
-        original_hybrid_init = hybrid_coordinator.__init__
+    coordinator_factory = kv_cache_coordinator.get_kv_cache_coordinator
+    if not getattr(coordinator_factory, "_tpu_hybrid_pcp_coordinator_patch", False):
+        original_factory = coordinator_factory
 
-        def _hybrid_init_with_logical_pcp_blocks(
-            self,
+        def _get_coordinator_with_logical_pcp_blocks(
             kv_cache_config,
             max_model_len,
             max_in_flight_tokens,
@@ -930,8 +992,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 )
                 pcp_world_size = 1
 
-            original_hybrid_init(
-                self,
+            return original_factory(
                 kv_cache_config,
                 max_model_len,
                 max_in_flight_tokens,
@@ -946,8 +1007,21 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 num_prefill_lookahead=num_prefill_lookahead,
             )
 
-        hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
-        hybrid_coordinator._tpu_hybrid_pcp_coordinator_patch = True
+        _get_coordinator_with_logical_pcp_blocks._tpu_hybrid_pcp_coordinator_patch = (
+            True
+        )
+        kv_cache_coordinator.get_kv_cache_coordinator = (
+            _get_coordinator_with_logical_pcp_blocks
+        )
+
+    # Normalize before the factory selects a prefix-cached or no-prefix
+    # coordinator. Patching only HybridKVCacheCoordinator misses the latter,
+    # so runtime admission would count unsharded pages and stall long prompts.
+    from vllm.v1.core import kv_cache_manager
+
+    kv_cache_manager.get_kv_cache_coordinator = (
+        kv_cache_coordinator.get_kv_cache_coordinator
+    )
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -990,6 +1064,218 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
 
     if not already_patched:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
+
+
+def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
+    """Return the fine prefix-hit unit for a single-group DCP model, or None.
+
+    Opt-in: only a single full-attention (incl. MLA) group under DCP with
+    prefix caching, no PCP, no KV connector, and an explicit
+    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
+    Everything else keeps upstream behavior (hash == scheduler block).
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+    cache_config = vllm_config.cache_config
+    parallel_config = vllm_config.parallel_config
+    unit = cache_config.prefix_match_unit
+    dcp = parallel_config.decode_context_parallel_size
+    groups = kv_cache_config.kv_cache_groups
+    if (
+        unit is None
+        or not cache_config.enable_prefix_caching
+        or dcp <= 1
+        or parallel_config.prefill_context_parallel_size != 1
+        # Connectors (P/D, offload) consume block hashes at block granularity.
+        or vllm_config.kv_transfer_config is not None
+        or len(groups) != 1
+    ):
+        return None
+    spec = groups[0].kv_cache_spec
+    leaves = (
+        spec.kv_cache_specs.values()
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else (spec,)
+    )
+    # Only layers managed by FullAttentionManager (full attention and MLA,
+    # incl. the DSA indexer cache), which implements fine-grained lookup and
+    # partial-hit CoW. SWA / R-SWA / chunked-local / mamba are excluded.
+    if not all(
+        KVCacheSpecRegistry.get_manager_class(leaf) is FullAttentionManager
+        for leaf in leaves
+    ):
+        return None
+    logical_block = cache_config.block_size * dcp
+    if unit >= logical_block:
+        return None
+    if logical_block % unit != 0:
+        raise ValueError(
+            f"Invalid prefix_match_unit={unit}; the DCP logical block size "
+            f"block_size*dcp={logical_block} must be divisible by it."
+        )
+    return unit
+
+
+def _patch_vllm_dcp_fine_prefix_hits() -> None:
+    """Prefix-cache hits finer than the DCP logical block (single group).
+
+    Under DCP a single-group model's manager block is ``block_size * dcp``
+    tokens (e.g. 256 * 16 = 4096), and upstream hashes at that granularity,
+    so a shared prefix only hits in 4096-token steps. With
+    ``--prefix-match-unit U`` (U < block_size * dcp) this patch:
+
+    1. resolves ``(scheduler_block_size, hash_block_size)`` to
+       ``(block_size * dcp, U)`` (request hashing then runs every U tokens);
+    2. lets ``UnitaryKVCacheCoordinator`` accept ``hash < block`` and look up
+       hits at U alignment. ``FullAttentionManager`` already implements the
+       fine-grained probe, the prompt-tail partial entry, the one-hash-unit
+       EAGLE/MTP drop, and copy-on-write of the shared tail block; the
+       scheduler forwards those CoW pairs as ``kv_cache_block_copies``,
+       which the TPU runner applies per layer (see
+       ``TPUModelRunner._apply_dense_kv_cache_block_copies``).
+
+    The physical block size and allocation are unchanged.
+    """
+    import functools
+    import inspect
+    import sys
+
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+
+    # (1) Block-size resolution. Wrap whatever is installed (the hybrid PCP
+    # wrapper runs first in the registry) and republish the direct-name
+    # imports, as EngineCore imports the function by name.
+    resolve = kv_cache_utils.resolve_kv_cache_block_sizes
+    if not getattr(resolve, "_tpu_dcp_fine_prefix_patch", False):
+        previous_resolve = resolve
+
+        @functools.wraps(previous_resolve)
+        def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config)
+            if unit is None:
+                if (
+                    vllm_config.cache_config.prefix_match_unit is not None
+                    and vllm_config.parallel_config.decode_context_parallel_size > 1
+                    and len(kv_cache_config.kv_cache_groups) == 1
+                ):
+                    logger.warning(
+                        "prefix_match_unit=%s is not applied under DCP for this "
+                        "config (needs prefix caching, no PCP, no KV connector, "
+                        "a single full-attention/MLA group, and a unit smaller "
+                        "than block_size*dcp); prefix hits stay block-aligned.",
+                        vllm_config.cache_config.prefix_match_unit,
+                    )
+                return previous_resolve(kv_cache_config, vllm_config)
+            dcp = vllm_config.parallel_config.decode_context_parallel_size
+            scheduler_block_size = vllm_config.cache_config.block_size * dcp
+            logger.info(
+                "DCP fine-grained prefix hits: scheduler_block_size=%d "
+                "hash_block_size=%d (dcp=%d)",
+                scheduler_block_size,
+                unit,
+                dcp,
+            )
+            return scheduler_block_size, unit
+
+        resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
+        kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
+        resolve = resolve_kv_cache_block_sizes
+    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
+            module.resolve_kv_cache_block_sizes = resolve
+
+    # (2) Coordinator. Patch the class (not the factory, which the hybrid PCP
+    # patch owns) so a hash finer than the manager block is accepted only in
+    # the DCP single-group case; otherwise the upstream __init__ runs as-is.
+    cls = kv_cache_coordinator.UnitaryKVCacheCoordinator
+    if getattr(cls, "_tpu_dcp_fine_prefix_patch", False):
+        return
+    original_init = cls.__init__
+    original_find = cls.find_longest_cache_hit
+    base_init = kv_cache_coordinator.KVCacheCoordinator.__init__
+    # Bind by name instead of restating upstream's parameter list, so a new
+    # upstream parameter is forwarded rather than breaking this wrapper.
+    init_signature = inspect.signature(original_init)
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        bound = init_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        init_args = dict(bound.arguments)
+        del init_args["self"]
+        kv_cache_config = init_args["kv_cache_config"]
+        hash_block_size = init_args["hash_block_size"]
+        num_prefill_lookahead = init_args.get("num_prefill_lookahead", 0)
+        fine = (
+            init_args["enable_caching"]
+            and init_args["dcp_world_size"] > 1
+            and init_args["pcp_world_size"] == 1
+            and len(kv_cache_config.kv_cache_groups) == 1
+            and hash_block_size < init_args["scheduler_block_size"]
+        )
+        if not fine:
+            original_init(self, *args, **kwargs)
+            return
+        # Upstream's __init__ forwards all of its arguments to the base
+        # __init__, then sets the attributes below. Mirror that minus its
+        # hash_block_size == block_size assert.
+        base_init(self, **init_args)
+        manager = self.single_type_managers[0]
+        self.kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        self.dcp_world_size = manager.dcp_world_size
+        self.pcp_world_size = init_args["pcp_world_size"]
+        self.block_size = manager.block_size
+        self.hash_block_size = hash_block_size
+        manager.use_eagle = 0 in self.eagle_group_ids
+        if not type(manager).supports_fine_grained_hash_lookup:
+            raise ValueError(
+                f"{type(manager).__name__} does not support prefix hits finer "
+                "than its block; unset --prefix-match-unit."
+            )
+        if self.block_size % hash_block_size != 0:
+            raise ValueError(
+                f"prefix_match_unit={hash_block_size} must divide the DCP "
+                f"manager block size {self.block_size}."
+            )
+        # EAGLE/MTP drops one hash unit (not a whole block) from each hit; it
+        # must still cover the multi-module prefill lookahead.
+        if self.eagle_group_ids and hash_block_size < num_prefill_lookahead:
+            raise ValueError(
+                f"prefix_match_unit={hash_block_size} must be >= "
+                f"num_speculative_tokens={num_prefill_lookahead}."
+            )
+        self.enable_partial_hash_hits = True
+        # Lets cache_blocks' reachability mask and the partial-tail entry use
+        # hash-unit boundaries.
+        manager.cache_hit_alignment_tokens = hash_block_size
+
+    @functools.wraps(original_find)
+    def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+        if not self.enable_partial_hash_hits:
+            return original_find(self, block_hashes, max_cache_hit_length)
+        # Same as upstream but aligned to the hash unit, which switches
+        # FullAttentionManager to its fine-grained probe; a hit ending inside
+        # a block is then CoW-copied by the manager on allocation.
+        hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=[0],
+            block_pool=self.block_pool,
+            kv_cache_spec=self.kv_cache_spec,
+            drop_eagle_block=0 in self.eagle_group_ids,
+            alignment_tokens=self.hash_block_size,
+            dcp_world_size=self.dcp_world_size,
+            pcp_world_size=self.pcp_world_size,
+        )
+        return hit_blocks, hit_length, 0
+
+    cls.__init__ = __init__
+    cls.find_longest_cache_hit = find_longest_cache_hit
+    cls._tpu_dcp_fine_prefix_patch = True
+    logger.info("Applied TPU patch: DCP single-group fine-grained prefix hits.")
 
 
 def _patch_vllm_merge_multimodal_embeddings() -> None:

@@ -46,7 +46,9 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
@@ -90,6 +92,9 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
 )
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
 
@@ -356,6 +361,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             offloading_config, vllm_config, kv_cache_config
         )
 
+        # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -390,6 +396,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             "supported by the Raiden offload store; reporting failure."
         )
         return False
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.take_events()
+        return []
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

@@ -39,7 +39,7 @@ IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
-  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" --default "" 2>/dev/null || true)"
 fi
 
 # Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
@@ -53,7 +53,7 @@ if [ -z "${IMAGE_TAG:-}" ]; then
     echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
     exit 1
   fi
-  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}${DOCKER_IMAGE_SUFFIX:-}"
 fi
 
 # Buildkite expands the last `---` group whenever a log contains no `+++` group
@@ -146,6 +146,7 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   -e HF_HOME=/local_hf_cache \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e RUN_CODE_EVAL="${RUN_CODE_EVAL:-}" \
+  -e RUN_LM_EVAL="${RUN_LM_EVAL:-}" \
   -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0" \
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \

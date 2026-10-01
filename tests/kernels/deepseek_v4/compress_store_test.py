@@ -19,6 +19,7 @@ import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compress_store_ref,
     config,
@@ -64,6 +65,15 @@ def normalize_bf16_zero_sign(arr):
     new_odd = jnp.where(is_zero, odd & 0x7F, odd)
     normalized = jnp.stack([even, new_odd], axis=-1)
     return normalized.reshape(orig_shape)
+
+
+def normalize_bf16_words_zero_sign(words):
+    """`normalize_bf16_zero_sign` for int32 words holding two bf16 each."""
+    u = jax.lax.bitcast_convert_type(words, jnp.uint32)
+    lo, hi = u & 0xFFFF, u >> 16
+    lo = jnp.where((lo & 0x7FFF) == 0, 0, lo)
+    hi = jnp.where((hi & 0x7FFF) == 0, 0, hi)
+    return jax.lax.bitcast_convert_type(lo | (hi << 16), jnp.int32)
 
 
 class CompressStoreTest(jtu.JaxTestCase):
@@ -196,6 +206,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         else:
             populated_cache = populated_state_cache
             populated_state_cache = None
+        if cfgs.dims.has_rope_cache:
+            # CSA's cache is allocated as int32 words (see csa_cache_layout).
+            populated_cache = csa_cache_layout.slabs_to_words(populated_cache)
 
         # 3. Setup Kernel 2 inputs
         if token_to_req_indices is None:
@@ -251,8 +264,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         cos_sin_cache = jax.random.normal(k5, (cos_sin_cache_len, rope_head_dim))
 
         if cfgs.dims.has_rope_cache:
+            num_rope_pages, rope_rows, _, lanes = cfgs.rope_cache_shape(num_pages)
             init_rope_cache = jnp.zeros(
-                cfgs.rope_cache_shape(num_pages), dtype=jnp.uint8
+                (num_rope_pages, rope_rows, lanes), dtype=jnp.int32
             )
         else:
             init_rope_cache = jnp.zeros((num_pages, 1, 1, 128), dtype=jnp.uint8)
@@ -324,6 +338,11 @@ class CompressStoreTest(jtu.JaxTestCase):
             interpret=interpret,
         )
         pallas_cache_output, pallas_rope_output = pallas_out
+        if cfgs.dims.has_rope_cache:
+            self.assertEqual(pallas_cache_output.dtype, jnp.int32)
+            self.assertEqual(ref_cache_output.dtype, jnp.int32)
+            pallas_cache_output = csa_cache_layout.words_to_slabs(pallas_cache_output)
+            ref_cache_output = csa_cache_layout.words_to_slabs(ref_cache_output)
 
         if is_quantized:
             pallas_cache_normalized = normalize_fp8_zero_sign(pallas_cache_output)
@@ -333,8 +352,9 @@ class CompressStoreTest(jtu.JaxTestCase):
             ref_cache_normalized = normalize_bf16_zero_sign(ref_cache_output)
 
         if cfgs.dims.has_rope_cache:
-            pallas_rope_normalized = normalize_bf16_zero_sign(pallas_rope_output)
-            ref_rope_normalized = normalize_bf16_zero_sign(ref_rope_output)
+            self.assertEqual(pallas_rope_output.dtype, jnp.int32)
+            pallas_rope_normalized = normalize_bf16_words_zero_sign(pallas_rope_output)
+            ref_rope_normalized = normalize_bf16_words_zero_sign(ref_rope_output)
             self.assertArraysEqual(pallas_rope_normalized, ref_rope_normalized)
 
         self.assertArraysEqual(pallas_cache_normalized, ref_cache_normalized)

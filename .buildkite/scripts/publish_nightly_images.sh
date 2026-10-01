@@ -18,12 +18,38 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
+# The branch decides the tags. main pushes nightly-YYYYMMDD and moves latest.
+# release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
+# never touches latest. The Buildkite pipeline runs this script from whichever
+# branch its schedule names, so a release branch cut from main after this
+# change needs only a new schedule, not a code change.
+BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
+DATE="$(date +%Y%m%d)"
+case "${BRANCH}" in
+  main)
+    DATE_TAG="nightly-${DATE}"
+    LATEST_TAG="latest"
+    ;;
+  release/*)
+    VERSION="${BRANCH#release/}"
+    # Starting with a digit keeps it from colliding with latest or nightly-*.
+    if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
+      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected release/X.Y.Z." >&2
+      exit 1
+    fi
+    DATE_TAG="${DATE}-${VERSION}"
+    LATEST_TAG="${VERSION}"
+    ;;
+  *)
+    echo "ERROR: nightly images are published from main or release/X.Y.Z, not '${BRANCH}'." >&2
+    exit 1
+    ;;
+esac
+
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 REGISTRY="${NIGHTLY_REGISTRY:-us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu}"
-DATE_TAG="nightly-$(date +%Y%m%d)"
-LATEST_TAG="latest"
 
 cd "${REPO_ROOT}"
 

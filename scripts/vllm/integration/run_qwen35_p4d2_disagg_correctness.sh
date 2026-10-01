@@ -44,7 +44,9 @@ default_prefill_speculative_config='{"method":"mtp","num_speculative_tokens":1}'
 default_decode_speculative_config='{"method":"mtp","num_speculative_tokens":3}'
 PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_speculative_config}}"
 DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
-MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.45}"
+# Candidate regression floor for this fixed PCP4/DP4 workload; configurable
+# for other models/geometries. Validate each cold start independently.
+MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.70}"
 
 cleanup() {
   local pid_file pid
@@ -186,7 +188,9 @@ if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
   echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
   exit 2
 fi
-prefix_hit_probe_namespace="pc-retention-${BUILDKITE_JOB_ID:-local}-$$"
+# The runner starts fresh servers; fixed prompt namespaces make acceptance
+# comparable across independent cold starts without reusing a live cache.
+prefix_hit_probe_namespace="pcp4-dp4-retention-v1"
 if [[ "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" == "0" ]]; then
   # Zero retention starts with no periodic Mamba checkpoints. Prime the full
   # attention cache once so the next request discovers the shared-prefix
@@ -232,6 +236,7 @@ python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace pcp4-dp4-correctness-v1 \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
 
 if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
@@ -240,6 +245,7 @@ if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
     --port "${PROXY_PORT}" \
     --model "${SERVED_MODEL_NAME}" \
     --max-tokens 1 \
+    --run-id pcp4-dp4-v1 \
     --no-logprobs \
     2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
 else
@@ -276,8 +282,8 @@ else
     -v d="${decode_draft_tokens}" 'BEGIN { printf "%.4f", a / d }')"
   echo "MTP_DECODE_ACCEPTANCE_RATE ${decode_acceptance_rate}"
 
-  if awk -v r="${decode_acceptance_rate}" -v m="${MIN_MTP_ACCEPTANCE_RATE}" \
-      'BEGIN { exit !(r < m) }'; then
+  if awk -v a="${decode_accepted_tokens}" -v d="${decode_draft_tokens}" \
+      -v m="${MIN_MTP_ACCEPTANCE_RATE}" 'BEGIN { exit !(a / d < m) }'; then
     echo "Expected MTP acceptance rate >= ${MIN_MTP_ACCEPTANCE_RATE} on the" \
       "decode engine, got ${decode_acceptance_rate}" >&2
     exit 1

@@ -239,8 +239,13 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     def cache(rows, width):
         return FakeTensor((num_blocks, rows, 4, width), 1, dtype="torch.uint8")
 
-    csa_nope = [cache(tokens, 128) for _ in range(2)]
-    csa_rope = [cache(tokens // 4, 128) for _ in range(2)]
+    def words(rows):
+        return FakeTensor((num_blocks, rows, 128), 4, dtype="torch.int32")
+
+    # CSA NoPE and RoPE are int32 word rows, like `_initialize_ds_v4_kv_cache`
+    # allocates them; everything overlaid on NoPE inherits that.
+    csa_nope = [words(tokens) for _ in range(2)]
+    csa_rope = [words(tokens // 4) for _ in range(2)]
     indexer = [cache(tokens // 4, 256) for _ in range(2)]
     hca = cache(tokens * 2, 128)
 

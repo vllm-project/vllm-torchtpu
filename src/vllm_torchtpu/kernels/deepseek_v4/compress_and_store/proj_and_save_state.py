@@ -21,6 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
@@ -107,7 +109,7 @@ def kernel(
     hidden_states,  # [num_tokens, hidden_size]
     wkv_wgate,  # [2 * state_width, hidden_size]
     ape,  # [compress_ratio, state_width]
-    cache,  # [num_pages, page_size, 4, 128] uint8 (aliased to output)
+    cache,  # [num_pages, page_size, 4, 128] uint8 or [..., 128] int32 (aliased)
     # output
     _,  # unused output ref (aliased to cache)
     # scratch_memory
@@ -123,6 +125,8 @@ def kernel(
     last_dim = acc_ref.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
+    # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
+    cache = csa_cache_layout.as_u8_slabs(cache)
     write_counts_ref[0] = 0
     write_counts_ref[1] = 0
 
@@ -341,7 +345,7 @@ def proj_and_save_state(
     ape: jax.Array,  # [compress_ratio, state_width]
     positions: jax.Array,  # [num_tokens]
     slot_mapping: jax.Array,  # [num_tokens]
-    cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8 / [..., 128] int32
     compress_ratio: int,
     interpret: bool = False,
 ) -> jax.Array:

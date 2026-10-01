@@ -39,8 +39,10 @@ def _runtime_mesh_and_partition(torch, dist):
         )
     # Main's TorchTPU assigns custom-op partitions in device-id order, not
     # process-rank order. Index inputs and the oracle in that same space.
+    # The shared partition specs also shard along "tp", so give it size 1.
     mesh = jax.sharding.Mesh(
-        np.asarray([devices[i] for i in device_ids]), axis_names=("pcp",)
+        np.asarray([devices[i] for i in device_ids]).reshape(8, 1),
+        axis_names=("pcp", "tp"),
     )
     return mesh, device_ids.index(device_id)
 

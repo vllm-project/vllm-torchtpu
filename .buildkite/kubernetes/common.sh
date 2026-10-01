@@ -25,17 +25,20 @@
 # surfaces twenty minutes later as ImagePullBackOff on a TPU node that scaled up
 # to sit idle.
 #
-# A step may still name its own image, which the disagg lane does - it builds
-# one of its own rather than using the CI image.
+# A step on another variant of the image - the -omni build - names it with
+# DOCKER_IMAGE_SUFFIX, as run_in_docker.sh reads it on bare metal. A step may
+# also name its own image, which the disagg lane does - it builds one of its
+# own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" \
-    2>/dev/null || true)
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+    --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   # Falling back to :latest would run whatever happened to be pushed last and
   # report the answer as this commit's.
-  echo "$0: no CI_IMAGE_TAG metadata and no WORKLOAD_IMAGE. The image build" \
-       "step has to run before this one, or the step has to name an image." >&2
+  echo "$0: no CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-} metadata and no WORKLOAD_IMAGE." \
+       "The image build step has to run before this one, or the step has to" \
+       "name an image." >&2
   exit 2
 fi
 export WORKLOAD_IMAGE
@@ -63,7 +66,8 @@ FORWARD=(
   FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
   UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
-  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_TYPE MODEL_PATH MODEL_URI EVAL_SOFT_FAIL
+  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
+  EVAL_SOFT_FAIL
   # Lets a one-off build force an xprof capture; unset leaves the day rule in
   # benchmark_with_profile.sh to decide.
   CAPTURE_PROFILE

@@ -15,21 +15,39 @@
 
 # Runs work across the hosts of a TPU slice.
 #
-#   .buildkite/kubernetes/run_multihost.sh [--backend ray|mp] <args...>
+#   .buildkite/kubernetes/run_multihost.sh [--backend ray|mp] [--topology 2x2x2|2x2x4] <args...>
 #
 # ray, the default, forms a Ray cluster and runs the given command on its head.
 # mp uses vLLM's own multi-node data parallelism instead and takes a benchmark
 # config rather than a command - the same split, and the same flag, as the
 # bare-metal script of this name.
 #
-# The slice shape comes from the manifest's nodeSelector, not from a flag.
+# --topology is the v7x slice shape, 2x2x2 (two hosts) by default; either
+# manifest takes it and the host count derived from it.
 set -euo pipefail
 
 backend="ray"
-if [[ "${1:-}" == "--backend" ]]; then
-  backend="${2:?--backend needs a value}"
-  shift 2
+topology="2x2x2"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend)  backend="${2:?--backend needs a value}"; shift 2 ;;
+    --topology) topology="${2:?--topology needs a value}"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+# Four chips to a v7x host, the tpu7x-standard-4t the manifest asks for.
+if [[ ! "${topology}" =~ ^([0-9]+)x([0-9]+)x([0-9]+)$ ]]; then
+  echo "$0: --topology '${topology}' is not AxBxC" >&2
+  exit 2
 fi
+chips=$(( BASH_REMATCH[1] * BASH_REMATCH[2] * BASH_REMATCH[3] ))
+if (( chips % 4 != 0 || chips / 4 < 2 )); then
+  echo "$0: --topology '${topology}' is ${chips} chips, not a multi-host slice of 4-chip hosts" >&2
+  exit 2
+fi
+export MULTIHOST_TOPOLOGY="${topology}"
+export MULTIHOST_HOSTS=$(( chips / 4 ))
 
 case "${backend}" in
   ray) manifest="ray-multihost-slice.yaml" ;;
@@ -38,7 +56,7 @@ case "${backend}" in
 esac
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 [--backend ray|mp] <args...>" >&2
+  echo "usage: $0 [--backend ray|mp] [--topology 2x2x2|2x2x4] <args...>" >&2
   exit 2
 fi
 

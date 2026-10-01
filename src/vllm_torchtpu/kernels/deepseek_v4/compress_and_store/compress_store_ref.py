@@ -15,6 +15,8 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     """Block fp8 quantization with UE8M0 (power-of-two) block scales."""
@@ -174,7 +176,7 @@ def _boundary_dest(
 
 def ref_compress_norm_rope_store(
     cache: jax.Array,  # [num_pages, page_size, slots_per_part_hbm, 128] uint8
-    rope_cache: jax.Array,  # [num_pages, rope_page_size, 4, 128] uint8
+    rope_cache: jax.Array,  # [num_pages, page_size // 4, 4, 128] uint8
     positions: jax.Array,  # [num_tokens] int
     slot_mapping: jax.Array,  # [num_tokens] int (state-cache slots)
     block_table: jax.Array,  # [num_reqs * stride] int (state pages)
@@ -198,8 +200,15 @@ def ref_compress_norm_rope_store(
     """Golden JAX reference for Kernel 2 (compress + store).
 
     ``state_cache`` is the array holding the f32 states; ``None`` means it
-    shares ``cache``'s buffer (CSA / indexer).
+    shares ``cache``'s buffer (CSA / indexer). CSA's arrays may also be the
+    int32 ``[num_pages, rows, 128]`` declarations of `csa_cache_layout`; the
+    outputs keep each input's dtype.
     """
+    cache_is_words = csa_cache_layout.is_word_array(cache.dtype)
+    if cache_is_words:
+        cache = csa_cache_layout.words_to_slabs(cache)
+    if state_cache is not None and csa_cache_layout.is_word_array(state_cache.dtype):
+        state_cache = csa_cache_layout.words_to_slabs(state_cache)
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     state_dim = 2 * state_width
@@ -221,14 +230,6 @@ def ref_compress_norm_rope_store(
     else:
         cache_for_unpack = cache
 
-    rope_page_size = rope_cache.shape[1] * 4 if has_rope_cache else rope_cache.shape[1]
-    if has_rope_cache:
-        rope_cache_for_unpack = rope_cache.reshape(
-            rope_cache.shape[0], rope_page_size, 1, 128
-        )
-    else:
-        rope_cache_for_unpack = rope_cache
-
     # 1. Geometry setup
     if is_indexer_mode:
         num_pages, page_size, dummy, d2 = cache_for_unpack.shape
@@ -242,12 +243,9 @@ def ref_compress_norm_rope_store(
 
     state_source = cache if state_cache is None else state_cache
 
-    rope_num_pages, rope_page_size_unpacked, rope_d1, rope_d2 = (
-        rope_cache_for_unpack.shape
-    )
-    assert rope_num_pages == num_pages
-    assert rope_page_size_unpacked == rope_page_size
-    assert rope_d1 == 1 and rope_d2 == 128
+    if has_rope_cache:
+        assert rope_cache.shape[0] == num_pages
+        assert rope_cache.shape[-1] == 128
 
     # 2. Unpack state cache inline.
     # The state is read from the *physical* cache, whatever the trailing dims are:
@@ -402,49 +400,32 @@ def ref_compress_norm_rope_store(
         cache_for_unpack.shape
     )
     new_cache = new_cache_unpacked.reshape(cache.shape)
+    if cache_is_words:
+        new_cache = csa_cache_layout.slabs_to_words(new_cache)
 
-    # 7. Scatter ROPE into rope_cache (only if has_rope_cache)
-    if has_rope_cache:
-        rope = compressed[..., nope_dim:]
-        rope_bf16 = rope.astype(jnp.bfloat16)
-        rope_hi = (
-            (jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16) >> 8) & 0xFF
-        ).astype(jnp.uint8)
-        rope_lo = (jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16) & 0xFF).astype(
-            jnp.uint8
-        )
-        rope_bytes_flat = jnp.concatenate([rope_hi, rope_lo], axis=-1)
-
-        rope_width_padded = 128
-        rope_pad = rope_width_padded - rope_bytes_flat.shape[-1]
-        if rope_pad < 0:
-            raise ValueError(
-                f"packed ROPE record {rope_bytes_flat.shape[-1]}B exceeds cache width"
-                f" {rope_width_padded}B"
-            )
-        rope_record = jnp.pad(rope_bytes_flat, ((0, 0), (0, rope_pad)))
-
-        rope_logical_slots_factor = 1
-        rope_num_slots = rope_num_pages * rope_page_size
-
-        dest_logical_rope = _boundary_dest(
-            positions, slot_mapping, kv_slot_mapping, compress_ratio, rope_num_slots
-        )
-
-        flat_rope = rope_cache_for_unpack.reshape(rope_num_slots, rope_d1, 128)
-        flat_rope_padded = jnp.concatenate(
-            [flat_rope, jnp.zeros((1, rope_d1, 128), dtype=jnp.uint8)], axis=0
-        )
-        rope_record_dup = jnp.broadcast_to(
-            rope_record[:, None, :], (rope_record.shape[0], rope_d1, 128)
-        )
-        flat_rope_padded = flat_rope_padded.at[
-            dest_logical_rope * rope_logical_slots_factor, :, :
-        ].set(rope_record_dup)
-        new_rope_cache_unpacked = flat_rope_padded[:-1].reshape(
-            rope_cache_for_unpack.shape
-        )
-        new_rope_cache = new_rope_cache_unpacked.reshape(rope_cache.shape)
-        return new_cache, new_rope_cache
-    else:
+    # 7. Scatter ROPE into rope_cache (only if has_rope_cache): each token's 32
+    # words into its quarter of a 4-token row (see `csa_cache_layout`).
+    if not has_rope_cache:
         return new_cache, rope_cache
+    rope_is_words = csa_cache_layout.is_word_array(rope_cache.dtype)
+    rope_rows = (
+        rope_cache if rope_is_words else csa_cache_layout.slabs_to_words(rope_cache)
+    )
+    rope = compressed[..., nope_dim:].astype(jnp.bfloat16)
+    if rope.shape[-1] != csa_cache_layout.ROPE_DIM:
+        raise ValueError(
+            f"CSA RoPE is {csa_cache_layout.ROPE_DIM} bf16 per token, got "
+            f"{rope.shape[-1]}"
+        )
+    words = csa_cache_layout.rope_words(rope)
+    flat_rope = rope_rows.reshape(-1, csa_cache_layout.ROPE_WORDS)
+    rope_num_slots = flat_rope.shape[0]
+    dest_rope = _boundary_dest(
+        positions, slot_mapping, kv_slot_mapping, compress_ratio, rope_num_slots
+    )
+    flat_rope = jnp.concatenate([flat_rope, jnp.zeros_like(flat_rope[:1])], axis=0)
+    flat_rope = flat_rope.at[dest_rope].set(words)
+    new_rope_rows = flat_rope[:-1].reshape(rope_rows.shape)
+    if rope_is_words:
+        return new_cache, new_rope_rows
+    return new_cache, csa_cache_layout.words_to_slabs(new_rope_rows)

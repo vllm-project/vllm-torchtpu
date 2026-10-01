@@ -563,7 +563,7 @@ class VllmDeepseekV4MLAAttention(
         """Bitcast 1-byte cache allocations to uint8 required by Pallas kernels."""
         if cache is None:
             return None
-        if cache.dtype != torch.uint8:
+        if cache.dtype not in (torch.uint8, torch.int32):
             return cache.view(torch.uint8)
         return cache
 

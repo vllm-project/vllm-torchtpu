@@ -19,6 +19,8 @@ import contextlib
 import json
 import os
 import random
+import re
+import shutil
 import socket
 import string
 import subprocess
@@ -385,6 +387,10 @@ class _InProcessEngine:
         outputs = self._llm.generate(prompts, sampling_config)
         return [output.outputs[0].text for output in outputs]
 
+    def generate_outputs(self, prompts: list[str], sampling_config: SamplingParams):
+        """The full RequestOutputs, for callers that need more than text."""
+        return self._llm.generate(prompts, sampling_config)
+
     def spec_counters(self) -> tuple[float, float, dict[str, float]]:
         num_draft_tokens = num_accepted_tokens = 0.0
         for metric in self._llm.get_metrics():
@@ -646,6 +652,79 @@ def test_qwen35_mtp_correctness_greedy_multi_step(
         max_num_seqs=4,
         async_scheduling=False,
         extra_kwargs=QWEN35_KWARGS,
+    )
+
+
+def _generated_logprobs(output) -> list[tuple[int, float, int]]:
+    """(token id, its logprob, top-1 token id) for each generated token."""
+    completion = output.outputs[0]
+    assert completion.logprobs is not None
+    assert len(completion.logprobs) == len(completion.token_ids)
+    rows = []
+    for token_id, entry in zip(completion.token_ids, completion.logprobs):
+        # A logprobs row paired with the wrong slot or request shows up here:
+        # every entry must carry the token that was actually generated.
+        assert token_id in entry, f"token {token_id} missing from {entry}"
+        top1 = next(t for t, lp in entry.items() if lp.rank == 1)
+        rows.append((token_id, entry[token_id].logprob, top1))
+    return rows
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "max_num_seqs,async_scheduling",
+    [
+        pytest.param(1, True, id="bs1-async"),
+        pytest.param(4, False, id="bs4-sync", marks=pytest.mark.nightly),
+    ],
+)
+def test_qwen35_mtp_logprobs_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """MTP must return the logprobs a no-spec reference returns.
+
+    A verify step computes a logprobs row for every draft and bonus slot and
+    keeps each request's accepted rows once the tokens reach the host. K=2
+    gives every verify two draft slots plus the bonus. Rows whose greedy text
+    differs from the reference (batch-position near-ties, see
+    _assert_no_spec_divergence) are not compared, but most must match.
+    """
+    sampling = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True, logprobs=1)
+    prompts = get_mtp_test_prompts()
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_seqs": max_num_seqs,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": async_scheduling,
+        **QWEN35_KWARGS,
+    }
+    with monkeypatch.context():
+        with _engine(QWEN35_MTP_MODEL, None, kwargs) as ref_engine:
+            ref_outputs = ref_engine.generate_outputs(prompts, sampling)
+        with _engine(
+            QWEN35_MTP_MODEL,
+            _qwen35_mtp_speculative_config(num_speculative_tokens=2),
+            kwargs,
+        ) as spec_engine:
+            spec_outputs = spec_engine.generate_outputs(prompts, sampling)
+
+    compared = 0
+    for ref_output, spec_output in zip(ref_outputs, spec_outputs):
+        ref_rows = _generated_logprobs(ref_output)
+        spec_rows = _generated_logprobs(spec_output)
+        if [r[0] for r in ref_rows] != [s[0] for s in spec_rows]:
+            continue
+        compared += 1
+        for pos, ((_, ref_lp, ref_top), (_, spec_lp, spec_top)) in enumerate(
+            zip(ref_rows, spec_rows)
+        ):
+            # One bf16 step of the logsumexp around the logits' magnitude.
+            assert abs(ref_lp - spec_lp) <= 0.125, (pos, ref_lp, spec_lp)
+            assert ref_top == spec_top, (pos, ref_top, spec_top)
+    assert compared > len(prompts) // 2, (
+        f"only {compared}/{len(prompts)} outputs matched the reference text"
     )
 
 
@@ -1621,6 +1700,11 @@ DP_REQUEST_TIMEOUT_S = 1500
 DP_EXECUTE_MODEL_TIMEOUT_S = 1800
 DP_CONCURRENCY = 8
 
+# CI mounts this directory into the container and uploads it as a build
+# artifact, so a failed server's full log survives the job.
+DP_SERVE_LOG_DIR = "/perf_eval_results"
+_SERVE_ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL)\b|Traceback|Timed out")
+
 # Prometheus renders the same counters the in-process reader exposes, with a
 # `_total` suffix.
 _DRAFT_METRIC = SPEC_DRAFT_METRIC + "_total"
@@ -1812,56 +1896,74 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
     # Log to a file rather than a pipe. vLLM startup writes far more than a
     # pipe buffer holds, and nothing here drains it, so PIPE would block the
     # server mid-startup and the health poll would never succeed.
-    log = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".log", prefix="vllm_serve_dp_", delete=False
-    )
+    ) as log:
 
-    def _fail(message: str) -> RuntimeError:
-        log.flush()
-        with open(log.name) as fh:
-            tail = fh.read()[-4000:]
-        return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+        def _fail(message: str) -> RuntimeError:
+            log.flush()
+            with open(log.name) as fh:
+                lines = fh.read().splitlines()
+            kept = log.name
+            if os.path.isdir(DP_SERVE_LOG_DIR):
+                kept = shutil.copy(log.name, DP_SERVE_LOG_DIR)
+            # Every DP worker logs each warmup step, so the end of the log is
+            # warmup chatter and the line saying why startup failed scrolls out
+            # of any short tail. Report the error lines from the whole log too.
+            errors = [line for line in lines if _SERVE_ERROR_LINE.search(line)]
+            return RuntimeError(
+                f"{message}\n--- full log: {kept} ---\n"
+                "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
+                "--- tail ---\n" + "\n".join(lines[-40:])
+            )
 
-    # The first request against a fresh engine pair compiles the runtime
-    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
-    # worker-RPC deadline -- the engine is torn down mid-compile and every
-    # request 500s. Raise the deadline past the compile.
-    env = dict(
-        os.environ, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S)
-    )
+        # The first request against a fresh engine pair compiles the runtime
+        # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+        # worker-RPC deadline -- the engine is torn down mid-compile and every
+        # request 500s. Raise the deadline past the compile.
+        #
+        # vLLM also gives its engine processes only 600s by default to report
+        # ready, a third of the startup this test allows. A DP engine pair
+        # compiles every graph at startup, which is CPU-bound: the DFlash pair
+        # takes about 630s on a host with a slower CPU. Wait as long as the
+        # health poll does.
+        env = dict(
+            os.environ,
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
+            VLLM_ENGINE_READY_TIMEOUT_S=str(DP_SERVER_STARTUP_TIMEOUT_S),
+        )
 
-    server = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
-    )
-    try:
-        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
-        while True:
-            if server.poll() is not None:
-                raise _fail(
-                    f"vllm serve exited with {server.returncode} during startup"
-                )
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=10).close()
-                break
-            except (urllib.error.URLError, OSError):
-                pass
-            if time.time() > deadline:
-                raise _fail(
-                    "vllm serve did not become healthy within "
-                    f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
-                )
-            time.sleep(10)
-        print(f"vllm serve ready at {base}; log: {log.name}")
-        yield _ServedEngine(base, model_name)
-    finally:
-        server.terminate()
+        server = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
+        )
         try:
-            server.wait(timeout=180)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=60)
-        log.close()
-        wait_for_tpu_release()
+            deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+            while True:
+                if server.poll() is not None:
+                    raise _fail(
+                        f"vllm serve exited with {server.returncode} during startup"
+                    )
+                try:
+                    urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                    break
+                except (urllib.error.URLError, OSError):
+                    pass
+                if time.time() > deadline:
+                    raise _fail(
+                        "vllm serve did not become healthy within "
+                        f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
+                    )
+                time.sleep(10)
+            print(f"vllm serve ready at {base}; log: {log.name}")
+            yield _ServedEngine(base, model_name)
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=60)
+            wait_for_tpu_release()
 
 
 def _qwen35_dp_kwargs() -> dict:
@@ -1962,4 +2064,83 @@ def test_qwen35_dflash_dp_performance_greedy(
         model_name=QWEN35_MTP_DP_MODEL,
         async_scheduling=False,
         extra_kwargs=_qwen35_dflash_dp_kwargs(),
+    )
+
+
+# DeepSeek-V4-Flash ships its DSpark draft (three decoder layers, combiner,
+# Markov head) inside the target checkpoint under mtp.*, so the speculative
+# config carries no separate draft `model`; the TPU registers its own draft
+# class for it (DSparkDeepseekV4ForCausalLM). fp8 at tp=8 with expert
+# parallelism is the deployed geometry and the only one exercised so far.
+DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+DSV4_DSPARK_TP_SIZE = 8
+# The checkpoint's dspark_block_size; the proposer rejects any other K.
+DSV4_DSPARK_NUM_SPECULATIVE_TOKENS = 5
+# Measured 57.6% on 8 mixed prompts at 64 tokens; the floor is a collapse
+# guard, not a quality target, like the Qwen3 DSpark floors above.
+DSV4_DSPARK_MIN_ACCEPTANCE_RATE = 0.2
+
+
+def _dsv4_dspark_kwargs() -> dict:
+    return {
+        "quantization": "deepseek_v4_fp8",
+        "tensor_parallel_size": DSV4_DSPARK_TP_SIZE,
+        "enable_expert_parallel": True,
+        "trust_remote_code": True,
+        "kv_cache_dtype": "fp8_e4m3",
+        "gpu_memory_utilization": 0.4,
+        # Kept off on both engines so the reference matches the spec run's
+        # cache behaviour.
+        "enable_prefix_caching": False,
+    }
+
+
+def _dsv4_dspark_speculative_config() -> dict:
+    return {
+        "method": "dspark",
+        "num_speculative_tokens": DSV4_DSPARK_NUM_SPECULATIVE_TOKENS,
+    }
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_dsv4_dspark_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """DSpark on DeepSeek-V4 must not change greedy output.
+
+    Same helper and comparison as the Qwen3 DSpark case; this one runs the
+    TPU draft class, its context-KV insert, and the non-causal SWA kernel
+    mode, none of which the Qwen3 checkpoint reaches.
+    """
+    _require_chips_for_dp(1, DSV4_DSPARK_TP_SIZE)
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        DSV4_DSPARK_MODEL,
+        _dsv4_dspark_speculative_config(),
+        async_scheduling=False,
+        extra_kwargs=_dsv4_dspark_kwargs(),
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_dsv4_dspark_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """The DeepSeek-V4 draft proposes and gets drafts accepted."""
+    _require_chips_for_dp(1, DSV4_DSPARK_TP_SIZE)
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _dsv4_dspark_speculative_config(),
+        min_acceptance_rate=DSV4_DSPARK_MIN_ACCEPTANCE_RATE,
+        model_name=DSV4_DSPARK_MODEL,
+        async_scheduling=False,
+        extra_kwargs=_dsv4_dspark_kwargs(),
     )

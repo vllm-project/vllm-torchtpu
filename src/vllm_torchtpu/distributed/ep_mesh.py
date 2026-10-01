@@ -75,12 +75,13 @@ def ep_token_replica_groups(
         else tuple(int(r) for r in parallel_state.get_tp_group().ranks)
     )
     device_ids = ep_device_ids()
+    assert device_ids is not None
     key = (ranks, device_ids, replicas)
     cached = _TOKEN_GROUP_CACHE.get(key)
     if cached is not None:
         return cached
 
-    gathered = [None] * len(ranks)
+    gathered: list[Any] = [None] * len(ranks)
     torch.distributed.all_gather_object(
         gathered, (rank, replicas), group=group.cpu_group
     )

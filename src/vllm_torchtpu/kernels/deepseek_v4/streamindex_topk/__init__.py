@@ -26,7 +26,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     DCP_AXIS_NAME,
     DEFAULT_VMEM_LIMIT_BYTES,
-    _select_owned_winners,
     cp_global_to_local,
     cp_local_length,
     cp_local_to_global,
@@ -50,7 +49,6 @@ __all__ = [
     "cp_owner_rank",
     "cp_global_to_local",
     "cp_rank_as_data",
-    "_select_owned_winners",
     "streamindex_topk",
     "streamindex_topk_dcp",
 ]

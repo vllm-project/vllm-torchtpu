@@ -165,8 +165,8 @@ def _attention_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    cache_kv_nope_hbm_ref,  # [total_num_pages, page_size * 4, 128]
-    cache_kv_rope_hbm_ref,  # [total_num_pages, page_size, rope_dim]
+    cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
+    cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
     swa_accumution_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     swa_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     swa_m_hbm_ref,  # [max_num_tokens, num_l_heads]
@@ -189,6 +189,11 @@ def _attention_kernel(
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
+    # csa_gather emits int32 words; these are the uint8 nope slabs
+    # [.., topk * 4, 128] and bf16 rope rows [.., topk // 2, 128] they encode,
+    # a free bitcast of the same bytes.
+    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+    cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
     # The gathered rope buffer carries two top-k entries per row (csa_gather).
     bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
 
@@ -621,8 +626,8 @@ def prepare_outputs(
 )
 def sparse_ragged_paged_attention(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-    cache_kv_nope: jax.Array,  # [total_num_pages, page_size, 4, 128]
-    cache_kv_rope: jax.Array,  # [total_num_pages, page_size // 4, 4, 128]
+    cache_kv_nope: jax.Array,  # int32[total_num_pages, page_size, 128]
+    cache_kv_rope: jax.Array,  # int32[total_num_pages, page_size // 4, 128]
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -642,8 +647,9 @@ def sparse_ragged_paged_attention(
 
     Args:
       q: concatenated all sequences' queries.
-      cache_kv_nope: the current kv cache for nope.
-      cache_kv_rope: the current kv cache for rope.
+      cache_kv_nope: the current kv cache for nope, one row per token (see
+        `csa_cache_layout`).
+      cache_kv_rope: the current kv cache for rope, 32 words per token.
       topk_indices: for each query token, the indices of the top k key tokens to
         attend to.
       page_indices: flattened page indices look-up table by (seq_id, page_id).
@@ -661,8 +667,8 @@ def sparse_ragged_paged_attention(
     # The cache is DSV4 FP8 format.
     # nope_cache contains 448 fp8 + 7 fp8 scales,
     # rope_cache contains 64 bf16
-    assert cache_kv_nope.dtype == jnp.uint8
-    assert cache_kv_rope.dtype == jnp.uint8
+    assert cache_kv_nope.dtype == jnp.int32
+    assert cache_kv_rope.dtype == jnp.int32
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
@@ -676,7 +682,7 @@ def sparse_ragged_paged_attention(
     assert swa_accumution.dtype == q.dtype
     swa_accumution, swa_l, swa_m = prepare_swa_inputs(swa_accumution, swa_l, swa_m)
 
-    _, page_size, _, _ = cache_kv_nope.shape
+    _, page_size, _ = cache_kv_nope.shape
 
     _, num_q_heads, _ = q.shape
     max_num_seqs = cu_q_lens.shape[0] - 1
@@ -685,8 +691,8 @@ def sparse_ragged_paged_attention(
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-        cache_kv_nope: jax.Array,  # [total_num_pages, page_size, nope_dim]
-        cache_kv_rope: jax.Array,  # [total_num_pages, page_size, rope_dim]
+        cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
+        cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
         kv_lens: jax.Array,  # i32[max_num_seqs]
         attention_sinks: jax.Array,  # float32[num_q_heads]
         swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
@@ -712,14 +718,17 @@ def sparse_ragged_paged_attention(
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
 
-        # One batch entry's worth of gathered top-k rows, per cache.
+        # One batch entry's worth of gathered top-k rows, per cache, in the
+        # uint8 / bf16 views the kernel bitcasts the int32 words to.
+        _, topk_rows, lanes = cache_kv_nope.shape
         bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, *cache_kv_nope.shape[1:]),
-            cache_kv_nope.dtype,
+            (2, batch_size, topk_rows * 4, lanes),
+            jnp.uint8,
         )
+        _, rope_rows, lanes = cache_kv_rope.shape
         bkv_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, *cache_kv_rope.shape[1:]),
-            cache_kv_rope.dtype,
+            (2, batch_size, rope_rows * 2, lanes),
+            jnp.bfloat16,
         )
 
         bq_double_bufq = pltpu.VMEM(
@@ -763,7 +772,7 @@ def sparse_ragged_paged_attention(
             jnp.full((2,), -1, jnp.int32),
         )
 
-        gathered_topk = cache_kv_rope.shape[1] * 2
+        gathered_topk = cache_kv_nope.shape[1]
         scope_name = (
             f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
         )
@@ -883,8 +892,8 @@ def sparse_ragged_paged_attention(
             num_valid_indices=num_valid_indices,
             top_k=topk,
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, -1, 128)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 2, -1)
+        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
+        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
 
         q = run_mla_kernel(
             q,

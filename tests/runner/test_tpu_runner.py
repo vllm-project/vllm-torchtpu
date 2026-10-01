@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,9 +29,18 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiKVConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    TpuKVConnectorStats,
+)
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -192,14 +202,92 @@ def test_async_sub_indices_skips_new_req():
     assert src == [0, 1, 2, 3]
 
 
-def test_get_finished_kv_transfers_drains_invalid_block_ids():
+def _spec_bucket_runner(spec_k):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=spec_k),
+        num_tokens_paddings=[32, 64, 128, 256, 384, 512, 768],
+        num_reqs_paddings=[8, 16, 32, 64, 128, 192],
+    )
+
+
+@pytest.mark.parametrize("spec_k", [1, 3, 7])
+def test_spec_verify_bucket_reachable_keeps_every_real_step(spec_k):
+    # n requests sample between n and n * (K + 1) logits positions; the
+    # padded bucket pair of every such step must survive the pruning.
+    runner = _spec_bucket_runner(spec_k)
+
+    def pad(value, paddings):
+        return next((p for p in paddings if p >= value), None)
+
+    for n in range(1, runner.num_reqs_paddings[-1] + 1):
+        for length in range(n, n * (spec_k + 1) + 1):
+            num_tokens = pad(length, runner.num_tokens_paddings)
+            if num_tokens is None:
+                break
+            num_reqs = pad(n, runner.num_reqs_paddings)
+            assert TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            ), (n, length, num_tokens, num_reqs)
+
+
+def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
+    runner = _spec_bucket_runner(3)
+    reachable = {
+        num_tokens: [
+            num_reqs
+            for num_reqs in runner.num_reqs_paddings
+            if TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            )
+        ]
+        for num_tokens in runner.num_tokens_paddings
+    }
+    assert reachable == {
+        32: [8, 16, 32],
+        64: [16, 32, 64],
+        128: [32, 64, 128],
+        256: [64, 128, 192],
+        384: [128, 192],
+        512: [128, 192],
+        768: [192],
+    }
+
+
+@pytest.mark.parametrize(
+    "stats_type", [None, OffloadingConnectorStats, TpuKVConnectorStats]
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("has_samples", [False, True])
+def test_get_finished_kv_transfers_drains_invalid_block_ids(
+    stats_type, nested, has_samples
+):
+    leaf_stats = stats_type() if stats_type is not None else None
+    if isinstance(leaf_stats, OffloadingConnectorStats):
+        leaf_stats.increase_counter("offload_transfers", 1)
+    unrelated_stats = OffloadingConnectorStats()
+    unrelated_stats.increase_counter("offload_transfers", 2)
+    original_unrelated_data = copy.deepcopy(unrelated_stats.data)
+    stats = leaf_stats
+    if nested:
+        stats = MultiKVConnectorStats(
+            data={
+                "MultiConnector": MultiKVConnectorStats(
+                    data={"child": leaf_stats} if leaf_stats is not None else {}
+                ),
+                "OffloadingConnector": unrelated_stats,
+            }
+        )
+    original_stats = copy.deepcopy(stats)
+    cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
+    device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
     connector.get_finished.return_value = ({"sent"}, {"loaded"})
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
-    connector.get_kv_connector_stats.return_value = None
-    runner = SimpleNamespace()
+    connector.get_kv_connector_stats.return_value = stats
+    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
     with (
@@ -213,7 +301,15 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids():
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, None)
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
+    assert result[-1] is stats
+    if isinstance(leaf_stats, TpuKVConnectorStats):
+        assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
+        assert leaf_stats.data["runner_device_elapsed_seconds"] == device_samples
+    else:
+        assert stats == original_stats
+    assert unrelated_stats.data == original_unrelated_data
+    runner._stage_timing.take_samples.assert_called_once_with()
     connector.get_finished.assert_called_once_with({"finished"})
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
@@ -900,6 +996,7 @@ class TestCompactMambaSlotPool:
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
+        runner._mamba_offset_seeded = set()
         runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
         runner.input_batch = MagicMock()
         # Bind the real methods.
@@ -1295,11 +1392,12 @@ class TestReadOffsetsClearedOnReallocation:
     the previous conversation: silent GDN state corruption, no crash.
     """
 
-    def _make_runner(self, num_blocks=8, width=2):
+    def _make_runner(self, num_blocks=8, width=2, lockstep=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
+        runner._dp_lockstep_enabled = lambda: lockstep
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
             TPUModelRunner._mamba_state_index_groups.__get__(runner)
@@ -1315,6 +1413,7 @@ class TestReadOffsetsClearedOnReallocation:
     def _set_batch(self, runner, req_ids, state_indices):
         runner.input_batch.req_ids = list(req_ids)
         runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        runner.requests = dict.fromkeys(req_ids)
         ctx = MagicMock()
         ctx.mamba_state_indices = torch.tensor(state_indices, dtype=torch.int32)
         ctx.unified_mamba_state_indices = None
@@ -1361,6 +1460,46 @@ class TestReadOffsetsClearedOnReallocation:
         assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
         assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
 
+    @pytest.mark.parametrize("lockstep", [False, True])
+    def test_all_seen_batch_skips_device_work_unless_lockstep(
+        self, monkeypatch, lockstep
+    ):
+        """A batch with no new request has nothing to reset. One engine's TP
+        ranks all see that batch, so they skip the upload and launches
+        together. Under EP-DP lockstep, where "new" is rank-local, every rank
+        still issues them."""
+        calls = []
+        real = tpu_runner._reset_read_offsets
+
+        def counting(*args):
+            calls.append(args)
+            real(*args)
+
+        monkeypatch.setattr(tpu_runner, "_reset_read_offsets", counting)
+        runner = self._make_runner(lockstep=lockstep)
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (2 if lockstep else 1)
+
+        # A new request is always reset.
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (3 if lockstep else 2)
+
+        # "a" leaves; the all-old batch is skipped without lockstep.
+        self._set_batch(runner, ["b"], [6, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (4 if lockstep else 2)
+
+        # "a" comes back on a recycled slot carrying a stale offset. It was
+        # forgotten when it left, so it counts as new and its slot is cleared.
+        runner.mamba_slot_read_offsets[5] = 2
+        self._set_batch(runner, ["b", "a"], [6, 5])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (5 if lockstep else 3)
+        assert int(runner.mamba_slot_read_offsets[5]) == 0
+
 
 class TestUnifiedReadOffsetMigration:
     """The align-mode seed-copy collector must migrate the per-block read
@@ -1397,6 +1536,7 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
         req_ids = [f"r{i}" for i in range(len(computed))]
+        runner._mamba_offset_seeded = set(req_ids)
         runner.input_batch.req_ids = req_ids
         runner.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         runner.input_batch.num_computed_tokens_cpu = np.array(computed)
@@ -1526,6 +1666,10 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
         kv_transfer_config=None,
     )
     resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
@@ -1754,9 +1898,10 @@ class TestAsyncSpecDecodeTokenAccounting:
         runner.input_batch.num_tokens_no_spec[0] = prompt_len
         runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
 
-        # Step 0: End of Prefill. _update_placeholder called with K=3 drafts
+        # Step 0: Prefill proposes K=3 drafts for the next step, but verifies
+        # none in this step: only its sampled bonus gets an output placeholder.
         request_seq_lens_0 = [(0, req_state, prompt_len, req_id)]
-        num_draft_0 = {0: 3}
+        num_draft_0 = {0: 0}
         next_token_indices = {0: 0}
         TPUModelRunner._update_placeholder(
             runner,
@@ -1765,9 +1910,8 @@ class TestAsyncSpecDecodeTokenAccounting:
             next_token_indices=next_token_indices,
             num_draft_per_req=num_draft_0,
         )
-        # 4 placeholders (1 bonus + 3 drafts) staged
-        assert runner.input_batch.num_tokens_no_spec[0] == 14
-        assert req_state.output_token_ids == [0, 0, 0, 0]
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert req_state.output_token_ids == [0]
 
         # Step 1: Start of Decode Step 1. _modify_prev_results for Prefill result.
         # Prefill only had 1 sampled bonus token: [100].
@@ -1785,9 +1929,9 @@ class TestAsyncSpecDecodeTokenAccounting:
         TPUModelRunner._modify_prev_results(runner)
 
         # Rollback check:
-        # output_token_ids should have 4 zeros dropped and [100] added
+        # Replace the single placeholder with the sampled bonus.
         assert req_state.output_token_ids == [100]
-        # num_tokens_no_spec should be rolled back: 14 - 4 + 1 = 11
+        # num_tokens_no_spec stays at 11 - 1 + 1 = 11.
         assert runner.input_batch.num_tokens_no_spec[0] == 11
         # token_ids_cpu slot 10 should be 100
         assert runner.input_batch.token_ids_cpu[0, 10] == 100

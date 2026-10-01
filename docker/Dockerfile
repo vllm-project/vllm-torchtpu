@@ -140,7 +140,16 @@ ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
 
-# Variant 4: Production/Full Image (Production/Minimal Variant)
+# Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
+FROM dev AS omni
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+      -r pyproject.toml \
+      --extra omni
+
+
+# Variant 5: Production/Full Image (Production/Minimal Variant)
 # This variant copies all source code and installs the package regularly
 # without extra dev/testing tools, starting directly from the runtime base.
 FROM base AS prod

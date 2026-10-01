@@ -622,13 +622,21 @@ def _raiden_dst_dcp_size(vllm_config: VllmConfig) -> int:
     return degree
 
 
-def _reshard_advertise_host() -> str:
-    host = str(tpu_envs.TPU_RAIDEN_ADVERTISE_HOST).strip()
-    if not host:
+def _reshard_advertise_host(dp_rank: int) -> str:
+    configured_hosts = str(tpu_envs.TPU_RAIDEN_ADVERTISE_HOST).strip()
+    hosts = [host.strip() for host in configured_hosts.split(",")]
+    if not configured_hosts or any(not host for host in hosts):
         raise ValueError(
             "TPU_RAIDEN_ADVERTISE_HOST is required when TPU_RAIDEN_RESHARD_IMPL=store"
         )
-    return host
+    if len(hosts) == 1:
+        return hosts[0]
+    if dp_rank < 0 or dp_rank >= len(hosts):
+        raise ValueError(
+            "TPU_RAIDEN_ADVERTISE_HOST has no host for data-parallel rank "
+            f"{dp_rank}: configured_hosts={len(hosts)}"
+        )
+    return hosts[dp_rank]
 
 
 def _reshard_service_port(dp_rank: int) -> int:
@@ -636,12 +644,12 @@ def _reshard_service_port(dp_rank: int) -> int:
 
 
 def _reshard_service_address(dp_rank: int) -> str:
-    return f"{_reshard_advertise_host()}:{_reshard_service_port(dp_rank)}"
+    return f"{_reshard_advertise_host(dp_rank)}:{_reshard_service_port(dp_rank)}"
 
 
 def _reshard_dispatch_address(dp_rank: int) -> str:
     port = int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(dp_rank)
-    return f"{_reshard_advertise_host()}:{port}"
+    return f"{_reshard_advertise_host(dp_rank)}:{port}"
 
 
 def _resolved_reshard_controller_address(dp_rank: int) -> str:
@@ -673,8 +681,8 @@ def _is_kimi(vllm_config: VllmConfig) -> bool:
 
 
 def _uses_tp_stage3_source(vllm_config: VllmConfig) -> bool:
-    """Whether producer cache ownership follows TP ranks rather than PCP."""
-    return _use_raiden_glm_admission() or (
+    """Whether the producer's TP ranks are transfer ranks."""
+    return (_use_raiden_glm_admission() and not _engine_is_pipeline(vllm_config)) or (
         bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER)
         and bool(tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION)
         and _is_kimi(vllm_config)
@@ -2028,7 +2036,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     )
                     params["_remote_kv_processed"] = True
             return False, None
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             return False, None
 
         # Decode deliberately computes the final prompt token locally to
@@ -2057,9 +2068,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if (
             not _uses_tp_stage3_source(self.vllm_config)
             and not _use_raiden_dsv4_admission()
+            and not self._stage3_mamba_group_indices
             and pcp_size > 1
         ):
-            # The interleave minimum applies to PCP sources only.
+            # Retain the short-prefix bypass for FA-only PCP sources.
+            # Hybrid ranks have GDN state to send even without FA tokens.
             interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
             min_transfer_tokens = pcp_size * interleave_size
             if num_tokens < min_transfer_tokens:
@@ -2780,6 +2793,7 @@ class TPURaidenConnectorWorker:
             named_kv_caches=named_kv_caches,
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
+            per_layer_tags=_use_per_layer_pool_tags(),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3057,7 +3071,13 @@ class TPURaidenConnectorWorker:
             measured_glm_layout_fingerprint,
         )
 
-        return measured_glm_layout_fingerprint(manifest, page_tokens=page_tokens)
+        # Pipeline stage may hold no indexer layer, so the indexer class stays out of
+        # the fingerprint on both sides.
+        return measured_glm_layout_fingerprint(
+            manifest,
+            page_tokens=page_tokens,
+            hash_indexer=not _use_per_layer_pool_tags(),
+        )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
@@ -3255,7 +3275,7 @@ class TPURaidenConnectorWorker:
                 data_name="reshard_store",
                 data_replica_idx=self.dp_rank,
             ),
-            store_server_ip=_reshard_advertise_host(),
+            store_server_ip=_reshard_advertise_host(self.dp_rank),
             raiden_controller_port=(
                 int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(self.dp_rank)
             ),
@@ -3483,13 +3503,12 @@ class TPURaidenConnectorWorker:
             or pcp_size != 1
             or tp_size != expected_tp
             or pp_size != 1
-            or (self.is_producer and dp_size != 1)
             or source_parallelism % dst_shards
         ):
             raise ValueError(
                 "Kimi Stage-3 requires PCP1, producer TP equal to "
                 "TPU_RAIDEN_TRANSFER_PARALLELISM, destination TP equal "
-                "to TPU_RAIDEN_DST_SHARDS, PP1, and producer DP1: "
+                "to TPU_RAIDEN_DST_SHARDS, and PP1: "
                 f"tp={tp_size}, pcp={pcp_size}, pp={pp_size}, dp={dp_size}, "
                 f"source_parallelism={source_parallelism}, "
                 f"dst_shards={dst_shards}"
@@ -3620,10 +3639,23 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
+            if (
+                metadata.reqs_to_send
+                and self.vllm_config.speculative_config is not None
+            ):
+                # Publishing a source lets Raiden read its pinned buffers
+                # immediately, including on a no-forward scheduler step.
+                # Draft KV writes can still be deferred after forward returns;
+                # materialize the model's typed KV views and wait before
+                # handing them to the external transfer engine. Admission's
+                # raw storage buffers alone do not express those writes.
+                synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
                     self._register_stage3_request_blocks_dsv4(metadata)
-                elif _uses_tp_stage3_source(self.vllm_config):
+                elif _use_raiden_glm_admission() or _uses_tp_stage3_source(
+                    self.vllm_config
+                ):
                     self._register_stage3_request_row_spans(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
@@ -4001,10 +4033,19 @@ class TPURaidenConnectorWorker:
         for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS:
             geo = geometry.get(tag)
             if not geo:
+                # Pipeline stage whose layers all reuse an earlier layer's top-k
+                # holds no indexer cache.
+                if tag == "dsa.idx" and _use_per_layer_pool_tags():
+                    continue
                 raise RuntimeError(f"Stage-3 GLM manifest is missing tag {tag!r}")
-            pool = next(p for p in manifest.pools if p.tag == tag)
-            (region,) = pool.regions
-            result[tag] = (int(geo["live_bytes_per_block"]), int(region.unit_bytes))
+            # One entry per exact pool tag: the class tag, or one per layer
+            # under per-layer tags.
+            for pool in manifest.pools_of_class(tag):
+                (region,) = pool.regions
+                result.setdefault(
+                    pool.tag,
+                    (int(geo["live_bytes_per_block"]), int(region.unit_bytes)),
+                )
         return result
 
     def _register_stage3_request_row_spans(
@@ -4039,6 +4080,11 @@ class TPURaidenConnectorWorker:
 
         tag_geometry = self._stage3_row_geometry
         page_tokens = int(self.vllm_config.cache_config.block_size)
+        # A pipeline stage holds every token of its own layers: it owns every
+        # page, and per-layer pool tags express its layer subset.
+        pipeline = _engine_is_pipeline(self.vllm_config)
+        lowering_parallelism = 1 if pipeline else parallelism
+        lowering_rank = 0 if pipeline else transfer_rank
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
@@ -4052,15 +4098,13 @@ class TPURaidenConnectorWorker:
             scheduler_ids = tuple(
                 int(block_id) for block_id in req_meta.local_block_ids
             )
-            transfer_tags = (
-                ("fa",) if self._stage3_kimi else _STAGE3_GLM_TRANSFER_POOL_TAGS
-            )
+            transfer_tags = ("fa",) if self._stage3_kimi else list(tag_geometry)
             pool_spans = [
                 lower_glm_row_spans(
                     tag=tag,
                     num_tokens=num_tokens,
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
+                    transfer_rank=lowering_rank,
+                    parallelism=lowering_parallelism,
                     page_tokens=page_tokens,
                     live_bytes_per_block=tag_geometry[tag][0],
                     row_bytes=tag_geometry[tag][1],
@@ -5176,7 +5220,7 @@ class TPURaidenConnectorWorker:
                     dst_counts.append(len(pages))
             else:
                 if _use_raiden_glm_admission():
-                    transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS)
+                    transfer_tags = list(self._stage3_row_geometry)
                 else:
                     transfer_tags = self._stage3_fa_registration_tags()
                 dst_blocks = list(local_blocks) * len(transfer_tags)
@@ -5684,7 +5728,7 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             transfer_tags = (
-                list(_STAGE3_GLM_TRANSFER_POOL_TAGS)
+                list(self._stage3_row_geometry)
                 if _use_raiden_glm_admission()
                 else self._stage3_fa_registration_tags()
             )

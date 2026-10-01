@@ -8,7 +8,7 @@ optimizations cannot change the training, recompute, or context-parallel paths.
 """
 
 # This file retains the source kernel's compact mathematical notation.
-# ruff: noqa: E702, E731, F841
+# ruff: noqa: E731, F841
 
 from __future__ import annotations
 

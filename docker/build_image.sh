@@ -10,7 +10,7 @@ Builds the vllm-torchtpu image from the repository root as the docker context.
 Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
-      --target TARGET      Dockerfile stage to build: prod, dev or ci (default: prod)
+      --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
   -h, --help               Show this help and exit
 
 Examples:

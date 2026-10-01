@@ -154,8 +154,9 @@ class Eagle3Proposer:
     ):
         self.runner = runner
         self.vllm_config = vllm_config
-        self.speculative_config = vllm_config.speculative_config
-        assert self.speculative_config is not None
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.speculative_config = speculative_config
         draft_tp = self.speculative_config.draft_tensor_parallel_size
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size
         # Default to (draft_tp == target tp) when unset. vLLM's
@@ -215,6 +216,11 @@ class Eagle3Proposer:
         self._mtp_loop_model: torch.nn.Module | None = None
         # Whether that program has run once (its first run compiles it).
         self._mtp_loop_model_warm = False
+        # MTP loop steps 1..K-1 as one compiled program (see
+        # mtp_fused_loop.py), and whether it has run once. Built in
+        # load_model; None means the per-step loop.
+        self._mtp_fused_loop: torch.nn.Module | None = None
+        self._mtp_fused_loop_warm = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -282,6 +288,7 @@ class Eagle3Proposer:
         self._init_mtp_index_sharing()
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
+        self._build_mtp_fused_loop()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -489,6 +496,121 @@ class Eagle3Proposer:
             "(%d buffer(s)).",
             len(self._mtp_topk_buffers),
         )
+
+    def _build_mtp_fused_loop(self) -> None:
+        """Compile an MTP draft's loop steps 1..K-1 as one program, so the
+        host dispatches once per propose for them instead of twice per step.
+        Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
+
+        Only for the plain case: IndexShare restores top-k rows between steps
+        on the host, a draft->target id map would need its gather in the
+        program, and a cross-model KV-sharing draft (Gemma-4 MTP) keeps
+        positions and seq_lens fixed across steps where the program advances
+        them.
+        """
+        draft_model = self.draft_model
+        if (
+            draft_model is None
+            or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            or self.speculative_config.method != "mtp"
+            or self._share_mtp_indices
+            or not self.advance_draft_positions
+            or getattr(draft_model, "draft_id_to_target_id", None) is not None
+        ):
+            return
+        draft_dims = getattr(draft_model, "_dynamic_arg_dims", None)
+        if draft_dims is None:
+            return
+        K = self.speculative_config.num_speculative_tokens
+        if K < 2:
+            return
+        try:
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
+
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                ),
+                set_current_vllm_config(self.draft_vllm_config),
+            ):
+                self._mtp_fused_loop = build_mtp_fused_loop(
+                    vllm_config=self.draft_vllm_config,
+                    prefix=f"mtp_fused_loop_k{K}",
+                    mtp=draft_model,
+                    num_steps=K - 1,
+                    dynamic_arg_dims=draft_dims,
+                )
+        except Exception:
+            logger.warning(
+                "Could not build the fused MTP loop program; draft loop steps "
+                "run one program each.",
+                exc_info=True,
+            )
+            self._mtp_fused_loop = None
+            return
+        self._mtp_fused_loop_warm = False
+        logger.info("MTP draft loop steps 1..%d run as one compiled program.", K - 1)
+
+    def _run_mtp_fused_loop(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_rejected_np: np.ndarray | None,
+        num_rejected_dev: torch.Tensor | None,
+        loop_query_start_loc: torch.Tensor,
+        loop_request_distribution: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Draft steps 1..K-1 of one chunk in one dispatch.
+
+        `input_ids` is step 0's token and `positions` step 1's. Returns the
+        K-1 tokens, or None when this chunk's metadata doesn't fit the
+        program (the caller then runs the per-step loop).
+        """
+        attn_metadata = self._build_draft_attn_metadata(
+            chunk=chunk,
+            step_idx=1,
+            seq_lens_delta=1,
+            num_rejected_np=num_rejected_np,
+            num_rejected_dev=num_rejected_dev,
+            loop_query_start_loc=loop_query_start_loc,
+            loop_request_distribution=loop_request_distribution,
+        )
+        # The program bumps seq_lens in place between steps; every draft
+        # layer must read that one tensor. It is fresh from the step-1 build
+        # (base + 1 - rejected), so nothing else holds it -- except the
+        # loop-step metadata cache, which only steps >= 2 read.
+        seq_lens_set = {id(md.seq_lens): md.seq_lens for md in attn_metadata.values()}
+        if len(seq_lens_set) != 1:
+            return None
+        (seq_lens,) = seq_lens_set.values()
+        self._draft_md_cache.pop(id(chunk), None)
+
+        num_tokens = input_ids.shape[0]
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                attn_metadata,
+                self.draft_vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+        ):
+            if not self._mtp_fused_loop_warm:
+                # The first call traces and compiles; like the loop-step
+                # program's, its outputs can carry symbolic sizes, so run it
+                # again compiled. The repeat rewrites the same KV entries;
+                # seq_lens is put back first because the program advanced it.
+                seq_lens_step1 = seq_lens.clone()
+                self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+                seq_lens.copy_(seq_lens_step1)
+                self._mtp_fused_loop_warm = True
+            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
 
     def _draft_model_for_step(self, step_idx: int):
         """The compiled program draft step `step_idx` runs.
@@ -964,6 +1086,9 @@ class Eagle3Proposer:
         hidden_carry_per_chunk = []
         positions_carry_per_chunk = []
         rejected_per_chunk = []
+        # The same counts as host arrays for the draft metadata builds; None
+        # when async, where they stay on device.
+        rejected_np_per_chunk: list[np.ndarray | None] = []
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
         is_async = next_tokens_per_chunk is not None
@@ -1005,6 +1130,9 @@ class Eagle3Proposer:
                 )
             )
             rejected_per_chunk.append(num_rejected)
+            rejected_np_per_chunk.append(
+                None if isinstance(num_rejected, torch.Tensor) else num_rejected
+            )
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -1012,7 +1140,7 @@ class Eagle3Proposer:
                 target_hidden_states=target_hidden_states,
                 step_idx=0,
                 seq_lens_delta=0,
-                num_rejected_np=(None if is_async else num_rejected),
+                num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
@@ -1100,37 +1228,69 @@ class Eagle3Proposer:
                         [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
                     )
                 )
-            for step in range(1, K):
+
+            def run_draft_step(ci: int, step: int) -> None:
+                """One separate draft step for chunk `ci`: a draft forward
+                and an lm-head + argmax, each its own dispatch."""
+                chunk = chunks[ci]
+                if self.advance_draft_positions:
+                    loop_positions[ci] = loop_positions[ci] + 1
+                # Prev step's [p] tokens feed directly — already bucketed.
+                loop_input_ids = draft_tokens_per_chunk[ci][-1]
+                last_hidden, hidden = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=loop_input_ids,
+                    positions=loop_positions[ci],
+                    target_hidden_states=loop_hidden[ci],
+                    step_idx=step,
+                    seq_lens_delta=(step if self.advance_draft_positions else 0),
+                    num_rejected_np=rejected_np_per_chunk[ci],
+                    num_tokens_padded=padded_nr_per_chunk[ci],
+                    num_rejected_dev=rejected_dev_per_chunk[ci],
+                    loop_query_start_loc=loop_qsl_per_chunk[ci],
+                    loop_request_distribution=loop_reqdist_per_chunk[ci],
+                )
+                with set_model_tag("eagle_head"):
+                    draft_tokens_per_chunk[ci].append(
+                        self._draft_propose_token(last_hidden)
+                    )
+                loop_hidden[ci] = hidden
+
+            if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
+                # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
+                # is fine here: the separate path is step-major only for
+                # IndexShare's shared top-k buffer, which the fused program
+                # never runs with.
                 for ci, chunk in enumerate(chunks):
-                    if self._share_mtp_indices:
-                        # The loop is step-major, so chunks interleave and each
-                        # one finds the buffer holding its predecessor's rows.
-                        # Restore unconditionally: one rule, no dependence on
-                        # the chunk count. With a single chunk this is a
-                        # self-copy of a few hundred KiB.
-                        self._mtp_restore_topk(saved_topk_per_chunk[ci])
-                    if self.advance_draft_positions:
-                        loop_positions[ci] = loop_positions[ci] + 1
-                    # Prev step's [p] tokens feed directly — already bucketed.
-                    loop_input_ids = draft_tokens_per_chunk[ci][-1]
-                    last_hidden, hidden = self._forward_draft(
+                    fused = self._run_mtp_fused_loop(
                         chunk=chunk,
-                        input_ids=loop_input_ids,
-                        positions=loop_positions[ci],
-                        target_hidden_states=loop_hidden[ci],
-                        step_idx=step,
-                        seq_lens_delta=(step if self.advance_draft_positions else 0),
-                        num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
-                        num_tokens_padded=padded_nr_per_chunk[ci],
+                        input_ids=draft_tokens_per_chunk[ci][-1],
+                        positions=loop_positions[ci] + 1,
+                        hidden_states=loop_hidden[ci],
+                        num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],
                     )
-                    with set_model_tag("eagle_head"):
-                        draft_tokens_per_chunk[ci].append(
-                            self._draft_propose_token(last_hidden)
-                        )
-                    loop_hidden[ci] = hidden
+                    if fused is not None:
+                        draft_tokens_per_chunk[ci].extend(fused)
+                        continue
+                    # This chunk's metadata doesn't fit the program.
+                    for step in range(1, K):
+                        run_draft_step(ci, step)
+            else:
+                # Separate: one draft forward and one lm-head per step.
+                for step in range(1, K):
+                    for ci in range(len(chunks)):
+                        if self._share_mtp_indices:
+                            # The loop is step-major, so chunks interleave and
+                            # each one finds the buffer holding its
+                            # predecessor's rows. Restore unconditionally: one
+                            # rule, no dependence on the chunk count. With a
+                            # single chunk this is a self-copy of a few
+                            # hundred KiB.
+                            self._mtp_restore_topk(saved_topk_per_chunk[ci])
+                        run_draft_step(ci, step)
 
         # EP-DP lockstep: pad this rank's draft-forward count up to the
         # step's coordinated chunk bound so ranks with fewer chunks still
@@ -1763,8 +1923,7 @@ class Eagle3Proposer:
                     torch.zeros(
                         (num_tokens, aux_w),
                         dtype=runner._hidden_states_dtype,
-                        device=runner.device,
-                    )
+                    ).to(runner.device)
                     for _ in range(3)
                 ]
                 out = self._draft_combine_hidden_states(*aux)
@@ -1791,9 +1950,9 @@ class Eagle3Proposer:
                 for p in idx_sizes:
                     if p > T:
                         continue
-                    ids = torch.zeros(T, dtype=torch.int32, device=runner.device)
-                    lti = torch.zeros(p, dtype=torch.int64, device=runner.device)
-                    nti = torch.zeros(p, dtype=torch.int32, device=runner.device)
+                    ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                    lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
 
@@ -1824,8 +1983,7 @@ class Eagle3Proposer:
                 dummy_hidden = torch.zeros(
                     (n, hidden_size),
                     dtype=runner._hidden_states_dtype,
-                    device=runner.device,
-                )
+                ).to(runner.device)
                 out = self._draft_propose_token(dummy_hidden)
                 synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)

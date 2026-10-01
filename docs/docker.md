@@ -50,6 +50,15 @@ For example, to pull the Developer Image from May 23, 2026:
 docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20260523
 ```
 
+#### Release Branch Tags
+
+Each scheduled `release/X.Y.Z` branch is also built nightly, into the same image names. `X.Y.Z` points at the most recent build of the branch head, and `YYYYMMDD-X.Y.Z` pins one day's build. `latest` and `nightly-YYYYMMDD` always come from `main`.
+
+```bash
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-<target>:0.0.1
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-<target>:20260930-0.0.1
+```
+
 ## Image targets
 
 ### `ci:latest`

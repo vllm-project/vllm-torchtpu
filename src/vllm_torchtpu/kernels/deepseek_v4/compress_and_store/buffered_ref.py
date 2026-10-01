@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import config
 
 
@@ -294,7 +295,8 @@ class OutputRef(_BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoPEOutputRef(_BufferedRef):
-    # VMEM block: cfgs.rope_output_shape() -> (tile_n, 1, LANE) uint8
+    # VMEM block: cfgs.rope_output_shape() -> (tile_n, 4, LANE) uint8, each
+    # token's whole 4-token RoPE row, read-modify-written.
     # Only used for CSA (has_rope_cache=True).
 
     def copy_in(self, src_ref, grid_indices):
@@ -428,6 +430,14 @@ def create_allocs_and_specs(
         tuple[Any, ...] | None,
     ],
 ]:
+    # CSA's int32 NoPE / RoPE arrays (and a state array hosted on one) are
+    # read and written through their uint8 slab view (see `csa_cache_layout`).
+    cache_ref = csa_cache_layout.as_u8_slabs(cache_ref)
+    if rope_cache_ref is not None:
+        rope_cache_ref = csa_cache_layout.as_u8_slabs(rope_cache_ref)
+    if state_cache_ref is not None:
+        state_cache_ref = csa_cache_layout.as_u8_slabs(state_cache_ref)
+
     # cos_sin
     if cfgs.dims.has_rope:
         tile_n = cfgs.tile_sizes.tile_n

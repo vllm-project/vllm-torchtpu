@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
+    HOST_TRACER_LEVEL: int = 2
+    DEVICE_TRACER_LEVEL: int = 1
+    TPU_TRACE_MODE: str = "TRACE_COMPUTE"
+    TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
+    TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
@@ -132,6 +137,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -387,6 +393,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL": lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
+    # Host tracer level for profiling
+    "HOST_TRACER_LEVEL": lambda: int(os.getenv("HOST_TRACER_LEVEL") or "2"),
+    # Device tracer level for profiling
+    "DEVICE_TRACER_LEVEL": lambda: int(os.getenv("DEVICE_TRACER_LEVEL") or "1"),
+    # TPU trace mode (e.g. TRACE_COMPUTE, TRACE_COMPUTE_AND_SYNC)
+    "TPU_TRACE_MODE": lambda: os.getenv("TPU_TRACE_MODE", "TRACE_COMPUTE"),
+    # Number of sparse cores to trace
+    "TPU_NUM_SPARSE_CORES_TO_TRACE": lambda: int(
+        os.getenv("TPU_NUM_SPARSE_CORES_TO_TRACE") or "1"
+    ),
+    # Number of sparse core tiles to trace
+    "TPU_NUM_SPARSE_CORE_TILES_TO_TRACE": lambda: int(
+        os.getenv("TPU_NUM_SPARSE_CORE_TILES_TO_TRACE") or "1"
+    ),
     # Enable/disable Ray usage statistics collection
     "RAY_USAGE_STATS_ENABLED": lambda: os.getenv("RAY_USAGE_STATS_ENABLED", "0"),
     # Ray compiled DAG channel type for TPU
@@ -820,6 +840,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Run an MTP draft's loop steps 1..K-1 as one compiled program
+    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
+    # TODO: support the two cases that still take the per-step loop:
+    #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
+    #     KV-sharing draft's fixed positions and seq_lens.
+    #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
+    #     collective trace.
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

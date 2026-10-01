@@ -30,6 +30,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
+    dcp_sc_compact,
     metadata,
 )
 
@@ -710,8 +711,9 @@ def streamindex_topk(
         the DCP attention kernels need an LSE output.
 
     Returns:
-      Top-K indices in global compressed space, or `(indices, scores)` if
-      `return_scores`. Unfilled slots are `-1` with score `-inf`.
+      Top-K indices in this rank's local compressed space, or
+      `(indices, scores)` if `return_scores`. Unfilled slots are `-1` with
+      score `-inf`.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
@@ -1144,16 +1146,9 @@ def streamindex_topk(
         )
         scores_out = scores_out[:max_num_tokens, :k]
 
-        # Columns are rank-local; callers (and the merge) want global positions.
-        filled = out >= 0
-        global_idxs = jnp.where(
-            filled,
-            cp_local_to_global(out, cp_rank, cp_size, interleave_c),
-            -1,
-        )
         if not return_scores:
-            return global_idxs
-        return global_idxs, scores_out
+            return out
+        return out, scores_out
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
@@ -1181,49 +1176,6 @@ def streamindex_topk(
         _common_path,
         None,
     )
-
-
-def _select_owned_winners(
-    merged: jax.Array,
-    dcp_size: int,
-    interleave_c: int,
-    dcp_rank: jax.Array | int,
-) -> jax.Array:
-    """Keep the winners this rank owns, left-packed as rank-local indices.
-
-    Every rank filters the identical `merged` global top-k list with its own
-    `dcp_rank`. Because `cp_owner_rank` partitions `[0, total_kv_positions)` onto
-    `range(dcp_size)`, the results across all ranks form an exact partition of
-    the global top-k: no winner is duplicated and none is lost. This is an
-    arithmetic identity regardless of buffer occupancy, which is why this requires
-    no capacity bounding and never truncates -- a rank owns at most all `k`
-    winners, and the output width is `k`.
-
-    Args:
-      merged: i32[num_rows, k] global compressed positions in `sparsecore_topk`
-        order, `-1` padded. Identical on every rank.
-      dcp_size: number of context-parallel ranks.
-      interleave_c: chunk-interleave width in compressed tokens.
-      dcp_rank: i32 scalar, this shard's index along the DCP axis.
-
-    Returns:
-      i32[num_rows, k] of rank-local cache indices for the winners this rank owns,
-      packed into a prefix and `-1` padded.
-    """
-    num_rows, width = merged.shape
-    mine = (merged >= 0) & (cp_owner_rank(merged, dcp_size, interleave_c) == dcp_rank)
-    local = cp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
-
-    # Exclusive prefix count of owned winners gives each entry's destination slot.
-    # At most `width` entries can be `mine`, so `slot <= width - 1`.
-    slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
-    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
-
-    # An extra column past the end (`width`) absorbs entries owned by other ranks;
-    # they all write -1 to the dump column, which is sliced off at the end.
-    out = jnp.full((num_rows, width + 1), -1, dtype=jnp.int32)
-    out = out.at[rows, jnp.where(mine, slot, width)].set(jnp.where(mine, local, -1))
-    return out[:, :width]
 
 
 @functools.partial(
@@ -1276,20 +1228,19 @@ def streamindex_topk_dcp(
          on its owner rank. Thus, every true global winner is guaranteed to
          survive into its owner's local candidate list.
       2. Candidate All-Gather: A single `all_gather` along the candidate axis
-         (axis 1) exchanges candidate *scores* plus one trailing column naming
-         the rank that produced them: `[T, k+1] -> [T, dcp_size * (k+1)]`,
-         reshaped to `[T, dcp_size, k+1]`. The indices are not exchanged.
+         (axis 1) exchanges candidate *scores* only, rank-major:
+         `[T, k] -> [T, dcp_size * k]`. The indices are not exchanged, so they
+         never leave the rank that produced them.
       3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
          `[T, dcp_size * k]` scores to select the exact top-k global winners:
          `[T, dcp_size * k] -> [T, k]`.
-      4. Rank-Local Filtering: Each rank keeps the slots whose chunk's gathered
-         source rank equals `dcp_rank`, resolves them against its own pre-gather
-         indices at `slot % k`. Both `slot // k` and `slot % k` are functions of
-         the chunk width alone, not of the order the chunks arrived in. The rest
-         are marked `-1`,
-         then `_select_owned_winners` maps them to local shard coordinates
-         (`cp_global_to_local`) and packs them into a `-1` padded prefix. The
-         ranks' outputs still form an exact partition of the global top-k.
+      4. Rank-Local Filtering: `dcp_sc_compact.resolve_owned_winners` keeps the
+         slots whose chunk came from `dcp_rank`, resolves them against this
+         rank's own pre-gather indices at `slot % k`, and left-packs them into a
+         `-1` padded prefix. Those indices are rank-local already -- they never
+         crossed the gather -- so no coordinate conversion is needed and
+         ownership is decided in exactly one place. The ranks' outputs form an
+         exact partition of the global top-k.
 
     By gathering candidates along axis 1 upfront rather than partitioning tokens
     over an `all_to_all`, all communication is consolidated into a single upfront
@@ -1350,7 +1301,6 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
-    interleave_c = interleave_size // compression_ratio
 
     def _local(
         q,
@@ -1388,17 +1338,7 @@ def streamindex_topk_dcp(
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
-        rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
-        payload = lax.all_gather(
-            jnp.concatenate([scores, rank_col], axis=1),
-            dcp_axis_name,
-            axis=1,
-            tiled=True,
-        )
-        # [T, dcp * (k+1)] -> [T, dcp, k+1]: column k is the chunk's source rank.
-        payload = payload.reshape(payload.shape[0], dcp_size, k + 1)
-        src = payload[:, :, k].astype(jnp.int32)
-        scores = payload[:, :, :k].reshape(payload.shape[0], dcp_size * k)
+        scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
         # Stage 2. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
@@ -1408,15 +1348,7 @@ def streamindex_topk_dcp(
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
             write_empty_rows=True,
         )
-        # Keep only winners this rank produced.
-        safe = jnp.maximum(slots, 0)
-        ours = (slots >= 0) & (
-            jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
-        )
-        merged = jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1)
-        merged = jnp.where(ours, merged, -1)
-
-        return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
+        return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
 
     replicated = P()
     return jax.shard_map(

@@ -17,7 +17,14 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
+from .pool_manifest import (
+    TAG_DSA_IDX,
+    TAG_FA,
+    TAG_GDN_CONV,
+    TAG_GDN_SSM,
+    TAG_MLA_NOPE,
+    PoolManifest,
+)
 from .tags import class_tag
 
 
@@ -215,7 +222,7 @@ def measured_kimi_k3_layout_fingerprint(
     if not any(pool.tag == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
@@ -261,11 +268,17 @@ def measured_glm_layout_fingerprint(
     page_tokens: int,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
+    hash_indexer: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
     Hash per-page geometry only: both peers must agree on it, but they size
     their pools independently.
+
+    ``hash_indexer=False`` leaves the indexer class out of the hash (every
+    pool is still validated): a pipeline stage whose layers reuse an earlier
+    layer's top-k holds no indexer cache, yet must fingerprint identically to
+    a destination holding every layer.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
@@ -273,6 +286,8 @@ def measured_glm_layout_fingerprint(
         layout_getter=layout_getter,
         include_page_shape=True,
     )
+    if not hash_indexer:
+        layouts.pop(TAG_DSA_IDX, None)
     version = package_version or importlib.metadata.version
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
@@ -323,7 +338,8 @@ def _measure_packed_row_layouts(
     for every pool, since one odd layer would corrupt just that layer.
 
     Pass ``page_tokens`` when every tag shares one page, which GLM and Kimi do
-    and DSv4 does not.
+    and DSv4 does not. DSv4's CSA arrays are rank-3 int32 word rows instead,
+    checked as packing-1 rows under one full-width tile level.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
@@ -340,7 +356,8 @@ def _measure_packed_row_layouts(
         tag = class_tag(pool.tag)
         tensor = manifest.storages[pool.storage_index]
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        if len(shape) != 4:
+        word_rows = len(shape) == 3 and int(tensor.element_size()) == 4
+        if len(shape) != 4 and not word_rows:
             raise RuntimeError(
                 f"admitted {pool.tag} storage must be rank-4: shape={shape}"
             )
@@ -360,7 +377,8 @@ def _measure_packed_row_layouts(
         # The measured element bits are unreliable (0 for these tensors);
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
-        _, rows, packing, width = shape
+        rows, width = shape[1], shape[-1]
+        packing = 1 if word_rows else shape[2]
         if page_tokens is not None:
             page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
             if page_rows_tokens != page_tokens:
@@ -368,13 +386,24 @@ def _measure_packed_row_layouts(
                     f"{pool.tag} page geometry {rows}x{packing} does not "
                     f"match page_tokens {page_tokens}"
                 )
-        if minor_to_major != ROW_CACHE_MINOR_TO_MAJOR:
+        expected_order = (
+            _row_major_minor_to_major(3) if word_rows else ROW_CACHE_MINOR_TO_MAJOR
+        )
+        if minor_to_major != expected_order:
             raise RuntimeError(
                 "Packed-row transfers require the natural physical order: "
                 f"tag={pool.tag}, layer={pool.layer_name}, "
                 f"minor_to_major={minor_to_major}"
             )
-        if tiles != ((packing, 128), (packing, 1)):
+        if word_rows:
+            # A row prefix is a byte prefix only under one tile level that
+            # spans the row and divides the page. XLA shrinks the (8, 128)
+            # tile on pages under 8 rows rather than padding them.
+            tiles_ok = len(tiles) == 1 and tiles[0][1] == width
+            tiles_ok = tiles_ok and rows % tiles[0][0] == 0
+        else:
+            tiles_ok = tiles == ((packing, 128), (packing, 1))
+        if not tiles_ok:
             raise RuntimeError(
                 "Packed-row transfers require the packed tile shape "
                 f"(({packing},128),({packing},1)): tag={pool.tag}, "

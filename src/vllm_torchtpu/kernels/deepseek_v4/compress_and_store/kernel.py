@@ -164,11 +164,10 @@ def inner_kernel(
         else:
             out_vmem[:, 0] = nope_val_padded
         if cfgs.dims.has_rope_cache:
-            rope_val_padded = compute.pack_rope_tiled(
-                rope_ropped, cfgs.dims.rope_head_dim, cfgs.dims.rope_width
-            )  # (tile_n, 1, 128)
-
-            rope_slots_val = rope_out_vmem[...]  # (tile_n, 4, 128)
+            # RoPE row of 4 tokens, token j in words [32 j, 32 j + 32) (see
+            # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
+            words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
+            rope_lane = config.LANE - cfgs.dims.rope_head_dim
             kv_slots = []
             for i in range(tile_n):
                 kv_slots.append(kv_slot_mapping_ref[global_idx + i])
@@ -178,11 +177,10 @@ def inner_kernel(
 
                 @pl.when(is_first)
                 def _merge_rope():
-                    rope_out_vmem[n] = compute.merge_slot_updates(
-                        rope_slots_val[n],
-                        kv_slots,
-                        rope_val_padded,
-                        n,
+                    row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
+                    rope_out_vmem[n] = pltpu.bitcast(
+                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
+                        jnp.uint8,
                     )
 
     else:

@@ -55,11 +55,11 @@ from jax.sharding import PartitionSpec as P
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch  # noqa: E402
-from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache  # noqa: E402
-from vllm_torchtpu.kernels.mla.masked_dense import csa_mask  # noqa: E402
-from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense  # noqa: E402
-from vllm_torchtpu.kernels.mla.sparse import kernel as sparse  # noqa: E402
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache
+from vllm_torchtpu.kernels.mla.masked_dense import csa_mask
+from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense
+from vllm_torchtpu.kernels.mla.sparse import kernel as sparse
 
 # GLM-5.2-FP8, read off the checkpoint config.
 LKV_DIM = 512  # kv_lora_rank

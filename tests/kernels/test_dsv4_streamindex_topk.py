@@ -1238,7 +1238,7 @@ class TestChunkedPipelining:
     has to agree with the unchunked one exactly.
     """
 
-    # yapf: disable
+    # fmt: off
     @pytest.mark.parametrize(
         "B, T_list, S_list, page_size, H_I, D, k, comp_ratio, bq_sz, bkv_p,"
         " block_table_list, chunk_tokens, kv_layout",
@@ -1345,7 +1345,7 @@ class TestChunkedPipelining:
             ),
         ],
     )
-    # yapf: enable
+    # fmt: on
     def test_chunking_matches_unchunked(
         self,
         B,

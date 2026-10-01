@@ -40,7 +40,14 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from vllm.v1.kv_offload.base import GPULoadStoreSpec, LookupResult, ReqContext
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    Locality,
+    LookupResult,
+    Medium,
+    OffloadKey,
+    ReqContext,
+)
 
 
 def _key(n: int) -> bytes:
@@ -111,6 +118,8 @@ class FakeKVCacheStore:
         # graceful degradation during registry outages (falls back to local).
         self.global_entries: dict[bytes, FakeRaidenBlockId] = {}
         self.registry_down = False
+        # Set by set_eviction_callback(); fired by simulate_evict().
+        self.eviction_callback = None
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
         self._save_failed: list[bytes] = []
@@ -298,6 +307,15 @@ class FakeKVCacheStore:
     def calls_named(self, name: str) -> list[_Call]:
         return [c for c in self.calls if c.name == name]
 
+    def set_eviction_callback(self, callback) -> None:
+        self.calls.append(_Call("set_eviction_callback", (callback,)))
+        self.eviction_callback = callback
+
+    def simulate_evict(self, block_hashes: list[bytes]) -> None:
+        """Fire the registered callback, as the C++ host LRU sweep would."""
+        if self.eviction_callback is not None:
+            self.eviction_callback(block_hashes)
+
     def pinned_hashes(self) -> dict[bytes, int]:
         """Sub-hashes the store still holds a pin for, and how many."""
         return {h: e.pin_count for h, e in self.entries.items() if e.pin_count}
@@ -375,18 +393,41 @@ def seed_global_entries(
 
 
 class TestConstructionGuards(unittest.TestCase):
-    def test_spec_rejects_kv_cache_events(self):
-        # The manager emits no offloading events (displaced keys are
-        # rediscovered by directory probes), so a configuration that expects
-        # KV cache events must be refused at startup, before any config
-        # derivation, rather than silently dropping BlockRemoved
-        # notifications.
+    def test_spec_allows_kv_cache_events(self):
+        # The manager now emits offloading events via take_events(), so
+        # enable_kv_cache_events is supported.
         from vllm_torchtpu.offload.raiden_store import TPURaidenStoreOffloadingSpec
 
         vllm_config = MagicMock()
         vllm_config.kv_events_config.enable_kv_cache_events = True
-        with self.assertRaisesRegex(ValueError, "enable_kv_cache_events"):
-            TPURaidenStoreOffloadingSpec(MagicMock(), vllm_config, MagicMock())
+        vllm_config.model_config.is_hybrid = False
+        kv_cache_config = MagicMock()
+        kv_cache_config.kv_cache_groups = []
+        config = MagicMock()
+        config.cache.blocks_per_chunk = 1
+        config.parallel.dcp_size = 1
+        config.parallel.pcp_size = 1
+        config.parallel.world_size = 1
+        config.extra_config = {"cpu_bytes_to_use": 1024 * 1024}
+        config.worker_kv_bytes_per_block = 1024
+        config.groups = []
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+                return_value=(16, (1, 1), None, 16),
+            ),
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_block_major_contract",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.offload.raiden_store.derive_offload_namespace",
+                return_value=b"test_ns",
+            ),
+        ):
+            spec = TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+            self.assertIsNotNone(spec)
+            self.assertEqual(spec.key_namespace, b"test_ns")
 
     def test_registry_requires_pythonhashseed(self):
         # Require PYTHONHASHSEED to prevent hash mismatch across distributed replicas.
@@ -397,6 +438,120 @@ class TestConstructionGuards(unittest.TestCase):
                 global_registry_address="registry:50051",
                 store_server_ip="10.0.0.1",
             )
+
+
+class TestEvictionEvents(unittest.TestCase):
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store, device_block_size_factor=4)
+
+    def test_eviction_callback_registered_and_unregistered(self):
+        self.assertEqual(self.store.eviction_callback, self.manager._on_eviction)
+        self.manager.shutdown()
+        self.assertIsNone(self.store.eviction_callback)
+
+    def test_sub_hash_to_offload_key(self):
+        key = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
+        sub_hashes_list = self.manager._sub_hashes(key)
+        self.assertEqual(len(sub_hashes_list), 4)
+        for i, sh in enumerate(sub_hashes_list):
+            parsed = self.manager._sub_hash_to_offload_key(sh)
+            self.assertIsNotNone(parsed)
+            assert parsed is not None
+            parsed_key, sub_idx = parsed
+            self.assertEqual(parsed_key, key)
+            self.assertEqual(sub_idx, i)
+
+        # Invalid sub_hashes
+        self.assertIsNone(self.manager._sub_hash_to_offload_key(b"short"))
+        # Invalid prefix when namespace is set
+        ns_mgr = make_manager(FakeKVCacheStore(), key_namespace=b"1234567890abcdef")
+        self.assertIsNone(
+            ns_mgr._sub_hash_to_offload_key(
+                b"wrongprefix1234" + key + (0).to_bytes(4, "big")
+            )
+        )
+        # Invalid sub_idx >= factor
+        invalid_sub_idx = self.manager._key_namespace + key + (10).to_bytes(4, "big")
+        self.assertIsNone(self.manager._sub_hash_to_offload_key(invalid_sub_idx))
+
+    def test_eviction_emits_event_on_first_sub_hash_and_deduplicates(self):
+        key1 = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
+        sub_hashes1 = self.manager._sub_hashes(key1)
+
+        # Evict first sub-block of key1
+        self.store.simulate_evict([sub_hashes1[0]])
+        events = self.manager.take_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].keys, [key1])
+        self.assertTrue(events[0].removed)
+        self.assertEqual(events[0].medium, Medium.CPU)
+        self.assertEqual(events[0].locality, Locality.LOCAL)
+
+        # Subsequent take_events is empty
+        self.assertEqual(self.manager.take_events(), [])
+
+        # Evicting remaining sub-blocks does not re-emit the event
+        self.store.simulate_evict(sub_hashes1[1:])
+        self.assertEqual(self.manager.take_events(), [])
+
+    def test_eviction_multiple_keys(self):
+        key1 = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
+        key2 = OffloadKey(_key(2) + (0).to_bytes(4, "big"))
+        sh1 = self.manager._sub_hashes(key1)
+        sh2 = self.manager._sub_hashes(key2)
+
+        # Evict all sub-blocks of both keys in one call
+        self.store.simulate_evict(sh1 + sh2)
+        events = self.manager.take_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(set(events[0].keys), {key1, key2})
+        self.assertEqual(self.manager.take_events(), [])
+
+    def test_eviction_cleared_on_re_store(self):
+        key1 = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
+        sh1 = self.manager._sub_hashes(key1)
+
+        # Partially evict sub-block 0
+        self.store.simulate_evict([sh1[0]])
+        events = self.manager.take_events()
+        self.assertEqual(len(events), 1)
+
+        # Re-store key1
+        self.manager.submit_store_job(1, [key1], [10])
+
+        # Key can be evicted and reported again in the future
+        self.store.simulate_evict([sh1[0]])
+        events2 = self.manager.take_events()
+        self.assertEqual(len(events2), 1)
+        self.assertEqual(events2[0].keys, [key1])
+
+    def test_eviction_ignores_unparseable_hashes(self):
+        # The host cache is shared, so the callback also sees hashes this
+        # manager never wrote (other namespaces, other sub-block factors).
+        # They must be dropped, not turned into bogus BlockRemoved events.
+        key = OffloadKey(_key(1) + (0).to_bytes(4, "big"))
+        self.store.simulate_evict(
+            [
+                b"short",
+                self.manager._key_namespace + key + (99).to_bytes(4, "big"),
+            ]
+        )
+        self.assertEqual(self.manager.take_events(), [])
+
+    def test_manager_tolerates_store_without_eviction_callback(self):
+        # Older Raiden wheels predate set_eviction_callback(); the manager
+        # must still build and simply report no events.
+        class _LegacyStore(FakeKVCacheStore):
+            def __getattribute__(self, name):
+                if name == "set_eviction_callback":
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+
+        manager = make_manager(_LegacyStore(), device_block_size_factor=4)
+        self.assertFalse(manager._supports_eviction_callback)
+        self.assertEqual(manager.take_events(), [])
+        manager.shutdown()
 
 
 class TestLookup(unittest.TestCase):

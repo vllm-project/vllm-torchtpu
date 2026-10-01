@@ -21,11 +21,19 @@ class _FakeHFConfig:
         return out
 
 
-def _make_proposer(hf_dict, num_speculative_tokens=4):
+def _make_proposer(hf_dict, num_speculative_tokens=4, **spec_fields):
+    # The vLLM 0.29 drafting fields at their defaults; tests override them.
+    fields = dict(
+        draft_sample_method="greedy",
+        enable_adaptive_verification=False,
+        dspark_draft_topk=None,
+    )
+    fields.update(spec_fields)
     speculative_config = SimpleNamespace(
         num_speculative_tokens=num_speculative_tokens,
         draft_tensor_parallel_size=1,
         draft_model_config=SimpleNamespace(hf_config=_FakeHFConfig(hf_dict)),
+        **fields,
     )
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
@@ -78,6 +86,26 @@ def test_bonus_anchor_keeps_dflash_layout():
     assert not p.sample_from_anchor
     assert p._query_block_size(4) == 5
     assert p.block_size == 5
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("draft_sample_method", "probabilistic"),
+        ("enable_adaptive_verification", True),
+        ("dspark_draft_topk", 8),
+    ],
+)
+def test_rejects_unsupported_drafting_options(field, value):
+    with pytest.raises(ValueError, match="does not support"):
+        _make_proposer(
+            {
+                "dspark_noise_token_id": 7,
+                "dspark_block_size": 4,
+                **_LAYER_IDS,
+            },
+            **{field: value},
+        )
 
 
 def test_block_size_guard():

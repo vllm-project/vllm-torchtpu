@@ -1154,3 +1154,23 @@ def test_dsv4_state_cache_name_resolves_its_compressed_kv_layer():
     )
     with pytest.raises(rpm.ManifestError, match="cannot be derived"):
         rpm.dsv4_compressed_kv_layer_name("model.layers.3.self_attn.attn")
+
+
+def test_glm_manifest_per_layer_tags():
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(),
+        raw_tensors=(),
+        block_size_tokens=1024,
+        per_layer_tags=True,
+    )
+    assert sorted(pool.tag for pool in manifest.pools) == [
+        "dsa.idx.l0",
+        "mla.nope.l0",
+        "mla.nope.l1",
+        "mla.rope.l0",
+        "mla.rope.l1",
+    ]
+    assert {pool.regions[0].name for pool in manifest.pools_of_class("mla.nope")} == {
+        "mla_nope_rows"
+    }
+    assert set(manifest.geometry_by_tag()) == {"mla.nope", "mla.rope", "dsa.idx"}

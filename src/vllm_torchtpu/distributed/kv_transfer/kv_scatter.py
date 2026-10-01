@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 # a working JAX install.
 _jax_import_error: BaseException | None = None
 try:
-    import jax  # noqa: F401
+    import jax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     from torch_tpu._internal import pallas as ttpu_pallas
