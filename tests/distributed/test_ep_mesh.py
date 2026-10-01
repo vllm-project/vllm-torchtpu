@@ -27,6 +27,7 @@ from vllm_torchtpu.distributed import ep_mesh as ep
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
+    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
 
 
 @pytest.mark.parametrize(
@@ -71,6 +72,19 @@ def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
     # Devices 10, 20, 30, 40 belong to EP ranks 2, 1, 3, 0.
     assert ep.ep_rank_order() == (2, 1, 3, 0)
     assert ep.ep_mesh_index() == 0
+
+
+def test_pcp_keeps_rank_order(monkeypatch, group):
+    """With PCP > 1 the mesh stays in rank order: the PCP mesh is rank-ordered
+    (its kernels index token shards and state by PCP rank), and torch_tpu
+    rejects two Pallas kernels with different DeviceAssignments in one compiled
+    module. So mesh index i is EP rank i and this rank's index is its EP rank,
+    even though the same device ids reorder the mesh with PCP off."""
+    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    assert ep.ep_rank_order() == (0, 1, 2, 3)
+    # Global rank 6 is EP rank 2 of [2, 4, 6, 8].
+    assert ep.ep_mesh_index() == 2
 
 
 def test_missing_rank_mapping(monkeypatch, group):
@@ -126,7 +140,6 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
-    monkeypatch.setattr(ep, "ep_rank_order", lambda: (2, 1, 3, 0))
 
     first = ep.build_ep_mesh()
     assert made.call_args.kwargs == {"axis_names": ("d",)}
@@ -135,12 +148,38 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     # Each device keeps the rank Torchtpu gave it; only the order changes.
     assert [d.process_index for d in first.devices.flat] == [2, 1, 3, 0]
     assert ep.build_ep_mesh() is first
-    # Same devices in a different order is the same mesh: the key sorts them.
+    # Same devices in a different rank order is the same mesh: the key is the
+    # mesh's device order, and both sort to it.
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20, 30, 40))
     assert ep.build_ep_mesh() is first
     assert ep.build_ep_mesh("experts") is not first
     assert made.call_args.kwargs == {"axis_names": ("experts",)}
     assert made.call_count == 2
+
+
+@pytest.mark.tpu_test
+def test_mesh_keeps_pallas_rank_order_under_pcp(monkeypatch):
+    """With PCP > 1 the EP mesh must have the PCP mesh's DeviceAssignment,
+    which is rank order -- on tpu7x, devices [0, 1, 4, 5, 6, 7, 2, 3]. Sorting
+    them here is what failed to compile with "Disjoint or conflicting device
+    assignments" on PCP + fused EP."""
+    import torch.distributed as dist
+    from torch_tpu._internal import pallas as pallas_module
+
+    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    rank_device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
+    monkeypatch.setattr(
+        pallas_module,
+        "get_pallas_mesh",
+        lambda axis_names: _fake_mesh(_pallas_devices(rank_device_ids), axis_names),
+    )
+    monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
+
+    mesh = ep.build_ep_mesh()
+    assert [d.id for d in mesh.devices.flat] == list(rank_device_ids)
+    assert [d.process_index for d in mesh.devices.flat] == list(range(8))
 
 
 @pytest.mark.tpu_test
@@ -186,10 +225,20 @@ def test_missing_native_ep_symbol(monkeypatch):
     assert ep.get_ep_group() is None
 
 
-@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize(
+    ("sequence_parallel", "pcp", "expected"),
+    [
+        (False, 1, ((0, 3), (2, 1))),
+        (True, 1, ((0,), (1,), (2,), (3,))),
+        # Rank order under PCP: mesh index i is EP rank i, i.e. global 2*i+2.
+        (False, 2, ((2, 0), (3, 1))),
+        (True, 2, ((0,), (1,), (2,), (3,))),
+    ],
+)
 def test_token_groups_use_native_membership_and_mesh_order(
-    monkeypatch, group, sequence_parallel
+    monkeypatch, group, sequence_parallel, pcp, expected
 ):
+    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: pcp)
     group.cpu_group = object()
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
     monkeypatch.setattr(
@@ -208,7 +257,6 @@ def test_token_groups_use_native_membership_and_mesh_order(
 
     collect = Mock(side_effect=gather)
     monkeypatch.setattr(ep.torch.distributed, "all_gather_object", collect)
-    expected = ((0,), (1,), (2,), (3,)) if sequence_parallel else ((0, 3), (2, 1))
     assert (
         ep.ep_token_replica_groups(is_sequence_parallel=sequence_parallel) == expected
     )
