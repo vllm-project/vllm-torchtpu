@@ -352,6 +352,31 @@ def outer_kernel(
     _run()
 
 
+def _select_state_buffers(
+    cfg: config.GDNConfig,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array | None,
+) -> config.GDNConfig:
+    """Uses split state buffers where they fit, else the shared buffer.
+
+    GDN halves the decode tile until split buffers fit: at 64 v-heads (DP8)
+    the batched pass at tile 2 with split buffers took 11% / 3% / 1% less
+    time than tile 4 with the shared buffer at 8 / 64 / 256 padded rows.
+    KDA keeps its tile; it is unmeasured. With no fitting tile, the
+    requested tile runs on the shared buffer.
+    """
+    candidates = [cfg]
+    if cfg.mode != config.GDNMode.PER_SEQ and not cfg.is_kda:
+        tile = cfg.tile_size
+        while tile > 1:
+            tile //= 2
+            candidates.append(dataclasses.replace(cfg, tile_size=tile))
+    for candidate in candidates:
+        if memory_ref.split_state_fits(candidate, conv_state, recurrent_state):
+            return dataclasses.replace(candidate, split_state=True)
+    return cfg
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -675,12 +700,7 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
-        cfg = dataclasses.replace(
-            cfg,
-            split_state=memory_ref.split_state_fits(
-                cfg, in_conv_state, in_recurrent_state
-            ),
-        )
+        cfg = _select_state_buffers(cfg, in_conv_state, in_recurrent_state)
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
