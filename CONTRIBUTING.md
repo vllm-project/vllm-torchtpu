@@ -94,6 +94,7 @@ pip install --upgrade pip
 
 # Install keyring plugin for persistent auth
 pip install keyring keyrings.google-artifactregistry-auth
+# TODO: Replace with the public index once torch_tpu is open-sourced
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 # Install vllm-torchtpu and dependencies in editable mode
@@ -104,8 +105,8 @@ VLLM_TARGET_DEVICE="empty" pip install --pre -e .
 If you are developing or debugging vLLM core in tandem with `vllm-torchtpu`:
 
 ```bash
-# Clone matching vLLM version (e.g. v0.27.0)
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+# Clone matching vLLM version (e.g. v0.29.0)
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install in editable mode without overwriting dependencies
 VLLM_TARGET_DEVICE="empty" uv pip install --no-deps -e ../vllm
