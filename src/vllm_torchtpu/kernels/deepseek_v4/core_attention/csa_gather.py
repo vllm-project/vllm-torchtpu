@@ -64,27 +64,29 @@ def main_kernel(
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
 
     def process_rope(gather_ref, out_ref, records, out_row_base=0):
-        words = gather_ref[...]
-        if shared_pool:
-            # An aliased pool must keep the same operand layout for both inputs.
-            # Current Mosaic cannot reshape a 1D-tiled HBM ref in the kernel.
-            # Gather a 128-word row, then select this token's 32-word quarter.
-            quarter = (records % 4)[:, None]
-            selected = jnp.zeros((row_subchunk_size, rope_in_cols), jnp.int32)
-            for part in range(4):
-                selected |= jnp.where(
-                    quarter == part,
-                    words[:, part * rope_in_cols : (part + 1) * rope_in_cols],
-                    0,
-                )
-            words = selected
+        def token_words(row):
+            words = gather_ref[pl.ds(row, 1), pl.ds(0, rope_in_cols)]
+            if shared_pool:
+                # Scalar selection avoids an unsupported SIMD-lane-to-major-
+                # dimension broadcast (16 -> 16x1) on SparseCore.
+                quarter = records[row] % 4
+                for part in range(1, 4):
+                    words = jnp.where(
+                        quarter == part,
+                        gather_ref[
+                            pl.ds(row, 1), pl.ds(part * rope_in_cols, rope_in_cols)
+                        ],
+                        words,
+                    )
+            return words
+
         # bf16 output rows 2t and 2t + 1 are the low and high halves of int32
         # row t, so each output word pairs one rope value of an even entry
         # with the same value of the next entry. A cache rope word k holds
         # values k (low) and k + 32 (high).
         for t in range(num_simd_lanes // 2):
-            even = words[2 * t : 2 * t + 1, :]
-            odd = words[2 * t + 1 : 2 * t + 2, :]
+            even = token_words(2 * t)
+            odd = token_words(2 * t + 1)
             row = pl.ds(out_row_base + t, 1)
             out_ref[row, pl.ds(0, rope_in_cols)] = jnp.bitwise_or(
                 jnp.bitwise_and(even, 0xFFFF), jnp.left_shift(odd, 16)
