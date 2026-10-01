@@ -123,6 +123,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -178,6 +179,9 @@ class ExecuteModelState:
     mamba_state_indices_list: list[list[torch.Tensor] | None] = field(
         default_factory=list
     )
+    # logits_list holds the greedy tokens ([rows, 1]), not logits
+    # (TPU_GREEDY_TOP_TOKENS).
+    top_tokens: bool = False
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -954,6 +958,8 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # Set at load when TPU_GREEDY_TOP_TOKENS is on.
+        self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -3570,6 +3576,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
+        top_tokens = self._greedy_top_tokens_this_step()
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -3824,7 +3831,18 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    logits = self.compute_selected_logits(hidden_states, logits_indices)
+                    if top_tokens:
+                        logits = self.compute_selected_top_tokens(
+                            hidden_states, logits_indices
+                        )
+                    else:
+                        logits = self.compute_selected_logits(
+                            hidden_states, logits_indices
+                        )
+                elif top_tokens:
+                    logits = self.compute_top_tokens_from_hidden_states(
+                        sample_hidden_states
+                    )
                 else:
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
@@ -3886,6 +3904,7 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
+            top_tokens=top_tokens,
         )
 
         if self.is_pooling_model:
@@ -4220,6 +4239,8 @@ class TPUModelRunner(GPUModelRunner):
                 "with the merged vLLM v1 sampler path yet."
             )
         needs_logprobs = max_num_logprobs is not None
+        # step_eligible keeps grammar and logprobs steps on the full logits.
+        assert not state.top_tokens or (grammar_output is None and not needs_logprobs)
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -4372,7 +4393,9 @@ class TPUModelRunner(GPUModelRunner):
                         logits, grammar_output, cur_start_idx, cur_end_idx
                     )
                 with self._stage_timing.stage("sample"):
-                    if all_greedy:
+                    if state.top_tokens:
+                        selected_token_ids = logits
+                    elif all_greedy:
                         selected_token_ids = self._greedy_sample(logits)
                     else:
                         temperatures_tpu, top_k_tpu, top_p_tpu = (
@@ -4780,6 +4803,16 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if (
+            envs.TPU_GREEDY_TOP_TOKENS
+            and self._pp_is_last
+            and not self.is_pooling_model
+        ):
+            self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
+                self.model, self._dp_lockstep_enabled()
+            )
+            if self.speculative_config is not None:
+                logger.info("TPU_GREEDY_TOP_TOKENS: off on speculative steps")
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -5506,6 +5539,35 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
+    def _precompile_compute_top_tokens(self) -> None:
+        if self._greedy_head_owner is None:
+            return
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_selected_top_tokens"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                for num_reqs in self.num_reqs_paddings:
+                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+        if not _get_sequence_layout_planner_for_runner(
+            self
+        ).uses_selected_logits_hidden_states:
+            return
+        with self._precompile_timed("compute_top_tokens_from_hidden_states"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_reqs, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                out = self.compute_top_tokens_from_hidden_states(dummy_hidden)
+                synchronize_tensors(out)
+
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decoding_manager.structured_decode_arange
@@ -5825,6 +5887,7 @@ class TPUModelRunner(GPUModelRunner):
             self
         ).uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
+        self._precompile_compute_top_tokens()
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
@@ -6926,6 +6989,26 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    def _greedy_top_tokens_this_step(self) -> bool:
+        return (
+            self._greedy_head_owner is not None
+            and self.speculative_config is None
+            and greedy_top_tokens.step_eligible(self.input_batch, self.requests)
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_top_tokens(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_top_tokens_from_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(

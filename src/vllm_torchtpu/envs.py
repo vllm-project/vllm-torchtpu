@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -580,6 +581,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Greedy steps without logprobs or grammar take the vocabulary-parallel
+    # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
