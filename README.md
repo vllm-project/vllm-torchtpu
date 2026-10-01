@@ -66,9 +66,9 @@ source during this process.
 
 > **Package names:** this repo is distributed as `vllm-torchtpu-core` (the
 > import package is still `vllm_torchtpu`). vLLM is **not** a core
-> dependency; the `[vllm]` extra installs it from source for development.
-> `vllm-torchtpu` is the name of the combined wheel (vLLM + a dependency on
-> `vllm-torchtpu-core`), see [Build the combined `vllm-torchtpu` wheel](#4-optional-build-the-combined-vllm-torchtpu-wheel).
+> dependency; the `vllm` dependency group (`--group vllm`) installs it from
+> source for development. `vllm-torchtpu` is the name of the combined wheel
+> (vLLM + a dependency on `vllm-torchtpu-core`).
 >
 > **Migrating an existing environment:** if this repo was installed before the
 > rename (distribution name `vllm_torchtpu`), uninstall it first:
@@ -98,8 +98,8 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
-# Install vLLM-TorchTPU and dependencies ([vllm] pulls vLLM from source)
-VLLM_TARGET_DEVICE="empty" uv pip install --pre -e ".[vllm]"
+# Install vLLM-TorchTPU and dependencies (--group vllm pulls vLLM from source)
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e . --group vllm
 ```
 
 #### Option B: Using `pip`
@@ -115,8 +115,9 @@ pip install keyring keyrings.google-artifactregistry-auth
 # Set the PIP_INDEX_URL environment variable (using keyring)
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-# Install vLLM-TorchTPU and dependencies ([vllm] pulls vLLM from source)
-VLLM_TARGET_DEVICE="empty" pip install --pre -e ".[vllm]"
+# Install vLLM-TorchTPU and dependencies (--group vllm pulls vLLM from source;
+# needs pip >= 25.1)
+VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 ```
 
 ### 3. \[Optional\] Install vLLM

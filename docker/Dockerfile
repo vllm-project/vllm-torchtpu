@@ -45,7 +45,7 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
-# vLLM comes from the [vllm] extra (see pyproject.toml).
+# vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
       -r pyproject.toml \
-      --extra vllm
+      --group vllm
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -101,13 +101,13 @@ FROM ci AS dev
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
-# --extra vllm keeps vLLM (already installed in base) in this resolution, so
+# --group vllm keeps vLLM (already installed in base) in this resolution, so
 # the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
-      --extra vllm \
-      --extra test \
+      --group vllm \
+      --group test \
       --extra benchmarking
 
 COPY . .
@@ -148,9 +148,12 @@ CMD ["/bin/bash"]
 # Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
 FROM dev AS omni
 
+# --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
+# replace it with a PyPI vllm.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
+      --group vllm \
       --extra omni
 
 

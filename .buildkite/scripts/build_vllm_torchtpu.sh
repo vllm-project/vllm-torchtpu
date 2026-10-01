@@ -74,7 +74,7 @@ VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 VLLM_SRC_DIR="${VLLM_SRC_DIR:-${TORCHTPU_ROOT}/build/vllm-torchtpu-src}"
 CORE_DIST_DIR="${CORE_DIST_DIR:-${TORCHTPU_ROOT}/dist}"
 
-# The vLLM ref pinned by the [vllm] extra in pyproject.toml. Used as the default
+# The vLLM ref pinned by the `vllm` dependency group in pyproject.toml. Used as the default
 # [vllm-ref] so the combined wheel ships core on the vLLM it is tested against.
 PINNED_VLLM_REF="$(sed -nE \
     '\|.*"vllm @ git\+https://github\.com/vllm-project/vllm\.git@([^"#]+)".*|{s||\1|p;q;}' \

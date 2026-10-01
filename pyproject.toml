@@ -27,7 +27,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # vllm: see the [vllm] extra below.
+    # vllm: see the `vllm` dependency group below.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -73,27 +73,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# vLLM for dev / CI / Docker. Deliberately NOT in `dependencies`: the combined
-# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
-# on top would overwrite it. Opt in with `pip install -e ".[vllm]"`.
-vllm = [
-    # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
-]
-
-# Required for running tests
-test = [
-    # tests/kernels/ and tests/layers/ use absl.testing.
-    "absl-py",
-    "pytest",
-    "pytest-mock",
-    "pytest-timeout",
-    "pytest-cov",
-    "parameterized",
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -126,6 +105,33 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+
+# Dev / CI / Docker only. These are PEP 735 dependency groups, not extras:
+# groups are never written into the built wheel's metadata, so their git URLs
+# do not block a PyPI upload (PyPI rejects direct-URL requirements, even in
+# extras). Install with `--group <name>` (uv, or pip >= 25.1).
+[dependency-groups]
+# vLLM built from source. Deliberately NOT in `dependencies`: the combined
+# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
+# on top would overwrite it. Opt in with `pip install -e . --group vllm`.
+vllm = [
+    # Note: we **intentionally** build vllm from source, see README.
+    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+]
+
+# Required for running tests
+test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+    "pytest-cov",
+    "parameterized",
+    # Not published on PyPI; lives in vLLM's tests/ directory.
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+]
 
 [tool.pytest.ini_options]
 markers = [

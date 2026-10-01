@@ -84,9 +84,9 @@ Example build using the standard helper script:
 ### `dev:latest`
 Developer image target built from `--target dev`.
 
-This image is based on the `ci` variant, copies the repository into the image, and installs the project in editable mode with test and benchmarking extras:
+This image is based on the `ci` variant, copies the repository into the image, and installs the project in editable mode with the `vllm`/`test` dependency groups and the `benchmarking` extra:
 
-* editable install: `-e ".[test,benchmarking]"`
+* dependencies: `--group vllm --group test --extra benchmarking`
 * intended for local development, debugging, and running tests
 
 Example build using the standard helper script:
