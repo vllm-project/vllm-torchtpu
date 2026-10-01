@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
     cache_page_size,
+    check_scatter_rows_supported,
     coalesced_kv_append,
     coalesced_kv_append_dcp,
     scatter_rows,
@@ -47,6 +48,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     cp_owner_rank,
     cp_rank_as_data,
     get_kv_cache_shape,
+    indexer_kv_layout,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -63,6 +65,7 @@ __all__ = [
     "DEFAULT_VMEM_LIMIT_BYTES",
     "DCP_AXIS_NAME",
     "cache_page_size",
+    "check_scatter_rows_supported",
     "coalesced_kv_append",
     "coalesced_kv_append_dcp",
     "convert_cache_to_seq_along_lane",
@@ -75,6 +78,7 @@ __all__ = [
     "get_dst_rows",
     "get_kv_cache_shape",
     "get_page_and_slot",
+    "indexer_kv_layout",
     "scatter_rows",
     "scatter_rows_reference",
     "streamindex_topk",

@@ -1475,6 +1475,63 @@ class CoalescedKvAppendTest(parameterized.TestCase):
                 cache_has, k, *metadata, 0, dcp_size=2, interleave_size=3
             )
 
+    def test_indexer_kv_layout_and_check_scatter_rows_supported(self):
+        has_enum = st_lib.KVLayout.HEAD_ALONG_SUBLANE
+        sal_enum = st_lib.KVLayout.SEQ_ALONG_LANE
+        self.assertEqual(st_lib.indexer_kv_layout(256, mode="xla"), has_enum)
+        self.assertEqual(st_lib.indexer_kv_layout(256, mode="has"), has_enum)
+        self.assertEqual(st_lib.indexer_kv_layout(256, mode="sal"), sal_enum)
+        self.assertEqual(st_lib.indexer_kv_layout(128, mode="sal"), sal_enum)
+        # block_size < 128 or non-multiple of 128 downgrades SAL to HAS.
+        self.assertEqual(st_lib.indexer_kv_layout(64, mode="sal"), has_enum)
+        self.assertEqual(st_lib.indexer_kv_layout(192, mode="sal"), has_enum)
+
+        # get_kv_cache_shape accepts both unpacked (128) and packed (129) head_dim.
+        self.assertEqual(
+            st_lib.get_kv_cache_shape(10, 256, 128, _SAL),
+            (10, 33, 4, 256),
+        )
+        self.assertEqual(
+            st_lib.get_kv_cache_shape(10, 256, 129, _SAL),
+            (10, 33, 4, 256),
+        )
+        self.assertEqual(
+            st_lib.get_kv_cache_shape(10, 64, 129, _HAS),
+            (10, 16, 4, 256),
+        )
+
+        # Pure-Python check_scatter_rows_supported validates geometry and VMEM.
+        cache_has_64 = jnp.zeros((4, 16, 4, 256), jnp.uint8)
+        cache_sal_256 = jnp.zeros((4, 33, 4, 256), jnp.uint8)
+        k = jnp.arange(4 * 129, dtype=jnp.uint8).reshape(4, 129)
+        kv_cache_append.check_scatter_rows_supported(cache_has_64, k, _HAS)
+        kv_cache_append.check_scatter_rows_supported(cache_sal_256, k, _SAL)
+
+        cache_has_1024 = jnp.zeros((4, 256, 4, 256), jnp.uint8)
+        with self.assertRaisesRegex(ValueError, "SEQ_ALONG_LANE"):
+            kv_cache_append.check_scatter_rows_supported(cache_sal_256, k, _HAS)
+        with self.assertRaisesRegex(ValueError, "HEAD_ALONG_SUBLANE"):
+            kv_cache_append.check_scatter_rows_supported(cache_has_1024, k, _SAL)
+        with self.assertRaisesRegex(ValueError, "SAL cache_kv shape"):
+            kv_cache_append.check_scatter_rows_supported(cache_has_64, k, _SAL)
+        with self.assertRaisesRegex(ValueError, "at most"):
+            kv_cache_append.check_scatter_rows_supported(
+                cache_has_64, jnp.zeros((65536, 129), jnp.uint8), _HAS
+            )
+
+        # Downgraded block_size=64 cache works end-to-end with coalesced_kv_append(HAS).
+        seq_lens = jnp.array([4], jnp.int32)
+        page_indices = jnp.array([[1]], jnp.int32)
+        cu_q_lens = jnp.array([0, 4], jnp.int32)
+        actual_64 = kv_cache_append.coalesced_kv_append(
+            cache_has_64, k, seq_lens, page_indices, cu_q_lens, kv_layout=_HAS
+        )
+        expected_64 = _reference(
+            cache_has_64, k, seq_lens, page_indices, cu_q_lens, layout=_HAS
+        )
+        np.testing.assert_array_equal(np.asarray(actual_64), np.asarray(expected_64))
+
 
 if __name__ == "__main__":
     absltest.main()
+

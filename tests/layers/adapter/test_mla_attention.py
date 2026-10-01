@@ -1015,25 +1015,45 @@ def test_indexer_kv_cache_mode_env_validation(monkeypatch):
 
 
 def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):
-    """Unsupported backend or cache geometry falls back to 'xla' and logs once."""
+    """Single-source layout + strict fallback rule: HAS may fall back to 'xla',
+    SAL never falls back to 'xla', and block_size < 128 downgrades SAL layout to HAS."""
+    import logging
+
     import jax
     import jax.numpy as jnp
 
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        streamindex_topk as st_mod,
+    )
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
+    caplog.set_level(logging.INFO)
     monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
     cache_has = jnp.zeros((4, 256, 4, 256), dtype=jnp.uint8)
+    cache_has_64 = jnp.zeros((4, 16, 4, 256), dtype=jnp.uint8)
     cache_sal = jnp.zeros((4, 33, 4, 1024), dtype=jnp.uint8)
     k_packed = jnp.zeros((8, 129), dtype=jnp.uint8)
 
-    # 'xla' never warns regardless of backend.
+    # 'xla' never warns regardless of backend and logs info once.
     monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    caplog.clear()
     assert mla_attention_op._resolve_indexer_kv_cache_mode(
         cache_has, k_packed, mode="xla"
     ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="xla"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    info_msgs = [
+        r.message for r in caplog.records if "indexer kv cache: mode=" in r.message
+    ]
+    assert info_msgs == [
+        "indexer kv cache: mode=xla writer=xla layout=HAS cache_shape=(4, 256, 4, 256)"
+    ]
 
-    # On CPU, 'has' and 'sal' fall back to 'xla' and warn once per (mode, reason).
+    # On CPU, 'has' falls back to 'xla' and warns once per (mode, reason).
     caplog.clear()
     assert mla_attention_op._resolve_indexer_kv_cache_mode(
         cache_has, k_packed, mode="has"
@@ -1049,26 +1069,61 @@ def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog)
     assert len(warnings) == 1
     assert "falling back to 'xla'" in warnings[0]
 
-    # On TPU, valid HAS and SAL shapes resolve to their Pallas modes; mismatched
-    # geometry (e.g., HAS-shaped cache with mode='sal') falls back to 'xla'.
-    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-    assert mla_attention_op._resolve_indexer_kv_cache_mode(
-        cache_has, k_packed, mode="has"
-    ) == ("has", KVLayout.HEAD_ALONG_SUBLANE)
-    assert mla_attention_op._resolve_indexer_kv_cache_mode(
-        cache_sal, k_packed, mode="sal"
-    ) == ("sal", KVLayout.SEQ_ALONG_LANE)
+    # On CPU, 'sal' with a SAL-shaped cache MUST raise, never fall back to XLA.
+    with pytest.raises(ValueError, match="cannot fall back to 'xla'"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(
+            cache_sal, k_packed, mode="sal"
+        )
 
+    # On TPU, valid HAS and SAL shapes resolve to ('pallas', layout).
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     caplog.clear()
     assert mla_attention_op._resolve_indexer_kv_cache_mode(
-        cache_has, k_packed, mode="sal"
-    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
-    warnings = [
+        cache_has, k_packed, mode="has"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_sal, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.SEQ_ALONG_LANE)
+    info_msgs = [
+        r.message for r in caplog.records if "indexer kv cache: mode=" in r.message
+    ]
+    assert info_msgs == [
+        "indexer kv cache: mode=has writer=pallas layout=HAS cache_shape=(4, 256, 4, 256)",
+        "indexer kv cache: mode=sal writer=pallas layout=SAL cache_shape=(4, 33, 4, 1024)",
+    ]
+
+    # Mismatched cache shape (HAS cache with block_size=1024 under mode='sal', or
+    # SAL cache under mode='has'/'xla') raises ValueError.
+    with pytest.raises(ValueError, match="does not match expected"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(
+            cache_has, k_packed, mode="sal"
+        )
+    with pytest.raises(ValueError, match="does not match expected"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(
+            cache_sal, k_packed, mode="has"
+        )
+
+    # SAL with unsupported token count raises ValueError rather than falling back.
+    with pytest.raises(ValueError, match="cannot fall back to 'xla'"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(
+            cache_sal, jnp.zeros((65536, 129), dtype=jnp.uint8), mode="sal"
+        )
+
+    # block_size=64 + mode='sal' downgrades layout via indexer_kv_layout to HAS
+    # (warning once) and uses the Pallas 'has' writer on TPU.
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has_64, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has_64, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    layout_warnings = [
         r.message
         for r in caplog.records
-        if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in r.message
+        if "requires block_size to be a positive multiple of 128" in r.message
     ]
-    assert len(warnings) == 1
+    assert len(layout_warnings) == 1
 
 
 def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
@@ -1194,7 +1249,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
 
 def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
     """_cp_scatter_indexer_k updates the DCP shard identically across xla, has,
-    and sal."""
+    and sal without re-resolving mode inside shard_map."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1202,6 +1257,7 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
     from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
         DCP_AXIS_NAME,
+        KVLayout,
         kv_cache_append,
     )
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
@@ -1243,7 +1299,8 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
         seq_lens,
         page_indices,
         cu_q_lens,
-        mode="xla",
+        writer="xla",
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         **common_kw,
     )
     out_has = mla_attention_op._cp_scatter_indexer_k(
@@ -1252,7 +1309,8 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
         seq_lens,
         page_indices,
         cu_q_lens,
-        mode="has",
+        writer="pallas",
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         **common_kw,
     )
     out_sal = mla_attention_op._cp_scatter_indexer_k(
@@ -1261,7 +1319,8 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
         seq_lens,
         page_indices,
         cu_q_lens,
-        mode="sal",
+        writer="pallas",
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
         **common_kw,
     )
 
@@ -1270,4 +1329,16 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
         np.asarray(out_sal),
         np.asarray(st_lib.convert_cache_to_seq_along_lane(out_xla, head_dim=head_dim)),
     )
+
+    with pytest.raises(ValueError, match="only supports HEAD_ALONG_SUBLANE"):
+        mla_attention_op._cp_scatter_indexer_k(
+            jnp.copy(init_sal),
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            writer="xla",
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            **common_kw,
+        )
 

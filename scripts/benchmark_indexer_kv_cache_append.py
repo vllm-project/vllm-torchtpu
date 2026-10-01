@@ -392,10 +392,8 @@ def _time_best(fn, make_cache, args, iters: int) -> float:
     return best
 
 
-def _count_hlo_cache_relayouts(fn, cache, args) -> int:
+def _count_hlo_cache_relayouts_from_text(hlo: str, cache_bytes: int) -> int:
     """Counts HLO instructions that copy/reshape/transpose the full cache buffer."""
-    hlo = fn.lower(cache, *args).compile().as_text()
-    cache_bytes = int(np.prod(cache.shape))
     count = 0
     for line in hlo.splitlines():
         if "= u8[" in line and any(
@@ -412,6 +410,35 @@ def _count_hlo_cache_relayouts(fn, cache, args) -> int:
     return count
 
 
+def _count_hlo_cache_relayouts(fn, cache, args) -> int:
+    """Counts HLO instructions that copy/reshape/transpose the full cache buffer."""
+    hlo = fn.lower(cache, *args).compile().as_text()
+    return _count_hlo_cache_relayouts_from_text(hlo, int(np.prod(cache.shape)))
+
+
+def _compile_and_time(
+    fn, make_cache, args, iters: int
+) -> tuple[np.ndarray, str]:
+    """Compiles `fn` once, warms up once, and returns `(samples_us, hlo_text)`."""
+    buf = make_cache()
+    compiled = fn.lower(buf, *args).compile()
+    hlo_text = compiled.as_text()
+    buf, _ = jax.block_until_ready(compiled(buf, *args))
+    samples = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        buf, _ = jax.block_until_ready(compiled(buf, *args))
+        samples.append((time.perf_counter() - t0) * 1e6)
+    return np.asarray(samples, dtype=np.float64), hlo_text
+
+
+def _fmt_stat(samples_us: np.ndarray, *, med_override: float | None = None) -> str:
+    med = float(np.median(samples_us)) if med_override is None else med_override
+    lo = float(np.min(samples_us))
+    hi = float(np.max(samples_us))
+    return f"{med:.1f} [{lo:.1f}..{hi:.1f}]"
+
+
 def run_region_benchmark_for_tokens(
     *,
     num_tokens: int,
@@ -425,23 +452,38 @@ def run_region_benchmark_for_tokens(
     iters: int,
     dcp_size: int,
     interleave_size: int,
+    dcp_rank: int = 0,
+    max_num_seqs: int = 16,
+    num_active_seqs: int | None = None,
+    min_pages_per_seq: int = 128,
+    barrier_metadata: bool = False,
+    scenario_label: str | None = None,
 ) -> None:
+    iters = max(5, iters)
     width = -(-(head_dim + 1) // 128) * 128
     cache_bytes = pages * page_size * width
+    title = scenario_label or (
+        f"T={num_tokens}, seq_len={seq_len}, dcp_size={dcp_size},"
+        f" dcp_rank={dcp_rank}, interleave={interleave_size}"
+    )
     print(
-        f"=== Region Benchmark: T={num_tokens},"
-        f" cache u8[{pages},{page_size // _KV_PACKING},{_KV_PACKING},{width}]"
-        f" ({cache_bytes / 2**20:.1f} MiB), seq_len={seq_len},"
-        f" layers={layers}, dcp_size={dcp_size}, interleave={interleave_size} ==="
+        f"=== Region Benchmark ({title}):"
+        f" cache HAS u8[{pages},{page_size // _KV_PACKING},{_KV_PACKING},{width}]"
+        f" ({cache_bytes / 2**20:.1f} MiB), layers={layers}, iters={iters},"
+        f" barrier_metadata={barrier_metadata} ==="
     )
 
     rng = np.random.default_rng(42 + num_tokens)
-    max_num_seqs = 16
-    pages_per_seq = max(128, (seq_len // max(1, dcp_size)) // page_size + 2)
+    pages_per_seq = max(
+        min_pages_per_seq, (seq_len // max(1, dcp_size)) // page_size + 2
+    )
     assert pages >= pages_per_seq
 
-    is_decode = num_tokens <= 8
-    num_active_seqs = num_tokens if is_decode else 1
+    if num_active_seqs is None:
+        is_decode = num_tokens <= 8
+        num_active_seqs = num_tokens if is_decode else 1
+    else:
+        is_decode = num_active_seqs == num_tokens
 
     seq_lens_np = np.zeros((max_num_seqs,), dtype=np.int32)
     cu_q_lens_np = np.zeros((max_num_seqs + 1,), dtype=np.int32)
@@ -467,16 +509,23 @@ def run_region_benchmark_for_tokens(
     cu_q_lens_d = jnp.asarray(cu_q_lens_np, dtype=jnp.int32)
 
     page_table_np = np.zeros((max_num_seqs, pages_per_seq), dtype=np.int32)
-    reserved_tail_pages = rng.choice(pages, size=num_active_seqs, replace=False)
-    remaining_pool = np.setdiff1d(np.arange(pages, dtype=np.int32), reserved_tail_pages)
-    virtual_page_size = page_size * max(1, dcp_size)
-    for s in range(num_active_seqs):
-        seq_pages = rng.choice(
-            remaining_pool, size=pages_per_seq, replace=False
-        ).astype(np.int32)
-        tail_ord = (int(seq_lens_np[s]) - 1) // virtual_page_size
-        seq_pages[tail_ord] = int(reserved_tail_pages[s])
-        page_table_np[s] = seq_pages
+    if pages >= num_active_seqs * pages_per_seq:
+        perm = rng.permutation(pages).astype(np.int32)
+        for s in range(num_active_seqs):
+            page_table_np[s] = perm[s * pages_per_seq : (s + 1) * pages_per_seq]
+    else:
+        reserved_tail_pages = rng.choice(pages, size=num_active_seqs, replace=False)
+        remaining_pool = np.setdiff1d(
+            np.arange(pages, dtype=np.int32), reserved_tail_pages
+        )
+        virtual_page_size = page_size * max(1, dcp_size)
+        for s in range(num_active_seqs):
+            seq_pages = rng.choice(
+                remaining_pool, size=pages_per_seq, replace=False
+            ).astype(np.int32)
+            tail_ord = (int(seq_lens_np[s]) - 1) // virtual_page_size
+            seq_pages[tail_ord] = int(reserved_tail_pages[s])
+            page_table_np[s] = seq_pages
     page_indices_d = jnp.asarray(page_table_np.reshape(-1), dtype=jnp.int32)
 
     k_all = jnp.asarray(
@@ -487,33 +536,39 @@ def run_region_benchmark_for_tokens(
     )
     w_d = jnp.asarray(rng.standard_normal((num_tokens, num_q_heads)), jnp.bfloat16)
 
-    base_cache_np = rng.integers(
+    # Materialize base caches once on device so per-variant copies stay on HBM.
+    tile_pages = min(pages, 64)
+    tile_np = rng.integers(
         1,
         127,
-        size=(pages, page_size // _KV_PACKING, _KV_PACKING, width),
+        size=(tile_pages, page_size // _KV_PACKING, _KV_PACKING, width),
         dtype=np.uint8,
+    )
+    tile_dev = jnp.asarray(tile_np, dtype=jnp.uint8)
+    reps_pages = -(-pages // tile_pages)
+    base_cache_has = jax.block_until_ready(
+        jnp.tile(tile_dev, (reps_pages, 1, 1, 1))[:pages]
+    )
+    base_cache_sal = jax.block_until_ready(
+        st_lib.convert_cache_to_seq_along_lane(base_cache_has, actual_head_dim=head_dim)
     )
 
     def mk_cache():
-        return jnp.asarray(base_cache_np, dtype=jnp.uint8)
-
-    base_cache_sal_np = np.asarray(
-        st_lib.convert_cache_to_seq_along_lane(mk_cache(), actual_head_dim=head_dim)
-    )
+        return jnp.copy(base_cache_has)
 
     def mk_cache_sal():
-        return jnp.asarray(base_cache_sal_np, dtype=jnp.uint8)
+        return jnp.copy(base_cache_sal)
 
-    dcp_rank_d = jnp.int32(0)
+    dcp_rank_d = jnp.int32(dcp_rank)
 
-    def _score(cache, kv_layout: str):
+    def _score(cache, kv_layout: str, sl, pi, cq):
         return st_lib.streamindex_topk(
             q_d,
             w_d,
             cache,
-            seq_lens_d,
-            page_indices_d,
-            cu_q_lens_d,
+            sl,
+            pi,
+            cq,
             distribution_d,
             k=topk,
             compression_ratio=1,
@@ -527,32 +582,30 @@ def run_region_benchmark_for_tokens(
 
     if dcp_size == 1:
 
-        def v0_xla_has(cache, k_p):
-            cache = has_append_4d(cache, k_p, seq_lens_d, page_indices_d, cu_q_lens_d)
-            return cache, _score(cache, _HAS)
+        def v0_xla_has(cache, k_p, sl, pi, cq):
+            cache = has_append_4d(cache, k_p, sl, pi, cq)
+            return cache, _score(cache, _HAS, sl, pi, cq)
 
-        def v2_pallas_has(cache, k_p):
+        def v2_pallas_has(cache, k_p, sl, pi, cq):
             cache = kv_cache_append.coalesced_kv_append(
-                cache, k_p, seq_lens_d, page_indices_d, cu_q_lens_d, kv_layout=_HAS
+                cache, k_p, sl, pi, cq, kv_layout=_HAS
             )
-            return cache, _score(cache, _HAS)
+            return cache, _score(cache, _HAS, sl, pi, cq)
 
-        def v3a_xla_sal(cache_sal, k_p):
-            cache_sal = sal_append_4d(
-                cache_sal, k_p, seq_lens_d, page_indices_d, cu_q_lens_d
-            )
-            return cache_sal, _score(cache_sal, _SAL)
+        def v3a_xla_sal(cache_sal, k_p, sl, pi, cq):
+            cache_sal = sal_append_4d(cache_sal, k_p, sl, pi, cq)
+            return cache_sal, _score(cache_sal, _SAL, sl, pi, cq)
 
-        def v3b_pallas_sal(cache_sal, k_p):
+        def v3b_pallas_sal(cache_sal, k_p, sl, pi, cq):
             cache_sal = kv_cache_append.coalesced_kv_append(
                 cache_sal,
                 k_p,
-                seq_lens_d,
-                page_indices_d,
-                cu_q_lens_d,
+                sl,
+                pi,
+                cq,
                 kv_layout=_SAL,
             )
-            return cache_sal, _score(cache_sal, _SAL)
+            return cache_sal, _score(cache_sal, _SAL, sl, pi, cq)
 
         c_ref = has_append_4d(
             mk_cache(), k_all[0], seq_lens_d, page_indices_d, cu_q_lens_d
@@ -573,59 +626,59 @@ def run_region_benchmark_for_tokens(
         )
     else:
 
-        def v0_xla_has(cache, k_p):
+        def v0_xla_has(cache, k_p, sl, pi, cq):
             cache = has_append_4d_dcp(
                 cache,
                 k_p,
-                seq_lens_d,
-                page_indices_d,
-                cu_q_lens_d,
+                sl,
+                pi,
+                cq,
                 dcp_rank_d,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
             )
-            return cache, _score(cache, _HAS)
+            return cache, _score(cache, _HAS, sl, pi, cq)
 
-        def v2_pallas_has(cache, k_p):
+        def v2_pallas_has(cache, k_p, sl, pi, cq):
             cache = kv_cache_append.coalesced_kv_append_dcp(
                 cache,
                 k_p,
-                seq_lens_d,
-                page_indices_d,
-                cu_q_lens_d,
+                sl,
+                pi,
+                cq,
                 dcp_rank_d,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 kv_layout=_HAS,
             )
-            return cache, _score(cache, _HAS)
+            return cache, _score(cache, _HAS, sl, pi, cq)
 
-        def v3a_xla_sal(cache_sal, k_p):
+        def v3a_xla_sal(cache_sal, k_p, sl, pi, cq):
             cache_sal = sal_append_4d_dcp(
                 cache_sal,
                 k_p,
-                seq_lens_d,
-                page_indices_d,
-                cu_q_lens_d,
+                sl,
+                pi,
+                cq,
                 dcp_rank_d,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
             )
-            return cache_sal, _score(cache_sal, _SAL)
+            return cache_sal, _score(cache_sal, _SAL, sl, pi, cq)
 
-        def v3b_pallas_sal(cache_sal, k_p):
+        def v3b_pallas_sal(cache_sal, k_p, sl, pi, cq):
             cache_sal = kv_cache_append.coalesced_kv_append_dcp(
                 cache_sal,
                 k_p,
-                seq_lens_d,
-                page_indices_d,
-                cu_q_lens_d,
+                sl,
+                pi,
+                cq,
                 dcp_rank_d,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 kv_layout=_SAL,
             )
-            return cache_sal, _score(cache_sal, _SAL)
+            return cache_sal, _score(cache_sal, _SAL, sl, pi, cq)
 
         c_ref = has_append_4d_dcp(
             mk_cache(),
@@ -683,7 +736,13 @@ def run_region_benchmark_for_tokens(
         def body(cache, ks):
             acc = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
             for r in range(reps):
-                cache, idx = step_fn(cache, ks[r])
+                if barrier_metadata:
+                    cache, k_r, sl, pi, cq = jax.lax.optimization_barrier(
+                        (cache, ks[r], seq_lens_d, page_indices_d, cu_q_lens_d)
+                    )
+                else:
+                    k_r, sl, pi, cq = ks[r], seq_lens_d, page_indices_d, cu_q_lens_d
+                cache, idx = step_fn(cache, k_r, sl, pi, cq)
                 cache, idx = jax.lax.optimization_barrier((cache, idx))
                 acc = acc ^ idx
             return cache, acc
@@ -691,40 +750,190 @@ def run_region_benchmark_for_tokens(
         return jax.jit(body, donate_argnums=(0,))
 
     variants = [
-        ("0. Today XLA (HAS) + StreamIdxTC (HAS)", v0_xla_has, mk_cache),
-        ("2B. coalesced_kv_append (HAS) + StreamIdxTC (HAS)", v2_pallas_has, mk_cache),
-        ("3A. Naive XLA (SAL) + StreamIdxTC (SAL)", v3a_xla_sal, mk_cache_sal),
+        (
+            "0. Today XLA (HAS) + StreamIdxTC (HAS)",
+            v0_xla_has,
+            mk_cache,
+            int(np.prod(base_cache_has.shape)),
+        ),
+        (
+            "2B. coalesced_kv_append (HAS) + StreamIdxTC (HAS)",
+            v2_pallas_has,
+            mk_cache,
+            int(np.prod(base_cache_has.shape)),
+        ),
+        (
+            "3A. Naive XLA (SAL) + StreamIdxTC (SAL)",
+            v3a_xla_sal,
+            mk_cache_sal,
+            int(np.prod(base_cache_sal.shape)),
+        ),
         (
             "3B. coalesced_kv_append (SAL) + StreamIdxTC (SAL)",
             v3b_pallas_sal,
             mk_cache_sal,
+            int(np.prod(base_cache_sal.shape)),
         ),
     ]
 
     _print_row(
-        f"Variant (T={num_tokens}, dcp={dcp_size})",
-        ["1-layer (us)", f"{layers}-layer (us)", "slope (us/layer)", "HLO relayouts"],
+        f"Variant ({title})",
+        [
+            "1-layer (us)",
+            f"{layers}-layer (us)",
+            "slope (us/layer)",
+            "78L step (ms)",
+            "HLO relayouts",
+        ],
     )
-    _print_row("---", ["--:", "--:", "--:", "--:"])
-    for label, step_fn, cache_maker in variants:
+    _print_row("---", ["--:", "--:", "--:", "--:", "--:"])
+    denom = max(1, layers - 1)
+    for label, step_fn, cache_maker, v_cache_bytes in variants:
         fn1 = chain(step_fn, 1)
         fnl = chain(step_fn, layers)
-        t1 = _time_best(fn1, cache_maker, (k_all[:1],), iters)
-        tl = _time_best(fnl, cache_maker, (k_all[:layers],), iters)
-        slope = (tl - t1) / max(1, layers - 1) * 1e6
-        relayouts = _count_hlo_cache_relayouts(fn1, cache_maker(), (k_all[:1],))
+        t1_us, hlo1 = _compile_and_time(fn1, cache_maker, (k_all[:1],), iters)
+        tl_us, _ = _compile_and_time(fnl, cache_maker, (k_all[:layers],), iters)
+        slope_samples = (tl_us - t1_us) / denom
+        slope_med = float(np.median(tl_us) - np.median(t1_us)) / denom
+        step78_ms = slope_med * 78.0 / 1000.0
+        relayouts = _count_hlo_cache_relayouts_from_text(hlo1, v_cache_bytes)
         _print_row(
             label,
-            [f"{t1 * 1e6:.1f}", f"{tl * 1e6:.1f}", f"{slope:.1f}", f"{relayouts}"],
+            [
+                _fmt_stat(t1_us),
+                _fmt_stat(tl_us),
+                _fmt_stat(slope_samples, med_override=slope_med),
+                f"{step78_ms:.2f}",
+                f"{relayouts}",
+            ],
         )
     print()
+
+
+def run_served_region_benchmarks(*, iters: int = 5, layers: int = 4) -> None:
+    """Runs Gate D served-shape Table B benchmarks (DCP16, block_size=256, max_num_seqs=8)
+    plus the DCP1 T=1/T=8 diagnostic comparison."""
+    iters = max(5, iters)
+    common = dict(
+        page_size=256,
+        head_dim=128,
+        num_q_heads=64,
+        topk=2048,
+        layers=layers,
+        iters=iters,
+    )
+
+    # Served DCP16 scenarios (--block-size=256, --max-num-batched-tokens=4096,
+    # --max-num-seqs=8, DCP16, interleave=4):
+    # - P90 context: 655360 + 8192 = 663552 (~41.5K tokens/rank/seq = 162 pages/rank/seq)
+    #   With pages_per_seq=164 and max_num_seqs=8, total pool = 1312 pages/rank.
+    # - P50 context: 163840 + 2048 = 165888 (~10.4K tokens/rank/seq = 40.5 pages/rank/seq)
+    #   With pages_per_seq=44 and max_num_seqs=8, total pool = 352 pages/rank.
+    p90_decode_seq_len = 655360 + 8192
+    p50_decode_seq_len = 163840 + 2048
+    p90_prefill_seq_len = 655360 + 4096
+    p50_prefill_seq_len = 163840 + 2048
+
+    served_scenarios = [
+        dict(
+            scenario_label="Served P90 decode B=8 T=8 ctx=663552 active (rank=0)",
+            num_tokens=8,
+            num_active_seqs=8,
+            max_num_seqs=8,
+            min_pages_per_seq=164,
+            pages=8 * 164,
+            seq_len=p90_decode_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=0,
+        ),
+        dict(
+            scenario_label="Served P90 decode B=8 T=8 ctx=663552 idle (rank=15)",
+            num_tokens=8,
+            num_active_seqs=8,
+            max_num_seqs=8,
+            min_pages_per_seq=164,
+            pages=8 * 164,
+            seq_len=p90_decode_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=15,
+        ),
+        dict(
+            scenario_label="Served P50 decode B=4 T=4 ctx=165888 active (rank=0)",
+            num_tokens=4,
+            num_active_seqs=4,
+            max_num_seqs=8,
+            min_pages_per_seq=44,
+            pages=8 * 44,
+            seq_len=p50_decode_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=0,
+        ),
+        dict(
+            scenario_label="Served P50 decode B=4 T=4 ctx=165888 idle (rank=15)",
+            num_tokens=4,
+            num_active_seqs=4,
+            max_num_seqs=8,
+            min_pages_per_seq=44,
+            pages=8 * 44,
+            seq_len=p50_decode_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=15,
+        ),
+        dict(
+            scenario_label="Served P90 prefill B=1 T=4096 off=655360 (rank=0)",
+            num_tokens=4096,
+            num_active_seqs=1,
+            max_num_seqs=8,
+            min_pages_per_seq=164,
+            pages=8 * 164,
+            seq_len=p90_prefill_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=0,
+        ),
+        dict(
+            scenario_label="Served P50 prefill B=1 T=2048 off=163840 (rank=0)",
+            num_tokens=2048,
+            num_active_seqs=1,
+            max_num_seqs=8,
+            min_pages_per_seq=44,
+            pages=8 * 44,
+            seq_len=p50_prefill_seq_len,
+            dcp_size=16,
+            interleave_size=4,
+            dcp_rank=0,
+        ),
+    ]
+
+    for sc in served_scenarios:
+        run_region_benchmark_for_tokens(**common, **sc)
+
+    # Diagnostic: DCP1 T=1 and T=8 at seq_len=32768 (pages=424) with and without
+    # per-layer optimization_barrier on metadata (seq_lens, page_indices, cu_q_lens).
+    for barrier_meta in (False, True):
+        tag = "barrier_meta=True" if barrier_meta else "barrier_meta=False (hoisted)"
+        for tok in (1, 8):
+            run_region_benchmark_for_tokens(
+                **common,
+                scenario_label=f"DCP1 T={tok} seq=32768 {tag}",
+                num_tokens=tok,
+                pages=424,
+                seq_len=32768,
+                dcp_size=1,
+                interleave_size=4,
+                barrier_metadata=barrier_meta,
+            )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("all", "append", "region"),
+        choices=("all", "append", "region", "served"),
         default="all",
         help="Benchmark mode to run.",
     )
@@ -756,7 +965,9 @@ def main() -> None:
     print(f"device: {jax.devices()[0].device_kind}  n={len(jax.devices())}\n")
     if args.mode in ("all", "append"):
         run_append_benchmark()
-    if args.mode in ("all", "region"):
+    if args.mode == "served":
+        run_served_region_benchmarks(iters=args.iters, layers=args.layers)
+    elif args.mode in ("all", "region"):
         for dcp_str in args.dcp_sizes.split(","):
             dcp_size = int(dcp_str.strip())
             for tok_str in args.region_tokens.split(","):
@@ -778,3 +989,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

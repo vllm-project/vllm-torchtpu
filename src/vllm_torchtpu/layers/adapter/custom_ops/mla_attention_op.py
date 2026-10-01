@@ -50,6 +50,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     coalesced_kv_append,
     coalesced_kv_append_dcp,
     cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
     kv_cache_append,
     streamindex_topk,
     streamindex_topk_dcp,
@@ -80,6 +82,7 @@ logger = init_logger(__name__)
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
+_INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
 
 
 def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
@@ -94,53 +97,40 @@ def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
     )
 
 
+def _log_indexer_kv_cache_once(
+    mode: str,
+    writer: str,
+    kv_layout: KVLayout,
+    cache_shape: tuple[int, ...],
+) -> None:
+    layout_tag = "SAL" if kv_layout == KVLayout.SEQ_ALONG_LANE else "HAS"
+    shape_tuple = tuple(int(d) for d in cache_shape)
+    key = (mode, writer, layout_tag, shape_tuple)
+    if key in _INDEXER_KV_CACHE_INFO_LOGGED:
+        return
+    _INDEXER_KV_CACHE_INFO_LOGGED.add(key)
+    logger.info(
+        "indexer kv cache: mode=%s writer=%s layout=%s cache_shape=%s",
+        mode,
+        writer,
+        layout_tag,
+        shape_tuple,
+    )
+
+
 def _unsupported_indexer_kv_cache_reason(
     cache_kv: jax.Array,
     k_packed: jax.Array,
-    mode: str,
+    kv_layout: KVLayout,
 ) -> str | None:
-    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use `mode`."""
+    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use Pallas."""
     backend = jax.default_backend()
     if backend != "tpu":
         return f"backend={backend!r} is not 'tpu'"
-    if cache_kv.dtype != jnp.uint8 or k_packed.ndim != 2 or k_packed.dtype != jnp.uint8:
-        return (
-            f"cache_kv dtype={cache_kv.dtype} or k_packed shape={k_packed.shape} "
-            f"dtype={k_packed.dtype} is not uint8"
-        )
-    layout = KVLayout.SEQ_ALONG_LANE if mode == "sal" else KVLayout.HEAD_ALONG_SUBLANE
     try:
-        page_size = kv_cache_append.cache_page_size(cache_kv, layout)
+        kv_cache_append.check_scatter_rows_supported(cache_kv, k_packed, kv_layout)
     except ValueError as exc:
         return str(exc)
-    if layout == KVLayout.SEQ_ALONG_LANE:
-        head_dim = (int(cache_kv.shape[1]) - 1) * 4
-        if head_dim <= 0 or head_dim % 64 != 0:
-            return (
-                f"SAL cache_kv shape={cache_kv.shape} does not match "
-                "(num_blocks, head_dim // 4 + 1, 4, page_size) with head_dim % 64 == 0"
-            )
-    num_tokens = int(k_packed.shape[0])
-    if num_tokens > kv_cache_append._MAX_TOKENS:
-        return (
-            f"num_tokens={num_tokens} exceeds max supported tokens "
-            f"{kv_cache_append._MAX_TOKENS}"
-        )
-    if num_tokens > 0:
-        launch = (
-            kv_cache_append._sal_launch
-            if layout == KVLayout.SEQ_ALONG_LANE
-            else kv_cache_append._has_launch
-        )
-        try:
-            launch(
-                cache_kv,
-                kv_cache_append._format_rows(k_packed, cache_kv, layout),
-                page_size=page_size,
-                wave=min(num_tokens, kv_cache_append._MAX_WAVE),
-            )
-        except ValueError as exc:
-            return str(exc)
     return None
 
 
@@ -150,10 +140,13 @@ def _resolve_indexer_kv_cache_mode(
     *,
     mode: str | None = None,
 ) -> tuple[str, KVLayout]:
-    """Resolves the effective indexer K-cache mode and `KVLayout`.
+    """Resolves the indexer K-cache `(writer, kv_layout)` for `cache_kv` and `k_packed`.
 
-    Returns `("xla", KVLayout.HEAD_ALONG_SUBLANE)` when `mode == "xla"` or when
-    CPU / unsupported cache geometry triggers a one-time fallback.
+    Layout is decided once by `indexer_kv_layout(block_size, mode=...)` and
+    validated against `get_kv_cache_shape`. `writer` is `'pallas'` for `'has'`
+    and `'sal'`, or `'xla'` for `'xla'`. XLA fallback is only permitted when
+    `kv_layout == KVLayout.HEAD_ALONG_SUBLANE`; `SEQ_ALONG_LANE` on a non-TPU
+    backend or unsupported geometry raises `ValueError`.
     """
     raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE if mode is None else mode
     resolved = raw_mode.strip().lower()
@@ -162,15 +155,58 @@ def _resolve_indexer_kv_cache_mode(
             f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
             "expected one of ('xla', 'has', 'sal')."
         )
+    if cache_kv.ndim != 4:
+        raise ValueError(
+            f"Expected 4-D cache_kv, got {cache_kv.ndim}-D shape {cache_kv.shape}."
+        )
+    if k_packed.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D k_packed, got {k_packed.ndim}-D shape {k_packed.shape}."
+        )
+
+    raw_width = int(k_packed.shape[-1])
+    actual_head_dim = (
+        raw_width - max(1, raw_width // 128)
+        if raw_width % 64 != 0
+        else raw_width
+    )
+    sal_sublane_groups = ((actual_head_dim + 127) // 128) * 128 // 4 + 1
+    block_size = (
+        int(cache_kv.shape[3])
+        if int(cache_kv.shape[1]) == sal_sublane_groups
+        else int(cache_kv.shape[1]) * 4
+    )
+    kv_layout = indexer_kv_layout(block_size, mode=resolved)
+    expected_shape = get_kv_cache_shape(
+        int(cache_kv.shape[0]),
+        block_size,
+        actual_head_dim,
+        kv_layout,
+    )
+    if tuple(int(d) for d in cache_kv.shape) != expected_shape:
+        raise ValueError(
+            f"cache_kv shape {tuple(cache_kv.shape)} does not match expected "
+            f"{kv_layout.name} shape {expected_shape} for "
+            f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r}."
+        )
+
     if resolved == "xla":
-        return "xla", KVLayout.HEAD_ALONG_SUBLANE
-    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, resolved)
+        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, kv_layout)
     if reason is not None:
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            raise ValueError(
+                f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r} with layout "
+                f"{kv_layout.name} cannot fall back to 'xla': {reason}"
+            )
         _warn_indexer_kv_cache_fallback_once(resolved, reason)
-        return "xla", KVLayout.HEAD_ALONG_SUBLANE
-    if resolved == "sal":
-        return "sal", KVLayout.SEQ_ALONG_LANE
-    return "has", KVLayout.HEAD_ALONG_SUBLANE
+        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    _log_indexer_kv_cache_once(resolved, "pallas", kv_layout, cache_kv.shape)
+    return "pallas", kv_layout
 
 
 def _cp_scatter_indexer_k(
@@ -184,7 +220,8 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
-    mode: str | None = None,
+    writer: str = "xla",
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -201,13 +238,16 @@ def _cp_scatter_indexer_k(
 
     `axis_name`/`cp_size` name the axis the cache is split over.
     """
+    if writer not in ("xla", "pallas"):
+        raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
+    if writer == "xla" and kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError(
+            f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
+        )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
-        effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
-            cache_kv, k_packed, mode=mode
-        )
         rank = cp_rank_as_data(axis_name, cp_size)
-        if effective_mode != "xla":
+        if writer == "pallas":
             return coalesced_kv_append_dcp(
                 cache_kv,
                 k_packed,
@@ -325,10 +365,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
-            if effective_mode == "xla":
+            if writer == "xla":
                 _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
                 block_size = block_size_per_kv_packing * kv_packing
                 # Cache rows are padded to the 128-lane HBM width; pad the packed
@@ -429,7 +469,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            effective_mode, kv_layout = _resolve_indexer_kv_cache_mode(
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
@@ -444,7 +484,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
-                mode=effective_mode,
+                writer=writer,
+                kv_layout=kv_layout,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)

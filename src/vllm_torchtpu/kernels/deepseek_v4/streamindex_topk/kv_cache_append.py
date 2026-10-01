@@ -118,12 +118,12 @@ def cache_page_size(cache_kv: jax.Array, kv_layout: KVLayout | str | None) -> in
         return page_size
     _, quads_per_page, _, lkv_dim = cache_kv.shape
     page_size = quads_per_page * _KV_PACKING
-    if page_size % _LANES or lkv_dim % _LANES:
+    if page_size < 64 or page_size % 64 or lkv_dim % _LANES:
         raise ValueError(
             f"cache_kv shape {cache_kv.shape} is invalid for HEAD_ALONG_SUBLANE"
-            f" (page_size={page_size}, lkv_dim={lkv_dim}; both must be multiples"
-            f" of {_LANES}). If this is a SEQ_ALONG_LANE cache, pass"
-            " kv_layout='seq_along_lane'."
+            f" (page_size={page_size} must be a positive multiple of 64,"
+            f" lkv_dim={lkv_dim} must be a multiple of {_LANES}). If this is a"
+            " SEQ_ALONG_LANE cache, pass kv_layout='seq_along_lane'."
         )
     return page_size
 
@@ -566,6 +566,59 @@ def _sal_launch(cache_kv: jax.Array, rows: jax.Array, *, page_size: int, wave: i
         pltpu.SemaphoreType.DMA((2,)),
     ]
     return k_in, kernel, scratch_shapes
+
+
+def check_scatter_rows_supported(
+    cache_kv: jax.Array,
+    src: jax.Array,
+    kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
+) -> None:
+    """Validates `cache_kv` and `src` geometry and VMEM budget in pure Python."""
+    layout = KVLayout.parse(kv_layout)
+    if cache_kv.dtype != jnp.uint8 or src.ndim != 2 or src.dtype != jnp.uint8:
+        raise ValueError(
+            f"cache_kv dtype={cache_kv.dtype} and 2-D src dtype={src.dtype} "
+            f"must be uint8, got src.shape={src.shape}."
+        )
+    cache_page_size(cache_kv, layout)
+    num_tokens = int(src.shape[0])
+    if num_tokens > _MAX_TOKENS:
+        raise ValueError(
+            f"scatter_rows supports at most {_MAX_TOKENS} tokens per call (SMEM"
+            f" run table), got {num_tokens}."
+        )
+    if num_tokens == 0:
+        return
+    wave = min(num_tokens, _MAX_WAVE)
+    if layout == KVLayout.SEQ_ALONG_LANE:
+        sublane_groups = int(cache_kv.shape[1])
+        head_dim = (sublane_groups - 1) * _KV_PACKING
+        if head_dim <= 0 or head_dim % 64 != 0:
+            raise ValueError(
+                f"SAL cache_kv shape={cache_kv.shape} does not match "
+                "(num_blocks, head_dim // 4 + 1, 4, page_size) with head_dim % 64 == 0."
+            )
+        rec_dim = sublane_groups * _KV_PACKING
+        transpose_width = _align_to(rec_dim, _LANES)
+        padded_tokens = _align_to(num_tokens, _LANES)
+        rmw_bytes = wave * rec_dim * _LANES
+        per_token_bytes = transpose_width + rec_dim
+        _check_vmem(
+            padded_tokens * per_token_bytes + rmw_bytes,
+            per_token_bytes,
+            rmw_bytes,
+            "SEQ_ALONG_LANE",
+        )
+        return
+    lkv_dim = int(cache_kv.shape[-1])
+    padded_tokens = _align_to(num_tokens, _KV_PACKING)
+    rmw_bytes = wave * _KV_PACKING * lkv_dim
+    _check_vmem(
+        padded_tokens * lkv_dim + rmw_bytes,
+        lkv_dim,
+        rmw_bytes,
+        "HEAD_ALONG_SUBLANE",
+    )
 
 
 def scatter_rows(
