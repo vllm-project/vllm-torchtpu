@@ -403,12 +403,14 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
     size the indexer K cache identically to PallasMLAttentionBackend under
     'xla'/'has' (256 B/token), halve to 132 B/token under 'sal', and fall back
     to HAS (256 B/token) with a one-time warning when block_size < 128."""
+    import importlib
+
     from vllm_torchtpu import envs
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        streamindex_topk as st_mod,
-    )
     from vllm_torchtpu.layers.adapter.attention import VllmTPUDeepseekV32IndexerBackend
 
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
     monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
     nb, block_size, head_size = 10, 256, 129
     indexer_spec = MLAAttentionSpec(

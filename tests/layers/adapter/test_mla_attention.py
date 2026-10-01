@@ -1017,17 +1017,18 @@ def test_indexer_kv_cache_mode_env_validation(monkeypatch):
 def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):
     """Single-source layout + strict fallback rule: HAS may fall back to 'xla',
     SAL never falls back to 'xla', and block_size < 128 downgrades SAL layout to HAS."""
+    import importlib
     import logging
 
     import jax
     import jax.numpy as jnp
 
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        KVLayout,
-        streamindex_topk as st_mod,
-    )
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
     monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
@@ -1189,7 +1190,9 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
             0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
         )
     )
-    init_sal = st_lib.convert_cache_to_seq_along_lane(init_has, head_dim=head_dim)
+    init_sal = st_lib.convert_cache_to_seq_along_lane(
+        init_has, actual_head_dim=head_dim
+    )
     q_bytes = jnp.asarray(
         rng.integers(0, 256, size=(num_tokens, num_heads, head_dim), dtype=np.uint8)
     )
@@ -1238,7 +1241,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
     )
     # SAL Pallas cache update matches converted XLA cache update bit-for-bit.
     expected_sal = st_lib.convert_cache_to_seq_along_lane(
-        results["xla"][0], head_dim=head_dim
+        results["xla"][0], actual_head_dim=head_dim
     )
     np.testing.assert_array_equal(
         np.asarray(results["sal"][0]), np.asarray(expected_sal)
@@ -1279,7 +1282,9 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
             0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
         )
     )
-    init_sal = st_lib.convert_cache_to_seq_along_lane(init_has, head_dim=head_dim)
+    init_sal = st_lib.convert_cache_to_seq_along_lane(
+        init_has, actual_head_dim=head_dim
+    )
     k_packed = jnp.asarray(
         rng.integers(0, 256, size=(num_tokens, head_dim + 1), dtype=np.uint8)
     )
@@ -1327,7 +1332,9 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
     np.testing.assert_array_equal(np.asarray(out_has), np.asarray(out_xla))
     np.testing.assert_array_equal(
         np.asarray(out_sal),
-        np.asarray(st_lib.convert_cache_to_seq_along_lane(out_xla, head_dim=head_dim)),
+        np.asarray(
+            st_lib.convert_cache_to_seq_along_lane(out_xla, actual_head_dim=head_dim)
+        ),
     )
 
     with pytest.raises(ValueError, match="only supports HEAD_ALONG_SUBLANE"):
