@@ -303,16 +303,12 @@ class _SalTiles:
             # tile: update the target lanes with a single tile roll + lane mask.
             @pl.when((n <= _KV_PACKING) & (src_start + n <= _LANES))
             def _():
-                a = pltpu.roll(
-                    self._src_tile(self.k, tok_aligned), shift=delta, axis=1
-                )
+                a = pltpu.roll(self._src_tile(self.k, tok_aligned), shift=delta, axis=1)
                 _write(a)
 
             @pl.when((n > _KV_PACKING) | (src_start + n > _LANES))
             def _():
-                a = pltpu.roll(
-                    self._src_tile(self.k, tok_aligned), shift=delta, axis=1
-                )
+                a = pltpu.roll(self._src_tile(self.k, tok_aligned), shift=delta, axis=1)
                 b = pltpu.roll(
                     self._src_tile(self.k, tok_aligned + _LANES),
                     shift=delta,

@@ -1083,9 +1083,7 @@ def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog)
 
     # On CPU, 'sal' with a SAL-shaped cache MUST raise, never fall back to XLA.
     with pytest.raises(ValueError, match="cannot fall back to 'xla'"):
-        mla_attention_op._resolve_indexer_kv_cache_mode(
-            cache_sal, k_packed, mode="sal"
-        )
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_sal, k_packed, mode="sal")
 
     # On TPU, valid HAS and SAL shapes resolve to ('pallas', layout).
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
@@ -1106,13 +1104,9 @@ def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog)
     # Mismatched cache shape (HAS cache with block_size=1024 under mode='sal', or
     # SAL cache under mode='has'/'xla') raises ValueError.
     with pytest.raises(ValueError, match="does not match expected"):
-        mla_attention_op._resolve_indexer_kv_cache_mode(
-            cache_has, k_packed, mode="sal"
-        )
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
     with pytest.raises(ValueError, match="does not match expected"):
-        mla_attention_op._resolve_indexer_kv_cache_mode(
-            cache_sal, k_packed, mode="has"
-        )
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_sal, k_packed, mode="has")
 
     # SAL with unsupported token count raises ValueError rather than falling back.
     with pytest.raises(ValueError, match="cannot fall back to 'xla'"):

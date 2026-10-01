@@ -166,9 +166,7 @@ def _resolve_indexer_kv_cache_mode(
 
     raw_width = int(k_packed.shape[-1])
     actual_head_dim = (
-        raw_width - max(1, raw_width // 128)
-        if raw_width % 64 != 0
-        else raw_width
+        raw_width - max(1, raw_width // 128) if raw_width % 64 != 0 else raw_width
     )
     sal_sublane_groups = ((actual_head_dim + 127) // 128) * 128 // 4 + 1
     block_size = (

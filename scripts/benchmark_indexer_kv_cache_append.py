@@ -416,9 +416,7 @@ def _count_hlo_cache_relayouts(fn, cache, args) -> int:
     return _count_hlo_cache_relayouts_from_text(hlo, int(np.prod(cache.shape)))
 
 
-def _compile_and_time(
-    fn, make_cache, args, iters: int
-) -> tuple[np.ndarray, str]:
+def _compile_and_time(fn, make_cache, args, iters: int) -> tuple[np.ndarray, str]:
     """Compiles `fn` once, warms up once, and returns `(samples_us, hlo_text)`."""
     buf = make_cache()
     compiled = fn.lower(buf, *args).compile()

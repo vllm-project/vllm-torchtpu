@@ -470,9 +470,7 @@ class CoalescedKvAppendTest(parameterized.TestCase):
             )
             self.assertFalse(
                 np.array_equal(
-                    np.asarray(
-                        _append(cache, *args, layout=layout, dcp_rank=1, **dcp)
-                    ),
+                    np.asarray(_append(cache, *args, layout=layout, dcp_rank=1, **dcp)),
                     np.asarray(
                         _reference(cache, *args, layout=layout, dcp_rank=0, **dcp)
                     ),
@@ -1001,9 +999,7 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         """
         page_size, num_pages = 256, 16
         q_lens = np.array([1, 0, 300, 7, 1, 40], np.int32)
-        seq_lens = jnp.array(
-            [5, 0, 1100 * dcp_size, 3, 700 * dcp_size, 90], jnp.int32
-        )
+        seq_lens = jnp.array([5, 0, 1100 * dcp_size, 3, 700 * dcp_size, 90], jnp.int32)
         cu_q_lens = _cu_q_lens(q_lens)
         num_tokens = int(q_lens.sum()) + 13  # batch padding
         rng = np.random.default_rng(31 + dcp_size)
@@ -1054,9 +1050,7 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         ("dcp4_il4", 4, 4),
         ("dcp16_il4", 16, 4),
     )
-    def test_address_layer_matches_mla_kv_cache_utils(
-        self, dcp_size, interleave_size
-    ):
+    def test_address_layer_matches_mla_kv_cache_utils(self, dcp_size, interleave_size):
         """`streamindex_topk.kv_cache_utils` matches `kernels.mla.kv_cache_utils`."""
         try:
             from vllm_torchtpu.kernels.mla import (
@@ -1073,9 +1067,7 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         cu_q_lens = _cu_q_lens(q_lens)
         num_tokens = int(q_lens.sum()) + 11
         rng = np.random.default_rng(91 + dcp_size)
-        table = jnp.asarray(
-            rng.integers(0, num_pages, size=(6, 8), dtype=np.int32)
-        )
+        table = jnp.asarray(rng.integers(0, num_pages, size=(6, 8), dtype=np.int32))
         if dcp_size == 1:
             page, slot = kv_cache_utils.get_page_and_slot(
                 num_tokens,

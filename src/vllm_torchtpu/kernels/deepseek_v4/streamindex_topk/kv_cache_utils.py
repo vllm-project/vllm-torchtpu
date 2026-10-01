@@ -133,11 +133,7 @@ def get_page_and_slot(
         block_tables, seq_lens.shape[0], seq_id, safe_pos // page_size
     )
     valid = (
-        in_batch
-        & (pos >= 0)
-        & ordinal_valid
-        & (raw_page >= 0)
-        & (raw_page < num_pages)
+        in_batch & (pos >= 0) & ordinal_valid & (raw_page >= 0) & (raw_page < num_pages)
     )
     page = jnp.where(valid, raw_page, jnp.int32(OOB_PAGE))
     slot = jnp.where(valid, safe_pos % page_size, 0)
