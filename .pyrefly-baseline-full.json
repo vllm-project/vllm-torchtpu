@@ -611,24 +611,9 @@
       "concise_description": "No attribute `_torchtpu_fori_patch_applied` in module `jax._src.pallas.mosaic.lowering`"
     },
     {
-      "path": "src/vllm_torchtpu/executors/kv_block_override.py",
-      "name": "bad-specialization",
-      "concise_description": "`int | None` is not assignable to upper bound `SupportsDunderGT[Any] | SupportsDunderLT[Any]` of type variable `SupportsRichComparisonT`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "missing-attribute",
-      "concise_description": "No attribute `CompiledDAG` in module `ray.dag`"
-    },
-    {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `PlacementGroup | None` is not assignable to parameter `placement_group` with type `PlacementGroup` in function `RayDistributedExecutor._init_workers_ray`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "not-iterable",
-      "concise_description": "Type `Future[list[Any]]` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
@@ -649,16 +634,6 @@
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
       "name": "invalid-inheritance",
       "concise_description": "Invalid base class: `RayWorkerWrapper | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `PlacementGroup | None` is not assignable to parameter `placement_group` with type `PlacementGroup` in function `vllm.v1.executor.ray_utils.get_bundles_sorted_by_node`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `PlacementGroup | None` is not assignable to parameter `placement_group` with type `PlacementGroup` in function `ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
@@ -5198,21 +5173,6 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `prefix`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `prefix`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `prefix`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `cache_config`"
     },
     {
@@ -5227,21 +5187,6 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `n_local_heads`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `head_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `eps`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, positions: Array, cos_sin_cache: Array, *, eps: float = ...) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P])"
     },
@@ -5252,38 +5197,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `rotary_emb`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `rotary_emb`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `n_local_heads`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `head_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `rotary_emb`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmDeepseekV4MLAAttention.forward_mqa` overrides parent class `DeepseekV4Attention` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `head_dim`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
@@ -5292,93 +5207,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Module | Size | Tensor` is not assignable to parameter `iterable` with type `Iterable[Any]` in function `tuple.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Module | Size | Tensor` is not assignable to parameter `iterable` with type `Iterable[Any]` in function `tuple.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Module | Size | Tensor` is not assignable to parameter `iterable` with type `Iterable[Any]` in function `list.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C._VariableFunctions.empty` called with arguments: (tuple[Unknown, Unknown], dtype=Module | Tensor | dtype, device=Module | Tensor | device)"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Module`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Module`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmDeepseekV4MLAAttention.forward` overrides parent class `DeepseekV4Attention` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `q_lora_rank`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `head_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `window_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `window_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `non_causal_multi_token_decode`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Module` has no attribute `non_causal_multi_token_decode`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Literal[True]` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `swa_cache_layer`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `fused_wqa_wkv`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `kv_norm`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/dspark.py",
@@ -5392,33 +5222,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `Tensor` is not assignable to declared return type `Parameter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype` is not assignable to parameter `dtype` with type `dtype | None` in function `torch._C._VariableFunctions.empty`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `routes_dp_gathered_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
-      "name": "bad-assignment",
-      "concise_description": "`IntermediateTensors | Tensor | Unknown` is not assignable to dict value type `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `IntermediateTensors | Tensor | Unknown` is not assignable to parameter `hidden_states` with type `Tensor` in function `vllm_torchtpu.models.vllm.deepseek_v4.layers.mhc_collapse_head`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Any, list[Tensor]]` is not assignable to declared return type `IntermediateTensors | Tensor`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/model.py",
@@ -5482,48 +5287,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `variance_epsilon`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `CustomOpDef | Unknown` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "bad-assignment",
       "concise_description": "`None` is not assignable to attribute `kv_cache` with type `tuple[Tensor, ...]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `weight`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
@@ -5572,16 +5337,6 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Array` is not assignable to parameter `query_start_loc` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
     },
@@ -5601,41 +5356,6 @@
       "concise_description": "Argument `Array` is not assignable to parameter `distribution` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
     },
     {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `mesh` with type `Mesh` in function `vllm_torchtpu.distributed.sharded_jax_op.sharded_jax_op`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/dspark.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `shard_id`"
@@ -5652,38 +5372,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/kimi_vit.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `config` with type `KimiK25VisionConfig` in function `vllm.model_executor.models.kimi_k25_vit.MoonViT3dPretrainedModel.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/kimi_vit.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `quant_config` with type `QuantizationConfig | None` in function `vllm.model_executor.models.kimi_k25_vit.MoonViT3dPretrainedModel.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/kimi_vit.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `prefix` with type `str` in function `vllm.model_executor.models.kimi_k25_vit.MoonViT3dPretrainedModel.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/kimi_vit.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `register_forward_hook`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `GroupCoordinator | TokenShardCollectives | Unknown | None` has no attribute `all_reduce`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
@@ -5692,28 +5382,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-assignment",
-      "concise_description": "`PreTrainedConfig` is not assignable to `KimiLinearConfig`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `input_ids` with type `Tensor` in function `KimiModel.embed_input_ids`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-assignment",
-      "concise_description": "`PreTrainedConfig` is not assignable to attribute `config` with type `KimiLinearConfig`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "bad-override",
       "concise_description": "Class member `KimiLinearForCausalLM.get_mamba_state_shape_from_config` overrides parent class `IsHybrid` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-assignment",
-      "concise_description": "`PreTrainedConfig` is not assignable to `KimiLinearConfig`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -5727,18 +5397,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-assignment",
-      "concise_description": "`PreTrainedConfig` is not assignable to `KimiK3Config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch.nn.modules.module.Module.to` called with arguments: (device=Unknown, dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -5747,28 +5407,8 @@
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch.nn.modules.module.Module.to` called with arguments: (device=Unknown, dtype=Literal['auto', 'bfloat16', 'float', 'float16', 'float32', 'half'] | dtype)"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "bad-override",
       "concise_description": "Class member `KimiK3ForConditionalGeneration.embed_multimodal` overrides parent class `SupportsMultiModal` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -5813,22 +5453,7 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `gather_moe_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `FusedMoEMethodBase` has no attribute `apply_with_routing`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
@@ -5886,81 +5511,6 @@
       "concise_description": "Class member `OmniTpuPlatform.dist_backend` overrides parent class `TpuPlatform` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `Module` has no class attribute `get_mamba_state_shape_from_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `Module` has no class attribute `get_mamba_state_shape_from_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `Module` has no class attribute `get_mamba_state_dtype_from_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, Sequence[object] | int | str | None]` is not assignable to parameter `derivation` with type `dict[str, object]` in function `_log_tpu_block_size_derivation`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `build_app`"
@@ -5969,21 +5519,6 @@
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `_tpu_kernel_reload_patch`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "not-iterable",
-      "concise_description": "`not in` is not supported between `Literal['phased_profiling_dir']` and `SupportsHash`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TpuPlatform.get_attn_backend_cls` overrides parent class `Platform` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TpuPlatform.get_current_memory_usage` overrides parent class `Platform` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
@@ -5997,38 +5532,8 @@
     },
     {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "not-iterable",
-      "concise_description": "`not in` is not supported between `Literal['sharding']` and `SupportsHash`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to attribute `compile_sizes` with type `list[int | str] | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `CompilationConfig` has no attribute `compile_ranges_split_points`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "not-iterable",
-      "concise_description": "`in` is not supported between `Literal[1]` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_page_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_min_page_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TpuPlatform.validate_request` overrides parent class `Platform` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/runner/kv_cache_dsv4.py",

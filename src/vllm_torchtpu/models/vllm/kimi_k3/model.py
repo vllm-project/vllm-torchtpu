@@ -195,7 +195,7 @@ class KimiDecoderLayer(nn.Module):
 class KimiModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         logger.info(
             "Kimi optional features: mla_use_output_gate=%s, hidden_act=%s, "
             "activation_situ_beta=%s, activation_situ_linear_beta=%s, "
@@ -253,11 +253,11 @@ class KimiModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        hidden_states = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            assert input_ids is not None
+            hidden_states = self.embed_input_ids(input_ids)
         num_tokens = hidden_states.shape[0]
         sequence_parallel = (
             self.sp_prefill
@@ -343,7 +343,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        self.config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         self.model = KimiModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -411,7 +411,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
-        config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         kda_config = config.linear_attn_config
         assert kda_config is not None
         local_heads = (
@@ -554,7 +554,7 @@ class KimiK3ForConditionalGeneration(
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         model_config = vllm_config.model_config
-        config: KimiK3Config = model_config.hf_config
+        config = cast(KimiK3Config, model_config.hf_config)
         if model_config.multimodal_config is None:
             raise ValueError(
                 "KimiK3ForConditionalGeneration requires multimodal config"
@@ -576,7 +576,7 @@ class KimiK3ForConditionalGeneration(
             )
             if vision_quant_config is None:
                 self.vision_tower = self.vision_tower.to(
-                    device=self.device, dtype=model_config.dtype
+                    device=self.device, dtype=cast(torch.dtype, model_config.dtype)
                 )
             else:
                 self.vision_tower = self.vision_tower.to(device=self.device)
@@ -588,16 +588,19 @@ class KimiK3ForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
             self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
+                device=self.device, dtype=cast(torch.dtype, model_config.dtype)
             )
 
         self.quant_config = vllm_config.quant_config
         with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=config.text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["KimiLinearForCausalLM"],
+            self.language_model = cast(
+                KimiLinearForCausalLM,
+                init_vllm_registered_model(
+                    vllm_config=vllm_config,
+                    hf_config=config.text_config,
+                    prefix=maybe_prefix(prefix, "language_model"),
+                    architectures=["KimiLinearForCausalLM"],
+                ),
             )
         self.media_placeholder = config.media_placeholder_token_id
 
