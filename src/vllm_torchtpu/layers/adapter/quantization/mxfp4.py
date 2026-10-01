@@ -45,7 +45,7 @@ scaling.
    - Returns output tensor
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax.numpy as jnp
 import torch
@@ -60,7 +60,10 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend as Mxfp4Backend,
 )
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
@@ -83,6 +86,9 @@ from vllm_torchtpu.layers.core.quantization import dequantize_mxfp4_packed
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
+
 logger = init_logger(__name__)
 
 
@@ -97,7 +103,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
     """
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         """Return the base quantization method name."""
         return MXFP4
 
@@ -204,6 +210,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
         activation_str = self._set_tpu_activation(layer)
@@ -233,8 +240,8 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-        layer.w13_weight_scale = None
-        layer.w2_weight_scale = None
+        layer.register_parameter("w13_weight_scale", None)
+        layer.register_parameter("w2_weight_scale", None)
 
         if layer.w13_bias is not None:
             w13_bias = layer.w13_bias.data
@@ -294,6 +301,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
@@ -453,7 +461,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
     def _dequantize_and_pad(
         self,
-        layer: RoutedExperts,
+        layer: "TpuRoutedExperts",
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, int
     ]:
@@ -580,6 +588,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # TODO(upstream): Extract generic on-disk quantization cache to a
         # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         device = layer.w13_weight.device
 
         activation_str = self._set_tpu_activation(layer)
@@ -709,6 +718,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             score_bias_operand,
         )
 
+        layer = cast("TpuRoutedExperts", layer)
         if fused_moe_ep_supported(self):
             # This rank's own tokens in and out: the kernel scores, selects,
             # dispatches, runs both matmuls and combines inside one program,

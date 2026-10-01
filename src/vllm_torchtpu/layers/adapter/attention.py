@@ -5,7 +5,8 @@ import dataclasses
 import functools
 import inspect
 import math
-from typing import Any, ClassVar
+from collections.abc import Callable
+from typing import Any, ClassVar, cast
 
 import jax
 import torch
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
     MLAAttentionImpl,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
@@ -230,6 +232,7 @@ def _pallas_rpa_kernel_impl(
     # zero-copy bitcasts on the donated buffer, preserving in-place updates.
     if block_major:
         kv_cache = kernel_view(kv_cache)
+    packed_pool_shape = None
     if kv_cache.ndim == 4:
         if (
             kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
@@ -293,6 +296,7 @@ def _pallas_rpa_kernel_impl(
         kv_layout=kv_layout,
     )
     if len(pool_shape) == 4:
+        assert packed_pool_shape is not None
         new_kv_cache = _reshape_packed_kv_cache(
             new_kv_cache, packed_pool_shape
         ).reshape(pool_shape)
@@ -755,7 +759,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
@@ -776,7 +780,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # Each Impl subclass points at its own RPA kernel entry function. Wrapped
     # with `staticmethod` so attribute access through `self` doesn't bind it
     # as a method. Subclasses override this to select a different kernel.
-    _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
+    _kernel_entry: ClassVar[Callable[..., tuple[jax.Array, jax.Array]]] = staticmethod(
+        _pallas_rpa_kernel_default
+    )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
 
@@ -972,6 +978,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
+        pcp_make_kwargs: dict[str, Any] = {}
         if use_pcp_streaming:
             pcp_make_kwargs = dict(
                 mesh=mesh,
@@ -989,7 +996,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             entry_params = inspect.signature(self._kernel_entry).parameters
-            entry_kwargs = {}
+            entry_kwargs: dict[str, Any] = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
             elif self._pool_is_seq_along_lane:
@@ -1035,6 +1042,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # is compiled.
         rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         if use_pcp_streaming:
+            assert op_mesh is not None and input_partition_specs is not None
             rpa_kernel_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,
@@ -1478,9 +1486,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
                 raise ValueError("k_scale_float and v_scale_float must be non-zero")
-            key, value = quantize_kv(
+            key, quantized_value = quantize_kv(
                 self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
             )
+            assert quantized_value is not None
+            value = quantized_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
@@ -1515,11 +1525,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "the PCP streaming sequence layout."
             )
         skip_kv_update = self.kv_sharing_target_layer_name is not None
+        cp_kv_cache_interleave_size = 0
         if use_pcp_streaming:
             self._validate_pcp_streaming_support(skip_kv_update)
-        cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size if use_pcp_streaming else 0
-        )
+            assert parallel_config is not None
+            cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         rpa_kernel = self._build_rpa_kernel(
             None,
             layer._k_scale_float if self.kv_cache_quantized_dtype else None,
@@ -1546,6 +1556,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA path does "
                     "not support PCP streaming or KV sharing"
                 )
+            assert self.rpa_kernel_bundled is not None
             outputs = self.rpa_kernel_bundled(
                 ctx.kv_cache_bundle,
                 self._bundle_layer_idx_tensor,
@@ -1559,8 +1570,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 sink,
             )
         else:
-            block_tables = attn_metadata.block_tables
+            block_tables = cast(torch.Tensor, attn_metadata.block_tables)
             if self._bm_kernel:
+                assert self._bm_region is not None
                 pool_index, layout = self._bm_region
                 block_tables = flat_kernel_ids(
                     block_tables, pool_index, layout.num_pools, layout.split
@@ -2153,6 +2165,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         mesh = self._dcp_mesh
+        assert mesh is not None
 
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
@@ -2259,7 +2272,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: Any,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
@@ -2326,6 +2339,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
         if layer.kv_cache_quantized_dtype is not None:
+            assert k_scale is not None
             kv_c_normed, _ = quantize_kv(
                 layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
             )
@@ -2397,6 +2411,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     layer, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
                 )
 
+            assert isinstance(kv_cache, torch.Tensor)
             outputs = layer.mla_op(
                 kv_cache,
                 ql_nope_flat,
@@ -2440,6 +2455,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         attn_metadata: AttentionMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
     ) -> None:
         """Structural no-op. TPU Pallas MLA unifies projection and evaluation
         inside `self.forward`."""

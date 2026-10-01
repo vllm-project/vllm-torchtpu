@@ -40,7 +40,7 @@ the blockwise Pallas kernel path instead.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -50,8 +50,11 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
-from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
@@ -98,6 +101,10 @@ from vllm_torchtpu.utils import synchronize_tensors
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
+    from vllm_torchtpu.layers.adapter.quantization.configs import (
+        TpuLinear,
+        TpuRoutedExperts,
+    )
     from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 
 logger = init_logger(__name__)
@@ -278,7 +285,7 @@ def _format_linear_scale_for_runtime(
 
 
 def _process_fp8_linear_weights(
-    layer: torch.nn.Module,
+    layer: TpuLinear,
     *,
     block_quant: bool,
     weight_block_size: tuple[int, int] | None,
@@ -466,7 +473,7 @@ def _quantize_and_format_moe_weights(
 
 
 def _process_fp8_moe_weights(
-    layer: RoutedExperts,
+    layer: TpuRoutedExperts,
     *,
     weight_block_size: tuple[int, int] | None = None,
     activation: str,
@@ -496,7 +503,9 @@ def _process_fp8_moe_weights(
     padded_intermediate = layer.moe_config.intermediate_size_per_partition
     unpadded_intermediate = layer.moe_config.intermediate_size_per_partition_unpadded
     needs_padding = padded_intermediate != unpadded_intermediate
+    local_real = padded_intermediate
     if needs_padding:
+        assert unpadded_intermediate is not None
         full_intermediate = unpadded_intermediate * layer.moe_config.tp_size
         local_start = padded_intermediate * layer.moe_config.tp_rank
         local_real = max(0, min(padded_intermediate, full_intermediate - local_start))
@@ -530,13 +539,19 @@ def _process_fp8_moe_weights(
 
     if weight_block_size is not None:
 
-        def dequantize_w13(w_q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        def dequantize_w13(
+            w_q: torch.Tensor, scale: torch.Tensor | None
+        ) -> torch.Tensor:
+            assert scale is not None
             return dequantize_tensor(w_q, scale, axis=(1, 2), out_dtype=torch.float32)
 
         dequantize_w2 = dequantize_w13
     else:
 
-        def dequantize_w13(w_q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        def dequantize_w13(
+            w_q: torch.Tensor, scale: torch.Tensor | None
+        ) -> torch.Tensor:
+            assert scale is not None
             w_q = w_q.to(torch.float32)
             s13 = scale.to(torch.float32)
             if s13.ndim == 2 and s13.shape[1] == 2:
@@ -548,7 +563,10 @@ def _process_fp8_moe_weights(
                 s13 = s13.view(-1, 1, 1)
             return w_q * s13
 
-        def dequantize_w2(w_q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        def dequantize_w2(
+            w_q: torch.Tensor, scale: torch.Tensor | None
+        ) -> torch.Tensor:
+            assert scale is not None
             w_q = w_q.to(torch.float32)
             s2 = scale.to(torch.float32)
             if s2.ndim == 2 and s2.shape[1] == w_q.shape[1]:
@@ -578,11 +596,12 @@ def _process_fp8_moe_weights(
         activation=activation,
     )
 
+    assert w13_scale is not None and w2_scale is not None
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
 def _quantize_bf16_moe_weights(
-    layer: RoutedExperts,
+    layer: TpuRoutedExperts,
     *,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
@@ -619,6 +638,7 @@ def _quantize_bf16_moe_weights(
         activation=activation,
     )
 
+    assert w13_scale is not None and w2_scale is not None
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
 
 
@@ -631,6 +651,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
     matched compressed-tensors FP8 scheme into an instance of this class to
     reuse its dequant/requant runtime path.
     """
+
+    # Set only on configs built from a compressed-tensors FP8 scheme.
+    is_channel_quant: bool
 
     def __init__(
         self,
@@ -653,7 +676,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         )
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         return FP8
 
     @classmethod
@@ -750,6 +773,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # pads to the checkpoint block grid instead of refining GPU scales.
         self.moe_block_shape = self.weight_block_size
         self.weight_scale_refine = None
+        # pyrefly: ignore[bad-assignment]
         self.fp8_backend = None
 
     @property
@@ -912,6 +936,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         directly using the same requantization path.
         """
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
@@ -920,7 +945,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
             weight_block_size = (
-                tuple(self.weight_block_size)
+                cast("tuple[int, int]", tuple(self.weight_block_size))
                 if self.weight_block_size is not None
                 else None
             )
@@ -1033,6 +1058,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
@@ -1175,7 +1201,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.use_deep_gemm = False
         self.cutlass_block_fp8_supported = False
         self.is_scale_e8m0 = getattr(quant_config, "is_scale_e8m0", False)
+        # pyrefly: ignore[bad-assignment]
         self.activation_quant_key = None
+        # pyrefly: ignore[bad-assignment]
         self.weight_quant_key = None
         self.input_dtype = torch.get_default_dtype()
         self.out_dtype = torch.get_default_dtype()
@@ -1275,6 +1303,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert dense linear checkpoint weights to runtime FP8."""
+        layer = cast("TpuLinear", layer)
         if self.online_fp8:
             if layer._tpu_online_fp8_processed:
                 return
@@ -1288,7 +1317,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 _process_fp8_linear_weights(
                     layer,
                     block_quant=self.block_quant,
-                    weight_block_size=tuple(self.weight_block_size)
+                    weight_block_size=cast(
+                        "tuple[int, int]", tuple(self.weight_block_size)
+                    )
                     if self.weight_block_size is not None
                     else None,
                     linear_config=self.linear_config,
@@ -1296,6 +1327,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 )
             )
         elif self.online_fp8:
+            assert self.online_fp8_policy is not None
             weight, weight_scale, requant_block_size = quantize_online_fp8(
                 layer.weight.data, self.online_fp8_policy
             )
@@ -1396,6 +1428,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        layer = cast("TpuLinear", layer)
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
