@@ -177,6 +177,8 @@ Tests requiring physical TPU hardware run in Buildkite CI.
   gh pr edit <PR_NUMBER> --add-label ready
   ```
 
+* **On-call fixes**: A PR that fixes a broken main or nightly build can also take the `oncall-fix` label. Its TPU jobs then run ahead of every other build, including builds of `main`. Adding the label starts a new build and cancels the queued one. Use it only for on-call fixes.
+
 ---
 
 ## 6. Pull Request & Review Lifecycle
