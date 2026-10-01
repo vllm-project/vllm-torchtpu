@@ -11,10 +11,161 @@ numbers. Those are the cases worth pinning.
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from vllm_torchtpu.distributed.chip_topology import ChipTopology
+
+
+@pytest.fixture(autouse=True)
+def restore_hierarchy_state(monkeypatch):
+    from vllm.model_executor.model_loader import default_loader, ep_weight_filter
+
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(
+        default_loader,
+        "compute_local_expert_ids",
+        ep_weight_filter.compute_local_expert_ids,
+    )
+    monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
+    monkeypatch.setattr(moe_hierarchical, "_SPLIT_CACHE", {})
+
+
+@pytest.fixture
+def dp_runtime(monkeypatch):
+    import torch.distributed
+    import vllm.config as config_module
+    import vllm.distributed as distributed
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed import chip_topology, ep_mesh
+    from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+            enable_eplb=False,
+            expert_placement_strategy="linear",
+            data_parallel_size=4,
+            tensor_parallel_size=8,
+            enable_ep_weight_filter=True,
+        ),
+        model_config=Mock(is_moe=True, get_num_experts=Mock(return_value=224)),
+    )
+    device_ids = tuple(
+        100 + 2 * ((7 * chip) % 16) + core for chip in range(16) for core in (1, 0)
+    )
+    runtime = SimpleNamespace(
+        config=config,
+        tp_rank=1,
+        layout=CpGroupLayout(
+            ranks=tuple(range(200, 232)),
+            device_ids=device_ids,
+            rank_in_group=9,
+            world_size=32,
+        ),
+    )
+    runtime.resolve_layout = Mock(side_effect=lambda group: runtime.layout)
+
+    def gather(out, split, group=None):
+        out[:] = [
+            chip_topology.hierarchical_moe_split(device_ids, r) for r in range(len(out))
+        ]
+
+    runtime.gather = Mock(side_effect=gather)
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", True)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    monkeypatch.setattr(
+        config_module, "get_current_vllm_config_or_none", lambda: config
+    )
+    monkeypatch.setattr(config_module, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        distributed, "get_dp_group", lambda: Mock(world_size=4, rank_in_group=1)
+    )
+    monkeypatch.setattr(
+        distributed, "get_pcp_group", lambda: Mock(world_size=1, rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        distributed, "get_tensor_model_parallel_rank", lambda: runtime.tp_rank
+    )
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: Mock())
+    monkeypatch.setattr(moe_hierarchical, "get_cp_group_layout", runtime.resolve_layout)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", runtime.gather)
+    monkeypatch.setattr(
+        chip_topology,
+        "get_chip_topology",
+        lambda: ChipTopology(
+            [[100 + 2 * chip, 101 + 2 * chip] for chip in range(16)],
+            list(reversed(range(100, 132))),
+        ),
+    )
+    return runtime
+
+
+def test_dp_split_uses_ep_device_mapping_and_agrees_once(dp_runtime):
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    assert moe_hierarchical.hierarchical_split_or_none() == (16, 12, 2, 0)
+    assert moe_hierarchical.hierarchical_split_or_none() == (16, 12, 2, 0)
+    assert dp_runtime.gather.call_count == 1
+
+
+@pytest.mark.parametrize("disabled", ["flag", "ep", "config"])
+def test_disabled_hierarchy_does_not_gather_devices(monkeypatch, dp_runtime, disabled):
+    import vllm.config as config_module
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    if disabled == "flag":
+        monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    elif disabled == "ep":
+        dp_runtime.config.parallel_config.enable_expert_parallel = False
+    else:
+        monkeypatch.setattr(
+            config_module, "get_current_vllm_config_or_none", lambda: None
+        )
+    assert moe_hierarchical.hierarchical_split_or_none() is None
+    dp_runtime.resolve_layout.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["enable_eplb", "USE_MOE_FUSED_EP_KERNEL"])
+def test_unsupported_hierarchy_config_fails_before_gather(
+    monkeypatch, dp_runtime, field
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    target = envs if field.isupper() else dp_runtime.config.parallel_config
+    monkeypatch.setattr(target, field, True)
+    with pytest.raises(ValueError, match="GMM MoE backend"):
+        moe_hierarchical.hierarchical_split_or_none()
+    dp_runtime.resolve_layout.assert_not_called()
+
+
+def test_unusable_topology_is_rejected(monkeypatch, dp_runtime):
+    from vllm_torchtpu.distributed import chip_topology
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(chip_topology, "get_chip_topology", lambda: None)
+    with pytest.raises(ValueError, match="complete multi-core chips"):
+        moe_hierarchical.hierarchical_split_or_none()
+
+
+def test_split_must_agree_across_ranks(dp_runtime):
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    def every_rank_claims_this_slot(out, split, group=None):
+        out[:] = [split] * len(out)
+
+    dp_runtime.gather.side_effect = every_rank_claims_this_slot
+    with pytest.raises(ValueError, match="on every rank"):
+        moe_hierarchical.hierarchical_split_or_none()
 
 
 class _FakeDevice:
@@ -199,7 +350,8 @@ def test_patch_is_reverted_even_when_construction_raises(monkeypatch) -> None:
     assert FusedMoEParallelConfig.make is original
 
 
-def test_patched_config_carries_the_chip_split(monkeypatch) -> None:
+@pytest.mark.parametrize("dp_size,dp_rank", [(1, 0), (4, 2)])
+def test_patched_config_carries_the_chip_split(monkeypatch, dp_size, dp_rank) -> None:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 
     from vllm_torchtpu.layers.adapter import moe_hierarchical
@@ -207,110 +359,75 @@ def test_patched_config_carries_the_chip_split(monkeypatch) -> None:
     flat = FusedMoEParallelConfig(
         tp_size=1,
         pcp_size=1,
-        dp_size=1,
-        ep_size=8,
+        dp_size=dp_size,
+        ep_size=dp_size * 8,
         tp_rank=0,
         pcp_rank=0,
-        dp_rank=0,
-        ep_rank=5,
+        dp_rank=dp_rank,
+        ep_rank=dp_rank * 8 + 5,
         sp_size=1,
         use_ep=True,
         all2all_backend="naive",
         enable_eplb=False,
     )
-    monkeypatch.setattr(
-        moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 2, 2, 1)
-    )
+    split = (dp_size * 4, dp_rank * 4 + 2, 2, 1)
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none", lambda: split)
     monkeypatch.setattr(
         FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: flat)
     )
 
     with moe_hierarchical.hierarchical_moe_parallel_config():
         got = FusedMoEParallelConfig.make(
-            tp_size_=8, pcp_size_=1, dp_size_=1, sp_size_=1, vllm_parallel_config=None
+            tp_size_=8,
+            pcp_size_=1,
+            dp_size_=dp_size,
+            sp_size_=1,
+            vllm_parallel_config=None,
         )
-    assert (got.ep_size, got.ep_rank) == (4, 2)
+    assert (got.ep_size, got.ep_rank) == split[:2]
     assert (got.tp_size, got.tp_rank) == (2, 1)
     # Untouched fields survive.
-    assert got.use_ep and got.dp_size == 1
+    assert got.use_ep and (got.dp_size, got.dp_rank) == (dp_size, dp_rank)
 
 
-def test_flat_tp_config_is_left_alone(monkeypatch) -> None:
-    """With EP off there is no expert split to make hierarchical.
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_ep_weight_filter_is_realigned_to_chip_block(dp_runtime, tp_rank):
+    from vllm.model_executor.model_loader import default_loader
 
-    Forcing tp_size=2 onto a config that shards experts by TP would change what
-    the flat layout means and mis-shard the weights.
-    """
+    from vllm_torchtpu import model_loader_patches
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    dp_runtime.layout = dataclasses.replace(
+        dp_runtime.layout, rank_in_group=8 + tp_rank
+    )
+    dp_runtime.tp_rank = tp_rank
+    flat = model_loader_patches._compute_local_expert_ids()
+    assert flat == set(range(56 + 7 * tp_rank, 63 + 7 * tp_rank))
+
+    moe_hierarchical.align_ep_weight_filter()
+    chip = model_loader_patches._compute_local_expert_ids()
+    # These EP ranks map to the two cores of physical chip 12.
+    assert chip == set(range(168, 182))
+    assert default_loader.compute_local_expert_ids(224, 32, 8 + tp_rank) == chip
+    wrapped = default_loader.compute_local_expert_ids
+    moe_hierarchical.align_ep_weight_filter()
+    assert default_loader.compute_local_expert_ids is wrapped
+
+
+def test_patched_config_rejects_sequence_parallel(monkeypatch):
     from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 
     from vllm_torchtpu.layers.adapter import moe_hierarchical
 
-    flat = FusedMoEParallelConfig(
-        tp_size=8,
-        pcp_size=1,
-        dp_size=1,
-        ep_size=1,
-        tp_rank=3,
-        pcp_rank=0,
-        dp_rank=0,
-        ep_rank=0,
-        sp_size=1,
-        use_ep=False,
-        all2all_backend="naive",
-        enable_eplb=False,
-    )
+    flat = SimpleNamespace(use_ep=True, is_sequence_parallel=True)
     monkeypatch.setattr(
-        moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 2, 2, 1)
+        moe_hierarchical, "hierarchical_split_or_none", lambda: (16, 3, 2, 1)
     )
-    monkeypatch.setattr(
-        FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: flat)
-    )
-    with moe_hierarchical.hierarchical_moe_parallel_config():
-        got = FusedMoEParallelConfig.make(
-            tp_size_=8, pcp_size_=1, dp_size_=1, sp_size_=1, vllm_parallel_config=None
-        )
-    assert dataclasses.asdict(got) == dataclasses.asdict(flat)
-
-
-def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
-    """The loader must read a chip's whole expert block, not a rank's half.
-
-    DefaultModelLoader derives ownership as ep_size = dp*pcp*tp / ep_rank =
-    tp_rank, independent of the layer's MoE config. Under the chip split that
-    hands rank 1 (core 1 of chip 0) only experts 28..55 when it needs 0..55 --
-    and the shortfall never raises, it just leaves those experts at their
-    initialized values.
-    """
-    from vllm.model_executor.model_loader import default_loader
-
-    from vllm_torchtpu.layers.adapter import moe_hierarchical
-
-    monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
-    # Rank 1 under flat EP8 would be ep_rank=1 of 8; under the chip split it is
-    # core 1 of chip 0, so ep_rank=0 of 4.
-    monkeypatch.setattr(
-        moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 0, 2, 1)
-    )
-    # The pristine function, not whatever a previous test left bound: the
-    # context manager patches the loader's namespace permanently (it is a
-    # one-time init in production), so `default_loader.compute_local_expert_ids`
-    # may already be wrapped by the time this runs.
-    from vllm.model_executor.model_loader import ep_weight_filter
-
-    pristine = ep_weight_filter.compute_local_expert_ids
-    monkeypatch.setattr(default_loader, "compute_local_expert_ids", pristine)
-
-    flat = pristine(224, 8, 1)  # what the loader would have computed
-    moe_hierarchical.align_ep_weight_filter()
-    chip = default_loader.compute_local_expert_ids(224, 8, 1)
-
-    assert flat == set(range(28, 56))
-    assert chip == set(range(0, 56)), "must cover the whole chip block"
-    assert flat < chip, "the flat set is a strict subset -- the missing half"
-    # Both chiplets of a chip must request the same experts.
-    monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
-    monkeypatch.setattr(
-        moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 0, 2, 0)
-    )
-    moe_hierarchical.align_ep_weight_filter()
-    assert default_loader.compute_local_expert_ids(224, 8, 0) == chip
+    monkeypatch.setattr(FusedMoEParallelConfig, "make", staticmethod(lambda: flat))
+    original = FusedMoEParallelConfig.make
+    with (
+        pytest.raises(ValueError, match="sequence parallelism"),
+        moe_hierarchical.hierarchical_moe_parallel_config(),
+    ):
+        FusedMoEParallelConfig.make()
+    assert FusedMoEParallelConfig.make is original

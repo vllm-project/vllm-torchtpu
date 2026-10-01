@@ -7,41 +7,56 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 
+import torch
+
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.chip_topology import hierarchical_moe_split
+from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_SPLIT_CACHE: dict[CpGroupLayout, tuple[int, int, int, int]] = {}
+
+
+def _agreed_split(group, layout: CpGroupLayout) -> tuple[int, int, int, int]:
+    """This rank's split, once every rank has resolved a consistent one."""
+    split = hierarchical_moe_split(layout.device_ids, layout.rank_in_group)
+    gathered: list[tuple[int, int, int, int] | None] = [None] * layout.world_size
+    torch.distributed.all_gather_object(gathered, split, group=group.cpu_group)
+    shapes = {(s[0], s[2]) for s in gathered if s is not None}
+    slots = {(s[1], s[3]) for s in gathered if s is not None}
+    if split is None or len(shapes) != 1 or len(slots) != layout.world_size:
+        raise ValueError(
+            "TPU_MOE_HIERARCHICAL_EP requires the EP group to cover complete "
+            f"multi-core chips on every rank; got {gathered}"
+        )
+    return split
+
 
 def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
-    """``(ep_size, ep_rank, tp_size, tp_rank)``, or ``None`` to stay flat.
-
-    ``None`` is the safe answer everywhere: the caller keeps vLLM's own
-    parallel config and the model runs exactly as it does today.
-    """
+    """Return chip-level EP and intra-chip TP, or None when disabled."""
     if not envs.TPU_MOE_HIERARCHICAL_EP:
         return None
 
-    from vllm.distributed import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-    )
+    from vllm.config import get_current_vllm_config_or_none
 
-    world_size = get_tensor_model_parallel_world_size()
-    rank = get_tensor_model_parallel_rank()
-    if world_size <= 1:
+    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or not vllm_config.parallel_config.enable_expert_parallel:
         return None
-
-    split = hierarchical_moe_split(world_size, rank)
-    if split is None:
-        logger.warning_once(
-            "TPU_MOE_HIERARCHICAL_EP is set but the chip topology could not be "
-            "used; falling back to flat expert parallelism."
+    if vllm_config.parallel_config.enable_eplb or envs.USE_MOE_FUSED_EP_KERNEL:
+        raise ValueError(
+            "TPU_MOE_HIERARCHICAL_EP requires the GMM MoE backend with EPLB disabled"
         )
+    group = get_ep_group()
+    if group is None:
         return None
-
-    return split
+    layout = get_cp_group_layout(group)
+    if layout not in _SPLIT_CACHE:
+        _SPLIT_CACHE[layout] = _agreed_split(group, layout)
+    return _SPLIT_CACHE[layout]
 
 
 _filter_patched = False
@@ -93,15 +108,9 @@ def hierarchical_moe_parallel_config():
 
     def patched_make(*args, **kwargs):
         config = original_make(*args, **kwargs)
-        if not config.use_ep:
-            # Expert parallelism is off entirely (no --enable-expert-parallel);
-            # there is no expert split to make hierarchical, and forcing one
-            # would silently change what the flat TP config means.
-            logger.warning_once(
-                "TPU_MOE_HIERARCHICAL_EP is set but expert parallelism "
-                "is off; leaving the MoE parallel config alone."
-            )
-            return config
+        assert config.use_ep
+        if config.is_sequence_parallel:
+            raise ValueError("Hierarchical MoE does not support sequence parallelism")
         return dataclasses.replace(
             config, ep_size=ep_size, ep_rank=ep_rank, tp_size=tp_size, tp_rank=tp_rank
         )

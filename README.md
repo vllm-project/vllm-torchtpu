@@ -197,6 +197,15 @@ python3 examples/offline_inference.py \
   --enable-expert-parallel
 ```
 
+For Kimi MoE, `TPU_MOE_HIERARCHICAL_EP=1` enables expert parallelism between
+physical chips and tensor parallelism within each chip. With
+`--tensor-parallel-size=8 --data-parallel-size=4 --enable-expert-parallel`
+on two-core chips, attention uses DP4×TP8 while routed experts use EP16×TP2.
+Use `--enable-ep-weight-filter` to load only the chip's expert block; both
+cores load complementary intermediate-width slices of those experts. The
+option is off by default and requires the GMM backend; EPLB, MoE sequence
+parallelism, and fused EP kernels are rejected at startup.
+
 #### Pipeline Parallelism (PP)
 
 Each pipeline stage runs a slice of the layers on one core and hands its

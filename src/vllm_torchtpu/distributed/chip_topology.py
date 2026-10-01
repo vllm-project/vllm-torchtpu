@@ -22,12 +22,7 @@ class ChipTopology:
         self.cores_per_chip = len(chips[0]) if chips else 0
 
     def chip_of(self, rank: int) -> tuple[int, int]:
-        """``(chip_index, core_on_chip)`` for a global device rank.
-
-        ``rank`` indexes ``device_ids`` -- i.e. it is the position in the
-        runtime's own device order, which is what a vLLM TP rank corresponds
-        to.
-        """
+        """``(chip_index, core_on_chip)`` for a rank in ``device_ids`` order."""
         if not 0 <= rank < len(self.device_ids):
             raise ValueError(
                 f"rank {rank} outside the {len(self.device_ids)} visible devices"
@@ -95,15 +90,14 @@ def get_chip_topology() -> ChipTopology | None:
 
 
 def hierarchical_moe_split(
-    world_size: int, rank: int
+    device_ids: tuple[int, ...], rank: int
 ) -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)`` for hierarchical MoE.
 
     Expert parallelism runs *between* chips and tensor parallelism *within*
     one, so ``ep_size`` is the chip count and ``tp_size`` the cores per chip.
-    Returns ``None`` when the split does not apply -- a topology that cannot be
-    read, a single core per chip, or a world size that is not the full visible
-    device set (a partial world would make "which chip" ambiguous).
+    ``device_ids`` maps process-group ranks to devices and must consist of
+    complete chips. Returns ``None`` for an unusable topology or mapping.
     """
     topology = get_chip_topology()
     if topology is None:
@@ -115,14 +109,10 @@ def hierarchical_moe_split(
             topology.cores_per_chip,
         )
         return None
-    if world_size != len(topology.device_ids):
-        logger.warning(
-            "World size %d does not match the %d visible devices; refusing to "
-            "guess the chip split.",
-            world_size,
-            len(topology.device_ids),
-        )
+    members = set(device_ids)
+    chips = [chip for chip in topology.chips if members.intersection(chip)]
+    if set().union(*chips) != members:
+        logger.warning("Hierarchical MoE group must consist of complete chips.")
         return None
-
-    chip_index, core_on_chip = topology.chip_of(rank)
-    return (topology.num_chips, chip_index, topology.cores_per_chip, core_on_chip)
+    chip_index, core_on_chip = ChipTopology(chips, list(device_ids)).chip_of(rank)
+    return (len(chips), chip_index, topology.cores_per_chip, core_on_chip)

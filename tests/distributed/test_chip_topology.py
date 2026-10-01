@@ -39,12 +39,15 @@ def test_chip_coordinates_and_runtime_rank_order(monkeypatch):
     assert result.chips == [[4, 5], [8, 9]]
     assert result.device_ids == [9, 5, 8, 4]
     assert [result.chip_of(r) for r in range(4)] == [(1, 1), (0, 1), (1, 0), (0, 0)]
-    assert [topology.hierarchical_moe_split(4, r) for r in range(4)] == [
+    assert [topology.hierarchical_moe_split((9, 5, 8, 4), r) for r in range(4)] == [
         (2, 1, 2, 1),
         (2, 0, 2, 1),
         (2, 1, 2, 0),
         (2, 0, 2, 0),
     ]
+    assert topology.hierarchical_moe_split((8, 9), 1) == (1, 0, 2, 1)
+    assert topology.hierarchical_moe_split((4, 8), 0) is None
+    assert topology.hierarchical_moe_split((4, 5, 20, 21), 0) is None
     assert topology.get_chip_topology() is result
     enumerate_devices.assert_called_once_with()
 
@@ -64,7 +67,7 @@ def test_chip_coordinates_and_runtime_rank_order(monkeypatch):
 def test_unusable_topology_returns_none(monkeypatch, devices):
     monkeypatch.setattr(jax, "devices", lambda: devices)
     assert topology.get_chip_topology() is None
-    assert topology.hierarchical_moe_split(4, 0) is None
+    assert topology.hierarchical_moe_split((0, 1, 2, 3), 0) is None
 
 
 def test_device_enumeration_failure_returns_none(monkeypatch):
@@ -72,17 +75,12 @@ def test_device_enumeration_failure_returns_none(monkeypatch):
     assert topology.get_chip_topology() is None
 
 
-@pytest.mark.parametrize(
-    "chips,ids,world_size",
-    [([[0], [1]], [0, 1], 2), ([[0, 1], [2, 3]], [0, 1, 2, 3], 2), ([], [], 0)],
-)
-def test_hierarchical_split_requires_full_multicore_world(
-    monkeypatch, chips, ids, world_size
-):
+@pytest.mark.parametrize("chips,ids", [([[0], [1]], [0, 1]), ([], [])])
+def test_hierarchical_split_requires_multicore_chips(monkeypatch, chips, ids):
     monkeypatch.setattr(
         topology, "get_chip_topology", lambda: topology.ChipTopology(chips, ids)
     )
-    assert topology.hierarchical_moe_split(world_size, 0) is None
+    assert topology.hierarchical_moe_split(tuple(ids), 0) is None
 
 
 @pytest.mark.parametrize("rank", [-1, 2])
