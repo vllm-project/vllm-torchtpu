@@ -35,7 +35,11 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
+pytestmark = [
+    pytest.mark.multichip,
+    pytest.mark.spawns_tpu_workers,
+    pytest.mark.skip(reason="b/561774581: torch-tpu StableHLO compiler issue"),
+]
 
 WORLD_SIZE = 8
 PAGE_SIZE = 256
