@@ -94,12 +94,10 @@ experiments/
 │   ├── profile_runner.py                                        # Throughput & latency profiling runner
 │   └── registry.py                                              # Central runner factory
 ├── sparsity/                                                    # Structured sparsity algorithms
-│   ├── LICENSE                                                  # Sparsity library license
 │   ├── README.md                                                # Sparsity package documentation
 │   ├── __init__.py                                              # Package initialization
 │   ├── datautils.py                                             # Calibration sequence tokenization utilities
 │   ├── gemma4.py                                                # Gemma 4 layer-0 capture and the CPU calibrator
-│   ├── llama.py                                                 # LLaMA architecture layer hooks
 │   ├── lrc.py                                                   # Low-Rank Compensated (LRC) alternating minimization
 │   ├── modelutils.py                                            # PyTorch module traversal & model structure helpers
 │   ├── naive_magnitude_pruner.py                                # Vectorized N:M magnitude pruner (dim=-1)
