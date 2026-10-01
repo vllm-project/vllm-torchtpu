@@ -1156,10 +1156,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
-        """Apply the row-major relayouts the env knobs ask for to ``model``.
+        """Give ``model`` the row-major table layouts the env knobs ask for.
 
-        Called for the target and, when one is loaded, the draft: both feed
-        the same cached Pallas ops, so their tables must share a layout.
+        ``load_model`` relayouts the target inline; this applies the same to
+        the draft, which feeds the same cached Pallas ops and so must share
+        the target's table layout.
         """
         if model is None:
             return
@@ -4624,7 +4625,10 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
-        self._relayout_tables(self.model)
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+            runner_utils.relayout_rope_caches(self.model)
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
+            runner_utils.relayout_hash_tables(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).

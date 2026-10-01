@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     """Whether a draft carries MoE layers, i.e. emits EP collectives.
 
-    Missing a MoE draft here is a hang, not an error: under EP-DP lockstep 
+    Missing a MoE draft here is a hang, not an error: under EP-DP lockstep
     the busy rank's draft forward waits on all-to-alls that the idle ranks never issue.
     """
     from vllm.model_executor.layers.fused_moe import MoERunner
