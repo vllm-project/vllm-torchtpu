@@ -129,6 +129,7 @@ def _name_float(value: float) -> str:
     return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
+# `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
 def _live_cache(entry: Any) -> torch.Tensor | None:
     """The array bound to a layer, or None while it has none.
 
@@ -143,7 +144,9 @@ class VllmDeepseekV4MLAAttention(
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
+    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
     mla_attn: VllmDeepseekV4MLAAttention
+    # Set to True on DSpark draft layers; read with getattr(..., False).
     non_causal_multi_token_decode: bool
 
     def __init__(

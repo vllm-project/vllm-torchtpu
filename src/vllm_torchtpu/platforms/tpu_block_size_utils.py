@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     class _HybridMambaModel(Protocol):
+        """Typing-only view of the mamba state classmethods on a hybrid model."""
+
         @classmethod
         def get_mamba_state_shape_from_config(
             cls, vllm_config: VllmConfig
@@ -307,6 +309,8 @@ def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
 
 
 class _TpuBlockSlotDerivation(TypedDict):
+    """The block-size derivation that the TPU platform logs."""
+
     backend: str
     block_size_source: str
     input_block_size: int

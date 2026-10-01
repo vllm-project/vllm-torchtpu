@@ -384,6 +384,7 @@ class MultiHeadLatentAttention(nn.Module):
         eps = self.q_a_layernorm.variance_epsilon
         if eps != self.kv_a_layernorm.variance_epsilon:
             raise ValueError("K3 MLA preprocessing requires matching norm epsilons")
+        # torch's Module.__setattr__ stub rejects a function as the value.
         # pyrefly: ignore[bad-argument-type]
         pack, wrapper.kimi_preprocess = group.mla_ops(eps)
         with torch.no_grad():

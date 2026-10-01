@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
     class _TpuAttentionBackend(Protocol):
+        """Typing-only view of the TPU classmethods on our attention backends."""
+
         @staticmethod
         def get_page_size(vllm_config: VllmConfig) -> int: ...
 
@@ -514,6 +516,7 @@ class TpuPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        # vLLM's selector passes num_heads by keyword; unused here.
         num_heads: int | None = None,
         **kwargs,
     ) -> str:
