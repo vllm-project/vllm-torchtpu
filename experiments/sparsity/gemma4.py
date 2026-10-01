@@ -43,28 +43,17 @@ def get_gemma4(model_path: str) -> Gemma4ForConditionalGeneration:
 
 
 @torch.no_grad()
-def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
-    """
-    Performs layer-by-layer sequential SparseGPT pruning on Gemma 4.
-    Passes calibration activations through each layer, captures empirical Hessians,
-    and applies second-order error compensation on all unpruned weights.
-    """
-    total_layers = len(model.model.language_model.layers)
-    sparsity_ratio = f"{args.prunen}:{args.prunem}" if args.prunem > 0 else f"{args.sparsity * 100:.1f}%"
-    print("=" * 85)
-    print(">>> [SPARSITY ENGINE] Starting Gemma 4 Sequential Pruning")
-    print(
-        f"    • Structured Sparsity: {sparsity_ratio} ({args.prunen} kept / {args.prunem} block)"
-    )
-    print(
-        f"    • Total Layers:        {total_layers} (pruning layers [{args.minlayer} .. {args.maxlayer}-1])"
-    )
-    print(f"    • Calibration Samples: {args.nsamples} sequences")
-    print(f"    • Device:              {dev}")
-    print("=" * 85)
+def capture_layer0_inputs(model, dataloader, dev, nsamples):
+    """Collect the inputs of decoder layer 0 for every calibration sample.
 
-    overall_start_time = time.time()
+    Runs the model on each batch with ``layers[0]`` replaced by a catcher that
+    records its input and aborts, so only the embedding stage executes.
 
+    Returns ``(lm, inps, position_embeddings)``: the text stack, a
+    ``(nsamples, seqlen, hidden)`` tensor on ``dev``, and the RoPE
+    ``(cos, sin)`` tables keyed by layer type. Every calibrator (CPU or TPU)
+    starts from this same state.
+    """
     lm = model.model.language_model
     layers = lm.layers
     embed_tokens = lm.embed_tokens.to(dev)
@@ -73,11 +62,10 @@ def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
     hidden_size = model.config.text_config.hidden_size
     seqlen = model.seqlen
 
-    # Pre-collect calibration embeddings from dataloader
     print(
-        f">>> [CALIBRATION] Collecting initial token embeddings for {args.nsamples} samples..."
+        f">>> [CALIBRATION] Collecting initial token embeddings for {nsamples} samples..."
     )
-    inps = torch.zeros((args.nsamples, seqlen, hidden_size),
+    inps = torch.zeros((nsamples, seqlen, hidden_size),
                        dtype=dtype,
                        device=dev)
     position_ids = torch.arange(seqlen, device=dev).unsqueeze(0)
@@ -108,13 +96,63 @@ def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    outs = torch.zeros_like(inps)
-
     # Precompute RoPE position embeddings for each unique attention layer type
     position_embeddings = {}
     for layer_type in lm.unique_layer_types:
         position_embeddings[layer_type] = lm.rotary_emb(
             inps[0:1], position_ids, layer_type)
+    return lm, inps, position_embeddings
+
+
+@torch.no_grad()
+def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
+    """
+    Performs layer-by-layer sequential SparseGPT pruning on Gemma 4.
+    Passes calibration activations through each layer, captures empirical Hessians,
+    and applies second-order error compensation on all unpruned weights.
+
+    Equivalent to ``capture_layer0_inputs`` followed by ``calibrate_layers_cpu``.
+    """
+    total_layers = len(model.model.language_model.layers)
+    sparsity_ratio = f"{args.prunen}:{args.prunem}" if args.prunem > 0 else f"{args.sparsity * 100:.1f}%"
+    print("=" * 85)
+    print(">>> [SPARSITY ENGINE] Starting Gemma 4 Sequential Pruning")
+    print(
+        f"    • Structured Sparsity: {sparsity_ratio} ({args.prunen} kept / {args.prunem} block)"
+    )
+    print(
+        f"    • Total Layers:        {total_layers} (pruning layers [{args.minlayer} .. {args.maxlayer}-1])"
+    )
+    print(f"    • Calibration Samples: {args.nsamples} sequences")
+    print(f"    • Device:              {dev}")
+    print("=" * 85)
+
+    lm, inps, position_embeddings = capture_layer0_inputs(
+        model, dataloader, dev, args.nsamples)
+    calibrate_layers_cpu(lm, inps, position_embeddings, args, dev, prune_fn=prune_fn)
+
+
+@torch.no_grad()
+def calibrate_layers_cpu(lm, inps, position_embeddings, args, dev, prune_fn=None):
+    """SparseGPT layer loop in PyTorch (the reference implementation).
+
+    For each layer in order: accumulate the input Hessian of every linear with
+    forward hooks (``SparseGPT.add_batch``), prune in place
+    (``SparseGPT.fasterprune`` or custom ``prune_fn``) if the layer is selected, then
+    propagate the calibration activations through the (now pruned) layer.
+
+    Calibrator contract (shared with ``tpu_gemma4.calibrate_layers_tpu``):
+    ``lm`` is the text stack with weights on CPU, ``inps`` the layer-0 inputs
+    from ``capture_layer0_inputs``, ``position_embeddings`` the RoPE tables,
+    ``args`` a ``PruneSpec``-like namespace. Weights are modified in place.
+    """
+    overall_start_time = time.time()
+    layers = lm.layers
+    total_layers = len(layers)
+    sparsity_ratio = f"{args.prunen}:{args.prunem}" if args.prunem > 0 else f"{args.sparsity * 100:.1f}%"
+    seqlen = inps.shape[1]
+    position_ids = torch.arange(seqlen, device=dev).unsqueeze(0)
+    outs = torch.zeros_like(inps)
 
     from transformers.models.gemma4.modeling_gemma4 import (
         create_causal_mask, create_sliding_window_causal_mask)

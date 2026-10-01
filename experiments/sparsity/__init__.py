@@ -2,13 +2,15 @@
 sparsity package
 ----------------
 Structured and unstructured weight pruning algorithms, Hessian estimation utilities,
-and TPU-accelerated SparseGPT kernel integrations for LLMs (Gemma 4, LLaMA).
+and SparseGPT calibration for Gemma 4 on CPU (reference) or TPU (JAX).
 """
 
+import dataclasses
+import importlib
 import os
 import shutil
 import time
-from typing import Any, Callable, Optional, Set
+from typing import Any, Callable, FrozenSet, Optional, Set
 
 import torch
 from transformers import AutoTokenizer
@@ -18,6 +20,49 @@ from .lrc import LrcResult, lrc_prune, make_lrc_pruner
 from .modelutils import find_layers
 from .quant import Quantizer
 from .sparsegpt import SparseGPT
+
+
+@dataclasses.dataclass(frozen=True)
+class PruneSpec:
+    """What to prune and how; the contract every calibrator receives.
+
+    ``sparse_layer_indices`` wins over ``[minlayer, maxlayer)`` when given.
+    ``sparsity`` is only used when ``prunen == 0`` (unstructured pruning).
+    """
+    prunen: int = 2
+    prunem: int = 4
+    sparsity: float = 0.0
+    percdamp: float = 0.01
+    blocksize: int = 128
+    nsamples: int = 64
+    minlayer: int = 0
+    maxlayer: int = 60
+    sparse_layer_indices: Optional[FrozenSet[int]] = None
+    prune_only: str = ""
+    prune_fn: Optional[Callable[[SparseGPT], Any]] = None
+
+    def layer_set(self, total_layers: int) -> Set[int]:
+        idx = (set(self.sparse_layer_indices) if self.sparse_layer_indices
+               is not None else set(range(self.minlayer, self.maxlayer)))
+        return {i for i in idx if 0 <= i < total_layers}
+
+
+# A calibrator is ``f(lm, inps, position_embeddings, spec, dev) -> None`` that
+# prunes ``lm`` in place, starting from the layer-0 inputs captured by
+# ``gemma4.capture_layer0_inputs``. Resolved lazily: the TPU one imports JAX,
+# which CPU-only callers must never load.
+CALIBRATORS = {
+    "cpu": ("sparsity.gemma4", "calibrate_layers_cpu"),
+    "tpu": ("sparsity.tpu_gemma4", "calibrate_layers_tpu"),
+}
+
+
+def get_calibrator(name: str) -> Callable:
+    if name not in CALIBRATORS:
+        raise ValueError(
+            f"unknown calibrator {name!r}; choose from {sorted(CALIBRATORS)}")
+    module, fn = CALIBRATORS[name]
+    return getattr(importlib.import_module(module), fn)
 
 
 def prune_gemma4(model_path: str,
@@ -33,11 +78,12 @@ def prune_gemma4(model_path: str,
                  save_path: str = "",
                  dev: str = "cpu",
                  sparse_layer_indices: Optional[Set[int]] = None,
-                 prune_fn: Optional[Callable[[SparseGPT], Any]] = None) -> str:
+                 prune_fn: Optional[Callable[[SparseGPT], Any]] = None,
+                 calibrator: str = "cpu") -> str:
     """
     Main entry point for SparseGPT pruning on Gemma 4 architectures.
     Captures layer activations sequentially, calculates second-order Hessian matrices,
-    and applies N:M structured sparsity on host CPU before serving on TPU.
+    and applies N:M structured sparsity, then saves a checkpoint for serving.
 
     Args:
         model_path: Path to HuggingFace or checkpoint directory.
@@ -51,15 +97,20 @@ def prune_gemma4(model_path: str,
         percdamp: Percentage dampening factor for Hessian regularization.
         blocksize: Column blocksize for Lazy OBS updates.
         save_path: Output directory to serialize sparsified weights and configs.
-        dev: Device string ('cpu' or 'cuda'/'tpu').
+        dev: Device for the model and the CPU calibrator ('cpu' or 'cuda').
         sparse_layer_indices: Optional explicit set of layer indices to prune.
-        prune_fn: Optional per-layer matrix solver callback prune_fn(gpt)
-            (defaults to SparseGPT.fasterprune).
+        prune_fn: Optional per-layer matrix solver callback ``prune_fn(gpt)``
+            (defaults to ``SparseGPT.fasterprune``).
+        calibrator: Key of ``CALIBRATORS``: "cpu" (PyTorch reference) or
+            "tpu" (JAX; holds the TPU until the process exits, so callers
+            that start vLLM afterwards run it in a child process).
     """
-    from .gemma4 import gemma4_sequential, get_gemma4
+    from .gemma4 import capture_layer0_inputs, get_gemma4
 
+    calibrate = get_calibrator(calibrator)  # fail before loading 60 GB
     device = torch.device(dev)
-    print(f">>> [SPARSITY ENGINE] Pruning Gemma 4 on device: {device}")
+    print(f">>> [SPARSITY ENGINE] Pruning Gemma 4 with the {calibrator} "
+          f"calibrator (model on {device})")
     model = get_gemma4(model_path)
     model.eval()
 
@@ -73,29 +124,24 @@ def prune_gemma4(model_path: str,
     )
 
     # 2. Assemble pruning parameters
-    class Args:
-        pass
+    spec = PruneSpec(
+        prunen=prunen,
+        prunem=prunem,
+        percdamp=percdamp,
+        blocksize=blocksize,
+        nsamples=nsamples,
+        minlayer=minlayer,
+        maxlayer=maxlayer,
+        sparse_layer_indices=(frozenset(int(i) for i in sparse_layer_indices)
+                              if sparse_layer_indices is not None else None),
+        prune_fn=prune_fn,
+    )
 
-    args = Args()
-    args.sparsity = 0
-    args.nsamples = nsamples
-    args.prunen = prunen
-    args.prunem = prunem
-    args.sparse_layer_indices = sparse_layer_indices
-    args.prune_fn = prune_fn
-    args.model_path = model_path
-    args.wbits = 16
-    args.percdamp = percdamp
-    args.blocksize = blocksize
-    args.minlayer = minlayer
-    args.maxlayer = maxlayer
-    args.prune_only = ""
-    args.invert = False
-    args.true_sequential = False
-
-    # 3. Execute sequential layer-by-layer Hessian collection and pruning
+    # 3. Capture layer-0 inputs once, then run the calibrator over the layers
     tick = time.time()
-    gemma4_sequential(model, dataloader, device, args, prune_fn=prune_fn)
+    lm, inps, position_embeddings = capture_layer0_inputs(
+        model, dataloader, device, nsamples)
+    calibrate(lm, inps, position_embeddings, spec, device)
     tock = time.time()
     print(f">>> [SPARSITY ENGINE] Pruning finished in {tock - tick:.2f}s")
 
@@ -117,8 +163,7 @@ def prune_gemma4(model_path: str,
                 f.endswith(".safetensors") for f in os.listdir(base_dir)))
         if has_safetensors:
             from resolvers.model_splicer import ModelSplicer
-            sparse_indices = sparse_layer_indices if sparse_layer_indices is not None else set(
-                range(minlayer, maxlayer))
+            sparse_indices = spec.layer_set(len(lm.layers))
             ModelSplicer.save_substituted_checkpoint(
                 base_model_dir=base_dir,
                 output_dir=save_path,
@@ -159,6 +204,9 @@ __all__ = [
     "LrcResult",
     "lrc_prune",
     "make_lrc_pruner",
+    "PruneSpec",
+    "CALIBRATORS",
+    "get_calibrator",
     "find_layers",
     "Quantizer",
     "get_loaders",
