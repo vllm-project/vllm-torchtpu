@@ -132,7 +132,7 @@ All contributions during this pre-public phase must strictly follow this 4-step 
    gh pr edit --add-reviewer reviewer3,reviewer4
    ```
 
-1. **Start CI with the `ready` Label:** Opening a PR does **NOT** start the test suite. Buildkite runs a short bootstrap job that stops unless the PR carries the `ready` label, so work-in-progress branches no longer occupy TPU agents:
+1. **Start CI with the `ready` Label:** Opening a PR does **NOT** start the test suite. Buildkite only creates a presubmit build once the PR carries the `ready` label, so work-in-progress branches no longer occupy TPU agents:
 
    ```bash
    gh pr edit <PR_NUMBER> --add-label ready
@@ -144,7 +144,7 @@ All contributions during this pre-public phase must strictly follow this 4-step 
 
 During this pre-public phase, GitHub does not automatically block merges or show status updates in the usual web UI ways. Pay attention to key differences and rules to watch out for:
 
-- **Missing `ready` Label Fails Fast:** If `buildkite/vllm-torchtpu-ci/pr` fails within seconds reporting `Missing 'ready' label`, that is the presubmit gate, not a test failure. Add the label (see Phase 1) and a fresh build starts automatically.
+- **No Buildkite Result Without `ready`:** On an unlabeled PR, `buildkite/vllm-torchtpu-ci/pr` stays at "Expected" and the `Check for Ready Label` GitHub check fails. That is the presubmit gate, not a test failure. Add the label (see Phase 1) and a build starts automatically.
 - **Watch CI Execution (No Automated Merge Blocking):** GitHub will not disable the merge button while CI is running or failing. Developers must manually monitor CI progress until all checks complete green.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for `gh pr checks <PR_NUMBER> --watch --fail-fast`)
   You can also check the Buildkite dashboard from the UI: [Buildkite TPU Commons](https://screenshot.googleplex.com/36Qsd6vKhWSjEmb)
@@ -205,14 +205,16 @@ Unmarked tests remain eligible for TPU queues.
 
 ### Presubmit Requires the `ready` Label
 
-- **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. Without it, the bootstrap job stops in about ten seconds and no test, build, or benchmark steps are uploaded.
+- **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. The gate is the `vllm-torchtpu-ci` pipeline filter in the Buildkite settings, so without the label no build is created at all.
 - **Rationale:** Previously every push to a PR branch launched the full suite, so a branch being iterated on could hold TPU agents for a whole test cycle before anyone intended to review it. The label makes that an explicit, deliberate step.
 - **Applying it:** `gh pr edit <PR_NUMBER> --add-label ready`. Any onboarded developer (Write access or above) can apply it — this is a signal of intent, not a permission boundary.
 - **Re-running:** A label change triggers a build by itself, so you do not need an empty commit to kick CI off. Pushing a new commit to a PR that already has the label rebuilds as usual.
 - **Not affected by the gate:**
   - Post-merge builds on `main`, scheduled nightlies, and manual Buildkite builds — these never look at labels.
-  - Docs-only PRs — these already short-circuit earlier and need no label.
   - `pre-commit` and `DCO`, which are GitHub checks and run regardless.
+- **`Check for Ready Label`:** A GitHub check that fails until the PR has the `ready` label, so the reason TPU CI has not run shows up next to `pre-commit` and `DCO`. It turns green as soon as the label is added.
+- **Docs-only PRs:** These need `ready` too. Once labeled, the pipeline's first step sees that only docs or other non-code files changed and reports green within seconds, without running TPU tests.
+- **Skipping TPU tests (`skip-tpu-ci`):** Add `skip-tpu-ci` next to `ready` when a PR doesn't need the TPU suites, for example a fix to a CI script. The pipeline's first step then reports green without running them. `skip-tpu-ci` alone does not start a build, and code-owner review still applies.
 
 > [!NOTE] The Label Does Not Gate Merging
 > Because this repository has no branch rulesets (see Section 1), the `ready` label controls only whether CI **runs**. It does not block the merge button. The Pre-Merge Verification Checklist is still what protects `main`.
