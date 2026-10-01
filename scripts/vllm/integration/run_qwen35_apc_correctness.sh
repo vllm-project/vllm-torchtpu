@@ -28,6 +28,16 @@ DUMP_DIR="/perf_eval_results/shardy_segfault_hlo"
 mkdir -p "$DUMP_DIR"
 export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${DUMP_DIR} --xla_dump_hlo_as_text --xla_dump_hlo_as_proto"
 
+package_dumps() {
+  set +e
+  if [ -d "$DUMP_DIR" ] && [ -n "$(ls -A "$DUMP_DIR" 2>/dev/null)" ]; then
+    echo "Packaging HLO dumps from $DUMP_DIR to /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz..."
+    tar -czf /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz -C /perf_eval_results shardy_segfault_hlo || true
+    rm -rf "$DUMP_DIR"
+    ls -lh /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz || true
+  fi
+}
+
 # max_num_seqs=1 removes batching nondeterminism, so a cold/warm difference is
 # the cache and nothing else. mamba_cache_mode resolves to align on its own.
 vllm serve "$MODEL" \
@@ -46,17 +56,12 @@ vllm serve "$MODEL" \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --default-chat-template-kwargs '{"enable_thinking":false}' &
 SERVER_PID=$!
-trap 'kill -TERM "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
+trap 'kill -TERM "$SERVER_PID" 2>/dev/null || true; sleep 2; package_dumps' EXIT
 
 deadline=$((SECONDS + STARTUP_TIMEOUT_S))
 until curl -sf "localhost:$PORT/health" >/dev/null; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "APC_CORRECTNESS_FAIL: server exited during startup"
-    if [ -d "$DUMP_DIR" ]; then
-      echo "Packaging HLO dumps from $DUMP_DIR..."
-      tar -czvf /perf_eval_results/shardy_segfault_hlo_dumps.tar.gz -C /perf_eval_results shardy_segfault_hlo || true
-      rm -rf "$DUMP_DIR"
-    fi
     exit 1
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then
