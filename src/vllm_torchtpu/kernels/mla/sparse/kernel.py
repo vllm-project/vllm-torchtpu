@@ -529,6 +529,11 @@ def prepare_outputs(
         "sparsecore_atoms_per_batch",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
+        "small_chunk_tokens",
+        "small_chunk_batch_size",
+        "small_chunk_live_gather",
+        "small_chunk_gather_atoms",
+        "live_gather_all_chunks",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -555,6 +560,11 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    small_chunk_tokens: int = 16,
+    small_chunk_batch_size: int | None = 1,
+    small_chunk_live_gather: bool = True,
+    small_chunk_gather_atoms: int = 1,
+    live_gather_all_chunks: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -585,6 +595,21 @@ def sparse_ragged_paged_attention(
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
         serving.
+      small_chunk_tokens: Chunks of at most this many tokens (the decode
+        bucket) take the small-chunk path below; 0 disables it. Full
+        `gather_and_attention_chunk_size` prefill chunks are unaffected.
+      small_chunk_batch_size: Attention grid step for small chunks, so the
+        traced grid `cdiv(real tokens, batch)` walks real tokens only. None
+        keeps `attention_kernel_batch_size`.
+      small_chunk_live_gather: For small chunks on the SparseCore layout, bound
+        the native SparseCore gather to the rows the attention grid reads,
+        `[start_pos, batch_end) x topk`; the remaining rows stay unwritten.
+      small_chunk_gather_atoms: `atoms_per_batch` for that bounded gather.
+      live_gather_all_chunks: Also bound the native SparseCore gather of
+        larger chunks to `[start_pos, batch_end) x topk`, keeping
+        `sparsecore_atoms_per_batch` (live granularity: one owner round).
+        Fully dead chunks issue no gather; an all-live chunk traces the same
+        grid length as the unbounded gather.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -843,7 +868,13 @@ def sparse_ragged_paged_attention(
         indices = physical_indices[start_pos:end_pos]
 
         # Batching
-        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
+        small_chunk = small_chunk_tokens > 0 and chunk_size <= small_chunk_tokens
+        batch_cap = attention_kernel_batch_size
+        if small_chunk and small_chunk_batch_size is not None:
+            # Size the grid step to the decode bucket so the traced grid below
+            # (cdiv(real tokens, batch)) walks real tokens only.
+            batch_cap = small_chunk_batch_size
+        kernel_batch_size = _largest_divisor(chunk_size, batch_cap)
         assert chunk_size % kernel_batch_size == 0
         # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
         # steps, so `batch_end - start_pos` MUST be a multiple of
@@ -874,15 +905,32 @@ def sparse_ragged_paged_attention(
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
         if sparsecore_layout:
+            live_kwargs = {}
+            gather_atoms = sparsecore_atoms_per_batch
+            if small_chunk and small_chunk_live_gather:
+                # Gather exactly the rows the attention grid will read,
+                # [start_pos, batch_end) x topk; the rest stay unwritten.
+                gather_atoms = small_chunk_gather_atoms
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            elif live_gather_all_chunks:
+                # Same bound for every chunk size, atoms kept.
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
             gathered_nope_buffer, gathered_rope_buffer = (
                 native_sc_gather.dsa_gather_native_sc(
                     cache_kv_nope,
                     cache_kv_rope,
                     indices,
                     out_size=chunk_size * topk,
-                    atoms_per_batch=sparsecore_atoms_per_batch,
+                    atoms_per_batch=gather_atoms,
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
+                    **live_kwargs,
                 )
             )
             gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)

@@ -47,6 +47,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.k_cache_insert import (
+    insert_indexer_k_cache_auto,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -189,6 +192,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        decode_kv_pages = envs.TPU_STREAMIDX_DECODE_KV_PAGES
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -202,27 +206,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
+            lkv_dim = cache_kv.shape[-1]
             # Cache rows are padded to the 128-lane HBM width; pad the packed
             # fp8+scale rows to match before scattering.
             k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
-            # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
+            # Insert this step's K rows into the KV cache: the Pallas insert
+            # for prefill-sized token buckets, the XLA scatter for decode-sized
+            # ones (see `KERNEL_MIN_TOKENS`).
+            cache_kv = insert_indexer_k_cache_auto(
+                cache_kv, k_packed, seq_lens, page_indices, cu_q_lens
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -238,7 +231,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 # The following parameters are tuned based on microbenchmark
                 # results.
-                num_kv_pages_per_block=(2, 2, 2),
+                num_kv_pages_per_block=(decode_kv_pages, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 chunk_tokens=chunk_tokens,
