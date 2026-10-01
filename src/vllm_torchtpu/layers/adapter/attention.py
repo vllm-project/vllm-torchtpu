@@ -992,6 +992,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
             entry_kwargs = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
+            elif self._pool_is_seq_along_lane:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND allocated SEQ_ALONG_LANE pages for this "
+                    f"layer, but its kernel {self._kernel_entry.__name__} takes no "
+                    "kv_layout and would read them as HEAD_ALONG_SUBLANE. The runner "
+                    "binds this kernel to a tp=1 speculative draft; raise the draft's "
+                    "tensor parallel size, or use VLLM_KV_CACHE_LAYOUT=NHD."
+                )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if block_major:

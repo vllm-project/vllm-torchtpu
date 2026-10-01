@@ -361,6 +361,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             offloading_config, vllm_config, kv_cache_config
         )
 
+        # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:

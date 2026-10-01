@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
+    copy_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -1770,6 +1771,7 @@ class TPUModelRunner(GPUModelRunner):
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
             state_srcs: list[int] = []
+            new_owners: list[bool] = []
             ckpt_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
@@ -1779,6 +1781,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     state_srcs.append(src)
+                    new_owners.append(req_ids[row] not in self._mamba_offset_seeded)
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
@@ -1796,7 +1799,7 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows)
+                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -1903,7 +1906,10 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _spec_seed_sources(
-        self, state_srcs: list[int], ckpt_rows: list[list[int]]
+        self,
+        state_srcs: list[int],
+        ckpt_rows: list[list[int]],
+        new_owners: list[bool],
     ) -> torch.Tensor:
         """Seed source per crossing: the checkpoint being resumed from.
 
@@ -1921,6 +1927,15 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        # PD and prefix-cache restores provide committed state in checkpoint 0.
+        # A recycled source block can retain another request's MTP offset.
+        # The first-forward reset clears the destination, after this source
+        # selection, so ignore that stale offset here without mutating the
+        # source block (which may be shared). Live requests retain their offset.
+        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
+            self.device, non_blocking=True
+        )
+        off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
@@ -1987,6 +2002,104 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+
+    def _dense_kv_copy_supported(self) -> bool:
+        """Whether CoW copies run on the per-layer KV cache tensors.
+
+        Only when DCP fine-grained prefix hits are active (see
+        ``_patch_vllm_dcp_fine_prefix_hits``), the one config whose copies
+        this path precompiles; any other emitter keeps the generic path.
+        Attention-only models outside the unified pool bind one tensor per
+        layer whose dim 0 is the (kernel-granular) block axis. Mamba state
+        without the unified pool is not block-indexed that way.
+        """
+        from vllm_torchtpu import _dcp_fine_prefix_match_unit
+
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        if (
+            kv_cache_config is None
+            or kv_cache_config.has_mamba_layers
+            or self.is_unified_pool_used()
+            or not getattr(self, "kv_caches", None)
+        ):
+            return False
+        # Fixed once the KV cache config is set; cache it per config.
+        cached = getattr(self, "_dense_kv_copy_cache", None)
+        if cached is None or cached[0] is not kv_cache_config:
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, self.vllm_config)
+            cached = (kv_cache_config, unit is not None)
+            self._dense_kv_copy_cache = cached
+        return cached[1]
+
+    def _dense_kv_copy_pool_sets(self) -> dict[int, list[torch.Tensor]]:
+        """Group the unique per-layer caches by manager-block split.
+
+        ``kv_caches`` may alias one tensor under several layers (shared KV).
+        A manager block spans ``split = dim0 // num_blocks`` consecutive
+        kernel blocks (under DCP, the rank-local slice of the logical block;
+        every rank copies its own slice under the same block ids). The MLA
+        latent cache and the DSA indexer cache are both such tensors.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        pool_sets: dict[int, list[torch.Tensor]] = {}
+        seen: set[int] = set()
+        for cache in self.kv_caches:
+            if id(cache) in seen:
+                continue
+            seen.add(id(cache))
+            assert cache.shape[0] % num_blocks == 0, (
+                f"KV cache dim 0 ({cache.shape[0]}) is not a multiple of "
+                f"num_blocks ({num_blocks})"
+            )
+            pool_sets.setdefault(cache.shape[0] // num_blocks, []).append(cache)
+        return pool_sets
+
+    def _apply_dense_kv_cache_block_copies(self, copies) -> None:
+        """Copy CoW blocks in every per-layer KV cache tensor.
+
+        Pairs fan out by each tensor's split and are padded to the seed-copy
+        bucket ladder with ``(0, 0)`` no-ops, so the compiled program sees a
+        few fixed shapes instead of one per copy count.
+        """
+        assert copies, "dense KV block copy requires at least one pair"
+        for split, pools in self._dense_kv_copy_pool_sets().items():
+            pairs = [
+                (c.src_block_id * split + j, c.dst_block_id * split + j)
+                for c in copies
+                for j in range(split)
+            ]
+            pairs = self._pad_to_bucket(pairs, pad=(0, 0))
+            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            copy_pool_blocks(pools, src_t, dst_t)
+
+    def _precompile_dense_kv_cache_block_copies(self) -> None:
+        """Warm the dense CoW copy program at every bucket length.
+
+        Only when fine-grained prefix hits can emit copies for this layout
+        (see ``_patch_vllm_dcp_fine_prefix_hits``). Must run while the caches
+        are quiescent, like the seed-copy precompile. All-zero indices copy
+        the null block onto itself.
+        """
+        if not self._dense_kv_copy_supported():
+            return
+        pool_sets = self._dense_kv_copy_pool_sets()
+        # At most one CoW pair per newly scheduled request per step.
+        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+            for split, pools in pool_sets.items():
+                synchronize_tensors(pools)
+                limit = self._bucket_len(self.max_num_reqs * split)
+                n = 8
+                while n <= limit:
+                    src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    copy_pool_blocks(pools, src, dst)
+                    n *= 4
+                synchronize_tensors(pools)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -2258,17 +2371,25 @@ class TPUModelRunner(GPUModelRunner):
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
+        # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
+        # prefix hits on an MLA model: copy with the same donating program.
+        use_dense_copy = bool(
+            copies and not use_page_local_copy and self._dense_kv_copy_supported()
+        )
         # The base implementation uses an advanced-index assignment which
         # TorchTPU functionalizes into a full raw-storage result. Hide only
         # the copy field from it; block zeroing and state updates stay intact.
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
-            if use_page_local_copy
+            if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
+        elif use_dense_copy:
+            self._apply_dense_kv_cache_block_copies(copies)
         return result
 
     def _modify_prev_results(self):
@@ -4683,6 +4804,7 @@ class TPUModelRunner(GPUModelRunner):
         use_max_model_len: bool = True,
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
+        through_handoff: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -4690,6 +4812,11 @@ class TPUModelRunner(GPUModelRunner):
         ``num_tokens`` tokens behind that many computed tokens (the same
         program: only the metadata values differ), and the forward's wall
         time in ms is returned once its outputs have materialized.
+
+        With ``through_handoff`` a pipeline stage takes its input from the
+        hand-off and passes its output on, as a serving step does; every
+        stage must then run the same sequence of forwards, and the caller
+        settles the hand-off afterwards.
         """
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
@@ -4829,7 +4956,11 @@ class TPUModelRunner(GPUModelRunner):
             # step is a real token.
             padding_state.update(num_tokens if profiling else 0, num_tokens)
         intermediate_tensors = None
-        if not self._pp_is_first:
+        if through_handoff:
+            assert self._pp_wave is not None and not profiling
+            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling
             )
@@ -4870,10 +5001,20 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
             )
             if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    # The output leaves padded to the hand-off buffer; it is
+                    # submitted without waiting, as between serving steps.
+                    self._pp_wave.end_forward(
+                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
                 # A stage before the last produces no logits; nothing
                 # consumes its output in a warmup.
                 synchronize_tensors(list(out.tensors.values()))
                 return (time.perf_counter() - started) * 1000.0 if profiling else None
+            if through_handoff:
+                self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
@@ -5655,6 +5796,45 @@ class TPUModelRunner(GPUModelRunner):
                 raise shape_variants.ShapeSpecializationError(
                     f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
                 )
+        if self._pp_wave is not None:
+            self._warmup_handoff_forwards()
+
+    def _warmup_handoff_forwards(self) -> None:
+        """Run every token bucket once through the pipeline hand-off.
+
+        A stage's serving forward reads a slice of the received buffer and
+        pads its output into the sent one, and those ops fuse with the
+        forward's first and last programs; the standalone pass above leaves
+        them to compile at the first serving step of each bucket, with every
+        stage waiting. The stages run this pass in step, so it comes after
+        the standalone pass, where each stage compiles its backbone on its
+        own.
+        """
+        assert self._pp_wave is not None
+        started = time.perf_counter()
+        for num_tokens in self.num_tokens_paddings:
+            self._dummy_run(
+                num_tokens,
+                self.num_reqs_max_model_len,
+                self.max_num_blocks_per_req,
+                use_max_model_len=True,
+                through_handoff=True,
+            )
+            if self.most_model_len is not None:
+                self._dummy_run(
+                    num_tokens,
+                    self.num_reqs_most_model_len,
+                    self.num_blocks_per_most_len_req,
+                    use_max_model_len=False,
+                    through_handoff=True,
+                )
+        self._pp_wave.settle()
+        synchronize_device()
+        logger.info(
+            "Pipeline hand-off warmup: %d buckets in %.1f s",
+            len(self.num_tokens_paddings),
+            time.perf_counter() - started,
+        )
 
     def _precompile_mamba_state_seed_copies(self) -> None:
         """Warm the seed-copy program for every raw-pool set at every bucket

@@ -1705,6 +1705,11 @@ class KVCacheManager:
                             attn_layer,
                         )
 
+        # No-op unless DCP fine-grained prefix hits can emit CoW copies on
+        # these per-layer caches (same gate as the runtime path); compile
+        # before any forward runs.
+        self.runner._precompile_dense_kv_cache_block_copies()
+
         if self.runner.use_spmd:
             # Shard KV Cache
             for cache in self.runner.kv_caches:

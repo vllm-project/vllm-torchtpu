@@ -444,7 +444,10 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        # WorkerBase declares `nn.Module | None`; this worker always holds a
+        # TPUModelRunner from here on.
+        # pyrefly: ignore[bad-override-mutable-attribute]
+        self.model_runner: TPUModelRunner = TPUModelRunner(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
