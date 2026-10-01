@@ -34,6 +34,7 @@ from typing import Any
 import torch
 from vllm.distributed import parallel_state
 
+from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
     _get_current_global_rank,
@@ -161,19 +162,23 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     DSv4-Pro run the fp8 activation all-gather (identical HLO and bytes) went
     from 178 to 321 us and end-to-end throughput dropped 4.5%.
 
-    With PCP on, the mesh stays in rank order. torch_tpu requires every Pallas
-    kernel in one compiled module to share a single DeviceAssignment, and the
-    PCP mesh (`pcp.get_or_create_pcp_mesh`) is rank-ordered because the PCP
-    kernels index token shards and state by PCP rank, so an EP mesh in
-    device-id order beside it fails to compile with "Disjoint or conflicting
-    device assignments".
+    With PCP or DCP on, the mesh stays in rank order. torch_tpu requires every
+    Pallas kernel in one compiled module to share a single DeviceAssignment,
+    and both CP meshes are rank-ordered: the PCP mesh
+    (`pcp.get_or_create_pcp_mesh`) because the PCP kernels index token shards
+    and state by PCP rank, the DCP mesh (`dcp.get_or_create_dcp_mesh`, used by
+    the MLA attention op) because it is built by walking the group's ranks. An
+    EP mesh in device-id order beside either fails to compile with "Disjoint or
+    conflicting device assignments" -- for DCP whenever a DCP group is not a
+    contiguous tile of the sorted EP mesh, e.g. TP4/DCP4 on tpu7x, whose DCP
+    groups are devices [0, 1, 4, 5] and [6, 7, 2, 3].
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
     ep_ranks = range(len(device_ids))
-    if get_pcp_world_size() > 1:
+    if get_pcp_world_size() > 1 or get_dcp_world_size() > 1:
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 
@@ -181,14 +186,15 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
 def ep_rank_order() -> tuple[int, ...] | None:
     """EP rank at each mesh index, or None when EP is off.
 
-    With the mesh in ascending device-id order (PCP off; see `_ep_mesh_order`)
+    With the mesh in ascending device-id order (PCP and DCP off; see
+    `_ep_mesh_order`)
     mesh index i is not EP rank i on a host whose PCI enumeration differs from
     its device ids -- every tpu7x host, where local ranks 0..7 land on devices
     `[0, 1, 4, 5, 6, 7, 2, 3]` -- so the shard at mesh index i owns the experts
     of EP rank `ep_rank_order()[i]`. The caller has to say so -- see
     `fused_moe_ep._mesh_expert_order` -- because the kernel reads a token's
-    expert id as `mesh_index * experts_per_shard + j`. With PCP on it is the
-    identity.
+    expert id as `mesh_index * experts_per_shard + j`. With PCP or DCP on it is
+    the identity.
     """
     device_ids = ep_device_ids()
     if device_ids is None:
@@ -210,7 +216,8 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
     The devices are Torchtpu's ``get_pallas_mesh`` ones, put in the order
-    `_ep_mesh_order` picks: ascending device id, or rank order when PCP is on.
+    `_ep_mesh_order` picks: ascending device id, or rank order when PCP or DCP
+    is on.
     `ep_rank_order` has the permutation this introduces and the consequence
     for the caller.
 

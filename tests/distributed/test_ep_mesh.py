@@ -28,6 +28,18 @@ def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
+
+
+# Each CP axis whose rank-ordered mesh pins the EP mesh to rank order, with a
+# size that turns it on. DCP=4 is the case that conflicts on tpu7x: TP4/DCP4
+# DCP groups are devices [0, 1, 4, 5] and [6, 7, 2, 3], not contiguous tiles
+# of the sorted EP mesh [0..7].
+_RANK_ORDERED_CP = pytest.mark.parametrize(
+    ("cp_size_fn", "cp_size"),
+    [("get_pcp_world_size", 2), ("get_dcp_world_size", 4)],
+    ids=["pcp", "dcp"],
+)
 
 
 @pytest.mark.parametrize(
@@ -74,13 +86,15 @@ def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
     assert ep.ep_mesh_index() == 0
 
 
-def test_pcp_keeps_rank_order(monkeypatch, group):
-    """With PCP > 1 the mesh stays in rank order: the PCP mesh is rank-ordered
-    (its kernels index token shards and state by PCP rank), and torch_tpu
-    rejects two Pallas kernels with different DeviceAssignments in one compiled
-    module. So mesh index i is EP rank i and this rank's index is its EP rank,
-    even though the same device ids reorder the mesh with PCP off."""
-    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 2)
+@_RANK_ORDERED_CP
+def test_cp_keeps_rank_order(monkeypatch, group, cp_size_fn, cp_size):
+    """With PCP or DCP > 1 the mesh stays in rank order: both CP meshes are
+    rank-ordered (the PCP kernels index token shards and state by PCP rank),
+    and torch_tpu rejects two Pallas kernels with different DeviceAssignments
+    in one compiled module. So mesh index i is EP rank i and this rank's index
+    is its EP rank, even though the same device ids reorder the mesh with both
+    off."""
+    monkeypatch.setattr(ep, cp_size_fn, lambda: cp_size)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
     assert ep.ep_rank_order() == (0, 1, 2, 3)
     # Global rank 6 is EP rank 2 of [2, 4, 6, 8].
@@ -158,15 +172,16 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
 
 
 @pytest.mark.tpu_test
-def test_mesh_keeps_pallas_rank_order_under_pcp(monkeypatch):
-    """With PCP > 1 the EP mesh must have the PCP mesh's DeviceAssignment,
-    which is rank order -- on tpu7x, devices [0, 1, 4, 5, 6, 7, 2, 3]. Sorting
-    them here is what failed to compile with "Disjoint or conflicting device
-    assignments" on PCP + fused EP."""
+@_RANK_ORDERED_CP
+def test_mesh_keeps_pallas_rank_order_under_cp(monkeypatch, cp_size_fn, cp_size):
+    """With PCP or DCP > 1 the EP mesh must share the CP mesh's
+    DeviceAssignment, which is rank order -- on tpu7x, devices
+    [0, 1, 4, 5, 6, 7, 2, 3]. Sorting them here is what failed to compile with
+    "Disjoint or conflicting device assignments" on PCP + fused EP."""
     import torch.distributed as dist
     from torch_tpu._internal import pallas as pallas_module
 
-    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(ep, cp_size_fn, lambda: cp_size)
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     rank_device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     monkeypatch.setattr(
@@ -226,19 +241,22 @@ def test_missing_native_ep_symbol(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("sequence_parallel", "pcp", "expected"),
+    ("sequence_parallel", "rank_ordered_cp", "expected"),
     [
-        (False, 1, ((0, 3), (2, 1))),
-        (True, 1, ((0,), (1,), (2,), (3,))),
-        # Rank order under PCP: mesh index i is EP rank i, i.e. global 2*i+2.
-        (False, 2, ((2, 0), (3, 1))),
-        (True, 2, ((0,), (1,), (2,), (3,))),
+        (False, None, ((0, 3), (2, 1))),
+        (True, None, ((0,), (1,), (2,), (3,))),
+        # Rank order under PCP/DCP: mesh index i is EP rank i, i.e. global 2*i+2.
+        (False, "get_pcp_world_size", ((2, 0), (3, 1))),
+        (True, "get_pcp_world_size", ((0,), (1,), (2,), (3,))),
+        (False, "get_dcp_world_size", ((2, 0), (3, 1))),
+        (True, "get_dcp_world_size", ((0,), (1,), (2,), (3,))),
     ],
 )
 def test_token_groups_use_native_membership_and_mesh_order(
-    monkeypatch, group, sequence_parallel, pcp, expected
+    monkeypatch, group, sequence_parallel, rank_ordered_cp, expected
 ):
-    monkeypatch.setattr(ep, "get_pcp_world_size", lambda: pcp)
+    if rank_ordered_cp is not None:
+        monkeypatch.setattr(ep, rank_ordered_cp, lambda: 2)
     group.cpu_group = object()
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
     monkeypatch.setattr(
