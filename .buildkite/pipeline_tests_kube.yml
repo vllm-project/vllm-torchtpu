@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The unit test suite on the Kueue fleet. Nothing gates a merge on it, so a
-# failure here is a question about the fleet. Keys match pipeline_tests.yml so
-# the two read side by side.
+# The unit test suite on the Kueue fleet. Keys match pipeline_tests.yml so the
+# two read side by side; bootstrap.sh uploads one or the other (ci_fleet.sh),
+# with the image build from pipeline_build.yml either way.
 #
 # The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
 # bktec runs in the pod, and run.sh forwards that configuration across - see
@@ -71,23 +71,6 @@ x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
 steps:
-  # Repeated from pipeline_build.yml because this pipeline is uploaded on its
-  # own rather than beside that one.
-  - label: ":docker: Build and Push CI Image"
-    key: "build_docker"
-    timeout_in_minutes: 120
-    agents:
-      queue: cpu_64_core
-    commands:
-      # setup_docker_env.sh reads the pinned vLLM commit from build metadata,
-      # which bootstrap.sh publishes only for the bare-metal pipeline slugs, so
-      # this lane resolves it from the same pyproject.toml pin itself.
-      - |
-        source .buildkite/scripts/configs/pipeline_config.sh
-        buildkite-agent meta-data set VLLM_COMMIT_HASH \
-          "${VLLM_COMMIT_HASH_OVERRIDE:-$(get_vllm_commit_hash)}"
-      - bash .buildkite/scripts/setup_docker_env.sh
-
   - label: ":kubernetes: Unit Tests - CPU (PR)"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'

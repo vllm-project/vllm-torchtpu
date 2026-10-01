@@ -89,22 +89,21 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   fi
 fi
 
+# Decided before anything is uploaded, and exported so the pipeline files can
+# interpolate ${CI_FLEET}; see ci_fleet.sh.
+echo "--- :kubernetes: Choosing bare metal or kube"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/ci_fleet.sh"
+resolve_ci_fleet
+if [[ "${CI_FLEET}" == "kube" ]]; then
+  buildkite-agent annotate --style info --context ci-fleet \
+    "Runs on the kube fleet (${CI_FLEET_REASON})."
+fi
+
 echo "--- Starting Buildkite Bootstrap"
 
 # Resolve and Publish Version Metadata
 INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
-
-# Sanity-check the pipeline slug to catch renames or typos immediately
-if [ "${BUILDKITE:-false}" == "true" ] || [ -n "${BUILDKITE_PIPELINE_SLUG:-}" ]; then
-  case "${BUILDKITE_PIPELINE_SLUG:-}" in
-    "vllm-torchtpu-ci"|"vllm-torchtpu-dev"|"${INTEGRATION_SLUG}")
-      ;;
-    *)
-      echo "ERROR: Unrecognized BUILDKITE_PIPELINE_SLUG '${BUILDKITE_PIPELINE_SLUG:-}'. Expected one of: vllm-torchtpu-ci, vllm-torchtpu-dev, ${INTEGRATION_SLUG}" >&2
-      exit 1
-      ;;
-  esac
-fi
 
 if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   # Integration pipeline tests upstream HEAD
@@ -129,17 +128,45 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-echo "Uploading Nightly Verification and Model Pipeline"
-upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
-
-echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
-
-echo "Uploading Integration Tests Pipeline"
-upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
-
-echo "Uploading Unit Tests Pipeline"
-upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
+# The suite's lanes, in upload order. Lane <lane> is
+# .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
+# kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
+# scheduled kube pipeline names its own lane - and defaults to all of them.
+ALL_LANES="verify perf integration tests"
+lanes="${CI_LANES:-${ALL_LANES}}"
+for lane in ${lanes}; do
+  if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
+    echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2
+    exit 1
+  fi
+done
+suffix=""
+if [[ "${CI_FLEET}" == "kube" ]]; then
+  suffix="_kube"
+fi
+missing=()
+for lane in ${ALL_LANES}; do
+  if [[ " ${lanes} " != *" ${lane} "* ]]; then
+    continue
+  fi
+  file=".buildkite/pipeline_${lane}${suffix}.yml"
+  if [[ ! -f "${file}" ]]; then
+    missing+=("${file}")
+    continue
+  fi
+  echo "Uploading ${file}"
+  upload_with_priority "${file}" "$JOB_PRIORITY"
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  # A lane asked for by name has to exist; the whole suite on a target that
+  # lacks a lane runs the rest and says what it left out.
+  if [[ -n "${CI_LANES:-}" ]]; then
+    echo "ERROR: CI_LANES asks for ${missing[*]}, which does not exist" >&2
+    exit 1
+  fi
+  buildkite-agent annotate --style warning --context ci-fleet-gaps \
+    "Not run on ${CI_FLEET}: no ${missing[*]} yet."
+fi
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
