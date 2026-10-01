@@ -44,6 +44,7 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
+    VllmDeepseekSparseSWABackend,
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
@@ -142,6 +143,9 @@ class VllmDeepseekV4MLAAttention(
     dsv4_attention.DeepseekV4Attention, AttentionLayerBase
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+
+    backend_cls = DeepseekV4TPUAttentionBackend
+    swa_backend_cls = VllmDeepseekSparseSWABackend
 
     def __init__(
         self,
@@ -827,7 +831,7 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(self, o: torch.Tensor | Any, positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.

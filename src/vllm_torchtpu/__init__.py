@@ -174,17 +174,17 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     original = VllmConfig.compute_hash
 
-    def compute_hash(self) -> str:
+    def compute_hash(self, include_version: bool = True) -> str:
         additional_config = self.additional_config
         if not isinstance(additional_config, dict):
-            return original(self)
+            return original(self, include_version=include_version)
         filtered = {
             key: value
             for key, value in additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
         if filtered == additional_config:
-            return original(self)
+            return original(self, include_version=include_version)
         # Hash a shallow copy with the filtered dict rather than mutating the
         # live config: compute_hash() may run while other code holds the same
         # VllmConfig, and a shallow copy shares every sub-config by reference
@@ -192,7 +192,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         # compute_hash its own additional_config to read.
         proxy = copy.copy(self)
         proxy.additional_config = filtered
-        return original(proxy)
+        return original(proxy, include_version=include_version)
 
     VllmConfig._tpu_upstream_compute_hash = original
     VllmConfig.compute_hash = compute_hash
@@ -934,6 +934,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             hash_block_size,
             metrics_collector=None,
             num_prefill_lookahead=0,
+            allow_partial_hash_hits: bool = True,
+            **kwargs,
         ):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
@@ -1005,6 +1007,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 hash_block_size,
                 metrics_collector,
                 num_prefill_lookahead=num_prefill_lookahead,
+                allow_partial_hash_hits=allow_partial_hash_hits,
+                **kwargs,
             )
 
         _get_coordinator_with_logical_pcp_blocks._tpu_hybrid_pcp_coordinator_patch = (
@@ -1167,6 +1171,12 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
                         "than block_size*dcp); prefix hits stay block-aligned.",
                         vllm_config.cache_config.prefix_match_unit,
                     )
+                    orig_unit = vllm_config.cache_config.prefix_match_unit
+                    try:
+                        vllm_config.cache_config.prefix_match_unit = None
+                        return previous_resolve(kv_cache_config, vllm_config)
+                    finally:
+                        vllm_config.cache_config.prefix_match_unit = orig_unit
                 return previous_resolve(kv_cache_config, vllm_config)
             dcp = vllm_config.parallel_config.decode_context_parallel_size
             scheduler_block_size = vllm_config.cache_config.block_size * dcp

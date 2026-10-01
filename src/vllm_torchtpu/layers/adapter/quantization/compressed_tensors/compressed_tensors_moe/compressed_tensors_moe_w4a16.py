@@ -75,7 +75,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.num_bits = int(getattr(weight_quant, "num_bits", 4))
         self.packed_factor = 32 // self.num_bits
         self.strategy = getattr(weight_quant, "strategy", "group")
-        self.group_size = getattr(weight_quant, "group_size", None)
+        group_size = getattr(weight_quant, "group_size", None)
+        self.group_size = -1 if group_size is None else int(group_size)
         self.is_transposed = True
 
     @property

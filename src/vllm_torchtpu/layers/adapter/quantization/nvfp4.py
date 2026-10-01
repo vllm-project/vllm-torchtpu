@@ -50,6 +50,7 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    KNvfp4Static,
     ModelOptLinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
@@ -592,7 +593,7 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
         self.kernel = _NullInputQuantKernel()
-        self.wkey = "weight"
+        self.wkey = KNvfp4Static()
 
     def create_weights(
         self,

@@ -160,6 +160,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
         num_items = len(self._get_item_specs(mm_kwargs))

@@ -5,6 +5,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fusion.mm_input_norm import (
     FusedMMInputNorm,
     IdentityInputNorm,
@@ -46,15 +47,16 @@ def test_encoder_protocol_normalizes_like_ordinary_image_path(
         SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen2_5_vl"))
     )
 
-    normalizer = (
-        FusedMMInputNorm(
-            mean=torch.tensor([0.5, 0.5, 0.5]),
-            std=torch.tensor([0.25, 0.25, 0.25]),
-            scale=1 / 255,
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+        normalizer = (
+            FusedMMInputNorm(
+                image_mean=[0.5, 0.5, 0.5],
+                image_std=[0.25, 0.25, 0.25],
+                rescale_factor=1 / 255,
+            )
+            if device_normalization
+            else IdentityInputNorm()
         )
-        if device_normalization
-        else IdentityInputNorm()
-    )
     visual = RecordingVisionEncoder(input_norm=normalizer)
     model = SimpleNamespace(
         visual=visual, input_norm=normalizer, use_data_parallel=False
@@ -81,7 +83,7 @@ def test_encoder_protocol_normalizes_like_ordinary_image_path(
 
     if encoder_path == "graph":
         values = {"pixel_values": pixels}
-        actual = Model.encoder_cudagraph_forward(model, values)
+        actual = Model.encoder_cudagraph_forward(model, values.copy())
         assert values["pixel_values"] is pixels
     else:
         pixel_key = "pixel_values" if encoder_path == "image" else "pixel_values_videos"

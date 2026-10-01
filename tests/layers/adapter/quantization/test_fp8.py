@@ -121,6 +121,10 @@ def test_fp8_routed_experts_checkpoint_allocation(
         "get_tensor_model_parallel_world_size",
         lambda: 2,
     )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
     quant_cls = VllmFp8Config
     if deepseek_v4:
         from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
