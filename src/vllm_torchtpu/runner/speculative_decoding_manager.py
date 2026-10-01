@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,11 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
+    # [padded_logits_length] Optional per-token draft flags
+    # (0=EMPTY, 1=MODEL, 2=GRAMMAR).
+    draft_flags: torch.Tensor | None = None
+    # CPU-side boolean indicating if any draft token has MODEL provenance (flag=1).
+    has_model_drafts: bool = True
 
 
 class SpeculativeDecodingManager:
@@ -168,7 +174,11 @@ class SpeculativeDecodingManager:
             assert self.runner._is_async_drafter, (
                 "device-seeded draft proposing is only supported with an async drafter"
             )
-        if self.runner.speculative_config.method == "ngram":
+        if self.runner.speculative_config.method == "gaad":
+            # GaaD executes in scheduler/engine-core process on CPU.
+            self._draft_token_ids = []
+            return None
+        elif self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
             self._draft_token_ids = self.runner.drafter.propose(
@@ -200,11 +210,52 @@ class SpeculativeDecodingManager:
                 f"'{self.runner.speculative_config.method}' is not supported."
             )
 
+    def _build_draft_flags_tensor(
+        self,
+        num_draft_tokens: np.ndarray,
+        padded_logits_length: int,
+        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None,
+        start_index: int = 0,
+    ) -> tuple[torch.Tensor | None, bool]:
+        if not scheduled_spec_decode_flags:
+            return None, True
+        num_reqs = num_draft_tokens.shape[0]
+        req_ids = self.runner.input_batch.req_ids[start_index : start_index + num_reqs]
+        flag_chunks = []
+        has_model_drafts = False
+        has_any_drafts = False
+        for req_id, n in zip(req_ids, num_draft_tokens):
+            n_int = int(n)
+            if n_int <= 0:
+                continue
+            has_any_drafts = True
+            flags = scheduled_spec_decode_flags.get(req_id)
+            if flags is not None:
+                f = list(flags[:n_int])
+                if len(f) < n_int:
+                    f.extend([1] * (n_int - len(f)))
+                if any(x == 1 for x in f):
+                    has_model_drafts = True
+                flag_chunks.append(np.array(f, dtype=np.int32))
+            else:
+                flag_chunks.append(np.ones(n_int, dtype=np.int32))
+                has_model_drafts = True
+        padded_draft_flags = np.zeros(padded_logits_length, dtype=np.int32)
+        if flag_chunks:
+            flat_flags = np.concatenate(flag_chunks)
+            padded_draft_flags[: flat_flags.shape[0]] = flat_flags
+        draft_flags_tensor = torch.from_numpy(padded_draft_flags).to(
+            self.runner.device, non_blocking=True
+        )
+        return draft_flags_tensor, (has_model_drafts if has_any_drafts else False)
+
     def get_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        scheduled_spec_decode_flags: Mapping[str, Sequence[int]] | None = None,
+        start_index: int = 0,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
@@ -235,6 +286,12 @@ class SpeculativeDecodingManager:
             draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
+            draft_flags_tensor, has_model_drafts = self._build_draft_flags_tensor(
+                num_draft_tokens,
+                padded_logits_length,
+                scheduled_spec_decode_flags,
+                start_index,
+            )
             return SpecDecodeMetadata(
                 draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
                     self.runner.device, non_blocking=True
@@ -246,6 +303,8 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                draft_flags=draft_flags_tensor,
+                has_model_drafts=has_model_drafts,
             )
 
         # [num_reqs]
@@ -338,6 +397,12 @@ class SpeculativeDecodingManager:
         # CPU -> TPU copy.
         device = self.runner.device
 
+        draft_flags_tensor, has_model_drafts = self._build_draft_flags_tensor(
+            num_draft_tokens,
+            padded_logits_length,
+            scheduled_spec_decode_flags,
+            start_index,
+        )
         metadata = SpecDecodeMetadata(
             draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
                 device, non_blocking=True
@@ -361,6 +426,8 @@ class SpeculativeDecodingManager:
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True
             ),
+            draft_flags=draft_flags_tensor,
+            has_model_drafts=has_model_drafts,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.

@@ -139,6 +139,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    VLLM_TPU_JUMP_DECODING: bool = False
 
 
 def env_with_choices(
@@ -854,6 +855,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Enables Grammar-as-a-Drafter (GaaD) jump decoding via speculative verifier.
+    "VLLM_TPU_JUMP_DECODING": env_bool("VLLM_TPU_JUMP_DECODING"),
 }
 
 
