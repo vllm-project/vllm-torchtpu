@@ -33,7 +33,9 @@ if [[ -z "${TYPECHECK_IN_PLACE:-}" && ! -f /.dockerenv && ! -f /run/.containeren
   if [[ "${image}" == "${nightly}" || -z "${old_id}" ]]; then
     if ! docker pull --platform linux/amd64 "${image}" >&2; then
       echo "Could not pull ${image}. For an authentication error, run:" \
-        "gcloud auth configure-docker us-central1-docker.pkg.dev" >&2
+        "gcloud auth configure-docker us-central1-docker.pkg.dev." \
+        "Without access to the registry, build the image locally:" \
+        "see docs/developers_guide/type_checking.md." >&2
       exit 1
     fi
     # Each nightly would otherwise leave several GB behind. Remove the

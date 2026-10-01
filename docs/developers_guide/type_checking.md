@@ -24,8 +24,21 @@ bash tools/typecheck_full.sh
 
 Other package versions report different errors, so `tools/typecheck_full.sh`
 reruns itself inside the nightly `torchtpu-vllm-dev` image when started outside
-a container. It needs Docker and a one-time
+a container. It needs Docker, read access to the image's Artifact Registry
+project (`cloud-ullm-inference-ci-cd`) and a one-time
 `gcloud auth configure-docker us-central1-docker.pkg.dev`, but no TPU.
+
+Without access to that registry, build the same image locally and point the
+script at it:
+
+```bash
+./docker/build_image.sh --target dev -t vllm-torchtpu-dev-local
+TYPECHECK_IMAGE=vllm-torchtpu-dev-local bash tools/typecheck_full.sh
+```
+
+The build needs only the torch-tpu registry access that installing
+`vllm-torchtpu` already requires (see the README). The script uses a local
+image as it is, so rebuild it after `main` or your PR changes dependencies.
 
 ## When Buildkite disagrees with a local run
 
