@@ -500,6 +500,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         """Dequantize staged shards, concatenate w13, and pad to strided block
         boundaries: on the device the shards sit on when
         VLLM_TPU_MXFP4_DEVICE_DEQUANT is set, else on CPU."""
+        assert isinstance(layer.w13_weight, torch.Tensor)
+        assert isinstance(layer.w13_weight_scale, torch.Tensor)
+        assert isinstance(layer.w2_weight, torch.Tensor)
+        assert isinstance(layer.w2_weight_scale, torch.Tensor)
         if envs.VLLM_TPU_MXFP4_DEVICE_DEQUANT:
             work_device = layer.w13_weight.device
             dequantize = _dequantize_mxfp4_packed_on_device
