@@ -13,6 +13,7 @@ from vllm.model_executor.layers import logits_processor as lp_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sampling_params import StructuredOutputsParams
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -208,4 +209,115 @@ def test_runner_step_choice():
 
     spec = _runner(torch.zeros(8, 2), SimpleNamespace(num_speculative_tokens=3))
     spec.input_batch, spec.requests = _batch(greedy)
+    assert spec._greedy_top_tokens_this_step()
+    # A mixed greedy / sampled batch verifies on the full logits.
+    spec.input_batch, spec.requests = _batch(greedy, SamplingParams(temperature=0.6))
     assert not spec._greedy_top_tokens_this_step()
+
+
+K = 3
+
+
+def _verify_chunk(monkeypatch, synthetic):
+    """Three requests at k=3: all drafts accepted, rejected at the second
+    draft, rejected at the first of two drafts. Rows are the vocab-parallel
+    logits of a 4-rank head; one target row is an exact tie."""
+    gen = torch.Generator().manual_seed(7)
+    weight = torch.randn(96, 16, generator=gen)
+    weight[20] *= 3
+    weight[50] = weight[20]
+    draft_lengths = [3, 3, 2]
+    rows = sum(d + 1 for d in draft_lengths)
+    hidden_states = torch.randn(rows, 16, generator=gen)
+    hidden_states[4] = weight[20]
+    logits = hidden_states @ weight.T
+    assert torch.topk(logits[4], 2).indices.sort().values.tolist() == [20, 50]
+    argmax = torch.argmax(logits, dim=-1)
+
+    target_rows, bonus_rows, drafts, segments, groups = [], [], [], [], []
+    row = 0
+    for req, length in enumerate(draft_lengths):
+        for pos in range(length):
+            target_rows.append(row + pos)
+            segments.append(req)
+            groups.append(pos)
+            token = int(argmax[row + pos])
+            rejected = (req == 1 and pos == 1) or (req == 2 and pos == 0)
+            drafts.append((token + 1) % 96 if rejected else token)
+        bonus_rows.append(row + length)
+        row += length + 1
+    md = SimpleNamespace(
+        draft_token_ids=torch.tensor(drafts, dtype=torch.int32),
+        draft_lengths=torch.tensor(draft_lengths, dtype=torch.int32),
+        target_logits_indices=torch.tensor(target_rows, dtype=torch.int32),
+        bonus_logits_indices=torch.tensor(bonus_rows, dtype=torch.int32),
+        segment_ids=torch.tensor(segments, dtype=torch.int64),
+        group_indices=torch.tensor(groups, dtype=torch.int32),
+    )
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=K,
+        rejection_sample_method="synthetic" if synthetic else "strict",
+        synthetic_acceptance_rates=[0.9, 0.5, 0.2] if synthetic else None,
+    )
+    runner = _runner(weight, spec_config)
+    runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
+    tokens = _vocab_parallel_top_tokens(weight, hidden_states, 4, monkeypatch)
+    return runner, logits, tokens, md
+
+
+def _sample(runner, values, md, top_tokens, seed=0):
+    with torch.compiler.set_stance("force_eager"):
+        return TPUModelRunner._sample_spec_verify_chunk(
+            runner,
+            values,
+            md,
+            None,
+            None,
+            0,
+            3,
+            True,
+            torch.Generator().manual_seed(seed),
+            top_tokens,
+        )
+
+
+def test_verify_on_top_tokens_matches_full_logits(monkeypatch):
+    runner, logits, tokens, md = _verify_chunk(monkeypatch, synthetic=False)
+
+    full = _sample(runner, logits, md, top_tokens=False)
+    top = _sample(runner, tokens, md, top_tokens=True)
+
+    assert torch.equal(top, full)
+    assert tokens[4].item() == 20  # the tie row, accepted as req 1's first draft
+    argmax = torch.argmax(logits, dim=-1).tolist()
+    drafts = md.draft_token_ids.tolist()
+    assert full.tolist() == [
+        [*drafts[0:3], argmax[3]],  # all accepted + bonus
+        [drafts[3], argmax[5], -1, -1],  # rejected at the second draft
+        [argmax[8], -1, -1, -1],  # rejected at the first draft
+    ]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_synthetic_verify_on_top_tokens_matches_full_logits(monkeypatch, seed):
+    runner, logits, tokens, md = _verify_chunk(monkeypatch, synthetic=True)
+
+    full = _sample(runner, logits, md, top_tokens=False, seed=seed)
+    top = _sample(runner, tokens, md, top_tokens=True, seed=seed)
+
+    assert torch.equal(top, full)
+
+
+def test_rejection_sampler_refuses_argmax_for_sampling():
+    with pytest.raises(ValueError, match="needs target_logits"):
+        RejectionSampler()(
+            draft_token_ids=torch.zeros(1, dtype=torch.int32),
+            num_draft_tokens=torch.ones(1, dtype=torch.int32),
+            target_logits=None,
+            bonus_token_ids=torch.zeros(1, dtype=torch.int64),
+            segment_ids=torch.zeros(1, dtype=torch.int64),
+            group_indices=torch.zeros(1, dtype=torch.int32),
+            max_draft_tokens=1,
+            do_sampling=True,
+            target_argmax=torch.zeros(1, dtype=torch.int64),
+        )

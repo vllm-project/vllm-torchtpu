@@ -4113,13 +4113,39 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         all_greedy: bool,
         sampling_generator: torch.Generator | None,
+        top_tokens: bool = False,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
-        selected tokens for the chunk.
+        selected tokens for the chunk. With ``top_tokens``, ``logits`` holds
+        each row's greedy token instead.
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
+        if top_tokens:
+            bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
+                logits, md.bonus_logits_indices, md.target_logits_indices
+            )
+            return self.rejection_sampler(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=None,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                accept_u=(
+                    torch.rand(
+                        md.draft_token_ids.shape,
+                        dtype=torch.float32,
+                        device=logits.device,
+                        generator=sampling_generator,
+                    )
+                    if self.rejection_sampler.synthetic_mode
+                    else None
+                ),
+                target_argmax=target_argmax,
+            )
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
         if all_greedy and grammar_output is None:
@@ -4293,6 +4319,7 @@ class TPUModelRunner(GPUModelRunner):
                             cur_end_idx,
                             all_greedy,
                             sampling_generator,
+                            state.top_tokens,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -4329,7 +4356,9 @@ class TPUModelRunner(GPUModelRunner):
                             cur_end_idx,
                         )
                     with self._stage_timing.stage("sample"):
-                        if all_greedy:
+                        if state.top_tokens:
+                            selected = logits
+                        elif all_greedy:
                             selected = self._greedy_sample(logits)
                         else:
                             temperatures_tpu, top_k_tpu, top_p_tpu = (
@@ -4811,8 +4840,6 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
-            if self.speculative_config is not None:
-                logger.info("TPU_GREEDY_TOP_TOKENS: off on speculative steps")
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -5816,6 +5843,17 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                     )
                     synchronize_tensors(out)
+                    if self._greedy_head_owner is not None:
+                        self._precompile_top_token_verify(
+                            num_tokens,
+                            draft_token_ids,
+                            target_logits_indices,
+                            segment_ids,
+                            group_indices,
+                            draft_lengths,
+                            bonus_logits_indices,
+                            warm_accept_u,
+                        )
                     # --- non-greedy verify path (do_sampling=True) ---
                     _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                         dummy_logits, bonus_logits_indices, target_logits_indices
@@ -5875,6 +5913,35 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+
+    def _precompile_top_token_verify(
+        self,
+        num_tokens: int,
+        draft_token_ids: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        warm_accept_u: torch.Tensor,
+    ) -> None:
+        """The greedy verify path on greedy tokens (TPU_GREEDY_TOP_TOKENS)."""
+        tokens = torch.zeros((num_tokens, 1), dtype=torch.int64).to(self.device)
+        bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
+            tokens, bonus_logits_indices, target_logits_indices
+        )
+        out = self.rejection_sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=draft_lengths,
+            target_logits=None,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            accept_u=warm_accept_u if self.rejection_sampler.synthetic_mode else None,
+            target_argmax=target_argmax,
+        )
+        synchronize_tensors(out)
 
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
@@ -6991,10 +7058,8 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(hidden_states)
 
     def _greedy_top_tokens_this_step(self) -> bool:
-        return (
-            self._greedy_head_owner is not None
-            and self.speculative_config is None
-            and greedy_top_tokens.step_eligible(self.input_batch, self.requests)
+        return self._greedy_head_owner is not None and greedy_top_tokens.step_eligible(
+            self.input_batch, self.requests
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7029,6 +7094,19 @@ class TPUModelRunner(GPUModelRunner):
         )
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_bonus_and_target_tokens(
+        self,
+        tokens: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # spec_bonus_and_target_logits on the greedy tokens ([rows, 1]) of
+        # TPU_GREEDY_TOP_TOKENS: the same rows, already argmaxed.
+        bonus_token_ids = torch.index_select(tokens, 0, bonus_logits_indices)
+        target_argmax = torch.index_select(tokens, 0, target_logits_indices)
+        return bonus_token_ids.view(-1), target_argmax.view(-1)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_gather_bonus_and_target_logits(

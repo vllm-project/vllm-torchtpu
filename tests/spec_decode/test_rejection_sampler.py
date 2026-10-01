@@ -321,6 +321,40 @@ def test_rejection_sampler_greedy_scenarios(case: RejectionSamplerCase, device):
     )
 
 
+@pytest.mark.parametrize("case", GREEDY_CASES, ids=lambda c: c.name)
+def test_rejection_sampler_greedy_from_target_argmax(
+    case: RejectionSamplerCase, device
+):
+    """TPU_GREEDY_TOP_TOKENS verifies on the target's argmax tokens; the
+    result must equal the target_logits path."""
+    sampler = RejectionSampler()
+    segment_ids, group_indices = _segment_info(case.num_draft_per_seq, device)
+    inputs = dict(
+        draft_token_ids=torch.tensor(
+            case.draft_tokens, dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor(
+            case.num_draft_per_seq, dtype=torch.int32, device=device
+        ),
+        bonus_token_ids=torch.tensor(
+            case.bonus_tokens, dtype=torch.int64, device=device
+        ),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max(case.num_draft_per_seq),
+    )
+    target_logits = _target_logits_from_tokens(case.target_tokens, device)
+
+    from_logits = sampler(target_logits=target_logits, **inputs)
+    from_argmax = sampler(
+        target_logits=None,
+        target_argmax=torch.argmax(target_logits, dim=-1),
+        **inputs,
+    )
+
+    assert torch.equal(from_argmax, from_logits)
+
+
 def test_rejection_sampler_synthetic_converts_to_conditional_rates(device):
     sampler = _synthetic_sampler([0.8, 0.4, 0.0], device)
 
