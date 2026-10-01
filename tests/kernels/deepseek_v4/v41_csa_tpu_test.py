@@ -47,28 +47,38 @@ def test_native_packer_parity():
     np.testing.assert_array_equal(actual, native)
 
 
-def test_independent_rope_gather_and_legacy_default():
+@pytest.mark.parametrize("shared_pool", [False, True])
+@pytest.mark.parametrize("separate", [False, True])
+def test_independent_rope_gather_and_legacy_default(shared_pool, separate):
     _require_tpu()
     rng = np.random.default_rng(131)
     words = rng.integers(-(2**31), 2**31 - 1, (256, 1, 128), dtype=np.int32)
     nope = rng.integers(0, 256, 3 * 128, dtype=np.int32)
     rope = rng.integers(0, 1024, 3 * 128, dtype=np.int32)
-    for separate in (False, True):
-        ri = rope if separate else nope
-        gathered, rotary = csa_gather(
-            jnp.asarray(words),
-            jnp.asarray(words),
+    ri = rope if separate else nope
+
+    def gather(first, second):
+        return csa_gather(
+            first,
+            second,
             jnp.asarray(nope),
             top_k=128,
             rope_indices=jnp.asarray(ri) if separate else None,
+            shared_pool=shared_pool,
         )
-        np.testing.assert_array_equal(gathered, words.reshape(-1, 128)[nope])
-        selected = words.reshape(-1, 32)[ri].view(np.uint32)
-        bits = np.concatenate((selected & 65535, selected >> 16), axis=-1)
-        halves = bits.reshape(-1, 2, 64, 64)
-        rows = np.concatenate((halves[:, 0], halves[:, 1]), axis=-1).reshape(-1, 2, 128)
-        expected = (rows[:, 0] | (rows[:, 1] << 16)).view(np.int32)
-        np.testing.assert_array_equal(rotary, expected)
+
+    if shared_pool:
+        # One operand feeding both arguments reproduces XLA deduplication.
+        gathered, rotary = jax.jit(lambda pool: gather(pool, pool))(jnp.asarray(words))
+    else:
+        gathered, rotary = gather(jnp.asarray(words), jnp.asarray(words))
+    np.testing.assert_array_equal(gathered, words.reshape(-1, 128)[nope])
+    selected = words.reshape(-1, 32)[ri].view(np.uint32)
+    bits = np.concatenate((selected & 65535, selected >> 16), axis=-1)
+    halves = bits.reshape(-1, 2, 64, 64)
+    rows = np.concatenate((halves[:, 0], halves[:, 1]), axis=-1).reshape(-1, 2, 128)
+    expected = (rows[:, 0] | (rows[:, 1] << 16)).view(np.int32)
+    np.testing.assert_array_equal(rotary, expected)
 
 
 @pytest.mark.parametrize("tokens,topk", [(8, 71), (8, 1024), (128, 2048)])

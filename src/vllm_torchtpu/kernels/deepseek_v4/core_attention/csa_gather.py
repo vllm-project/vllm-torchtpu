@@ -40,14 +40,8 @@ def main_kernel(
     num_row_subchunks: int,
     num_streams: int,
     top_k: int,
+    shared_pool: bool,
 ):
-    # Keep both cache operands in 128-word rows at the custom-call boundary.
-    # They may alias one shared pool. Different operand shapes at that boundary
-    # make XLA deduplication bind the 32-word RoPE view to a 128-word argument.
-    # Reinterpret the untiled HBM reference inside the kernel instead.
-    rope_in_hbm_ref = rope_in_hbm_ref.reshape(
-        rope_in_hbm_ref.shape[0] * 4, csa_cache_layout.ROPE_WORDS
-    )
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None
@@ -61,7 +55,7 @@ def main_kernel(
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
     nope_in_cols = nope_in_hbm_ref.shape[1]
-    rope_in_cols = rope_in_hbm_ref.shape[1]
+    rope_in_cols = csa_cache_layout.ROPE_WORDS
     # A `bf16[n, 64]` output is tiled to 128 lanes, so XLA pads it and it
     # costs twice its own bytes -- on this kernel's write and on the
     # consumer's read. The output is 128 lanes wide instead, pairing entry `i`
@@ -69,14 +63,28 @@ def main_kernel(
     # consumer splits apart with a lane slice and a row concatenate.
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
 
-    def process_rope(gather_ref, out_ref, out_row_base=0):
+    def process_rope(gather_ref, out_ref, records, out_row_base=0):
+        words = gather_ref[...]
+        if shared_pool:
+            # An aliased pool must keep the same operand layout for both inputs.
+            # Current Mosaic cannot reshape a 1D-tiled HBM ref in the kernel.
+            # Gather a 128-word row, then select this token's 32-word quarter.
+            quarter = (records % 4)[:, None]
+            selected = jnp.zeros((row_subchunk_size, rope_in_cols), jnp.int32)
+            for part in range(4):
+                selected |= jnp.where(
+                    quarter == part,
+                    words[:, part * rope_in_cols : (part + 1) * rope_in_cols],
+                    0,
+                )
+            words = selected
         # bf16 output rows 2t and 2t + 1 are the low and high halves of int32
         # row t, so each output word pairs one rope value of an even entry
         # with the same value of the next entry. A cache rope word k holds
         # values k (low) and k + 32 (high).
         for t in range(num_simd_lanes // 2):
-            even = gather_ref[pl.ds(2 * t, 1), :]
-            odd = gather_ref[pl.ds(2 * t + 1, 1), :]
+            even = words[2 * t : 2 * t + 1, :]
+            odd = words[2 * t + 1 : 2 * t + 2, :]
             row = pl.ds(out_row_base + t, 1)
             out_ref[row, pl.ds(0, rope_in_cols)] = jnp.bitwise_or(
                 jnp.bitwise_and(even, 0xFFFF), jnp.left_shift(odd, 16)
@@ -133,6 +141,7 @@ def main_kernel(
                 process_rope(
                     gather_ref=rope_g[s],
                     out_ref=rope_o,
+                    records=idx_window(rope_idx_ref, r, s),
                     out_row_base=s * rope_rows_per_stream,
                 )
 
@@ -156,8 +165,11 @@ def main_kernel(
         # rope: gather the entry's own 32-word quarter row == index.
         rope_in_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(row_subchunk_size), rope_in_cols),
-                lambda r, s=s: (idx_window(rope_idx_ref, r, s), 0),
+                (pl.Indirect(row_subchunk_size), rope_in_hbm_ref.shape[1]),
+                lambda r, s=s: (
+                    idx_window(rope_idx_ref, r, s) // (4 if shared_pool else 1),
+                    0,
+                ),
             )
             for s in range(num_streams)
         )
@@ -210,7 +222,7 @@ def main_kernel(
     )(indices_hbm_ref, rope_indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k",))
+@functools.partial(jax.jit, static_argnames=("top_k", "shared_pool"))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -219,6 +231,7 @@ def csa_gather(
     *,
     top_k: int = 1024,
     rope_indices: jax.Array | None = None,
+    shared_pool: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -238,6 +251,8 @@ def csa_gather(
       rope_indices: Optional independent 32-word record addresses for RoPE.
         Defaults to indices. Shared pools can place NoPE and RoPE in separate
         page regions without materializing contiguous whole-cache views.
+      shared_pool: Keep both operands in 128-word rows when they may alias.
+        RoPE then gathers a full row and selects the requested quarter in VMEM.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -263,10 +278,12 @@ def csa_gather(
     assert rope_cache.shape[2] == csa_cache_layout.ROW_WORDS
 
     # A 128-lane int32 array's T(8,128) tiling is byte-identical to row-major.
-    # The kernel takes both operands untiled (`use_tc_tiling_on_sc=False`) and
-    # views RoPE as 32-word records internally, including when the pools alias.
+    # Distinct pools use 32-word RoPE gathers. Aliased pools keep identical
+    # operand shapes: XLA deduplication cannot bind two layouts to one argument.
     nope_cache = nope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
-    rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
+    rope_cache = rope_cache.reshape(
+        -1, csa_cache_layout.ROW_WORDS if shared_pool else csa_cache_layout.ROPE_WORDS
+    )
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
     out_size = indices.size
@@ -313,6 +330,7 @@ def csa_gather(
             num_row_subchunks=num_row_subchunks,
             num_streams=num_streams,
             top_k=top_k,
+            shared_pool=shared_pool,
         ),
         out_type=(
             jax.ShapeDtypeStruct(

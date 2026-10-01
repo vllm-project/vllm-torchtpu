@@ -912,6 +912,7 @@ def sparse_ragged_paged_attention(
                 if rope_gather_indices is None
                 else rope_gather_indices[start_pos * topk : end_pos * topk]
             ),
+            shared_pool=physical_indices is not None,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
