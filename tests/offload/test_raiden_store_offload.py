@@ -1439,6 +1439,16 @@ class TestWorkerSideConnector(unittest.TestCase):
         self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
         self.assertEqual(conn.get_block_ids_with_load_errors(), set())
 
+    def test_load_errors_group_index_is_unscoped(self):
+        # The runner calls this whenever failed block ids are reported.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            failed_load_device_block_ids=[10, 11],
+        )
+        conn.get_finished(set())
+        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
+        self.assertIsNone(conn.get_block_ids_with_load_errors_group_index())
+
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
         self.assertIsNone(conn.build_connector_worker_meta())

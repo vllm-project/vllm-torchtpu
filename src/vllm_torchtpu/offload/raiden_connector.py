@@ -509,6 +509,16 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self._load_error_block_ids = set()
         return block_ids
 
+    def get_block_ids_with_load_errors_group_index(self) -> int | None:
+        """Returns None: offload load errors are not scoped to one KV group.
+
+        The runner reads this whenever ``get_block_ids_with_load_errors``
+        returns a non-empty set. Failed device block ids come from the
+        scheduler-side block table and resolve against every cache group,
+        so there is no single group index to report.
+        """
+        return None
+
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if not (self._fenced_jobs or self._completed_jobs):
             return None
