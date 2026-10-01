@@ -35,12 +35,12 @@ from collections import Counter
 
 import pytest
 
-pytestmark = pytest.mark.skip(reason="known Raiden DMA uprev / DmaMap issue")
-
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
 from .tpu_test_utils import run_in_isolated_process
+
+pytestmark = pytest.mark.skip(reason="known Raiden DMA uprev / DmaMap issue")
 
 
 def _can_allocate_tpu_tensor() -> tuple[bool, str]:

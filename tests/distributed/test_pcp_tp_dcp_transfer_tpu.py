@@ -16,8 +16,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-pytestmark = pytest.mark.skip(reason="known Raiden DMA uprev / DmaMap issue")
-
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 
 from .raiden_test_utils import FakeTensor
@@ -29,6 +27,8 @@ from .test_raiden_fa_layout_calibration_tpu import (
     _require_e0_runtime,
 )
 from .tpu_test_utils import run_in_isolated_process
+
+pytestmark = pytest.mark.skip(reason="known Raiden DMA uprev / DmaMap issue")
 
 
 def _store(name):
