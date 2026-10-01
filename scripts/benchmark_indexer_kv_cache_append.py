@@ -811,8 +811,8 @@ def run_region_benchmark_for_tokens(
 
 
 def run_served_region_benchmarks(*, iters: int = 5, layers: int = 4) -> None:
-    """Runs Gate D served-shape Table B benchmarks (DCP16, block_size=256, max_num_seqs=8)
-    plus the DCP1 T=1/T=8 diagnostic comparison."""
+    """Runs Gate D served-shape Table B benchmarks (DCP16, block_size=256,
+    max_num_seqs=8) plus the DCP1 T=1/T=8 diagnostic comparison."""
     iters = max(5, iters)
     common = dict(
         page_size=256,
@@ -825,9 +825,9 @@ def run_served_region_benchmarks(*, iters: int = 5, layers: int = 4) -> None:
 
     # Served DCP16 scenarios (--block-size=256, --max-num-batched-tokens=4096,
     # --max-num-seqs=8, DCP16, interleave=4):
-    # - P90 context: 655360 + 8192 = 663552 (~41.5K tokens/rank/seq = 162 pages/rank/seq)
+    # - P90 context: 655360 + 8192 = 663552 (~41.5K tok/rank/seq = 162 pages/rank/seq)
     #   With pages_per_seq=164 and max_num_seqs=8, total pool = 1312 pages/rank.
-    # - P50 context: 163840 + 2048 = 165888 (~10.4K tokens/rank/seq = 40.5 pages/rank/seq)
+    # - P50 context: 163840 + 2048 = 165888 (~10.4K tok/rank/seq = 40.5 pages/rank/seq)
     #   With pages_per_seq=44 and max_num_seqs=8, total pool = 352 pages/rank.
     p90_decode_seq_len = 655360 + 8192
     p50_decode_seq_len = 163840 + 2048
@@ -989,4 +989,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

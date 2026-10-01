@@ -95,7 +95,7 @@ def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 
 def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
-    """True for the packed uint8 DSA indexer K-cache spec (`DeepseekV32IndexerCache`)."""
+    """True for packed uint8 DSA indexer K-cache (`DeepseekV32IndexerCache`)."""
     return (
         isinstance(spec, MLAAttentionSpec)
         and not spec.dtype.is_floating_point

@@ -547,4 +547,3 @@ def test_non_indexer_mla_specs_unaffected_by_indexer_kv_cache_mode(monkeypatch) 
             attention_backend=PallasAttentionBackend,
         )
         assert current == baseline
-

@@ -1340,7 +1340,8 @@ class CoalescedKvAppendTest(parameterized.TestCase):
             run_len = (idx % 4) + 1
             page = idx // 2
             tile_base = (idx % 2) * 128
-            # Keep inside the 128-lane tile for the first pass; cross-tile is tested below.
+            # Keep inside the 128-lane tile for the first pass; cross-tile is
+            # tested below.
             slot = tile_base + min(slot_mod_128, 128 - run_len)
             for r in range(run_len):
                 dst.append(page * page_size + slot + r)
@@ -1721,4 +1722,3 @@ class CoalescedKvAppendTest(parameterized.TestCase):
 
 if __name__ == "__main__":
     absltest.main()
-

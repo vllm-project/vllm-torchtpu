@@ -1096,12 +1096,11 @@ def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog)
     assert mla_attention_op._resolve_indexer_kv_cache_mode(
         cache_sal, k_packed, mode="sal"
     ) == ("pallas", KVLayout.SEQ_ALONG_LANE)
-    info_msgs = [
-        r.message for r in caplog.records if "indexer kv cache: mode=" in r.message
-    ]
+    prefix = "indexer kv cache: mode="
+    info_msgs = [r.message for r in caplog.records if prefix in r.message]
     assert info_msgs == [
-        "indexer kv cache: mode=has writer=pallas layout=HAS cache_shape=(4, 256, 4, 256)",
-        "indexer kv cache: mode=sal writer=pallas layout=SAL cache_shape=(4, 33, 4, 1024)",
+        f"{prefix}has writer=pallas layout=HAS cache_shape=(4, 256, 4, 256)",
+        f"{prefix}sal writer=pallas layout=SAL cache_shape=(4, 33, 4, 1024)",
     ]
 
     # Mismatched cache shape (HAS cache with block_size=1024 under mode='sal', or
@@ -1359,4 +1358,3 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             **common_kw,
         )
-

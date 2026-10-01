@@ -15,7 +15,6 @@
 
 import functools
 import logging
-import os
 
 import jax
 import jax.numpy as jnp
@@ -533,10 +532,7 @@ def indexer_kv_layout(
 
             raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
         except ImportError:
-            raw_mode = (
-                os.getenv("VLLM_TPU_INDEXER_KV_CACHE_MODE")
-                or DEFAULT_INDEXER_KV_CACHE_MODE
-            )
+            raw_mode = DEFAULT_INDEXER_KV_CACHE_MODE
     else:
         raw_mode = mode
     resolved = raw_mode.strip().lower()

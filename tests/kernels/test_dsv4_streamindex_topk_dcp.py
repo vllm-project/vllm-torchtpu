@@ -479,4 +479,3 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
 
     np.testing.assert_array_equal(topk_has, topk_xla)
     np.testing.assert_array_equal(topk_sal, topk_xla)
-
