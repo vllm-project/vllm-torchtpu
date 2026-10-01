@@ -487,15 +487,18 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     if state_layout == "split" and np.any(request_absolute_starts):
         # Nonzero history makes treating an absolute continuation as a fresh
         # request numerically observable in both conv and recurrent state.
-        conv_state0 = jax.random.normal(
-            keys[7], (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
-        ) * jnp.asarray(0.01, dtype=jnp.bfloat16)
+        conv_state0 = (
+            jax.random.normal(
+                keys[7], (num_blocks, kernel_size - 1, dim), dtype=jnp.float32
+            )
+            * 0.01
+        )
         rec_state0 = (
             jax.random.normal(keys[8], (num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
             * 0.01
         )
     else:
-        conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16)
+        conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim), dtype=jnp.float32)
         rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
     conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size), dtype=jnp.bfloat16)
     conv_bias0 = jax.random.normal(keys[4], (dim,), dtype=jnp.bfloat16)
@@ -797,7 +800,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     ref_z = projected_qkvz[:, qkv_dim:]
     b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
-    conv_state = jnp.zeros((num_blocks, kernel_size - 1, qkv_dim), dtype=jnp.bfloat16)
+    conv_state = jnp.zeros((num_blocks, kernel_size - 1, qkv_dim), dtype=jnp.float32)
     recurrent_state = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
     conv_weight = jax.random.normal(
         keys[3], (qkv_dim, 1, kernel_size), dtype=jnp.bfloat16
