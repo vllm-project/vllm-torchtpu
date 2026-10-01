@@ -208,11 +208,12 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
         scheduler.schedule()
     # 32K over 8 stages: 4K steps.
     assert scheduler._step_limit == 4096
-    # 8K left of a prompt: one granule per stage is the floor.
+    # 8K left of a prompt: 2K steps pad to the 4K bucket and take as long
+    # as 4K ones, so two 4K steps finish sooner than four.
     scheduler = _scheduler(cost=model, running=[_request(24576, 32768)])
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
-    assert scheduler._step_limit == 2048
+    assert scheduler._step_limit == 4096
     # Waiting requests count; enough work keeps full steps.
     waiting = [_request(0, 65536, f"w{i}") for i in range(4)]
     scheduler = _scheduler(cost=model, running=lone, waiting=waiting)
@@ -229,6 +230,27 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert scheduler._step_limit is None
+
+
+def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
+    # A 4K step costs more than an 8K one: a lone 8K prompt on 4 stages
+    # leaves sooner as one step (4 steps of 109 ms) than as two (5 of 118).
+    buckets = [4096, 8192, 12288, 16384]
+    linear = {4096: 118.0, 8192: 109.0, 12288: 133.0, 16384: 164.0}
+    model = StepCostModel(buckets, linear, 3.3e-8, 330.0, 4096)
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # Two such prompts: one each per step, not both in one.
+        scheduler.waiting = [_request(0, 8192, "w")]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # Four: still one prompt per step, all four stages busy.
+        scheduler.waiting = [_request(0, 8192, f"w{i}") for i in range(3)]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
 
 
 def test_schedule_resets_the_step_accounting():
