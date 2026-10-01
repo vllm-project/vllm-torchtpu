@@ -997,11 +997,11 @@ def test_mla_forward_uses_context_without_runtime_kv_scale_state():
 
 
 def test_indexer_kv_cache_mode_env_validation(monkeypatch):
-    """VLLM_TPU_INDEXER_KV_CACHE_MODE defaults to 'xla', normalizes case, and
+    """VLLM_TPU_INDEXER_KV_CACHE_MODE defaults to 'sal', normalizes case, and
     rejects unknown modes."""
     assert "VLLM_TPU_INDEXER_KV_CACHE_MODE" in TpuPlatform.additional_env_vars
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
-    assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "xla"
+    assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
 
     for raw, expected in [("HAS", "has"), ("SAL", "sal"), ("Xla", "xla")]:
         monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raw)

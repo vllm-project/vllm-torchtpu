@@ -421,6 +421,9 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
         page_size_padded=None,
     )
 
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
+
     for mode in ("xla", "has"):
         monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
         shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
