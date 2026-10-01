@@ -582,6 +582,48 @@ class TestPooledSpecWindows:
                 err_msg=f"step {step_num}",
             )
 
+    def test_spec_checkpoints_repeat_exactly(self):
+        # Four tiles of four verify windows: a tile's state write-back raced
+        # the refill of its VMEM slot two tiles later, so checkpoint 0 of
+        # the 2nd..4th sequence of a tile came out nondeterministic.
+        num_spec, window, n = 3, 4, 16
+        ckpt_indices = (
+            jnp.arange(1, n * window + 1, dtype=jnp.int32).reshape(window, n).T
+        )
+        pool = _garbage_pool(65, n * window + 1)
+        keys = iter(jax.random.split(jax.random.key(65), 2 * window))
+        for t in range(window):
+            pool = _write_states(
+                pool,
+                jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+                jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                    jnp.bfloat16
+                ),
+                ckpt_indices[:, t],
+            )
+        kwargs = _rand_inputs(66, n * window) | dict(
+            query_start_loc=jnp.arange(0, n * window + 1, window, dtype=jnp.int32),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+            read_offsets=jnp.asarray([i % window for i in range(n)], jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        runs = [
+            wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=ckpt_indices[:, 0],
+                state_source=jnp.copy(pool),
+                state_plan=_plan(pool),
+                **kwargs,
+            )[0]
+            for _ in range(3)
+        ]
+        first = np.asarray(runs[0].view(jnp.int16))
+        for again in runs[1:]:
+            np.testing.assert_array_equal(np.asarray(again.view(jnp.int16)), first)
+
 
 @pytest.mark.tpu_test
 class TestPooledCallerV3:
