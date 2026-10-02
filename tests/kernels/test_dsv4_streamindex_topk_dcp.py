@@ -416,7 +416,7 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
                 np.asarray(shards_has).reshape(
                     dcp_size, vpages, PAGE_SIZE // 4, 4, WIDTH
                 )[r],
-                head_dim=D_IDX,
+                actual_head_dim=D_IDX,
             )
             for r in range(dcp_size)
         ],
