@@ -724,7 +724,9 @@ class KimiK3ForConditionalGeneration(
 
     @staticmethod
     def _grid_thw_list(grid_thws: object) -> list[list[int]]:
-        return grid_thws.tolist() if isinstance(grid_thws, torch.Tensor) else grid_thws
+        if isinstance(grid_thws, torch.Tensor):
+            return cast(torch.Tensor, grid_thws).tolist()
+        return cast(list[list[int]], grid_thws)
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
