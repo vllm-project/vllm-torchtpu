@@ -828,6 +828,8 @@ class KimiK3ForConditionalGeneration(
         )
         values = dict(metadata)
         values["pixel_values"] = dummy_pixel_values
+        # None entries (sequence_lengths off FlashInfer) reach the encoder as is.
+        # pyrefly: ignore[bad-argument-type]
         return EncoderCudaGraphCaptureInputs(values=values)
 
     def prepare_encoder_cudagraph_replay_buffers(
