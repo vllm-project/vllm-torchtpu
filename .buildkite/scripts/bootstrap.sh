@@ -178,6 +178,14 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     "Not run on ${CI_FLEET}: no ${missing[*]} yet."
 fi
 
+# pipeline_build.yml skips the -omni image build when this is non-empty.
+# Buildkite rejects the upload if a skip reason is over 70 characters.
+OMNI_IMAGE_SKIP=""
+if [[ " ${lanes} " != *" tests "* ]]; then
+  OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+fi
+export OMNI_IMAGE_SKIP
+
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
 
