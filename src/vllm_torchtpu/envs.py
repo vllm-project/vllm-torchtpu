@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    USE_MOE_FUSED_TP_KERNEL: bool = False
+    MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -537,6 +539,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
+    ),
+    # Serve tensor-parallel (non-EP) MoE with the fused TP kernel
+    # (kernels/experimental/moe_fused_tp.py) when the token count is at most
+    # MOE_FUSED_TP_KERNEL_MAX_TOKENS. Larger shapes and unsupported layouts use
+    # the GMM path. Both are read once at import of fused_moe_gmm; the cap is
+    # compared with each call's static token count when it is traced.
+    "USE_MOE_FUSED_TP_KERNEL": env_bool("USE_MOE_FUSED_TP_KERNEL"),
+    "MOE_FUSED_TP_KERNEL_MAX_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_TP_KERNEL_MAX_TOKENS", 512
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

@@ -23,6 +23,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_fused_tp import (
+    can_use_fused_tp,
+    fused_moe_tp,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -63,6 +67,9 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+_FUSED_TP_MAX_TOKENS = (
+    envs.MOE_FUSED_TP_KERNEL_MAX_TOKENS if envs.USE_MOE_FUSED_TP_KERNEL else 0
+)
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -620,6 +627,28 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    # Tensor-parallel experts at decode-sized token counts: one fused kernel
+    # with no token permutation. Prefill buckets above the cap keep routed GMM.
+    if (
+        not use_ep
+        and 0 < num_tokens <= _FUSED_TP_MAX_TOKENS
+        and can_use_fused_tp(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        logger.info_once("Selected fused TP MoE kernel (max tokens %d)", _FUSED_TP_MAX_TOKENS)
+        return fused_moe_tp(
+            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
