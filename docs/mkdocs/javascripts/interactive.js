@@ -18,7 +18,7 @@
 
 const COMMAND_DATA = {
     "uv_pip": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry (for torch_tpu wheels):\ngcloud auth application-default login\n\n# 2. Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv sync --group vllm\nsource .venv/bin/activate`,
+        cmd: `# Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nVLLM_TARGET_DEVICE=empty uv sync --group vllm\nsource .venv/bin/activate`,
         inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch_tpu</code> dependencies into a managed virtual environment using <code>uv</code>."
     },
     "docker": {
@@ -32,8 +32,8 @@ const COMMAND_DATA = {
         }
     },
     "source": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry:\ngcloud auth application-default login\n\n# 2. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\n\n# 3. Install in editable mode with vllm and dev dependencies:\nuv pip install --prerelease=allow -e . --group vllm --group dev\n\n# 4. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
-        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group dev</code>. Optionally mount an editable <code>vllm</code> checkout."
+        cmd: `# 1. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\nexport UV_TORCH_BACKEND=cpu\n\n# 2. Install in editable mode with vllm and test dependencies:\nVLLM_TARGET_DEVICE=empty uv pip install -e . --group vllm --group test\n\n# 3. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group test</code>. Optionally mount an editable <code>vllm</code> checkout."
     }
 };
 

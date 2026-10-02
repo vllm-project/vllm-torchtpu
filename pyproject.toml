@@ -274,15 +274,15 @@ include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 
-[tool.uv]
-keyring-provider = "subprocess"
-
+# Default PyPI serves Linux x86_64 wheels of torch and torchvision built with
+# CUDA, which pulls gigabytes of unnecessary nvidia-* runtime dependencies onto
+# TPU hosts. Pin them to the official PyTorch CPU index while resolving all
+# other packages (including torch-tpu, libtpu, and tpu-sync-torch) from PyPI.
 [[tool.uv.index]]
-name = "torch-tpu-registry"
-# torch-tpu-release-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch-tpu = { index = "torch-tpu-registry" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
