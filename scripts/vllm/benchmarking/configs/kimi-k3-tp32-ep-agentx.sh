@@ -2,14 +2,15 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Kimi-K3 on the v7x-32 pod: server geometry for the InferenceX AgentX trace
 # replay (multi-turn agentic-coding sessions, 100k+ token contexts, heavy
-# prefix reuse), driven by agentx_sweep.sh. Derived from
-# kimi-k3-tp32-ep.sh; differences:
-#   - long context: MAX_MODEL_LEN default 131072 (the driver overrides it);
-#     the aiperf client filters traces above it
-#   - prefix caching via ENABLE_PREFIX_CACHING (driver --apc 1), which on the
-#     hybrid KDA+MLA model needs --mamba-cache-mode align and the unified KV
-#     pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1, exported by the driver)
-#   - throughput regime: MAX_NUM_SEQS = 2 x max concurrency (driver),
+# prefix reuse). agentx_sweep.sh starts this server; agentx_client.sh replays
+# the traces against it. Derived from kimi-k3-tp32-ep.sh; differences:
+#   - long context: MAX_MODEL_LEN default 131072, overridden by
+#     agentx_sweep.sh --max-model-len; the aiperf client filters traces above it
+#   - prefix caching via ENABLE_PREFIX_CACHING (agentx_sweep.sh --apc 1), which
+#     on the hybrid KDA+MLA model needs --mamba-cache-mode align and the
+#     unified KV pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1, exported by
+#     agentx_sweep.sh)
+#   - throughput regime: MAX_NUM_SEQS = 2 x AGENTX_CONC_LIST's top concurrency,
 #     batched tokens 8192, gpu-memory-utilization 0.85 (0.7 leaves ~3 GiB/rank
 #     of KV, far too little for concurrent 128k contexts)
 #   - --block-size 256: with the 16-token default, prefill at 100k+ context is
@@ -22,8 +23,8 @@
 #     (16 covers up to 16 sequences; 32..512 are added up to the first bucket
 #     that holds MAX_NUM_SEQS). Prefill chunks are 8192 with remainders padded to 1024/2048/4096.
 #   - the built-in harness bench is a 4-prompt 8k/1k warmup; the replay is
-#     driven by agentx_sweep.sh against the kept-alive server
-# K3_EXTRA_SERVE_ARGS (driver --extra-serve-args) is appended LAST, so it can
+#     driven by agentx_client.sh against the kept-alive server
+# K3_EXTRA_SERVE_ARGS (agentx_sweep.sh --extra-serve-args) is appended LAST, so it can
 # override any flag set here (vLLM takes the last occurrence of a flag).
 MODEL="moonshotai/Kimi-K3"
 MODEL_URI="${MODEL_URI:-gs://tpu-commons-ci/moonshootai/kimi/k3}"
@@ -31,6 +32,15 @@ TENSOR_PARALLELISM=32
 DATA_PARALLELISM=1
 ENABLE_EP=true
 QUANTIZATION=""
+# The AgentX cases: one trace replay per concurrency, ascending, against one
+# server. agentx_sweep.sh reads this and passes it to agentx_client.sh, and the
+# kube 1P1D lane reads it for the same purpose, so this list is the only place
+# that says what the sweep covers. MAX_NUM_SEQS below has to cover it.
+AGENTX_CONC_LIST="1 2 4 8"
+
+# Not the AgentX cases. run_benchmarks.sh insists on a fixed-sequence cell
+# before it will hand back a live server, and these are the smallest one that
+# boots; the replay that follows ignores them.
 ISL_OSL_CONFIGS="8192:1024"
 CONCURRENCY_OPTIONS="1"
 NUM_PROMPTS=4
@@ -38,7 +48,11 @@ RANDOM_RANGE_RATIO="0.0"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# Twice AGENTX_CONC_LIST's top concurrency, so the scheduler is never the limit
+# in a throughput measurement. agentx_sweep.sh checks the two agree instead of
+# deriving this, so that a server too small for the ladder fails at boot rather
+# than quietly capping the numbers.
+MAX_NUM_SEQS=16
 
 SERVER_READY_WAIT_MIN=240
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"

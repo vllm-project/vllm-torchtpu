@@ -39,12 +39,21 @@ save_now() {
     done
 }
 
-server_alive() { curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; }
+# k3_server_url: the base URL of the vLLM server to send requests to. Empty or
+# unset K3_SERVER_URL means agentx_sweep.sh or eval_conc_sweep.sh started that
+# server in this same container, so it is at 127.0.0.1:$PORT. A caller whose
+# server runs on another host - the kube 1P1D lane, where the servers are on TPU
+# pods and the client is in a CPU pod - sets K3_SERVER_URL to its URL. Resolved
+# per call, so neither PORT nor K3_SERVER_URL has to be set before this file is
+# sourced.
+k3_server_url() { echo "${K3_SERVER_URL:-http://127.0.0.1:$PORT}"; }
+
+server_alive() { curl -sf "$(k3_server_url)/v1/models" >/dev/null; }
 
 # Number of requests the engine holds (running + waiting), from /metrics.
 # The anchor stops vllm:num_requests_waiting_by_reason{...} from matching too.
 k3_engine_queue_depth() {
-    curl -s "http://127.0.0.1:$PORT/metrics" \
+    curl -s "$(k3_server_url)/metrics" \
         | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
 }
 
@@ -52,7 +61,7 @@ k3_engine_queue_depth() {
 # preemptions (a preempted request is re-prefilled from its KV state) and
 # finished requests. Printed as "preemptions=N finished=M".
 k3_engine_counters() {
-    curl -s "http://127.0.0.1:$PORT/metrics" | awk '
+    curl -s "$(k3_server_url)/metrics" | awk '
         /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
         /^vllm:request_success_total( |\{)/ {f+=$NF}
         END {printf "preemptions=%d finished=%d\n", p, f}'
@@ -103,9 +112,9 @@ k3_check_disk() {
 k3_boot_server() {
     local config="$1" t0 rc
     k3_check_disk 50 || return 1
-    bash "$K3_SWEEP_SCRIPT_DIR/cleanup_server.sh"
+    bash "$K3_BENCHMARKING_DIR/cleanup_server.sh"
     t0=$(date +%s)
-    "$K3_SWEEP_SCRIPT_DIR/run_benchmarks.sh" --config "$config" --results-dir "$RESULTS_DIR" --keep-alive --port "$PORT"
+    "$K3_BENCHMARKING_DIR/run_benchmarks.sh" --config "$config" --results-dir "$RESULTS_DIR" --keep-alive --port "$PORT"
     rc=$?
     if [ "$rc" -ne 0 ]; then
         log "FATAL: run_benchmarks.sh --config $config failed (rc=$rc): server boot or smoke bench failed; see server.log context below"
@@ -136,4 +145,7 @@ k3_dump_server_log_context() {
     tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
 }
 
-K3_SWEEP_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# run_benchmarks.sh, cleanup_server.sh and configs/ are shared with every other
+# model's benchmarks and stay in scripts/vllm/benchmarking/; these scripts live
+# two directories deeper, under benchmark/inferencex/kimi-k3/.
+K3_BENCHMARKING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../benchmarking" && pwd)"

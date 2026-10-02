@@ -75,7 +75,7 @@ SUMMARY_PRINTED=0
 # shellcheck disable=SC2317  # run by the EXIT trap
 cleanup() {
     log "cleanup"
-    bash "$SCRIPT_DIR/cleanup_server.sh"
+    bash "$K3_BENCHMARKING_DIR/cleanup_server.sh"
     k3_dump_server_log_context
     if [ -f "$SUMMARY" ] && [ "$SUMMARY_PRINTED" = "0" ]; then log "===== summary (partial) ====="; cat "$SUMMARY"; fi
     if [ -n "$GCS_ROOT" ] && command -v gsutil >/dev/null 2>&1; then

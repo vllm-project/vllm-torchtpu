@@ -52,7 +52,9 @@
 #   per chip, TTFT, TPOT, P90 interactivity, cache hit. A run below the
 #   model's native context replays only the traces that fit (the client logs
 #   how many), so it is a bring-up number, not a submission.
-#     K3_CONC_LIST         default 1,2,4,8   (none = GSM8K probe only)
+#   The concurrencies are AGENTX_CONC_LIST in that config, not a build
+#   variable: they have to stay matched to the config's MAX_NUM_SEQS, so a
+#   different ladder is a config edit.
 #     K3_CTX               default 131072    (max-model-len)
 #     K3_KV                default fp8       (fp8 | auto = bf16)
 #     K3_APC               default 0         (1 = prefix caching + unified KV pool)
@@ -107,7 +109,7 @@ steps:
     artifact_paths:
       - "perf_eval_results/**/*"
 
-  - label: "K3 perf sweep: AgentX conc ${K3_CONC_LIST:-1,2,4,8} ctx ${K3_CTX:-131072} kv ${K3_KV:-fp8} apc ${K3_APC:-0} spec ${K3_SPEC:-none} fast ${K3_FAST:-1} rq ${K3_MOE_REQUANT:-0} (TPU v7x-32)"
+  - label: "K3 perf sweep: AgentX ctx ${K3_CTX:-131072} kv ${K3_KV:-fp8} apc ${K3_APC:-0} spec ${K3_SPEC:-none} fast ${K3_FAST:-1} rq ${K3_MOE_REQUANT:-0} (TPU v7x-32)"
     key: k3_agentx_sweep
     if: 'build.env("K3_SWEEP") == "perf" || build.env("K3_SWEEP") == "both"'
     depends_on: build_docker
@@ -119,6 +121,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"
