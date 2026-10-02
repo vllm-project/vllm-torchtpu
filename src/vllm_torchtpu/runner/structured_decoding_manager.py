@@ -195,6 +195,7 @@ class StructuredDecodingManager:
                 assert target_row_starts is not None, (
                     f"chunk without target_logits scheduled drafts for request {req_id}"
                 )
+                assert draft_lengths_cpu is not None
                 assert draft_lengths_cpu[local_index] == num_drafts
                 row = int(target_row_starts[local_index])
                 self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
@@ -301,6 +302,8 @@ class StructuredDecodingManager:
             cur_end_idx=cur_end_idx,
         ):
             if target_logits is not None:
+                assert require_target is not None
+                assert target_bitmask is not None
                 target_logits = self.structured_decode(
                     require_target, target_bitmask, target_logits, arange
                 )

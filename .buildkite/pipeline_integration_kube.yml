@@ -36,23 +36,6 @@ x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
 x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
-  # Repeated from pipeline_build.yml because this pipeline is uploaded on its
-  # own rather than beside that one.
-  - label: ":docker: Build and Push CI Image"
-    key: "build_docker"
-    timeout_in_minutes: 120
-    agents:
-      queue: cpu_64_core
-    commands:
-      # setup_docker_env.sh reads the pinned vLLM commit from build metadata,
-      # which bootstrap.sh publishes only for the bare-metal pipeline slugs, so
-      # this lane resolves it from the same pyproject.toml pin itself.
-      - |
-        source .buildkite/scripts/configs/pipeline_config.sh
-        buildkite-agent meta-data set VLLM_COMMIT_HASH \
-          "${VLLM_COMMIT_HASH_OVERRIDE:-$(get_vllm_commit_hash)}"
-      - bash .buildkite/scripts/setup_docker_env.sh
-
   - group: "Integration Tests on TPU"
     key: "integration_tpu"
     steps:

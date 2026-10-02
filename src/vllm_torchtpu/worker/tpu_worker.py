@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import torch
@@ -401,7 +401,10 @@ class TPUWorker(WorkerBase):
 
         from vllm.platforms import current_platform
 
-        dist_backend = current_platform.get_worker_distributed_backend(dist_world_size)
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        tpu_platform = cast(TpuPlatform, current_platform)
+        dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
@@ -444,7 +447,10 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        # WorkerBase declares `nn.Module | None`; this worker always holds a
+        # TPUModelRunner from here on.
+        # pyrefly: ignore[bad-override-mutable-attribute]
+        self.model_runner: TPUModelRunner = TPUModelRunner(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
@@ -654,6 +660,7 @@ class TPUWorker(WorkerBase):
             # re-deriving it from the stop call's prefix.
             profile_dir = self.profile_run_dir
             if self.profile_capture_dir and self.profile_canonical_ts:
+                assert profile_dir is not None
                 profiler_trace.merge_rank_capture(
                     self.profile_capture_dir,
                     profile_dir,
