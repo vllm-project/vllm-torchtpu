@@ -375,8 +375,59 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
+    router_logits, score_bias, hash_ids = _simulated_routing_operands(
+        router_logits, score_bias, hash_ids
+    )
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+def _simulated_routing_operands(
+    router_logits: torch.Tensor,
+    score_bias: torch.Tensor | None,
+    hash_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """The kernel's routing operands, under `uniform_random` routing simulation.
+
+    The fused kernel scores and selects experts itself, so
+    `moe_routing.maybe_simulate_routing` never runs on this path. To make
+    `VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random` mean here what it
+    means on the grouped-matmul path -- every token's experts drawn uniformly
+    at random, so expert load is balanced in expectation -- the kernel is
+    handed operands whose top-k IS that draw:
+
+    - gating: f32 uniform noise plus the real logits' mean, the same anchor
+      `moe_routing._uniform_random_routing` uses. A uniform shift does not
+      change top-k; it keeps a data edge to this layer's activations so XLA
+      cannot hoist every layer's routing into one blob. The noise stays f32:
+      in bf16, a few hundred experts' noise values in [m, m + 1) collide and
+      top-k breaks the ties toward low expert ids, which is not uniform.
+    - score bias: zeros, so the correction bias cannot shift the draw.
+    - hash ids (hash-routed layers): top-k of the same noise.
+
+    The gate weights are the kernel's scoring of the noise rather than the
+    grouped-matmul path's ones; the expert choice, which is what the simulation
+    exists to control, is the same distribution. Profiling only: the model's
+    output is meaningless, as `moe_routing` already warns at import.
+
+    Returns the operands unchanged when no simulation is set.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    if (
+        moe_routing._SIMULATION_STRATEGY is None
+        or moe_routing._strategy_name != moe_routing._UNIFORM_RANDOM
+    ):
+        return router_logits, score_bias, hash_ids
+    noise = torch.rand_like(router_logits, dtype=torch.float32)
+    noise = noise + router_logits.float().mean()
+    if hash_ids is not None:
+        hash_ids = torch.topk(noise, k=hash_ids.shape[-1], dim=-1).indices.to(
+            torch.int32
+        )
+    if score_bias is not None:
+        score_bias = torch.zeros_like(score_bias)
+    return noise, score_bias, hash_ids
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -843,12 +894,18 @@ def _unsupported_routing_reason(layer, *, supplies_hash_ids=False) -> str | None
             )
     # The routing simulator replaces the routing output wholesale, so a run
     # that asked for it and got real routing is a profiling result that is
-    # quietly not the thing it claims to measure.
-    if moe_routing._SIMULATION_STRATEGY is not None:
+    # quietly not the thing it claims to measure. The kernel routes by itself,
+    # so it can only honour a strategy whose draw can be handed to it as
+    # routing operands: `uniform_random` can (`_simulated_routing_operands`),
+    # the others are refused.
+    if (
+        moe_routing._SIMULATION_STRATEGY is not None
+        and moe_routing._strategy_name != moe_routing._UNIFORM_RANDOM
+    ):
         return (
-            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set and the kernel "
-            "does its own routing, so the simulation would not be in "
-            "effect"
+            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set to a strategy other "
+            "than uniform_random and the kernel does its own routing, so the "
+            "simulation would not be in effect"
         )
     return None
 

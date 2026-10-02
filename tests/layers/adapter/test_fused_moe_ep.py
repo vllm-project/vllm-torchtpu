@@ -372,11 +372,63 @@ def test_refused_on_routing_the_kernel_does_not_implement(routing):
     assert _prebuild(_layer(**routing)) is None
 
 
-def test_refused_while_the_routing_simulator_is_on():
+def test_refused_while_a_non_uniform_routing_simulator_is_on():
     from vllm_torchtpu.layers.adapter import moe_routing
 
-    with patch.object(moe_routing, "_SIMULATION_STRATEGY", object()):
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", "normal_routing"),
+    ):
         assert _prebuild(_layer()) is None
+
+
+def test_arms_under_uniform_random_routing_simulation():
+    """uniform_random is honoured in-op (`_simulated_routing_operands`)."""
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM),
+    ):
+        assert _prebuild(_layer()) == "op"
+
+
+def test_simulated_routing_operands_are_untouched_without_a_simulator():
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    logits = torch.randn(4, 8, dtype=torch.bfloat16)
+    bias = torch.randn(8)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    with patch.object(moe_routing, "_SIMULATION_STRATEGY", None):
+        got = bridge._simulated_routing_operands(logits, bias, ids)
+    assert got[0] is logits and got[1] is bias and got[2] is ids
+
+
+def test_simulated_routing_operands_draw_uniform_experts():
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    tokens, experts, topk = 8192, 64, 4
+    logits = torch.randn(tokens, experts, dtype=torch.bfloat16)
+    bias = torch.randn(experts)
+    ids = torch.zeros(tokens, topk, dtype=torch.int32)
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM),
+    ):
+        gating, zero_bias, sim_ids = bridge._simulated_routing_operands(
+            logits, bias, ids
+        )
+    # f32 noise: bf16 would tie and bias top-k toward low expert ids.
+    assert gating.dtype == torch.float32 and gating.shape == logits.shape
+    assert torch.equal(zero_bias, torch.zeros_like(bias))
+    assert sim_ids.dtype == torch.int32 and sim_ids.shape == ids.shape
+    # Hash ids are the noise's own top-k: distinct per token, in range.
+    assert torch.equal(sim_ids, torch.topk(gating, k=topk, dim=-1).indices.int())
+    assert int(sim_ids.min()) >= 0 and int(sim_ids.max()) < experts
+    assert all(len(set(row)) == topk for row in sim_ids.tolist())
+    # Uniform: every expert's load is near tokens * topk / experts (512 here).
+    load = torch.bincount(sim_ids.flatten().long(), minlength=experts).float()
+    assert float(load.max() / load.mean()) < 1.25
 
 
 def test_arming_is_per_layer_not_per_process():
