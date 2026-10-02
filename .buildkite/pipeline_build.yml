@@ -22,3 +22,9 @@ steps:
           queue: cpu_64_core
         commands:
           - bash .buildkite/scripts/setup_docker_env.sh
+        # The torch-tpu virtual registry sometimes 404s a wheel it serves
+        # moments later; a build that fails that way passes on the next try.
+        retry:
+          automatic:
+            - exit_status: 1
+              limit: 1
