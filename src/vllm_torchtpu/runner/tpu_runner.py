@@ -3003,10 +3003,10 @@ class TPUModelRunner(GPUModelRunner):
             # Reuse cached device tensors — skip 3 H2D copies.
             query_start_loc = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
+            # None with mamba read offsets: the combined upload below sets it.
             request_distribution = self._cached_request_distribution
             assert query_start_loc is not None
             assert logits_indices is not None
-            assert request_distribution is not None
         else:
             # Compute and copy to device (first call or shape changed). Spec
             # steps miss the decode cache above but usually repeat the same
