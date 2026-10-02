@@ -5937,6 +5937,8 @@ class TPUModelRunner(GPUModelRunner):
                 through_handoff=True,
             )
             if self.most_model_len is not None:
+                assert self.num_reqs_most_model_len is not None
+                assert self.num_blocks_per_most_len_req is not None
                 self._dummy_run(
                     num_tokens,
                     self.num_reqs_most_model_len,
