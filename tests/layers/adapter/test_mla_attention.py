@@ -614,6 +614,62 @@ def _gate_wrapper(modules, q_lora_rank, **kwargs):
         )
 
 
+def test_mla_wrapper_forwards_the_shared_topk_buffer():
+    """A layer that reuses an earlier layer's indices has no indexer, so the
+    shared buffer is what states its top-k width to masked-dense admission."""
+    modules = _gate_modules("none", 2)
+    modules.topk_indices_buffer = torch.full((4, 2048), -1, dtype=torch.int32)
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmTPUMLAAttention"
+    ) as attention:
+        VllmMultiHeadLatentAttentionWrapper(
+            hidden_size=4,
+            num_heads=1,
+            scale=1.0,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=1,
+            v_head_dim=2,
+            q_lora_rank=2,
+            kv_lora_rank=2,
+            mla_modules=modules,
+        )
+    kwargs = attention.call_args.kwargs
+    assert kwargs["topk_indices_buffer"] is modules.topk_indices_buffer
+
+
+@pytest.mark.parametrize("allowed", [None, False, True])
+def test_sparse_mla_op_reads_admission_when_traced(allowed):
+    """The op is built before the KV cache is allocated, so it reads the
+    layer's admission when traced; an unadmitted layer passes False."""
+    impl, layer, _, _ = _make_impl_and_layer()
+    layer.layer_name = "model.layers.0.self_attn.attn"
+    layer.scale = 0.125
+    layer.kv_cache_quantized_dtype = None
+    captured = {}
+
+    def jax_op(name, fn, **kwargs):
+        captured["core"] = fn
+        return MagicMock()
+
+    with (
+        patch.object(attention_adapter.pallas, "jax_op", side_effect=jax_op),
+        patch.object(
+            attention_adapter,
+            "get_vllm_model_wrapper_context",
+            return_value=SimpleNamespace(mesh="mesh"),
+        ),
+        patch(
+            "vllm_torchtpu.layers.core.attention_interface.sparse_mla_attention"
+        ) as core,
+    ):
+        impl._build_sparse_mla_op(layer)
+        layer.mla_kv_spec = ("nope_spec", "rope_spec")
+        if allowed is not None:
+            layer.allow_masked_dense = allowed
+        captured["core"](*range(11))
+    assert core.call_args.kwargs["allow_masked_dense"] is bool(allowed)
+
+
 @pytest.mark.parametrize(
     "gate_mode,q_lora_rank",
     [("none", None), ("none", 2), ("separate", None), ("separate", 2), ("fused", 2)],

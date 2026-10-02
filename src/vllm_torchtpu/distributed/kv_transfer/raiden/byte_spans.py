@@ -207,15 +207,12 @@ def lower_gdn_state_shard_spans(
         name = str(_region_value(region, "name"))
         if name in normalized:
             raise ValueError(f"duplicate GDN state region {name!r} ({tag})")
-        values = tuple(
-            int(_region_value(region, field))
-            for field in (
-                "offset_bytes",
-                "stride_bytes",
-                "unit_bytes",
-                "num_units",
-                "units_per_stride",
-            )
+        values = (
+            int(_region_value(region, "offset_bytes")),
+            int(_region_value(region, "stride_bytes")),
+            int(_region_value(region, "unit_bytes")),
+            int(_region_value(region, "num_units")),
+            int(_region_value(region, "units_per_stride")),
         )
         if min(values) < 0 or values[2] <= 0 or values[3] <= 0 or values[4] <= 0:
             raise ValueError(f"invalid GDN state region {name!r} ({tag})")

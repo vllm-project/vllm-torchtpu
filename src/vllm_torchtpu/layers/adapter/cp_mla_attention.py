@@ -119,5 +119,15 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     denom = weights.sum(dim=0)
     safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
 
-    mine = weights[int(group.rank_in_group)] / safe_denom
+    # This rank's row of `gathered` is `lse_f32` itself. Weighting from the
+    # local copy instead of indexing by rank keeps the rank out of the traced
+    # program, so every DCP rank compiles the same executable.
+    mine = (
+        torch.where(
+            torch.isfinite(lse_f32),
+            torch.exp(lse_f32 - shift),
+            torch.zeros_like(lse_f32),
+        )
+        / safe_denom
+    )
     return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()

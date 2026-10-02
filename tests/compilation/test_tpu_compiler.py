@@ -448,3 +448,22 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
+        """A bucket's HLO, and so its cache key, must not depend on what the
+        rank compiled before it."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        firsts = []
+
+        def fake_backend(graph, example_inputs):
+            firsts.append(config.reserve_scheduling_group_ids(3))
+            return lambda *args: args
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        compiler = TpuCompilerAdaptor()
+        compiler._run_backend(None, [])
+        compiler._run_backend(None, [])
+        assert firsts == [1, 1]

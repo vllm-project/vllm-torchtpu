@@ -11,7 +11,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -54,9 +54,11 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -84,6 +86,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
@@ -94,6 +97,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
+    copy_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -116,7 +120,10 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
-from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_encoder_manager import (
+    MMEncoderManager,
+    maybe_create_mm_encoder_manager,
+)
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
@@ -501,6 +508,22 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    rejection_sampler: RejectionSampler | None
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    model: torch.nn.Module
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    input_ids: torch.Tensor
+    empty_slot_mappings: dict[int, torch.Tensor]
+
+    @property
+    def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
+        drafter = self.drafter
+        assert isinstance(drafter, (DFlashProposer, Eagle3Proposer))
+        return drafter
+
     @property
     def _is_async_drafter(self) -> bool:
         if not self.speculative_config:
@@ -649,7 +672,7 @@ class TPUModelRunner(GPUModelRunner):
         # `_read_offset_reset_scratch`.
         self._read_offset_scratch: dict[
             tuple[int, str],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
@@ -687,6 +710,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
+        self._dp_step_has_encoder_inputs = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -709,7 +733,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-        self._hidden_states_dtype = self.dtype
+        self._hidden_states_dtype = cast(torch.dtype, self.dtype)
 
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
@@ -761,6 +785,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # Pallas attention bookkeeping.
         self._attention_kernels_initialized = False
+        # Set while allocating KV caches: whether every sparse MLA layer
+        # matches the masked-dense routing profile, so requests may be ordered
+        # by KV length. None until a sparse MLA layer is allocated.
+        self._masked_dense_groups_requests: bool | None = None
 
         # CPU staging tensors (TPU prepares inputs on CPU then transfers).
         self.input_ids_cpu = torch.zeros(
@@ -1426,6 +1454,9 @@ class TPUModelRunner(GPUModelRunner):
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
+        mla_dispatch.maybe_order_prefills_by_kv_len(
+            self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+        )
         return num_decode, num_windowed
 
     def _build_attention_metadata(
@@ -1435,7 +1466,7 @@ class TPUModelRunner(GPUModelRunner):
         max_query_len: int = 1,
         num_tokens_padded: int | None = None,
         num_reqs_padded: int | None = None,
-        slot_mappings: torch.Tensor | None = None,
+        slot_mappings: dict[int, torch.Tensor] | None = None,
     ) -> tuple[dict[str, AttentionMetadata], None]:
         """Lean TPU group walk: stage one batched block-table upload, then
         build every group's metadata straight from the builder context.
@@ -1719,6 +1750,7 @@ class TPUModelRunner(GPUModelRunner):
             cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
+        assert self._mamba_state_block_size is not None
         col_stride = self._mamba_state_block_size * cp_world_size
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
@@ -1770,6 +1802,7 @@ class TPUModelRunner(GPUModelRunner):
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
             state_srcs: list[int] = []
+            new_owners: list[bool] = []
             ckpt_rows: list[list[int]] = []
             for row, prev, curr in crossings:
                 src = int(bt[row, prev])
@@ -1779,6 +1812,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     state_srcs.append(src)
+                    new_owners.append(req_ids[row] not in self._mamba_offset_seeded)
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
@@ -1796,7 +1830,7 @@ class TPUModelRunner(GPUModelRunner):
             if spec_seed:
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
-                src_t = self._spec_seed_sources(state_srcs, ckpt_rows)
+                src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
                 dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
                     self.device, non_blocking=True
                 )
@@ -1903,7 +1937,10 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _spec_seed_sources(
-        self, state_srcs: list[int], ckpt_rows: list[list[int]]
+        self,
+        state_srcs: list[int],
+        ckpt_rows: list[list[int]],
+        new_owners: list[bool],
     ) -> torch.Tensor:
         """Seed source per crossing: the checkpoint being resumed from.
 
@@ -1921,6 +1958,15 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        # PD and prefix-cache restores provide committed state in checkpoint 0.
+        # A recycled source block can retain another request's MTP offset.
+        # The first-forward reset clears the destination, after this source
+        # selection, so ignore that stale offset here without mutating the
+        # source block (which may be shared). Live requests retain their offset.
+        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
+            self.device, non_blocking=True
+        )
+        off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
@@ -1957,7 +2003,8 @@ class TPUModelRunner(GPUModelRunner):
             "page-local KV block copy requires the unified KV pool"
         )
 
-        if getattr(self, "mamba_slot_read_offsets", None) is not None:
+        read_offsets = getattr(self, "mamba_slot_read_offsets", None)
+        if read_offsets is not None:
             mgr_pairs = [
                 (block_copy.src_block_id, block_copy.dst_block_id)
                 for block_copy in copies
@@ -1969,9 +2016,7 @@ class TPUModelRunner(GPUModelRunner):
             mgr_dst_t = torch.tensor([d for _, d in mgr_pairs], dtype=torch.long).to(
                 self.device, non_blocking=True
             )
-            _rollback_offsets_migrate(
-                self.mamba_slot_read_offsets, mgr_src_t, mgr_dst_t
-            )
+            _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
 
         split = self._pool_block_split
         pairs = [
@@ -1987,6 +2032,104 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+
+    def _dense_kv_copy_supported(self) -> bool:
+        """Whether CoW copies run on the per-layer KV cache tensors.
+
+        Only when DCP fine-grained prefix hits are active (see
+        ``_patch_vllm_dcp_fine_prefix_hits``), the one config whose copies
+        this path precompiles; any other emitter keeps the generic path.
+        Attention-only models outside the unified pool bind one tensor per
+        layer whose dim 0 is the (kernel-granular) block axis. Mamba state
+        without the unified pool is not block-indexed that way.
+        """
+        from vllm_torchtpu import _dcp_fine_prefix_match_unit
+
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        if (
+            kv_cache_config is None
+            or kv_cache_config.has_mamba_layers
+            or self.is_unified_pool_used()
+            or not getattr(self, "kv_caches", None)
+        ):
+            return False
+        # Fixed once the KV cache config is set; cache it per config.
+        cached = getattr(self, "_dense_kv_copy_cache", None)
+        if cached is None or cached[0] is not kv_cache_config:
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, self.vllm_config)
+            cached = (kv_cache_config, unit is not None)
+            self._dense_kv_copy_cache = cached
+        return cached[1]
+
+    def _dense_kv_copy_pool_sets(self) -> dict[int, list[torch.Tensor]]:
+        """Group the unique per-layer caches by manager-block split.
+
+        ``kv_caches`` may alias one tensor under several layers (shared KV).
+        A manager block spans ``split = dim0 // num_blocks`` consecutive
+        kernel blocks (under DCP, the rank-local slice of the logical block;
+        every rank copies its own slice under the same block ids). The MLA
+        latent cache and the DSA indexer cache are both such tensors.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        pool_sets: dict[int, list[torch.Tensor]] = {}
+        seen: set[int] = set()
+        for cache in self.kv_caches:
+            if id(cache) in seen:
+                continue
+            seen.add(id(cache))
+            assert cache.shape[0] % num_blocks == 0, (
+                f"KV cache dim 0 ({cache.shape[0]}) is not a multiple of "
+                f"num_blocks ({num_blocks})"
+            )
+            pool_sets.setdefault(cache.shape[0] // num_blocks, []).append(cache)
+        return pool_sets
+
+    def _apply_dense_kv_cache_block_copies(self, copies) -> None:
+        """Copy CoW blocks in every per-layer KV cache tensor.
+
+        Pairs fan out by each tensor's split and are padded to the seed-copy
+        bucket ladder with ``(0, 0)`` no-ops, so the compiled program sees a
+        few fixed shapes instead of one per copy count.
+        """
+        assert copies, "dense KV block copy requires at least one pair"
+        for split, pools in self._dense_kv_copy_pool_sets().items():
+            pairs = [
+                (c.src_block_id * split + j, c.dst_block_id * split + j)
+                for c in copies
+                for j in range(split)
+            ]
+            pairs = self._pad_to_bucket(pairs, pad=(0, 0))
+            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            copy_pool_blocks(pools, src_t, dst_t)
+
+    def _precompile_dense_kv_cache_block_copies(self) -> None:
+        """Warm the dense CoW copy program at every bucket length.
+
+        Only when fine-grained prefix hits can emit copies for this layout
+        (see ``_patch_vllm_dcp_fine_prefix_hits``). Must run while the caches
+        are quiescent, like the seed-copy precompile. All-zero indices copy
+        the null block onto itself.
+        """
+        if not self._dense_kv_copy_supported():
+            return
+        pool_sets = self._dense_kv_copy_pool_sets()
+        # At most one CoW pair per newly scheduled request per step.
+        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+            for split, pools in pool_sets.items():
+                synchronize_tensors(pools)
+                limit = self._bucket_len(self.max_num_reqs * split)
+                n = 8
+                while n <= limit:
+                    src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    copy_pool_blocks(pools, src, dst)
+                    n *= 4
+                synchronize_tensors(pools)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -2258,17 +2401,25 @@ class TPUModelRunner(GPUModelRunner):
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
+        # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
+        # prefix hits on an MLA model: copy with the same donating program.
+        use_dense_copy = bool(
+            copies and not use_page_local_copy and self._dense_kv_copy_supported()
+        )
         # The base implementation uses an advanced-index assignment which
         # TorchTPU functionalizes into a full raw-storage result. Hide only
         # the copy field from it; block zeroing and state updates stay intact.
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
-            if use_page_local_copy
+            if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
+        elif use_dense_copy:
+            self._apply_dense_kv_cache_block_copies(copies)
         return result
 
     def _modify_prev_results(self):
@@ -2539,6 +2690,7 @@ class TPUModelRunner(GPUModelRunner):
     ):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
+        assert self.reorder_batch_threshold is not None
         rpa_num_decode_reqs = (
             num_windowed_reqs if self.reorder_batch_threshold > 1 else num_decode_reqs
         )
@@ -2679,7 +2831,7 @@ class TPUModelRunner(GPUModelRunner):
             use_max_model_len,
         )
 
-        request_major_input_ids_cpu: torch.Tensor
+        request_major_input_ids_cpu: torch.Tensor | None = None
         if self._pcp_enabled and self._mtp_enabled:
             # prepare_real() may repack input_ids_cpu in place. Preserve only
             # the real request-major prefix before crossing that boundary.
@@ -2711,6 +2863,7 @@ class TPUModelRunner(GPUModelRunner):
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
+            assert request_major_input_ids_cpu is not None
             request_major_input_ids_cpu_padded = torch.zeros(
                 layout_plan.global_padded_num_tokens,
                 dtype=request_major_input_ids_cpu.dtype,
@@ -2839,6 +2992,9 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
             request_distribution = self._cached_request_distribution
+            assert query_start_loc is not None
+            assert logits_indices is not None
+            assert request_distribution is not None
         else:
             # Compute and copy to device (first call or shape changed).
             if use_max_model_len:
@@ -2846,6 +3002,7 @@ class TPUModelRunner(GPUModelRunner):
                     : self.num_reqs_max_model_len + 1
                 ].to(self.device, non_blocking=True)
             else:
+                assert self.num_reqs_most_model_len is not None
                 query_start_loc = self.query_start_loc_cpu[
                     : self.num_reqs_most_model_len + 1
                 ].to(self.device, non_blocking=True)
@@ -3127,7 +3284,11 @@ class TPUModelRunner(GPUModelRunner):
         return num_chunks, max_chunk_reqs
 
     def _dp_coordinated_step(
-        self, local_num_tokens: int, local_num_chunks: int, local_num_reqs: int = 0
+        self,
+        local_num_tokens: int,
+        local_num_chunks: int,
+        local_num_reqs: int = 0,
+        has_encoder_inputs: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         if not self._dp_lockstep_enabled():
@@ -3139,7 +3300,12 @@ class TPUModelRunner(GPUModelRunner):
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
         t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
+            [
+                int(local_num_tokens),
+                int(local_num_chunks),
+                int(local_num_reqs),
+                int(has_encoder_inputs),
+            ],
             dtype=torch.int64,
             device="cpu",
         )
@@ -3152,7 +3318,56 @@ class TPUModelRunner(GPUModelRunner):
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
+        self._dp_step_has_encoder_inputs = bool(t[3].item())
         return bucket, int(t[1].item())
+
+    def _execute_dp_mm_encoder(
+        self, scheduler_output: "SchedulerOutput | None" = None
+    ) -> None:
+        if not self._dp_step_has_encoder_inputs:
+            return
+        manager = cast(MMEncoderManager | None, self.encoder_cudagraph_manager)
+        if manager is None:
+            raise ValueError(
+                "Multimodal attention DP with EP requires encoder graph replay "
+                "(cudagraph_mm_encoder=True) and a supported model"
+            )
+        mm_hashes: list[str] = []
+        kwargs = None
+        input_error = None
+        try:
+            if scheduler_output is not None:
+                mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(
+                    scheduler_output
+                )
+                if mm_kwargs:
+                    if self.lora_config or any(m != "image" for m, _ in mm_kwargs):
+                        raise ValueError(
+                            "Coordinated encoding supports images without LoRA"
+                        )
+                    batches = list(
+                        group_and_batch_mm_kwargs(
+                            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
+                        )
+                    )
+                    if len(batches) != 1:
+                        raise ValueError(
+                            "Coordinated encoding requires one image batch"
+                        )
+                    kwargs = batches[0][2]
+        except (KeyError, TypeError, ValueError) as exc:
+            input_error = str(exc)
+        synchronize_tensors()
+        outputs = manager.execute_dp_coordinated(kwargs, input_error=input_error)
+        synchronize_tensors()
+        if scheduler_output is not None:
+            for mm_hash, output in zip(mm_hashes, outputs, strict=True):
+                self._cache_encoder_output(
+                    mm_hash,
+                    output,
+                    scheduler_output.ec_manager_metadata,
+                    scheduler_output.free_encoder_mm_hashes,
+                )
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(
@@ -3164,11 +3379,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
-        """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
-        busy rank does — ALL target dummy forwards, then ALL draft dummy
-        forwards.
-        """
-        # Set before any dummy fires: both _run_dp_dummy_chunk and the draft
+        """Pair encoder, target and draft collectives on an idle EP-DP rank."""
+        self._execute_dp_mm_encoder()
+        # Set before decoder dummies: both _run_dp_dummy_chunk and the draft
         # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
         # equal-token shape.
         self._dp_target_bucket = bucket
@@ -3179,7 +3392,7 @@ class TPUModelRunner(GPUModelRunner):
         # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self.drafter.run_dp_dummy_draft(num_chunks)
+            self._async_drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
@@ -3196,7 +3409,7 @@ class TPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3233,24 +3446,38 @@ class TPUModelRunner(GPUModelRunner):
                         f"num_prompt_tokens={num_prompt}. "
                         "Set SamplingParams(max_tokens=1) at the service entry."
                     )
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output
+        )
+        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            local_num_reqs=local_max_chunk_reqs,
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+        )
+        self._dp_step_num_chunks = target_num_chunks
+
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs and self._pp_is_first:
-            has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
-            if has_encoder_inputs:
-                synchronize_tensors()
-            self._execute_mm_encoder(scheduler_output)
-            if has_encoder_inputs:
-                synchronize_tensors()
-
-        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
-            scheduler_output
-        )
+            if self._dp_lockstep_enabled():
+                self._execute_dp_mm_encoder(scheduler_output)
+            else:
+                has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+                if has_encoder_inputs:
+                    synchronize_tensors()
+                self._execute_mm_encoder(scheduler_output)
+                if has_encoder_inputs:
+                    synchronize_tensors()
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
+        batch_composition_stats = None
         if self.phase_based_profiler:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
@@ -3296,22 +3523,6 @@ class TPUModelRunner(GPUModelRunner):
                 mm_cumsum_np = np.concatenate(
                     [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
                 )
-
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
-        )
-        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
-            local_num_chunks,
-            # Exact per-chunk request bound on this rank; the DP-wide MAX of
-            # it sizes every rank's draft forwards.
-            local_num_reqs=local_max_chunk_reqs,
-        )
-        # Retained for the spec-decode propose phase (sample_tokens): under
-        # EP-DP locksteps every rank must run the same number of draft forwards per
-        # step, and the coordinated chunk count from this one all-reduce is the shared
-        # bound — no additional draft-side collective is needed.
-        self._dp_step_num_chunks = target_num_chunks
 
         start_index = 0
         chunk_index = 0
@@ -3395,10 +3606,12 @@ class TPUModelRunner(GPUModelRunner):
             # come from the host-side cumsum, so no per-chunk device sync.
             chunk_mm_inputs = None
             if is_mm_embed_full is not None:
+                assert mm_tok_cumsum is not None
                 tok_start = int(mm_tok_cumsum[start_index])
                 tok_end = int(mm_tok_cumsum[end_index])
                 is_mm_chunk = is_mm_embed_full[tok_start:tok_end]
                 if mm_cumsum_np is not None:
+                    assert mm_embeds_flat is not None
                     mm_start = int(mm_cumsum_np[tok_start])
                     mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
                     chunk_embeds = (
@@ -3424,19 +3637,21 @@ class TPUModelRunner(GPUModelRunner):
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
             # For multimodal models _get_model_inputs returns input_ids=None
             # and packs the tokens into inputs_embeds; use whichever exists.
-            num_tokens_padded = (
-                input_ids if input_ids is not None else inputs_embeds
-            ).shape[0]
+            sizing_input = input_ids if input_ids is not None else inputs_embeds
+            assert sizing_input is not None
+            num_tokens_padded = sizing_input.shape[0]
             self._token_padding_update(num_tokens_padded)
             intermediate_tensors = None
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
 
-            trace_kwargs = {}
+            trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
-                trace_kwargs = extract_request_ids_for_tracing(
-                    self.input_batch.req_ids, start_index, num_reqs
+                trace_kwargs.update(
+                    extract_request_ids_for_tracing(
+                        self.input_batch.req_ids, start_index, num_reqs
+                    )
                 )
                 trace_kwargs.update(
                     extract_kv_lens_for_tracing(
@@ -3444,7 +3659,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
-            if self.phase_based_profiler and "batch_composition_stats" in locals():
+            if self.phase_based_profiler and batch_composition_stats is not None:
                 stats_map = {
                     "num_prefill_tokens": "num_prefill_tokens",
                     "num_decode_tokens": "num_decode_tokens",
@@ -3498,6 +3713,7 @@ class TPUModelRunner(GPUModelRunner):
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
+                assert self._pp_wave is not None
                 self._pp_wave.end_forward(
                     self._pp_outgoing_tensors(hidden_states.tensors, num_tokens_padded),
                     num_tokens_padded,
@@ -3584,6 +3800,7 @@ class TPUModelRunner(GPUModelRunner):
                 # captured by the group builders during metadata build.
                 mamba_state_indices_list.append(ctx.unified_mamba_state_indices)
             if is_draft_model:
+                assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
@@ -3838,6 +4055,7 @@ class TPUModelRunner(GPUModelRunner):
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk.
         """
+        req_temperatures = req_top_k = req_top_p = None
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -3858,6 +4076,7 @@ class TPUModelRunner(GPUModelRunner):
                         cur_end_idx,
                     )
                 )
+                assert target_logits is not None
             if all_greedy:
                 bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
             else:
@@ -3876,6 +4095,8 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                 ).view(-1)
         accept_u = None
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
             accept_u = torch.rand(
                 md.draft_token_ids.shape,
@@ -3895,6 +4116,9 @@ class TPUModelRunner(GPUModelRunner):
                 accept_u=accept_u,
             )
         assert accept_u is not None
+        assert req_temperatures is not None
+        assert req_top_k is not None
+        assert req_top_p is not None
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
@@ -3932,7 +4156,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Hand the per-chunk draft inputs to the drafter.
         if self._is_async_drafter:
-            self.drafter.draft_chunks = state.draft_chunks
+            self._async_drafter.draft_chunks = state.draft_chunks
 
         # Prepare inputs, the requests might be split into multiple
         # executions, combine the result of each execution.
@@ -3968,14 +4192,14 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
+        # Per-chunk device rejection outputs, kept for the async-spec
+        # producer below.
+        next_tokens_per_chunk: list[torch.Tensor] = []
         if self.is_pooling_model:
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
         elif is_spec_step:
-            # Per-chunk device rejection outputs, kept for the async-spec
-            # producer below.
-            next_tokens_per_chunk: list[torch.Tensor] = []
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, md, mamba_indices in zip(
@@ -4049,6 +4273,7 @@ class TPUModelRunner(GPUModelRunner):
                                 top_p_tpu,
                                 all_greedy=False,
                             )
+                    assert self.speculative_config is not None
                     padded = torch.full(
                         (
                             selected.shape[0],
@@ -4131,6 +4356,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
                 if needs_logprobs:
+                    assert logprobs is not None
                     sliced_logprobs = LogprobsTensors(
                         logprobs.logprob_token_ids[:num_reqs],
                         logprobs.logprobs[:num_reqs],
@@ -4218,7 +4444,7 @@ class TPUModelRunner(GPUModelRunner):
         # manager for take_draft_token_ids(). ngram has no device path and
         # keeps proposing from the host-materialized output in the sync block
         # below.
-        is_async = self.scheduler_config.async_scheduling
+        is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
         if self._is_async_drafter and combined_selected_tokens:
             if is_spec_step:
@@ -4361,6 +4587,7 @@ class TPUModelRunner(GPUModelRunner):
                 # positions are unchanged. Spec only (stride 1+K); pure-non-spec
                 # async keeps its stride-1 source + existing precompile.
                 if spec_num_rejected is not None:
+                    assert self.speculative_config is not None
                     bound = self.max_num_reqs * (
                         1 + self.speculative_config.num_speculative_tokens
                     )
@@ -4381,7 +4608,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 self._pre_async_results = None
 
-        pooler_output = []
+        pooler_output: list[torch.Tensor | None] = []
         if self.is_pooling_model:
             for out in state.pooler_output_list:
                 # Move to CPU as expected by vLLM
@@ -4474,7 +4701,8 @@ class TPUModelRunner(GPUModelRunner):
             ),
             set_current_vllm_config(self.vllm_config),
         ):
-            model = model_loader.load_model(
+            load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
+            model = load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
@@ -4498,7 +4726,7 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
-            self.drafter.load_model(self.model)
+            self._async_drafter.load_model(self.model)
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
@@ -4566,11 +4794,10 @@ class TPUModelRunner(GPUModelRunner):
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
             for name, attn_layer in layers.items():
-                if isinstance(
-                    getattr(attn_layer, "impl", None), PallasAttentionBackendImpl
-                ):
+                impl = getattr(attn_layer, "impl", None)
+                if isinstance(impl, PallasAttentionBackendImpl):
                     is_draft = name in draft_attn_names
-                    pre_w = attn_layer.impl.decode_query_size
+                    pre_w = impl.decode_query_size
                     # Keep a sharded draft at its K+1 decode tile. The drafter's
                     # first pass attends with the TARGET's request_distribution
                     # (eagle3 `_build_draft_attn_metadata`, step_idx == 0), so
@@ -4582,30 +4809,35 @@ class TPUModelRunner(GPUModelRunner):
                     # A REPLICATED (tp=1) draft moves to the LOCAL (non-shard_map)
                     # kernel, which is 1-wide; its width is folded into the
                     # threshold below.
-                    if (
-                        is_draft
-                        and self.speculative_config.draft_tensor_parallel_size == 1
-                    ):
-                        attn_layer.impl.decode_query_size = 1
+                    replicated_draft = False
+                    if is_draft:
+                        assert self.speculative_config is not None
+                        replicated_draft = (
+                            self.speculative_config.draft_tensor_parallel_size == 1
+                        )
+                    if replicated_draft:
+                        impl.decode_query_size = 1
                         # Instance attrs shadow the ClassVars; unique prefix
                         # keeps the local kernel op out of the sharded
                         # registry.
-                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                        # pyrefly: ignore[read-only]
+                        impl._kernel_entry = _pallas_rpa_kernel_local
+                        # pyrefly: ignore[read-only]
+                        impl._kernel_op_prefix = "pallas::rpa_kernel_local"
                         logger.info(
                             "Draft attn %s -> LOCAL (non-shard_map) RPA "
                             "kernel | DRAFT_KV_BLOCK_CAP=%d",
                             name,
                             _DRAFT_KV_BLOCK_CAP,
                         )
-                    attn_layer.impl.initialize_kernel(attn_layer)
+                    impl.initialize_kernel(cast(AttentionLayer, attn_layer))
                     layer_widths.append(
                         (
                             "draft" if is_draft else "target",
-                            type(attn_layer.impl).__name__,
+                            type(impl).__name__,
                             pre_w,
-                            attn_layer.impl.decode_query_size,
-                            getattr(attn_layer.impl, "head_size", None),
+                            impl.decode_query_size,
+                            getattr(impl, "head_size", None),
                         )
                     )
                     # Draft layers count too. `reorder_batch_threshold` shapes
@@ -4613,7 +4845,7 @@ class TPUModelRunner(GPUModelRunner):
                     # first pass attends with that same distribution, so every
                     # layer that consumes it needs a DECODE tile at least as
                     # wide as the widest window the threshold puts there.
-                    decode_query_sizes.append(attn_layer.impl.decode_query_size)
+                    decode_query_sizes.append(impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels
@@ -4683,6 +4915,7 @@ class TPUModelRunner(GPUModelRunner):
         use_max_model_len: bool = True,
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
+        through_handoff: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -4690,19 +4923,24 @@ class TPUModelRunner(GPUModelRunner):
         ``num_tokens`` tokens behind that many computed tokens (the same
         program: only the metadata values differ), and the forward's wall
         time in ms is returned once its outputs have materialized.
+
+        With ``through_handoff`` a pipeline stage takes its input from the
+        hand-off and passes its output on, as a serving step does; every
+        stage must then run the same sequence of forwards, and the caller
+        settles the hand-off afterwards.
         """
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
+        profile_query_lens: list[int] = []
         if profiling:
             input_ids = self._profile_input("ids", (self.max_num_tokens,), torch.int32)[
                 :num_tokens
             ].to(self.device)
             # One prefill request, or several of at most the model length
             # when a bucket exceeds it.
-            profile_query_lens = []
             left = num_tokens
             while left > 0:
                 profile_query_lens.append(min(left, self.max_model_len))
@@ -4829,7 +5067,11 @@ class TPUModelRunner(GPUModelRunner):
             # step is a real token.
             padding_state.update(num_tokens if profiling else 0, num_tokens)
         intermediate_tensors = None
-        if not self._pp_is_first:
+        if through_handoff:
+            assert self._pp_wave is not None and not profiling
+            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling
             )
@@ -4870,10 +5112,20 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
             )
             if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    # The output leaves padded to the hand-off buffer; it is
+                    # submitted without waiting, as between serving steps.
+                    self._pp_wave.end_forward(
+                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
                 # A stage before the last produces no logits; nothing
                 # consumes its output in a warmup.
                 synchronize_tensors(list(out.tensors.values()))
                 return (time.perf_counter() - started) * 1000.0 if profiling else None
+            if through_handoff:
+                self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
@@ -5086,16 +5338,18 @@ class TPUModelRunner(GPUModelRunner):
         started = time.perf_counter()
         for tokens, prefix in points:
             # Each point is timed twice; the faster run is kept.
-            ms = min(
-                self._dummy_run(
+            timings = []
+            for _ in range(2):
+                elapsed_ms = self._dummy_run(
                     tokens,
                     self.num_reqs_max_model_len,
                     self.max_num_blocks_per_req,
                     use_max_model_len=True,
                     profile_prefix=prefix,
                 )
-                for _ in range(2)
-            )
+                assert elapsed_ms is not None
+                timings.append(elapsed_ms)
+            ms = min(timings)
             samples.append((int(tokens), int(prefix), float(ms)))
         logger.info(
             "Pipeline step profile (%d points, %.1f s): %s",
@@ -5103,8 +5357,10 @@ class TPUModelRunner(GPUModelRunner):
             time.perf_counter() - started,
             ", ".join(f"{t}+{p}: {ms:.1f} ms" for t, p, ms in samples),
         )
+        granularity = self._pp_chunk_granularity
+        assert granularity is not None
         return {
-            "granularity": int(self._pp_chunk_granularity),
+            "granularity": int(granularity),
             "samples": samples,
             "schedule": schedule,
         }
@@ -5120,6 +5376,7 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens]. E.g. with K=3, num_reqs=8 covers at most 32 positions, so
         padded_logits_length=768 never pairs with it.
         """
+        assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
         tokens_paddings = sorted(self.num_tokens_paddings)
         idx = bisect.bisect_left(tokens_paddings, num_tokens)
@@ -5260,6 +5517,7 @@ class TPUModelRunner(GPUModelRunner):
         sees, then `gather_logprobs` over padded_logits_length rows, which
         `_precompile_gather_logprobs` (num_reqs buckets) does not cover.
         """
+        assert self.speculative_config is not None
         k = self.speculative_config.num_speculative_tokens
         max_logits_len = _get_padded_token_len(
             self.num_tokens_paddings,
@@ -5299,6 +5557,7 @@ class TPUModelRunner(GPUModelRunner):
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
         if self._is_async_drafter:
+            assert self.speculative_config is not None
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
@@ -5350,6 +5609,8 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not (self._is_async_drafter):
             return
+        assert self.speculative_config is not None
+        assert self.rejection_sampler is not None
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
         # padded_logits_length sweep to the bucket that covers the full batch.
@@ -5510,7 +5771,7 @@ class TPUModelRunner(GPUModelRunner):
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
             if self._is_async_drafter:
-                self.drafter.precompile()
+                self._async_drafter.precompile()
                 if self._pcp_enabled and self._mtp_enabled:
                     logger.info(
                         "Skipping rejection replay and decode/verify warmup "
@@ -5565,6 +5826,7 @@ class TPUModelRunner(GPUModelRunner):
 
         rid = "__pcp_mtp_warmup__"
         max_pos = min(self.max_model_len, P + 1)
+        assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
@@ -5642,6 +5904,8 @@ class TPUModelRunner(GPUModelRunner):
                     use_max_model_len=True,
                 )
                 if self.most_model_len is not None:
+                    assert self.num_reqs_most_model_len is not None
+                    assert self.num_blocks_per_most_len_req is not None
                     self._dummy_run(
                         num_tokens,
                         self.num_reqs_most_model_len,
@@ -5655,6 +5919,45 @@ class TPUModelRunner(GPUModelRunner):
                 raise shape_variants.ShapeSpecializationError(
                     f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
                 )
+        if self._pp_wave is not None:
+            self._warmup_handoff_forwards()
+
+    def _warmup_handoff_forwards(self) -> None:
+        """Run every token bucket once through the pipeline hand-off.
+
+        A stage's serving forward reads a slice of the received buffer and
+        pads its output into the sent one, and those ops fuse with the
+        forward's first and last programs; the standalone pass above leaves
+        them to compile at the first serving step of each bucket, with every
+        stage waiting. The stages run this pass in step, so it comes after
+        the standalone pass, where each stage compiles its backbone on its
+        own.
+        """
+        assert self._pp_wave is not None
+        started = time.perf_counter()
+        for num_tokens in self.num_tokens_paddings:
+            self._dummy_run(
+                num_tokens,
+                self.num_reqs_max_model_len,
+                self.max_num_blocks_per_req,
+                use_max_model_len=True,
+                through_handoff=True,
+            )
+            if self.most_model_len is not None:
+                self._dummy_run(
+                    num_tokens,
+                    self.num_reqs_most_model_len,
+                    self.num_blocks_per_most_len_req,
+                    use_max_model_len=False,
+                    through_handoff=True,
+                )
+        self._pp_wave.settle()
+        synchronize_device()
+        logger.info(
+            "Pipeline hand-off warmup: %d buckets in %.1f s",
+            len(self.num_tokens_paddings),
+            time.perf_counter() - started,
+        )
 
     def _precompile_mamba_state_seed_copies(self) -> None:
         """Warm the seed-copy program for every raw-pool set at every bucket
@@ -5826,6 +6129,8 @@ class TPUModelRunner(GPUModelRunner):
             SchedulerOutput,
         )
 
+        assert self.speculative_config is not None
+        assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
@@ -5928,6 +6233,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         rid = f"__spec_warmup_{idx}__"
+        assert self.speculative_config is not None
+        assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         # The contexts (num_computed_tokens) to run decode steps at: a short walk
         # near the prefill.
@@ -5954,7 +6261,7 @@ class TPUModelRunner(GPUModelRunner):
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
-            return
+            return False
         block_ids = tuple(block_ids_per_group)
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
@@ -6077,7 +6384,7 @@ class TPUModelRunner(GPUModelRunner):
                 cleanup_succeeded = False
                 logger.exception("spec-decode warmup draft cleanup failed")
         try:
-            if self.drafter is not None:
+            if isinstance(self.drafter, (DFlashProposer, Eagle3Proposer)):
                 self.drafter.draft_chunks = None
         except Exception:
             cleanup_succeeded = False

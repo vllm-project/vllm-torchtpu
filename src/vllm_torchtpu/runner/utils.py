@@ -132,7 +132,7 @@ def get_batch_composition_stats(
                 # It's a single token for an ongoing request, so it's decode
                 num_decode_tokens += 1
 
-    stats = {
+    stats: dict[str, Any] = {
         "batch_id": batch_id,
         "total_num_scheduled_tokens": total_num_scheduled_tokens,
         "num_prefill_tokens": num_prefill_tokens,
