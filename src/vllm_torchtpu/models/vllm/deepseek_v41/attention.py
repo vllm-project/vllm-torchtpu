@@ -22,8 +22,14 @@ from .cache import (
 )
 from .ced import ced_attention
 from .compressor import AttentionBackend, DeepseekCompressor, write_compressed_cache
-from .indexer import paged_indexer
-from .ops import device_hooks, rotary, round_fp8_activation
+from .indexer import (
+    INDEX_HEAD_DIM,
+    INDEX_RECORD_BYTES,
+    IndexCacheRows,
+    paged_indexer,
+    publish_index_keys,
+)
+from .ops import device_hooks, rotary
 
 
 def indexer_uses_fp4(vllm_config):
@@ -72,13 +78,25 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def __init__(self, *args, **kwargs):
-        # Indexer keys retain FP8-rounded BF16 values for exact scoring;
-        # compressed attention KV is packed separately.
-        kwargs["head_dim"] = (
+        if (
             get_current_vllm_config().model_config.hf_config.index_head_dim
-        )
-        kwargs["dtype"] = torch.bfloat16
+            != INDEX_HEAD_DIM
+        ):
+            raise ValueError("V4.1 native index cache requires 128-dimensional keys")
+        kwargs["head_dim"] = INDEX_RECORD_BYTES
+        kwargs["dtype"] = torch.uint8
         super().__init__(*args, **kwargs)
+
+    @property
+    def kv_cache(self):
+        raw = getattr(self, "_tpu_raw_cache", None)
+        if torch.compiler.is_compiling() and raw is not None:
+            return IndexCacheRows(raw, self._tpu_cache_layout)
+        return self._bound_cache
+
+    @kv_cache.setter
+    def kv_cache(self, cache):
+        self._bound_cache = cache
 
     def get_attn_backend(self):
         return AttentionBackend
@@ -195,12 +213,6 @@ class DeepseekV41Attention(
             self._max_model_len // self.compress_ratio <= self._config["index_topk"]
         )
 
-    def _quantize_indexer(self, values):
-        # Values are kept dequantized in BF16 storage, not silently changed to
-        # another quantizer. Power-of-two FP8 scales remain with Q/K, so weights
-        # must NOT fold the Q scale a second time.
-        return round_fp8_activation(values, self.indexer.head_dim)
-
     def _split_qkv_and_norm(self, qr_kv):
         return (
             self.q_norm(qr_kv[:, : self.q_lora_rank]),
@@ -240,7 +252,7 @@ class DeepseekV41Attention(
         )
         indexer = self.indexer
         keys = indexer.k_norm(_value(indexer.wk(latent)))
-        keys = self._quantize_indexer(self._rotate(keys, group_positions))
+        keys = self._rotate(keys, group_positions)
         index_cache = indexer.k_cache.kv_cache
         index_slots = _cache_slots(
             index_cache,
@@ -248,10 +260,11 @@ class DeepseekV41Attention(
             positions,
             compress_ratio=indexer.k_cache.compress_ratio,
         )
+        records = index_cache.row_indices(index_slots.clamp(min=0))
+        records = records.masked_fill(~valid | (index_slots < 0), -1)
         if defer_index_write and not self._all_indices_fit:
-            records = index_cache.row_indices(index_slots.clamp(min=0))
-            return records.masked_fill(~valid | (index_slots < 0), -1), keys
-        write_cache(index_cache, index_slots, keys, valid)
+            return records, keys
+        publish_index_keys(index_cache, records, keys)
         return None
 
     def write_encoder_global_kv(self, hidden_states, positions):
@@ -297,7 +310,7 @@ class DeepseekV41Attention(
             index_q = _value(self.indexer.wq_b(qr)).reshape(
                 -1, self.indexer.n_head, self.indexer.head_dim
             )
-            index_q = self._quantize_indexer(self._rotate(index_q, positions))
+            index_q = self._rotate(index_q, positions)
             weights = (
                 index_weights.float()
                 * self.indexer.head_dim**-0.5
