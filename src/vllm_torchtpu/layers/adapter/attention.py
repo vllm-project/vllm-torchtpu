@@ -12,12 +12,12 @@ import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
-from vllm.compilation import backends as vllm_compilation_backends
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
     AttentionBackend,

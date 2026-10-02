@@ -367,9 +367,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is
     # faster. The spec-decode draft ignores the cap.
-    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int(
-        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64
-    ),
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
