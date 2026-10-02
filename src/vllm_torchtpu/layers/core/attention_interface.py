@@ -1153,12 +1153,31 @@ def sparse_mla_attention_dcp(
         # cheapest dummy; the softmax it produces is real but meaningless, and
         # `owns` below is what keeps it out of the merge.
         owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
-
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+
+        if envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+            topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+            output, lse = sparse_mla_kernel.dispatch_sparse_mla_6rung(
+                ql_nope,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                cache_layout=cache_layout,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+            )
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+            return (kv_cache_nope, kv_cache_rope, output, lse)
+
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,

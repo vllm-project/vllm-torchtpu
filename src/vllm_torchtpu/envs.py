@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -372,6 +373,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
+    ),
+    # Lossless 6-rung dynamic KV slice dispatch and VMEM split-Q LSE join for DCP.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool(
+        "TPU_DCP_MLA_SPLIT_Q_LSE", default=True
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
