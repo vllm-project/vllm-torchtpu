@@ -61,7 +61,7 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
         _execute_dp_mm_encoder=lambda: order.append("encoder"),
         _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
         speculative_config=SimpleNamespace(use_eagle=lambda: True),
-        drafter=SimpleNamespace(
+        _async_drafter=SimpleNamespace(
             run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
         ),
     )
