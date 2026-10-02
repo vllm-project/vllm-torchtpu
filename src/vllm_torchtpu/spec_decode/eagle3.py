@@ -256,6 +256,7 @@ class Eagle3Proposer:
             self._validate_pcp_draft_model(draft_attn_layer_names)
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
+        assert self.draft_model is not None
         maybe_share_embeddings(
             self.draft_model, target_model, self._draft_tp_matches_target
         )
@@ -342,6 +343,7 @@ class Eagle3Proposer:
         num_mtp_layers = getattr(mtp_model, "num_mtp_layers", None)
         if num_mtp_layers is None or num_mtp_layers <= 1:
             return
+        assert self.draft_model is not None
         if not any(True for _ in iter_mtp_shared_heads(self.draft_model)):
             return
         raise NotImplementedError(
@@ -452,6 +454,7 @@ class Eagle3Proposer:
         one compiled program. If the program can't be built, IndexShare is
         switched off rather than left in place doing nothing.
         """
+        assert self.draft_model is not None
         try:
             from vllm_torchtpu.spec_decode.mtp_loop_model import (
                 MTP_DYNAMIC_ARG_DIMS,
@@ -612,7 +615,7 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
 
-    def _draft_model_for_step(self, step_idx: int):
+    def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
         Without IndexShare that is always the draft itself. With it, step 0
@@ -620,14 +623,17 @@ class Eagle3Proposer:
         (indexer off). `skip_topk` is set before every call, but it only
         matters on each program's first run, when it gets baked in.
         """
-        if self._mtp_loop_model is None:
+        assert self.draft_model is not None
+        loop_model = self._mtp_loop_model
+        if loop_model is None:
             return self.draft_model
         loop_step = step_idx > 0
         self._mtp_set_skip_topk(loop_step)
-        return self._mtp_loop_model if loop_step else self.draft_model
+        return loop_model if loop_step else self.draft_model
 
     def _mtp_set_skip_topk(self, skip: bool) -> None:
         if self._share_mtp_indices:
+            assert self.draft_model is not None
             self.draft_model.model.set_skip_topk(skip)
 
     def _mtp_compact_and_save(self, gather_indices: torch.Tensor) -> list[torch.Tensor]:
@@ -641,6 +647,7 @@ class Eagle3Proposer:
         position-in-the-current-forward, so the *next* chunk's step-0 indexer
         write lands on exactly these rows and destroys them.
         """
+        assert self.draft_model is not None
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
@@ -711,6 +718,7 @@ class Eagle3Proposer:
             return
         self._validate_kv_sharing_supported()
 
+        assert self.draft_model is not None
         draft_text_config = self.draft_model.config.get_text_config()
         target_text_config = target_model.config.get_text_config()
         target_layer_types = getattr(target_text_config, "layer_types", [])
@@ -948,6 +956,7 @@ class Eagle3Proposer:
         # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
+        assert self.draft_model is not None
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
@@ -998,6 +1007,7 @@ class Eagle3Proposer:
         # per live dispatch context, or (c) fuse the combine mm forward into the
         # downstream draft_input_ids seed scatter. Same pattern as
         # _draft_propose_token / _draft_gather_carries.
+        assert self.draft_model is not None
         return self.draft_model.combine_hidden_states(
             torch.cat((aux0, aux1, aux2), dim=-1)
         )
@@ -1028,7 +1038,7 @@ class Eagle3Proposer:
 
     def propose(
         self,
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: list[list[int]] | None,
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
         scheduler_output,
@@ -1108,6 +1118,7 @@ class Eagle3Proposer:
                     "hidden state was captured for this chunk."
                 )
                 if self.speculative_config.method == "eagle3":
+                    assert self.draft_model is not None
                     with set_model_tag("eagle_head"):
                         target_hidden_states = self.draft_model.combine_hidden_states(
                             chunk.hidden_states
@@ -1198,6 +1209,7 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 if is_async:
                     rejected_dev_per_chunk.append(
                         _maybe_pad_dim0(nr, knr) if nr is not None else None
@@ -1221,6 +1233,7 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
+                assert knr is not None
                 qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
                 loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
                 loop_reqdist_per_chunk.append(
@@ -1319,7 +1332,7 @@ class Eagle3Proposer:
     def _prepare_draft_inputs(
         self,
         chunk: DraftChunkInputs,
-        sampled_token_ids: list[list[int]],
+        sampled_token_ids: list[list[int]] | None,
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
         scheduler_output,
@@ -1467,6 +1480,7 @@ class Eagle3Proposer:
                     torch.tensor(ov_i, dtype=torch.long, device=runner.device)
                 ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
         else:
+            assert sampled_token_ids is not None
             num_rejected_out = num_rejected_np
             next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
             for i in range(num_reqs):
@@ -1587,6 +1601,7 @@ class Eagle3Proposer:
             if use_max_model_len
             else runner.num_reqs_most_model_len
         )
+        assert kernel_num_reqs is not None
 
         if step_idx == 0:
             seq_lens = chunk_ctx.seq_lens
@@ -1768,7 +1783,7 @@ class Eagle3Proposer:
 
         num_tokens = input_ids.shape[0]
 
-        kwargs = {
+        kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
             "positions": positions,
             "hidden_states": target_hidden_states,
@@ -1834,6 +1849,7 @@ class Eagle3Proposer:
         (`backbone_hidden_size`) is the TARGET's, not the draft's. Fall back
         to vLLM's already-resolved text config for those.
         """
+        assert self.draft_model is not None
         hidden_size = getattr(self.draft_model.config, "hidden_size", None)
         if hidden_size is None:
             hidden_size = (
@@ -1847,6 +1863,7 @@ class Eagle3Proposer:
         """
         if self.speculative_config.method == "mtp":
             return False
+        assert self.draft_model is not None
         return bool(getattr(self.draft_model.model, "use_aux_hidden_state", True))
 
     def _draft_combine_input_size(self) -> int:
@@ -1857,6 +1874,7 @@ class Eagle3Proposer:
         hidden_size-wide target hidden state, so the input width is just hidden_size.
         """
         if self._draft_uses_aux_hidden_state():
+            assert self.draft_model is not None
             return self.draft_model.model.fc_input_size
         return self._draft_hidden_size()
 
@@ -2008,6 +2026,7 @@ class Eagle3Proposer:
         if num_chunks * K == 0:
             return
         bucket = runner._dp_target_bucket
+        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
         num_reqs = runner.num_reqs_max_model_len
         input_ids = torch.zeros(bucket, dtype=torch.int32, device=runner.device)
         # Two consumers, two ranks. The draft forward takes mrope-shaped
@@ -2088,6 +2107,8 @@ class Eagle3Proposer:
         # combine_hidden_states at all, so replaying one here would both
         # crash and add a step the real trace does not have.
         combines_plain = not uses_aux and (self.speculative_config.method == "eagle3")
+        combine_aux: list[torch.Tensor] = []
+        combine_plain: torch.Tensor | None = None
         if uses_aux:
             aux_width = self._draft_combine_input_size() // 3
             combine_aux = [
@@ -2107,6 +2128,7 @@ class Eagle3Proposer:
                     if uses_aux:
                         self._draft_combine_hidden_states(*combine_aux)
                     else:
+                        assert self.draft_model is not None
                         self.draft_model.combine_hidden_states(combine_plain)
             last_hidden, _ = self._forward_draft(
                 chunk=chunk,

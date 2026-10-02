@@ -59,6 +59,7 @@ nav:
   - 'Developers Guides':
     - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
     - 'Buildkite Pipelines': developers_guide/buildkite.md
+    - 'Type Checking': developers_guide/type_checking.md
     - 'TPU Patch Mechanism': tpu_patch_mechanism.md
     - 'Profiling': developers_guide/profiling.md
 

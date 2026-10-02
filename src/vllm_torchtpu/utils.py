@@ -2,7 +2,7 @@
 import importlib
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from typing import Any, NamedTuple
 
@@ -268,7 +268,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    kv_caches: Mapping[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
