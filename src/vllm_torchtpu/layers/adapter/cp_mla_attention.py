@@ -62,7 +62,7 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, allow_all_to_all: bool = True
+    output: torch.Tensor, lse: torch.Tensor, per_bucket: bool = True
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -83,8 +83,9 @@ def merge_lse_partials_scatter_heads(
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
-      allow_all_to_all: whether `TPU_DCP_LSE_MERGE_A2A` may pick the exchange
-        path here. False for a model whose one trace serves every bucket.
+      per_bucket: whether the caller is traced once per bucket group, so the
+        path may depend on the token count. A model whose one trace serves
+        every bucket passes False and takes the exchange at every size.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -95,12 +96,10 @@ def merge_lse_partials_scatter_heads(
         return output
 
     # Shapes are static per compiled bucket, so this picks a path per bucket.
-    # That holds only for a model traced once per bucket group;
-    # `allow_all_to_all=False` keeps a single-trace caller off the branch.
-    if (
-        allow_all_to_all
-        and envs.TPU_DCP_LSE_MERGE_A2A
-        and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    # A single-trace caller must not branch on the token count: it takes the
+    # exchange everywhere, which costs it only its rare large buckets.
+    if envs.TPU_DCP_LSE_MERGE_A2A and (
+        not per_bucket or output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 

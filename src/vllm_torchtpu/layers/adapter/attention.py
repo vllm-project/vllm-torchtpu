@@ -2406,7 +2406,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
-                    allow_all_to_all=vllm_compilation_backends.model_tag == "backbone",
+                    per_bucket=vllm_compilation_backends.model_tag == "backbone",
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:

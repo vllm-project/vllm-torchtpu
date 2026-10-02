@@ -374,6 +374,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # up to f32 summation order. The reduce-scatter sums in the network and
     # wins past ~64 tokens (dcp=8, compiled: a2a 26 vs 29 us at 16 tokens,
     # 34 vs 48 at 32, 63 vs 65 at 64, 113 vs 108 at 128), hence the cap.
+    # The cap applies to the backbone only; the spec-decode draft, traced once
+    # for every bucket, takes the exchange at every size.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64
