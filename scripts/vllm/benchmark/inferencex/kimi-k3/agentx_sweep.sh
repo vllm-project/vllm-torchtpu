@@ -146,7 +146,20 @@ export TMPDIR="$DATA_SCRATCH/tmp"; mkdir -p "$TMPDIR"
 export AIPERF_UV_CACHE_DIR="$DATA_SCRATCH/uv-cache"
 IX_DIR="$SCRATCH/InferenceX"
 IX_URL=https://github.com/SemiAnalysisAI/InferenceX
-if [ ! -d "$IX_DIR/utils/aiperf/src" ]; then
+# ix_layout_root <dir>: the directory inside the checkout that holds
+# benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
+# InferenceX moved that tree down into inferencex-e2e/ (the root now also holds
+# collectivex/, operatorx/ and power_model/), and --ix-ref can still pin a
+# commit from before the move, so this is probed rather than hardcoded.
+ix_layout_root() {
+    local d
+    for d in "$1/inferencex-e2e" "$1"; do
+        [ -d "$d/utils/aiperf/src" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+if ! ix_layout_root "$IX_DIR" >/dev/null; then
     rm -rf "$IX_DIR"
     if [[ "$IX_REF" =~ ^[0-9a-f]{7,40}$ ]]; then
         # A commit cannot be cloned with --branch: fetch just that commit.
@@ -161,7 +174,16 @@ if [ ! -d "$IX_DIR/utils/aiperf/src" ]; then
             || { log "FATAL: cannot clone InferenceX branch/tag $IX_REF from $IX_URL"; exit 1; }
     fi
 fi
-log "InferenceX $(git -C "$IX_DIR" rev-parse --short HEAD), aiperf $(git -C "$IX_DIR/utils/aiperf" rev-parse --short HEAD)"
+IX_ROOT=$(ix_layout_root "$IX_DIR") || {
+    log "FATAL: $IX_DIR has no utils/aiperf/src under its root or inferencex-e2e/"; exit 1
+}
+# The eval task files and their lm-eval patch moved from utils/evals to
+# infx/evals in the same reorganisation.
+IX_EVALS=""
+for _d in "$IX_ROOT/infx/evals" "$IX_ROOT/utils/evals"; do
+    [ -d "$_d" ] && { IX_EVALS="$_d"; break; }
+done
+log "InferenceX $(git -C "$IX_DIR" rev-parse --short HEAD) (tree $IX_ROOT), aiperf $(git -C "$IX_ROOT/utils/aiperf" rev-parse --short HEAD)"
 
 # ---- Boot the server once ---------------------------------------------------
 k3_boot_server "$CONFIG_NAME" || exit 1
@@ -214,6 +236,11 @@ FAIL=0
 declare -a GSM8K_ROWS=()
 for gc in "${GSM8K_CONCS[@]}"; do
     [ "$GSM8K_LIMIT" -gt 0 ] || break
+    if [ -z "$IX_EVALS" ]; then
+        log "ERROR: no evals tree in $IX_ROOT (infx/evals or utils/evals); skipping GSM8K"
+        FAIL=1
+        break
+    fi
     log "===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$gc ====="
     EVAL_DIR="$RESULTS_DIR/gsm8k_c$gc"; mkdir -p "$EVAL_DIR"
     T0=$(date +%s)
@@ -222,9 +249,9 @@ for gc in "${GSM8K_CONCS[@]}"; do
     # InferenceX's gsm8k.yaml + its lm_eval sitecustomize patch score it; the
     # patch targets lm-eval 0.4.9.x and overrides TemplateAPI.apply_chat_template,
     # so re-check it whenever the image's lm-eval pin moves.
-    PATCH_DIR=$(mktemp -d); cp "$IX_DIR/utils/evals/patches/lm_eval_sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
+    PATCH_DIR=$(mktemp -d); cp "$IX_EVALS/patches/lm_eval_sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
     PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}" OPENAI_API_KEY=EMPTY \
-    lm_eval --tasks "$IX_DIR/utils/evals/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
+    lm_eval --tasks "$IX_EVALS/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
         --model local-chat-completions --apply_chat_template --log_samples \
         --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$gc,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
         --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
@@ -250,7 +277,7 @@ if [ "${#CONCS[@]}" -eq 0 ]; then
 fi
 
 # ---- (2) AgentX replay, one concurrency at a time, ascending ----------------
-export INFMAX_CONTAINER_WORKSPACE="$IX_DIR"
+export INFMAX_CONTAINER_WORKSPACE="$IX_ROOT"
 export AIPERF_RUNTIME_DIR="$SCRATCH/inferencex-agentic"
 # The trace corpus goes into the HF cache; the pod mounts a persistent one at
 # /root/.cache/huggingface, so use it when writable and fall back to scratch.
@@ -278,7 +305,7 @@ export AGENTIC_WARMUP_GRACE_PERIOD="${AGENTIC_WARMUP_GRACE_PERIOD:-7200}"
 export AIPERF_DRAIN_TIMEOUT_SECONDS="${AIPERF_DRAIN_TIMEOUT_SECONDS:-3600}"
 
 # shellcheck source=/dev/null  # lives in the InferenceX checkout
-source "$IX_DIR/benchmarks/benchmark_lib.sh"
+source "$IX_ROOT/benchmarks/benchmark_lib.sh"
 resolve_trace_source            # aiperf venv + corpus download (HF, public)
 UV_CACHE_DIR="$AIPERF_UV_CACHE_DIR" "$AIPERF_UV_BIN" pip install --python "$AIPERF_PYTHON" -q blobfile tiktoken \
     || log "WARNING: blobfile install failed"
