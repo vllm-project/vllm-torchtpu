@@ -828,7 +828,7 @@ class KimiK3ForConditionalGeneration(
             ),
             device=device,
         )
-        values = dict(metadata)
+        values = {key: value for key, value in metadata.items() if value is not None}
         values["pixel_values"] = dummy_pixel_values
         return EncoderCudaGraphCaptureInputs(values=values)
 
