@@ -126,6 +126,12 @@ ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
+# Benchmark prompts: "random" (default) sizes them from ISL_OSL_CONFIGS; any
+# other vllm bench serve --dataset-name (e.g. sharegpt with DATASET_PATH)
+# takes prompts from the dataset. For sharegpt the OSL still sets the output
+# length; ISL is then only the cell label.
+DATASET_NAME="${DATASET_NAME:-random}"
+DATASET_PATH="${DATASET_PATH:-}"
 RANDOM_RANGE_RATIO=""
 NUM_PROMPTS=""
 # How RANDOM_RANGE_RATIO is interpreted:
@@ -458,6 +464,30 @@ run_benchmark_once() {
         extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
     fi
 
+    local dataset_args=()
+    if [ "${DATASET_NAME:-random}" = "random" ]; then
+        dataset_args=(
+            --dataset-name random
+            --random-input-len "$bench_input_len"
+            --random-output-len "$bench_output_len"
+            --random-range-ratio "$bench_range_ratio"
+        )
+    else
+        # Prompts come from the dataset, so ISL is only the cell label.
+        # vllm bench serve takes each ShareGPT request's output length from
+        # its reference answer unless --sharegpt-output-len is given; pass
+        # the config's OSL so the cell decodes the length it is named for.
+        dataset_args=(
+            --dataset-name "$DATASET_NAME"
+        )
+        if [ -n "${DATASET_PATH:-}" ]; then
+            dataset_args+=(--dataset-path "$DATASET_PATH")
+        fi
+        if [ "$DATASET_NAME" = "sharegpt" ]; then
+            dataset_args+=(--sharegpt-output-len "$bench_output_len")
+        fi
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -466,10 +496,7 @@ run_benchmark_once() {
         --trust-remote-code \
         --host "$HOST" \
         --port "$PORT" \
-        --dataset-name random \
-        --random-input-len "$bench_input_len" \
-        --random-output-len "$bench_output_len" \
-        --random-range-ratio "$bench_range_ratio" \
+        "${dataset_args[@]}" \
         --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
@@ -570,6 +597,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "enable_ep": $ENABLE_EP,
     "quantization": "${QUANTIZATION:-none}",
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
+    "dataset_name": "$DATASET_NAME",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "num_prompts": ${NUM_PROMPTS:-320},
     "random_range_ratio": $RANDOM_RANGE_RATIO,

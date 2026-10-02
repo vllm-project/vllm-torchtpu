@@ -24,6 +24,7 @@ class TestConfigs:
         [
             ("qwen3-0.6b-structured-flat-json", "properties"),
             ("qwen3-0.6b-structured-complex-ast", "$defs"),
+            ("qwen3-0.6b-structured-character-dataset", "properties"),
         ],
     )
     def test_config_sends_a_structured_outputs_grammar(self, config, schema_key):
@@ -36,7 +37,11 @@ class TestConfigs:
 
     @pytest.mark.parametrize(
         "config",
-        ["qwen3-0.6b-structured-flat-json", "qwen3-0.6b-structured-complex-ast"],
+        [
+            "qwen3-0.6b-structured-flat-json",
+            "qwen3-0.6b-structured-complex-ast",
+            "qwen3-0.6b-structured-character-dataset",
+        ],
     )
     def test_config_saves_generated_text_and_keeps_caller_args(self, config):
         _, bench_args, _ = self._source(config, extra_bench_args="--trust-remote-code")
@@ -44,7 +49,11 @@ class TestConfigs:
 
     @pytest.mark.parametrize(
         "config",
-        ["qwen3-0.6b-structured-flat-json", "qwen3-0.6b-structured-complex-ast"],
+        [
+            "qwen3-0.6b-structured-flat-json",
+            "qwen3-0.6b-structured-complex-ast",
+            "qwen3-0.6b-structured-character-dataset",
+        ],
     )
     def test_config_disables_free_whitespace_and_keeps_caller_args(self, config):
         """xgrammar reads disable_any_whitespace from the server config only.
@@ -98,3 +107,28 @@ class TestConfigs:
         assert {"$ref": "#/$defs/Expression"} in defs["Node"]["anyOf"]
         items = body["structured_outputs"]["json"]["properties"]["expressions"]["items"]
         assert items["properties"]["ast"] == {"$ref": "#/$defs/Expression"}
+
+    def test_character_dataset_and_schema(self):
+        schema_path = _BENCH_DIR / "structured_schemas" / "character_schema.json"
+        assert schema_path.exists()
+        schema = json.loads(schema_path.read_text())["structured_outputs"]["json"]
+        assert set(schema["required"]) == {
+            "name",
+            "house",
+            "blood status",
+            "occupation",
+            "wand",
+            "alive",
+            "patronus",
+            "bogart",
+        }
+
+        dataset_path = _BENCH_DIR / "datasets" / "character_benchmark.json"
+        assert dataset_path.exists()
+        dataset = json.loads(dataset_path.read_text())
+        assert len(dataset) == 50
+        for i, item in enumerate(dataset):
+            assert item["id"] == str(i)
+            assert len(item["conversations"]) == 2
+            assert item["conversations"][0]["from"] == "human"
+            assert "Harry Potter" in item["conversations"][0]["value"]
