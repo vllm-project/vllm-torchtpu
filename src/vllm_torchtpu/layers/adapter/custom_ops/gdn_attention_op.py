@@ -1040,12 +1040,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         elif weight.dtype == torch.float8_e4m3fn:
             if weight_scale is None or weight_scale.dtype != torch.float32:
                 raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
-            from vllm_torchtpu.kernels.gdn.v3.projection_scale import (
-                projection_scale_layout,
+            from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+                projection_scale,
             )
 
             try:
-                projection_scale_layout(weight.shape, weight_scale.shape)
+                projection_scale.projection_scale_layout(
+                    weight.shape, weight_scale.shape
+                )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
         else:

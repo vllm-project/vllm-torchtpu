@@ -33,11 +33,13 @@ from vllm_torchtpu.gdn_pool_layout import (
     pooled_gdn_ssm_state_bytes,
 )
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    pcp_wrapper as gdn_pcp_fused_wrapper,
+)
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
-from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
@@ -1236,7 +1238,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             recurrent_state_dtype=recurrent_state_dtype,
         )
 
-        return gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn(
+        return gdn_pcp_fused_wrapper.fused_qkvz_projection_pcp_gdn(
             local_hidden_states,
             qkvz_weight_,
             qkvz_weight_scale_,

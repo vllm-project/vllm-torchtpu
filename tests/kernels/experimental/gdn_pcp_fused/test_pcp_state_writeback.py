@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.gdn.v3 import legacy_unified, pcp_wrapper
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import legacy_unified, pcp_wrapper
 
 
 def _region(

@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vllm_torchtpu.kernels.gdn.v3 import config, pcp_metadata
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, pcp_metadata
 
 _PROJECTION_TOKEN_BLOCK_SIZE = 1024
 _NUM_QKV_OUT_BLOCKS = 72

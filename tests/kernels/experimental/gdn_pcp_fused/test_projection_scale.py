@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.gdn.v3.projection_scale import (
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused.projection_scale import (
     normalize_projection_scale,
     projection_scale_layout,
 )
