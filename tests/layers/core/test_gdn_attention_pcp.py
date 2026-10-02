@@ -20,9 +20,13 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from kernels.gdn.v3.gdn_pool_state_utils import (
+    GRANULE,
+    WORDS_PER_GRANULE,
+    read_states,
+    recurrent_granules,
+)
 
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order,
 )
@@ -32,6 +36,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.quantized_matmul import util as quantized_matmul_util
+from vllm_torchtpu.layers.core import gdn_attention as gdn_attention_module
 from vllm_torchtpu.layers.core.gdn_attention import (
     _derive_pcp_ragged_exchange_descriptors,
     _derive_pcp_rank_major_reorder_indices,
@@ -139,6 +144,21 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         id="batch-flat-owner-with-history-bf16-ssm-cache",
     ),
 )
+# HND (seq-on-lane) is the production layout. With 128 granules per pool
+# block slice it is also what leaves non-state padding in the kernel's
+# compact state updates, which the NHD shapes above never do.
+_GDN_PCP_FUSED_PROJECTION_HND_CASE_IDS = (
+    "gqa-multiple-groups-per-shard",
+    "batch-flat-owner-with-history-bf16-ssm-cache",
+)
+_GDN_PCP_FUSED_PROJECTION_CASES = tuple(
+    pytest.param(*case.values, "NHD", id=case.id)
+    for case in _GDN_PCP_FUSED_PROJECTION_CASES
+) + tuple(
+    pytest.param(*case.values, "HND", id=f"{case.id}-hnd")
+    for case in _GDN_PCP_FUSED_PROJECTION_CASES
+    if case.id in _GDN_PCP_FUSED_PROJECTION_HND_CASE_IDS
+)
 
 
 def _query_start_loc_from_lengths(lengths):
@@ -147,6 +167,24 @@ def _query_start_loc_from_lengths(lengths):
         np.concatenate(
             (np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32))
         )
+    )
+
+
+def _pool_block_words(rank_pool_bytes, num_blocks):
+    """uint8 rank pool -> `[num_blocks, words]` in the kernel's word order.
+
+    NumPy twin of `gdn_pool_state_utils.state_words`, kept on host so raw
+    bytes never pass through a TPU float path.
+    """
+    moved = np.ascontiguousarray(np.moveaxis(rank_pool_bytes, -2, -1))
+    return moved.view(np.uint32).reshape(num_blocks, -1)
+
+
+def _pool_from_block_words(words, pool_shape):
+    """Inverse of `_pool_block_words`."""
+    moved_shape = (*pool_shape[:-2], pool_shape[-1], pool_shape[-2])
+    return np.moveaxis(
+        np.ascontiguousarray(words).view(np.uint8).reshape(moved_shape), -1, -2
     )
 
 
@@ -691,6 +729,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         "request_absolute_starts",
         "recurrent_state_dtype",
         "pool_block_tokens",
+        "kv_layout",
     ),
     _GDN_PCP_FUSED_PROJECTION_CASES,
 )
@@ -704,8 +743,10 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     request_absolute_starts,
     recurrent_state_dtype,
     pool_block_tokens,
+    kv_layout,
     projection_dtype,
     weight_scheme,
+    monkeypatch,
 ):
     """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
     lengths = np.asarray(lengths, dtype=np.int32)
@@ -881,20 +922,62 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     # The Qwen3.8 K=4/V=32 shape needs four local recurrent heads. Match its
     # production pool capacity while keeping the smaller PCP2 cases unchanged.
     pool_tail_lanes = max(4, 2 * (n_v // pcp_size))
-    local_pool_shape = (
-        num_blocks * pool_split,
-        pool_kernel_block_tokens,
-        1,
-        pool_tail_lanes,
-        128,
-    )
+    # The V3 kernel addresses the pool in its compact (packing, lanes) layout,
+    # so fp8 rows keep four packed entries in the second-minor axis.
+    pool_packing = 4
+    # Two spare blocks after the last request block, plus null block 0, are
+    # never addressed by state_indices and must come back bit-identical.
+    pool_num_blocks = num_blocks + 2
+    if kv_layout == "HND":
+        monkeypatch.setattr(
+            gdn_attention_module, "_is_seq_along_lane_pool", lambda: True
+        )
+        # (kernel blocks, Kx2, D // P, P, page): two KV heads of head_dim 256
+        # in fp8 with the page on lanes, as the Qwen3.5 attention pool.
+        local_pool_shape = (
+            pool_num_blocks * pool_split,
+            2,
+            256 // pool_packing,
+            pool_packing,
+            pool_kernel_block_tokens,
+        )
+    else:
+        local_pool_shape = (
+            pool_num_blocks * pool_split,
+            pool_kernel_block_tokens,
+            pool_tail_lanes // pool_packing,
+            pool_packing,
+            128,
+        )
     global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
-    # Keep this pool zero so the fused numerical case isolates owner-driven
+    touched_blocks = np.zeros((pcp_size, pool_num_blocks), dtype=bool)
+    touched_blocks[:, np.asarray(state_indices)] = True
+    touched_rows = np.repeat(touched_blocks.reshape(-1), pool_split)
+    # Only the state granules at the front of an addressed block belong to
+    # GDN; the kernel must leave the rest of the block alone. Keep the state
+    # granules zero so the fused numerical case isolates owner-driven
     # stage/DMA geometry. Nonzero absolute-history state loading is covered by
     # the raw-QKV split-state case above; the metadata unit test separately
     # checks that these absolute starts set the initial-state flags.
+    pool_geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    conv_state_bytes = (kernel_size - 1) * pool_geometry.local_conv_dim(d_k, d_v) * 4
+    state_words = WORDS_PER_GRANULE * (
+        recurrent_granules(
+            (pool_geometry.local_num_v_heads, d_k, d_v), recurrent_state_dtype
+        )
+        + (conv_state_bytes + GRANULE - 1) // GRANULE
+    )
+    initial_pool_bytes = np.random.default_rng(0).integers(
+        0, 256, size=global_pool_shape, dtype=np.uint8
+    )
+    for rank_pool in initial_pool_bytes.reshape(pcp_size, *local_pool_shape):
+        words = _pool_block_words(rank_pool, pool_num_blocks)
+        words[np.asarray(state_indices), :state_words] = 0
+        rank_pool[...] = _pool_from_block_words(words, local_pool_shape)
     pool = jax.device_put(
-        jnp.zeros(global_pool_shape, dtype=jnp.float8_e4m3fn),
+        jax.lax.bitcast_convert_type(
+            jnp.asarray(initial_pool_bytes), jnp.float8_e4m3fn
+        ),
         NamedSharding(mesh, P("pcp")),
     )
 
@@ -924,6 +1007,23 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         mesh=mesh,
         recurrent_state_dtype=recurrent_state_dtype,
     )
+    # Compare raw bytes: fp8 NaN patterns must not go through a float path.
+    new_pool_bytes = np.asarray(jax.lax.bitcast_convert_type(new_pool, jnp.uint8))
+    np.testing.assert_array_equal(
+        new_pool_bytes[~touched_rows], initial_pool_bytes[~touched_rows]
+    )
+    for new_rank_pool, initial_rank_pool in zip(
+        new_pool_bytes.reshape(pcp_size, *local_pool_shape),
+        initial_pool_bytes.reshape(pcp_size, *local_pool_shape),
+        strict=True,
+    ):
+        addressed = np.asarray(state_indices)
+        np.testing.assert_array_equal(
+            _pool_block_words(new_rank_pool, pool_num_blocks)[addressed, state_words:],
+            _pool_block_words(initial_rank_pool, pool_num_blocks)[
+                addressed, state_words:
+            ],
+        )
 
     def restore_request_order(tensor):
         packed = np.asarray(tensor).reshape(padded_num_tokens, -1)
@@ -944,43 +1044,21 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     local_n_kq = geometry.local_num_kq_heads
     local_n_v = geometry.local_num_v_heads
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
-    layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=local_n_v * d_k * d_v * jnp.dtype(recurrent_state_dtype).itemsize,
-        conv_bytes=(kernel_size - 1) * local_conv_dim * 2,
-        token_bytes=int(np.prod(local_pool_shape[2:])),
-    )
-
-    def read_local_states(local_pool):
-        conv = pool_adapters.gather_region(
-            local_pool,
+    # Each rank's pool shard holds its local heads' states in the V3 layout.
+    # Decode the raw bytes copied out above, so no float path sees them.
+    local_states = [
+        read_states(
+            local_pool_bytes,
             state_indices,
-            tok0=layout.ssm_tokens,
-            ntok=layout.conv_tokens,
-            out_dtype=jnp.bfloat16,
             split=pool_split,
+            recurrent_shape=(local_n_v, d_k, d_v),
+            conv_shape=(kernel_size - 1, local_conv_dim),
+            recurrent_dtype=recurrent_state_dtype,
         )
-        conv = conv.reshape(len(lengths), -1)[:, : (kernel_size - 1) * local_conv_dim]
-        recurrent = pool_adapters.gather_region(
-            local_pool,
-            state_indices,
-            tok0=0,
-            ntok=layout.ssm_tokens,
-            out_dtype=recurrent_state_dtype,
-            out_lanes=d_v if recurrent_state_dtype == jnp.float32 else None,
-            split=pool_split,
-        )
-        return (
-            conv.reshape(len(lengths), kernel_size - 1, local_conv_dim),
-            recurrent.reshape(len(lengths), local_n_v, d_k, d_v),
-        )
-
-    pcp_conv, pcp_recurrent = jax.shard_map(
-        read_local_states,
-        mesh=mesh,
-        in_specs=P("pcp"),
-        out_specs=(P("pcp"), P("pcp")),
-        check_vma=False,
-    )(new_pool)
+        for local_pool_bytes in new_pool_bytes.reshape(pcp_size, *local_pool_shape)
+    ]
+    pcp_recurrent = np.concatenate([np.asarray(ssm) for ssm, _ in local_states])
+    pcp_conv = np.concatenate([np.asarray(conv) for _, conv in local_states])
     q, k, v = np.split(np.asarray(ref_conv)[1:], [n_kq * d_k, 2 * n_kq * d_k], -1)
     local_key_dim = local_n_kq * d_k
     local_value_dim = local_n_v * d_v

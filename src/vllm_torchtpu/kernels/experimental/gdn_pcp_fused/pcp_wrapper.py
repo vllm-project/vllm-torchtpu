@@ -21,8 +21,10 @@
 
 The Qwen3.5 BF16/FP8 entry projects QKVZ in-kernel and interleaves all but the first
 projection block with GDN tiles. BA exchange, gated normalization, and the
-final output projection remain outside. GDN state streams directly to and from
-the unified KV pool through a StateSourcePlan. QKV is written directly into a
+final output projection remain outside. GDN state is read from the unified KV
+pool through the same granule-addressed state refs as the non-PCP V3 kernel,
+written to compact per-sequence updates, and scattered back into the donated
+pool outside Pallas. QKV is written directly into a
 compact destination-major HBM layout, so each source rank pushes one contiguous
 rank-local token chunk per destination without head-width padding.
 
@@ -36,6 +38,7 @@ packed token rows and the source rank's value-head columns.
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -45,7 +48,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     config,
-    legacy_unified,
     memory_ref,
     pcp_metadata,
     wrapper,
@@ -231,14 +233,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     b_ref: jax.Array,
     a_ref: jax.Array,
     state_source_ref: jax.Array,
+    state_pad_src_ref: jax.Array,
     zero_gdn_ref: jax.Array,
     packed_out_hbm_ref: jax.Array,
     weights_ref: memory_ref.WeightRefs,
     # Outputs.
     gdn_out_ref: jax.Array,
     packed_out_ref: jax.Array,
-    conv_state_updates_ref: jax.Array,
-    recurrent_state_updates_ref: jax.Array,
+    state_updates_ref: jax.Array,
     projected_qkv_ref: jax.Array,
     z_ref: jax.Array,
     active_rows_out_ref: jax.Array,
@@ -267,6 +269,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_pending_out_ref: jax.Array,
     active_rows_smem_ref: jax.Array,
     active_rows_dma_sem: jax.Array,
+    state_pad_sem: jax.Array,
     *,
     cfg: config.GDNConfig,
     pcp_size: int,
@@ -274,8 +277,17 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_cfg: _ProjectionConfig,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
+    state_pad_start: int,
 ) -> None:
-    """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
+    """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN.
+
+    The pool (``state_source_ref``) is read-only here. Final states go to
+    ``state_updates_ref[s]``, which mirrors the first ``k`` slices of sequence
+    ``s``'s logical pool block; the wrapper scatters it back into the pool.
+    Granules from ``state_pad_start`` to the end of each compact block are not
+    state, so they are copied from the pool unchanged (``state_pad_src_ref[s]``
+    is the source block, or -1 for sequences that are not written back).
+    """
     del packed_out_hbm_ref
     is_fp8_projection = projection_weight_ref.dtype == jnp.float8_e4m3fn
     projection_pending_out_ref[0] = -1
@@ -803,10 +815,55 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             conv_state_ref=state_source_ref,
             recurrent_state_ref=state_source_ref,
             cfg=cfg,
-            conv_state_output_ref=conv_state_updates_ref,
-            recurrent_state_output_ref=recurrent_state_updates_ref,
+            state_output_ref=state_updates_ref,
         )
     )
+
+    num_state_seqs = state_updates_ref.shape[0]
+    pool_granules = memory_ref.granule_view(
+        state_source_ref, state_source_ref.shape[:1]
+    )
+    update_granules = memory_ref.granule_view(
+        state_updates_ref, state_updates_ref.shape[:1]
+    )
+    num_pad_granules = update_granules.shape[1] - state_pad_start
+
+    def _state_pad_copy(seq):
+        """HBM-to-HBM copy of one sequence's non-state granules.
+
+        It touches only granules past ``state_pad_start``, disjoint from the
+        state granules the pipeline writes, so it needs no ordering with them.
+        """
+        src_block = state_pad_src_ref[seq]
+        size = jnp.where(src_block >= 0, 1, 0)
+        return pltpu.make_async_copy(
+            pool_granules.at[
+                pl.ds(jnp.maximum(src_block, 0), size),
+                pl.ds(state_pad_start, num_pad_granules),
+            ],
+            update_granules.at[
+                pl.ds(seq, size), pl.ds(state_pad_start, num_pad_granules)
+            ],
+            state_pad_sem,
+        )
+
+    def _start_state_pad_copies() -> None:
+        if num_pad_granules == 0:
+            return
+
+        def _start(seq, _) -> None:
+            _state_pad_copy(seq).start()
+
+        lax.fori_loop(0, num_state_seqs, _start, None, unroll=False)
+
+    def _wait_state_pad_copies() -> None:
+        if num_pad_granules == 0:
+            return
+
+        def _wait(seq, _) -> None:
+            _state_pad_copy(seq).wait()
+
+        lax.fori_loop(0, num_state_seqs, _wait, None, unroll=False)
 
     num_tiles = metadata_ref.num_tiles[...]
     active_stages = stage_metadata_ref.num_stages[...]
@@ -1065,6 +1122,10 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         barrier_sems,
         allocations,
     ) -> None:
+        # Non-state granules of each compact update are independent of all
+        # compute; overlap their copy with the whole schedule.
+        _start_state_pad_copies()
+
         # Only QKV from the first live projection block is unconditional
         # critical-path work. Subsequent QKVZ blocks are overlapped below and
         # dynamically caught up only when a ragged stage reaches them early.
@@ -1151,6 +1212,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             output_recv_sems,
         )
 
+        _wait_state_pad_copies()
+
         # A two-phase final barrier prevents a fast rank from entering the next
         # invocation and reusing this remote-copy schedule while a peer is still
         # leaving the current one.
@@ -1178,106 +1241,32 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
 
 
-def _scatter_compact_state_updates(
-    state_source: jax.Array,
-    updates: jax.Array,
-    state_indices: jax.Array,
-    query_start_loc: jax.Array,
-    num_active_seqs: jax.Array,
-    *,
-    state_stride: int,
-    region: legacy_unified.StateRegion,
-    whole_block_dma: bool,
+def _scatter_state_updates(
+    pool: jax.Array,
+    state_updates: jax.Array,
+    state_dst: jax.Array,
+    num_seqs: jax.Array,
 ) -> jax.Array:
-    """Apply raw per-sequence state tiles to a donated unified pool.
+    """Write each compact update to the first slices of its pool block.
 
-    Pallas emits only the state bytes touched by this invocation.  Expressing
-    the final pool update with native dynamic slices keeps the mutation visible
-    to JAX/XLA and allows donation to reuse the input allocation, without
-    making the whole pool a Pallas output.
+    ``state_updates[s]`` replaces ``pool[state_dst[s], :k]``; sequences with
+    ``state_dst[s] < 0`` are skipped. Native dynamic slices keep the mutation
+    visible to XLA, so the donated pool is updated without a copy.
     """
-    num_sequences = state_indices.shape[0]
-    active_bound = jnp.minimum(num_active_seqs, num_sequences)
+    start_tail = (0,) * (pool.ndim - 1)
 
-    def _apply_one(sequence_id, pool):
-        state_index = state_indices[sequence_id]
-        block_start = state_index * state_stride + region.kb0
-        has_tokens = query_start_loc[sequence_id + 1] > query_start_loc[sequence_id]
-        valid = jnp.logical_and(has_tokens, state_index >= 0)
-        valid = jnp.logical_and(
-            valid,
-            block_start + region.nblocks <= state_source.shape[0],
-        )
+    def _apply_one(seq, pool):
+        dst = state_dst[seq]
 
         def _write(pool):
-            if whole_block_dma:
-                start_indices = (block_start, *(0,) * (state_source.ndim - 1))
-            else:
-                start_indices = (
-                    block_start,
-                    region.row0,
-                    *(0,) * (state_source.ndim - 2),
-                )
-            return lax.dynamic_update_slice(pool, updates[sequence_id], start_indices)
+            update = lax.dynamic_index_in_dim(state_updates, seq, keepdims=True)
+            return lax.dynamic_update_slice(pool, update, (dst, *start_tail))
 
-        return lax.cond(valid, _write, lambda pool: pool, pool)
+        return lax.cond(dst >= 0, _write, lambda pool: pool, pool)
 
-    # A runtime loop scales the update work with the live request count rather
-    # than the compile bucket's maximum sequence capacity.
-    return lax.fori_loop(0, active_bound, _apply_one, state_source)
-
-
-def _compact_state_updates_shape(
-    state_source: jax.Array,
-    num_sequences: int,
-    region: legacy_unified.StateRegion,
-    *,
-    whole_block_dma: bool,
-) -> jax.ShapeDtypeStruct:
-    """Shape of one compact external-state update per sequence.
-
-    NHD can address a token-row subregion directly. HND stores tokens on the
-    minormost lane, so the V3 state seam copies complete source pages and keeps
-    all of their inner dimensions, matching ``ExternalStateBufferedRef``.
-    """
-    if whole_block_dma:
-        region_shape = (region.nblocks, *state_source.shape[1:])
-    else:
-        region_shape = (region.nblocks, region.nrows, *state_source.shape[2:])
-    return jax.ShapeDtypeStruct((num_sequences, *region_shape), state_source.dtype)
-
-
-def _validate_compact_state_writeback_plan(
-    state_plan: legacy_unified.StateSourcePlan,
-) -> None:
-    """Reject whole-page state plans that cannot be scattered independently.
-
-    The PCP kernel emits separate compact Conv and recurrent updates. With HND
-    each update contains complete source pages, so both regions must start at a
-    page boundary and must not cover the same page. Otherwise the later
-    full-page scatter would overwrite state written by the earlier one.
-    """
-    if not state_plan.whole_block_dma:
-        return
-
-    regions = (("conv", state_plan.conv), ("recurrent", state_plan.recurrent))
-    for name, region in regions:
-        if region.row0 != 0:
-            raise NotImplementedError(
-                "PCP HND state writeback requires page-aligned state regions; "
-                f"{name} starts at row {region.row0}."
-            )
-
-    conv_end = state_plan.conv.kb0 + state_plan.conv.nblocks
-    recurrent_end = state_plan.recurrent.kb0 + state_plan.recurrent.nblocks
-    regions_overlap = (
-        state_plan.conv.kb0 < recurrent_end and state_plan.recurrent.kb0 < conv_end
-    )
-    if regions_overlap:
-        raise NotImplementedError(
-            "PCP HND state writeback requires non-overlapping Conv and "
-            "recurrent state pages."
-        )
+    # A runtime loop scales with the live request count rather than the
+    # compile bucket's maximum sequence capacity.
+    return lax.fori_loop(0, num_seqs, _apply_one, pool)
 
 
 @functools.partial(
@@ -1295,7 +1284,7 @@ def _validate_compact_state_writeback_plan(
         "compute_precision",
         "mesh_axis_names",
         "pcp_axis_name",
-        "state_plan",
+        "recurrent_state_dtype",
     ),
 )
 def fused_qkvz_projection_pcp_gdn(
@@ -1323,7 +1312,7 @@ def fused_qkvz_projection_pcp_gdn(
     comm_chunk_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    state_plan: legacy_unified.StateSourcePlan,
+    recurrent_state_dtype: jnp.dtype = jnp.float32.dtype,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1331,8 +1320,13 @@ def fused_qkvz_projection_pcp_gdn(
 
     hidden_states is the rank-local token shard. b and a have already been
     exchanged and restored to global request-major order for the PCP-local
-    value-head shard. state_source is this rank's unified KV pool; state_plan
-    describes its conv and recurrent byte regions. Runtime stage metadata
+    value-head shard. state_source is this rank's unified KV pool, reshaped
+    so dim 0 indexes logical state blocks and its two minor dims are the
+    compact (packing, lanes) layout; the recurrent region (in
+    recurrent_state_dtype) and the fp32 conv region are addressed exactly as
+    in the non-PCP V3 kernel. The kernel only reads the pool; final states
+    come back as compact per-sequence updates that are scattered into the
+    donated pool. Runtime stage metadata
     handles mixed request lengths and arbitrary absolute query offsets without
     expanding active work to the compile bucket.
     """
@@ -1358,8 +1352,14 @@ def fused_qkvz_projection_pcp_gdn(
     geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
     if b.shape != a.shape:
         raise ValueError(f"b and a shapes must match, got {b.shape} and {a.shape}.")
-    if state_plan is None:
-        raise ValueError("The unified-pool PCP kernel requires a state plan.")
+    if jnp.dtype(recurrent_state_dtype) not in (
+        jnp.dtype(jnp.float32),
+        jnp.dtype(jnp.bfloat16),
+    ):
+        raise NotImplementedError(
+            "GDN v3 needs an fp32 or bf16 recurrent state; got "
+            f"{recurrent_state_dtype}."
+        )
 
     global_batch_size = b.shape[0]
     local_num_tokens = hidden_states.shape[0]
@@ -1466,7 +1466,9 @@ def fused_qkvz_projection_pcp_gdn(
             "The unified state source must have at least three "
             f"dimensions, got {state_source.shape}."
         )
-    _validate_compact_state_writeback_plan(state_plan)
+    state_packing = 4 // state_source.dtype.itemsize
+    # Ensure compact layout is used.
+    assert state_source.shape[-2] == state_packing
 
     global_stage_tokens = pcp_size * comm_chunk_size
     tile_size = min(mixed_tile_size, global_stage_tokens, global_batch_size)
@@ -1502,7 +1504,7 @@ def fused_qkvz_projection_pcp_gdn(
             act_in=jnp.float32.dtype,
             act_out=act_out_dtype,
             compute=compute_precision,
-            recurrent_state=jnp.float32.dtype,
+            recurrent_state=jnp.dtype(recurrent_state_dtype),
             conv_state=jnp.float32.dtype,
         ),
         batch_size=global_batch_size,
@@ -1513,9 +1515,49 @@ def fused_qkvz_projection_pcp_gdn(
         num_v_heads=local_n_v,
         kq_head_dim=d_k,
         v_head_dim=d_v,
-        state_plan=state_plan,
+        is_shared=True,
     )
     receive_group_stride = _qkv_receive_group_stride(comm_chunk_size, tile_size)
+
+    # Compact state updates: the first ``state_slices`` dim-1 slices of each
+    # logical pool block, which is enough to hold every state granule.
+    # Trimming only leading dims keeps the physical granule order, so a
+    # granule index means the same bytes in the pool and in the update.
+    granule_bytes = 4 * pltpu.get_tpu_info().num_lanes
+    slice_bytes = math.prod(state_source.shape[2:]) * state_source.dtype.itemsize
+    if slice_bytes % granule_bytes != 0:
+        raise ValueError(
+            f"Pool block slices of {slice_bytes} bytes are not a whole number "
+            f"of {granule_bytes}-byte granules: {state_source.shape}."
+        )
+    conv_state_bytes = (
+        cfg.prev_kernel_size * cfg.dim_size * jnp.dtype(cfg.dtypes.conv_state).itemsize
+    )
+    state_granules = cfg.conv_hbm_offset + pl.cdiv(conv_state_bytes, granule_bytes)
+    state_slices = pl.cdiv(state_granules * granule_bytes, slice_bytes)
+    if state_slices > state_source.shape[1]:
+        raise ValueError(
+            f"GDN state of {state_granules} granules does not fit a pool block "
+            f"{state_source.shape[1:]}."
+        )
+    num_state_seqs = state_indices.shape[0]
+    state_updates_shape = jax.ShapeDtypeStruct(
+        (num_state_seqs, state_slices, *state_source.shape[2:]),
+        state_source.dtype,
+    )
+    # A sequence is written back iff the kernel produced its final state:
+    # it lies in [0, distribution[-1]), has tokens, and has a real block.
+    seq_ids = jnp.arange(num_state_seqs, dtype=jnp.int32)
+    seq_starts = query_start_loc[:num_state_seqs]
+    seq_ends = query_start_loc[1 : num_state_seqs + 1]
+    has_tokens = seq_ends > seq_starts
+    write_back = (
+        (seq_ids < distribution[-1])
+        & has_tokens
+        & (state_indices >= 0)
+        & (state_indices < state_source.shape[0])
+    )
+    state_dst = jnp.where(write_back, state_indices, -1).astype(jnp.int32)
 
     metadata_obj, stage_metadata_obj = pcp_metadata.compute_pcp_stage_metadata(
         cfg=cfg,
@@ -1590,18 +1632,6 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
-    conv_state_updates_shape = _compact_state_updates_shape(
-        state_source,
-        state_indices.shape[0],
-        state_plan.conv,
-        whole_block_dma=state_plan.whole_block_dma,
-    )
-    recurrent_state_updates_shape = _compact_state_updates_shape(
-        state_source,
-        state_indices.shape[0],
-        state_plan.recurrent,
-        whole_block_dma=state_plan.whole_block_dma,
-    )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -1667,9 +1697,14 @@ def fused_qkvz_projection_pcp_gdn(
                 b,
                 a,
                 state_source,
+                state_dst,
             )
         )
     )
+    # The pool is deliberately NOT aliased to an output. XLA keeps a whole
+    # copy of any buffer aliased through this communicating kernel (measured:
+    # two pool-sized copies per call), so the kernel only reads the pool and
+    # emits compact per-sequence updates that are scattered back below.
     input_output_aliases = {
         output_input_offset: 0,
         output_input_offset + 1: 1,
@@ -1686,8 +1721,7 @@ def fused_qkvz_projection_pcp_gdn(
     (
         gdn_out,
         packed_out,
-        conv_state_updates,
-        recurrent_state_updates,
+        state_updates,
         _projected_qkv,
         z,
         active_rows,
@@ -1700,12 +1734,12 @@ def fused_qkvz_projection_pcp_gdn(
             projection_cfg=projection_cfg,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            state_pad_start=state_granules,
         ),
         out_shape=(
             zero_gdn_out,
             zero_packed_out,
-            conv_state_updates_shape,
-            recurrent_state_updates_shape,
+            state_updates_shape,
             projected_qkv_shape,
             z_shape,
             jax.ShapeDtypeStruct((1,), jnp.int32),
@@ -1719,12 +1753,12 @@ def fused_qkvz_projection_pcp_gdn(
             hbm_spec,
             hbm_spec,
             hbm_spec,
+            pl.BlockSpec(memory_space=pltpu.SMEM),
             hbm_spec,
             hbm_spec,
             weights_spec,
         ),
         out_specs=(
-            hbm_spec,
             hbm_spec,
             hbm_spec,
             hbm_spec,
@@ -1761,6 +1795,7 @@ def fused_qkvz_projection_pcp_gdn(
             *projection_scratch_shapes,
             pltpu.SMEM((1,), jnp.int32),
             pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
         ),
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
@@ -1778,31 +1813,17 @@ def fused_qkvz_projection_pcp_gdn(
         b,
         a,
         state_source,
+        state_dst,
         zero_gdn_out,
         zero_packed_out,
         weights,
     )
 
-    num_active_seqs = distribution[-1]
-    state_source = _scatter_compact_state_updates(
+    state_source = _scatter_state_updates(
         state_source,
-        conv_state_updates,
-        state_indices,
-        query_start_loc,
-        num_active_seqs,
-        state_stride=state_plan.stride,
-        region=state_plan.conv,
-        whole_block_dma=state_plan.whole_block_dma,
-    )
-    state_source = _scatter_compact_state_updates(
-        state_source,
-        recurrent_state_updates,
-        state_indices,
-        query_start_loc,
-        num_active_seqs,
-        state_stride=state_plan.stride,
-        region=state_plan.recurrent,
-        whole_block_dma=state_plan.whole_block_dma,
+        state_updates,
+        state_dst,
+        jnp.minimum(distribution[-1], num_state_seqs),
     )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)

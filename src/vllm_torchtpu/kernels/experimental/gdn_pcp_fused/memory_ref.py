@@ -268,10 +268,21 @@ class StateBufferedRef(BaseBufferedRef):
     Without speculative decoding `window_size` is 1 and `read_offset` is 0,
     so this reduces to reading and writing the single state at
     `state_indices[s]`.
+
+    With `compact_output_ref` set, the final state is written to
+    `compact_output_ref[s]` (same granule offset) instead of back into the
+    source. The fused PCP kernel uses this: XLA copies the whole pool when it
+    is an aliased output of that communicating kernel, so the pool stays a
+    read-only input and the compact updates are applied outside Pallas.
     """
 
     # HBM address offset.
     offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+    # NOTE: Static for the same reason as `metadata_ref`: it only points to
+    # an HBM ref allocated outside of the pipeline.
+    compact_output_ref: Any | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
@@ -347,6 +358,12 @@ class StateBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        is_compact = self.compact_output_ref is not None
+        if is_compact:
+            # One compact update per sequence slot; PCP has no checkpoints.
+            assert self.cfg.window_size == 1
+            dst_ref = self.compact_output_ref
+
         vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         dst_ref = granule_view(dst_ref, dst_ref.shape[:1])
         num_granules = vmem_ref.shape[2]
@@ -364,7 +381,7 @@ class StateBufferedRef(BaseBufferedRef):
             for t in range(self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 dma_size = jnp.where(should_write, 1, 0)
-                state_idx = self._ckpt_state_idx(s_idx, t)
+                state_idx = s_idx if is_compact else self._ckpt_state_idx(s_idx, t)
                 pltpu.make_async_copy(
                     vmem_ref.at[pl.ds(idx, dma_size), t],
                     dst_ref.at[
@@ -405,6 +422,7 @@ def create_allocs(
     cfg: config.GDNConfig,
     conv_state_output_ref: jax.Array | None = None,
     recurrent_state_output_ref: jax.Array | None = None,
+    state_output_ref: jax.Array | None = None,
 ) -> tuple[
     InBufferedRef,
     InBufferedRef,
@@ -413,9 +431,17 @@ def create_allocs(
     StateBufferedRef,
     OutBufferedRef,
 ]:
+    """Build the pipeline allocations.
+
+    `state_output_ref`, if given, is a `[num_seqs, ...]` buffer laid out like
+    one state block of the pool; both state refs write their final state into
+    it by sequence slot instead of back into `conv_state_ref`.
+    """
     del recurrent_state_ref
     if cfg.state_plan is None and conv_state_output_ref is not None:
         raise ValueError("Compact state outputs require an external state source plan.")
+    if cfg.state_plan is not None and state_output_ref is not None:
+        raise ValueError("state_output_ref requires the granule-addressed state path.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -488,6 +514,7 @@ def create_allocs(
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
+            compact_output_ref=state_output_ref,
         )
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),

@@ -26,7 +26,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_state_bytes,
@@ -854,6 +853,28 @@ def _build_v3_pool_state_plan(
     )
 
 
+def _as_logical_block_pool(
+    recurrent_state: jnp.ndarray, pool_block_tokens: int
+) -> jnp.ndarray:
+    """Reshape the attention-shaped pool so dim 0 is `num_logical_blocks`.
+
+    `*pool_shape[-2:]` is kept untouched so the reshape is a free 0-copy one;
+    the V3 kernel addresses each logical block through granule views.
+    """
+    pool_shape = recurrent_state.shape
+    if _is_seq_along_lane_pool():
+        # HND shape is (num_blocks, Kx2, D // P, P, kernel_block_size) with
+        # `kernel_block_size` at dim -1; fold `split` into dim 1 since the
+        # kernel only requires `dim 0 == num_logical_blocks`.
+        split = pool_block_tokens // pool_shape[-1]
+        return recurrent_state.reshape(
+            pool_shape[0] // split,
+            pool_shape[1] * split,
+            *pool_shape[2:],
+        )
+    return recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -888,21 +909,8 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    # Reshape so dim 0 is `num_logical_blocks` while keeping `*pool_shape[-2:]`
-    # untouched for a free 0-copy reshape.
     pool_shape = recurrent_state.shape
-    if _is_seq_along_lane_pool():
-        # HND shape is (num_blocks, Kx2, D // P, P, kernel_block_size) with
-        # `kernel_block_size` at dim -1; fold `split` into dim 1 since the
-        # kernel only requires `dim 0 == num_logical_blocks`.
-        split = pool_block_tokens // pool_shape[-1]
-        pool = recurrent_state.reshape(
-            pool_shape[0] // split,
-            pool_shape[1] * split,
-            *pool_shape[2:],
-        )
-    else:
-        pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
+    pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
 
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
@@ -1226,25 +1234,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                 f"selection: expected {local_conv_dim}, got "
                 f"{weight_shard.shape[0]}."
             )
-        state_plan = _build_v3_pool_state_plan(
-            pool_,
-            conv_dim=local_conv_dim,
-            n_v=local_n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            pool_block_tokens=pool_block_tokens,
-            qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
-            recurrent_state_dtype=recurrent_state_dtype,
-        )
+        pool_shape = pool_.shape
+        pool = _as_logical_block_pool(pool_, pool_block_tokens)
 
-        return gdn_pcp_fused_wrapper.fused_qkvz_projection_pcp_gdn(
+        pool, output, z = gdn_pcp_fused_wrapper.fused_qkvz_projection_pcp_gdn(
             local_hidden_states,
             qkvz_weight_,
             qkvz_weight_scale_,
             b_shard,
             a_shard,
-            pool_,
+            pool,
             weight_shard,
             bias_shard,
             A_shard,
@@ -1262,8 +1261,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             comm_chunk_size=interleave_size,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
-            state_plan=state_plan,
+            recurrent_state_dtype=jnp.dtype(recurrent_state_dtype),
         )
+        return pool.reshape(pool_shape), output, z
 
     mapped_fn = jax.shard_map(
         _pooled_pcp_prefill_fn,
