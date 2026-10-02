@@ -179,6 +179,15 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_multi
+          # The DSv4 DSpark tests compile DeepSeek-V4 on eight ranks, and the
+          # saved artifacts reach ~70 GB within minutes. On the pod's ephemeral
+          # storage that gets the pod evicted, and the Job reruns the whole file
+          # until the launcher's deadline. The caches go to the compilation
+          # bucket, as in the DSv4 manifests, and the inductor scratch to shm.
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
         plugins:
           - *kube_plugin
           - tests#v1.0.0:

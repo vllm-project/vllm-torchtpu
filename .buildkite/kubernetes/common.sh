@@ -74,6 +74,9 @@ FORWARD=(
   # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
   # JSON, which is an evicted pod if it lands on ephemeral storage.
   TMPDIR RAY_TMPDIR
+  # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
+  # storage. A step that compiles a large model points them at /cache/jax.
+  VLLM_CACHE_ROOT VLLM_XLA_CACHE_PATH
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT
