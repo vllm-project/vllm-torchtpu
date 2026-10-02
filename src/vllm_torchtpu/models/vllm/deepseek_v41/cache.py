@@ -196,10 +196,6 @@ class NativeCacheView:
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
-        if raw is not None and getattr(self, "_tpu_fp8_csa_cache", False):
-            from .csa import PackedCSACache
-
-            return PackedCSACache(raw, self._tpu_cache_layout)
         if torch.compiler.is_compiling() and raw is not None:
             return PagedCacheRows(raw, self._tpu_cache_layout)
         return self._bound_cache

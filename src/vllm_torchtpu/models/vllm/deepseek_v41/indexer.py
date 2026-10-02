@@ -1,109 +1,10 @@
-"""Paged attention, exact index selection and index-cache publication."""
+"""Exact index selection and index-cache publication."""
 
 import jax
 import jax.numpy as jnp
 import torch
 
 from .cache import gather_cache_values, scatter_cache_values
-
-_attention_op = None
-
-
-def paged_attention_state_jax(q, pool, records, scale, state=None):
-    """Unnormalized SWA/MLA state, also consumed by the native CSA merger."""
-    tokens, heads, dim = q.shape
-    tile = 64
-    if state is None:
-        state = (
-            jnp.full((tokens, heads), -1e30, jnp.float32),
-            jnp.zeros((tokens, heads), jnp.float32),
-            jnp.zeros(q.shape, jnp.float32),
-        )
-    width = records.shape[1]
-    if not width:
-        return state
-    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
-
-    # Gather BF16 rows once outside; keep FP32 scratch tiled.
-    gathered = gather_cache_values(
-        pool, jnp.maximum(records, 0).reshape(-1), dim
-    ).reshape(tokens, records.shape[1], dim)
-
-    def step(index, carry):
-        maximum, denominator, numerator = carry
-        addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
-        valid = addresses >= 0
-        kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
-        kv = jnp.where(valid[..., None], kv, 0)
-        scores = (
-            jnp.einsum(
-                "thd,tkd->thk",
-                q.astype(jnp.float32),
-                kv.astype(jnp.float32),
-                preferred_element_type=jnp.float32,
-            )
-            * scale
-        )
-        scores = jnp.where(valid[:, None], scores, -jnp.inf)
-        new_max = jnp.maximum(maximum, scores.max(-1))
-        correction = jnp.exp(maximum - new_max)
-        exponentials = jnp.exp(scores - new_max[..., None])
-        denominator = denominator * correction + exponentials.sum(-1)
-        numerator = numerator * correction[..., None] + jnp.einsum(
-            "thk,tkd->thd",
-            exponentials.astype(jnp.bfloat16),
-            kv,
-            preferred_element_type=jnp.float32,
-        )
-        return new_max, denominator, numerator
-
-    return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
-
-
-def paged_attention_jax(
-    q: jax.Array,
-    swa_pool: jax.Array,
-    main_pool: jax.Array,
-    swa_records: jax.Array,
-    main_records: jax.Array,
-    sink: jax.Array,
-    scale: float,
-) -> jax.Array:
-    # SWA widths in the released model are multiples of 64, preserving the
-    # reference's accumulation boundaries when compressed rows follow.
-    state = paged_attention_state_jax(q, swa_pool, swa_records, scale)
-    maximum, denominator, numerator = paged_attention_state_jax(
-        q, main_pool, main_records, scale, state
-    )
-    denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
-    return (numerator / denominator[..., None]).astype(q.dtype)
-
-
-def initialize_paged_attention():
-    global _attention_op
-    if _attention_op is not None:
-        return
-    from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal import pallas
-
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        get_vllm_model_wrapper_context,
-    )
-
-    _attention_op = pallas.jax_op(
-        "pallas::deepseek_v41_paged_bf16_attention",
-        paged_attention_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
-    )
-    _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
-
-
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
-    assert _attention_op is not None
-    return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
-    )
 
 
 def paged_index_scores_jax(
@@ -271,8 +172,7 @@ def paged_indexer_jax(
         selected_valid = values > -jnp.inf
         # The dense reference fills an underfull top-k with the lowest logical
         # -inf positions, then sorts all positions before masking them. Preserve
-        # those padding locations too: moving padding across a 64-key attention
-        # tile changes BF16 accumulation boundaries.
+        # those padding locations in the logical buffer shared by reuse layers.
         occupied = jnp.zeros((records.shape[0], output_width + 1), jnp.bool_)
         occupied_ids = jnp.where(
             selected_valid & (selected < output_width), selected, output_width

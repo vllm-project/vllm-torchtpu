@@ -12,7 +12,7 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 
-from .cache import scatter_cache_words
+from .cache import gather_cache_values, scatter_cache_words
 
 CSA_RECORD_BYTES = 640  # 448 FP8 values, 64 E8M0 scales, 64 BF16 RoPE values.
 
@@ -111,46 +111,9 @@ class PackedCSACache:
             self.row_offset + slots // self.shape[1] * self.page_stride + self.shape[1]
         ) * 4 + slots % self.shape[1]
 
-    def __getitem__(self, indices):
-        if self.raw.device.type != "cpu":
-            raise RuntimeError("Packed CSA reads must use the native CSA kernel")
-        blocks, rows = indices
-        slots = blocks * self.shape[1] + rows
-        nope = self.raw[self.row_indices(slots).long()].long()
-        slab = torch.stack([(nope >> (8 * i)) & 255 for i in range(4)], dim=-2)
-        record = slab.to(torch.uint8).flatten(-2)
-        fp8 = record[..., :448].contiguous().view(torch.float8_e4m3fn).float()
-        scales = torch.pow(2.0, record[..., 448:].int() - 127)
-        nope = (fp8.unflatten(-1, (7, 64)) * scales[..., None, :]).flatten(-2)
-        rope = self.raw.reshape(-1, 32)[self.rope_indices(slots).long()].long()
-        bits = torch.cat((rope & 65535, (rope >> 16) & 65535), dim=-1)
-        rope = bits.to(torch.int16).view(torch.bfloat16)
-        return torch.cat((nope.to(torch.bfloat16), rope), dim=-1)
-
     def write(self, slots, values):
         nope_records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
         rope_records = self.rope_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
-        if self.raw.device.type == "cpu":
-            valid = slots >= 0
-            values = values[valid].to(torch.bfloat16)
-            groups = values[:, :448].float().reshape(-1, 7, 64)
-            scales = torch.pow(
-                2.0, torch.ceil(torch.log2(groups.abs().amax(1).clamp_min(1e-4) / 448))
-            )
-            fp8 = (groups / scales[:, None]).to(torch.float8_e4m3fn)
-            scale_bytes = (scales.view(torch.int32) >> 23).to(torch.uint8)
-            slabs = (
-                torch.cat((fp8.view(torch.uint8).reshape(-1, 448), scale_bytes), dim=1)
-                .reshape(-1, 4, 128)
-                .int()
-            )
-            words = slabs[:, 0] | (slabs[:, 1] << 8) | (slabs[:, 2] << 16)
-            words |= slabs[:, 3] << 24
-            self.raw.index_copy_(0, nope_records[valid].long(), words)
-            bits = values[:, 448:].contiguous().view(torch.int16).int() & 65535
-            rope = bits[:, :32] | (bits[:, 32:] << 16)
-            self.raw.reshape(-1, 32).index_copy_(0, rope_records[valid].long(), rope)
-            return
         assert _write_op is not None
         self.raw.copy_(
             _write_op(self.raw, nope_records.int(), rope_records.int(), values)
@@ -170,6 +133,56 @@ def compact_csa_records(nope_records, rope_records):
     )
 
 
+def swa_attention_state(q, pool, records, scale):
+    """Compute the BF16 SWA state consumed by the native CSA merger."""
+    tokens, heads, dim = q.shape
+    tile = 64
+    state = (
+        jnp.full((tokens, heads), -1e30, jnp.float32),
+        jnp.zeros((tokens, heads), jnp.float32),
+        jnp.zeros(q.shape, jnp.float32),
+    )
+    width = records.shape[1]
+    if not width:
+        return state
+    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
+
+    # Gather BF16 rows once outside; keep FP32 scratch tiled.
+    gathered = gather_cache_values(
+        pool, jnp.maximum(records, 0).reshape(-1), dim
+    ).reshape(tokens, records.shape[1], dim)
+
+    def step(index, carry):
+        maximum, denominator, numerator = carry
+        addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
+        valid = addresses >= 0
+        kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
+        kv = jnp.where(valid[..., None], kv, 0)
+        scores = (
+            jnp.einsum(
+                "thd,tkd->thk",
+                q.astype(jnp.float32),
+                kv.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            )
+            * scale
+        )
+        scores = jnp.where(valid[:, None], scores, -jnp.inf)
+        new_max = jnp.maximum(maximum, scores.max(-1))
+        correction = jnp.exp(maximum - new_max)
+        exponentials = jnp.exp(scores - new_max[..., None])
+        denominator = denominator * correction + exponentials.sum(-1)
+        numerator = numerator * correction[..., None] + jnp.einsum(
+            "thk,tkd->thd",
+            exponentials.astype(jnp.bfloat16),
+            kv,
+            preferred_element_type=jnp.float32,
+        )
+        return new_max, denominator, numerator
+
+    return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
+
+
 def csa_attention_jax(
     q: jax.Array,
     swa: jax.Array,
@@ -180,11 +193,10 @@ def csa_attention_jax(
     sink: jax.Array,
     scale: float,
 ) -> jax.Array:
-    from .attention_kernels import paged_attention_state_jax
-
-    maximum, denominator, numerator = paged_attention_state_jax(
-        q, swa, swa_records, scale
-    )
+    maximum, denominator, numerator = swa_attention_state(q, swa, swa_records, scale)
+    if nope_records.shape[1] == 0:
+        denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
+        return (numerator / denominator[..., None]).astype(q.dtype)
     nope_records, rope_records = compact_csa_records(nope_records, rope_records)
     # The model has already applied the source layer's block table and causal
     # mask. Both regions live in the upstream shared pool, at distinct offsets.

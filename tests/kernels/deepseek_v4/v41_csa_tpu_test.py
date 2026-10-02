@@ -13,6 +13,8 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import compute
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import csa_gather
 from vllm_torchtpu.models.vllm.deepseek_v41 import cache, csa
 
+from .v41_csa_cache_test import read_cpu_cache, write_cpu_cache
+
 
 def test_torchtpu_bridge_registration():
     _require_tpu()
@@ -94,7 +96,7 @@ def test_independent_rope_gather_and_legacy_default(shared_pool, separate):
     np.testing.assert_array_equal(rotary, expected)
 
 
-@pytest.mark.parametrize("tokens,topk", [(8, 71), (8, 1024), (128, 2048)])
+@pytest.mark.parametrize("tokens,topk", [(8, 0), (8, 71), (8, 1024), (128, 2048)])
 @pytest.mark.parametrize("reserved_bytes", [640, 1024])
 def test_shared_pool_csa_with_swa_and_holey_selection(tokens, topk, reserved_bytes):
     _require_tpu()
@@ -109,7 +111,7 @@ def test_shared_pool_csa_with_swa_and_holey_selection(tokens, topk, reserved_byt
         ((16, 8, reserved_bytes), torch.uint8, 8 * reserved_bytes + 2048, 3 * 512),
     )
     slots = torch.arange(count, dtype=torch.int32)
-    owner.write(slots, values)
+    write_cpu_cache(owner, slots, values)
     nope = owner.row_indices(slots).numpy()
     rope = owner.rope_indices(slots).numpy()
     # Device publication must preserve both adjacent records and unrelated bytes.
@@ -120,7 +122,7 @@ def test_shared_pool_csa_with_swa_and_holey_selection(tokens, topk, reserved_byt
         jnp.asarray(values.float().numpy(), jnp.bfloat16),
     )
     np.testing.assert_array_equal(written, owner.raw.numpy())
-    decoded = owner[slots // 8, slots % 8].float().numpy()
+    decoded = read_cpu_cache(owner, slots).float().numpy()
     q = jnp.asarray(rng.normal(size=(tokens, heads, dim)), jnp.bfloat16)
     swa_values = jnp.asarray(rng.normal(size=(count, dim)), jnp.bfloat16)
     swa_pool = jax.jit(cache.scatter_cache_values)(
