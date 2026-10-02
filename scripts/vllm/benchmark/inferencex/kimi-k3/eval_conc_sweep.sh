@@ -5,7 +5,7 @@
 # (local-chat-completions, plain chat, thinking off). Engine drained between
 # points. Every point is uploaded as soon as it is scored.
 #
-#   k3_eval_conc_sweep.sh --results-dir DIR [--config NAME]
+#   eval_conc_sweep.sh --results-dir DIR [--config NAME]
 #                         [--conc-list 1,2,4,...] [--tasks mmlu_pro,gsm8k]
 #                         [--gsm8k-limit 128] [--mmlu-limit 10]
 #                         [--ctx 16384] [--max-num-seqs 256] [--port 8000]
@@ -16,7 +16,7 @@
 # copies each point to <gcs-root>/<build number>/ as soon as it is scored.
 #
 # Question counts grow with concurrency so that the requested concurrency is
-# really reached (k3_sweep_summary.py question-limit): gsm8k limit =
+# really reached (sweep_summary.py question-limit): gsm8k limit =
 # max(--gsm8k-limit, 2*conc); mmlu_pro limit (per subject, 14 subjects) =
 # max(--mmlu-limit, ceil(2*conc/14)).
 #
@@ -56,9 +56,9 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K3_SWEEP_TAG="k3-eval-sweep"
-# shellcheck source=scripts/vllm/benchmarking/k3_sweep_lib.sh
-source "$SCRIPT_DIR/k3_sweep_lib.sh"
-SUMMARY_PY="$SCRIPT_DIR/k3_sweep_summary.py"
+# shellcheck source=scripts/vllm/benchmark/inferencex/kimi-k3/sweep_lib.sh
+source "$SCRIPT_DIR/sweep_lib.sh"
+SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
 
 k3_check_conc_list "$CONC_LIST" || exit 1
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"

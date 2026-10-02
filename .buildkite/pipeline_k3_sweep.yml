@@ -29,7 +29,7 @@
 # then "New Build" with K3_SWEEP (and any knobs below) in the build's
 # environment. Or select this file on vllm-torchtpu-dev with DEV_PIPELINE_FILE.
 #
-# K3_SWEEP=eval  — driver scripts/vllm/benchmarking/k3_eval_conc_sweep.sh
+# K3_SWEEP=eval  — driver scripts/vllm/benchmark/inferencex/kimi-k3/eval_conc_sweep.sh
 #   Nightly kimi-k3-tp32-ep serve flags with a 16k context, max-num-seqs 256
 #   and matching compile buckets (config kimi-k3-tp32-ep-concsweep), then
 #   lm_eval for each task at each client concurrency in ascending order,
@@ -44,7 +44,7 @@
 #     K3_SWEEP_GCS_ROOT      default empty (no GCS copy; artifacts only)
 #   Runtime at the defaults: ~30 min boot + ~90 min sweep.
 #
-# K3_SWEEP=perf  — driver scripts/vllm/benchmarking/k3_agentx_sweep.sh
+# K3_SWEEP=perf  — driver scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh
 #   K3 AgentX server geometry (config kimi-k3-tp32-ep-agentx: TP32/EP, long
 #   context, tool-call + reasoning parsers, block size 256), a GSM8K probe on
 #   the fresh server, then the InferenceX AgentX trace replay (aiperf, Claude
@@ -103,7 +103,7 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_eval_conc_sweep.sh --results-dir /perf_eval_results/k3-eval-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} --gcs-root \"${K3_SWEEP_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/eval_conc_sweep.sh --results-dir /perf_eval_results/k3-eval-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} --gcs-root \"${K3_SWEEP_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"
 
@@ -119,6 +119,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"

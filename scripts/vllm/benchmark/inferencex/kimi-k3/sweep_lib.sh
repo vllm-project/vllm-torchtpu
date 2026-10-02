@@ -1,6 +1,6 @@
 #!/bin/bash
-# Shared helpers for the Kimi-K3 sweep drivers (k3_eval_conc_sweep.sh,
-# k3_agentx_sweep.sh). Source it after setting:
+# Shared helpers for the Kimi-K3 sweep drivers (eval_conc_sweep.sh,
+# agentx_sweep.sh). Source it after setting:
 #   K3_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
 #   RESULTS_DIR    where the harness and the sweep write results
 #   PORT           the vLLM server port

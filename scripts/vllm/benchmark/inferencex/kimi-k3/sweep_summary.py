@@ -15,7 +15,7 @@
 """Result parsing for the Kimi-K3 sweep drivers.
 
 Pure functions plus a small CLI, so the drivers' summary logic can be unit
-tested (tests/scripts/test_k3_sweep_summary.py) without a TPU:
+tested (tests/scripts/test_sweep_summary.py) without a TPU:
 
   lm-eval-score  --output-dir DIR --task TASK
       -> "<metric> <score> <stderr>" from the newest lm_eval results_*.json

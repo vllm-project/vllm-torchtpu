@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Kimi-K3 on the v7x-32 pod: server geometry for the InferenceX AgentX trace
 # replay (multi-turn agentic-coding sessions, 100k+ token contexts, heavy
-# prefix reuse), driven by k3_agentx_sweep.sh. Derived from
+# prefix reuse), driven by agentx_sweep.sh. Derived from
 # kimi-k3-tp32-ep.sh; differences:
 #   - long context: MAX_MODEL_LEN default 131072 (the driver overrides it);
 #     the aiperf client filters traces above it
@@ -22,7 +22,7 @@
 #     (16 covers up to 16 sequences; 32..512 are added up to the first bucket
 #     that holds MAX_NUM_SEQS). Prefill chunks are 8192 with remainders padded to 1024/2048/4096.
 #   - the built-in harness bench is a 4-prompt 8k/1k warmup; the replay is
-#     driven by k3_agentx_sweep.sh against the kept-alive server
+#     driven by agentx_sweep.sh against the kept-alive server
 # K3_EXTRA_SERVE_ARGS (driver --extra-serve-args) is appended LAST, so it can
 # override any flag set here (vLLM takes the last occurrence of a flag).
 MODEL="moonshotai/Kimi-K3"

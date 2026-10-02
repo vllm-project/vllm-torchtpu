@@ -13,7 +13,7 @@
 # model's native context replays a subset of the corpus (the client logs how
 # many traces survived) and is a bring-up number, not a submission.
 #
-#   k3_agentx_sweep.sh [--conc-list 1,2,4,8] [--max-model-len 131072]
+#   agentx_sweep.sh [--conc-list 1,2,4,8] [--max-model-len 131072]
 #       [--kv fp8|auto] [--apc 0|1] [--spec none|dspark] [--fast 1|0]
 #       [--duration 1800] [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]]
 #       [--moe-requant 0|512] [--extra-serve-args "..."] [--ix-ref main]
@@ -85,9 +85,9 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K3_SWEEP_TAG="k3-agentx-sweep"
-# shellcheck source=scripts/vllm/benchmarking/k3_sweep_lib.sh
-source "$SCRIPT_DIR/k3_sweep_lib.sh"
-SUMMARY_PY="$SCRIPT_DIR/k3_sweep_summary.py"
+# shellcheck source=scripts/vllm/benchmark/inferencex/kimi-k3/sweep_lib.sh
+source "$SCRIPT_DIR/sweep_lib.sh"
+SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
 mkdir -p "$RESULTS_DIR"
 k3_set_gcs_root "$GCS_ARG"
 
