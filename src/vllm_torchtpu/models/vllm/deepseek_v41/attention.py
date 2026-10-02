@@ -42,6 +42,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 
     @property
     def kv_cache(self):
+        raw = getattr(self, "_tpu_raw_cache", None)
+        if torch.compiler.is_compiling() and raw is not None:
+            return raw.view(self._tpu_kernel_shape)
         return self._bound_cache
 
     @kv_cache.setter
@@ -63,6 +66,7 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         self.kv_cache = cache
         self._tpu_raw_cache = raw_cache
         self._tpu_cache_layout = layout
+        self._tpu_kernel_shape = tuple(cache.shape)
         self.block_size = layout[0][1]
 
 
@@ -143,6 +147,9 @@ class DeepseekV41Attention(
 
     @property
     def kv_cache(self):
+        raw = getattr(self, "_tpu_raw_cache", None)
+        if torch.compiler.is_compiling() and raw is not None:
+            return raw.view(self._tpu_kernel_shape), self._bound_cache[1]
         return self._bound_cache
 
     @kv_cache.setter
@@ -157,6 +164,8 @@ class DeepseekV41Attention(
                 "V4.1 compressed KV requires the allocator's logical layout"
             )
         self.kv_cache = cache
+        self._tpu_raw_cache = raw_cache
+        self._tpu_kernel_shape = tuple(cache[0].shape)
         self.cache_num_states = layout[0][1]
 
     def get_kv_cache_spec(self, vllm_config):

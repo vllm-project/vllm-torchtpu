@@ -118,11 +118,16 @@ class DsV4KVCacheAllocator:
             )
             for _ in range(max(regions.values()) + 1)
         ]
+        # Every layer must capture the same Tensor object for a shared pool.
+        # Capture only its word rows; derive kernel shapes inside the graph.
+        # Capturing separate 2D/3D views makes AOT synthesize as_strided_scatter
+        # updates of the entire pool for every cache mutation.
+        raw_nope = [nope.flatten(0, 1) for nope, _ in pairs]
         result = MaterializedNativeKVCache({}, [t for pair in pairs for t in pair])
         for name, region in regions.items():
             spec = per_layer_spec(name)
             nope, rope = pairs[region]
-            raw = nope.flatten(0, 1)
+            raw = raw_nope[region]
             is_main = isinstance(spec, MLAAttentionSpec) and not name.endswith(
                 self._DS_V4_INDEXER_CACHE_SUFFIX
             )
