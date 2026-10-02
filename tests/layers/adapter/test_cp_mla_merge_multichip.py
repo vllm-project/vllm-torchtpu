@@ -389,6 +389,8 @@ def _launch(result_dir: Path, extra: list[str]) -> subprocess.CompletedProcess[s
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # libtpu logs can carry non-UTF-8 bytes; they must not fail the test.
+        errors="replace",
         start_new_session=True,
     )
     try:
