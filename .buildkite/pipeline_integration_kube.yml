@@ -207,7 +207,7 @@ steps:
         --max-num-batched-tokens 256
         --max-tokens 32
 
-  # The two role-per-host tests. Each holds both hosts - two engines of eight
+  # The role-per-host tests. Each holds both hosts - two engines of eight
   # devices, which is one whole tpu7x-standard-4t each - so like the multihost
   # step above they sit outside the tpu/v7x concurrency group, which counts
   # steps rather than chips.
@@ -218,7 +218,7 @@ steps:
   # allow_failure throughout because what each needs from the step before is
   # its chips, not its result.
   #
-  # Neither uploads artifacts. The pod is deleted when the run ends and these
+  # None uploads artifacts. The pod is deleted when the run ends and these
   # submit a manifest rather than going through run.sh's upload wrapper, so the
   # logs are the record - as for the multihost step above.
   - label: ":kubernetes: Integration: qwen35-pcp8-dp8-disagg-correctness"
@@ -248,3 +248,20 @@ steps:
       - *kube_plugin
     commands:
       - .buildkite/kubernetes/run_jobset.sh qwen3.5-gpc-two-replica.yaml
+
+  # Nightly only, as on bare metal: a DSv4 boot is ~27 min of weight streaming
+  # and compile before the probes start.
+  - label: ":kubernetes: Integration: Nightly dsv4-pd-disagg-correctness"
+    key: "integration_nightly_dsv4_pd_disagg_correctness"
+    if: 'build.env("NIGHTLY") == "1"'
+    depends_on:
+      - "build_docker"
+      - step: "integration_qwen35_gpc_correctness"
+        allow_failure: true
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_jobset.sh dsv4-pd-disagg.yaml
