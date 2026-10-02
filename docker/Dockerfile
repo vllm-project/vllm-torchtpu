@@ -68,22 +68,12 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 ENV CXX=g++
 ENV CC=gcc
 ENV VLLM_TARGET_DEVICE=empty
+ENV UV_TORCH_BACKEND=cpu
 
-# Install all dependencies from pyproject.toml. We mount the gcloud token secret
-# to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# Install all dependencies from pyproject.toml.
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gcloud_token \
-    set -eu; \
-    TOKEN=""; \
-    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
-    if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
-    export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
-    export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     uv pip install --system \
-      --index https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/ \
-      --extra-index-url https://pypi.org/simple \
-      --index-strategy unsafe-best-match \
       -r pyproject.toml \
       --group vllm
 

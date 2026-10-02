@@ -36,9 +36,8 @@ script at it:
 TYPECHECK_IMAGE=vllm-torchtpu-dev-local bash tools/typecheck_full.sh
 ```
 
-The build needs only the torch-tpu registry access that installing
-`vllm-torchtpu` already requires (see the README). The script uses a local
-image as it is, so rebuild it after `main` or your PR changes dependencies.
+The script uses a local image as it is, so rebuild it after `main` or your PR
+changes dependencies.
 
 ## When Buildkite disagrees with a local run
 

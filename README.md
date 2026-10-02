@@ -45,7 +45,9 @@ See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quot
 `vllm-torchtpu` requires **Python 3.12** on a Cloud TPU VM. Install the plugin and a matching vLLM with a single command:
 
 ```bash
-pip install vllm-torchtpu
+pip install \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  vllm-torchtpu
 ```
 
 For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](docs/getting_started/installation.md) and [Docker guide](docs/getting_started/docker.md).
