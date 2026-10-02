@@ -256,6 +256,7 @@ class KimiMoE(nn.Module):
     ) -> torch.Tensor:
         """Run EP experts with sharded or replicated tokens, then add shared experts."""
         group = self.prefill_group
+        assert group is not None
         router_logits, _ = self.gate(hidden_states)
         latent = hidden_states
         if self.routed_expert_down_proj is not None:

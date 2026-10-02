@@ -61,6 +61,7 @@ x-cpu-unit-test-defaults: &cpu_unit_test_defaults
 x-tests-plugin-defaults: &tests_plugin_defaults
   suite-slug: tpu-ci
   test-runner: pytest
+  test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
 
@@ -79,8 +80,6 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          # tests/omni/models needs the -omni image and runs in the Omni steps.
-          test-file-exclude-pattern: "tests/omni/models/**"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -92,7 +91,6 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          test-file-exclude-pattern: "tests/omni/models/**"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -110,8 +108,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
         <<: *tpu_step
@@ -122,8 +120,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Representative correctness cases run on PRs; the full parameter matrix
       # and acceptance-rate tests run nightly. Split by example because the
@@ -181,7 +179,7 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/omni/models/**/{test_*,*_test}.py"
+              test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
               test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -208,6 +206,15 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_multi
+          # The DSv4 DSpark tests compile DeepSeek-V4 on eight ranks, and the
+          # saved artifacts reach ~70 GB within minutes. On the pod's ephemeral
+          # storage that gets the pod evicted, and the Job reruns the whole file
+          # until the launcher's deadline. The caches go to the compilation
+          # bucket, as in the DSv4 manifests, and the inductor scratch to shm.
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
         plugins:
           - *kube_plugin
           - tests#v1.0.0:
@@ -224,8 +231,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
         <<: *tpu_step
@@ -236,8 +243,8 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "{tests/entrypoints/llm/test_speculative_decoding.py,tests/omni/**}"
-              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip and not omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Omni (Nightly)"
         <<: *tpu_step
@@ -252,6 +259,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/omni/models/**/{test_*,*_test}.py"
+              test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
               test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"

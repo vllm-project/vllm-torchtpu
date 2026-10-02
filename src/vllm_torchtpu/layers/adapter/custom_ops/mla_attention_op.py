@@ -583,6 +583,7 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_q_replicate: bool = False,
         use_sparse: bool = False,
         indexer: object | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         **extra_impl_args,
     ):
         torch.nn.Module.__init__(self)
@@ -632,6 +633,9 @@ class VllmTPUMLAAttention(MLAAttention):
         # process_weights_after_loading gathers W_UK_T on the flag too, and
         # this class does that itself once the weight is on device.
         self.dcp_q_replicate = dcp_q_replicate
+        # The shared top-k table. A layer that reuses an earlier layer's
+        # indices has no indexer, so this is where its top-k width is stated.
+        self.topk_indices_buffer = topk_indices_buffer
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -865,6 +869,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             dcp_q_replicate=self.dcp_q_replicate and self.is_sparse,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 

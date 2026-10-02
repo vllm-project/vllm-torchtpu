@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -52,6 +53,21 @@ from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def test_idle_dp_rank_encodes_before_decoder_pairing():
+    order = []
+    runner = SimpleNamespace(
+        _execute_dp_mm_encoder=lambda: order.append("encoder"),
+        _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        _async_drafter=SimpleNamespace(
+            run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
+        ),
+    )
+    TPUModelRunner._run_dp_idle_pairing(runner, 8, 2)
+    assert runner._dp_target_bucket == 8
+    assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -1134,21 +1150,27 @@ class TestReorderBatchForRpa:
     returned (num_decode, num_windowed) split is fed to both RPA (decode-only
     front) and the GDN windowed kernel (decode + verify)."""
 
-    def _make_runner(self):
+    def _make_runner(self, groups_requests=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
+        runner._masked_dense_groups_requests = groups_requests
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
         )
         return runner
 
-    def _batch(self, runner, req_ids):
+    def _batch(self, runner, req_ids, computed=None):
         ib = runner.input_batch
         ib.req_ids = list(req_ids)
         ib.num_reqs = len(req_ids)
+        ib.num_computed_tokens_cpu = list(computed or [0] * len(req_ids))
 
         def swap_states(i, j):
             ib.req_ids[i], ib.req_ids[j] = ib.req_ids[j], ib.req_ids[i]
+            ib.num_computed_tokens_cpu[i], ib.num_computed_tokens_cpu[j] = (
+                ib.num_computed_tokens_cpu[j],
+                ib.num_computed_tokens_cpu[i],
+            )
 
         ib.swap_states.side_effect = swap_states
 
@@ -1203,6 +1225,117 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_masked_dense_orders_by_kv_length(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "long", "decode", "medium"],
+            computed=[1000, 7000, 9000, 3000],
+        )
+        sched = self._sched(
+            {
+                "short": 512,
+                "long": 32,
+                "decode": 1,
+                "medium": 256,
+            }
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        assert runner.input_batch.req_ids == ["decode", "long", "medium", "short"]
+
+    def test_ordering_moves_request_state_and_keeps_ties(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "decode", "tie_a", "tie_b"],
+            computed=[2500, 9000, 3900, 3400],
+        )
+        sched = self._sched(
+            {
+                "short": 100,
+                "decode": 1,
+                "tie_a": 100,
+                "tie_b": 600,
+            }
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "decode"
+        assert ids[-1] == "short"
+        assert set(ids[1:3]) == {"tie_a", "tie_b"}
+        assert dict(zip(ids, runner.input_batch.num_computed_tokens_cpu)) == {
+            "short": 2500,
+            "decode": 9000,
+            "tie_a": 3900,
+            "tie_b": 3400,
+        }
+
+    @pytest.mark.parametrize("groups_requests", [False, None])
+    def test_order_kept_unless_grouping_applies(self, groups_requests):
+        runner = self._make_runner(groups_requests=groups_requests)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        assert runner._reorder_batch_for_rpa(
+            self._sched({"short": 512, "long": 32})
+        ) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
+
+    def test_speculative_step_keeps_existing_segments(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(runner, ["short", "verify", "long"], computed=[1000, 9000, 7000])
+        sched = self._sched(
+            {"short": 32, "verify": 3, "long": 32}, spec_reqs=("verify",)
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (0, 1)
+        assert runner.input_batch.req_ids == ["verify", "short", "long"]
+
+    def test_speculative_configuration_keeps_order_without_spec_tokens(self):
+        """Admission rejects a speculative configuration outright, so even a
+        step that schedules no draft tokens keeps its request order."""
+        hf_config = SimpleNamespace(
+            model_type="glm_moe_dsa",
+            architectures=["GlmMoeDsaForCausalLM"],
+            num_attention_heads=64,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_topk=2048,
+        )
+        parallel_config = SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        )
+        layer = SimpleNamespace(
+            num_heads=64,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            indexer=SimpleNamespace(topk_tokens=2048),
+        )
+        specs = [SimpleNamespace(layout=SimpleNamespace(value="tensorcore"))] * 2
+        runner = self._make_runner(groups_requests=None)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        with (
+            patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+            patch.object(mla_dispatch, "masked_dense_limits", return_value=(0, 6144)),
+        ):
+            for speculative_config in (None, object()):
+                runner.vllm_config = SimpleNamespace(
+                    model_config=SimpleNamespace(hf_config=hf_config),
+                    parallel_config=parallel_config,
+                    cache_config=SimpleNamespace(kv_offloading_size=None),
+                    speculative_config=speculative_config,
+                    kv_transfer_config=None,
+                )
+                runner._masked_dense_groups_requests = None
+                mla_dispatch.admit_layer(runner, layer, specs, 1024)
+                assert runner._masked_dense_groups_requests is (
+                    speculative_config is None
+                )
+            assert runner._reorder_batch_for_rpa(
+                self._sched({"short": 512, "long": 32})
+            ) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
 
 
 class TestInitializeAttentionKernelsThreshold:

@@ -18,7 +18,11 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    derive_pooled_gdn_state_layout,
+    pooled_gdn_state_itemsize,
+)
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
@@ -536,11 +540,15 @@ def _pooled_kda_core(
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
     kernel_size = conv_weight.shape[0]
-    elem_bytes = jnp.dtype(pool.dtype).itemsize
-    tok_bytes = math.prod(pool.shape[2:]) * elem_bytes
+    # The pool dtype is the attention KV dtype. The state regions keep the
+    # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
+    # sizing, the Raiden manifest), so an fp8 pool still holds bf16 conv rows.
+    conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
+    conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=num_heads * head_dim * head_dim * 4,
-        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * elem_bytes,
+        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * conv_elem_bytes,
         token_bytes=tok_bytes,
     )
     # state_indices are MANAGER block ids, and the region offsets are
@@ -599,7 +607,9 @@ def _pooled_kda_core(
     if layout.conv_tokens % conv_shards:
         raise ValueError("KDA conv shards must occupy whole packed pool rows")
     shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
-    padded_shard_elems = layout.conv_tokens // conv_shards * tok_bytes // elem_bytes
+    padded_shard_elems = (
+        layout.conv_tokens // conv_shards * tok_bytes // conv_elem_bytes
+    )
     if shard_elems > padded_shard_elems:
         raise ValueError("KDA conv shard exceeds its padded pool region")
     conv_gathered = pool_adapters.gather_region(
@@ -607,7 +617,7 @@ def _pooled_kda_core(
         state_indices,
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
-        out_dtype=pool.dtype,
+        out_dtype=conv_dtype,
         split=split,
     )
     conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
@@ -763,6 +773,7 @@ def build_kimi_pooled_kda_op(
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
+    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
     if conv_shard_heads is not None:
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.

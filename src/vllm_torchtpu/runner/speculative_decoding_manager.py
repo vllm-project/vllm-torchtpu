@@ -168,9 +168,11 @@ class SpeculativeDecodingManager:
             assert self.runner._is_async_drafter, (
                 "device-seeded draft proposing is only supported with an async drafter"
             )
+        assert self.runner.speculative_config is not None
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
+            assert scheduler_output is not None
             self._draft_token_ids = self.runner.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,
                 sampled_token_ids[:num_reqs],
@@ -179,7 +181,7 @@ class SpeculativeDecodingManager:
             )
             return None
         elif self.runner._is_async_drafter:
-            result = self.runner.drafter.propose(
+            result = self.runner._async_drafter.propose(
                 sampled_token_ids[:num_reqs]
                 if sampled_token_ids
                 else sampled_token_ids,
@@ -191,7 +193,9 @@ class SpeculativeDecodingManager:
                 device_seed=device_seed,
             )
             if return_device:
+                assert isinstance(result, torch.Tensor)
                 return result
+            assert isinstance(result, list)
             self._draft_token_ids = result
             return None
         else:

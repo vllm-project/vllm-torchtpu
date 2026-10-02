@@ -30,11 +30,18 @@ determine_job_priority() {
     priority="$PRIORITY_NIGHTLY"
     echo "Build type: Nightly - Priority: $priority" >&2
   elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
-    # Pre-merge PR tests
-    priority="$PRIORITY_PRE_MERGE"
-    echo "Build type: Pre-merge (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    local labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+    if grep -qx "oncall-fix" <<< "${labels//,/$'\n'}"; then
+      # PR that fixes a CI or nightly breakage (Highest priority)
+      priority="$PRIORITY_ONCALL_FIX"
+      echo "Build type: On-call fix (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    else
+      # Pre-merge PR tests
+      priority="$PRIORITY_PRE_MERGE"
+      echo "Build type: Pre-merge (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    fi
   elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
-    # Post-merge tests on main (Highest priority)
+    # Post-merge tests on main
     priority="$PRIORITY_POST_MERGE"
     echo "Build type: Post-merge (Main branch) - Priority: $priority" >&2
   else
@@ -49,6 +56,10 @@ determine_job_priority() {
 JOB_PRIORITY=$(determine_job_priority)
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
+if [[ "$JOB_PRIORITY" == "$PRIORITY_ONCALL_FIX" ]]; then
+  buildkite-agent annotate --style warning --context oncall-fix \
+    "Runs at on-call priority (\`oncall-fix\` label): ahead of every other build, including main."
+fi
 
 # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 echo "--- :git: Checking if CI build should be skipped"
@@ -166,6 +177,14 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   buildkite-agent annotate --style warning --context ci-fleet-gaps \
     "Not run on ${CI_FLEET}: no ${missing[*]} yet."
 fi
+
+# pipeline_build.yml skips the -omni image build when this is non-empty.
+# Buildkite rejects the upload if a skip reason is over 70 characters.
+OMNI_IMAGE_SKIP=""
+if [[ " ${lanes} " != *" tests "* ]]; then
+  OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+fi
+export OMNI_IMAGE_SKIP
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"

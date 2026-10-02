@@ -227,7 +227,7 @@ class _HostStagedParams:
 
     def __init__(self):
         # name -> (parameter, its real device tensor).
-        self._staged: dict[str, tuple[torch.nn.Parameter, torch.Tensor]] = {}
+        self._staged: dict[str, tuple[torch.nn.Parameter, torch.nn.Parameter]] = {}
 
     def stage(self, name: str, param: torch.nn.Parameter) -> torch.nn.Parameter:
         """Return a host-backed stand-in for `param` for loaders to write."""
@@ -240,7 +240,10 @@ class _HostStagedParams:
             # ``param.data`` cannot simply be re-pointed at host storage:
             # this backend's tensors carry their own TensorImpl and set_data
             # rejects the dispatch-key change.
-            host = torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False)
+            host = typing.cast(
+                torch.nn.Parameter,
+                torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False),
+            )
             host.__dict__.update(param.__dict__)
             self._staged[name] = (param, host)
         return self._staged[name][1]
@@ -337,7 +340,7 @@ class DeepseekV4Model(nn.Module):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
-                dtype=vllm_config.model_config.dtype,
+                dtype=typing.cast(torch.dtype, vllm_config.model_config.dtype),
             )
         else:
             self._mtp_hidden_buffer = None
@@ -415,7 +418,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -424,7 +427,9 @@ class DeepseekV4Model(nn.Module):
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
+            hidden_states = typing.cast(
+                torch.Tensor, intermediate_tensors["hidden_states"]
+            )
 
         # Hash routing is confined to the first `num_hash_layers`; only those
         # layers need ids gathered across DP.
