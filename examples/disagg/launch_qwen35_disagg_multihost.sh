@@ -138,6 +138,12 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+PREFILL_GPU_MEMORY_UTILIZATION="${PREFILL_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION}}"
+PREFILL_MAX_NUM_BATCHED_TOKENS="${PREFILL_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS}}"
+PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-${MAX_NUM_SEQS}}"
+DECODE_GPU_MEMORY_UTILIZATION="${DECODE_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION}}"
+DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS}}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-${MAX_NUM_SEQS}}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
@@ -248,11 +254,8 @@ common_args=(
   --max-model-len "${MAX_MODEL_LEN}"
   --enable-expert-parallel
   --disable-custom-all-reduce
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-  --kv-cache-dtype fp8
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8}"
   --language-model-only
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
-  --max-num-seqs "${MAX_NUM_SEQS}"
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
@@ -269,6 +272,14 @@ if [[ -z "${LOAD_FORMAT}" && "${MODEL_PATH}" == gs://* ]]; then
 fi
 if [[ -n "${LOAD_FORMAT}" ]]; then
   common_args+=(--load-format "${LOAD_FORMAT}")
+fi
+
+if [[ -n "${MAMBA_SSM_CACHE_DTYPE:-}" ]]; then
+  common_args+=(--mamba-ssm-cache-dtype "${MAMBA_SSM_CACHE_DTYPE}")
+fi
+
+if [[ -n "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-}" ]]; then
+  common_args+=(--prefix-cache-retention-interval "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}")
 fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
@@ -299,6 +310,9 @@ prefill_args=(
   --host 0.0.0.0
   --port "${PREFILL_PORT}"
   "${common_args[@]}"
+  --gpu-memory-utilization "${PREFILL_GPU_MEMORY_UTILIZATION}"
+  --max-num-batched-tokens "${PREFILL_MAX_NUM_BATCHED_TOKENS}"
+  --max-num-seqs "${PREFILL_MAX_NUM_SEQS}"
   --compilation-config "${prefill_compilation_config}"
   --tensor-parallel-size "${PREFILL_TP}"
   --prefill-context-parallel-size "${PREFILL_PCP}"
@@ -321,6 +335,9 @@ decode_args=(
   --host 0.0.0.0
   --port "${DECODE_PORT}"
   "${common_args[@]}"
+  --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION}"
+  --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}"
+  --max-num-seqs "${DECODE_MAX_NUM_SEQS}"
   --compilation-config "${decode_compilation_config}"
   --tensor-parallel-size "${DECODE_TP}"
   --prefill-context-parallel-size 1
@@ -368,6 +385,12 @@ DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
 DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET=${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}
 DECODE_DP_MASTER_PORT=${DECODE_DP_MASTER_PORT}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
+PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION}
+PREFILL_MAX_NUM_BATCHED_TOKENS=${PREFILL_MAX_NUM_BATCHED_TOKENS}
+PREFILL_MAX_NUM_SEQS=${PREFILL_MAX_NUM_SEQS}
+DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION}
+DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS}
+DECODE_MAX_NUM_SEQS=${DECODE_MAX_NUM_SEQS}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
@@ -415,8 +438,24 @@ common_env_exports=(
 
 joined_common_env=$(IFS='; '; echo "${common_env_exports[*]}")
 
+# 将继承的模型配置写入启动命令和参数记录，便于复现 CI。
+for name in VLLM_KV_CACHE_LAYOUT USE_MOE_FUSED_EP_KERNEL \
+  MOE_FUSED_EP_V2_SHARDED_PLAN MOE_REQUANTIZE_BLOCK_SIZE \
+  ONEHOT_MOE_PERMUTE_THRESHOLD RAGGED_GATHER_REDUCE_VERSION \
+  TPU_PARALLEL_PRECOMPILE TPU_PREMAPPED_BUFFER_SIZE \
+  TPU_RAIDEN_PREFIX_AWARE_LOAD VLLM_PREFIX_CACHE_RETENTION_INTERVAL; do
+  if [[ -v "${name}" ]]; then
+    joined_common_env+=$'\n'"export ${name}=$(printf '%q' "${!name}")"
+    printf '%s=%s\n' "${name}" "${!name}" >>"${RUN_DIR}/launch_params.txt"
+  fi
+done
+
 if [[ "${ROLE}" == "prefill" || "${ROLE}" == "all" ]]; then
   prefill_cmd="${joined_common_env}; export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID='prefill-engine-${RUN_ID}'; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${PREFILL_ADVERTISE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(printf '%q' "${PYTHON_BIN}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+  if [[ -n "${PREFILL_TPU_RAIDEN_DST_SHARDS:-}" ]]; then
+    prefill_cmd="export TPU_RAIDEN_DST_SHARDS=$(printf '%q' "${PREFILL_TPU_RAIDEN_DST_SHARDS}"); ${prefill_cmd}"
+    printf 'PREFILL_TPU_RAIDEN_DST_SHARDS=%s\n' "${PREFILL_TPU_RAIDEN_DST_SHARDS}" >>"${RUN_DIR}/launch_params.txt"
+  fi
   printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
   echo "--- Starting prefill server (PCP=${PREFILL_PCP}, PORT=${PREFILL_PORT})"
   setsid bash -lc "${prefill_cmd}" >"${RUN_DIR}/logs/prefill.log" 2>&1 &

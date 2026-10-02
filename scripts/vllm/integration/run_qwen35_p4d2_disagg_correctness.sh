@@ -4,7 +4,11 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
-MODEL_PATH="${MODEL_PATH:-${QWEN35_A3B_FP8_MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}}"
+export PREFILL_PCP="${PREFILL_PCP:-4}"
+export DECODE_DP="${DECODE_DP:-2}"
+# shellcheck source=scripts/vllm/integration/configs/qwen35_disagg.sh
+source "${script_dir}/configs/qwen35_disagg.sh"
+
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
 RUN_ROOT="${RUN_ROOT:-/tmp/qwen35_p4d2_disagg_ci}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/run}"
@@ -15,37 +19,9 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 VLLM_SRC="${VLLM_SRC:-${repo_root}}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-1}"
-TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
-ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
-PREFILL_TP="${PREFILL_TP:-1}"
-PREFILL_PCP="${PREFILL_PCP:-4}"
-PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
-DECODE_TP="${DECODE_TP:-1}"
-DECODE_DP="${DECODE_DP:-4}"
-PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
-DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
-ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
-MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
-VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
-TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-1}"
-# P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
-# default to reduce libtpu startup reservation time for this bounded case.
+# 单机 CI 使用较小的 per-worker premapped pool，缩短 libtpu 启动预留时间。
 TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
-TPU_PARALLEL_PRECOMPILE="${TPU_PARALLEL_PRECOMPILE:-1}"
-# Match the large-cache PCP prefill compilation geometry. An empty override
-# makes vLLM derive the block count from available HBM.
-NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE-}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-4096}"
-DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256}"
-default_prefill_speculative_config='{"method":"mtp","num_speculative_tokens":1}'
-default_decode_speculative_config='{"method":"mtp","num_speculative_tokens":3}'
-PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_speculative_config}}"
-DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
-# Candidate regression floor for this fixed PCP4/DP4 workload; configurable
-# for other models/geometries. Validate each cold start independently.
+# Retain the main-branch regression floor; remeasure for TP2/DP2 on TPU.
 MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.70}"
 
 cleanup() {
@@ -91,7 +67,6 @@ mkdir -p "${RUN_ROOT}" "${RUN_DIR}/logs"
 EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-$(python3 -c 'import importlib.metadata as m; print(m.version("vllm"))')}"
 export EXPECTED_VLLM_VERSION
 
-export MODEL_PATH
 export SERVED_MODEL_NAME
 export RUN_ROOT
 export RUN_DIR
@@ -102,29 +77,7 @@ export PROXY_PORT
 export VLLM_SRC
 export TORCHTPU_VLLM_SRC
 export USE_CURRENT_PY_ENV
-export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-export ASYNC_SCHEDULING
-export PREFILL_TP
-export PREFILL_PCP
-export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE
-export DECODE_TP
-export DECODE_DP
-export PREFILL_BLOCK_SIZE
-export DECODE_BLOCK_SIZE
-export ENABLE_PREFIX_CACHING
-export MAMBA_CACHE_MODE
-export VLLM_PREFIX_CACHE_RETENTION_INTERVAL
-export TPU_RAIDEN_PREFIX_AWARE_LOAD
 export TPU_PREMAPPED_BUFFER_SIZE
-export TPU_PARALLEL_PRECOMPILE
-export NUM_GPU_BLOCKS_OVERRIDE
-export GPU_MEMORY_UTILIZATION
-export MAX_MODEL_LEN
-export MAX_NUM_SEQS
-export PREFILL_COMPILE_SIZES
-export DECODE_COMPILE_SIZES
-export PREFILL_SPECULATIVE_CONFIG
-export DECODE_SPECULATIVE_CONFIG
 
 export P4D2_SHORT_REPEAT_LINES="${P4D2_SHORT_REPEAT_LINES:-32}"
 export P4D2_SHORT_REPEAT_COUNT="${P4D2_SHORT_REPEAT_COUNT:-3}"

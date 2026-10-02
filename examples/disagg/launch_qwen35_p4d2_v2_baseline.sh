@@ -86,6 +86,7 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
 EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.29.0}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-0}"
+STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-1800}"
 
 SERVE_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
 PREFILL_PORT="${PREFILL_PORT:-8400}"
@@ -142,6 +143,12 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
+PREFILL_GPU_MEMORY_UTILIZATION="${PREFILL_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION}}"
+PREFILL_MAX_NUM_BATCHED_TOKENS="${PREFILL_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS}}"
+PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-${MAX_NUM_SEQS}}"
+DECODE_GPU_MEMORY_UTILIZATION="${DECODE_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION}}"
+DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS}}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-${MAX_NUM_SEQS}}"
 COMPILE_SIZES="${COMPILE_SIZES:-16384}"
 PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-${COMPILE_SIZES}}"
 DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-${COMPILE_SIZES}}"
@@ -279,11 +286,8 @@ common_args=(
   --max-model-len "${MAX_MODEL_LEN}"
   --enable-expert-parallel
   --disable-custom-all-reduce
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-  --kv-cache-dtype fp8
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8}"
   --language-model-only
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
-  --max-num-seqs "${MAX_NUM_SEQS}"
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
   --mamba-cache-mode "${MAMBA_CACHE_MODE}"
@@ -294,6 +298,10 @@ common_args=(
 
 if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
   common_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
+fi
+
+if [[ -n "${MAMBA_SSM_CACHE_DTYPE:-}" ]]; then
+  common_args+=(--mamba-ssm-cache-dtype "${MAMBA_SSM_CACHE_DTYPE}")
 fi
 
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
@@ -325,6 +333,7 @@ TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
 EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
+STARTUP_TIMEOUT_S=${STARTUP_TIMEOUT_S}
 CONNECTOR=TPUMultiConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
@@ -340,6 +349,12 @@ PREFILL_BLOCK_SIZE=${prefill_block_size_label}
 DECODE_BLOCK_SIZE=${decode_block_size_label}
 NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
+PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION}
+PREFILL_MAX_NUM_BATCHED_TOKENS=${PREFILL_MAX_NUM_BATCHED_TOKENS}
+PREFILL_MAX_NUM_SEQS=${PREFILL_MAX_NUM_SEQS}
+DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION}
+DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS}
+DECODE_MAX_NUM_SEQS=${DECODE_MAX_NUM_SEQS}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
 MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE}
 VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}
@@ -395,7 +410,7 @@ export TPU_HMA_MAX_INFLIGHT_D2H_SENDS=1 TPU_HMA_MAX_INFLIGHT_PULLS=8;
 export TPU_MAX_HOST_KV_BUFFER_SIZE=64 TPU_P2P_WAIT_PULL_TIMEOUT=600;
 export TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB}";
 export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
-export ONEHOT_MOE_PERMUTE_THRESHOLD=1024;
+export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-1024}";
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
 export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
@@ -404,15 +419,27 @@ export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
 export TPU_RAIDEN_QWEN35_ADMISSION=1;
 export TPU_KV_RESHARD_TRANSPORT=raiden;
-export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
+export TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-4}";
 EOF
 )
 
-prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
+# 将继承的模型配置写入启动命令和参数记录，便于复现 CI。
+for name in VLLM_KV_CACHE_LAYOUT USE_MOE_FUSED_EP_KERNEL \
+  MOE_FUSED_EP_V2_SHARDED_PLAN MOE_REQUANTIZE_BLOCK_SIZE \
+  ONEHOT_MOE_PERMUTE_THRESHOLD RAGGED_GATHER_REDUCE_VERSION \
+  TPU_PARALLEL_PRECOMPILE TPU_PREMAPPED_BUFFER_SIZE \
+  TPU_RAIDEN_PREFIX_AWARE_LOAD VLLM_PREFIX_CACHE_RETENTION_INTERVAL; do
+  if [[ -v "${name}" ]]; then
+    common_env+=$'\n'"export ${name}=$(printf '%q' "${!name}")"
+    printf '%s=%s\n' "${name}" "${!name}" >>"${RUN_DIR}/launch_params.txt"
+  fi
+done
+
+prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --gpu-memory-utilization "${PREFILL_GPU_MEMORY_UTILIZATION}" --max-num-batched-tokens "${PREFILL_MAX_NUM_BATCHED_TOKENS}" --max-num-seqs "${PREFILL_MAX_NUM_SEQS}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
 if [[ "${PREFILL_PCP}" -gt 1 ]]; then
   prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
 fi
-decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
+decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION}" --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}" --max-num-seqs "${DECODE_MAX_NUM_SEQS}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
 if [[ "${DECODE_DP}" -gt 1 ]]; then
   decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
 fi
@@ -434,6 +461,10 @@ printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
+if [[ -n "${PREFILL_TPU_RAIDEN_DST_SHARDS:-}" ]]; then
+  prefill_cmd="export TPU_RAIDEN_DST_SHARDS=$(printf '%q' "${PREFILL_TPU_RAIDEN_DST_SHARDS}"); ${prefill_cmd}"
+  printf 'PREFILL_TPU_RAIDEN_DST_SHARDS=%s\n' "${PREFILL_TPU_RAIDEN_DST_SHARDS}" >>"${RUN_DIR}/launch_params.txt"
+fi
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
 
@@ -446,7 +477,8 @@ echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
 health_log="${RUN_DIR}/logs/health_poll.log"
-for ((attempt = 1; attempt <= 120; attempt++)); do
+deadline=$((SECONDS + STARTUP_TIMEOUT_S))
+while ((SECONDS < deadline)); do
   p_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${PREFILL_PORT}/health" 2>/dev/null || true)
   d_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${DECODE_PORT}/health" 2>/dev/null || true)
   echo "$(date +%H:%M:%S) P=${p_code:-NA} D=${d_code:-NA}" | tee -a "${health_log}"

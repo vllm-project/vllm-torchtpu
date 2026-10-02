@@ -16,7 +16,7 @@ steps:
   - group: "Integration Tests on TPU"
     depends_on: "build_docker"
     steps:
-      - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
+      - label: "Integration: qwen35-pcp4-tp2-dp2-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
         agents:
           queue: "tpu_v7x_8_queue"
@@ -28,7 +28,7 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
+      - label: "Integration: qwen35-pcp8-tp2-dp4-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
         agents:
           queue: "tpu_v7x_16_queue"
