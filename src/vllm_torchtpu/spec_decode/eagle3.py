@@ -1605,6 +1605,7 @@ class Eagle3Proposer:
             if chunk.attn_ctx.use_max_model_len
             else runner.num_reqs_most_model_len
         )
+        assert kernel_num_reqs is not None
         # query_start_loc / request_distribution depend only on num_reqs;
         # the loop hoists them across steps. Fall back to building them here
         # when not supplied (keeps this helper usable standalone).
@@ -1720,10 +1721,16 @@ class Eagle3Proposer:
             result = {}
             for name, md in target_md.items():
                 if id(md) not in replaced_target:
+                    # AttentionMetadata annotates these fields with the
+                    # kernels' jax.Array; the runner fills them with torch
+                    # tensors, as every builder of it does.
                     replaced_target[id(md)] = dataclasses.replace(
                         md,
+                        # pyrefly: ignore[bad-argument-type]
                         seq_lens=seq_lens,
+                        # pyrefly: ignore[bad-argument-type]
                         query_start_loc=query_start_loc,
+                        # pyrefly: ignore[bad-argument-type]
                         request_distribution=request_distribution,
                     )
                 result[name] = replaced_target[id(md)]
