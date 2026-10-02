@@ -28,13 +28,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @property
     def dist_backend(self) -> str:
-        # DiffusionWorker exports WORLD_SIZE before set_device, but building
-        # the worker's VllmConfig afterwards runs check_and_update_config,
-        # which pops WORLD_SIZE for that world_size=1 vLLM config. Fall back
-        # to the size set_device saw, so multi-rank process groups get
-        # tpu_dist instead of gloo.
-        world_size = int(os.environ.get("WORLD_SIZE") or self._worker_world_size)
-        return TpuPlatform.get_worker_distributed_backend(world_size=world_size)
+        return TpuPlatform.get_worker_distributed_backend(
+            world_size=self._worker_world_size
+        )
 
     def __init__(self) -> None:
         super().__init__()
@@ -77,6 +73,17 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size
+            chips = os.environ.get("TPU_VISIBLE_CHIPS")
+            if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
+                logger.warning(
+                    "Diffusion stage is pinned to TPU_VISIBLE_CHIPS=%s, but its "
+                    "%d ranks bind chips 0-%d by local rank. Multi-rank diffusion "
+                    "stages on other chips (e.g. in multi-stage pipelines) are "
+                    "not supported on TPU yet.",
+                    chips,
+                    world_size,
+                    world_size - 1,
+                )
             cls._set_shared_slicebuilder_addresses(world_size)
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
@@ -94,14 +101,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         the slice bootstrap never completes. The workers already share
         MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
         list is derived from it.
+
+        An inherited list is replaced even when its size matches: in
+        multi-stage pipelines it is an LLM stage's list (built in the
+        orchestrator process), and sharing it hangs that stage's workers.
         """
         # TODO: Remove once vLLM-Omni calls a platform hook in the parent before
         # spawning diffusion workers, so every rank inherits one address list, or
         # torch_tpu allows more than one addressable device per process.
-        #
-        addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
-        if addresses and len(addresses.split(",")) == world_size:
-            return
         base_port = int(os.environ["MASTER_PORT"])
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
             f"localhost:{base_port + 1 + i}" for i in range(world_size)
