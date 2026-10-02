@@ -28,7 +28,7 @@ class NgramHashState(upstream.NgramHashState):
             # block size copied at model construction. Match the bound view
             # used by slot_mapping and block_table before upstream sizes its
             # generated-token history cache.
-            block_size = kv_cache.shape[1]
+            block_size = self.swa_cache_module.block_size
             if self.block_size != block_size:
                 self.block_size = block_size
                 self._kv_cache_ref = None

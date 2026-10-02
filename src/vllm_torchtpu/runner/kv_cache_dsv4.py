@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -28,6 +29,32 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def deepseek_v41_cache_spec(spec, vllm_config, *, compressed=False):
+    """Budget separate NoPE/RoPE arrays and the auxiliary NoPE overlays.
+
+    Each physical region must hold a BF16 SWA page or the C2 compressor's
+    eight FP32 state rows (KV plus scores). Reserve the companion RoPE array
+    explicitly, so splitting the native arrays never exceeds vLLM's budget.
+    Padding leaves logical block sizes unchanged across cache groups.
+    """
+    if spec is None:
+        return None
+    block_size = vllm_config.cache_config.block_size
+    nope_bytes = max(block_size * 512 * 2, 8 * 1024 * 4)
+    page_bytes = nope_bytes * 5 // 4
+    changes: dict[str, Any] = {"page_size_padded": page_bytes}
+    if hasattr(spec, "alignment"):
+        changes["alignment"] = None
+    if compressed:
+        if spec.num_states % 4:
+            raise ValueError("CSA pages require a multiple of four compressed states")
+        changes.update(dtype=torch.uint8, state_content_bytes=640)
+    result = replace(spec, **changes)
+    if result.unpadded_page_size_bytes > (page_bytes if compressed else nope_bytes):
+        raise ValueError(f"V4.1 cache page exceeds its native array budget: {result}")
+    return result
+
+
 class DsV4KVCacheAllocator:
     """Owns the DeepSeek-V4 special cases in KV-cache allocation."""
 
@@ -39,6 +66,86 @@ class DsV4KVCacheAllocator:
 
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+
+    def initialize_v41(self, kv_cache_config, per_layer_spec):
+        """Bind V4.1 source caches as V4 `(nope, rope)` arrays.
+
+        Retain vLLM's physical-region assignments, including overlays across
+        groups. SWA and auxiliary state/indexer records use the NoPE array;
+        RoPE has a distinct allocation under the source's same block table.
+        """
+        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+        from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
+            MaterializedNativeKVCache,
+            native_cache_view,
+        )
+
+        regions = layer_to_pool_index(kv_cache_config)
+        page_bytes = {
+            group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_config.kv_cache_groups
+        }
+        if len(page_bytes) != 1:
+            raise ValueError(
+                "V4.1 native arrays require a uniform physical page budget"
+            )
+        page_bytes = page_bytes.pop()
+        if page_bytes % 2560:
+            raise ValueError("V4.1 page budget must contain complete NoPE/RoPE rows")
+        nope_bytes = page_bytes * 4 // 5
+        rows = nope_bytes // 512
+        num_blocks = kv_cache_config.num_blocks
+        pairs = [
+            (
+                torch.zeros(
+                    (num_blocks, rows, 128),
+                    dtype=torch.int32,
+                    device=self.runner.device,
+                ),
+                torch.zeros(
+                    (num_blocks, rows // 4, 128),
+                    dtype=torch.int32,
+                    device=self.runner.device,
+                ),
+            )
+            for _ in range(max(regions.values()) + 1)
+        ]
+        result = MaterializedNativeKVCache({}, [t for pair in pairs for t in pair])
+        for name, region in regions.items():
+            spec = per_layer_spec(name)
+            nope, rope = pairs[region]
+            raw = nope.flatten(0, 1)
+            is_main = isinstance(spec, MLAAttentionSpec) and not name.endswith(
+                self._DS_V4_INDEXER_CACHE_SUFFIX
+            )
+            shape = (
+                num_blocks,
+                spec.num_states,
+                spec.state_content_size_bytes // spec.dtype.itemsize,
+            )
+            layout = (shape, spec.dtype, nope_bytes, 0)
+            result.native_raw_cache[name] = raw
+            result.native_cache_layouts[name] = layout
+            if is_main:
+                result.kv_caches[name] = (nope, rope)
+            elif self._is_ds_v4_swa_layer(name, spec):
+                result.kv_caches[name] = nope
+            else:
+                result.kv_caches[name] = native_cache_view(
+                    raw.view(torch.int8).flatten(),
+                    (num_blocks, 1, *shape[1:]),
+                    spec.dtype,
+                    nope_bytes,
+                    0,
+                )
+        self._validate_ds_v4_overlay(kv_cache_config, result.kv_caches)
+        allocated_bytes = sum(t.nbytes for t in result.raw_tensors)
+        budget_bytes = max(t.size for t in kv_cache_config.kv_cache_tensors)
+        if allocated_bytes > budget_bytes:
+            raise ValueError(
+                f"V4.1 native cache allocation {allocated_bytes} exceeds {budget_bytes}"
+            )
+        return result
 
     @staticmethod
     def _ds_v4_compressed_kv_layer_name(state_cache_name: str) -> str:

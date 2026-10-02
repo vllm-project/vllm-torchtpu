@@ -1362,15 +1362,8 @@ class KVCacheManager:
         native_raw_cache = None
         native_cache_layouts = None
         if use_upstream_allocator:
-            from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
-                materialize_upstream_kv_cache,
-            )
-
-            materialized = materialize_upstream_kv_cache(
-                kv_cache_config,
-                self.runner.device,
-                self.runner.cache_config.get_resolved_kv_cache_layout(),
-                word_rows=True,
+            materialized = self.ds_v4.initialize_v41(
+                kv_cache_config, layer_name_to_spec.__getitem__
             )
             kv_caches = materialized.kv_caches
             # Match the shared pool path: donation must start only after

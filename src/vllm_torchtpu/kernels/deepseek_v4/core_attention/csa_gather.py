@@ -29,7 +29,6 @@ def main_kernel(
     nope_in_hbm_ref: Any,
     rope_in_hbm_ref: Any,
     indices_hbm_ref: Any,
-    rope_indices_hbm_ref: Any,
     valid_indices_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
@@ -40,7 +39,6 @@ def main_kernel(
     num_row_subchunks: int,
     num_streams: int,
     top_k: int,
-    shared_pool: bool,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -55,7 +53,7 @@ def main_kernel(
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
     nope_in_cols = nope_in_hbm_ref.shape[1]
-    rope_in_cols = csa_cache_layout.ROPE_WORDS
+    rope_in_cols = rope_in_hbm_ref.shape[1]
     # A `bf16[n, 64]` output is tiled to 128 lanes, so XLA pads it and it
     # costs twice its own bytes -- on this kernel's write and on the
     # consumer's read. The output is 128 lanes wide instead, pairing entry `i`
@@ -63,30 +61,14 @@ def main_kernel(
     # consumer splits apart with a lane slice and a row concatenate.
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
 
-    def process_rope(gather_ref, out_ref, records, out_row_base=0):
-        def token_words(row):
-            words = gather_ref[pl.ds(row, 1), pl.ds(0, rope_in_cols)]
-            if shared_pool:
-                # Scalar selection avoids an unsupported SIMD-lane-to-major-
-                # dimension broadcast (16 -> 16x1) on SparseCore.
-                quarter = records[row] % 4
-                for part in range(1, 4):
-                    words = jnp.where(
-                        quarter == part,
-                        gather_ref[
-                            pl.ds(row, 1), pl.ds(part * rope_in_cols, rope_in_cols)
-                        ],
-                        words,
-                    )
-            return words
-
+    def process_rope(gather_ref, out_ref, out_row_base=0):
         # bf16 output rows 2t and 2t + 1 are the low and high halves of int32
         # row t, so each output word pairs one rope value of an even entry
         # with the same value of the next entry. A cache rope word k holds
         # values k (low) and k + 32 (high).
         for t in range(num_simd_lanes // 2):
-            even = token_words(2 * t)
-            odd = token_words(2 * t + 1)
+            even = gather_ref[pl.ds(2 * t, 1), :]
+            odd = gather_ref[pl.ds(2 * t + 1, 1), :]
             row = pl.ds(out_row_base + t, 1)
             out_ref[row, pl.ds(0, rope_in_cols)] = jnp.bitwise_or(
                 jnp.bitwise_and(even, 0xFFFF), jnp.left_shift(odd, 16)
@@ -96,7 +78,7 @@ def main_kernel(
                 jnp.bitwise_and(odd, jnp.int32(-65536)),  # 0xFFFF0000
             )
 
-    def outer_pipeline(idx_ref, rope_idx_ref, valid_ref):
+    def outer_pipeline(idx_ref, valid_ref):
         valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
         b = pl.program_id(0)
         out_row_base = (b * num_cores + core_index) * num_row_subchunks
@@ -109,8 +91,8 @@ def main_kernel(
         def subchunk(r, s):
             return r * num_streams + s
 
-        def idx_window(ref, r, s):
-            return ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
+        def idx_window(r, s):
+            return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
 
         # int32 rows produced per stream in the rope output (2 tokens per row).
         rope_rows_per_stream = row_subchunk_size // 2
@@ -143,7 +125,6 @@ def main_kernel(
                 process_rope(
                     gather_ref=rope_g[s],
                     out_ref=rope_o,
-                    records=idx_window(rope_idx_ref, r, s),
                     out_row_base=s * rope_rows_per_stream,
                 )
 
@@ -160,18 +141,15 @@ def main_kernel(
         nope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), nope_in_cols),
-                lambda r, s=s: (idx_window(idx_ref, r, s), 0),
+                lambda r, s=s: (idx_window(r, s), 0),
             )
             for s in range(num_streams)
         )
         # rope: gather the entry's own 32-word quarter row == index.
         rope_in_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(row_subchunk_size), rope_in_hbm_ref.shape[1]),
-                lambda r, s=s: (
-                    idx_window(rope_idx_ref, r, s) // (4 if shared_pool else 1),
-                    0,
-                ),
+                (pl.Indirect(row_subchunk_size), rope_in_cols),
+                lambda r, s=s: (idx_window(r, s), 0),
             )
             for s in range(num_streams)
         )
@@ -213,18 +191,14 @@ def main_kernel(
                 lambda b: (b * num_cores + core_index,),
             ),
             pl.BlockSpec(
-                (row_chunk_size,),
-                lambda b: (b * num_cores + core_index,),
-            ),
-            pl.BlockSpec(
                 (row_subchunk_size,),
                 lambda b: (0,),
             ),
         ),
-    )(indices_hbm_ref, rope_indices_hbm_ref, valid_indices_ref)
+    )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k", "shared_pool"))
+@functools.partial(jax.jit, static_argnames=("top_k",))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -232,8 +206,6 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
-    rope_indices: jax.Array | None = None,
-    shared_pool: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -250,11 +222,6 @@ def csa_gather(
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
-      rope_indices: Optional independent 32-word record addresses for RoPE.
-        Defaults to indices. Shared pools can place NoPE and RoPE in separate
-        page regions without materializing contiguous whole-cache views.
-      shared_pool: Keep both operands in 128-word rows when they may alias.
-        RoPE then gathers a full row and selects the requested quarter in VMEM.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -270,22 +237,17 @@ def csa_gather(
         `jnp.concatenate([blk[:, :64], blk[:, 64:]], axis=0)`.
     """
     assert indices.ndim == 1, "Indices must be 1D."
-    assert top_k > 0 and top_k % 128 == 0
-    if rope_indices is None:
-        rope_indices = indices
-    assert rope_indices.shape == indices.shape
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
     assert nope_cache.dtype == jnp.int32, "Caches must be int32."
     assert nope_cache.shape[2] == csa_cache_layout.ROW_WORDS
     assert rope_cache.shape[2] == csa_cache_layout.ROW_WORDS
 
-    # A 128-lane int32 array's T(8,128) tiling is byte-identical to row-major.
-    # Distinct pools use 32-word RoPE gathers. Aliased pools keep identical
-    # operand shapes: XLA deduplication cannot bind two layouts to one argument.
+    # Free reshapes: a 128-lane int32 array's T(8,128) tiling is byte-identical
+    # to row-major, and the kernel takes its operands untiled
+    # (`use_tc_tiling_on_sc=False`), so token t's rope is words
+    # [32 t, 32 t + 32).
     nope_cache = nope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
-    rope_cache = rope_cache.reshape(
-        -1, csa_cache_layout.ROW_WORDS if shared_pool else csa_cache_layout.ROPE_WORDS
-    )
+    rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
     out_size = indices.size
@@ -314,10 +276,6 @@ def csa_gather(
         num_tokens = nope_cache.shape[0]
         pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
-        rope_pad = (jnp.arange(out_pad_size, dtype=rope_indices.dtype) * 104729) % (
-            rope_cache.size // csa_cache_layout.ROPE_WORDS
-        )
-        rope_indices = jnp.concatenate([rope_indices, rope_pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -332,7 +290,6 @@ def csa_gather(
             num_row_subchunks=num_row_subchunks,
             num_streams=num_streams,
             top_k=top_k,
-            shared_pool=shared_pool,
         ),
         out_type=(
             jax.ShapeDtypeStruct(
@@ -353,5 +310,5 @@ def csa_gather(
         ),
         mesh=vector_mesh,
         name="sc_csa_gather",
-    )(nope_cache, rope_cache, indices, rope_indices, valid_indices)
+    )(nope_cache, rope_cache, indices, valid_indices)
     return nope_out[:out_size], rope_out[: out_size // 4]

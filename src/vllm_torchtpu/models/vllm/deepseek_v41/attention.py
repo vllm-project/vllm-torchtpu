@@ -1,161 +1,29 @@
 """TPU MLA and compressor adapters with upstream cache ownership."""
 
-from collections.abc import Callable
 from typing import cast
 
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import attention as upstream
-from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from .cache import NativeCacheView, write_cache
-from .csa import PackedCSACache, csa_attention, packed_csa_spec
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import DeepseekTPUAttentionMixin
+from vllm_torchtpu.runner.kv_cache_dsv4 import deepseek_v41_cache_spec
+
+from .cache import (
+    NativeCacheView,
+    PagedCacheRows,
+    _block_table,
+    _cache_slots,
+    _row_slots,
+    _token_requests,
+    write_cache,
+)
+from .ced import ced_attention
+from .compressor import AttentionBackend, DeepseekCompressor, write_compressed_cache
 from .indexer import paged_indexer
-from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
-
-
-def _block_table(metadata):
-    return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
-
-
-def _token_requests(metadata, positions):
-    rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
-
-
-def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):
-    """Derive this cache's addresses from the shared TPU metadata contract."""
-    if metadata.seq_lens.numel() == 0:
-        return torch.full_like(positions, -1)
-    table = _block_table(metadata)
-    requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
-    rows_per_page = cache.shape[1]
-    logical = positions // compress_ratio
-    columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
-    slots = blocks * rows_per_page + logical % rows_per_page
-    # Padded request boundaries repeat the last real token offset. Keep the
-    # mask on device, including dummy runs and batches with no active tokens.
-    rows = torch.arange(positions.shape[0], device=positions.device)
-    return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
-
-
-class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateCache):
-    """Upstream CircularBufferSpec, allocation lifecycle and cache binding."""
-
-    def get_attn_backend(self):
-        return AttentionBackend
-
-
-def save_compress_norm(
-    kv_score,
-    positions,
-    state_cache,
-    slot_mapping,
-    query_start_loc,
-    token_to_req_indices,
-    norm_weight,
-    eps,
-    ratio,
-    latent,
-):
-    """Tensor implementation of the compressor_upstream fused compression operation.
-
-    Read the previous row before publishing ring writes. For a long prefill,
-    previous rows come directly from this chunk and only the final ring-sized
-    suffix is stored, so writes never race aliases from earlier ring wraps.
-    """
-    count = kv_score.shape[0]
-    if slot_mapping is not None:
-        slot_mapping = slot_mapping[:count]
-    if token_to_req_indices is not None:
-        token_to_req_indices = token_to_req_indices[:count]
-    dim = norm_weight.numel()
-    values = kv_score[:, :dim].float()
-    valid = slot_mapping >= 0
-    if ratio == 2:
-        capacity = state_cache.shape[1]
-        cache = state_cache
-        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
-        requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
-        previous_slots = (
-            slot_mapping.clamp(min=0) // capacity * capacity
-            + (positions - 1) % capacity
-        )
-        previous = torch.where(
-            (rows > starts)[:, None],
-            kv_score[(rows - 1).clamp(min=0)].float(),
-            cache[previous_slots // capacity, previous_slots % capacity],
-        )
-        scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
-        pair = torch.stack((previous[:, :dim], values), 1)
-        values = (pair * scores.softmax(1)).sum(1)
-        # All reads above refer to the old ring. Keep unique physical writes.
-        publish = valid & (rows >= ends - capacity)
-        write_cache(cache, slot_mapping, kv_score.float(), publish)
-        valid = valid & (positions % 2 == 1)
-    elif ratio != 1:
-        raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
-    result = rms_norm(values, norm_weight, eps)
-    latent.copy_(result.masked_fill(~valid[:, None], 0).to(latent.dtype))
-
-
-class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
-    """Inherit weights and state ownership; consume the shared TPU metadata."""
-
-    def __init__(self, *args, **kwargs):
-        with device_hooks(
-            compressor_upstream, CompressorStateCache=CompressorStateCache
-        ):
-            super().__init__(*args, **kwargs)
-
-    def project(self, hidden_states):
-        from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-
-        layer = self.fused_wkv_wgate
-        weight = layer.weight.float()
-        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            weight = weight.t()
-        # Upstream accumulates the unquantized KV/score projection in FP32.
-        # Keep that precision through pooling and normalization.
-        return torch.mm(hidden_states.float(), weight)
-
-    def forward(self, kv_score, positions):
-        metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict):
-            return None
-        if self.state_cache is None:
-            state_cache = query_start_loc = requests = None
-            cache = self._static_forward_context[self.k_cache_prefix].kv_cache
-            slots = _cache_slots(cache, metadata[self.k_cache_prefix], positions)
-        else:
-            state_metadata = metadata[self.state_cache.prefix]
-            state_cache = self.state_cache.kv_cache
-            slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
-            query_start_loc = state_metadata.query_start_loc
-            requests = _token_requests(state_metadata, positions)
-        latent = torch.empty(
-            (kv_score.shape[0], self.head_dim),
-            dtype=torch.bfloat16,
-            device=kv_score.device,
-        )
-        save_compress_norm(
-            kv_score,
-            positions,
-            state_cache,
-            slots,
-            query_start_loc,
-            requests,
-            self.norm.weight,
-            self.rms_norm_eps,
-            self.compress_ratio,
-            latent,
-        )
-        return latent
+from .ops import device_hooks, rotary, round_fp8_activation
 
 
 def indexer_uses_fp4(vllm_config):
@@ -166,23 +34,36 @@ def indexer_uses_fp4(vllm_config):
     return False
 
 
-class AttentionBackend(compressor_upstream.CompressorBackend):
-    @staticmethod
-    def get_name():
-        return "TORCH_TPU_DEEPSEEK_V41"
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks, block_size, num_kv_heads, head_size, *args, **kwargs
-    ):
-        return num_blocks, num_kv_heads, block_size, head_size
-
-
 class SWACache(NativeCacheView, DeepseekV4SWACache):
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
+
+    @property
+    def kv_cache(self):
+        return self._bound_cache
+
+    @kv_cache.setter
+    def kv_cache(self, cache):
+        self._bound_cache = cache
+
+    @property
+    def paged_cache(self):
+        raw = getattr(self, "_tpu_raw_cache", None)
+        return (
+            PagedCacheRows(raw, self._tpu_cache_layout)
+            if raw is not None
+            else self._bound_cache
+        )
+
+    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
+        if layout is None:
+            raise ValueError("V4.1 SWA binding requires the allocator's logical layout")
+        self.kv_cache = cache
+        self._tpu_raw_cache = raw_cache
+        self._tpu_cache_layout = layout
+        self.block_size = layout[0][1]
 
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
@@ -203,19 +84,15 @@ def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _row_slots(cache, block_table, requests, logical):
-    """Gather fixed-width token rows without inspecting device values on host."""
-    safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
-    blocks = block_table[requests[:, None], safe // cache.shape[1]].long()
-    return blocks * cache.shape[1] + safe % cache.shape[1]
-
-
-class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
+class DeepseekV41Attention(
+    DeepseekTPUAttentionMixin, NativeCacheView, upstream.DeepseekV4Attention
+):
     backend_cls = AttentionBackend
     swa_backend_cls = AttentionBackend
     use_fp8_ds_mla_layout = False
     _ced_decoder = False
     _ced_global_from_encoder = False
+    csa_kernel_batch_size = 1
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -248,25 +125,46 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         self._config = vllm_config.model_config.hf_config.to_dict()
         self._max_model_len = vllm_config.model_config.max_model_len
+        self.custom_prefix = self.prefix
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
     @property
+    def attention_kind(self):
+        return "csa" if self.compress_ratio else "swa"
+
+    @property
+    def main_cache_layer(self):
+        return (
+            self._static_forward_context[self.compressed_cache_prefix]
+            if self.compress_ratio
+            else self
+        )
+
+    @property
     def kv_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        if raw is not None and self.is_kv_source:
-            return PackedCSACache(raw, self._tpu_cache_layout)
         return self._bound_cache
 
     @kv_cache.setter
     def kv_cache(self, cache):
         self._bound_cache = cache
 
+    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
+        if not isinstance(cache, tuple) or len(cache) != 2:
+            raise ValueError("V4.1 compressed KV requires a (NoPE, RoPE) pair")
+        if layout is None:
+            raise ValueError(
+                "V4.1 compressed KV requires the allocator's logical layout"
+            )
+        self.kv_cache = cache
+        self.cache_num_states = layout[0][1]
+
     def get_kv_cache_spec(self, vllm_config):
-        spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None:
-            return spec
-        return packed_csa_spec(spec)
+        return deepseek_v41_cache_spec(
+            super().get_kv_cache_spec(vllm_config),
+            vllm_config,
+            compressed=True,
+        )
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
@@ -301,17 +199,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self.kv_norm(qr_kv[:, self.q_lora_rank :]),
         )
 
-    @property
-    def kv_rope_op(self):
-        op = self.__dict__.get("_kv_rope_op_instance")
-        if op is not None:
-            return op
-        from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
-            VllmDeepseekV4MLAAttention,
-        )
-
-        return cast(Callable, VllmDeepseekV4MLAAttention.kv_rope_op.fget)(self)
-
     def _rotate(self, values, positions, inverse=False):
         if values.device.type != "cpu" and not inverse:
             return self.kv_rope_op(values, positions, self._tpu_rope_cache)
@@ -327,18 +214,20 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         metadata = get_forward_context().attn_metadata
         latent = self.compressor(kv_score, positions)
         compressed_slots = _cache_slots(
-            self.kv_cache,
+            self.kv_cache[0],
             metadata[self.prefix],
             positions,
             compress_ratio=self.compress_ratio,
+            rows_per_page=self.cache_num_states,
         )
         valid = (compressed_slots >= 0) & ((positions + 1) % self.compress_ratio == 0)
         group_positions = positions // self.compress_ratio * self.compress_ratio
-        write_cache(
+        write_compressed_cache(
             self.kv_cache,
             compressed_slots,
             self._rotate(latent, group_positions),
             valid,
+            self.cache_num_states,
         )
         indexer = self.indexer
         keys = indexer.k_norm(_value(indexer.wk(latent)))
@@ -359,7 +248,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     def write_encoder_global_kv(self, hidden_states, positions):
         """Publish decoder global KV for all encoder tokens before replay."""
         metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict) or not self.kv_cache.numel():
+        if not isinstance(metadata, dict) or not isinstance(self.kv_cache, tuple):
             return
         self._write_global_kv(
             self.compressor.project(hidden_states), positions, defer_index_write=False
@@ -381,7 +270,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
             return
         swa = metadata[self.swa_cache_layer.prefix]
-        swa_cache = self.swa_cache_layer.kv_cache
+        swa_cache = self.swa_cache_layer.paged_cache
         swa_table = _block_table(swa)
         swa_slots = _cache_slots(swa_cache, swa, positions)
         q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
@@ -391,7 +280,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         q = self._rotate(q, positions)
         # SWA retains BF16 values; only compressed KV is packed as FP8.
         kv = self._rotate(kv, positions)
-        write_cache(self.swa_cache_layer.kv_cache, swa_slots, kv, swa_slots >= 0)
         index_q = weights = None
         pending_index_write = None
         if self.compressor is not None and not self._ced_global_from_encoder:
@@ -408,24 +296,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
         count = positions.shape[0]
         requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
-        logical = (
-            positions[:, None]
-            - self.window_size
-            + 1
-            + torch.arange(self.window_size, device=positions.device)[None, :]
-        )
-        valid_window = (logical >= 0) & (swa_slots[:, None] >= 0)
-        if self._ced_decoder:
-            replay_starts = get_forward_context().additional_kwargs[
-                "deepseek_v41_replay_starts"
-            ]
-            valid_window &= logical >= replay_starts[requests, None]
-        main_cache = swa_cache
-        main_records = positions.new_empty((count, 0))
-        rope_records = positions.new_empty((count, 0))
+        selected = None
         if self.compress_ratio:
-            source = self._static_forward_context[self.compressed_cache_prefix]
-            source_meta = metadata[self.compressed_cache_prefix]
             capacity = max(1, self._max_model_len // self.compress_ratio)
             logical_compressed = torch.arange(capacity, device=positions.device)
             logical_compressed = logical_compressed[None, :].expand(count, -1)
@@ -474,32 +346,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             selected = self.topk_indices_buffer[
                 :count, : min(capacity, self.topk_indices_buffer.shape[-1])
             ]
-            main_cache = source.kv_cache
-            valid_compressed = (
-                (selected >= 0) & (selected < lengths) & (swa_slots[:, None] >= 0)
+            selected = selected.masked_fill(
+                (selected < 0) | (selected >= lengths) | (swa_slots[:, None] < 0), -1
             )
-            slots = _row_slots(
-                main_cache, _block_table(source_meta), requests, selected.long()
-            )
-            main_records = main_cache.row_indices(slots).masked_fill(
-                ~valid_compressed, -1
-            )
-            rope_records = main_cache.rope_indices(slots).masked_fill(
-                ~valid_compressed, -1
-            )
-        slots = _row_slots(swa_cache, swa_table, requests, logical)
-        records = swa_cache.row_indices(slots).masked_fill(~valid_window, -1)
-        result = csa_attention(
-            q,
-            swa_cache,
-            main_cache,
-            records,
-            main_records,
-            rope_records,
-            self.attn_sink,
-            self.scale,
-        )
-        output.copy_(result.masked_fill((swa_slots < 0)[:, None, None], 0))
+        self.forward_mqa(q, kv, positions, output, topk_indices=selected)
+        output.masked_fill_((swa_slots < 0)[:, None, None], 0)
 
     def _select_paged_indices(
         self,
@@ -558,31 +409,64 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
         return selected
 
-    def forward_mqa(self, q, kv, positions, output):
-        raise RuntimeError("TPU sparse attention is dispatched by _prepare_tpu")
-
-    @property
-    def o_proj_op(self):
-        from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
-            VllmDeepseekV4MLAAttention,
+    def forward_mqa(self, q, kv, positions, output, *, topk_indices=None):
+        if not self._ced_decoder:
+            output.copy_(
+                self._run_mqa(q, kv, positions, output, topk_indices=topk_indices)
+            )
+            return
+        # Decoder replay begins at the whole prompt's tail. Its first query
+        # must not see older keys even when those pages remain in SWA storage.
+        metadata = get_forward_context().attn_metadata
+        swa = metadata[self.swa_cache_layer.prefix]
+        cache = self.swa_cache_layer.paged_cache
+        slots = _cache_slots(cache, swa, positions)
+        write_cache(cache, slots, kv, slots >= 0)
+        table = _block_table(swa)
+        requests = _token_requests(swa, positions).clamp(max=table.shape[0] - 1)
+        logical = (
+            positions[:, None]
+            - self.window_size
+            + 1
+            + torch.arange(self.window_size, device=positions.device)[None]
         )
-
-        getter = cast(Callable, VllmDeepseekV4MLAAttention.o_proj_op.fget)
-        return getter(self)
-
-    def _assert_o_proj_supported(self):
-        from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
-            VllmDeepseekV4MLAAttention,
+        replay_starts = get_forward_context().additional_kwargs[
+            "deepseek_v41_replay_starts"
+        ]
+        valid = (
+            (logical >= 0)
+            & (slots[:, None] >= 0)
+            & (logical >= replay_starts[requests, None])
         )
-
-        VllmDeepseekV4MLAAttention._assert_o_proj_supported(self)
+        records = cache.row_indices(
+            _row_slots(cache, table, requests, logical)
+        ).masked_fill(~valid, -1)
+        source = self.main_cache_layer
+        if topk_indices is None:
+            topk_indices = positions.new_empty(
+                (positions.shape[0], 0), dtype=torch.int32
+            )
+            main = (self.swa_cache_layer.kv_cache,) * 2
+            source_meta, num_states = swa, 1
+        else:
+            main = source.kv_cache
+            source_meta, num_states = metadata[source.prefix], source.cache_num_states
+        output.copy_(
+            ced_attention(
+                q,
+                cache,
+                main,
+                records,
+                topk_indices,
+                source_meta,
+                self.attn_sink,
+                self.scale,
+                num_states,
+            )
+        )
 
     def process_weights_after_loading(self, act_dtype):
-        from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
-            VllmDeepseekV4MLAAttention,
-        )
-
-        VllmDeepseekV4MLAAttention.process_weights_after_loading(self, act_dtype)
+        super().process_weights_after_loading(act_dtype)
         self._assert_o_proj_supported()
         # Register before TorchDynamo captures the first model forward.
         if self.wo_a.weight.device.type == "tpu":
