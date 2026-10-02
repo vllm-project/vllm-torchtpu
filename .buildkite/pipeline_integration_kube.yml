@@ -20,9 +20,9 @@ x-kube-plugin: &kube_plugin
 x-integration-step-defaults: &integration_step
   depends_on:
     - "build_docker"
-  # Matches the quota: eight v7x chips, four to a step.
+  # Shared with pipeline_perf_kube.yml, which says why six.
   concurrency_group: "tpu/v7x"
-  concurrency: 2
+  concurrency: 6
   # Covers queueing as well as running, so it cannot be set from how long the
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
