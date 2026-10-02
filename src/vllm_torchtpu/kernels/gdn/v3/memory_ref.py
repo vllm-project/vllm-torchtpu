@@ -397,8 +397,6 @@ def create_allocs(
     conv_state_ref: jax.Array,
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
-    conv_state_output_ref: jax.Array | None = None,
-    recurrent_state_output_ref: jax.Array | None = None,
 ) -> tuple[
     InBufferedRef,
     InBufferedRef,
@@ -408,8 +406,6 @@ def create_allocs(
     OutBufferedRef,
 ]:
     del recurrent_state_ref
-    if cfg.state_plan is None and conv_state_output_ref is not None:
-        raise ValueError("Compact state outputs require an external state source plan.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -501,8 +497,6 @@ def create_allocs(
             state_source_ref=conv_state_ref,
             block_spec_partial=block_spec_partial,
             pipeline_mode=pipeline_mode,
-            conv_state_output_ref=conv_state_output_ref,
-            recurrent_state_output_ref=recurrent_state_output_ref,
         )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

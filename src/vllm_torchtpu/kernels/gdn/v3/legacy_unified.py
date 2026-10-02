@@ -104,13 +104,6 @@ class ExternalStateBufferedRef(memory_ref.BaseBufferedRef):
 
     region: StateRegion = dataclasses.field(metadata=dict(static=True))
     stride: int = dataclasses.field(metadata=dict(static=True))
-    # The PCP fused kernel writes one compact update per sequence and applies
-    # those updates to the donated pool outside Pallas.  Keeping the compact
-    # output ref here lets the regular buffered pipeline retain its state
-    # copy-in schedule without exposing the whole pool as a Pallas output.
-    compact_output_ref: Any | None = dataclasses.field(
-        default=None, metadata=dict(static=True)
-    )
 
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
@@ -185,37 +178,7 @@ class ExternalStateBufferedRef(memory_ref.BaseBufferedRef):
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
-    def _copy_out_compact(self, grid_indices: tuple[int | jax.Array]):
-        """PCP fused kernel: one compact update per sequence.
-
-        The updates are applied to the donated pool outside Pallas, so the
-        pool never has to be exposed as a Pallas output. This path predates
-        per-checkpoint blocks and PCP rejects speculative decoding, so it
-        writes the compact tile without checkpoint addressing.
-        """
-        assert self.sem_sends is not None
-        assert self.window_ref is not None
-        slot = self.current_copy_out_slot
-        sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        for idx in range(self.cfg.seq_tile_size):
-            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts * self.region.nblocks, 0)
-
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
-                self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
-                sem,
-            ).start()
-
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        if self.compact_output_ref is not None:
-            return self._copy_out_compact(grid_indices)
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
@@ -272,8 +235,6 @@ def external_state_allocs(
     state_source_ref: jax.Array,
     block_spec_partial: Any,
     pipeline_mode: pl.Buffered,
-    conv_state_output_ref: jax.Array | None,
-    recurrent_state_output_ref: jax.Array | None,
 ) -> tuple[ExternalStateBufferedRef, ExternalStateBufferedRef]:
     """Conv and recurrent state allocs for `cfg.state_plan`.
 
@@ -281,16 +242,6 @@ def external_state_allocs(
     source's raw block layout and `select_states` applies the typed region view
     inside the kernel body.
     """
-    if (conv_state_output_ref is None) != (recurrent_state_output_ref is None):
-        raise ValueError(
-            "Conv and recurrent compact state outputs must be set together."
-        )
-    if conv_state_output_ref is not None and cfg.window_size != 1:
-        raise ValueError(
-            "Compact external state outputs do not support checkpoint "
-            f"windows, got window_size={cfg.window_size}."
-        )
-
     plan = cfg.state_plan
     if plan.whole_block_dma:
         # Whole-block DMA transfers complete pages, retaining all inner dims.
@@ -335,12 +286,10 @@ def external_state_allocs(
         partial(
             spec=block_spec_partial(block_shape=conv_shape),
             region=plan.conv,
-            compact_output_ref=conv_state_output_ref,
         ),
         partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
             region=plan.recurrent,
-            compact_output_ref=recurrent_state_output_ref,
         ),
     )
 
