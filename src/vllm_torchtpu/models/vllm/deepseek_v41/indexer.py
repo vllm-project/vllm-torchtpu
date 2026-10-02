@@ -1,107 +1,113 @@
-"""Paged attention, exact index selection and index-cache publication."""
+"""V4.1 index selection over V4's packed FP8 index-key records."""
 
 import jax
 import jax.numpy as jnp
 import torch
 
-from .cache import gather_cache_values, scatter_cache_values
+INDEX_HEAD_DIM = 128
+INDEX_RECORD_BYTES = 256
 
-_attention_op = None
+
+class IndexCacheRows:
+    """Logical index records in the shared native word pool.
+
+    Four records form V4's uint8 ``[4, 256]`` slab. In the pool's int32
+    view, each key owns one byte of each word in two adjacent 128-word rows.
+    Keep the pool as the same Tensor captured by SWA, CSA and state writers.
+    """
+
+    def __init__(self, raw, layout):
+        self.shape, dtype, stride_bytes, offset_bytes = layout
+        if dtype != torch.uint8 or self.shape[2:] != (INDEX_RECORD_BYTES,):
+            raise ValueError("Index cache requires 256-byte uint8 records")
+        if raw.dtype != torch.int32 or raw.ndim != 2 or raw.shape[1] != 128:
+            raise ValueError("Index cache requires native int32 word rows")
+        if stride_bytes % 1024 or offset_bytes % 1024:
+            raise ValueError("Index pages must contain complete four-key slabs")
+        if raw.numel() // 64 > torch.iinfo(torch.int32).max:
+            raise ValueError("Index record addresses must fit int32")
+        self.raw = raw
+        self.page_stride = stride_bytes // INDEX_RECORD_BYTES
+        self.row_offset = offset_bytes // INDEX_RECORD_BYTES
+
+    def row_indices(self, slots):
+        return (
+            self.row_offset
+            + slots // self.shape[1] * self.page_stride
+            + slots % self.shape[1]
+        )
 
 
-def paged_attention_jax(
-    q: jax.Array,
-    swa_pool: jax.Array,
-    main_pool: jax.Array,
-    swa_records: jax.Array,
-    main_records: jax.Array,
-    sink: jax.Array,
-    scale: float,
-) -> jax.Array:
-    tokens, heads, dim = q.shape
-    tile = 64
-    state = (
-        jnp.full((tokens, heads), -1e30, jnp.float32),
-        jnp.zeros((tokens, heads), jnp.float32),
-        jnp.zeros(q.shape, jnp.float32),
+def quantize_index_rows(values: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One power-of-two scale for all 128 post-RoPE channels of each Q/K."""
+    if values.shape[-1] != INDEX_HEAD_DIM:
+        raise ValueError("V4.1 FP8 index vectors must have 128 channels")
+    values = values.astype(jnp.float32)
+    amax = jnp.maximum(jnp.abs(values).max(axis=-1), 1e-4)
+    exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
+    scale_bytes = (exponent + 127).astype(jnp.uint8)
+    scales = jax.lax.bitcast_convert_type(
+        scale_bytes.astype(jnp.uint32) << 23, jnp.float32
+    )
+    quantized = (values / scales[..., None]).astype(jnp.float8_e4m3fn)
+    return quantized, scales, scale_bytes
+
+
+def pack_index_keys(keys: jax.Array) -> jax.Array:
+    """128 E4M3 bytes, one E8M0 byte, then 127 zero padding bytes."""
+    quantized, _, scale_bytes = quantize_index_rows(keys)
+    return jnp.concatenate(
+        (
+            jax.lax.bitcast_convert_type(quantized, jnp.uint8),
+            scale_bytes[:, None],
+            jnp.zeros((keys.shape[0], 127), jnp.uint8),
+        ),
+        axis=-1,
     )
 
-    def attend(pool, records, state):
-        width = records.shape[1]
-        if not width:
-            return state
-        records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
-        # Gather BF16 rows once outside; keep FP32 scratch tiled.
-        gathered = gather_cache_values(
-            pool, jnp.maximum(records, 0).reshape(-1), dim
-        ).reshape(tokens, records.shape[1], dim)
+def gather_index_keys(pool: jax.Array, records: jax.Array):
+    """Decode only selected records, keeping key operands in FP8 for the dot."""
 
-        def step(index, carry):
-            maximum, denominator, numerator = carry
-            addresses = jax.lax.dynamic_slice_in_dim(
-                records, index * tile, tile, axis=1
+    def arbitrary_rows(_):
+        safe = jnp.maximum(records, 0)
+        word_rows = safe // 4 * 2
+        shifts = (safe % 4 * 8).astype(jnp.int32)
+        return (
+            ((pool[word_rows] >> shifts[..., None]) & 255).astype(jnp.uint8),
+            ((pool[word_rows + 1, 0] >> shifts) & 255).astype(jnp.uint8),
+        )
+
+    if records.shape[-1] % 4:
+        key_bytes, scale_bytes = arbitrary_rows(None)
+    else:
+        groups = records.reshape(*records.shape[:-1], -1, 4)
+        first = groups[..., :1]
+        lanes = jnp.arange(4)
+        grouped = jnp.all(
+            (groups < 0) | ((first >= 0) & (first % 4 == 0) & (groups == first + lanes))
+        )
+
+        def four_key_slabs(_):
+            # Full pages and aligned candidate blocks share these word reads
+            # across four keys, rather than fetching each slab four times.
+            rows = jnp.maximum(first[..., 0], 0) // 4 * 2
+            shifts = lanes * 8
+            keys = (pool[rows][..., None, :] >> shifts[:, None]) & 255
+            scales = (pool[rows + 1, 0][..., None] >> shifts) & 255
+            return (
+                keys.astype(jnp.uint8).reshape(*records.shape, INDEX_HEAD_DIM),
+                scales.astype(jnp.uint8).reshape(records.shape),
             )
-            valid = addresses >= 0
-            kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
-            kv = jnp.where(valid[..., None], kv, 0)
-            scores = (
-                jnp.einsum(
-                    "thd,tkd->thk",
-                    q.astype(jnp.float32),
-                    kv.astype(jnp.float32),
-                    preferred_element_type=jnp.float32,
-                )
-                * scale
-            )
-            scores = jnp.where(valid[:, None], scores, -jnp.inf)
-            new_max = jnp.maximum(maximum, scores.max(-1))
-            correction = jnp.exp(maximum - new_max)
-            exponentials = jnp.exp(scores - new_max[..., None])
-            denominator = denominator * correction + exponentials.sum(-1)
-            numerator = numerator * correction[..., None] + jnp.einsum(
-                "thk,tkd->thd",
-                exponentials.astype(jnp.bfloat16),
-                kv,
-                preferred_element_type=jnp.float32,
-            )
-            return new_max, denominator, numerator
 
-        return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
-
-    # SWA widths in the released model are multiples of 64, preserving the
-    # reference's accumulation boundaries when compressed rows follow.
-    maximum, denominator, numerator = attend(
-        main_pool, main_records, attend(swa_pool, swa_records, state)
-    )
-    denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
-    return (numerator / denominator[..., None]).astype(q.dtype)
-
-
-def initialize_paged_attention():
-    global _attention_op
-    if _attention_op is not None:
-        return
-    from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal import pallas
-
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        get_vllm_model_wrapper_context,
-    )
-
-    _attention_op = pallas.jax_op(
-        "pallas::deepseek_v41_paged_bf16_attention",
-        paged_attention_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
-    )
-    _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
-
-
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
-    assert _attention_op is not None
-    return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
+        key_bytes, scale_bytes = jax.lax.cond(
+            grouped, four_key_slabs, arbitrary_rows, None
+        )
+    return (
+        jax.lax.bitcast_convert_type(key_bytes, jnp.float8_e4m3fn),
+        jax.lax.bitcast_convert_type(scale_bytes, jnp.float8_e8m0fnu).astype(
+            jnp.float32
+        ),
     )
 
 
@@ -112,8 +118,10 @@ def paged_index_scores_jax(
     weights: jax.Array,
     lengths: jax.Array,
 ) -> jax.Array:
-    tokens, width = records.shape
-    dim, tile = q.shape[-1], 128
+    width = records.shape[1]
+    tile = 128
+    q, q_scales, _ = quantize_index_rows(q)
+    weights = weights.astype(jnp.float32) * q_scales
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full(records.shape, -jnp.inf, jnp.float32)
 
@@ -122,14 +130,13 @@ def paged_index_scores_jax(
         # the loop materializes [tokens, max_context / ratio, dim] even when
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
-        keys = gather_cache_values(
-            pool, jnp.maximum(addresses, 0).reshape(-1), dim
-        ).reshape(tokens, tile, dim)
+        keys, k_scales = gather_index_keys(pool, addresses)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
-        # Upstream quantized MQA logits and the weighted head reduction are
-        # FP32. BF16 cache storage is not a request to round the dot product.
+        # The FP8 dot and weighted head reduction accumulate in FP32. Q's
+        # scale is folded into weights once; the shared K scale follows the
+        # head reduction, as in V4's FP8 scoring path.
         logits = jnp.maximum(logits, 0)
-        values = (logits * weights.astype(jnp.float32)[:, :, None]).sum(1)
+        values = (logits * weights[:, :, None]).sum(1) * k_scales
         return jax.lax.dynamic_update_slice_in_dim(
             result, values.astype(jnp.float32), index * tile, axis=1
         )
@@ -145,6 +152,7 @@ def paged_index_scores_jax(
 
 
 _indexer_op = None
+_write_index_op = None
 
 
 def select_indices_jax(
@@ -270,8 +278,7 @@ def paged_indexer_jax(
         selected_valid = values > -jnp.inf
         # The dense reference fills an underfull top-k with the lowest logical
         # -inf positions, then sorts all positions before masking them. Preserve
-        # those padding locations too: moving padding across a 64-key attention
-        # tile changes BF16 accumulation boundaries.
+        # those padding locations in the logical buffer shared by reuse layers.
         occupied = jnp.zeros((records.shape[0], output_width + 1), jnp.bool_)
         occupied_ids = jnp.where(
             selected_valid & (selected < output_width), selected, output_width
@@ -302,12 +309,24 @@ def paged_indexer_jax(
 def write_index_keys(
     pool: jax.Array, write_records: jax.Array, keys: jax.Array
 ) -> jax.Array:
-    """Publish index records through the same cache writer as KV and state."""
+    """Update native four-key slabs without losing neighboring key bytes."""
     if keys.dtype != jnp.bfloat16:
         raise ValueError("Index keys must be BF16")
     if keys.ndim != 2 or write_records.shape != (keys.shape[0],):
         raise ValueError("One physical record index per key is required")
-    return scatter_cache_values(pool, write_records, keys)
+    if not keys.shape[0]:
+        return pool
+    packed = pack_index_keys(keys).reshape(-1, 2, 128).astype(jnp.int32)
+    records = jnp.maximum(write_records, 0)
+    rows = records[:, None] // 4 * 2 + jnp.arange(2)[None]
+    shifts = (records % 4 * 8)[:, None, None]
+    previous = (pool[rows] >> shifts) & 255
+    # Distinct records can own different bytes of the SAME word. Add integer
+    # byte deltas so scatter combines those updates rather than racing whole
+    # word replacements. Modular int32 addition preserves the other bytes.
+    deltas = (packed - previous) << shifts
+    rows = jnp.where(write_records[:, None] >= 0, rows, pool.shape[0])
+    return pool.at[rows[..., None], jnp.arange(128)].add(deltas, mode="drop")
 
 
 def update_and_select_jax(
@@ -341,7 +360,7 @@ def update_and_select_jax(
 
 
 def initialize_indexer():
-    global _indexer_op
+    global _indexer_op, _write_index_op
     if _indexer_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -352,7 +371,7 @@ def initialize_indexer():
     )
 
     _indexer_op = pallas.jax_op(
-        "pallas::deepseek_v41_exact_indexer",
+        "pallas::deepseek_v41_fp8_indexer",
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
@@ -382,6 +401,19 @@ def initialize_indexer():
         )
 
     _indexer_op.register_fake(fake)
+    _write_index_op = pallas.jax_op(
+        "pallas::deepseek_v41_write_index_keys",
+        write_index_keys,
+        donate_argnums=(0,),
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(),) * 3,
+    )
+    _write_index_op.register_fake(lambda pool, records, keys: torch.empty_like(pool))
+
+
+def publish_index_keys(cache, records, keys):
+    assert _write_index_op is not None
+    cache.raw.copy_(_write_index_op(cache.raw, records.int(), keys))
 
 
 def paged_indexer(

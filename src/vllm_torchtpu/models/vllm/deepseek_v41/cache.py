@@ -6,7 +6,6 @@ from typing import Any, Protocol, cast
 
 import jax
 import torch
-from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
@@ -36,73 +35,6 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
     return pages[:, page_offset : page_offset + page_bytes].view(dtype).reshape(shape)
 
 
-def materialize_upstream_kv_cache(
-    kv_cache_config, device, layout, *, word_rows=False
-) -> MaterializedNativeKVCache:
-    """Keep upstream placements, with one TPU input per shared physical region."""
-    from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
-
-    views = allocate_upstream_kv_cache(kv_cache_config, torch.device("meta"), layout)
-    if not views:
-        return MaterializedNativeKVCache({}, [])
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1
-    backing_bytes = sizes.pop()
-    if layout.is_layer_compact:
-        # Reuse the same physical-region split as the hybrid attention/Mamba
-        # path. Overlaid groups keep one owner, while unrelated layers no
-        # longer functionalize mutations of the entire model cache.
-        pool_indices = layer_to_pool_index(kv_cache_config)
-        pool_bytes = kv_cache_config.num_blocks * max(
-            group.kv_cache_spec.page_size_bytes
-            for group in kv_cache_config.kv_cache_groups
-        )
-    else:
-        pool_indices = dict.fromkeys(views, 0)
-        pool_bytes = backing_bytes
-    # Use DSV4's native 128-word rows at the kernel boundary. Allocate
-    # in that layout: reshaping a flat byte pool inside XLA copies the
-    # entire pool on every read, even when only a few rows are requested.
-    if word_rows:
-        assert pool_bytes % ROW_BYTES == 0, pool_bytes
-    raw_tensors = [
-        torch.zeros(
-            (pool_bytes // ROW_BYTES, ROW_WORDS) if word_rows else (pool_bytes,),
-            dtype=torch.int32 if word_rows else torch.int8,
-            device=device,
-        )
-        for _ in range(backing_bytes // pool_bytes)
-    ]
-    caches = {}
-    native_raw_cache = {}
-    native_cache_layouts = {}
-    for name, view in views.items():
-        assert view.ndim == 4 and view.shape[1] == 1
-        assert view.stride(-1) == 1 and view.stride(-2) == view.shape[-1]
-        itemsize = view.element_size()
-        pool_index = pool_indices[name]
-        native_raw_cache[name] = raw_tensors[pool_index]
-        native_cache_layouts[name] = (
-            (view.shape[0], *view.shape[2:]),
-            view.dtype,
-            view.stride(0) * itemsize,
-            view.storage_offset() * itemsize - pool_index * pool_bytes,
-        )
-        caches[name] = native_cache_view(
-            raw_tensors[pool_index].view(torch.int8).flatten(),
-            tuple(view.shape),
-            view.dtype,
-            view.stride(0) * itemsize,
-            view.storage_offset() * itemsize - pool_index * pool_bytes,
-        )
-    return MaterializedNativeKVCache(
-        kv_caches=caches,
-        raw_tensors=raw_tensors,
-        native_raw_cache=native_raw_cache,
-        native_cache_layouts=native_cache_layouts,
-    )
-
-
 _read_values_op = None
 _write_op = None
 _write_values_op = None
@@ -110,6 +42,8 @@ _write_values_op = None
 
 class _CacheBinding(Protocol):
     def bind_kv_cache(self, cache: Any) -> None: ...
+
+    def get_kv_cache_spec(self, vllm_config: Any) -> Any: ...
 
 
 class PagedCacheRows:
@@ -192,6 +126,13 @@ class NativeCacheView:
     """Expose each shared physical pool once, deriving layer views in the graph."""
 
     tpu_native_kv = True
+
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm_torchtpu.runner.kv_cache_dsv4 import deepseek_v41_cache_spec
+
+        return deepseek_v41_cache_spec(
+            cast(_CacheBinding, super()).get_kv_cache_spec(vllm_config), vllm_config
+        )
 
     @property
     def kv_cache(self):
@@ -361,7 +302,21 @@ def scatter_cache_values(
         else values,
         jnp.int32,
     )
+    return scatter_cache_words(cache, records, words)
+
+
+def scatter_cache_words(
+    cache: jax.Array, records: jax.Array, words: jax.Array
+) -> jax.Array:
+    """Publish packed words in full rows or independent sub-row records."""
+    import jax.numpy as jnp
+
+    assert cache.dtype == words.dtype == jnp.int32
+    assert cache.ndim == words.ndim == 2 and cache.shape[1] == ROW_WORDS
+    if not words.shape[0]:
+        return cache
     width = words.shape[1]
+    assert width % ROW_WORDS == 0 or ROW_WORDS % width == 0
     if width < ROW_WORDS or jax.default_backend() != "tpu":
         columns = jnp.arange(width)[None]
         if width < ROW_WORDS:
@@ -412,3 +367,38 @@ def scatter_cache_values(
         # Flatten only the small update batch. A partial DMA from a tiled 2D
         # source can straddle its padded minor dimension; the cache stays 2D.
     )(records, words.reshape(-1), cache)
+
+
+def _block_table(metadata):
+    return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
+
+
+def _token_requests(metadata, positions):
+    rows = torch.arange(positions.shape[0], device=positions.device)
+    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+
+
+def _cache_slots(
+    cache, metadata, positions, *, compress_ratio=1, ring=False, rows_per_page=None
+):
+    """Derive this cache's addresses from the shared TPU metadata contract."""
+    if metadata.seq_lens.numel() == 0:
+        return torch.full_like(positions, -1)
+    table = _block_table(metadata)
+    requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
+    rows_per_page = rows_per_page or cache.shape[1]
+    logical = positions // compress_ratio
+    columns = torch.zeros_like(logical) if ring else logical // rows_per_page
+    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
+    slots = blocks * rows_per_page + logical % rows_per_page
+    # Padded request boundaries repeat the last real token offset. Keep the
+    # mask on device, including dummy runs and batches with no active tokens.
+    rows = torch.arange(positions.shape[0], device=positions.device)
+    return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
+
+
+def _row_slots(cache, block_table, requests, logical):
+    """Gather fixed-width token rows without inspecting device values on host."""
+    safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
+    blocks = block_table[requests[:, None], safe // cache.shape[1]].long()
+    return blocks * cache.shape[1] + safe % cache.shape[1]

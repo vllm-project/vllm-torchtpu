@@ -192,6 +192,8 @@ def _attention_csa(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
+    attention_kernel_batch_size: int = 16,
+    logical_main_page_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
@@ -219,21 +221,80 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    output = sparse_ragged_paged_attention(
+    output = _attention_csa_from_swa(
+        q,
+        main_cache_kv,
+        main_cache_rope,
+        extra,
+        main_page_indices,
+        main_cu_q_lens,
+        main_distribution,
+        attention_sinks,
+        swa_output,
+        swa_l,
+        swa_m,
+        sm_scale=sm_scale,
+        attention_kernel_batch_size=attention_kernel_batch_size,
+        logical_main_page_size=logical_main_page_size,
+    )
+    return output, updated_sw_cache
+
+
+def _attention_csa_from_swa(
+    q: jax.Array,
+    main_cache_kv: jax.Array,
+    main_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sinks: jax.Array,
+    swa_output: jax.Array,
+    swa_l: jax.Array,
+    swa_m: jax.Array,
+    *,
+    sm_scale: float,
+    attention_kernel_batch_size: int = 16,
+    logical_main_page_size: int | None = None,
+) -> jax.Array:
+    """Merge compressed attention with an already-computed SWA softmax state.
+
+    V4 and ordinary V4.1 layers obtain the state from `_run_swa`. CED
+    supplies its bounded-replay state without changing the SWA kernel.
+    """
+    if logical_main_page_size is not None:
+        # A padded physical page may hold more native rows than the logical
+        # compressed page. Keep the source page table; adapt only the row
+        # coordinate and compact invalid holes into the kernel's masked tail.
+        valid = topk_indices >= 0
+        order = jnp.argsort(~valid, axis=-1, stable=True)
+        topk_indices = jnp.take_along_axis(topk_indices, order, axis=-1)
+        topk_indices = jnp.where(
+            topk_indices >= 0,
+            topk_indices // logical_main_page_size * main_cache_kv.shape[1]
+            + topk_indices % logical_main_page_size,
+            -1,
+        )
+        topk_indices = jnp.pad(
+            topk_indices,
+            ((0, 0), (0, -topk_indices.shape[1] % 128)),
+            constant_values=-1,
+        )
+    return sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,
         cache_kv_rope=main_cache_rope,
-        topk_indices=extra,
-        page_indices=main_page_indices,
-        cu_q_lens=main_cu_q_lens,
-        distribution=main_distribution,
+        topk_indices=topk_indices,
+        page_indices=page_indices.flatten(),
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
         attention_sinks=attention_sinks,
         swa_accumution=swa_output,
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
+        attention_kernel_batch_size=attention_kernel_batch_size,
     )
-    return output, updated_sw_cache
 
 
 def get_packed_mla_head_size(hf_config) -> int:

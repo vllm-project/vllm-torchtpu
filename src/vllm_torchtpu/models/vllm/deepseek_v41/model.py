@@ -16,10 +16,11 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41Mo
 from vllm_torchtpu.logger import init_logger
 
 from .attention import DeepseekV41Attention, _block_table, _cache_slots
-from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
-from .ced import plan_decoder_replay
+from .ced import initialize_ced_attention, plan_decoder_replay
+from .compressor import initialize_compressor_ops
 from .engram import Engram, NgramHashState
+from .indexer import initialize_indexer
 from .mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -293,7 +294,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     lookback_token_ids,
                     upstream.image_sentinel_mask(lookback_token_ids),
                     _cache_slots(
-                        self.engram_hash.swa_cache_module.kv_cache,
+                        self.engram_hash.swa_cache_module.paged_cache,
                         swa_metadata,
                         positions,
                     ),
@@ -416,7 +417,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_mhc_post()
-        initialize_paged_attention()
+        initialize_compressor_ops()
+        initialize_ced_attention()
         initialize_indexer()
         with (
             device_hooks(
