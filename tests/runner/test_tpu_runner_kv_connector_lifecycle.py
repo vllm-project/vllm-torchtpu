@@ -110,6 +110,7 @@ def _fake_runner(method, is_async, verify, propose):
         _stage_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
+    runner._async_drafter = runner.drafter
     for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner

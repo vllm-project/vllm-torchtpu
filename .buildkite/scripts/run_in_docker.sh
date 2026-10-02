@@ -15,12 +15,6 @@
 
 set -euo pipefail
 
-# Set HF_TOKEN from GCP Secret Manager if not already in /etc/environment
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
-
 # Sourcing /etc/environment early ensures TPU_VERSION, HF_TOKEN, etc., are available immediately
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091

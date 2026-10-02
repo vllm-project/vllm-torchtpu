@@ -51,11 +51,7 @@ import jax.numpy as jnp
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEQuantConfig,
-    mxfp4_w4a16_moe_quant_config,
-)
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend as Mxfp4Backend,
 )
@@ -311,17 +307,6 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-        )
-
-    def get_fused_moe_quant_config(
-        self,
-        layer: torch.nn.Module,
-    ) -> FusedMoEQuantConfig | None:
-        return mxfp4_w4a16_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=getattr(layer, "w13_bias", None),
-            w2_bias=getattr(layer, "w2_bias", None),
         )
 
     rhs_quant_dtype: Any = None

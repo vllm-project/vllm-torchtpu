@@ -30,6 +30,7 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
 # count against it, because the kernel requires one equal block per shard.
@@ -533,8 +534,8 @@ def test_env_flag_alone_does_not_claim_the_collectives():
         assert prop.fget(SimpleNamespace()) is False
 
 
-class TestFusedOutputIsReducedPatch:
-    """`_patch_moe_runner_fused_output_is_reduced` rewrites an upstream class.
+class TestFusedOutputIsReduced:
+    """`VllmMoERunner._fused_output_is_reduced` overrides an upstream answer.
 
     It is the guard that stops vLLM all-reducing an output the kernel already
     combined, so it has to be right about three things: it stays out of runs
@@ -542,77 +543,32 @@ class TestFusedOutputIsReducedPatch:
     `skip_final_all_reduce`, and it answers per layer.
     """
 
-    @staticmethod
-    def _fresh_runner_cls():
-        """A MoERunner with the patch un-applied, restored after the test."""
-        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
-
-        return mr.MoERunner
-
-    @pytest.fixture(autouse=True)
-    def _restore(self):
-        cls = self._fresh_runner_cls()
-        saved = cls.__dict__.get("_fused_output_is_reduced")
-        saved_flag = cls.__dict__.get("_tpu_fused_output_reduced_patch")
-        if hasattr(cls, "_tpu_fused_output_reduced_patch"):
-            del cls._tpu_fused_output_reduced_patch
-        yield cls
-        if saved is not None:
-            cls._fused_output_is_reduced = saved
-        if saved_flag is not None:
-            cls._tpu_fused_output_reduced_patch = saved_flag
-        elif hasattr(cls, "_tpu_fused_output_reduced_patch"):
-            del cls._tpu_fused_output_reduced_patch
-
-    def _apply(self):
-        import vllm_torchtpu
-
-        vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
-
-    def _runner(self, cls, *, armed, skip_final_all_reduce=False):
-        """A stub standing in for a MoERunner, with `original` forced False."""
+    def _answer(self, *, armed, skip_final_all_reduce=False):
         # `moe_kernel=None` is what the TPU fp8 method actually has, and it
         # is what makes upstream's own getter return False -- so a True here
-        # can only have come from the patch.
+        # can only have come from the override.
         quant_method = SimpleNamespace(moe_kernel=None)
         if armed:
             setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, "op")
-        runner = SimpleNamespace(
-            _quant_method=quant_method,
-            moe_config=SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce),
-        )
-        return cls._fused_output_is_reduced.fget(runner)
+        runner = VllmMoERunner.__new__(VllmMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+        runner.moe_config = SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce)
+        return runner._fused_output_is_reduced
 
-    def test_not_installed_without_the_env_flag(self, _restore):
-        cls = _restore
-        before = cls.__dict__.get("_fused_output_is_reduced")
+    def test_defers_to_upstream_without_the_env_flag(self):
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False):
-            self._apply()
-        assert cls.__dict__.get("_fused_output_is_reduced") is before
-        assert not getattr(cls, "_tpu_fused_output_reduced_patch", False)
+            assert self._answer(armed=True) is False
 
-    def test_reports_reduced_only_for_an_armed_layer(self, _restore):
-        cls = _restore
+    def test_reports_reduced_only_for_an_armed_layer(self):
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-        assert cls._tpu_fused_output_reduced_patch is True
-        assert self._runner(cls, armed=True) is True
-        assert self._runner(cls, armed=False) is False
+            assert self._answer(armed=True) is True
+            assert self._answer(armed=False) is False
 
-    def test_defers_to_upstream_under_skip_final_all_reduce(self, _restore):
+    def test_defers_to_upstream_under_skip_final_all_reduce(self):
         """The upstream assert requires an un-reduced fused output there."""
-        cls = _restore
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-        assert self._runner(cls, armed=True, skip_final_all_reduce=True) is False
-
-    def test_is_idempotent(self, _restore):
-        cls = _restore
-        with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-            first = cls.__dict__["_fused_output_is_reduced"]
-            self._apply()
-        assert cls.__dict__["_fused_output_is_reduced"] is first
+            assert self._answer(armed=True, skip_final_all_reduce=True) is False
 
 
 def _fp4_layer(block=512, hidden=512, inter=512):

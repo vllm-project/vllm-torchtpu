@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -29,15 +29,28 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.multimodal.processing import ProcessorInputs
+    from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
+
+    class _TpuAttentionBackend(Protocol):
+        """Typing-only view of the TPU classmethods on our attention backends."""
+
+        @staticmethod
+        def get_page_size(vllm_config: VllmConfig) -> int: ...
+
+        @staticmethod
+        def get_min_page_size(vllm_config: VllmConfig) -> int: ...
+
+        @classmethod
+        def get_preferred_block_size(cls, default_block_size: int) -> int: ...
+
 else:
     ModelConfig = None
     VllmConfig = None
-    ProcessorInputs = None
+    EngineInput = None
     PoolingParams = None
     AttentionBackendEnum = None
     SamplingParams = None
@@ -297,7 +310,7 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     Both mistakes below produce a run that looks healthy and writes no
     traces, which is only discovered once the benchmark has finished.
     """
-    assert "phased_profiling_dir" not in vllm_config.additional_config, (
+    assert "phased_profiling_dir" not in cast(dict, vllm_config.additional_config), (
         "Legacy additional_config['phased_profiling_dir'] is no longer "
         "supported. Set USE_PHASED_PROFILER=true and "
         "--profiler-config.torch_profiler_dir=<dir> instead."
@@ -503,6 +516,8 @@ class TpuPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        # vLLM's selector passes num_heads by keyword; unused here.
+        num_heads: int | None = None,
         **kwargs,
     ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -544,7 +559,9 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
         if not torch.tpu.is_initialized():
             return 0.0
         free, total = torch.accelerator.get_memory_info(device)
@@ -599,7 +616,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        assert "sharding" not in vllm_config.additional_config, (
+        assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
@@ -719,10 +736,13 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
-            compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
-                max_token_size=scheduler_config.max_num_batched_tokens,
-                extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+            compilation_config.compile_sizes = cast(
+                list[int | str],
+                _get_token_paddings(
+                    min_token_size=16,
+                    max_token_size=scheduler_config.max_num_batched_tokens,
+                    extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+                ),
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
@@ -985,7 +1005,9 @@ class TpuPlatform(Platform):
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        backend_cls = cast(
+            "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)
+        )
 
         if backend_cls is None:
             return
@@ -1064,7 +1086,7 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        processed_inputs: ProcessorInputs,
+        processed_inputs: EngineInput,
         params: Union["SamplingParams", PoolingParams],
     ) -> None:
         """Raises if this request is unsupported on this platform"""

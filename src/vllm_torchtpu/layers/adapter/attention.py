@@ -2058,6 +2058,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
+            # Recorded when the KV cache is allocated, which precedes tracing.
+            allow_masked_dense = getattr(layer, "allow_masked_dense", False) is True
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -2075,6 +2077,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
+                allow_masked_dense=allow_masked_dense,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"

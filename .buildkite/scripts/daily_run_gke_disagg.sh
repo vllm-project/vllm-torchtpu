@@ -26,14 +26,6 @@ fi
 export PATH="${REPO_DIR}:${REPO_DIR}/google-cloud-sdk/bin:${HOME}/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin:${PATH:-}"
 export USE_GKE_GCLOUD_AUTH_PLUGIN=True
 
-if [ -z "${HF_TOKEN:-}" ]; then
-  if command -v gcloud &>/dev/null; then
-    echo "HF_TOKEN not set. Attempting to fetch from GCP Secret Manager..."
-    HF_TOKEN=$(gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet 2>/dev/null || true)
-    export HF_TOKEN
-  fi
-fi
-
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 TIMEOUT_SECONDS=36000
 

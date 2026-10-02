@@ -195,7 +195,13 @@ class StructuredDecodingManager:
                 assert target_row_starts is not None, (
                     f"chunk without target_logits scheduled drafts for request {req_id}"
                 )
-                assert draft_lengths_cpu[local_index] == num_drafts
+                assert draft_lengths_cpu is not None
+                if draft_lengths_cpu[local_index] != num_drafts:
+                    raise ValueError(
+                        f"Draft lengths mismatch for request {req_id}: "
+                        f"scheduler scheduled {num_drafts} drafts, but runner recorded "
+                        f"{draft_lengths_cpu[local_index]} drafts."
+                    )
                 row = int(target_row_starts[local_index])
                 self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
                     torch.from_numpy(bitmask[mask_row : mask_row + num_drafts])
@@ -301,6 +307,8 @@ class StructuredDecodingManager:
             cur_end_idx=cur_end_idx,
         ):
             if target_logits is not None:
+                assert require_target is not None
+                assert target_bitmask is not None
                 target_logits = self.structured_decode(
                     require_target, target_bitmask, target_logits, arange
                 )

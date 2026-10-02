@@ -835,6 +835,8 @@ def sparse_mla_attention(
     rope_spec: SparseMLAKVCacheSpec,
     sm_scale: float | None = None,
     k_scale: float | None = None,
+    *,
+    allow_masked_dense: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -858,6 +860,9 @@ def sparse_mla_attention(
       rope_spec: Layout descriptor the rope cache was allocated from.
       sm_scale: Softmax temperature scale.
       k_scale: Dequantization scale for fp8 keys.
+      allow_masked_dense: Whether masked-dense routing admitted this layer
+        (`kernels.mla.dispatch.admit_layer`). A static Python bool; when false
+        the layer compiles only the original sparse call.
 
     Returns:
       A tuple containing:
@@ -941,13 +946,31 @@ def sparse_mla_attention(
             rope_spec=rope_spec,
         )
 
+        # Opt-in masked-dense routing builds Q inside each device branch.
+        if allow_masked_dense and mla_dispatch.applies(
+            ql_nope, q_pe, kv_cache_nope, kv_cache_rope, topk_idx, cache_layout
+        ):
+            output = mla_dispatch.attention_from_parts(
+                ql_nope,
+                q_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+            )
+            return output, kv_cache_nope, kv_cache_rope
+
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = mla_dispatch.ragged_paged_attention(
+        output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
             topk_idx,
-            seq_lens_,
             block_tables_,
             query_start_loc_,
             request_distribution_,
