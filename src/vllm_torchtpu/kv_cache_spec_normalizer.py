@@ -18,7 +18,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 
 def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
-    kv_cache_dtype: str | torch.dtype,
+    kv_cache_dtype: torch.dtype,
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
@@ -94,7 +94,7 @@ def _pooled_physical_mamba_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 def _normalize_one_spec(
     spec: KVCacheSpec,
-    kv_cache_dtype: str | torch.dtype,
+    kv_cache_dtype: torch.dtype,
     *,
     attention_backend: type[PallasAttentionBackend],
 ) -> KVCacheSpec:

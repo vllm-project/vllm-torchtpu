@@ -56,24 +56,26 @@ def align_ep_weight_filter() -> None:
     split = hierarchical_split_or_none()
     if split is None:
         return
-    ep_size, ep_rank, _, _ = split
+    chip_ep_size, chip_ep_rank, _, _ = split
 
     from vllm.model_executor.model_loader import default_loader
 
     original = default_loader.compute_local_expert_ids
 
-    def chip_aware(num_experts, _ep_size, _ep_rank, placement="linear"):
+    def chip_aware(
+        num_experts: int, ep_size: int, ep_rank: int, placement: str = "linear"
+    ) -> set[int] | None:
         # Ignore the caller's rank-derived ownership; the experts this rank
         # needs are its chip's block, shared with the other chiplet.
-        return original(num_experts, ep_size, ep_rank, placement=placement)
+        return original(num_experts, chip_ep_size, chip_ep_rank, placement=placement)
 
     default_loader.compute_local_expert_ids = chip_aware
     _filter_patched = True
     logger.info(
         "EP weight filter realigned to chip-block ownership: ep_size=%d, "
         "ep_rank=%d (was rank-derived).",
-        ep_size,
-        ep_rank,
+        chip_ep_size,
+        chip_ep_rank,
     )
 
 

@@ -78,7 +78,9 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     return expert_id not in local_expert_ids
 
 
-def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
+def _should_skip_weight_tpu(
+    weight_name: str, local_expert_ids: set[int] | None
+) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
@@ -88,7 +90,7 @@ def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> boo
     """
     if local_expert_ids is None:
         return False
-    return _should_skip(name, local_expert_ids)
+    return _should_skip(weight_name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -198,6 +200,8 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
+                # run_start is set whenever a size is appended to run_sizes.
+                assert run_start is not None
                 requests.append(FileChunks(len(requests), path, run_start, run_sizes))
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []

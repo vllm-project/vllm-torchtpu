@@ -178,12 +178,14 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
+        self._runnables: dict[
+            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+        ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
-        self, cache_dir: str, key: str, graph: fx.GraphModule
+        self, cache_dir: str | None, key: str, graph: fx.GraphModule
     ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
@@ -201,7 +203,7 @@ class BucketExecutables:
 
     def put(
         self,
-        cache_dir: str,
+        cache_dir: str | None,
         key: str,
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
@@ -236,7 +238,7 @@ def warmup() -> Iterator[BucketExecutables]:
 
 
 def runnable_for(
-    cache_dir: str, key: str, graph: fx.GraphModule, size: int | None = None
+    cache_dir: str | None, key: str, graph: fx.GraphModule, size: int | None = None
 ) -> Callable[..., Any] | None:
     """What this compile should use instead of compiling, if anything.
 
@@ -266,6 +268,7 @@ def runnable_for(
         )
 
     logger.info("[shape-variants] %s left to a later trace: %s", key, reason)
+    assert size is not None
     _session.refused.add(size)
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
@@ -278,7 +281,7 @@ def runnable_for(
 
 
 def remember(
-    cache_dir: str, key: str, graph: fx.GraphModule, runnable: Callable[..., Any]
+    cache_dir: str | None, key: str, graph: fx.GraphModule, runnable: Callable[..., Any]
 ) -> None:
     """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:

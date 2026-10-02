@@ -292,7 +292,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             return block_size
         return min(block_size, window_size)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Update self.block_size so the returned spec and the Pallas kernel's
         # logical_page_size in attention.py agree on the final runtime block size.
         self.block_size = self._swa_block_size(

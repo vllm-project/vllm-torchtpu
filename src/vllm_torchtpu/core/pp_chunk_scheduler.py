@@ -20,7 +20,7 @@ then chunks are cut by token count alone.
 """
 
 import math
-from typing import Any
+from typing import Any, cast
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -199,7 +199,8 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
         [[tuple(s) for s in report["samples"]] for report in reports],
         envs.TPU_PP_CHUNK_SLACK,
         granularity,
-        min(schedules) if schedules else None,
+        # Each worker reports its kernel schedule as (pairs, bq, bkv).
+        cast(tuple[int, int, int], min(schedules)) if schedules else None,
     )
     scheduler.install_cost_model(model)
 

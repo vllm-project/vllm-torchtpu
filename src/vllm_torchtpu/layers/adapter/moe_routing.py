@@ -247,6 +247,8 @@ def select_experts(
     )
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        # hash_indices_table is only set when layer is not None.
+        assert layer is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -268,6 +270,7 @@ def select_experts(
             grouped_topk,
         )
 
+        assert layer is not None
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
