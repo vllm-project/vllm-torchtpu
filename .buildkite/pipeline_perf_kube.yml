@@ -34,12 +34,14 @@ x-eval-runtime: &eval_runtime "18000"
 x-perf-step-defaults: &perf_step
   depends_on:
     - "build_docker"
-  # Matches the quota: eight v7x chips, four to a step. More would stage faster
-  # but every pod loading a model rewrites refs/<rev> in the shared bucket, and
-  # a pod holding a handle across another's rewrite gets
-  # OSError: [Errno 116] Stale file handle.
+  # Six steps of four chips is 24 of the cohort's 40 v7x chips: the eight the
+  # 2x2x1 queue owns plus sixteen borrowed from 2x2x4, which a Kimi-K3 run
+  # reclaims. The other sixteen stay free for the multi-host steps of other
+  # lanes. Above this, watch for OSError: [Errno 116] Stale file handle: every
+  # pod loading a model rewrites refs/<rev> in the shared HF cache bucket, and a
+  # pod holding a handle across another's rewrite gets that error.
   concurrency_group: "tpu/v7x"
-  concurrency: 2
+  concurrency: 6
   # Covers queueing as well as running, so it cannot be set from how long the
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
@@ -229,8 +231,8 @@ steps:
     # that was never pushed and holds the fleet in ImagePullBackOff.
     #
     # TODO: drop the perf_tpu edge once the reservation has room for this
-    # alongside the group. Chips come free only when the two-at-a-time group
-    # drains, and it backfills the moment a slot opens, so a step wanting the
+    # alongside the group. Chips come free only when the group drains,
+    # and it backfills the moment a slot opens, so a step wanting the
     # whole fleet never sees it. allow_failure because what this needs from
     # those steps is their chips, not their results.
     depends_on:
