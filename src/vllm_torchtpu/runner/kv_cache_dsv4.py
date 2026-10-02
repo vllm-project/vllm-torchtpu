@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
@@ -35,7 +36,8 @@ def deepseek_v41_cache_spec(spec, vllm_config, *, compressed=False):
     Each physical region must hold a BF16 SWA page or the C2 compressor's
     eight FP32 state rows (KV plus scores). Reserve the companion RoPE array
     explicitly, so splitting the native arrays never exceeds vLLM's budget.
-    Padding leaves logical block sizes unchanged across cache groups.
+    Each logical page uses its array's full record capacity; the fixed
+    compressor ring retains its upstream lifetime and row count.
     """
     if spec is None:
         return None
@@ -46,9 +48,15 @@ def deepseek_v41_cache_spec(spec, vllm_config, *, compressed=False):
     if hasattr(spec, "alignment"):
         changes["alignment"] = None
     if compressed:
-        if spec.num_states % 4:
-            raise ValueError("CSA pages require a multiple of four compressed states")
-        changes.update(dtype=torch.uint8, state_content_bytes=640)
+        changes.update(
+            dtype=torch.uint8,
+            state_content_bytes=640,
+            block_size=int(nope_bytes // 512 * spec.tokens_per_state),
+        )
+    elif not isinstance(spec, CircularBufferSpec):
+        changes["block_size"] = int(
+            nope_bytes // spec.state_content_size_bytes * spec.tokens_per_state
+        )
     result = replace(spec, **changes)
     if result.unpadded_page_size_bytes > (page_bytes if compressed else nope_bytes):
         raise ValueError(f"V4.1 cache page exceeds its native array budget: {result}")
