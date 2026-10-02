@@ -44,7 +44,11 @@ dependencies = [
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    #
+    # Bump this together with torch-tpu above. The extension calls into
+    # torch-tpu's PJRT client through C++ virtual methods, so a mismatched
+    # pair still imports, then segfaults in the Raiden KVCacheManager init.
+    "tpu-sync-torch==0.0.1.dev20261001082953",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
