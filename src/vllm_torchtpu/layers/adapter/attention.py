@@ -1043,7 +1043,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # is compiled.
         rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         if use_pcp_streaming:
-            assert op_mesh is not None and input_partition_specs is not None
             rpa_kernel_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,

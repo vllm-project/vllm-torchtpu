@@ -1022,6 +1022,11 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, *tuple[Unknown, ...]] | None` is not assignable to parameter `input_partition_specs` with type `Sequence[Unknown]` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter.pcp_streaming_jax_op`"
+    },
+    {
+      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `parallel_config`"
     },
