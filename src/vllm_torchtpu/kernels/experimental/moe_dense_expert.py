@@ -142,8 +142,8 @@ def _kernel(
                     xq_ref[:, k : k + 512], rhs, preferred_element_type=jnp.float32
                 ).astype(jnp.bfloat16)
                 xs = xs_ref[k // 512, :, :]
-                part *= jnp.concatenate((xs, xs), axis=1)
                 part *= scale.astype(jnp.bfloat16)
+                part *= jnp.concatenate((xs, xs), axis=1)
                 acc += part
             a_ref[:, n : n + 128] = jax.nn.silu(acc[:, :128]) * acc[:, 128:]
         _quantize(a_ref[...], aq_ref, asc_ref)
@@ -156,8 +156,8 @@ def _kernel(
                     preferred_element_type=jnp.float32,
                 ).astype(jnp.bfloat16)
                 asc = asc_ref[k // 512, :, :]
-                part *= jnp.concatenate((asc, asc), axis=1)
                 part *= s2_ref[:, n : n + 256].astype(jnp.bfloat16)
+                part *= jnp.concatenate((asc, asc), axis=1)
                 acc += part
             # Mask before accumulation; zero routing must suppress even
             # non-finite unused expert outputs, rather than multiply NaN*0.

@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# NOTE: This is a stale version. For all new development on this kernel, please
+# develop in the tokamax repo tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py
+
 """Tests for gmm_v2.
 
 Most helper logic in this file is copied from

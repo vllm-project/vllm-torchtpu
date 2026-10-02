@@ -20,9 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import apply_act_fn, interleave_lane
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,

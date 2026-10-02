@@ -7,9 +7,9 @@ import torch
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import gmm_v2
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's

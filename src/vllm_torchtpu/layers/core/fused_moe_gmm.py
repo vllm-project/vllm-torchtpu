@@ -17,13 +17,13 @@ import functools
 import jax
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
+from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import get_packing_factor, gmm_v2
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,

@@ -21,8 +21,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax._src.ops.experimental.gmm_v2.gmm_v2 as gmm_v2
 
-from vllm_torchtpu.kernels.megablox import gmm_v2, moe_onehot_unpermute
+from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute
 
 
 def _require_tpu() -> jax.Device:

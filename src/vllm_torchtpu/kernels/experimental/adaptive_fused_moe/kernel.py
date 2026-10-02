@@ -25,6 +25,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
+# implementation, called here rather than copied.
+from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import swigluoai
+
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
@@ -38,10 +42,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     QB4,
     ROWBLK,
 )
-
-# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
-# implementation, called here rather than copied.
-from vllm_torchtpu.kernels.megablox.gmm_v2 import swigluoai
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
