@@ -107,6 +107,7 @@ def _make_manager_with_eagle3_drafter(num_reqs=2):
     mock_runner.speculative_config.method = "eagle3"
     mock_drafter = MagicMock(spec=Eagle3Proposer)
     mock_runner.drafter = mock_drafter
+    mock_runner._async_drafter = mock_drafter
     manager = SpeculativeDecodingManager(mock_runner)
     return manager, mock_runner, mock_drafter
 

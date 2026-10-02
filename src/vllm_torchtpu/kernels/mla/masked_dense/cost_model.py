@@ -31,15 +31,18 @@ KV_BLOCK_SIZE = 1024
 QUERY_BLOCK_SIZE = 32
 
 # Conservative integer fits to the TPU7x medians produced by
-# scripts/benchmark_masked_dense_vs_sparse_mla.py. The masked-dense estimate
-# grows with the actual query-block x KV-block grid; sparse gather grows with
-# query tokens and is otherwise nearly flat in KV length.
+# scripts/benchmark_masked_dense_vs_sparse_mla.py. The query/KV-grid term also
+# includes the grouped mixed measurements at 5,120 and 6,144 KV tokens: a
+# 63-decode/961-prefill call wins at 5,120 and loses at 6,144. The
+# masked-dense estimate grows with the actual query-block x KV-block grid; the
+# sparse gather estimate grows with query tokens and is otherwise nearly flat
+# in KV length.
 GLM52_TPU7X_PREFILL_COST_MODEL = MaskedDensePrefillCostModel(
     analytic_fixed_ns=215_000,
     analytic_token_ns=245,
     bitmap_fixed_ns=227_000,
     bitmap_token_ns=451,
-    q_kv_block_ns=9_040,
+    q_kv_block_ns=8_700,
     sparse_fixed_ns=259_000,
     sparse_token_ns=2_156,
 )

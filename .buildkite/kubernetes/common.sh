@@ -25,17 +25,20 @@
 # surfaces twenty minutes later as ImagePullBackOff on a TPU node that scaled up
 # to sit idle.
 #
-# A step may still name its own image, which the disagg lane does - it builds
-# one of its own rather than using the CI image.
+# A step on another variant of the image - the -omni build - names it with
+# DOCKER_IMAGE_SUFFIX, as run_in_docker.sh reads it on bare metal. A step may
+# also name its own image, which the disagg lane does - it builds one of its
+# own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" \
-    2>/dev/null || true)
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+    --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   # Falling back to :latest would run whatever happened to be pushed last and
   # report the answer as this commit's.
-  echo "$0: no CI_IMAGE_TAG metadata and no WORKLOAD_IMAGE. The image build" \
-       "step has to run before this one, or the step has to name an image." >&2
+  echo "$0: no CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-} metadata and no WORKLOAD_IMAGE." \
+       "The image build step has to run before this one, or the step has to" \
+       "name an image." >&2
   exit 2
 fi
 export WORKLOAD_IMAGE
@@ -72,6 +75,9 @@ FORWARD=(
   # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
   # JSON, which is an evicted pod if it lands on ephemeral storage.
   TMPDIR RAY_TMPDIR
+  # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
+  # storage. A step that compiles a large model points them at /cache/jax.
+  VLLM_CACHE_ROOT VLLM_XLA_CACHE_PATH
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT

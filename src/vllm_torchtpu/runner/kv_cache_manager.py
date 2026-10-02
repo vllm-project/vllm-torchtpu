@@ -11,7 +11,7 @@ import copy
 import dataclasses
 import math
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -30,7 +30,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -55,6 +55,7 @@ from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -265,6 +266,7 @@ class KVCacheManager:
                     # The layout can pad a page past what its shape and dtype
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
+                    assert backend_cls is not None
                     _warn_if_kv_cache_is_padded(
                         backend_cls,
                         block_size,
@@ -390,6 +392,7 @@ class KVCacheManager:
             and not ds_v4_layers
             and not self.runner._unified_kv_layout
         ):
+            assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
                 kv_cache_spec, backend_cls
             )
@@ -441,7 +444,9 @@ class KVCacheManager:
             page_bytes,
         )
         return {
-            name: dataclasses.replace(spec, page_size_padded=page_bytes)
+            name: dataclasses.replace(
+                cast(AttentionSpec, spec), page_size_padded=page_bytes
+            )
             for name, spec in kv_cache_specs.items()
         }
 
@@ -602,6 +607,7 @@ class KVCacheManager:
         backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
         for m in layers.values():
             if isinstance(m, Attention):
+                assert backend_cls is not None
                 attn_page_sizes.add(
                     backend_cls.get_kv_cache_page_size_bytes(
                         block_size,
@@ -668,6 +674,7 @@ class KVCacheManager:
             else 1
         )
         attention_backend = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        assert attention_backend is not None
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.runner.block_size,
             num_kv_heads,
@@ -1486,9 +1493,10 @@ class KVCacheManager:
             region: tuple[int, int],
             geometry: list[tuple[tuple[int, ...], torch.dtype]],
         ) -> tuple[torch.Tensor, ...]:
+            native_caches = None
+            key = tuple(geometry)
             if share_attention_regions:
                 native_caches = attention_regions.setdefault(region, {})
-                key = tuple(geometry)
                 if key in native_caches:
                     return native_caches[key]
                 allocated_bytes = sum(
@@ -1509,7 +1517,7 @@ class KVCacheManager:
                 torch.zeros(shape, dtype=dtype).to(self.runner.device)
                 for shape, dtype in geometry
             )
-            if share_attention_regions:
+            if native_caches is not None:
                 native_caches[key] = caches
             return caches
 
@@ -1586,6 +1594,7 @@ class KVCacheManager:
                         layer_name
                     )
                     if getattr(attn_module, "use_sparse", False):
+                        assert attn_module is not None
                         # Split (nope, rope) cache; each half's shape and dtype
                         # come from its own layout spec.
                         specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
@@ -1593,6 +1602,9 @@ class KVCacheManager:
                             kv_cache_spec.block_size,
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
+                        )
+                        mla_dispatch.admit_layer(
+                            self.runner, attn_module, specs, kv_cache_spec.block_size
                         )
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = allocate_attention_region(
@@ -1637,6 +1649,7 @@ class KVCacheManager:
                         # with self._kv_cache_bundle.
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:
+                        assert backend_cls is not None
                         kv_cache_shape = backend_cls.get_kv_cache_shape(
                             num_blocks,
                             kv_cache_spec.block_size,
@@ -1688,21 +1701,21 @@ class KVCacheManager:
             layers = get_layers_from_vllm_config(self.runner.vllm_config, Attention)
             # Only enter wrapper context when eligible attention layers are present.
             eligible = [
-                (name, attn_layer)
+                (name, attn_layer, impl)
                 for name, attn_layer in layers.items()
                 if name in self.runner._kv_cache_bundle_layer_index
-                and isinstance(attn_layer.impl, PallasAttentionBackendImpl)
+                and isinstance(impl := attn_layer.impl, PallasAttentionBackendImpl)
             ]
             if eligible:
                 with set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh,
                     kv_cache_bundle=self.runner._kv_cache_bundle,
                 ):
-                    for name, attn_layer in eligible:
-                        attn_layer.impl.setup_bundled(
+                    for name, attn_layer, impl in eligible:
+                        impl.setup_bundled(
                             self.runner._kv_cache_bundle_layer_index[name],
                             self.runner._kv_cache_bundle.device,
-                            attn_layer,
+                            cast(AttentionLayer, attn_layer),
                         )
 
         # No-op unless DCP fine-grained prefix hits can emit CoW copies on

@@ -204,103 +204,8 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     )
 
 
-def _patch_default_moe_runner_select_forward() -> None:
-    """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
-
-    Upstream gates this on ``is_tpu()``; under our OOT plugin that's False
-    and we'd take ``torch.ops.vllm.moe_forward``, which captures weight
-    tensors as closures and trips torch_tpu's MLIR builder.
-    """
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _dmr
-
-    if getattr(_dmr.MoERunner, "_tpu_select_forward_patch", False):
-        return
-
-    def patched_select(self):
-        return (
-            _dmr._moe_forward
-            if self.shared_experts is None
-            else _dmr._moe_forward_shared
-        )
-
-    _dmr.MoERunner._select_forward = patched_select
-    _dmr.MoERunner._tpu_select_forward_patch = True
-    logger.info("Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
-
-
-def _patch_moe_runner_fused_output_is_reduced() -> None:
-    """Tell vLLM the fused EP MoE kernel already reduced its output.
-
-    `fused_moe_ep` returns this rank's tokens combined over ALL experts -- the
-    kernel pushes each result row back to the chip that owns the token, so
-    there is nothing left to reduce. vLLM does not know that: it decides from
-    `MoERunner._fused_output_is_reduced`, which reads
-    `quant_method.moe_kernel.output_is_reduced()`, and the TPU fp8 method never
-    sets `moe_kernel` -- it declares itself through `supports_internal_mk`
-    instead. So `moe_runner.py` all-reduces the already-combined output
-    whenever `tp_size > 1 or ep_size > 1`.
-
-    Today it changes no answer, and the reason is worth stating exactly rather
-    than calling it luck: `prebuild_fused_moe_ep` refuses tp_size > 1, so the
-    kernel only ever arms with a tensor-parallel group of world size one, where
-    all three all-reduces this flag gates are `return input_`. The patch is the
-    guard that keeps that true if the TP refusal is ever lifted, at which point
-    the unpatched path would silently multiply every routed MoE output by
-    tp_size, with no test to catch it and no log to mention it.
-
-    Reporting True here is the correct signal rather than deleting the
-    all-reduce, because the SHARED expert genuinely is TP-partial
-    (`Qwen3NextMLP(..., reduce_results=False)`): the same flag routes it to
-    `_maybe_reduce_shared_expert_output`, which reduces it on its own.
-    """
-    # Only installed where the kernel can arm. `prebuild_fused_moe_ep` returns
-    # on its first statement unless this flag is set, so with the flag off the
-    # patch provably cannot change an answer and would only leave an upstream
-    # class mutated in every other TPU deployment. The cost of the gate is that
-    # the unguarded `_fused_output_is_reduced` read below stops failing loudly
-    # on an upstream rename in runs that do not use the kernel; if arming ever
-    # grows a non-env path, this gate has to go with it.
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
-        return
-
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
-
-    if getattr(_mr.MoERunner, "_tpu_fused_output_reduced_patch", False):
-        return
-
-    original = _mr.MoERunner._fused_output_is_reduced
-
-    @property
-    def patched(self):
-        # `skip_final_all_reduce` asserts the fused output is NOT pre-reduced,
-        # and in that mode the model reduces externally anyway, so leave it be.
-        if getattr(self.moe_config, "skip_final_all_reduce", False):
-            return original.fget(self)
-        try:
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-        except ImportError:
-            return original.fget(self)
-        # Asked of the layer's own quant method, because arming is per layer:
-        # a model whose layers do not all qualify must not have one armed layer
-        # answer for the rest.
-        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
-            adaptive_fused_moe_supported,
-        )
-
-        owner = getattr(self, "_quant_method", None)
-        return (
-            fused_moe_ep_supported(owner)
-            or adaptive_fused_moe_supported(owner)
-            or original.fget(self)
-        )
-
-    _mr.MoERunner._fused_output_is_reduced = patched
-    _mr.MoERunner._tpu_fused_output_reduced_patch = True
-    logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
-
-
 def _patch_moe_explicit_pcp_collectives() -> None:
-    """Give each PCP MoE implementation exactly one collective owner.
+    """Keep PCP dispatch/combine explicit unless MoE chunk pipelining owns it.
 
     vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
     skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
@@ -310,13 +215,9 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     Chunk pipelining is a process-wide configuration, so it can select the
     contract through ``FusedMoEParallelConfig.use_all2all_kernels``.  The fused
-    EP kernel is different: it is armed per layer after checking that layer's
-    weights, routing and device resources.  Patch ``MoERunner`` as well so an
-    armed layer suppresses the outer PCP pair, while a refused layer in the
-    same model still gets the explicit fallback collectives.
+    EP kernel is armed per layer instead; ``VllmMoERunner`` handles that case.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 
     if not getattr(
         FusedMoEParallelConfig, "_tpu_explicit_pcp_collectives_patch", False
@@ -341,47 +242,9 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         )
         FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
 
-    runner_cls = _moe_runner.MoERunner
-    if not getattr(runner_cls, "_tpu_fused_ep_pcp_collectives_patch", False):
-        upstream_dispatch = runner_cls._maybe_dispatch
-        upstream_combine = runner_cls._maybe_combine
-
-        def fused_ep_owns_pcp_collectives(self) -> bool:
-            if self.moe_config.pcp_size <= 1:
-                return False
-            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (  # noqa: E501
-                adaptive_fused_moe_supported,
-            )
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-            owner = getattr(self, "_quant_method", None)
-            return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
-
-        def maybe_dispatch(self, hidden_states, router_logits):
-            if fused_ep_owns_pcp_collectives(self):
-                # An armed fused method also reports supports_internal_mk, so
-                # upstream's generic DP/EP dispatch is a no-op.  The only work
-                # being bypassed here is its explicit PCP all-gather pair.
-                return hidden_states, router_logits
-            return upstream_dispatch(self, hidden_states, router_logits)
-
-        def maybe_combine(self, shared_output, hidden_states):
-            if fused_ep_owns_pcp_collectives(self):
-                # The fused program has already pushed and summed routed rows
-                # back onto their token-owning PCP rank.  Preserve upstream's
-                # return shape for a separately-computed shared expert.
-                if self.shared_experts is not None:
-                    return shared_output, hidden_states
-                return hidden_states
-            return upstream_combine(self, shared_output, hidden_states)
-
-        runner_cls._maybe_dispatch = maybe_dispatch
-        runner_cls._maybe_combine = maybe_combine
-        runner_cls._tpu_fused_ep_pcp_collectives_patch = True
-
     logger.info(
         "Applied TPU patch: use explicit PCP collectives unless MoE "
-        "chunk pipelining or an armed fused EP layer owns them."
+        "chunk pipelining owns them."
     )
 
 

@@ -120,6 +120,7 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "cpu_test: tests that run without accelerator hardware",
     "nightly: tests that only run in the nightly CI workflow",

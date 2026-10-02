@@ -47,12 +47,6 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-# Set HF_TOKEN from GCP Secret Manager if not already in /etc/environment
-# (same bootstrap as run_in_docker.sh).
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true

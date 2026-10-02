@@ -66,11 +66,9 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
     # MoE routing and collectives.
-    Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
     Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),
     # KV cache, scheduling, and offloading.
     Patch(
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",

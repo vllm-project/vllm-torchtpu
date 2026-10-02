@@ -899,9 +899,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
-    def get_fused_moe_quant_config(self, layer):
-        return None
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
         Process MoE weights into the runtime FP8 layout used by the GMM kernel.

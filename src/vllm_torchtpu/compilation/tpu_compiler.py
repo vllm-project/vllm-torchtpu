@@ -433,6 +433,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         tracing_ctx = (
             torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
         )
+        # Each call builds one program. Kernels number their scheduling groups
+        # from 1 within it, so the HLO, and with it torch_tpu's cache key, does
+        # not depend on what this process compiled before: every rank then
+        # builds the same key for a bucket and can hit an executable another
+        # rank already put in the Tier-2 cache.
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        config.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 

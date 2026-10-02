@@ -33,12 +33,17 @@
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
+      "concise_description": "Object of class `ModuleType` has no attribute `_promote_local_kv_cache_specs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_dcp_fine_prefix_patch`"
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `ModuleType` has no attribute `_promote_local_kv_cache_specs`"
+      "concise_description": "Object of class `ModuleType` has no attribute `resolve_kv_cache_block_sizes`"
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
@@ -304,11 +309,6 @@
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
       "name": "unbound-name",
       "concise_description": "`descriptors` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/kv_block_override.py",
-      "name": "bad-specialization",
-      "concise_description": "`int | None` is not assignable to upper bound `SupportsDunderGT[Any] | SupportsDunderLT[Any]` of type variable `SupportsRichComparisonT`"
     },
     {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
@@ -1378,52 +1378,12 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `numel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `cache_config`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `variance_epsilon`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `weight`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
@@ -1439,61 +1399,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "unbound-name",
       "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `TokenShardCollectives | Unknown | None` has no attribute `all_reduce`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -1541,21 +1446,6 @@
       "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
     },
     {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `gather_moe_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_qwen3_vl_rope_index_patch`"
@@ -1586,66 +1476,6 @@
       "concise_description": "Class member `OmniTpuPlatform.dist_backend` overrides parent class `TpuPlatform` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, Sequence[object] | int | str | None]` is not assignable to parameter `derivation` with type `dict[str, object]` in function `_log_tpu_block_size_derivation`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-import",
       "concise_description": "Cannot find module `fastapi`"
@@ -1666,129 +1496,9 @@
       "concise_description": "Object of class `ModuleType` has no attribute `_tpu_kernel_reload_patch`"
     },
     {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "unbound-name",
-      "concise_description": "`native_caches` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "unbound-name",
-      "concise_description": "`key` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `iterable` with type `Iterable[@_]` in function `list.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `iterable` with type `Iterable[@_]` in function `list.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `method`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `propose`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_spec_tokens_to_schedule`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/speculative_decoding_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `propose`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `Literal[1]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`request_major_input_ids_cpu` may be uninitialized"
-    },
-    {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `run_dp_dummy_draft`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `typing.MutableMapping.update` called with arguments: (dict[str, int])"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`batch_composition_stats` may be uninitialized"
+      "concise_description": "Object of class `NoneType` has no attribute `end_forward`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -1797,111 +1507,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[int, str], tuple[Unknown, Unknown, Unknown, Unknown]]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Unknown, Unknown, Unknown] | tuple[Unknown, Unknown, Unknown, Unknown]` is not assignable to declared return type `tuple[Unknown, Unknown, Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `synthetic_mode`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`req_temperatures` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`req_top_k` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`req_top_p` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `draft_chunks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `logprob_token_ids`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `logprobs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `selected_token_ranks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `cu_num_generated_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`next_tokens_per_chunk` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `load_model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `draft_tensor_parallel_size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "unbound-name",
-      "concise_description": "`profile_query_lens` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
     },
@@ -1912,63 +1517,8 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `synthetic_mode`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `precompile`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `None` is not assignable to declared return type `bool`"
     },
     {
       "path": "src/vllm_torchtpu/runner/utils.py",
@@ -1999,151 +1549,11 @@
       "path": "src/vllm_torchtpu/runner/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `num_reqs` with type `int` in function `DFlashProposer._dummy_precompute_and_update_kv_cache`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Unknown | None` is not assignable to parameter `num_blocks` with type `int` in function `DFlashProposer._dummy_precompute_and_update_kv_cache`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `precompute_and_store_context_kv`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `compute_logits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `compute_draft_logits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `markov_bias`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `markov_embed`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dspark.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `map_draft_to_target`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `compute_logits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `logits_processor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `lm_head`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `combine_hidden_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `combine_hidden_states`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `target_len` with type `int` in function `_maybe_pad_dim0`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `Literal[1]`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
@@ -2154,61 +1564,6 @@
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unbound-name",
       "concise_description": "`last_token_indices` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `Literal[1]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `target_num_reqs` with type `int` in function `vllm_torchtpu.runner.tpu_runner.TPUModelRunner._build_mamba_state_indices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `num_reqs` with type `int` in function `vllm_torchtpu.runner.tpu_runner.TPUModelRunner._build_attention_metadata`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `model`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "bad-specialization",
-      "concise_description": "`int | None` is not assignable to upper bound `SupportsDunderGT[Any] | SupportsDunderLT[Any]` of type variable `SupportsRichComparisonT`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unbound-name",
-      "concise_description": "`combine_aux` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `combine_hidden_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unbound-name",
-      "concise_description": "`combine_plain` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/tools/merge_xplane.py",
@@ -2224,16 +1579,6 @@
       "path": "src/vllm_torchtpu/utils.py",
       "name": "bad-return",
       "concise_description": "Returned type `(obj: object, /) -> int` is not assignable to declared return type `(Any) -> bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/worker/tpu_worker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `str | None` is not assignable to parameter `dst_root` with type `str` in function `vllm_torchtpu.profiler_trace.merge_rank_capture`"
-    },
-    {
-      "path": "src/vllm_torchtpu/worker/tpu_worker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `str | None` is not assignable to parameter `dst_root` with type `str` in function `vllm_torchtpu.profiler_trace.clear_canonical_ts_marker`"
     }
   ]
 }

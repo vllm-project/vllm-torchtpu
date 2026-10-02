@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import torch
@@ -130,7 +130,8 @@ def _name_float(value: float) -> str:
     return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
-def _live_cache(entry: object) -> torch.Tensor | None:
+# `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
+def _live_cache(entry: Any) -> torch.Tensor | None:
     """The array bound to a layer, or None while it has none.
 
     vLLM binds a numel==0 placeholder until `initialize_kv_cache` runs, so an
@@ -146,6 +147,10 @@ class VllmDeepseekV4MLAAttention(
 
     backend_cls = DeepseekV4TPUAttentionBackend
     swa_backend_cls = VllmDeepseekSparseSWABackend
+    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
+    mla_attn: VllmDeepseekV4MLAAttention
+    # Set to True on DSpark draft layers; read with getattr(..., False).
+    non_causal_multi_token_decode: bool
 
     def __init__(
         self,
@@ -763,7 +768,7 @@ class VllmDeepseekV4MLAAttention(
                   self.n_local_groups * self.o_lora_rank).
         """
         del act_dtype
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
             self.n_local_groups * self.o_lora_rank,
@@ -786,7 +791,7 @@ class VllmDeepseekV4MLAAttention(
         The kernel is the only `wo_a` path, so an unmet condition is a
         configuration error.
         """
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         scale = getattr(self.wo_a, "weight_scale", None)
 
         # Both MXU operands are fp8: the kernel quantizes the activations

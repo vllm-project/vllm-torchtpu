@@ -24,7 +24,7 @@ from vllm.sequence import IntermediateTensors
 # What `support_torch_compile` infers for `DeepSeekMTP.forward`: dim 0, the
 # token dimension, of every tensor argument. The proposer checks the draft's
 # own dims against this before building the program.
-MTP_DYNAMIC_ARG_DIMS = {
+MTP_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
     "input_ids": 0,
     "positions": 0,
     "hidden_states": 0,
