@@ -50,6 +50,9 @@ nav:
   - 'Features & Usage':
     - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
     - 'Docker': docker.md
+  - 'Supported Models':
+    - 'GLM-5.3-Flash': models/glm53_flash.md
+    - 'Model Onboarding Template': models/TEMPLATE.md
   - 'Developers Guides':
     - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
     - 'Type Checking': developers_guide/type_checking.md

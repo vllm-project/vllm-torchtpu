@@ -1538,6 +1538,49 @@ def static_validate_inputs(
     del v_scale
 
 
+def fit_block_sizes_to_vmem(
+    bq_sz,
+    bkv_sz,
+    bq_csz,
+    bkv_csz,
+    *,
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    vmem_limit_bytes,
+):
+    """Shrinks (bq_sz, bkv_sz, bq_csz, bkv_csz) until the scratch fits in VMEM.
+
+    The KV fetch block is halved first, down to `bkv_csz`: that leaves the
+    compute tiles, and so the register spills, unchanged. Then the query block
+    is halved. Block sizes whose `get_vmem_estimate_bytes` already fits are
+    returned unchanged. A page-aligned `bkv_csz` keeps `bkv_sz` page aligned.
+    """
+
+    def fits(bq, bkv):
+        return (
+            get_vmem_estimate_bytes(
+                actual_num_kv_heads,
+                max(1, actual_num_q_heads // actual_num_kv_heads),
+                head_dim,
+                bq,
+                bkv,
+                q_dtype,
+                kv_dtype,
+            )
+            <= vmem_limit_bytes
+        )
+
+    while not fits(bq_sz, bkv_sz) and bkv_sz > bkv_csz:
+        bkv_sz = max(bkv_csz, align_to(bkv_sz // 2, bkv_csz))
+    while not fits(bq_sz, bkv_sz) and bq_sz > 1:
+        bq_sz = max(1, bq_sz // 2)
+        bq_csz = min(bq_csz, bq_sz)
+    return bq_sz, bkv_sz, bq_csz, bkv_csz
+
+
 def get_default_block_sizes(
     q_dtype,
     kv_dtype,
@@ -1550,10 +1593,12 @@ def get_default_block_sizes(
     pages_per_seq,
     *,
     case: RpaCase = RpaCase.MIXED,
+    vmem_limit_bytes: int | None = None,
 ):
     """Get (bq, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas.
 
-    Note the default block sizes are not necessarily optimal.
+    Note the default block sizes are not necessarily optimal. They are shrunk
+    to fit `vmem_limit_bytes` (default: the chip's VMEM capacity).
     """
     tpu_version = get_tpu_version()
 
@@ -1598,11 +1643,28 @@ def get_default_block_sizes(
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
 
+    # The formulas above ignore the head count and head_dim: e.g. 8 local KV
+    # heads at head_dim 256 need ~71 MiB of VMEM in the mixed case on TPU7x.
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    bq_sz, bkv_sz, bq_csz, bkv_csz = fit_block_sizes_to_vmem(
+        max(1, bq_sz),
+        align_to(bkv_sz, page_size),
+        max(1, bq_csz),
+        align_to(bkv_csz, page_size),
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        actual_num_q_heads=actual_num_q_heads,
+        actual_num_kv_heads=actual_num_kv_heads,
+        head_dim=head_dim,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
     return {
-        "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
-        "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bq_sz": bq_sz,
+        "bkv_sz": bkv_sz,
+        "bq_csz": bq_csz,
+        "bkv_csz": bkv_csz,
     }
 
 
@@ -1939,6 +2001,7 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
+                vmem_limit_bytes=vmem_limit_bytes,
             )
         return {
             "bq_sz": block_sizes[0],
