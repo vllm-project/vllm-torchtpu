@@ -12,9 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# memory_ref and legacy_unified import each other, and legacy_unified reads
-# memory_ref attributes at import time, so legacy_unified has to load first.
-# V3 only gets this order by accident of what imports it.
-from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
-    legacy_unified,  # noqa: F401
-)

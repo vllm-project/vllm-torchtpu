@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, legacy_unified
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config
 
 
 def granule_view(ref: jax.Ref, leading_shape: tuple[int, ...]) -> jax.Ref:
@@ -420,8 +420,6 @@ def create_allocs(
     conv_state_ref: jax.Array,
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
-    conv_state_output_ref: jax.Array | None = None,
-    recurrent_state_output_ref: jax.Array | None = None,
     state_output_ref: jax.Array | None = None,
 ) -> tuple[
     InBufferedRef,
@@ -438,10 +436,6 @@ def create_allocs(
     it by sequence slot instead of back into `conv_state_ref`.
     """
     del recurrent_state_ref
-    if cfg.state_plan is None and conv_state_output_ref is not None:
-        raise ValueError("Compact state outputs require an external state source plan.")
-    if cfg.state_plan is not None and state_output_ref is not None:
-        raise ValueError("state_output_ref requires the granule-addressed state path.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -488,54 +482,42 @@ def create_allocs(
         metadata_ref=metadata_ref,
     )
 
-    if cfg.state_plan is None:
-        # One state checkpoint per window position per sequence (a single one
-        # without speculative decoding, where window_size is 1).
-        conv_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
-            cfg.prev_kernel_size,
-            1,
-            cfg.dim_size,
-        )
-        # The window stores the state as uint32 words; `packing` state
-        # values share one word, so it has kq_head_dim // packing rows.
-        packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
-        recurrent_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
-            cfg.num_v_heads,
-            cfg.kq_head_dim // packing,
-            cfg.v_head_dim,
-        )
-        state_buffered_partial = functools.partial(
-            StateBufferedRef.input_output,
-            buffer_count=pipeline_mode.buffer_count,
-            use_lookahead=pipeline_mode.use_lookahead,
-            cfg=cfg,
-            metadata_ref=metadata_ref,
-            compact_output_ref=state_output_ref,
-        )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
-            dtype_or_type=cfg.dtypes.conv_state,
-            offset=cfg.conv_hbm_offset,
-        )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=jnp.uint32,
-            offset=cfg.recurrent_hbm_offset,
-        )
-    else:
-        # TODO: Delete this after unified pool migration completes.
-        conv_alloc, recurrent_alloc = legacy_unified.external_state_allocs(
-            cfg=cfg,
-            metadata_ref=metadata_ref,
-            state_source_ref=conv_state_ref,
-            block_spec_partial=block_spec_partial,
-            pipeline_mode=pipeline_mode,
-            conv_state_output_ref=conv_state_output_ref,
-            recurrent_state_output_ref=recurrent_state_output_ref,
-        )
+    # One state checkpoint per window position per sequence (a single one
+    # without speculative decoding, where window_size is 1).
+    conv_shape = (
+        cfg.seq_tile_size,
+        cfg.window_size,
+        cfg.prev_kernel_size,
+        1,
+        cfg.dim_size,
+    )
+    # The window stores the state as uint32 words; `packing` state
+    # values share one word, so it has kq_head_dim // packing rows.
+    packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
+    recurrent_shape = (
+        cfg.seq_tile_size,
+        cfg.window_size,
+        cfg.num_v_heads,
+        cfg.kq_head_dim // packing,
+        cfg.v_head_dim,
+    )
+    state_buffered_partial = functools.partial(
+        StateBufferedRef.input_output,
+        buffer_count=pipeline_mode.buffer_count,
+        use_lookahead=pipeline_mode.use_lookahead,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+        compact_output_ref=state_output_ref,
+    )
+    conv_alloc = state_buffered_partial(
+        spec=block_spec_partial(block_shape=conv_shape),
+        dtype_or_type=cfg.dtypes.conv_state,
+        offset=cfg.conv_hbm_offset,
+    )
+    recurrent_alloc = state_buffered_partial(
+        spec=block_spec_partial(block_shape=recurrent_shape),
+        dtype_or_type=jnp.uint32,
+        offset=cfg.recurrent_hbm_offset,
+    )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

@@ -84,8 +84,6 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
-    # TODO: Delete this after unified pool migration completes.
-    state_plan: Any = None
 
     @property
     def conv_hbm_offset(self) -> int:

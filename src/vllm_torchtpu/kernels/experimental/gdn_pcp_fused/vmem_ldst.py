@@ -22,11 +22,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
-    config,
-    legacy_unified,
-    memory_ref,
-)
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, memory_ref
 
 
 def load_strided_heads(
@@ -117,10 +113,6 @@ def load_and_select_states(
     carry states from previous tile. If `has_initial_state` is False, states are
     zero initialized.
 
-    When `cfg.state_plan` is set, the state refs hold raw source-layout
-    tiles (see `legacy_unified.ExternalStateBufferedRef`) and are decoded
-    through the plan's typed region views instead of read directly.
-
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
@@ -152,41 +144,26 @@ def load_and_select_states(
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
-        if cfg.state_plan is not None:
-            # TODO: Delete this after unified pool migration completes.
-            prev_conv_state, prev_recurrent_state = legacy_unified.select_states(
-                conv_state_slot_ref,
-                recurrent_slot_ref,
-                carry_conv_scratch_ref,
-                carry_recurrent_scratch_ref,
-                cfg,
-                idx,
-                has_initial_state,
-                is_first_tile,
+        # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
+        hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
+        prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
+
+        if carry_conv_scratch_ref is not None:
+            prev_tile_conv = carry_conv_scratch_ref[idx]
+            prev_conv_state = jnp.where(is_first_tile, prev_conv_state, prev_tile_conv)
+
+        # Unpack the uint32 words to the state dtype, then upcast because
+        # compute runs in fp32.
+        hbm_recurrent_state = pltpu.bitcast(
+            recurrent_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+        ).astype(jnp.float32)
+        prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
+
+        if carry_recurrent_scratch_ref is not None:
+            prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
+            prev_recurrent_state = jnp.where(
+                is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
             )
-        else:
-            # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-            hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
-            prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
-
-            if carry_conv_scratch_ref is not None:
-                prev_tile_conv = carry_conv_scratch_ref[idx]
-                prev_conv_state = jnp.where(
-                    is_first_tile, prev_conv_state, prev_tile_conv
-                )
-
-            # Unpack the uint32 words to the state dtype, then upcast because
-            # compute runs in fp32.
-            hbm_recurrent_state = pltpu.bitcast(
-                recurrent_slot_ref[idx, 0], cfg.dtypes.recurrent_state
-            ).astype(jnp.float32)
-            prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
-
-            if carry_recurrent_scratch_ref is not None:
-                prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
-                prev_recurrent_state = jnp.where(
-                    is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
-                )
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
@@ -221,12 +198,7 @@ def load_activation_as_compact(
         qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
     )
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
-    if cfgs.is_kda:
-        # KDA's gate is per-channel, so it splits into heads like q/k/v do
-        # instead of occupying a single lane per head.
-        a_compact = load_compact_heads(a_vmem_ref, cfgs.num_v_heads, cfgs.kq_head_dim)
-    else:
-        a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
+    a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
     return q_compact, k_compact, v_compact, b_compact, a_compact
 
 
@@ -247,7 +219,6 @@ def load_activation_as_large(
     q_large_list = []
     k_large_list = []
     v_large_list = []
-    a_large_list = []
     for idx in range(cfgs.seq_tile_size):
         qkv_slot = qkv_vmem_ref.at[idx]
         q_large_list.append(
@@ -261,21 +232,11 @@ def load_activation_as_large(
                 qkv_slot, cfgs.num_v_heads, cfgs.v_head_dim, 2 * kq_lanes
             )
         )
-        if cfgs.is_kda:
-            # Per-channel gate: split into heads and transpose like q/k/v.
-            a_large_list.append(
-                load_strided_heads(
-                    a_vmem_ref.at[idx], cfgs.num_v_heads, cfgs.kq_head_dim
-                )
-            )
 
     q_large = jnp.stack(q_large_list, axis=0)
     k_large = jnp.stack(k_large_list, axis=0)
     v_large = jnp.stack(v_large_list, axis=0)
     b_large = jnp.expand_dims(load_compact_to_large(b_vmem_ref), axis=1)
-    if cfgs.is_kda:
-        a_large = jnp.stack(a_large_list, axis=0)
-    else:
-        a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
+    a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
 
     return q_large, k_large, v_large, b_large, a_large

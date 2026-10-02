@@ -48,9 +48,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     config,
+    kernel,
     memory_ref,
     pcp_metadata,
-    wrapper,
 )
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused.projection_scale import (
     normalize_projection_scale,
@@ -207,7 +207,7 @@ def _compute_gdn_tile(
     for prefix in range(_TPU_TILE_ROWS):
         _load_qkv(prefix)
 
-    wrapper.inner_kernel(
+    kernel.inner_kernel(
         compute_qkv_ref,
         b_slot_ref,
         a_slot_ref,
