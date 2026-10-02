@@ -143,7 +143,7 @@ fi
 # kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
 # scheduled kube pipeline names its own lane - and defaults to all of them.
 ALL_LANES="verify perf integration tests"
-lanes="${CI_LANES:-${ALL_LANES}}"
+lanes="${CI_LANES:-perf}"  # DO NOT MERGE: bisect
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
     echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2
