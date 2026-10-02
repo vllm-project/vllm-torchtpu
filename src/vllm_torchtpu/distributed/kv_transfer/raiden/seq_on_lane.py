@@ -688,7 +688,7 @@ def measured_sol_layout_fingerprint(
             f"gate: measured={element_bits} expected=8"
         )
     version = package_version or importlib.metadata.version
-    qk_pair = bool(getattr(tpu_envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", True))
+    qk_pair = tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
     payload = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),

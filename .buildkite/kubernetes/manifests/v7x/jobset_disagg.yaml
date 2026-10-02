@@ -185,8 +185,6 @@ spec:
                   value: "27100"
                 - name: TPU_RAIDEN_TRANSFER_PARALLELISM
                   value: "8"
-                - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
-                  value: "1"
                 - name: XLA_PYTHON_CLIENT_PREALLOCATE
                   value: "false"
                 - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
@@ -394,8 +392,6 @@ spec:
                   value: "28100"
                 - name: TPU_RAIDEN_TRANSFER_PARALLELISM
                   value: "8"
-                - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
-                  value: "1"
                 - name: XLA_PYTHON_CLIENT_PREALLOCATE
                   value: "false"
                 - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN

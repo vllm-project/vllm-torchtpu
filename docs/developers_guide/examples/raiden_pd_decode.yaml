@@ -116,8 +116,6 @@ spec:
           value: "vllm"
         - name: TPU_PREMAPPED_BUFFER_SIZE
           value: "4294967296"
-        - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
-          value: "1"
         - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
           value: "1"
         - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER

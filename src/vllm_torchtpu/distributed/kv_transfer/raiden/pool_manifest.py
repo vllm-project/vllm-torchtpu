@@ -389,31 +389,14 @@ def _gdn_conv_regions(
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
-    qk_bytes = 2 * geometry.local_key_heads * key_bytes
     if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
-        # QK pair-blocked layout: the rank-local Q and K rows share whole
-        # pool tokens ([Q-pair, K-pair] per token), so the transferable
-        # unit is the combined QK block followed by the V block — two
-        # contiguous extents per tap.  Full-width states store the rank
-        # blocks in rank order, which the pooled kernel's rows_perm maps
-        # back to the logical [Q | K | V] row order.
-        return (
-            RegionSpec(
-                name="gdn_conv_qk",
-                offset_bytes=0,
-                stride_bytes=row_stride,
-                unit_bytes=qk_bytes,
-                num_units=taps,
-                units_per_stride=1,
-            ),
-            RegionSpec(
-                name="gdn_conv_v",
-                offset_bytes=qk_bytes,
-                stride_bytes=row_stride,
-                unit_bytes=value_bytes,
-                num_units=taps,
-                units_per_stride=geometry.local_value_heads,
-            ),
+        # The pooled GDN kernel reads conv rows in [Q | K | V] order with
+        # no row permutation, so a pair-blocked transfer would mix up Q and
+        # K channels. With fp32 conv, each rank's Q and K slices are whole
+        # 1,024-B tiles up to an 8-way head split.
+        raise ManifestError(
+            "TPU_GDN_CONV_QK_PAIR_LAYOUT is not readable by the pooled GDN "
+            "kernel; unset it to use the per-segment conv layout"
         )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
