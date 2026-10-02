@@ -2399,10 +2399,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-                # The scatter undoes the head all-gather above. Only the
-                # backbone is re-traced per token bucket (`shape_variants`); the
-                # spec-decode draft shares one trace across buckets, so it must
-                # not branch on the token count.
+                # The scatter undoes the head all-gather above.
+                #
+                # `per_bucket` lets the merge pick its collective by token
+                # count (all-to-all for small decode buckets, reduce-scatter
+                # above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS). That is only safe
+                # when each bucket gets its own trace, which is true for the
+                # backbone. The spec-decode draft is traced once for all
+                # buckets: a token-count branch there becomes a shape guard,
+                # and larger buckets then fail with ShapeSpecializationError.
+                # So the draft passes False and always uses the all-to-all.
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,

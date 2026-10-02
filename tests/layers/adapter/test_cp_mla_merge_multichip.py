@@ -41,11 +41,10 @@ VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
-# name -> (TPU_DCP_LSE_MERGE_A2A, TPU_DCP_LSE_MERGE_RS_BF16)
+# name -> TPU_DCP_LSE_MERGE_A2A
 ARMS = {
-    "today": (False, False),
-    "a2a": (True, False),
-    "rs_bf16": (False, True),
+    "today": False,
+    "a2a": True,
 }
 
 
@@ -180,10 +179,8 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 
 
 def _set_arm(cp_mla, arm):
-    a2a, rs_bf16 = ARMS[arm]
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = a2a
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
-    cp_mla.envs.TPU_DCP_LSE_MERGE_RS_BF16 = rs_bf16
 
 
 def _compile(fn):

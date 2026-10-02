@@ -83,9 +83,12 @@ def merge_lse_partials_scatter_heads(
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
-      per_bucket: whether the caller is traced once per bucket group, so the
-        path may depend on the token count. A model whose one trace serves
-        every bucket passes False and takes the exchange at every size.
+      per_bucket: True if the caller is compiled separately for each token
+        bucket, so the merge may choose all-to-all vs reduce-scatter by
+        `num_tokens`. Pass False when one trace serves every bucket (the
+        spec-decode draft): branching on the token count there would
+        specialize the graph to one size. With False and
+        TPU_DCP_LSE_MERGE_A2A set, the all-to-all is used at every size.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -104,8 +107,6 @@ def merge_lse_partials_scatter_heads(
         return merge_lse_partials_all_to_all(output, lse, group)
 
     weighted = _weight_by_lse(output, lse, group)
-    if envs.TPU_DCP_LSE_MERGE_RS_BF16:
-        weighted = weighted.to(output.dtype)
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
 
 
@@ -147,9 +148,6 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
 
 
-_BITS_OF_WIDTH = {2: torch.int16, 4: torch.int32}
-
-
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
     result came from rank `r`."""
@@ -162,25 +160,15 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
 def merge_lse_partials_all_to_all(
     output: torch.Tensor, lse: torch.Tensor, group: Any
 ) -> torch.Tensor:
-    """`merge_lse_partials_scatter_heads` as an exchange and a local merge.
+    """Same result as the reduce-scatter merge, via all-to-all.
 
-    Rank `r` sends head block `d` of its partial (native dtype, normalized
-    `o_r`) and of its f32 `lse_r` to rank `d`, then merges the `world_size`
-    partials it received for its own heads in f32:
-    `o = sum_r exp(lse_r - m) * o_r / sum_r exp(lse_r - m)`, with the same
-    `-inf` rules as `_weight_by_lse` (a `-inf` rank weighs nothing; a token
-    with no contributor anywhere comes out zero). Versus the reduce-scatter it
-    moves `o_r` in its own dtype instead of f32, needs no lse all-gather or
-    full-width weight multiply, and its two all-to-alls are independent, so
-    neither waits on the other. The reduce-scatter sums in the network, so at
-    large token counts it can still be the faster of the two.
+    Each rank sends head block `d` of its partial and lse to rank `d`, then
+    merges its own heads locally in f32. Faster for small token counts.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
     local = num_heads // world
-    # Destination-major: [world, T, local, V] and [world, T, local]. (Packing
-    # the lse bytes into the partial's payload measured slower: one fewer
-    # collective, but a flattened concat the exchange handles badly.)
+    # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
     o_recv = _all_to_all(o_send, group)
@@ -200,12 +188,8 @@ def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
     )
     denom = weights.sum(dim=0)
     weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
-    # Compiled, a multiply-then-`sum(0)` over the rank axis lowers to a dot at
-    # the default matmul precision, which rounds the f32 weights to bf16 (about
-    # a bf16 ulp of output error; measured). `o_recv` is already exact in bf16,
-    # so split the weights into a bf16 head and a residual: each half's product
-    # is then exact at any matmul precision, and the f32 sum of the two halves
-    # loses only ~2^-16 relative.
+    # The compiler lowers multiply-then-sum to a dot that rounds f32 operands to
+    # bf16. Splitting the weights into a bf16 part and a residual keeps it exact.
     o_f32 = o_recv.to(torch.float32)
     w_hi = weights.to(torch.bfloat16).to(torch.float32)
     w_lo = weights - w_hi

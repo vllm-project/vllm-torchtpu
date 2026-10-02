@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
-    TPU_DCP_LSE_MERGE_RS_BF16: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -364,27 +363,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
-    # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
-    # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
-    # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial
-    # and an f32 reduce-scatter over heads, all-to-all each destination's head
-    # slice of the native-dtype partial and of the f32 lse, and merge this
-    # rank's heads locally in f32. Half the bytes and no serial lse round
-    # trip, so it pays where the merge is latency-bound (decode); same result
-    # up to f32 summation order. The reduce-scatter sums in the network and
-    # wins past ~64 tokens (dcp=8, compiled: a2a 26 vs 29 us at 16 tokens,
-    # 34 vs 48 at 32, 63 vs 65 at 64, 113 vs 108 at 128), hence the cap.
-    # The cap applies to the backbone only; the spec-decode draft, traced once
-    # for every bucket, takes the exchange at every size.
+    # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
+    # Largest step (tokens) that uses it; above this, the reduce-scatter is
+    # faster. The spec-decode draft ignores the cap.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64
     ),
-    # Experimental, not recommended: cast the weighted partial to bf16 before
-    # the merge's reduce-scatter. Halves its bytes but rounds the cross-rank
-    # sum in bf16 at every stage; a quarter to a third of outputs move by more
-    # than one bf16 ulp (dcp=8/16), which fails the merge's accuracy bar.
-    "TPU_DCP_LSE_MERGE_RS_BF16": env_bool("TPU_DCP_LSE_MERGE_RS_BF16", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
