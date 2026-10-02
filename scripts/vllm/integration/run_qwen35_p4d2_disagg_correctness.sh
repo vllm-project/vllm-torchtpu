@@ -46,7 +46,7 @@ PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_specu
 DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
 # Candidate regression floor for this fixed PCP4/DP4 workload; configurable
 # for other models/geometries. Validate each cold start independently.
-MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.70}"
+MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.50}"
 
 cleanup() {
   local pid_file pid

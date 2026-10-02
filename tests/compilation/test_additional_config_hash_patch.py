@@ -66,6 +66,7 @@ class _StubVllmConfig:
         self.observability_config = SimpleNamespace(
             compute_hash=lambda: "observability"
         )
+        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
         # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so

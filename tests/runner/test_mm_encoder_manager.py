@@ -20,6 +20,7 @@ def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
+        capture_axes=(),
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
             "local": SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),

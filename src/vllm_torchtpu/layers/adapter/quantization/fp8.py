@@ -645,12 +645,13 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
         super().__init__(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
         )
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod
     def get_name(cls) -> str:
