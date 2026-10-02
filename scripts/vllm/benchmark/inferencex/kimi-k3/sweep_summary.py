@@ -15,7 +15,7 @@
 """Result parsing for the Kimi-K3 sweep drivers.
 
 Pure functions plus a small CLI, so the drivers' summary logic can be unit
-tested (tests/scripts/test_sweep_summary.py) without a TPU:
+tested (tests/scripts/test_k3_sweep_summary.py) without a TPU:
 
   lm-eval-score  --output-dir DIR --task TASK
       -> "<metric> <score> <stderr>" from the newest lm_eval results_*.json
@@ -144,13 +144,20 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
                 f"| {c} | (no aggregate: {why}{os.path.basename(path)} missing) |"
             )
             continue
-        with open(path) as f:
-            d = json.load(f)
+        label = f"{c} (HARD_TIMEOUT)" if timed_out else str(c)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            # One truncated aggregate must not cost the whole table: the other
+            # points' numbers are still the run's result.
+            lines.append(f"| {label} | (unreadable: {type(e).__name__}) |")
+            continue
         cells = []
         for _, key in AGENTX_COLUMNS:
             v = dotted_get(d, key)
             cells.append("-" if v is None else f"{v:.4g}")
-        lines.append(f"| {c} | " + " | ".join(cells) + " |")
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 

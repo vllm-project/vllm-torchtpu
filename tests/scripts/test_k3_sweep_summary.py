@@ -174,14 +174,16 @@ def test_gsm8k_row(tmp_path):
     )
 
 
-def _aggregate(per_gpu_out, requests_ok):
-    # Shape of InferenceX's aggregate JSON (process_agentic_result.py).
+def _aggregate(per_gpu_out, requests_ok, chips=32):
+    # Shape of InferenceX's aggregate JSON (process_agentic_result.py). aiperf
+    # divides total throughput by the chip count the client exported, so the
+    # two throughput fields are related by whatever that count was.
     return {
         "conc": 1,
         "num_requests_successful": requests_ok,
         "request_metrics": {
             "throughput": {
-                "output": {"tokens_per_second": per_gpu_out * 32},
+                "output": {"tokens_per_second": per_gpu_out * chips},
                 "per_gpu": {"output_tput_tps": per_gpu_out},
             },
             "latency": {
@@ -208,6 +210,37 @@ def test_agentx_table_reads_per_gpu_throughput(tmp_path):
     assert rows[2].startswith("| 1 | 1.54 | 49.28 | 48 | 1.5 | 7.2 | 0.0255 | 37 |")
     assert "hard timeout" in rows[3] and rows[3].startswith("| 4 |")
     assert rows[4].startswith("| 8 | (no aggregate:") and "hard timeout" not in rows[4]
+
+
+def test_agentx_table_marks_a_timeout_that_still_wrote_an_aggregate(tmp_path):
+    # The failure the watchdog exists for: aiperf writes the aggregate and then
+    # hangs in shutdown. The numbers are real but the point ran to the cap, so
+    # the row has to say so instead of looking clean.
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c2.json").write_text(json.dumps(_aggregate(1.1, 12)))
+    (tmp_path / "conc_2").mkdir()
+    (tmp_path / "conc_2" / "HARD_TIMEOUT").write_text("")
+    row = summary.agentx_table(str(tmp_path), base, [2]).splitlines()[2]
+    assert row.startswith("| 2 (HARD_TIMEOUT) | 1.1 |")
+
+
+def test_agentx_table_survives_an_unreadable_aggregate(tmp_path):
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text('{"conc": 1, "request_met')
+    (tmp_path / f"{base}_c2.json").write_text(json.dumps(_aggregate(2.5, 20)))
+    rows = summary.agentx_table(str(tmp_path), base, [1, 2]).splitlines()
+    assert rows[2].startswith("| 1 | (unreadable: JSONDecodeError)")
+    assert rows[3].startswith("| 2 | 2.5 |")
+
+
+def test_agentx_table_per_chip_column_is_whatever_the_client_divided_by(tmp_path):
+    # A TP8 x DP4 pod and a v7x-32 pod both have 32 chips; a v7x-64 pod has 64.
+    # The table prints per_gpu as reported, so the chip count lives in the
+    # client's --chips, not here.
+    base = "agentx_k3"
+    (tmp_path / f"{base}_c1.json").write_text(json.dumps(_aggregate(3.0, 9, chips=64)))
+    row = summary.agentx_table(str(tmp_path), base, [1]).splitlines()[2]
+    assert row.startswith("| 1 | 3 | 192 |")
 
 
 def test_dotted_get_ignores_bools_and_missing():

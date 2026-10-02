@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Shared helpers for the Kimi-K3 sweep drivers (eval_conc_sweep.sh,
 # agentx_sweep.sh). Source it after setting:
 #   K3_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
 #   RESULTS_DIR    where the harness and the sweep write results
 #   PORT           the vLLM server port
-# Everything here talks to the server the caller booted with
-# run_benchmarks.sh --keep-alive on 127.0.0.1:$PORT.
+# Everything here talks to the server named by k3_server_url: the one the
+# caller booted with run_benchmarks.sh --keep-alive, or one on another host.
 
 log() { echo "[${K3_SWEEP_TAG:-k3-sweep}] $*"; }
 
@@ -23,6 +23,12 @@ k3_check_conc_list() {
 k3_set_gcs_root() {
     GCS_ROOT=""
     [ -n "${1:-}" ] || return 0
+    # Said once, here: without gsutil every save_now is a silent no-op, so
+    # --gcs-root would look honoured for the whole run and upload nothing.
+    if ! command -v gsutil >/dev/null 2>&1; then
+        log "WARNING: --gcs-root $1 was given but gsutil is not on PATH; nothing will be uploaded"
+        return 0
+    fi
     GCS_ROOT="${1%/}/${BUILDKITE_BUILD_NUMBER:-local}"
 }
 
@@ -42,18 +48,26 @@ save_now() {
 # k3_server_url: the base URL of the vLLM server to send requests to. Empty or
 # unset K3_SERVER_URL means agentx_sweep.sh or eval_conc_sweep.sh started that
 # server in this same container, so it is at 127.0.0.1:$PORT. A caller whose
-# server runs on another host - the kube 1P1D lane, where the servers are on TPU
-# pods and the client is in a CPU pod - sets K3_SERVER_URL to its URL. Resolved
+# server runs on another host - a kube P/D JobSet, where the engines are on TPU
+# pods and the client is on a CPU pod - sets K3_SERVER_URL to its URL. Resolved
 # per call, so neither PORT nor K3_SERVER_URL has to be set before this file is
 # sourced.
 k3_server_url() { echo "${K3_SERVER_URL:-http://127.0.0.1:$PORT}"; }
 
-server_alive() { curl -sf "$(k3_server_url)/v1/models" >/dev/null; }
+# --max-time on every poll: an engine that is wedged but still listening would
+# otherwise block the caller forever, and wait_server_idle only checks its
+# deadline between polls, so its timeout would never fire.
+server_alive() { curl -sf --max-time 10 "$(k3_server_url)/v1/models" >/dev/null; }
 
 # Number of requests the engine holds (running + waiting), from /metrics.
 # The anchor stops vllm:num_requests_waiting_by_reason{...} from matching too.
+# Returns non-zero when /metrics could not be read, so a caller can tell
+# "unreachable" from "drained" instead of reading both as 0.
 k3_engine_queue_depth() {
-    curl -s "$(k3_server_url)/metrics" \
+    local body
+    body=$(curl -s --max-time 30 "$(k3_server_url)/metrics") || return 1
+    [ -n "$body" ] || return 1
+    printf '%s' "$body" \
         | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
 }
 
@@ -61,7 +75,7 @@ k3_engine_queue_depth() {
 # preemptions (a preempted request is re-prefilled from its KV state) and
 # finished requests. Printed as "preemptions=N finished=M".
 k3_engine_counters() {
-    curl -s "$(k3_server_url)/metrics" | awk '
+    curl -s --max-time 30 "$(k3_server_url)/metrics" | awk '
         /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
         /^vllm:request_success_total( |\{)/ {f+=$NF}
         END {printf "preemptions=%d finished=%d\n", p, f}'
@@ -74,7 +88,10 @@ wait_server_idle() {
     local timeout="${1:-1800}" t0 idle=0 n
     t0=$(date +%s)
     while [ $(( $(date +%s) - t0 )) -lt "$timeout" ]; do
-        n=$(k3_engine_queue_depth)
+        if ! n=$(k3_engine_queue_depth); then
+            log "WARNING: /metrics unreachable while draining"
+            idle=0; sleep 10; continue
+        fi
         if [ "${n%.*}" = "0" ]; then
             idle=$((idle + 1)); [ "$idle" -ge 3 ] && return 0
         else
