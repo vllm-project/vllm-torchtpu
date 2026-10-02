@@ -78,10 +78,15 @@ steps:
       # step rather than buried in the general run and so the suite runs on
       # its own agents instead of serializing behind everything else. The
       # general steps exclude the file to avoid running it twice.
+      #
+      # bktec splits General by file, not by example, so a file that shares
+      # one engine across its tests (module-scoped fixtures, the Qwen2.5-VL
+      # engines in test_multi_modal_inference.py) starts it in one shard only.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 3
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
