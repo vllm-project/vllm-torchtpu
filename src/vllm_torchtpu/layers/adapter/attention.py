@@ -17,6 +17,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -2398,8 +2399,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-                # The scatter undoes the head all-gather above.
-                outputs = merge_lse_partials_scatter_heads(partial, lse)
+                # The scatter undoes the head all-gather above. Only the
+                # backbone is re-traced per token bucket (`shape_variants`); the
+                # spec-decode draft shares one trace across buckets, so it must
+                # not branch on the token count.
+                outputs = merge_lse_partials_scatter_heads(
+                    partial,
+                    lse,
+                    allow_all_to_all=vllm_compilation_backends.model_tag == "backbone",
+                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
