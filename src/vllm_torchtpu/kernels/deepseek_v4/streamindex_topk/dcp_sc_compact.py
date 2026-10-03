@@ -265,9 +265,8 @@ def resolve_owned_winners(
 
     if sc is None:
         dcp_rank_i32 = jnp.asarray(dcp_rank, dtype=jnp.int32)
-        ours = (slots >= dcp_rank_i32 * k) & (slots < (dcp_rank_i32 + 1) * k)
-        cols = jnp.mod(jnp.maximum(slots, 0), k)
-        vals = jnp.where(ours, jnp.take_along_axis(local_idxs, cols, axis=1), -1)
+        r_idx = jnp.arange(b, dtype=jnp.int32)[:, None]
+        vals = jnp.where(ours, local_idxs[r_idx, cols], -1)
         return pack_nonnegative_ref(vals)
 
     lanes = sc.num_lanes
