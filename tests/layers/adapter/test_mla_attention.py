@@ -812,6 +812,11 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
         group = _FakeHeadGatherGroup(per_rank, rank)
         monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
         torch.testing.assert_close(cp_mla.all_gather_heads(per_rank[rank]), grouped)
+        nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+            per_rank[rank][..., :3], per_rank[rank][..., 3:], 3
+        )
+        torch.testing.assert_close(nope_dcp, grouped[..., :3])
+        torch.testing.assert_close(pe_dcp, grouped[..., 3:])
         torch.testing.assert_close(
             _FakeQProj(group_size, rank)._local_view(grouped), per_rank[rank]
         )
@@ -905,10 +910,11 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
         )
     )
 
-    def _explode(_tensor):
+    def _explode(*_args):
         raise AssertionError("qrep must not all-gather the query heads")
 
     monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
+    monkeypatch.setattr(attention_adapter, "all_gather_q_nope_pe_heads", _explode)
     monkeypatch.setattr(
         attention_adapter,
         "merge_lse_partials_scatter_heads",
@@ -970,6 +976,48 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
 
     assert len(gathered) == 2
     assert all(t.shape[1] == local_heads for t in gathered)
+
+    # Also verify the default fused Q gather path (`all_gather_q_nope_pe_heads`)
+    fused_calls = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        cp_mla.all_gather_heads,
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_q_nope_pe_heads",
+        lambda nope, pe, rank: (
+            fused_calls.append((nope, pe, rank)),
+            (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
+        )[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(fused_calls) == 1
+    assert fused_calls[0][0].shape[1] == local_heads
+    assert fused_calls[0][1].shape[1] == local_heads
+    assert fused_calls[0][2] == layer.kv_lora_rank
+
+    # Negative control: disabling TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER falls back
+    # to two separate all_gather_heads calls.
+    unfused_calls = []
+    monkeypatch.setenv("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", "0")
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(unfused_calls) == 2
+    assert len(fused_calls) == 1
 
 
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():

@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -742,6 +743,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )()
         or DEFAULT_INDEXER_KV_CACHE_MODE
     ).lower(),
+    "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
+        "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
