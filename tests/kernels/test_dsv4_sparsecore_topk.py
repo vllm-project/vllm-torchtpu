@@ -13,20 +13,11 @@
 # limitations under the License.
 """Tests for the Deepseek V4 SparseCore top-k kernel.
 
-`sparsecore_topk` has two execution paths and, before this file, neither had a
-test. `_pick_partition` returns P=1 for most shapes and the call takes the
-single-stage fast path; only when `b < 32` or `n > 32K` does it split each row
-into P slices, run a local top-k per slice, and merge the `P * k_p` candidates
-in a second pass. Every GLM-5.2 configuration exercised in practice to date has
-run at `--max-model-len=9216` (`n=10240`), where the batch sizes that matter
-resolve to P=1 -- so the **two-stage path had never executed at all** until it
-was checked deliberately.
-
-It matters because the path is live, not dead code: `streamindex_topk` calls
-this from `_common_path`, and `enable_early_exit` defaults to `False`, so there
-is no `lax.cond` and no env flag standing between production and this kernel.
-Raising the context is all it takes. At `--max-model-len=132096` the call
-resolves to P=8 with 16640-word slices and 16384 candidates.
+`sparsecore_topk` executes in a single kernel launch for partition factors
+`P in {1, 2, 4, 8, 16}` (`P == 1` per-subcore or `P > 1` cooperative
+`VMEM_SHARED` global radix histogram), and falls back to the zero-gather
+two-stage merge (`_sc_topk_two_stage`, carrying stage-1 indices as the stage-2
+`values` payload) when `P > 16` (e.g. `N_1M = 1048576` where `P = 32`).
 
 Two properties of the kernel shape these tests, and both rule out the obvious
 assertion:
@@ -46,10 +37,15 @@ so the comparison helper is run a second time against deliberately corrupted
 output and is required to reject it.
 """
 
+import ast
+from contextlib import nullcontext
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_module
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
@@ -57,6 +53,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     MAX_SLICE_WORDS,
     _align_to,
     _pick_partition,
+    _select_p,
     sparsecore_topk,
 )
 
@@ -70,6 +67,33 @@ N_128K = 133120  # --max-model-len 132096
 N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
 
 SEED = 20260904
+
+
+def _require_sparsecore():
+    """Skip hardware execution tests when no SparseCore TPU device is present."""
+    try:
+        if pltpu.get_tpu_info().sparse_core is not None:
+            return
+    except Exception:
+        pass
+    pytest.skip("needs SparseCore")
+
+
+def _tpu_lowering_context():
+    """Provide a TPU7x AbstractMesh on CPU hosts so `.lower()` can target TPU."""
+    if jax.devices()[0].platform == "tpu":
+        return nullcontext()
+    ad = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=2, platform="tpu"
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=ad)
+    return jax.sharding.use_abstract_mesh(mesh)
+
+
+def _lower_to_tpu_text(fn, scores, k: int, *args, **kwargs) -> str:
+    with _tpu_lowering_context():
+        traced = jax.jit(lambda s, *a: fn(s, k, *a, **kwargs)).trace(scores, *args)
+        return traced.lower(lowering_platforms=("tpu",)).as_text()
 
 
 def _topk_n(max_model_len: int, page_size: int = 1024, bkv_p: int = 2) -> int:
@@ -148,25 +172,10 @@ def _mismatch(
 def _scores(kind: str, b: int, n: int, rng: np.random.Generator) -> np.ndarray:
     """Score rows, each probing a different way selection can go wrong."""
     if kind == "strict_desc":
-        # Tie-free and monotone: the answer is known in closed form, so a
-        # kernel that mishandles ordering has nowhere to hide.
-        # This is also the only `kind` whose winners are negative, so it is
-        # what covers `monotone_key` -- the involution is the identity on
-        # non-negative floats, and `random`/`heavy_ties` are centred at or
-        # above zero. Measured: dropping the involution at stage 2's emit site
-        # fails this `kind` on all five two-stage shapes (and nothing on the
-        # single-stage one, which has no emit site). The only other test that
-        # catches it is `test_topk_concentrated_in_the_last_partition`, via its
-        # negative `-1e30` padding fill.
         return np.repeat(-np.arange(n, dtype=np.float32)[None, :], b, axis=0)
     if kind == "random":
         return rng.standard_normal((b, n), dtype=np.float32)
     if kind == "heavy_ties":
-        # 17 distinct values across the whole row, so the k-th and (k+1)-th
-        # scores are equal in every row and every partition boundary lands in a
-        # tie. This is the case that makes an index-based assertion wrong.
-        # int8 first: `rng.integers` defaults to int64, which is 1 GiB at the
-        # 128K shape.
         return rng.integers(0, 17, size=(b, n), dtype=np.int8).astype(np.float32)
     if kind == "all_neg_inf":
         return np.full((b, n), -np.inf, np.float32)
@@ -181,28 +190,19 @@ def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
     )
 
 
-# Shapes covering the single-stage path and both two-stage partition factors
-# production can reach. The expected `P` is asserted separately, not assumed --
-# see
-# `test_partition_factor_is_what_these_tests_assume`. `P` at the 128K shape is
-# 8 rather than 4 because `MAX_SLICE_WORDS` is the *single-buffer* budget and
-# the resident slice is now double-buffered by `emit_pipeline`, so `p_min`
-# doubled.
+# Shapes covering `P == 1` and cooperative `VMEM_SHARED` `P in {2, 8}`
+# partition factors production can reach.
 SHAPES = [
     pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
     pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
     pytest.param(16, N_128K, 2048, 8, id="p8-b16-n133120"),
     pytest.param(64, N_128K, 2048, 8, id="p8-b64-n133120"),
     pytest.param(16, N_128K, 512, 8, id="p8-b16-n133120-k512"),
-    # The other end of the production bucket ladder. `_dp_coordinated_step`
-    # all-reduce-MAXes the token count across the 16 DP ranks, so a step in
-    # which any one rank prefills drags every rank to the top bucket -- 1024 at
-    # `--max-num-batched-tokens=1024`. It is as much a production shape as 16
-    # is, and it is the one that needs 64x as many stage-1 waves as `b=16`.
     pytest.param(1024, N_128K, 2048, 8, id="p8-b1024-n133120"),
 ]
 
 
+@pytest.mark.cpu_test
 def test_shape_derivation_matches_max_model_len():
     """The 128K shape is derived, not hardcoded, so a page-size change shows."""
     assert _topk_n(9216) == N_SHORT
@@ -212,17 +212,11 @@ def test_shape_derivation_matches_max_model_len():
 
 @pytest.mark.parametrize("b,k", [(64, 2048), (128, 2048)])
 def test_exact_topk_when_stage_two_needs_its_own_partition(b, k):
-    """`p * k_p` past one slice must recurse, not overflow SparseCore.
-
-    At 1M context `p` reaches 32, so stage 2 sees 65536 candidates. Feeding
-    that straight to `_sc_topk_direct` fails to compile with E3000
-    CompileTimeSparseCoreAllocationFailure in tile_spmem. Below `b=32` the
-    single stage-1 wave keeps the same width inside budget, so the batch sizes
-    here are the ones that actually reproduce it.
-    """
+    """`p > 16` at 1M context uses the two-stage fallback and stage 2 runs VMEM_SHARED."""
+    _require_sparsecore()
     p = _pick_partition(b, N_1M, k)
     assert p * min(k, N_1M // p) > MAX_SLICE_WORDS, (
-        f"{b=} {k=} no longer reaches the recursive stage-2 path (p={p})"
+        f"{b=} {k=} no longer reaches the multi-partition stage-2 path (p={p})"
     )
     rng = np.random.default_rng(SEED)
     scores = _scores("random", b, N_1M, rng)
@@ -230,20 +224,35 @@ def test_exact_topk_when_stage_two_needs_its_own_partition(b, k):
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_partition_factor_is_what_these_tests_assume(b, n, k, expected_p):
-    """Pin `P` so a change to `_pick_partition` cannot silently retarget these.
-
-    Without this, tuning `MAX_SLICE_WORDS` or the doubling loop could collapse
-    every case below to the single-stage path, and the suite would keep passing
-    while testing nothing about the two-stage merge.
-    """
+    """Pin `P` so a change to `_pick_partition` cannot silently retarget these."""
     assert _pick_partition(b, n, k) == expected_p
+
+
+@pytest.mark.cpu_test
+def test_select_p_and_env_override(monkeypatch):
+    """Verify `_select_p` honors `max_p` and `TPU_SC_TOPK_MAX_P` while respecting `p_min`."""
+    # Default at b=8, n=65536, k=2048: p_min=2, b*p reaches 32 at p=4.
+    assert _select_p(8, 65536, 2048, None) == 4
+    # Explicit max_p=2 clamps p from 4 down to p_min=2.
+    assert _select_p(8, 65536, 2048, 2) == 2
+    # Explicit max_p=1 cannot go below hardware SRAM floor p_min=2 for n=65536.
+    assert _select_p(8, 65536, 2048, 1) == 2
+    # For n=32768 (p_min=1), max_p=1 forces p=1 even at small batch b=4.
+    assert _select_p(4, 32768, 2048, None) == 8
+    assert _select_p(4, 32768, 2048, 1) == 1
+    assert _select_p(4, 32768, 2048, 2) == 2
+    # Environment variable override TPU_SC_TOPK_MAX_P.
+    monkeypatch.setenv("TPU_SC_TOPK_MAX_P", "4")
+    assert _select_p(4, 32768, 2048, None) == 4
 
 
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 @pytest.mark.parametrize("kind", ["strict_desc", "random", "heavy_ties"])
 def test_exact_topk_full_rows(b, n, k, expected_p, kind):
+    _require_sparsecore()
     rng = np.random.default_rng(SEED)
     scores = _scores(kind, b, n, rng)
     row_lengths = np.full(b, n, np.int32)
@@ -252,13 +261,8 @@ def test_exact_topk_full_rows(b, n, k, expected_p, kind):
 
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_p):
-    """Ragged lengths are the chunked-prefill case and the two-stage risk.
-
-    `_effective_row_lengths` gives every row in a chunk a different amount of
-    visible context, so partitions are routinely partly or wholly empty. Edges
-    exactly at `n_p` are where a stage-1 slice contributes nothing and stage 2
-    must cope with all-padding candidate blocks.
-    """
+    """Ragged lengths straddling subcore slice boundaries."""
+    _require_sparsecore()
     n_p = n // expected_p
     rng = np.random.default_rng(SEED)
     scores = _scores("random", b, n, rng)
@@ -288,6 +292,7 @@ def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
     """`-inf` is never eligible, so every output slot must be `-1`."""
+    _require_sparsecore()
     rng = np.random.default_rng(SEED)
     scores = _scores("all_neg_inf", b, n, rng)
     row_lengths = np.full(b, n, np.int32)
@@ -297,12 +302,8 @@ def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
 
 
 def test_topk_concentrated_in_the_last_partition():
-    """The two-stage path's own failure mode.
-
-    All the mass sits in the final slice, so all but one of the stage-1
-    candidate blocks are pure padding and stage 2 has to discard them without
-    letting a padded entry outrank a real one.
-    """
+    """All mass sits in the final slice while earlier slices are `-1e30`."""
+    _require_sparsecore()
     b, n, k, p = 16, N_128K, 2048, 8
     assert _pick_partition(b, n, k) == p
     rng = np.random.default_rng(SEED)
@@ -316,18 +317,8 @@ def test_topk_concentrated_in_the_last_partition():
     "corruption", ["worst_index", "drop_one", "duplicate", "negative"]
 )
 def test_comparison_detects_a_wrong_index(corruption):
-    """The meta-test: prove `_mismatch` can reject bad output.
-
-    Every other assertion in this file is `_mismatch(...) is None`, which is
-    worth exactly as much as this test. Four independent corruptions, each of
-    which a correct kernel would never produce.
-
-    `worst_index` swaps in the row's *minimum* eligible column rather than
-    shifting an index by one. Under `heavy_ties` an adjacent column very often
-    carries an identical score, so a one-off shift leaves the score multiset
-    unchanged -- the comparison would rightly accept it, and the control would
-    look broken when it was the perturbation that was too weak.
-    """
+    """The meta-test: prove `_mismatch` can reject bad output."""
+    _require_sparsecore()
     b, n, k = 16, N_128K, 2048
     rng = np.random.default_rng(SEED)
     scores = _scores("random", b, n, rng)
@@ -355,14 +346,16 @@ def test_comparison_detects_a_wrong_index(corruption):
 @pytest.mark.parametrize(
     "b,n,k",
     [
-        (32, 2048, 256),  # single_stage
-        (4, 8192, 256),  # two_stage
+        (32, 2048, 256),  # p == 1 single_stage
+        (4, 8192, 256),  # p == 8 VMEM_SHARED single_stage
+        (64, N_1M, 2048),  # p == 32 two_stage
     ],
 )
 def test_return_scores(b: int, n: int, k: int):
     """Verifies that return_scores=True returns matching scores for winners and
-    -inf for pad.
+    -inf for pad across p=1, VMEM_SHARED p>1, and two-stage p>16.
     """
+    _require_sparsecore()
     np.random.seed(800 + b + n + k)
     scores = np.random.randn(b, n).astype(np.float32)
     row_lengths = np.random.randint(k, n + 1, size=(b,), dtype=np.int32)
@@ -388,39 +381,78 @@ def test_return_scores(b: int, n: int, k: int):
                 assert score_val == -np.inf
 
 
+@pytest.mark.parametrize(
+    "b,n,k,return_scores",
+    [
+        (32, 2048, 256, False),  # p == 1
+        (4, 8192, 256, True),  # p == 8 VMEM_SHARED
+        (8, 49152, 512, False),  # padded non-multiple of p*128
+        (64, N_1M, 2048, False),  # p == 32 two-stage fallback
+    ],
+)
+def test_values_payload_tracks_selected_indices(
+    b: int, n: int, k: int, return_scores: bool
+):
+    """Verifies that `values=` payload returns `values[r, idx]` for winners and `-1` for pad."""
+    _require_sparsecore()
+    rng = np.random.default_rng(SEED + b + n)
+    scores = rng.standard_normal((b, n), dtype=np.float32)
+    row_offs = (np.arange(b, dtype=np.int32)[:, None] + 1) * (n + 100)
+    payload = row_offs + np.arange(n, dtype=np.int32)[None, :]
+    row_lengths = rng.integers(k // 2, n + 1, size=(b,), dtype=np.int32)
+
+    res = sparsecore_topk(
+        jnp.asarray(scores),
+        k,
+        jnp.asarray(row_lengths),
+        values=jnp.asarray(payload),
+        return_scores=return_scores,
+    )
+    if return_scores:
+        actual_vals, _ = res
+    else:
+        actual_vals = res
+
+    actual_vals = np.asarray(actual_vals)
+    actual_idxs = np.where(actual_vals >= 0, actual_vals - row_offs, -1)
+    assert _mismatch(scores, actual_idxs, k, row_lengths) is None
+
+    for r in range(b):
+        live = actual_vals[r] >= 0
+        np.testing.assert_array_equal(
+            actual_vals[r, live], payload[r, actual_idxs[r, live]]
+        )
+        assert np.all(actual_vals[r, ~live] == -1)
+
+
 # --------------------------------------------------------------------------- #
 # Scheduling groups.
 # --------------------------------------------------------------------------- #
-# `scheduling_group_id` puts stage 1 in an XLA scheduling group and
-# `stage2_scheduling_group_id` puts stage 2 in a *different* one, so a caller
-# pipelining several chunks can overlap each stage with a different chunk's
-# TensorCore work. Stage 2 only exists on the two-stage path.
-#
-# Both ids are scheduling hints, so there are exactly two ways they can be
-# wrong: the annotation lands on the wrong stage (or leaks onto a stage the
-# caller left unannotated, which would pin two stages into one group and
-# serialise the overlap it was added to create), or it perturbs the selection.
-# One test each. Which stage gets which id is decided before any kernel is
-# built, so that half is a `cpu_test` and only the other two need a TPU.
-
-# `b=16, n=N_128K` is the two-stage shape; `b=64, n=N_SHORT` is single-stage.
-TWO_STAGE = (16, N_128K, 2048)
+# `b=64, n=N_1M` (`p=32 > 16`) is the two-stage shape; `b=64, n=N_SHORT` (`p=1`)
+# and `b=16, n=N_128K` (`p=8` VMEM_SHARED) are single-stage shapes.
+TWO_STAGE = (64, N_1M, 2048)
 SINGLE_STAGE = (64, N_SHORT, 2048)
+SINGLE_STAGE_VMEM_SHARED = (16, N_128K, 2048)
 
 
 def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
-    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
-
-    Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
-    stub is guaranteed to be the function that runs: a cached trace from an
-    earlier test would otherwise re-run the real kernel and record nothing.
-    """
+    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order."""
     seen: list[int | None] = []
 
-    def _stub(scores, k_, row_lengths, *, write_empty=True, scheduling_group_id=None):
+    def _stub(
+        scores,
+        k_,
+        row_lengths,
+        *,
+        p=1,
+        values=None,
+        return_scores=True,
+        write_empty=True,
+        scheduling_group_id=None,
+    ):
         seen.append(scheduling_group_id)
         out = jnp.zeros((scores.shape[0], k_), jnp.int32)
-        return out, out
+        return (out, out) if return_scores else out
 
     monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
@@ -431,44 +463,54 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
 @pytest.mark.parametrize(
     "shape,kwargs,expected",
     [
-        # Each stage gets its own group, and stage 2 gets the stage-2 one.
+        # Two-stage (p=32 at 1M): each stage gets its own group.
         (TWO_STAGE, dict(scheduling_group_id=3, stage2_scheduling_group_id=4), [3, 4]),
         # Stage 2 unannotated: it must NOT inherit stage 1's group.
         (TWO_STAGE, dict(scheduling_group_id=3), [3, None]),
         # Stage 1 unannotated, stage 2 annotated: the two are independent.
         (TWO_STAGE, dict(stage2_scheduling_group_id=4), [None, 4]),
         (TWO_STAGE, {}, [None, None]),
-        # One stage exists, so the stage-2 id is accepted and unused.
+        # Single-stage p=1 and p=8 VMEM_SHARED: stage-2 id is accepted and unused.
         (SINGLE_STAGE, dict(scheduling_group_id=3, stage2_scheduling_group_id=4), [3]),
         (SINGLE_STAGE, dict(stage2_scheduling_group_id=4), [None]),
+        (
+            SINGLE_STAGE_VMEM_SHARED,
+            dict(scheduling_group_id=3, stage2_scheduling_group_id=4),
+            [3],
+        ),
     ],
-    ids=["both", "stage1_only", "stage2_only", "neither", "p1_both", "p1_stage2_only"],
+    ids=[
+        "both",
+        "stage1_only",
+        "stage2_only",
+        "neither",
+        "p1_both",
+        "p1_stage2_only",
+        "p8_vmem_shared_both",
+    ],
 )
 def test_each_stage_gets_the_group_id_it_was_given(
     monkeypatch, shape, kwargs, expected
 ):
     b, n, k = shape
-    assert _pick_partition(b, n, k) == (8 if len(expected) == 2 else 1)
     assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
 
 
+@pytest.mark.cpu_test
 def test_scheduling_group_ids_reach_the_lowered_hlo():
-    """The stub test above proves the plumbing; this proves the plumbing does
-    something. Both ids have to survive as frontend attributes, or the stages
-    are annotated only in the source."""
+    """Verify both scheduling group IDs survive as frontend attributes in lowered HLO."""
     b, n, k = TWO_STAGE
-    assert _pick_partition(b, n, k) == 8
-    scores = jnp.zeros((b, n), jnp.float32)
-    row_lengths = jnp.full((b,), n, jnp.int32)
+    assert _pick_partition(b, n, k) == 32
+    scores = jax.ShapeDtypeStruct((b, n), jnp.float32)
+    row_lengths = jax.ShapeDtypeStruct((b,), jnp.int32)
 
     def _text(**kwargs):
-        return sparsecore_topk.lower(scores, k, row_lengths, **kwargs).as_text()
+        return _lower_to_tpu_text(sparsecore_topk, scores, k, row_lengths, **kwargs)
 
     both = _text(scheduling_group_id=3, stage2_scheduling_group_id=4)
     assert '_scheduling_group_id = "3"' in both
     assert '_scheduling_group_id = "4"' in both
 
-    # Nothing is annotated unless it was asked for.
     stage1_only = _text(scheduling_group_id=3)
     assert '_scheduling_group_id = "3"' in stage1_only
     assert '_scheduling_group_id = "4"' not in stage1_only
@@ -478,7 +520,8 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
 @pytest.mark.parametrize("kind", ["random", "heavy_ties"])
 def test_scheduling_group_ids_do_not_change_the_selection(kind):
     """A scheduling hint that changed the answer would be a correctness bug."""
-    b, n, k = TWO_STAGE
+    _require_sparsecore()
+    b, n, k = SINGLE_STAGE_VMEM_SHARED
     rng = np.random.default_rng(SEED)
     scores = _scores(kind, b, n, rng)
     row_lengths = np.full(b, n, np.int32)
@@ -497,8 +540,53 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
     )
 
     assert _mismatch(scores, grouped, k, row_lengths) is None
-    # Indices may legitimately differ on ties, the selected scores may not.
     np.testing.assert_array_equal(
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+@pytest.mark.cpu_test
+def test_zero_take_along_axis_and_zero_gather_in_lowered_hlo():
+    """Verify 0 `take_along_axis` in kernel sources and 0 `stablehlo.gather` in lowered HLO."""
+    kernel_root = Path(sc_module.__file__).resolve().parent
+    target_files = [
+        kernel_root / "sparsecore_topk.py",
+        kernel_root / "streamindex_topk" / "dcp_sc_compact.py",
+        kernel_root / "streamindex_topk" / "streamindex_topk.py",
+    ]
+    for path in target_files:
+        src = path.read_text()
+        assert "take_along_axis" not in src, f"Found take_along_axis in {path}"
+        tree = ast.parse(src)
+        attrs = [
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        ]
+        assert "take_along_axis" not in attrs, f"Found AST take_along_axis in {path}"
+
+    for m, n, k, with_val, ret_scores, max_p in [
+        (32, 10240, 2048, False, True, None),  # P == 1 single-stage
+        (8, 65536, 2048, True, True, 4),  # P == 4 VMEM_SHARED with payload + scores
+        (8, 49152, 2048, True, False, None),  # padded non-multiple of P*128
+        (64, N_1M, 2048, True, True, None),  # P == 32 two-stage fallback
+    ]:
+        x_spec = jax.ShapeDtypeStruct((m, n), jnp.float32)
+        if with_val:
+            v_spec = jax.ShapeDtypeStruct((m, n), jnp.int32)
+            fn = lambda s, v: sparsecore_topk(
+                s, k, values=v, return_scores=ret_scores, max_p=max_p
+            )
+            with _tpu_lowering_context():
+                traced = jax.jit(fn).trace(x_spec, v_spec)
+                hlo = traced.lower(lowering_platforms=("tpu",)).as_text()
+        else:
+            fn = lambda s: sparsecore_topk(
+                s, k, return_scores=ret_scores, max_p=max_p
+            )
+            with _tpu_lowering_context():
+                traced = jax.jit(fn).trace(x_spec)
+                hlo = traced.lower(lowering_platforms=("tpu",)).as_text()
+        assert "stablehlo.gather" not in hlo, (
+            f"Found stablehlo.gather in lowered HLO for m={m}, n={n}, "
+            f"with_val={with_val}, ret_scores={ret_scores}, max_p={max_p}"
+        )

@@ -175,7 +175,7 @@ def paged_attention_with_guarded_smem(
 
     num_kernel_launches = batch_size // mini_batch_size
 
-    outputs = jnp.zeros_like(q).reshape(
+    outputs = jnp.empty_like(q).reshape(
         (num_kernel_launches, mini_batch_size, *q.shape[1:])
     )
     q = q.reshape((num_kernel_launches, mini_batch_size, *q.shape[1:]))
@@ -1009,6 +1009,144 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def _merge_dcp_partials_a2a(
+    output: jax.Array,  # [num_tokens, num_heads, lkv_dim], this rank's partial
+    lse: jax.Array,  # f32[num_tokens, num_heads], -inf where nothing is owned
+    *,
+    dcp_size: int,
+    axis_name: str,
+) -> jax.Array:
+    """Log-sum-exp merge of the DCP partials with a single all-to-all.
+
+    Rank `j` owns head slice `j`. Each rank sends every peer that peer's head
+    slice of its partial output, with the matching f32 log-sum-exps bitcast
+    into one extra bf16 head row, and then combines the `dcp_size` partials
+    it receives locally in f32. Returns `[num_tokens, num_heads // dcp_size,
+    lkv_dim]` in `output.dtype`.
+    """
+    num_tokens, num_heads, lkv_dim = output.shape
+    if jnp.dtype(output.dtype).itemsize != 2:
+        raise ValueError(f"expected a 16-bit partial output, got {output.dtype}")
+    local_heads = num_heads // dcp_size
+    out = output.reshape(num_tokens, dcp_size, local_heads, lkv_dim)
+    # Lossless bitcast: reinterpret each 32-bit IEEE float32 LSE as 2x 16-bit words
+    # (reinterpret_cast via words_per_lse = 2), NOT a numerical downcast (astype(bfloat16)).
+    # The receiving peer reverses this with bitcast_convert_type(..., jnp.float32),
+    # recovering the exact 32-bit IEEE float32 LSE with 0 ULP loss (bit-exact uint32).
+    words_per_lse = jnp.dtype(jnp.float32).itemsize // jnp.dtype(output.dtype).itemsize
+    lse_words = jax.lax.bitcast_convert_type(
+        lse.astype(jnp.float32), output.dtype
+    ).reshape(num_tokens, dcp_size, 1, -1)
+    if lse_words.shape[-1] > lkv_dim:
+        raise ValueError(
+            f"cannot pack {local_heads} f32 lse values into a {lkv_dim}-wide row"
+        )
+    lse_row = jnp.pad(
+        lse_words, ((0, 0), (0, 0), (0, 0), (0, lkv_dim - lse_words.shape[-1]))
+    )
+    packed = jnp.concatenate([out, lse_row], axis=2)
+    # [num_tokens, dcp_size (source rank), local_heads + 1, lkv_dim]
+    received = jax.lax.all_to_all(
+        packed, axis_name, split_axis=1, concat_axis=1, tiled=True
+    )
+    partials = received[:, :, :local_heads, :].astype(jnp.float32)
+    # Recover exact 32-bit IEEE float32 LSE via inverse bitcast (zero bits lost)
+    peer_lse = jax.lax.bitcast_convert_type(
+        received[:, :, local_heads, : local_heads * words_per_lse].reshape(
+            num_tokens, dcp_size, local_heads, words_per_lse
+        ),
+        jnp.float32,
+    )
+    finite = jnp.isfinite(peer_lse)
+    shift = jnp.max(jnp.where(finite, peer_lse, -jnp.inf), axis=1, keepdims=True)
+    # No contributor anywhere: pin the shift and let the zero weights give 0.
+    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+    weights = jnp.where(finite, jnp.exp(peer_lse - shift), 0.0)
+    denom = jnp.sum(weights, axis=1)
+    denom = jnp.where(denom > 0, denom, 1.0)
+    # Split normalized FP32 weights into high and low parts (TwoProduct / Dekker split)
+    # so even if XLA lowers sum(bf16.astype(f32) * f32, axis=1) to an MXU dot,
+    # the FP32 weight mantissa is preserved to < 2^-16 relative error.
+    w = weights / jnp.expand_dims(denom, axis=1)
+    w_hi = w.astype(jnp.bfloat16).astype(jnp.float32)
+    w_lo = w - w_hi
+    merged = jnp.sum(partials * w_hi[..., None], axis=1) + jnp.sum(
+        partials * w_lo[..., None], axis=1
+    )
+    return merged.astype(output.dtype)
+
+
+def _merge_dcp_partials_psum_scatter(
+    output: jax.Array,
+    lse: jax.Array,
+    *,
+    dcp_size: int,
+    axis_name: str,
+) -> jax.Array:
+    """Merge DCP partial outputs across `axis_name` via head-major `psum_scatter`.
+
+    Used on prefill buckets (`num_tokens > TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS`)
+    when `merge_partials=True` so `sparse_mla_attention_dcp` still returns
+    `[num_tokens, num_heads // dcp_size, lkv_dim]` (preserving PyTorch's static
+    `jax_op` output shape across all dynamic `SymInt` token counts) without
+    allocating the `1.07 GiB/layer` (`T=4096`) `all_to_all` transpose buffer.
+    """
+    del dcp_size
+    lse_f32 = lse.astype(jnp.float32)
+    gathered = jax.lax.all_gather(lse_f32, axis_name, axis=0, tiled=False)
+    finite = jnp.isfinite(gathered)
+    shift = jnp.max(jnp.where(finite, gathered, -jnp.inf), axis=0)
+    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+    weights = jnp.where(finite, jnp.exp(gathered - shift[None, ...]), 0.0)
+    denom = jnp.sum(weights, axis=0)
+    safe_denom = jnp.where(denom > 0, denom, 1.0)
+    mine = (
+        jnp.where(
+            jnp.isfinite(lse_f32),
+            jnp.exp(lse_f32 - shift),
+            0.0,
+        )
+        / safe_denom
+    )
+    output_hm = jnp.swapaxes(output, 0, 1)
+    mine_hm = jnp.swapaxes(mine, 0, 1)[..., None]
+    weighted_hm = output_hm.astype(jnp.float32) * mine_hm
+    scattered_hm = jax.lax.psum_scatter(
+        weighted_hm, axis_name, scatter_dimension=0, tiled=True
+    )
+    return jnp.swapaxes(scattered_hm.astype(output.dtype), 0, 1)
+
+
+def should_use_sparse_mla_dcp_a2a_merge(
+    num_tokens: int,
+    *,
+    merge_partials: bool | None = None,
+    max_tokens: int | None = None,
+) -> bool:
+    """Whether to merge DCP sparse-MLA partials in-op via all-to-all for `num_tokens`.
+
+    When `max_tokens > 0` (default `256`), decode buckets (`num_tokens <= max_tokens`)
+    merge in-op via `_merge_dcp_partials_a2a`, while prefill buckets
+    (`num_tokens > max_tokens`) merge via head-major `_merge_dcp_partials_psum_scatter`
+    (or `merge_lse_partials_scatter_heads`).
+    """
+    enabled = (
+        envs.TPU_SPARSE_MLA_DCP_A2A_MERGE
+        if merge_partials is None
+        else bool(merge_partials)
+    )
+    if not enabled:
+        return False
+    limit = (
+        envs.TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS
+        if max_tokens is None
+        else int(max_tokens)
+    )
+    if limit > 0 and int(num_tokens) > limit:
+        return False
+    return True
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1030,6 +1168,7 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    merge_partials: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1055,6 +1194,11 @@ def sparse_mla_attention_dcp(
       before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
       top-k, which is what makes that merge a plain softmax with no separate
       count channel.
+
+      With `merge_partials`, the merge runs here instead: `output` is this
+      rank's head slice of the whole-context result,
+      `[dcp_size * num_tokens, num_heads // dcp_size, lkv_dim]`, and `lse` is
+      returned unmerged and should be ignored.
     """
     if dcp_size <= 1:
         raise ValueError(
@@ -1117,6 +1261,21 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    use_a2a_merge = (
+        should_use_sparse_mla_dcp_a2a_merge(
+            num_tokens, merge_partials=merge_partials
+        )
+        if merge_partials
+        else False
+    )
+    if merge_partials and not use_a2a_merge:
+        logger.info_once(
+            "TPU_SPARSE_MLA_DCP_A2A_MERGE skipped for bucket T=%d > "
+            "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS=%d; using in-op "
+            "head-major psum_scatter.",
+            int(num_tokens),
+            envs.TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS,
+        )
 
     def _local(
         ql_nope,
@@ -1159,23 +1318,37 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            local_block_tables,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-            return_lse=True,
-            # The kernel defaults to tensorcore; the caches follow the spec.
-            cache_layout=cache_layout,
-        )
+
+        def _attend(idx):
+            return sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                return_lse=True,
+                # The kernel defaults to tensorcore; the caches follow the spec.
+                cache_layout=cache_layout,
+            )
+
+        output, lse = _attend(topk_idx)
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
-        return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
+        output = output[..., : ql_nope.shape[-1]]
+        if merge_partials:
+            if use_a2a_merge:
+                output = _merge_dcp_partials_a2a(
+                    output, lse, dcp_size=dcp_size, axis_name=dcp_axis_name
+                )
+            else:
+                output = _merge_dcp_partials_psum_scatter(
+                    output, lse, dcp_size=dcp_size, axis_name=dcp_axis_name
+                )
+        return (kv_cache_nope, kv_cache_rope, output, lse)
 
     return jax.jit(
         shard_map.shard_map(

@@ -14,6 +14,7 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -622,6 +623,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "return_raw_scores",
     ),
 )
 def streamindex_topk(
@@ -649,7 +651,9 @@ def streamindex_topk(
     cp_size: int = 1,
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
+    values: jax.Array | None = None,
     return_scores: bool = False,
+    return_raw_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1093,15 +1097,13 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        raw_scores_list = []
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
             tc_group = None if m == 0 else group_base + m - 1
             sc_group = None if m == num_chunks - 1 else group_base + m
-            # Stage 2 lands one group later than its own stage 1, so it overlaps
-            # chunk m + 2's scoring. The last two chunks have no later group.
-            sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1113,25 +1115,63 @@ def streamindex_topk(
                 tc_group,
             )
             scores = scores.reshape(chunk_len, -1)
+            if return_raw_scores:
+                raw_scores_list.append(scores)
+                continue
+
+            chunk_vals = (
+                None if values is None else values[start : start + chunk_len]
+            )
             if scores.shape[1] < k:
+                pad_w = k - scores.shape[1]
                 scores = jnp.pad(
                     scores,
-                    ((0, 0), (0, k - scores.shape[1])),
+                    ((0, 0), (0, pad_w)),
                     constant_values=BITS_NEG_INF,
                 )
+                if chunk_vals is not None:
+                    chunk_vals = jnp.pad(
+                        chunk_vals.astype(jnp.int32),
+                        ((0, 0), (0, pad_w)),
+                        constant_values=-1,
+                    )
 
-            chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                scores,
-                k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
-                write_empty_rows=True,
-                scheduling_group_id=sc_group,
-                stage2_scheduling_group_id=sc2_group,
-                return_scores=True,
-            )
-            topk_idxs.append(chunk_topk_idxs)
             if need_scores:
+                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    values=chunk_vals,
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    return_scores=True,
+                )
                 topk_scores_list.append(chunk_topk_scores)
+            else:
+                chunk_topk_idxs = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    values=chunk_vals,
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    return_scores=False,
+                )
+            topk_idxs.append(chunk_topk_idxs)
+
+        if return_raw_scores:
+            raw_out = (
+                raw_scores_list[0]
+                if len(raw_scores_list) == 1
+                else jnp.concatenate(raw_scores_list)
+            )
+            raw_out = raw_out[:max_num_tokens]
+            col_iota = jnp.arange(raw_out.shape[1], dtype=jnp.int32)[None, :]
+            return jnp.where(
+                col_iota < eff_row_lengths[:, None],
+                raw_out,
+                jnp.int32(BITS_NEG_INF),
+            )
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
@@ -1191,8 +1231,11 @@ def streamindex_topk(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "single_stage_score_ag",
+        "single_stage_return_global",
     ),
 )
 def streamindex_topk_dcp(
@@ -1214,76 +1257,33 @@ def streamindex_topk_dcp(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    single_stage_score_ag: bool | None = None,
+    single_stage_return_global: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
-    Architecture:
+    Architecture (2-stage default):
       1. Local Scoring: Every rank scores the replicated query tokens against its
          own local KV cache shard via `streamindex_topk`, producing candidate
-         indices and scores of shape `[padded_num_tokens, k]`. Because DCP
-         partitions the KV cache, a true global top-k winner is beaten by at most
-         `k - 1` positions globally, and therefore by at most `k - 1` positions
-         on its owner rank. Thus, every true global winner is guaranteed to
-         survive into its owner's local candidate list.
+         indices and scores of shape `[padded_num_tokens, k]`.
       2. Candidate All-Gather: A single `all_gather` along the candidate axis
          (axis 1) exchanges candidate *scores* only, rank-major:
-         `[T, k] -> [T, dcp_size * k]`. The indices are not exchanged, so they
-         never leave the rank that produced them.
-      3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
-         `[T, dcp_size * k]` scores to select the exact top-k global winners:
-         `[T, dcp_size * k] -> [T, k]`.
-      4. Rank-Local Filtering: `dcp_sc_compact.resolve_owned_winners` keeps the
-         slots whose chunk came from `dcp_rank`, resolves them against this
-         rank's own pre-gather indices at `slot % k`, and left-packs them into a
-         `-1` padded prefix. Those indices are rank-local already -- they never
-         crossed the gather -- so no coordinate conversion is needed and
-         ownership is decided in exactly one place. The ranks' outputs form an
-         exact partition of the global top-k.
+         `[T, k] -> [T, dcp_size * k]`.
+      3. SparseCore Merge with Rank Payload: Each rank builds `rank_payload` of
+         shape `[T, dcp_size * k]` holding its local `idxs` at
+         `[dcp_rank * k : (dcp_rank + 1) * k]` and `-1` elsewhere, and passes
+         `values=rank_payload` directly into `sparsecore_topk` so owned winners
+         emerge as local indices and foreign winners emerge as `-1` with zero
+         XLA gathers.
+      4. Rank-Local Compaction: `dcp_sc_compact.pack_nonnegative(merged)`
+         left-packs the non-negative owned winners into a `-1` padded prefix.
 
-    By gathering candidates along axis 1 upfront rather than partitioning tokens
-    over an `all_to_all`, all communication is consolidated into a single upfront
-    collective phase, avoiding the barrier latency of a multi-phase pipeline and
-    preserving the token axis `T` unpartitioned.
-
-    Args:
-      q: replicated query tokens, in natural request-major order
-        `[padded_num_tokens, num_q_heads, head_dim]`.
-      indexer_weights: replicated query weights `[padded_num_tokens,
-        num_q_heads]`.
-      cache_kv: this rank's shard of the compressed KV cache.
-      seq_lens: the length of each sequence in the kv cache (uncompressed).
-      page_indices: replicated *virtual* page ordinals, resolved against each
-        rank's own shard by `local = virtual % num_local_pages`.
-      cu_q_lens: the cumulative sum of the effective query lengths.
-      distribution: (i, j, k) partition indices.
-      mesh: mesh containing `dcp_axis_name`.
-      k: Number of top-K elements to retrieve.
-      compression_ratio: KV cache compression ratio.
-      dcp_size: number of context-parallel ranks.
-      interleave_size: chunk-interleave width in uncompressed tokens.
-      num_kv_pages_per_block: number of kv pages per block in pallas kernel.
-      num_queries_per_block: number of queries per block in pallas kernel.
-      buffer_count: buffer count for pallas kernel.
-      vmem_limit_bytes: vmem limit for pallas kernel.
-      decode_req_batch_size: maximum decode batch size per iteration.
-      chunk_tokens: forwarded to `streamindex_topk` for the per-rank local
-        scoring pass; see there for the semantics. Chunking cuts the replicated
-        query-token axis, which is orthogonal to the KV axis DCP shards, so the
-        two compose.
-      dcp_axis_name: name of the DCP mesh axis.
-
-    Returns:
-      i32[padded_num_tokens, k] of this rank's own *local* cache indices for
-      every token, packed into a prefix and `-1` padded, sharded over
-      `dcp_axis_name` (global leading dim `dcp_size * padded_num_tokens`).
-      Callers derive per-token counts from the `-1` padding; a row that is all
-      `-1` means this rank owns none of that token's top-k, which the attention
-      side must mask out of the LSE merge rather than attend over. Rows are
-      `k` wide but hold `k / dcp_size` entries on average, so a caller that
-      gathers the full width pays `dcp_size`x more than it needs to; the
-      attention side should bound its gather by the per-row count.
+    Optional Single-Stage Score All-Gather (`single_stage_score_ag=True`, b/568775832):
+      All-gathers raw masked local KV scores across `dcp_axis_name` and runs a
+      single local `sparsecore_topk` over all `[T, dcp_size * L_local]` scores.
     """
     if dcp_size <= 1:
         raise ValueError(
@@ -1302,6 +1302,22 @@ def streamindex_topk_dcp(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
 
+    parsed_layout = KVLayout.parse(kv_layout)
+    if single_stage_score_ag is None:
+        max_kv_env = int(
+            os.environ.get("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "0") or "0"
+        )
+        page_sz = (
+            cache_kv.shape[3]
+            if parsed_layout == KVLayout.SEQ_ALONG_LANE
+            else cache_kv.shape[1] * cache_kv.shape[2]
+        )
+        pages_per_seq = page_indices.shape[0] // seq_lens.shape[0]
+        l_local_est = pages_per_seq * page_sz
+        use_single_stage = max_kv_env > 0 and (l_local_est * dcp_size <= max_kv_env)
+    else:
+        use_single_stage = bool(single_stage_score_ag)
+
     def _local(
         q,
         indexer_weights,
@@ -1313,6 +1329,79 @@ def streamindex_topk_dcp(
     ):
         dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
+
+        if use_single_stage:
+            local_scores = streamindex_topk(
+                q,
+                indexer_weights,
+                cache_kv,
+                seq_lens,
+                local_page_indices,
+                cu_q_lens,
+                distribution,
+                k=k,
+                compression_ratio=compression_ratio,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                buffer_count=buffer_count,
+                vmem_limit_bytes=vmem_limit_bytes,
+                decode_req_batch_size=decode_req_batch_size,
+                enable_early_exit=False,
+                kv_layout=parsed_layout,
+                chunk_tokens=chunk_tokens,
+                cp_size=dcp_size,
+                cp_rank=dcp_rank,
+                interleave_size=interleave_size,
+                return_scores=False,
+                return_raw_scores=True,
+            )
+            all_scores = lax.all_gather(
+                local_scores, dcp_axis_name, axis=1, tiled=True
+            )
+            l_local = local_scores.shape[1]
+            if single_stage_return_global:
+                interleave_c = interleave_size // compression_ratio
+                local_global_idxs = cp_local_to_global(
+                    jnp.arange(l_local, dtype=jnp.int32),
+                    dcp_rank,
+                    dcp_size,
+                    interleave_c,
+                )
+                all_global_idxs = lax.all_gather(
+                    local_global_idxs[None, :], dcp_axis_name, axis=1, tiled=True
+                )
+                all_global_idxs = jnp.broadcast_to(
+                    all_global_idxs, all_scores.shape
+                )
+                return sparsecore_topk(
+                    all_scores,
+                    k,
+                    row_lengths=jnp.full(
+                        (all_scores.shape[0],), all_scores.shape[1], dtype=jnp.int32
+                    ),
+                    values=all_global_idxs,
+                    write_empty_rows=True,
+                    return_scores=False,
+                )[: q.shape[0]]
+
+            local_iota = jnp.broadcast_to(
+                jnp.arange(l_local, dtype=jnp.int32)[None, :],
+                local_scores.shape,
+            )
+            rank_payload = dcp_sc_compact.build_rank_payload(
+                local_iota, dcp_size, dcp_rank
+            )
+            merged = sparsecore_topk(
+                all_scores,
+                k,
+                row_lengths=jnp.full(
+                    (all_scores.shape[0],), all_scores.shape[1], dtype=jnp.int32
+                ),
+                values=rank_payload,
+                write_empty_rows=True,
+                return_scores=False,
+            )
+            return dcp_sc_compact.pack_nonnegative(merged)[: q.shape[0]]
 
         idxs, scores = streamindex_topk(
             q,
@@ -1330,6 +1419,7 @@ def streamindex_topk_dcp(
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
             enable_early_exit=False,
+            kv_layout=parsed_layout,
             chunk_tokens=chunk_tokens,
             cp_size=dcp_size,
             cp_rank=dcp_rank,
@@ -1340,15 +1430,20 @@ def streamindex_topk_dcp(
         # Stage 1. All-gather the scores; the indices stay home.
         scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
-        # Stage 2. Full width as the row length: -inf entries (unfilled local
-        # slots, padding tokens) are never selected, so they need no masking.
-        slots = sparsecore_topk(
+        # Stage 2. Rank-masked payload (`rank_payload`) carries this rank's
+        # local candidate indices at `[dcp_rank * k : (dcp_rank + 1) * k]` and
+        # `-1` elsewhere, so `sparsecore_topk` emits owned winners directly
+        # without any post-hoc gather.
+        rank_payload = dcp_sc_compact.build_rank_payload(idxs, dcp_size, dcp_rank)
+        merged = sparsecore_topk(
             scores,
             k,
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
+            values=rank_payload,
             write_empty_rows=True,
+            return_scores=False,
         )
-        return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
+        return dcp_sc_compact.pack_nonnegative(merged)[: q.shape[0]]
 
     replicated = P()
     return jax.shard_map(

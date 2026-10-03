@@ -67,6 +67,11 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
+import vllm_torchtpu.layers.adapter.cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+    all_gather_heads as _base_all_gather_heads,
+    merge_lse_partials_scatter_heads as _base_merge_lse_partials_scatter_heads,
+)
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -1999,7 +2004,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
-
+        # Whether the DCP sparse-MLA op returns merged head slices itself.
+        self.sparse_mla_dcp_merges_partials = (
+            self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_A2A_MERGE
+        )
+        self.sparse_mla_dcp_a2a_merge_max_tokens = (
+            envs.TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS
+        )
+        if self.sparse_mla_dcp_merges_partials:
+            logger.info_once(
+                "Applied TPU patch: TPU_SPARSE_MLA_DCP_A2A_MERGE - DCP "
+                "sparse-MLA partials merged in-op with one all-to-all per "
+                "layer (dcp=%d, max_tokens=%d).",
+                self.dcp_size,
+                self.sparse_mla_dcp_a2a_merge_max_tokens,
+            )
         if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
             logger.info_once(
                 "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
@@ -2260,6 +2279,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_impl
 
+    def _use_sparse_mla_dcp_a2a_merge(self, num_tokens: Any) -> bool:
+        """Whether to merge DCP sparse-MLA partials in-op via all-to-all for `num_tokens`.
+
+        Safe on symbolic dimensions (`torch.SymInt`): never calls `int()` or
+        evaluates relational comparisons on non-`int` symbolic dimensions,
+        preventing TorchDynamo `ShapeEnv` guard specialization
+        (`ConstraintViolationError`).
+        """
+        if not self.sparse_mla_dcp_merges_partials:
+            return False
+        if type(num_tokens) is not int:
+            return True
+        max_tokens = getattr(self, "sparse_mla_dcp_a2a_merge_max_tokens", 0)
+        if max_tokens > 0 and num_tokens > max_tokens:
+            logger.info_once(
+                "TPU_SPARSE_MLA_DCP_A2A_MERGE skipped for %d-token bucket "
+                "(> TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS=%d); using "
+                "in-op head-major psum_scatter merge.",
+                num_tokens,
+                max_tokens,
+            )
+            return False
+        return True
+
     def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int, interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2268,10 +2311,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         stream, so every rank already holds every row and only its write mask
         (owner rank) differs.
 
-        The op returns unmerged partials. Combining them is one log-sum-exp
-        reduction over the DCP group, is done by the torch
-        caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
-        also narrows the head axis back down.
+        The op returns unmerged partials when `sparse_mla_dcp_merges_partials`
+        is False (combined by `cp_mla_attention.merge_lse_partials_scatter_heads`),
+        or merged `[T, H // dcp_size, D]` outputs when `sparse_mla_dcp_merges_partials`
+        is True (using in-op all-to-all for decode `T <= max_tokens` and in-op
+        head-major `psum_scatter` for prefill `T > max_tokens`).
         """
         from vllm_torchtpu.layers.core.attention_interface import (
             sparse_mla_attention_dcp,
@@ -2318,6 +2362,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                merge_partials=self.sparse_mla_dcp_merges_partials,
             )
 
         op_name = (
@@ -2338,10 +2383,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
         ):
             del rest, kwargs
+            num_tokens, num_heads, lkv_dim = ql_nope.shape
+            out_heads = (
+                num_heads // dcp_size
+                if self.sparse_mla_dcp_merges_partials
+                else num_heads
+            )
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
-                torch.empty_like(ql_nope),
+                ql_nope.new_empty((num_tokens, out_heads, lkv_dim)),
                 # LSE: one f32 per (token, head).
                 ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
             )
@@ -2514,7 +2565,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.request_distribution,
                 )
                 # The scatter undoes the head all-gather above.
-                outputs = merge_lse_partials_scatter_heads(partial, lse)
+                if self.sparse_mla_dcp_merges_partials:
+                    outputs = partial
+                else:
+                    outputs = merge_lse_partials_scatter_heads(partial, lse)
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2551,9 +2605,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
-            0, 1
-        )
+        outputs_t = outputs.reshape(
+            -1, layer.num_heads, layer.kv_lora_rank
+        ).transpose(0, 1)
         w_uv = (
             layer.W_UV.to(outputs_t.dtype)
             if layer.W_UV.dtype != outputs_t.dtype

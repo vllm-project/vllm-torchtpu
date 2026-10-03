@@ -13,24 +13,35 @@
 # limitations under the License.
 """Exact unsorted top-k over fp32 score rows on SparseCore.
 
-Hierarchical 2-stage multi-subcore selection:
+Single-stage multi-subcore selection with VMEM_SHARED global histogram:
 1. For any batch size B (including B = 1, 2, 4, 8, 16, 32) and N in 2048..256K,
-   rows are partitioned into P slices (where B * P <= 32) so that all 32
-   subcores
-   on the chip are utilized in parallel with zero inter-subcore synchronization.
-2. In Stage 1, all 32 subcores independently find local top-k candidates on
-their
-   slice in lock-free, single-subcore mode.
-3. In Stage 2, candidate scores are merged on SparseCore to produce the exact
-   global top-k column indices.
+   rows are partitioned into P slices across up to 16 subcores per SparseCore.
+2. When P == 1, all 32 subcores independently find the top-k on their full row
+   in lock-free, single-subcore mode.
+3. When 1 < P <= 16, groups of P subcores on the same SparseCore cooperatively
+   build and refine a global radix histogram in ``VMEM_SHARED`` to find the
+   exact global threshold and emit only the final k winners directly to HBM in a
+   single stage.
+4. When P > 16 (e.g., 1M context where a row exceeds 16 single-subcore slices),
+   Stage 1 finds local top-k candidates per slice and Stage 2 merges them while
+   carrying candidate payloads directly through the kernel without any HBM
+   gather.
 
 Output rows are the top-k column indices in unspecified order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
 or beyond ``row_lengths`` are never selected. NaNs are unsupported.
+
+An optional i32 ``values`` payload, shaped like ``scores``, can be passed to
+return ``values[row, col]`` for each winner instead of ``col``. The kernel emits
+the payload with the same compaction as the index, so callers that would
+otherwise run a post-hoc XLA gather over the result (which is offloaded to
+SparseCore and serialises against these kernels) get it for free.
 """
 
 import functools
+import os
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +59,7 @@ NUM_BUCKETS = 256
 MAX_SLICE_WORDS = 32 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
+DEFAULT_MAX_P = 16
 
 L0_SHIFT = 24
 REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
@@ -68,31 +80,69 @@ def _cdiv_dyn(x):
     return jnp.right_shift(x + (LANES - 1), 4)
 
 
+def _payload_slice_cap(rows: int) -> int:
+    """Largest slice `_sc_topk_direct` can keep resident next to a payload.
+
+    One wave (``rows <= 32``) is single-buffered, so scores plus payload take
+    the same tile memory a double-buffered score slice already does. More waves
+    double-buffer both inputs, so each has to halve to stay within budget.
+    """
+    return MAX_SLICE_WORDS if rows <= 32 else MAX_SLICE_WORDS // 2
+
+
+def _resolve_max_p(max_p: int | None = None) -> int:
+    """Resolves the maximum subcore partition factor P per SparseCore (1..16)."""
+    if max_p is not None:
+        return max(1, min(DEFAULT_MAX_P, int(max_p)))
+    env_val = os.environ.get("TPU_SC_TOPK_MAX_P")
+    if env_val is not None and env_val.strip():
+        return max(1, min(DEFAULT_MAX_P, int(env_val.strip())))
+    return DEFAULT_MAX_P
+
+
 def _topk_body(
-    scores_hbm,  # i32[padded_b, slice_len] (fp32 score bits)
-    lengths_hbm,  # i32[padded_b, LANES]
-    out_hbm,  # i32[padded_b, k]
-    keys_hbm,  # i32[padded_b, k]          (fp32 winner score bits)
-    glob_vmem,  # i32[NUM_BUCKETS + LANES] (histogram, then its prefix sum)
-    rowbuf_vmem,  # i32[k + LANES]          (winner indices for one row)
-    keybuf_vmem,  # i32[k + LANES]          (winner score bits for one row)
+    scores_hbm,  # i32[padded_b * p * slice_len] (fp32 score bits)
+    lengths_hbm,  # i32[padded_b * p * LANES]
+    values_hbm,  # i32[padded_b * p * slice_len] payload, or None to emit indices
+    out_hbm,  # i32[padded_b * k]
+    keys_hbm,  # i32[padded_b * k] | None
+    glob_vmem,
+    rowbuf_vmem,
+    keybuf_vmem,
+    peer_hist_vmem,
+    peer_idx_vmem,
+    peer_key_vmem,
+    shared_hist_vmem,
+    shared_counts_vmem,
+    shared_idx_vmem,
+    shared_key_vmem,
     *,
     b: int,
     n: int,
     k: int,
+    p: int = 1,
     slice_len: int,
     num_waves: int,
     write_empty: bool,
+    return_scores: bool,
 ):
-    # `keys_hbm` is i32[padded_b, k]: the fp32 score bits of each winner, paired
-    # slot for slot with out_hbm, so the caller need not gather the scores back.
-    del write_empty
-
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
     sub = lax.axis_index("subcore")
     flat = core * num_subcores + sub
+
+    groups_per_core = num_subcores // p
+    groups_per_chip = num_sc_cores * groups_per_core
+    if p == num_subcores:
+        group_id = jnp.int32(0)
+        s = sub
+        group_base = jnp.int32(0)
+    else:
+        group_id = jnp.right_shift(sub, int(np.log2(p)))
+        s = jnp.bitwise_and(sub, jnp.int32(p - 1))
+        group_base = group_id * p
+    col_base = s * slice_len
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
     neg_inf_key = jnp.int32(KEY_NEG_INF)
@@ -105,18 +155,7 @@ def _topk_body(
         return jnp.bitwise_xor(bits, m)
 
     def key_window(prefix, shift):
-        """Scalar bounds of the key range ``key >> shift == prefix``.
-
-        Returns ``(lo_excl, hi_incl)`` so that a bucket test is two plain compares
-        against loop-invariant scalars, with no per-element shift:
-
-          ``key >> shift >= prefix``  <=>  ``key > lo_excl``
-          ``key >> shift >  prefix``  <=>  ``key > hi_incl``
-
-        Both bounds are floored at the ``-inf`` sentinel key, so ``key > lo_excl``
-        also rejects ``-inf`` and the poisoned tail lanes. That lets every scan
-        below drop its separate validity test.
-        """
+        """Scalar bounds of the key range ``key >> shift == prefix``."""
         lo = jnp.left_shift(prefix, shift)
         hi = jnp.bitwise_or(lo, jnp.left_shift(jnp.int32(1), shift) - 1)
         return jnp.maximum(lo, neg_inf_key + 1) - 1, jnp.maximum(hi, neg_inf_key)
@@ -129,10 +168,53 @@ def _topk_body(
 
     def hist_add(bucket, mask):
         """Accumulates one chunk's bucket counts into the histogram."""
-        # ``dup`` counts occurrences inclusive of the element itself, so at a
-        # ``last`` position it already holds the chunk's total for that bucket.
         dup, last = plsc.scan_count(bucket, mask=mask)
         plsc.addupdate_scatter(glob_vmem, (bucket,), dup, mask=last)
+
+    def sync_and_reduce_hist(slot: int, active_hist):
+        """Synchronizes per-subcore histograms via VMEM_SHARED and reduces across P slices."""
+        if p == 1:
+            return
+
+        @pl.when(active_hist)
+        def _():
+            dst_off = pl.multiple_of(
+                (slot * num_subcores + sub) * NUM_BUCKETS, LANES
+            )
+            pltpu.sync_copy(
+                glob_vmem.at[pl.ds(0, NUM_BUCKETS)],
+                shared_hist_vmem.at[pl.ds(dst_off, NUM_BUCKETS)],
+            )
+
+        plsc.subcore_barrier()
+
+        @pl.when(active_hist)
+        def _():
+            src_off = pl.multiple_of(
+                (slot * num_subcores + group_base) * NUM_BUCKETS, LANES
+            )
+            pltpu.sync_copy(
+                shared_hist_vmem.at[pl.ds(src_off, p * NUM_BUCKETS)],
+                peer_hist_vmem.at[pl.ds(0, p * NUM_BUCKETS)],
+            )
+
+            def init_hist(i):
+                glob_vmem[pl.ds(i * LANES, LANES)] = peer_hist_vmem[
+                    pl.ds(i * LANES, LANES)
+                ]
+
+            plsc.parallel_loop(0, NUM_BUCKETS // LANES, unroll=8)(init_hist)
+
+            def add_peer(t):
+                def add_chunk(i):
+                    glob_vmem[pl.ds(i * LANES, LANES)] = (
+                        glob_vmem[pl.ds(i * LANES, LANES)]
+                        + peer_hist_vmem[pl.ds(t * NUM_BUCKETS + i * LANES, LANES)]
+                    )
+
+                plsc.parallel_loop(0, NUM_BUCKETS // LANES, unroll=8)(add_chunk)
+
+            plsc.parallel_loop(1, p, unroll=1)(add_peer)
 
     def scan_glob(bound):
         def body(i, carry):
@@ -153,22 +235,33 @@ def _topk_body(
             body
         )  # pytype: disable=bad-argument-type
 
-    def pipeline_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
+    def _run_step(
+        scores_vmem,
+        len_slice_vmem,
+        vals_vmem: Any = None,
+        out_vmem: Any = None,
+        keys_vmem: Any = None,
+    ):
         w = pl.program_id(0)
-        row = w * (num_sc_cores * num_subcores) + flat
+        row = (
+            w * (num_sc_cores * num_subcores) + flat
+            if p == 1
+            else w * groups_per_chip + core * groups_per_core + group_id
+        )
         active = row < b
-        eff_len = jnp.minimum(vec_at(len_slice_vmem, 0), n)
-        eff_len = jnp.where(active, eff_len, 0)
+        row_eff_len = jnp.minimum(vec_at(len_slice_vmem, 0), n)
+        row_eff_len = jnp.where(active, row_eff_len, 0)
 
-        i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
+        if p == 1:
+            i_hi = jnp.where(row_eff_len > 0, jnp.minimum(slice_len, row_eff_len), 0)
+        else:
+            i_hi = jnp.clip(row_eff_len - col_base, 0, slice_len)
         walk_chunks = _cdiv_dyn(i_hi)
 
         zero_hist(NUM_BUCKETS // LANES)
 
         @pl.when(i_hi > 0)
         def _():
-            # Poison the ragged lanes of the final chunk with -inf once, so that no
-            # later scan has to re-test ``j < i_hi``.
             tail = (walk_chunks - 1) * LANES
             scores_vmem[pl.ds(tail, LANES)] = jnp.where(
                 tail + lane_iota < i_hi,
@@ -176,8 +269,6 @@ def _topk_body(
                 jnp.int32(BITS_NEG_INF),
             )
 
-            # Convert to monotone keys in place and histogram the top byte in the
-            # same pass, so the slice is read once instead of twice.
             def hist0_body(i):
                 key = monotone_key(scores_vmem[pl.ds(i * LANES, LANES)])
                 scores_vmem[pl.ds(i * LANES, LANES)] = key
@@ -186,12 +277,16 @@ def _topk_body(
 
             plsc.parallel_loop(0, walk_chunks, unroll=SCAN_UNROLL)(hist0_body)
 
+        sync_and_reduce_hist(0, active)
+
         total = scan_glob(NUM_BUCKETS // LANES)
         keep_all = total <= k
 
         b_star = find_bucket(NUM_BUCKETS // LANES, total - k)
         cum_at = vec_at(glob_vmem, b_star)
-        cum_lo = jnp.where(b_star > 0, vec_at(glob_vmem, jnp.maximum(b_star - 1, 0)), 0)
+        cum_lo = jnp.where(
+            b_star > 0, vec_at(glob_vmem, jnp.maximum(b_star - 1, 0)), 0
+        )
         c_hi = total - cum_at
         cnt = cum_at - cum_lo
         quota = k - c_hi
@@ -200,7 +295,7 @@ def _topk_body(
         shift = jnp.int32(L0_SHIFT)
         done = keep_all | (quota == cnt)
 
-        for lvl_shift, lvl_mask in REFINEMENT_LEVELS:
+        for lvl_idx, (lvl_shift, lvl_mask) in enumerate(REFINEMENT_LEVELS, start=1):
             hist_bound = jnp.where(done, 0, NUM_BUCKETS // LANES)
             zero_hist(hist_bound)
             active_walk = jnp.where(done, 0, walk_chunks)
@@ -222,10 +317,14 @@ def _topk_body(
 
             plsc.parallel_loop(0, active_walk, unroll=SCAN_UNROLL)(ref_body)
 
+            sync_and_reduce_hist(lvl_idx % 2, ~done)
+
             sub_total = scan_glob(hist_bound)
             b2 = find_bucket(hist_bound, sub_total - quota)
             cum_at2 = vec_at(glob_vmem, b2)
-            cum_lo2 = jnp.where(b2 > 0, vec_at(glob_vmem, jnp.maximum(b2 - 1, 0)), 0)
+            cum_lo2 = jnp.where(
+                b2 > 0, vec_at(glob_vmem, jnp.maximum(b2 - 1, 0)), 0
+            )
             c_above2 = sub_total - cum_at2
             cnt2 = cum_at2 - cum_lo2
             quota2 = quota - c_above2
@@ -241,53 +340,86 @@ def _topk_body(
             cnt = jnp.where(done, cnt, cnt2)
             done = new_done
 
-        my_take = jnp.where(keep_all, 0, quota)
-
         def fill_body(i):
             rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
-            # Padding slots must read back as -inf, the same value the
-            # caller used to substitute for a -1 index.
-            keybuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full(
-                (LANES,), BITS_NEG_INF, jnp.int32
-            )
+            if return_scores:
+                keybuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full(
+                    (LANES,), BITS_NEG_INF, jnp.int32
+                )
 
-        fill_bound = jnp.where(total < k, k // LANES, 0)
+        if p == 1:
+            fill_bound = jnp.where(total < k, k // LANES, 0)
+        else:
+            fill_bound = jnp.where((s == 0) & (total < k), k // LANES, 0)
         plsc.parallel_loop(0, fill_bound, unroll=4)(fill_body)
 
-        # The winning set is ``key >> shift >= prefix`` minus however many of the
-        # boundary-bucket ties do not fit in the quota. Ranking those ties costs a
-        # per-chunk cumsum plus a second serial carry, but it is only needed when
-        # the quota splits the bucket -- i.e. when the boundary score is an exact
-        # fp32 duplicate. Whenever the bucket is taken whole (which includes
-        # ``keep_all``) or dropped whole, selection collapses to one compare
-        # against a loop-invariant scalar.
         lo_excl, hi_incl = key_window(prefix, shift)
-        take_all_ties = keep_all | (my_take >= cnt)
-        gate = jnp.where(take_all_ties, lo_excl, hi_incl)
-        whole_bucket = take_all_ties | (my_take <= 0)
+        if p == 1:
+            my_take = jnp.where(keep_all, 0, quota)
+            take_all_ties = keep_all | (my_take >= cnt)
+            gate = jnp.where(take_all_ties, lo_excl, hi_incl)
+            whole_bucket = take_all_ties | (my_take <= 0)
+        else:
+            last_b = jnp.bitwise_and(prefix, jnp.int32(0xFF))
+
+            def tie_body(t, carry):
+                tb, cs = carry
+                c_t = vec_at(peer_hist_vmem, t * NUM_BUCKETS + last_b)
+                return (
+                    jnp.where(t < s, tb + c_t, tb),
+                    jnp.where(t == s, c_t, cs),
+                )
+
+            ties_before, cnt_s = plsc.parallel_loop(
+                0, p, unroll=1, carry=(jnp.int32(0), jnp.int32(0))
+            )(tie_body)
+
+            global_take_all = keep_all | (quota >= cnt)
+            global_drop_all = (~keep_all) & (quota <= 0)
+            my_take = jnp.where(
+                global_take_all,
+                cnt_s,
+                jnp.where(
+                    global_drop_all,
+                    0,
+                    jnp.clip(quota - ties_before, 0, cnt_s),
+                ),
+            )
+            take_all_ties = global_take_all | ((my_take >= cnt_s) & (cnt_s > 0))
+            gate = jnp.where(take_all_ties, lo_excl, hi_incl)
+            whole_bucket = take_all_ties | (my_take <= 0)
+
         emit_chunks = jnp.where(active, walk_chunks, 0)
 
         def emit(i, woff, key, sel):
+            # With a payload, emit it in place of the column index. Its tail
+            # lanes are never selected: the matching keys were poisoned to -inf.
+            if vals_vmem is None:
+                payload = (
+                    i * LANES + lane_iota
+                    if p == 1
+                    else col_base + i * LANES + lane_iota
+                )
+            else:
+                payload = vals_vmem[pl.ds(i * LANES, LANES)]
             plsc.store_compressed(
                 rowbuf_vmem.at[pl.ds(woff, LANES)],
-                i * LANES + lane_iota,
+                payload,
                 mask=sel,
             )
-            # monotone_key is an involution, so this recovers the original
-            # fp32 bits. Same woff and same mask, so the two compactions
-            # stay aligned slot for slot.
-            plsc.store_compressed(
-                keybuf_vmem.at[pl.ds(woff, LANES)],
-                monotone_key(key),
-                mask=sel,
-            )
+            if return_scores:
+                plsc.store_compressed(
+                    keybuf_vmem.at[pl.ds(woff, LANES)],
+                    monotone_key(key),
+                    mask=sel,
+                )
             return woff + plsc.all_reduce_population_count(sel)[0]
 
         def emit_whole(i, woff):
             key = scores_vmem[pl.ds(i * LANES, LANES)]
             return emit(i, woff, key, key > gate)
 
-        plsc.parallel_loop(
+        m_whole = plsc.parallel_loop(
             0,
             jnp.where(whole_bucket, emit_chunks, 0),
             unroll=SCAN_UNROLL,
@@ -299,91 +431,269 @@ def _topk_body(
             key = scores_vmem[pl.ds(i * LANES, LANES)]
             in_set = key > lo_excl
             strict = key > hi_incl
-            # ``strict`` implies ``in_set``, so the difference is the tie mask.
             tie_rank = (
                 plsc.cumsum(in_set.astype(jnp.int32) - strict.astype(jnp.int32)) + rank
             )
             sel = strict | (in_set & (tie_rank <= my_take))
             return emit(i, woff, key, sel), tie_rank[LANES - 1]
 
-        plsc.parallel_loop(
+        m_ranked, _ = plsc.parallel_loop(
             0,
             jnp.where(whole_bucket, 0, emit_chunks),
             unroll=4,
             carry=(jnp.int32(0), jnp.int32(0)),
         )(emit_ranked)
 
-        def copy_out(i):
-            out_vmem[pl.ds(i * LANES, LANES)] = rowbuf_vmem[pl.ds(i * LANES, LANES)]
-            keys_vmem[pl.ds(i * LANES, LANES)] = keybuf_vmem[pl.ds(i * LANES, LANES)]
+        if p == 1:
+            def copy_out(i):
+                out_vmem[pl.ds(i * LANES, LANES)] = rowbuf_vmem[pl.ds(i * LANES, LANES)]
+                if return_scores:
+                    keys_vmem[pl.ds(i * LANES, LANES)] = keybuf_vmem[
+                        pl.ds(i * LANES, LANES)
+                    ]
 
-        plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
+            plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
+        else:
+            m_s = jnp.where(whole_bucket, m_whole, m_ranked)
+            w_slot = jnp.bitwise_and(w, jnp.int32(1))
+            glob_vmem[pl.ds(0, LANES)] = jnp.broadcast_to(m_s, (LANES,))
+
+            @pl.when(active)
+            def _():
+                cnt_off = pl.multiple_of(
+                    (w_slot * num_subcores + sub) * LANES, LANES
+                )
+                pltpu.sync_copy(
+                    glob_vmem.at[pl.ds(0, LANES)],
+                    shared_counts_vmem.at[pl.ds(cnt_off, LANES)],
+                )
+
+            chunks_s = _cdiv_dyn(m_s)
+            aligned_m_s = pl.multiple_of(chunks_s * LANES, LANES)
+
+            @pl.when(active & (s > 0) & (chunks_s > 0))
+            def _():
+                base_off = pl.multiple_of((w_slot * num_subcores + sub) * k, LANES)
+                pltpu.sync_copy(
+                    rowbuf_vmem.at[pl.ds(0, aligned_m_s)],
+                    shared_idx_vmem.at[pl.ds(base_off, aligned_m_s)],
+                )
+                if return_scores:
+                    pltpu.sync_copy(
+                        keybuf_vmem.at[pl.ds(0, aligned_m_s)],
+                        shared_key_vmem.at[pl.ds(base_off, aligned_m_s)],
+                    )
+
+            plsc.subcore_barrier()
+
+            should_write = active & (jnp.bool_(write_empty) | (row_eff_len > 0))
+
+            @pl.when((s == 0) & should_write)
+            def _():
+                grp_cnt_off = pl.multiple_of(
+                    (w_slot * num_subcores + group_base) * LANES, LANES
+                )
+                pltpu.sync_copy(
+                    shared_counts_vmem.at[pl.ds(grp_cnt_off, p * LANES)],
+                    peer_hist_vmem.at[pl.ds(0, p * LANES)],
+                )
+
+                all_true = jnp.ones((LANES,), dtype=jnp.bool_)
+
+                def gather_peer(t, woff):
+                    m_t = vec_at(peer_hist_vmem, t * LANES)
+                    chunks_t = _cdiv_dyn(m_t)
+                    aligned_m_t = pl.multiple_of(chunks_t * LANES, LANES)
+
+                    @pl.when(chunks_t > 0)
+                    def _():
+                        peer_off = pl.multiple_of(
+                            (w_slot * num_subcores + group_base + t) * k, LANES
+                        )
+                        pltpu.sync_copy(
+                            shared_idx_vmem.at[pl.ds(peer_off, aligned_m_t)],
+                            peer_idx_vmem.at[pl.ds(0, aligned_m_t)],
+                        )
+                        if return_scores:
+                            pltpu.sync_copy(
+                                shared_key_vmem.at[pl.ds(peer_off, aligned_m_t)],
+                                peer_key_vmem.at[pl.ds(0, aligned_m_t)],
+                            )
+
+                        full_chunks = jnp.right_shift(m_t, 4)
+
+                        def append_full(c):
+                            plsc.store_compressed(
+                                rowbuf_vmem.at[pl.ds(woff + c * LANES, LANES)],
+                                peer_idx_vmem[pl.ds(c * LANES, LANES)],
+                                mask=all_true,
+                            )
+                            if return_scores:
+                                plsc.store_compressed(
+                                    keybuf_vmem.at[pl.ds(woff + c * LANES, LANES)],
+                                    peer_key_vmem[pl.ds(c * LANES, LANES)],
+                                    mask=all_true,
+                                )
+
+                        plsc.parallel_loop(0, full_chunks, unroll=4)(append_full)
+
+                        tail_rem = jnp.bitwise_and(m_t, jnp.int32(LANES - 1))
+                        tail_sel = lane_iota < tail_rem
+                        tail_off = woff + full_chunks * LANES
+                        plsc.store_compressed(
+                            rowbuf_vmem.at[pl.ds(tail_off, LANES)],
+                            peer_idx_vmem[pl.ds(full_chunks * LANES, LANES)],
+                            mask=tail_sel,
+                        )
+                        if return_scores:
+                            plsc.store_compressed(
+                                keybuf_vmem.at[pl.ds(tail_off, LANES)],
+                                peer_key_vmem[pl.ds(full_chunks * LANES, LANES)],
+                                mask=tail_sel,
+                            )
+
+                    return woff + m_t
+
+                plsc.parallel_loop(
+                    1, p, unroll=1, carry=m_s
+                )(gather_peer)  # pytype: disable=bad-argument-type
+
+                out_off = pl.multiple_of(row * k, LANES)
+                pltpu.sync_copy(
+                    rowbuf_vmem.at[pl.ds(0, k)],
+                    out_hbm.at[pl.ds(out_off, k)],
+                )
+                if return_scores:
+                    pltpu.sync_copy(
+                        keybuf_vmem.at[pl.ds(0, k)],
+                        keys_hbm.at[pl.ds(out_off, k)],
+                    )
 
     cores_per_chip = num_sc_cores * num_subcores
     buf_count = 1 if num_waves == 1 else 2
-    in_specs = (
-        pl.BlockSpec(
-            (slice_len,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-        pl.BlockSpec(
-            (LANES,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
+    slice_spec = pl.BlockSpec(
+        (slice_len,),
+        lambda w: (w * cores_per_chip + flat,),
+        pipeline_mode=pl.Buffered(buf_count),
     )
-    out_specs = (
-        pl.BlockSpec(
+    len_spec = pl.BlockSpec(
+        (LANES,),
+        lambda w: (w * cores_per_chip + flat,),
+        pipeline_mode=pl.Buffered(buf_count),
+    )
+    in_specs = (slice_spec, len_spec)
+    in_refs = (scores_hbm, lengths_hbm)
+    if values_hbm is not None:
+        in_specs += (slice_spec,)
+        in_refs += (values_hbm,)
+
+    if p == 1:
+        out_block_spec = pl.BlockSpec(
             (k,),
             lambda w: (w * cores_per_chip + flat,),
             pipeline_mode=pl.Buffered(buf_count),
-        ),
-        pl.BlockSpec(
-            (k,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-    )
-    pltpu.emit_pipeline(
-        pipeline_step,
-        grid=(num_waves,),
-        in_specs=in_specs,
-        out_specs=out_specs,
-    )(scores_hbm, lengths_hbm, out_hbm, keys_hbm)
+        )
+        if return_scores:
+            def pipeline_step_p1_scores(*blocks):
+                if values_hbm is None:
+                    scores_vmem, len_slice_vmem, out_vmem, keys_vmem = blocks
+                    vals_vmem = None
+                else:
+                    scores_vmem, len_slice_vmem, vals_vmem, out_vmem, keys_vmem = blocks
+                _run_step(scores_vmem, len_slice_vmem, vals_vmem, out_vmem, keys_vmem)
+
+            pltpu.emit_pipeline(
+                pipeline_step_p1_scores,
+                grid=(num_waves,),
+                in_specs=in_specs,
+                out_specs=(out_block_spec, out_block_spec),
+            )(*in_refs, out_hbm, keys_hbm)
+        else:
+            def pipeline_step_p1_idx(*blocks):
+                if values_hbm is None:
+                    scores_vmem, len_slice_vmem, out_vmem = blocks
+                    vals_vmem = None
+                else:
+                    scores_vmem, len_slice_vmem, vals_vmem, out_vmem = blocks
+                _run_step(scores_vmem, len_slice_vmem, vals_vmem, out_vmem, None)
+
+            pltpu.emit_pipeline(
+                pipeline_step_p1_idx,
+                grid=(num_waves,),
+                in_specs=in_specs,
+                out_specs=(out_block_spec,),
+            )(*in_refs, out_hbm)
+    else:
+        def pipeline_step_coop(*blocks):
+            if values_hbm is None:
+                scores_vmem, len_slice_vmem = blocks
+                vals_vmem = None
+            else:
+                scores_vmem, len_slice_vmem, vals_vmem = blocks
+            _run_step(scores_vmem, len_slice_vmem, vals_vmem)
+
+        pltpu.emit_pipeline(
+            pipeline_step_coop,
+            grid=(num_waves,),
+            in_specs=in_specs,
+            out_specs=(),
+        )(*in_refs)
 
 
 def _topk_kernel(
-    scores_hbm,
-    lengths_hbm,
-    out_hbm,
-    keys_hbm,
-    glob_vmem,
-    rowbuf_vmem,
-    keybuf_vmem,
-    *,
+    *refs,
+    has_values: bool,
     b: int,
     n: int,
     k: int,
+    p: int = 1,
     slice_len: int,
     num_waves: int,
     write_empty: bool,
+    return_scores: bool,
 ):
-    """Indices plus each winner's score."""
-    _topk_body(
-        scores_hbm,
-        lengths_hbm,
+    """Indices (or payload values) plus optionally each winner's score."""
+    num_in = 3 if has_values else 2
+    scores_hbm, lengths_hbm = refs[:2]
+    values_hbm = refs[2] if has_values else None
+    (
         out_hbm,
         keys_hbm,
         glob_vmem,
         rowbuf_vmem,
         keybuf_vmem,
+        peer_hist_vmem,
+        peer_idx_vmem,
+        peer_key_vmem,
+        shared_hist_vmem,
+        shared_counts_vmem,
+        shared_idx_vmem,
+        shared_key_vmem,
+    ) = refs[num_in:]
+    _topk_body(
+        scores_hbm,
+        lengths_hbm,
+        values_hbm,
+        out_hbm,
+        keys_hbm,
+        glob_vmem,
+        rowbuf_vmem,
+        keybuf_vmem,
+        peer_hist_vmem,
+        peer_idx_vmem,
+        peer_key_vmem,
+        shared_hist_vmem,
+        shared_counts_vmem,
+        shared_idx_vmem,
+        shared_key_vmem,
         b=b,
         n=n,
         k=k,
+        p=p,
         slice_len=slice_len,
         num_waves=num_waves,
         write_empty=write_empty,
+        return_scores=return_scores,
     )
 
 
@@ -392,16 +702,23 @@ def _sc_topk_direct(
     k: int,
     row_lengths: jax.Array,  # i32[b]
     *,
+    p: int = 1,
+    values: jax.Array | None = None,  # i32[b, n]
     write_empty: bool = True,
+    return_scores: bool = True,
     scheduling_group_id: int | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    """Single-stage lock-free SparseCore top-k on 32 subcores.
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Single-stage SparseCore top-k on 32 subcores.
+
+    When ``p == 1``, each subcore processes a full row independently.
+    When ``p > 1``, groups of ``p`` subcores on the same SparseCore cooperatively
+    process a row using a shared global histogram in ``VMEM_SHARED``.
 
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
 
-    Returns each winner's score as i32 bits, paired slot-for-slot with the
-    returned indices, and the bits of ``-inf`` in the pad slots.
+    If ``values`` is given, the first output holds ``values[row, col]`` for each
+    winner instead of ``col`` (still ``-1`` in pad slots).
     """
     b, n = scores.shape
     info = pltpu.get_tpu_info()
@@ -414,16 +731,38 @@ def _sc_topk_direct(
         if scores.dtype == jnp.int32
         else jax.lax.bitcast_convert_type(scores, jnp.int32)
     )
-    slice_len = _align_to(n, LANES)
-    num_waves = _cdiv(b, 32)
-    padded_b = num_waves * 32
+    groups_per_chip = 32 // p
+    slice_len = _align_to(_cdiv(n, p), LANES)
+    num_waves = _cdiv(b, groups_per_chip)
+    padded_b = num_waves * groups_per_chip
     pad_b = padded_b - b
-    pad_n = slice_len - n
+    pad_n = slice_len * p - n
     if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+        words = jnp.pad(
+            words, ((0, pad_b), (0, pad_n)), constant_values=BITS_NEG_INF
+        )
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    if p > 1:
+        lengths = jnp.repeat(lengths, p)
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+
+    inputs = (words.reshape(-1), lengths_2d.reshape(-1))
+    if values is not None:
+        if values.shape != scores.shape or values.dtype != jnp.int32:
+            raise ValueError(
+                f"values must be i32{list(scores.shape)}, got "
+                f"{values.dtype}{list(values.shape)}"
+            )
+        if slice_len > _payload_slice_cap(b * p):
+            raise ValueError(
+                f"{n=} exceeds the {_payload_slice_cap(b * p)}-word slice that fits "
+                f"alongside a payload at {b=} {p=}"
+            )
+        vals = values
+        if pad_b > 0 or pad_n > 0:
+            vals = jnp.pad(vals, ((0, pad_b), (0, pad_n)), constant_values=-1)
+        inputs += (vals.reshape(-1),)
 
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
@@ -432,23 +771,46 @@ def _sc_topk_direct(
         subcore_axis_name="subcore",
     )
     slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
-    out_type = (slot_type, slot_type)
+    out_type = (slot_type, slot_type if return_scores else None)
 
     scratch_types = (
-        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
-        pltpu.VMEM((k + LANES,), jnp.int32),
-        pltpu.VMEM((k + LANES,), jnp.int32),
+        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf_vmem
+        pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32)
+        if p > 1
+        else None,  # peer_hist_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if p > 1 else None,  # peer_idx_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32)
+        if (p > 1 and return_scores)
+        else None,  # peer_key_vmem
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * NUM_BUCKETS,), jnp.int32)
+        if p > 1
+        else None,  # shared_hist_vmem
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * LANES,), jnp.int32)
+        if p > 1
+        else None,  # shared_counts_vmem
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
+        if p > 1
+        else None,  # shared_idx_vmem
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
+        if (p > 1 and return_scores)
+        else None,  # shared_key_vmem
     )
 
+    suffix = "_v" if values is not None else ""
     out = pl.kernel(
         functools.partial(
             _topk_kernel,
+            has_values=values is not None,
             b=b,
             n=n,
             k=k,
+            p=p,
             slice_len=slice_len,
             num_waves=num_waves,
             write_empty=write_empty,
+            return_scores=return_scores,
         ),
         out_type=out_type,
         compiler_params=pltpu.CompilerParams(
@@ -456,36 +818,105 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}",
-    )(words.reshape(-1), lengths_2d.reshape(-1))
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{suffix}",
+    )(*inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
     slots, keys = out
     slots_2d = slots.reshape(padded_b, k)[:b]
-    keys_2d = keys.reshape(padded_b, k)[:b]
-    return slots_2d, keys_2d
+    if return_scores:
+        assert keys is not None
+        keys_2d = keys.reshape(padded_b, k)[:b]
+        return slots_2d, keys_2d
+    return slots_2d
 
 
-def _pick_partition(b: int, n: int, k: int) -> int:
-    """Picks the power-of-two partition factor P (1..32) per row to maximize
+def _pick_partition(
+    b: int,
+    n: int,
+    k: int,
+    max_slice_words: int = MAX_SLICE_WORDS,
+    max_p: int | None = None,
+) -> int:
+    """Picks the power-of-two partition factor P per row to maximize
 
-    subcore utilization across all 32 subcores while fitting in VMEM.
+    subcore utilization across subcores while fitting in VMEM and VMEM_SHARED.
     """
-    p_min = _cdiv(n, MAX_SLICE_WORDS)
+    p_min = _cdiv(n, max_slice_words)
     p = 1
     while p < p_min:
         p *= 2
 
-    max_p = 32 // b if b < 32 else 1
-    while p * 2 <= max_p:
+    eff_max_p = _resolve_max_p(max_p)
+    subcore_max_p = min(eff_max_p, 32 // b) if b < 32 else 1
+    while p * 2 <= subcore_max_p:
         next_np = n // (p * 2)
-        if next_np >= k and next_np >= LANES and (n % (p * 2)) == 0:
+        if (
+            next_np >= k
+            and next_np >= LANES
+            and (n % (p * 2)) == 0
+            and (next_np % LANES) == 0
+        ):
             p *= 2
         else:
             break
     return p
+
+
+def _select_p(
+    b: int,
+    n: int,
+    k: int = 2048,
+    max_p: int | None = None,
+    max_slice_words: int = MAX_SLICE_WORDS,
+) -> int:
+    """Selects single-stage cooperative VMEM_SHARED partition factor P in {1, 2, 4, 8, 16}."""
+    return min(
+        DEFAULT_MAX_P,
+        _pick_partition(b, n, k, max_slice_words=max_slice_words, max_p=max_p),
+    )
+
+
+def _sc_topk_padded(
+    scores: jax.Array,
+    k: int,
+    row_lengths: jax.Array | None = None,
+    *,
+    values: jax.Array | None = None,
+    write_empty_rows: bool = True,
+    scheduling_group_id: int | None = None,
+    stage2_scheduling_group_id: int | None = None,
+    return_scores: bool = False,
+    max_p: int | None = None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Pads unaligned row width N to a multiple of LANES without post-hoc gathers."""
+    b, n = scores.shape
+    if row_lengths is None:
+        row_lengths = jnp.full((b,), n, jnp.int32)
+    else:
+        row_lengths = jnp.minimum(row_lengths.astype(jnp.int32), n)
+    n_pad = _align_to(n, LANES)
+    pad_n = n_pad - n
+    if pad_n > 0:
+        pad_val = BITS_NEG_INF if scores.dtype == jnp.int32 else -jnp.inf
+        scores = jnp.pad(scores, ((0, 0), (0, pad_n)), constant_values=pad_val)
+        if values is not None:
+            values = jnp.pad(
+                values.astype(jnp.int32), ((0, 0), (0, pad_n)), constant_values=-1
+            )
+    return sparsecore_topk.__wrapped__(
+        scores,
+        k,
+        row_lengths=row_lengths,
+        values=values,
+        write_empty_rows=write_empty_rows,
+        scheduling_group_id=scheduling_group_id,
+        stage2_scheduling_group_id=stage2_scheduling_group_id,
+        return_scores=return_scores,
+        max_p=max_p,
+    )
 
 
 @functools.partial(
@@ -496,6 +927,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "scheduling_group_id",
         "stage2_scheduling_group_id",
         "return_scores",
+        "max_p",
     ),
 )
 def sparsecore_topk(
@@ -503,57 +935,84 @@ def sparsecore_topk(
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
+    values: jax.Array | None = None,  # i32[b, n]
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     stage2_scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    max_p: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
-    """Exact top-k indices per row, unsorted, -1 suffix-padded.
+    """Exact top-k indices (or payload values) per row, unsorted, -1 suffix-padded.
 
-    Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
-    all 32 subcores in parallel without inter-core barrier overhead.
+    When ``1 < p <= 16`` (for ``b < 32`` or ``n > 32K``), subcores on the same
+    SparseCore cooperatively compute a global histogram in ``VMEM_SHARED`` to
+    find the exact global threshold in a single stage without writing intermediate
+    candidates back to HBM.
 
-    On the two-stage path, stage 1 emits each winner's score alongside its index,
-    feeding directly into stage 2 without an intermediate HBM score gather.
+    When ``p > 16`` (e.g. 1M context where a row exceeds 16 single-subcore VMEM
+    slices), stage 1 emits each slice winner's score and payload, feeding directly
+    into stage 2 without an intermediate HBM score or index gather.
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
 
-    ``scheduling_group_id`` and ``stage2_scheduling_group_id`` place each stage
-    in an XLA scheduling group, so each can overlap a different caller's
-    TensorCore work. Stage 2 only exists on the two-stage path.
+    ``values``, if given, is an i32 payload shaped like ``scores``; the result
+    then holds ``values[row, col]`` for each winning ``col`` instead of ``col``,
+    and is still ``-1`` in pad slots. It replaces a post-hoc XLA index gather
+    after the call.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):
         raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
     b, n = scores.shape
-    if n % LANES != 0:
-        raise ValueError(f"{n=} must be a multiple of {LANES}")
     if k % LANES != 0 or not 0 < k <= 4096:
         raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
+    if values is not None:
+        if values.shape != scores.shape:
+            raise ValueError(
+                f"values shape {values.shape} must match scores {scores.shape}"
+            )
+        values = values.astype(jnp.int32)
+
+    if n % LANES != 0:
+        return _sc_topk_padded(
+            scores,
+            k,
+            row_lengths=row_lengths,
+            values=values,
+            write_empty_rows=write_empty_rows,
+            scheduling_group_id=scheduling_group_id,
+            stage2_scheduling_group_id=stage2_scheduling_group_id,
+            return_scores=return_scores,
+            max_p=max_p,
+        )
 
     if row_lengths is None:
         row_lengths = jnp.full((b,), n, jnp.int32)
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
-    p = _pick_partition(b, n, k)
+    p = _pick_partition(b, n, k, max_p=max_p)
+    if values is not None and _cdiv(b * p, 32) > 1:
+        # Multi-wave with a payload: both inputs are double-buffered.
+        p = _pick_partition(b, n, k, _payload_slice_cap(b * p), max_p=max_p)
 
-    # Fast-path: single-stage execution when p == 1
-    if p == 1:
-        slots, keys = _sc_topk_direct(
+    # Single-stage execution via lock-free (p == 1) or cooperative VMEM_SHARED (1 < p <= 16)
+    if p <= DEFAULT_MAX_P:
+        return _sc_topk_direct(
             scores,
             k,
             row_lengths,
+            p=p,
+            values=values,
             write_empty=write_empty_rows,
+            return_scores=return_scores,
             scheduling_group_id=scheduling_group_id,
         )
-        if return_scores:
-            return slots, keys
-        return slots
 
-    # Stage 1: Partition each row into P slices and find local top-k candidates
+    # Wide fallback (p > 16, e.g. 1M context): Stage 1 finds local candidates per slice,
+    # Stage 2 merges them with cand_payload carried in-kernel (zero post-hoc gather).
     n_p = n // p
     k_p = min(k, n_p)
     scores_p = scores.reshape(b * p, n_p)
@@ -561,51 +1020,39 @@ def sparsecore_topk(
     offsets = jnp.arange(p, dtype=jnp.int32) * n_p
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
 
-    local_slots, cand_scores = _sc_topk_direct(
+    local_out, cand_scores = _sc_topk_direct(
         scores_p,
         k_p,
         lengths_p,
+        p=1,
+        values=None if values is None else values.reshape(b * p, n_p),
         write_empty=True,
+        return_scores=True,
         scheduling_group_id=scheduling_group_id,
     )
-    local_indices = local_slots.reshape(b, p, k_p)
     cand_scores = cand_scores.reshape(b, p * k_p)
 
-    # Map local indices to global column indices
-    global_cand_indices = jnp.where(
-        local_indices < 0,
-        -1,
-        offsets[None, :, None] + local_indices,
-    ).reshape(b, p * k_p)
+    if values is None:
+        # Map local indices to global column indices via arithmetic (no gather).
+        local_indices = local_out.reshape(b, p, k_p)
+        cand_payload = jnp.where(
+            local_indices < 0,
+            -1,
+            offsets[None, :, None] + local_indices,
+        ).reshape(b, p * k_p)
+    else:
+        # Stage 1 already emitted the caller's payload for each candidate.
+        cand_payload = local_out.reshape(b, p * k_p)
 
-    # Stage 2: Merge the P * k_p candidates to select the final top-k
     cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
 
-    if p * k_p > MAX_SLICE_WORDS:
-        # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
-        # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
-        final_cand_slots, final_cand_scores = sparsecore_topk(
-            cand_scores,
-            k,
-            row_lengths=cand_lengths,
-            write_empty_rows=write_empty_rows,
-            scheduling_group_id=stage2_scheduling_group_id,
-            return_scores=True,
-        )
-    else:
-        final_cand_slots, final_cand_scores = _sc_topk_direct(
-            cand_scores,
-            k,
-            cand_lengths,
-            write_empty=write_empty_rows,
-            scheduling_group_id=stage2_scheduling_group_id,
-        )
-
-    # Map candidate slots back to original column indices
-    safe_slots = jnp.maximum(final_cand_slots, 0)
-    final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
-    final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
-
-    if return_scores:
-        return final_indices, final_cand_scores
-    return final_indices
+    return sparsecore_topk.__wrapped__(
+        cand_scores,
+        k,
+        row_lengths=cand_lengths,
+        values=cand_payload,
+        write_empty_rows=write_empty_rows,
+        scheduling_group_id=stage2_scheduling_group_id,
+        return_scores=return_scores,
+        max_p=max_p,
+    )

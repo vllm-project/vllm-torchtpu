@@ -10,9 +10,8 @@ Tier 3 (CPU Numerical Parity vs. Physical TPU Execution):
    (NOT A PHYSICAL TPU RUN)]
   Executes PyTorch tensor collectives (`DeviceCommunicatorBase.all_gather` and
   `DeviceCommunicatorBase.reduce_scatter`) across simulated multi-rank DCP groups
-  against AST-extracted functions from
-  `gen4_dcp/src/vllm_torchtpu/layers/adapter/attention.py`
-  and `gen4_dcp/cp_mla_attention.py`.
+  against AST-extracted functions from `src/vllm_torchtpu/layers/adapter/attention.py`
+  and `src/vllm_torchtpu/layers/adapter/cp_mla_attention.py`.
 ================================================================================
 """
 
@@ -30,9 +29,7 @@ try:
 except ModuleNotFoundError:
     _venv_dir = "/usr/local/google/home/jfy/.venvs/torchcpu"
     _venv_py = os.path.join(_venv_dir, "bin", "python3")
-    if os.path.exists(_venv_py) and os.path.abspath(sys.prefix) != os.path.abspath(
-        _venv_dir
-    ):
+    if os.path.exists(_venv_py) and os.path.abspath(sys.prefix) != os.path.abspath(_venv_dir):
         os.execv(_venv_py, [_venv_py, *sys.argv])
     raise
 
@@ -48,7 +45,9 @@ def _find_repo_root(start: str) -> str:
 
 _FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 HERE = _find_repo_root(_FILE_DIR)
-F_ATTN = os.path.join(HERE, "src", "vllm_torchtpu", "layers", "adapter", "attention.py")
+F_ATTN = os.path.join(
+    HERE, "src", "vllm_torchtpu", "layers", "adapter", "attention.py"
+)
 F_CP_MLA = os.path.join(
     HERE, "src", "vllm_torchtpu", "layers", "adapter", "cp_mla_attention.py"
 )
@@ -87,22 +86,18 @@ def _cossim_and_sqnr(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
 
 
 class _InstrumentedDeviceCommunicatorGroup:
-    """Exact replica of
-    `vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase`
+    """Exact replica of `vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase`
     `all_gather` (L229-252) and `reduce_scatter` (L262-294), instrumented to record:
       - `all_gather_post_reshape_copied_bytes`: bytes copied when post-all_gather
         `output_tensor.reshape((world_size,) + input_size).movedim(0, dim).reshape(...)`
         cannot return a zero-copy view of `output_tensor`.
       - `reduce_scatter_pre_movedim_copied_bytes`: bytes copied by
-        `input_tensor = input_.movedim(0, dim).contiguous()`
-        before `reduce_scatter_tensor`.
+        `input_tensor = input_.movedim(0, dim).contiguous()` before `reduce_scatter_tensor`.
       - `reduce_scatter_post_movedim_copied_bytes`: bytes copied by
         `output_tensor.movedim(0, dim).contiguous()` after `reduce_scatter_tensor`.
     """
 
-    def __init__(
-        self, rank: int, world_size: int, peer_buffers: dict[str, list[torch.Tensor]]
-    ):
+    def __init__(self, rank: int, world_size: int, peer_buffers: dict[str, list[torch.Tensor]]):
         self.rank = rank
         self.world_size = world_size
         self.peer_buffers = peer_buffers
@@ -120,9 +115,7 @@ class _InstrumentedDeviceCommunicatorGroup:
         )
         # Simulate dist.all_gather_into_tensor(output_tensor, input_) across ranks:
         # Note: dist.all_gather_into_tensor requires contiguous input_ on TPU/NCCL.
-        assert input_.is_contiguous(), (
-            "dist.all_gather_into_tensor requires contiguous input_"
-        )
+        assert input_.is_contiguous(), "dist.all_gather_into_tensor requires contiguous input_"
         peers = self.peer_buffers.get("ag_inputs")
         if peers is not None:
             torch.cat([p.contiguous() for p in peers], dim=0, out=output_tensor)
@@ -171,7 +164,9 @@ class _InstrumentedDeviceCommunicatorGroup:
             total = sum(p.movedim(0, dim).contiguous() for p in peers)
         else:
             total = input_tensor * world_size
-        output_tensor.copy_(total.narrow(0, self.rank * chunk_size, chunk_size))
+        output_tensor.copy_(
+            total.narrow(0, self.rank * chunk_size, chunk_size)
+        )
 
         out_ptr = output_tensor.data_ptr()
         ret = output_tensor.movedim(0, dim).contiguous()
@@ -188,9 +183,7 @@ def _legacy_all_gather_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
-def _legacy_weight_by_lse(
-    output: torch.Tensor, lse: torch.Tensor, group: Any
-) -> torch.Tensor:
+def _legacy_weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
     lse_f32 = lse.to(torch.float32).contiguous()
     gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
     finite = torch.isfinite(gathered)
@@ -257,9 +250,7 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             self.assertIn(fn_name, ns_attn)
             self.assertIn(fn_name, ns_cp)
 
-    def test_reduce_scatter_dim0_eliminates_movedim_copies_and_preserves_gate7_parity(
-        self,
-    ):
+    def test_reduce_scatter_dim0_eliminates_movedim_copies_and_preserves_gate7_parity(self):
         torch.manual_seed(42)
         world_size = 4
         T = 64
@@ -268,9 +259,13 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
         D = 512
 
         partials = [
-            torch.randn(T, H_dcp, D, dtype=torch.bfloat16) for _ in range(world_size)
+            torch.randn(T, H_dcp, D, dtype=torch.bfloat16)
+            for _ in range(world_size)
         ]
-        lses = [torch.randn(T, H_dcp, dtype=torch.float32) for _ in range(world_size)]
+        lses = [
+            torch.randn(T, H_dcp, dtype=torch.float32)
+            for _ in range(world_size)
+        ]
         # Inject -inf for ranks owning nothing on specific tokens and all-empty token 3
         lses[0][1, :] = float("-inf")
         lses[2][1, :] = float("-inf")
@@ -280,9 +275,8 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
         group_box: list[Any] = [None]
         ns = self._load_fns(F_ATTN, group_box)
 
-        # Precompute weighted tensors across ranks for both legacy (dim=1)
-        # and new (dim=0)
-        lse_peers = [lse_val.unsqueeze(0) for lse_val in lses]
+        # Precompute weighted tensors across ranks for both legacy (dim=1) and new (dim=0)
+        lse_peers = [l.unsqueeze(0) for l in lses]
         legacy_weighted = []
         new_weighted = []
         for r in range(world_size):
@@ -306,8 +300,7 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
                 partials[r], lses[r], g_old
             )
             outputs_t_old = out_old.reshape(-1, H_local, D).transpose(0, 1)
-            # Legacy dim=1 copies full [T, H_dcp, D] f32 before RS and
-            # [T, H_local, D] f32 after RS
+            # Legacy dim=1 copies full [T, H_dcp, D] f32 before RS and [T, H_local, D] f32 after RS
             self.assertEqual(
                 g_old.reduce_scatter_pre_movedim_copied_bytes,
                 T * H_dcp * D * 4,
@@ -325,7 +318,9 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
                 {"ag_inputs": lse_peers, "rs_inputs": new_weighted},
             )
             group_box[0] = g_new
-            out_new = ns["merge_lse_partials_scatter_heads"](partials[r], lses[r])
+            out_new = ns["merge_lse_partials_scatter_heads"](
+                partials[r], lses[r]
+            )
             self.assertEqual(out_new.shape, (T, H_local, D))
             outputs_3d = (
                 out_new
@@ -455,32 +450,26 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
 
     def test_negative_control_misaligned_lse_or_wrong_split_fails(self):
         """Gate 4 Negative Control:
-        1. Permuting rank LSEs in `merge_lse_partials_scatter_heads` must diverge.
-        2. Passing a wrong `kv_lora_rank` split offset to `all_gather_q_nope_pe_heads`
-           must produce wrong tensor shapes.
+          1. Permuting rank LSEs in `merge_lse_partials_scatter_heads` must diverge.
+          2. Passing a wrong `kv_lora_rank` split offset to `all_gather_q_nope_pe_heads`
+             must produce wrong tensor shapes.
         """
         torch.manual_seed(7)
         world_size = 4
         T, H_local, D = 16, 2, 32
         H_dcp = H_local * world_size
-        partials = [
-            torch.randn(T, H_dcp, D, dtype=torch.bfloat16) for _ in range(world_size)
-        ]
-        lses = [
-            torch.randn(T, H_dcp, dtype=torch.float32) * 5.0 for _ in range(world_size)
-        ]
+        partials = [torch.randn(T, H_dcp, D, dtype=torch.bfloat16) for _ in range(world_size)]
+        lses = [torch.randn(T, H_dcp, dtype=torch.float32) * 5.0 for _ in range(world_size)]
 
         group_box: list[Any] = [None]
         ns = self._load_fns(F_ATTN, group_box)
 
-        lse_peers = [lse_val.unsqueeze(0) for lse_val in lses]
+        lse_peers = [l.unsqueeze(0) for l in lses]
         good_weighted = [
             ns["_weight_by_lse"](
                 partials[r],
                 lses[r],
-                _InstrumentedDeviceCommunicatorGroup(
-                    r, world_size, {"ag_inputs": lse_peers}
-                ),
+                _InstrumentedDeviceCommunicatorGroup(r, world_size, {"ag_inputs": lse_peers}),
             )
             for r in range(world_size)
         ]
@@ -489,9 +478,7 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             ns["_weight_by_lse"](
                 partials[r],
                 lses[(r + 1) % world_size],
-                _InstrumentedDeviceCommunicatorGroup(
-                    r, world_size, {"ag_inputs": lse_peers}
-                ),
+                _InstrumentedDeviceCommunicatorGroup(r, world_size, {"ag_inputs": lse_peers}),
             )
             for r in range(world_size)
         ]
@@ -521,17 +508,18 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
         (`len(shape_env.guards) > 0`, Negative Control).
         """
         from torch._dynamo.source import LocalSource
-        from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import (
             DimDynamic,
             ShapeEnv,
         )
+        from torch._subclasses.fake_tensor import FakeTensorMode
 
         tree = ast.parse(_read(F_ATTN), filename=F_ATTN)
         cls_node = next(
             n
             for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "PallasMLAttentionBackendImpl"
+            if isinstance(n, ast.ClassDef)
+            and n.name == "PallasMLAttentionBackendImpl"
         )
         methods = {
             n.name: n
@@ -539,6 +527,7 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             if isinstance(n, ast.FunctionDef)
             and n.name
             in {
+                "_use_sparse_mla_dcp_a2a_merge",
                 "_build_sparse_mla_dcp_op",
                 "forward",
             }
@@ -546,16 +535,32 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
         self.assertEqual(
             set(methods),
             {
+                "_use_sparse_mla_dcp_a2a_merge",
                 "_build_sparse_mla_dcp_op",
                 "forward",
             },
         )
 
+        # Verify AST of `forward` and `_build_sparse_mla_dcp_op` never calls
+        # `_use_sparse_mla_dcp_a2a_merge`
+        for fn_name in ("_build_sparse_mla_dcp_op", "forward"):
+            called = {
+                node.func.attr
+                for node in ast.walk(methods[fn_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+            }
+            self.assertNotIn(
+                "_use_sparse_mla_dcp_a2a_merge",
+                called,
+                f"{fn_name} must not call _use_sparse_mla_dcp_a2a_merge on SymInt shapes",
+            )
+
         group_box: list[Any] = [None]
         ns = self._load_fns(F_ATTN, group_box)
         mod = ast.fix_missing_locations(
             ast.Module(
-                body=[methods["forward"]],
+                body=[methods["_use_sparse_mla_dcp_a2a_merge"], methods["forward"]],
                 type_ignores=[],
             )
         )
@@ -574,12 +579,20 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
 
         class _DummyBackend:
             dcp_size = 4
+            sparse_mla_dcp_merges_partials = True
+            sparse_mla_dcp_a2a_merge_max_tokens = 256
+            _use_sparse_mla_dcp_a2a_merge = ns["_use_sparse_mla_dcp_a2a_merge"]
             forward = ns["forward"]
 
             def _get_kv_scales(self, layer):
                 return (None, None, None)
 
         backend = _DummyBackend()
+        # Concrete int behavior preserved:
+        self.assertTrue(backend._use_sparse_mla_dcp_a2a_merge(16))
+        self.assertTrue(backend._use_sparse_mla_dcp_a2a_merge(256))
+        self.assertFalse(backend._use_sparse_mla_dcp_a2a_merge(257))
+        self.assertFalse(backend._use_sparse_mla_dcp_a2a_merge(2048))
 
         # Symbolic `SymInt` behavior (`s_tok` backed by 16, dynamic):
         shape_env = ShapeEnv()
@@ -589,6 +602,10 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             dynamic_dim=DimDynamic.DYNAMIC,
         )
         self.assertIsInstance(sym_t, torch.SymInt)
+        self.assertEqual(len(shape_env.guards), 0)
+
+        # 1. Calling `_use_sparse_mla_dcp_a2a_merge(sym_t)` adds ZERO guards
+        self.assertTrue(backend._use_sparse_mla_dcp_a2a_merge(sym_t))
         self.assertEqual(len(shape_env.guards), 0)
 
         with FakeTensorMode(shape_env=shape_env, static_shapes=False):
@@ -618,8 +635,13 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
                 @staticmethod
                 def sparse_mla_dcp_op(kv_cache, ql_nope_dcp, *args):
                     t, h, d = ql_nope_dcp.shape
+                    out_h = (
+                        h // backend.dcp_size
+                        if backend.sparse_mla_dcp_merges_partials
+                        else h
+                    )
                     return (
-                        ql_nope_dcp.new_empty((t, h, d)),
+                        ql_nope_dcp.new_empty((t, out_h, d)),
                         ql_nope_dcp.new_empty((t, h), dtype=torch.float32),
                     )
 
@@ -631,8 +653,7 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
 
             guards_before_forward = list(shape_env.guards)
 
-            # 2. Tracing `forward()` with dynamic `sym_t` adds ZERO
-            # specialization guards
+            # 2. Tracing `forward()` with dynamic `sym_t` adds ZERO specialization guards
             out = backend.forward(
                 _FakeLayer(),
                 (fake_q_nope, fake_q_pe),
@@ -649,15 +670,15 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             self.assertEqual(out.shape[1], 4 * 128)
             self.assertIsInstance(out.shape[0], torch.SymInt)
             new_guards = [
-                str(g.expr) for g in shape_env.guards[len(guards_before_forward) :]
+                str(g.expr)
+                for g in shape_env.guards[len(guards_before_forward) :]
             ]
             # Verify no specialization guard (Eq(..., 16) or <= 256) was added!
             for expr_str in new_guards:
                 self.assertNotIn("16", expr_str)
                 self.assertNotIn("256", expr_str)
 
-            # Negative control: legacy `int(sym_t) > 256` immediately specializes
-            # `Eq(s_tok, 16)`!
+            # Negative control: legacy `int(sym_t) > 256` immediately specializes `Eq(s_tok, 16)`!
             _ = int(sym_t) > 256
             all_exprs = [str(g.expr) for g in shape_env.guards]
             self.assertTrue(
@@ -666,8 +687,10 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
             )
 
     def test_dcp_mla_default_env_flags(self):
-        """Verifies that DCP MLA optimization flags default safely in envs.py:
-        - TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER defaults to True
+        """Verifies that DCP MLA optimization flags default cleanly in envs.py:
+        - TPU_SPARSE_MLA_DCP_A2A_MERGE defaults to False
+        - TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS defaults to 256
+        - TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER defaults to True ("1"), and honors "0" override
         """
         import importlib.util
 
@@ -675,9 +698,173 @@ class TestDcpDim0CollectivesZeroMovedimAndGate7Parity(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_dcp_envs", f_envs)
         assert spec is not None and spec.loader is not None
         envs_mod = importlib.util.module_from_spec(spec)
-        os.environ.pop("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", None)
         spec.loader.exec_module(envs_mod)
+        os.environ.pop("TPU_SPARSE_MLA_DCP_A2A_MERGE", None)
+        os.environ.pop("TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS", None)
+        os.environ.pop("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", None)
+        self.assertFalse(envs_mod.TPU_SPARSE_MLA_DCP_A2A_MERGE)
+        self.assertEqual(envs_mod.TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS, 256)
         self.assertTrue(envs_mod.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER)
+        os.environ["TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER"] = "0"
+        try:
+            self.assertFalse(envs_mod.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER)
+        finally:
+            os.environ.pop("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", None)
+
+    def test_jax_psum_scatter_in_op_merge_gate7_parity(self):
+        """Verifies that `_merge_dcp_partials_psum_scatter` in
+        `layers/core/attention_interface.py` produces identical `[T, H // dcp_size, D]`
+        outputs to `_merge_dcp_partials_a2a` across a 4-device JAX CPU mesh
+        (`CosSim >= 0.99999, SQNR >= 45.0 dB`).
+        """
+        import subprocess
+
+        f_ai = os.path.join(
+            HERE, "src", "vllm_torchtpu", "layers", "core", "attention_interface.py"
+        )
+        code = f"""
+import ast, os
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental import shard_map
+from jax.sharding import Mesh, PartitionSpec as P
+
+path = {f_ai!r}
+with open(path) as f:
+    tree = ast.parse(f.read(), filename=path)
+picked = [
+    n for n in tree.body
+    if isinstance(n, ast.FunctionDef)
+    and n.name in {{"_merge_dcp_partials_a2a", "_merge_dcp_partials_psum_scatter"}}
+]
+assert len(picked) == 2, f"Expected 2 merge functions, got {{len(picked)}}"
+ns = {{"jax": jax, "jnp": jnp}}
+exec(compile(ast.fix_missing_locations(ast.Module(body=picked, type_ignores=[])), path, "exec"), ns)
+
+mesh = Mesh(np.array(jax.devices()[:4]), ("dcp",))
+rng = np.random.default_rng(123)
+# Global stacked across 4 DCP ranks: [4 * T, H_dcp, D]
+T, H_dcp, D = 32, 16, 512
+partials_np = rng.standard_normal((4 * T, H_dcp, D)).astype(np.float32)
+lse_np = rng.standard_normal((4 * T, H_dcp)).astype(np.float32)
+# Inject -inf on rank 0 token 1 and all ranks token 5
+lse_np[1, :] = -np.inf
+for r in range(4):
+    lse_np[r * T + 5, :] = -np.inf
+
+partials = jnp.asarray(partials_np, dtype=jnp.bfloat16)
+lse = jnp.asarray(lse_np, dtype=jnp.float32)
+
+run_a2a = jax.jit(shard_map.shard_map(
+    lambda o, l: ns["_merge_dcp_partials_a2a"](o, l, dcp_size=4, axis_name="dcp"),
+    mesh=mesh, in_specs=(P("dcp", None, None), P("dcp", None)), out_specs=P("dcp", None, None), check_rep=False
+))
+run_rs = jax.jit(shard_map.shard_map(
+    lambda o, l: ns["_merge_dcp_partials_psum_scatter"](o, l, dcp_size=4, axis_name="dcp"),
+    mesh=mesh, in_specs=(P("dcp", None, None), P("dcp", None)), out_specs=P("dcp", None, None), check_rep=False
+))
+
+out_a2a = np.asarray(run_a2a(partials, lse), dtype=np.float64).reshape(-1)
+out_rs = np.asarray(run_rs(partials, lse), dtype=np.float64).reshape(-1)
+cossim = float(np.dot(out_a2a, out_rs) / (np.linalg.norm(out_a2a) * np.linalg.norm(out_rs)))
+noise = float(np.sum((out_a2a - out_rs) ** 2))
+sig = float(np.sum(out_a2a ** 2))
+sqnr = float(10.0 * np.log10(sig / noise)) if noise > 0 else float("inf")
+assert cossim >= 0.99999, f"cossim={{cossim}}"
+assert sqnr >= 45.0, f"sqnr={{sqnr}}"
+print(f"JAX_PSUM_SCATTER_PARITY_OK cossim={{cossim:.8f}} sqnr={{sqnr:.2f}}dB")
+"""
+        res = subprocess.run(
+            ["/usr/bin/python3", "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("JAX_PSUM_SCATTER_PARITY_OK", res.stdout)
+
+    def test_bitcast_convert_type_lossless_roundtrip_and_a2a_merge_f64_parity(self):
+        """Proves that:
+        1. jax.lax.bitcast_convert_type(lse, bfloat16) -> (..., float32) round-trips
+           arbitrary float32 LSE values with 0 ULP error (bit-exact uint32).
+        2. _merge_dcp_partials_a2a reduction matches a float64 reference within
+           <= 1 bf16 ULP.
+        """
+        import subprocess
+
+        code = """
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+# 1. Verify 0 ULP bitcast roundtrip (bit-exact uint32)
+rng = np.random.default_rng(2026)
+lse_f32 = rng.standard_normal((128, 32)).astype(np.float32)
+lse_f32[0, 0] = -np.inf
+lse_f32[1, 1] = 1e-30
+lse_f32[2, 2] = 1e30
+lse_f32[3, 3] = -123.456
+
+words = jax.lax.bitcast_convert_type(jnp.asarray(lse_f32), jnp.bfloat16)
+rec = jax.lax.bitcast_convert_type(words, jnp.float32)
+
+u_orig = np.frombuffer(lse_f32.tobytes(), dtype=np.uint32)
+u_rec = np.frombuffer(np.asarray(rec).tobytes(), dtype=np.uint32)
+assert np.array_equal(u_orig, u_rec), "Bitcast roundtrip was not bit-exact!"
+
+# 2. Verify _merge_dcp_partials_a2a matches float64 reference within <= 1 bf16 ULP
+T, dcp_size, local_heads, lkv_dim = 8, 4, 8, 128
+partials_np = rng.standard_normal((T, dcp_size, local_heads, lkv_dim)).astype(np.float32)
+partials_bf16 = jnp.asarray(partials_np, dtype=jnp.bfloat16)
+partials_f64 = np.asarray(partials_bf16, dtype=np.float64)
+
+peer_lse_np = rng.standard_normal((T, dcp_size, local_heads)).astype(np.float32)
+peer_lse_np[0, 0, :] = -np.inf
+peer_lse_f64 = peer_lse_np.astype(np.float64)
+
+# Golden reference in float64
+finite_f64 = np.isfinite(peer_lse_f64)
+shift_f64 = np.max(np.where(finite_f64, peer_lse_f64, -np.inf), axis=1, keepdims=True)
+shift_f64 = np.where(np.isfinite(shift_f64), shift_f64, 0.0)
+weights_f64 = np.where(finite_f64, np.exp(peer_lse_f64 - shift_f64), 0.0)
+denom_f64 = np.sum(weights_f64, axis=1, keepdims=True)
+denom_f64 = np.where(denom_f64 > 0, denom_f64, 1.0)
+w_norm_f64 = weights_f64 / denom_f64
+merged_f64 = np.sum(partials_f64 * w_norm_f64[..., None], axis=1)
+
+# Method under test (w_hi / w_lo Dekker split)
+partials_f32 = partials_bf16.astype(jnp.float32)
+peer_lse_f32 = jnp.asarray(peer_lse_np)
+finite = jnp.isfinite(peer_lse_f32)
+shift = jnp.max(jnp.where(finite, peer_lse_f32, -jnp.inf), axis=1, keepdims=True)
+shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+weights = jnp.where(finite, jnp.exp(peer_lse_f32 - shift), 0.0)
+denom = jnp.sum(weights, axis=1)
+denom = jnp.where(denom > 0, denom, 1.0)
+w = weights / jnp.expand_dims(denom, axis=1)
+w_hi = w.astype(jnp.bfloat16).astype(jnp.float32)
+w_lo = w - w_hi
+merged_split = jnp.sum(partials_f32 * w_hi[..., None], axis=1) + jnp.sum(partials_f32 * w_lo[..., None], axis=1)
+merged_bf16 = merged_split.astype(jnp.bfloat16)
+
+ref_bf16 = jnp.asarray(merged_f64, dtype=jnp.bfloat16)
+u_ref = np.frombuffer(np.asarray(ref_bf16).tobytes(), dtype=np.uint16)
+u_out = np.frombuffer(np.asarray(merged_bf16).tobytes(), dtype=np.uint16)
+ulp_diff = int(np.max(np.abs(u_ref.astype(int) - u_out.astype(int))))
+assert ulp_diff <= 1, f"Expected <= 1 ULP diff, got {ulp_diff}"
+print(f"BITCAST_AND_F64_PARITY_OK max_ulp_diff={ulp_diff}")
+"""
+        res = subprocess.run(
+            ["/usr/bin/python3", "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("BITCAST_AND_F64_PARITY_OK", res.stdout)
 
 
 if __name__ == "__main__":

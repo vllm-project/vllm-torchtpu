@@ -15,14 +15,124 @@
 position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
+import importlib.util
 import math
+import os
+import sys
+import types
+import unittest
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from absl.testing import parameterized
+
+try:
+    import torch
+except ModuleNotFoundError:
+    _venv_dir = "/usr/local/google/home/jfy/.venvs/torchcpu"
+    _venv_py = os.path.join(_venv_dir, "bin", "python3")
+    if os.path.exists(_venv_py) and os.path.abspath(sys.prefix) != os.path.abspath(_venv_dir):
+        os.execv(_venv_py, [_venv_py, *sys.argv])
+    raise
+
+try:
+    from absl.testing import parameterized
+except ModuleNotFoundError:
+
+    class _ParameterizedFallback:
+        TestCase = unittest.TestCase
+
+        @staticmethod
+        def named_parameters(*cases):
+            def _decorator(fn):
+                def _wrapped(self):
+                    for case in cases:
+                        if isinstance(case, dict):
+                            kwargs = {
+                                k: v
+                                for k, v in case.items()
+                                if k != "testcase_name"
+                            }
+                            fn(self, **kwargs)
+                        else:
+                            fn(self, *case[1:])
+
+                return _wrapped
+
+            return _decorator
+
+    parameterized = _ParameterizedFallback()
+
+if importlib.util.find_spec("torch_tpu") is None:
+    if "tpu" not in torch._dynamo.list_backends(None):
+        torch._dynamo.register_backend(
+            name="tpu", compiler_fn=lambda gm, example_inputs: gm
+        )
+    _tt = types.ModuleType("torch_tpu")
+    _tt_int = types.ModuleType("torch_tpu._internal")
+    _tt_pal = types.ModuleType("torch_tpu._internal.pallas")
+    _tt_pal_inner = types.ModuleType("torch_tpu._internal.pallas.pallas")
+    _tt_pal_inner.JAX_TO_TORCH_DTYPE_MAP = {
+        jnp.uint8: torch.uint8,
+        jnp.uint32: torch.int32,
+        jnp.bfloat16: torch.bfloat16,
+        jnp.float32: torch.float32,
+    }
+    _tt_pal.pallas = _tt_pal_inner
+    _tt_int.pallas = _tt_pal
+    _tt._internal = _tt_int
+    sys.modules.setdefault("torch_tpu", _tt)
+    sys.modules.setdefault("torch_tpu._internal", _tt_int)
+    sys.modules.setdefault("torch_tpu._internal.pallas", _tt_pal)
+    sys.modules.setdefault("torch_tpu._internal.pallas.pallas", _tt_pal_inner)
+
+if importlib.util.find_spec("vllm") is None:
+    import logging
+
+    _vllm_mod = types.ModuleType("vllm")
+    _vllm_mod.__path__ = []
+    _vllm_logger_mod = types.ModuleType("vllm.logger")
+    _vllm_utils_mod = types.ModuleType("vllm.utils")
+    _vllm_utils_mod.__path__ = []
+    _vllm_math_mod = types.ModuleType("vllm.utils.math_utils")
+    _vllm_math_mod.cdiv = lambda a, b: (a + b - 1) // b
+    _vllm_torch_mod = types.ModuleType("vllm.utils.torch_utils")
+    _vllm_torch_mod.PIN_MEMORY = False
+    _vllm_dist_mod = types.ModuleType("vllm.distributed")
+    _vllm_dist_mod.__path__ = []
+    _vllm_dist_mod.get_pcp_group = lambda: None
+    _vllm_v1_mod = types.ModuleType("vllm.v1")
+    _vllm_v1_mod.__path__ = []
+    _vllm_v1_attn_mod = types.ModuleType("vllm.v1.attention")
+    _vllm_v1_attn_mod.__path__ = []
+    _vllm_v1_backend_mod = types.ModuleType("vllm.v1.attention.backend")
+    _vllm_v1_backend_mod.AttentionMetadataBuilder = object
+    _vllm_v1_kv_mod = types.ModuleType("vllm.v1.kv_cache_interface")
+    _vllm_v1_kv_mod.MambaSpec = object
+    _vllm_logger_mod.init_logger = logging.getLogger
+    _vllm_mod.logger = _vllm_logger_mod
+    _vllm_mod.utils = _vllm_utils_mod
+    _vllm_mod.distributed = _vllm_dist_mod
+    _vllm_mod.v1 = _vllm_v1_mod
+    sys.modules.setdefault("vllm", _vllm_mod)
+    sys.modules.setdefault("vllm.logger", _vllm_logger_mod)
+    sys.modules.setdefault("vllm.utils", _vllm_utils_mod)
+    sys.modules.setdefault("vllm.utils.math_utils", _vllm_math_mod)
+    sys.modules.setdefault("vllm.utils.torch_utils", _vllm_torch_mod)
+    sys.modules.setdefault("vllm.distributed", _vllm_dist_mod)
+    sys.modules.setdefault("vllm.v1", _vllm_v1_mod)
+    sys.modules.setdefault("vllm.v1.attention", _vllm_v1_attn_mod)
+    sys.modules.setdefault("vllm.v1.attention.backend", _vllm_v1_backend_mod)
+    sys.modules.setdefault("vllm.v1.kv_cache_interface", _vllm_v1_kv_mod)
+    # Prevent vllm_torchtpu/layers/__init__.py from importing full vllm adapter.attention
+    import vllm_torchtpu
+
+    _layers_pkg = types.ModuleType("vllm_torchtpu.layers")
+    _layers_pkg.__path__ = [
+        os.path.join(os.path.dirname(vllm_torchtpu.__file__), "layers")
+    ]
+    sys.modules.setdefault("vllm_torchtpu.layers", _layers_pkg)
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
@@ -154,7 +264,7 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
 
 
 class _HeadGatherGroup:
-    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
+    """Serves `all_gather(dim=0)` on head-major `[H_local, T, D]` slices."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -162,9 +272,12 @@ class _HeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
-        assert dim == 1
-        assert tensor.shape == self._per_rank[self.rank_in_group].shape
-        return torch.cat(list(self._per_rank), dim=1)
+        assert dim == 0
+        expected_hm = self._per_rank[self.rank_in_group].transpose(0, 1)
+        assert tensor.shape == expected_hm.shape
+        return torch.cat(
+            [r.transpose(0, 1).contiguous() for r in self._per_rank], dim=0
+        )
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
@@ -188,10 +301,46 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_coalesced_q_nope_pe_head_gather_matches_separate_head_gathers(
+    rank, monkeypatch
+):
+    """`all_gather_q_nope_pe_heads` (`b/568770670`) must produce bit-identical
+    `(ql_nope_dcp, q_pe_dcp)` to two separate `all_gather_heads` calls in one
+    coalesced `dim=0` collective."""
+    rng = np.random.default_rng(41)
+    ql_nope_ranks = torch.from_numpy(
+        rng.standard_normal((4, 6, 3, 16)).astype(np.float32)
+    )
+    q_pe_ranks = torch.from_numpy(
+        rng.standard_normal((4, 6, 3, 8)).astype(np.float32)
+    )
+    cat_ranks = torch.cat([ql_nope_ranks, q_pe_ranks], dim=-1)
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: _HeadGatherGroup(cat_ranks, rank)
+    )
+    ql_nope_dcp, q_pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+        ql_nope_ranks[rank], q_pe_ranks[rank], 16
+    )
+    assert ql_nope_dcp.shape == (6, 12, 16)
+    assert q_pe_dcp.shape == (6, 12, 8)
+    np.testing.assert_array_equal(
+        ql_nope_dcp[:, rank * 3 : (rank + 1) * 3].numpy(),
+        ql_nope_ranks[rank].numpy(),
+    )
+    np.testing.assert_array_equal(
+        q_pe_dcp[:, rank * 3 : (rank + 1) * 3].numpy(),
+        q_pe_ranks[rank].numpy(),
+    )
+
+
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)
     assert cp_mla.all_gather_heads(q) is q
+    q_pe = torch.ones(2, 3, 2)
+    ql_out, q_pe_out = cp_mla.all_gather_q_nope_pe_heads(q, q_pe, 4)
+    assert ql_out is q and q_pe_out is q_pe
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):

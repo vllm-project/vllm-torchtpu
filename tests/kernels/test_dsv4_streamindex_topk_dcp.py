@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -113,6 +115,29 @@ def _sparse_fixture(num_rows=16, width=128, keep_rate=0.5, seed=20260906):
     return vals
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_build_rank_payload_places_owned_slice_and_neg_one_elsewhere(dcp_size):
+    """`build_rank_payload` places `local_idxs` at `[r*w:(r+1)*w]` and `-1` elsewhere."""
+    num_rows, width = 6, 16
+    rng = np.random.default_rng(20261002 + dcp_size)
+    local_idxs = rng.integers(0, 4096, size=(num_rows, width), dtype=np.int32)
+
+    for r in range(dcp_size):
+        payload = np.asarray(
+            dcp_sc_compact.build_rank_payload(
+                jnp.asarray(local_idxs), dcp_size, jnp.int32(r)
+            )
+        )
+        assert payload.shape == (num_rows, dcp_size * width)
+        for peer in range(dcp_size):
+            col_slice = payload[:, peer * width : (peer + 1) * width]
+            if peer == r:
+                np.testing.assert_array_equal(col_slice, local_idxs)
+            else:
+                assert np.all(col_slice == -1)
+
+
 @pytest.mark.parametrize("num_rows,width", [(16, 128), (1, 16), (33, 256)])
 @pytest.mark.parametrize("keep_rate", [0.1, 0.5, 0.9])
 def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
@@ -195,6 +220,140 @@ def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
 
 
 # ===================================================================== #
+# TPU7x HLO Lowering Verification (2-stage vs single_stage_score_ag).
+# ===================================================================== #
+
+
+@pytest.mark.cpu_test
+def test_dcp_tpu7x_lowering_zero_2d_gather_and_single_stage_score_ag(monkeypatch):
+    """Verify TPU7x HLO lowering of `dcp_sc_compact` and `streamindex_topk_dcp`:
+    1. `dcp_sc_compact` primitives contain 0 `stablehlo.gather` ops.
+    2. `streamindex_topk_dcp` contains 0 2D score/index `stablehlo.gather` ops in
+       both `single_stage_score_ag=False` and `single_stage_score_ag=True`.
+    3. `single_stage_score_ag=True` (explicit or via `TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV`)
+       all-gathers the full `(B, L_local)` score tensor and invokes SparseCore top-k
+       once instead of twice.
+    """
+    ad = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=2, platform="tpu"
+    )
+    mesh1 = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=ad)
+    with jax.sharding.use_abstract_mesh(mesh1):
+        x_spec = jax.ShapeDtypeStruct((8, 2048), jnp.int32)
+        rank_spec = jax.ShapeDtypeStruct((), jnp.int32)
+        hlo_pack = (
+            jax.jit(dcp_sc_compact.pack_nonnegative)
+            .trace(x_spec)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert "stablehlo.gather" not in hlo_pack
+
+        hlo_resolve = (
+            jax.jit(
+                lambda l, s, r: dcp_sc_compact.resolve_owned_winners(
+                    l, s, 2048, r
+                )
+            )
+            .trace(x_spec, x_spec, rank_spec)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert "stablehlo.gather" not in hlo_resolve
+
+        hlo_payload = (
+            jax.jit(lambda l, r: dcp_sc_compact.build_rank_payload(l, 2, r))
+            .trace(x_spec, rank_spec)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert "stablehlo.gather" not in hlo_payload
+
+    dcp_size = 2
+    mesh_dcp = jax.sharding.AbstractMesh(
+        (dcp_size,), (DCP_AXIS_NAME,), abstract_device=ad
+    )
+    q_len, h_idx, d_idx, k = 128, 32, 128, 2048
+    kv_len, page_size, width = 32768, 1024, 256
+    vpages = kv_len // (page_size * dcp_size)
+
+    q_spec = jax.ShapeDtypeStruct((q_len, h_idx, d_idx), jnp.float8_e4m3fn)
+    w_spec = jax.ShapeDtypeStruct((q_len, h_idx), jnp.bfloat16)
+    kc_spec = jax.ShapeDtypeStruct(
+        (dcp_size * vpages, page_size // 4, 4, width),
+        jnp.uint8,
+        sharding=jax.sharding.NamedSharding(mesh_dcp, P(DCP_AXIS_NAME)),
+    )
+    kl_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
+    pt_spec = jax.ShapeDtypeStruct((vpages,), jnp.int32)
+    qsl_spec = jax.ShapeDtypeStruct((2,), jnp.int32)
+    dist_spec = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+    def _lower_dcp(**extra_kw) -> str:
+        with jax.sharding.use_abstract_mesh(mesh_dcp):
+            fn = jax.jit(
+                lambda q, w, kc, kl, pt, qsl, dist: streamindex_topk_dcp(
+                    q,
+                    w,
+                    kc,
+                    kl,
+                    pt,
+                    qsl,
+                    dist,
+                    mesh=mesh_dcp,
+                    k=k,
+                    compression_ratio=1,
+                    dcp_size=dcp_size,
+                    interleave_size=1,
+                    num_kv_pages_per_block=2,
+                    num_queries_per_block=128,
+                    **extra_kw,
+                )
+            )
+            return (
+                fn.trace(
+                    q_spec, w_spec, kc_spec, kl_spec, pt_spec, qsl_spec, dist_spec
+                )
+                .lower(lowering_platforms=("tpu",))
+                .as_text()
+            )
+
+    hlo_two_stage = _lower_dcp(single_stage_score_ag=False)
+    hlo_single_stage = _lower_dcp(single_stage_score_ag=True)
+
+    # Any 2D score/index gather from `take_along_axis` would index a 2D tensor
+    # `tensor<128x...xi32>` or `tensor<128x...xf32>`. Only 1D metadata gathers
+    # on `query_start_loc` (`tensor<2xi32>`) and `k_lens` (`tensor<1xi32>`) are allowed.
+    for mode_name, hlo_text in [
+        ("two_stage", hlo_two_stage),
+        ("single_stage", hlo_single_stage),
+    ]:
+        gather_lines = [
+            line for line in hlo_text.splitlines() if "stablehlo.gather" in line
+        ]
+        for line in gather_lines:
+            assert re.search(r"\(tensor<\d+xi32>,", line), (
+                f"Unexpected non-1D gather in {mode_name}: {line}"
+            )
+
+    # 2-stage all-gathers `(128, 2048) -> (128, 4096)`; 1-stage all-gathers
+    # `(128, 16384) -> (128, 32768)`.
+    assert "(tensor<128x2048xi32>) -> tensor<128x4096xi32>" in hlo_two_stage
+    assert "(tensor<128x16384xi32>) -> tensor<128x32768xi32>" in hlo_single_stage
+
+    # Verify env threshold `TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV`.
+    monkeypatch.setenv("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "32768")
+    streamindex_topk_dcp._clear_cache()
+    hlo_env_enabled = _lower_dcp()
+    assert "(tensor<128x16384xi32>) -> tensor<128x32768xi32>" in hlo_env_enabled
+
+    monkeypatch.setenv("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "16384")
+    streamindex_topk_dcp._clear_cache()
+    hlo_env_disabled = _lower_dcp()
+    assert "(tensor<128x2048xi32>) -> tensor<128x4096xi32>" in hlo_env_disabled
+
+
+# ===================================================================== #
 # End-to-end against the unsharded kernel.
 # ===================================================================== #
 
@@ -265,7 +424,10 @@ def _dcp_case(dcp_size, seed):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
+@pytest.mark.parametrize("single_stage_score_ag", [False, True])
+def test_dcp_reassembles_the_unsharded_global_topk(
+    dcp_size, single_stage_score_ag
+):
     """Union the per-rank lists back together; it must be the global top-k"""
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
@@ -289,9 +451,11 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
     )
 
     # Global leading dim is dcp_size * Q_LEN, rank-major.
-    local_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs)).reshape(
-        dcp_size, Q_LEN, K
-    )
+    local_topk = np.asarray(
+        streamindex_topk_dcp(
+            *args, **kwargs, single_stage_score_ag=single_stage_score_ag
+        )
+    ).reshape(dcp_size, Q_LEN, K)
     assert local_topk.max() < KV_LEN // dcp_size, "a rank got a foreign index"
 
     for t in range(Q_LEN):
