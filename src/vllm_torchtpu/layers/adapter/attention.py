@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
-import vllm_torchtpu.layers.adapter.cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
@@ -67,6 +66,10 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
+from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+    all_gather_heads,
+    merge_lse_partials_scatter_heads,
+)
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -87,105 +90,6 @@ from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
-
-
-def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
-    """Widen a rank's query head slice to the whole DCP group's heads via `dim=0`.
-
-    Running `group.all_gather` on head-major `[H_local, T, D]` along `dim=0`
-    makes `DeviceCommunicatorBase.all_gather`'s post-collective
-    `reshape(...).movedim(0, dim).reshape(...)` a 100% zero-copy view of
-    `dist.all_gather_into_tensor`, eliminating SparseCore `OFFLOAD_DATA_FORMATTING`
-    copies inside `all_gather`. When `q` is a `.transpose(0, 1)` view of
-    `torch.bmm(q_nope_t, w_uk_t)` (`[H_local, T, D]`), `q.transpose(0, 1).contiguous()`
-    is also a zero-copy no-op.
-    """
-    group = _get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return q
-    q_hm = q.transpose(0, 1).contiguous()
-    gathered_hm = group.all_gather(q_hm, dim=0)
-    return gathered_hm.transpose(0, 1).contiguous()
-
-
-def all_gather_q_nope_pe_heads(
-    ql_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    kv_lora_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused head-major `dim=0` all-gather of `(ql_nope, q_pe)` across DCP ranks.
-
-    Eliminates the intermediate contiguous `q_dcp` materialization inside
-    `DeviceCommunicatorBase.all_gather(..., dim=1)` by gathering
-    `[H_local, T, D_nope + D_pe]` along `dim=0` (zero post-collective copy)
-    and slicing/transposing `ql_nope_dcp` and `q_pe_dcp` in a single pass.
-    """
-    group = _get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return ql_nope, q_pe
-    q_cat_hm = torch.cat([ql_nope.transpose(0, 1), q_pe.transpose(0, 1)], dim=-1)
-    q_dcp_hm = group.all_gather(q_cat_hm, dim=0)
-    ql_nope_dcp = q_dcp_hm[..., :kv_lora_rank].transpose(0, 1).contiguous()
-    q_pe_dcp = q_dcp_hm[..., kv_lora_rank:].transpose(0, 1).contiguous()
-    return ql_nope_dcp, q_pe_dcp
-
-
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """This rank's `softmax_r(lse) * o_r` term, materialized once in head-major
-    `f32[num_heads, num_tokens, kv_lora_rank]` for zero-`movedim`
-    `reduce_scatter(dim=0)`.
-    """
-    lse_f32 = (
-        lse
-        if (lse.dtype == torch.float32 and lse.is_contiguous())
-        else lse.to(torch.float32).contiguous()
-    )
-    gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
-    if not isinstance(gathered, torch.Tensor):
-        gathered = torch.cat(list(gathered), dim=0)
-
-    finite = torch.isfinite(gathered)
-    shift = torch.where(finite, gathered, -float("inf")).amax(dim=0)
-    empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, 0.0, shift)
-
-    weights = torch.where(finite, torch.exp(gathered - shift.unsqueeze(0)), 0.0)
-    denom = weights.sum(dim=0)
-    safe_denom = torch.where(denom > 0, denom, 1.0)
-
-    mine = (
-        torch.where(
-            torch.isfinite(lse_f32),
-            torch.exp(lse_f32 - shift),
-            0.0,
-        )
-        / safe_denom
-    )
-    output_hm = output.transpose(0, 1)
-    mine_hm = mine.transpose(0, 1).unsqueeze(-1)
-    return (output_hm.to(torch.float32) * mine_hm).contiguous()
-
-
-def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor
-) -> torch.Tensor:
-    """Combine this rank's partial attention output with its peers' via `dim=0`
-    head-major `reduce_scatter`, eliminating `DeviceCommunicatorBase.reduce_scatter`
-    `movedim(0, 1).contiguous()` copies.
-    """
-    group = _get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return output
-
-    weighted_hm = _weight_by_lse(output, lse, group)
-    scattered_hm = group.reduce_scatter(weighted_hm, dim=0).to(output.dtype)
-    return scattered_hm.transpose(0, 1)
-
-
-_cp_mla_attention.all_gather_heads = all_gather_heads
-_cp_mla_attention._weight_by_lse = _weight_by_lse
-_cp_mla_attention.merge_lse_partials_scatter_heads = merge_lse_partials_scatter_heads
-_cp_mla_attention.all_gather_q_nope_pe_heads = all_gather_q_nope_pe_heads
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -1999,21 +1903,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
-
-        if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
-            logger.info_once(
-                "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
-                "all-gather of concatenated (q_nope, q_pe) whenever q is "
-                "not replicated and both share a dtype (dcp=%d).",
-                self.dcp_size,
-            )
         if self.dcp_size > 1:
-            logger.info_once(
-                "Applied TPU patch: DCP MLA head-major dim=0 collectives "
-                "(all_gather_heads / merge_lse_partials_scatter_heads "
-                "zero-movedim layout, dcp=%d).",
-                self.dcp_size,
-            )
             # The indexer refuses pcp>1 and dcp>1 together (see
             # `VllmTPUSparseAttnIndexer.__init__`)
             pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
@@ -2448,11 +2338,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         ql_nope = torch.bmm(q_nope_t, w_uk_t)
         if w_uk_t_scale is not None:
             ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = (
-            ql_nope.to(input_dtype).transpose(0, 1)
-            if ql_nope.dtype != input_dtype
-            else ql_nope.transpose(0, 1)
-        )
+        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2486,18 +2372,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # KV shard, and the head axis is scattered back after the
                 # merge. Under qrep the group's heads are already local, so
                 # the gather is the identity and is skipped outright.
-                if use_qrep:
-                    ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
-                elif (
-                    envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
-                    and ql_nope_flat.dtype == q_pe_flat.dtype
-                ):
-                    ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
-                        ql_nope_flat, q_pe_flat, layer.kv_lora_rank
-                    )
-                else:
-                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
-                    q_pe_dcp = all_gather_heads(q_pe_flat)
+                ql_nope_dcp = (
+                    ql_nope_flat if use_qrep else all_gather_heads(ql_nope_flat)
+                )
+                q_pe_dcp = q_pe_flat if use_qrep else all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
