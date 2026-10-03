@@ -175,6 +175,8 @@ def pipelined_fused_moe_gmm(
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
+            # parallel_size > 1 only when collective_group is set.
+            assert collective_group is not None
             ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
                 collective_group.all_gather(topk_weights, dim=0)
@@ -209,10 +211,12 @@ def pipelined_fused_moe_gmm(
         )
 
         if parallel_size > 1:
+            assert collective_group is not None
             return collective_group.reduce_scatter(out, dim=0)
         return out
 
     _log_active_chunk_pipeline()
+    assert collective_group is not None
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
@@ -252,17 +256,21 @@ def pipelined_fused_moe_gmm(
     rs_outputs = []
 
     for i in range(num_chunks):
+        ag_hs_next = ag_tw_next = ag_ti_next = None
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            # Locals let the None checks below narrow; subscripts do not.
+            weights_next = weights_slices[i + 1]
             ag_tw_next = (
-                collective_group.all_gather(weights_slices[i + 1], dim=0)
-                if weights_slices[i + 1] is not None
+                collective_group.all_gather(weights_next, dim=0)
+                if weights_next is not None
                 else None
             )
+            ids_next = ids_slices[i + 1]
             ag_ti_next = (
-                collective_group.all_gather(ids_slices[i + 1], dim=0)
-                if ids_slices[i + 1] is not None
+                collective_group.all_gather(ids_next, dim=0)
+                if ids_next is not None
                 else None
             )
 
@@ -289,6 +297,7 @@ def pipelined_fused_moe_gmm(
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:
+            assert ag_hs_next is not None
             ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
 
     return torch.cat(rs_outputs, dim=0)

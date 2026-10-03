@@ -1,5 +1,6 @@
 import math
 import zlib
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -27,6 +28,9 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
 )
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
 from vllm_torchtpu.utils import synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
 def _fresh(t: torch.Tensor) -> torch.Tensor:
@@ -65,7 +69,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         scratch = getattr(parameter, "_cpu_scratch", None)
         return parameter.data if scratch is None else scratch.data
 
-    def _initialize_dummy_quantized_weights(self, layer: RoutedExperts) -> None:
+    def _initialize_dummy_quantized_weights(self, layer: "TpuRoutedExperts") -> None:
         """Use finite, nonzero random FP4 weights for meaningful dummy runs.
 
         The upstream dummy loader skips integer checkpoint containers. Encode
@@ -115,7 +119,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         # Inject our optimized TPU CPU weight loader hook
         extra_weight_attrs["weight_loader"] = get_cpu_weight_loader_hook(
-            layer,
+            cast("RoutedExperts", layer),
             orig_loader,
             self.moe.tp_size,
             self.moe.tp_rank,
@@ -131,7 +135,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             **extra_weight_attrs,
         )
 
-    def _neutralize_padded_scales(self, layer: RoutedExperts) -> None:
+    def _neutralize_padded_scales(self, layer: "TpuRoutedExperts") -> None:
         """Make unloaded E8M0 padding finite without initializing full buffers.
 
         The checkpoint loader only writes the logical intermediate width into
@@ -143,6 +147,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         large models.
         """
         unpadded_size = self.moe.intermediate_size_per_partition_unpadded
+        assert unpadded_size is not None
         padded_size = self.moe.intermediate_size_per_partition
         if unpadded_size >= padded_size:
             return
@@ -160,6 +165,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
 
         self._initialize_dummy_quantized_weights(layer)
         self._neutralize_padded_scales(layer)
@@ -293,6 +299,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         SP callers gather the small top-k tensors instead of full logits.
         Rows here are in the same global token order as ``x``.
         """
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"

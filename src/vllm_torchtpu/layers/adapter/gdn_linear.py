@@ -26,6 +26,9 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
     Parameter creation, quantization and forward remain in the parent layer.
     """
 
+    # Registered by the parent layer; declared here for the type checker.
+    weight: torch.nn.Parameter
+
     def __init__(
         self,
         *,
