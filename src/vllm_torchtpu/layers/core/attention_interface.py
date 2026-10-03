@@ -1082,6 +1082,7 @@ def _merge_dcp_partials_psum_scatter(
     *,
     dcp_size: int,
     axis_name: str,
+    reduce_scatter_bf16: bool | None = None,
 ) -> jax.Array:
     """Merge DCP partial outputs across `axis_name` via head-major `psum_scatter`.
 
@@ -1090,8 +1091,14 @@ def _merge_dcp_partials_psum_scatter(
     `[num_tokens, num_heads // dcp_size, lkv_dim]` (preserving PyTorch's static
     `jax_op` output shape across all dynamic `SymInt` token counts) without
     allocating the `1.07 GiB/layer` (`T=4096`) `all_to_all` transpose buffer.
+    Under `reduce_scatter_bf16=True` (b/568555797), psum_scatter reduces in
+    `output.dtype` (bfloat16) rather than f32, halving communication volume for
+    a 2x collective speedup.
     """
     del dcp_size
+    if reduce_scatter_bf16 is None:
+        reduce_scatter_bf16 = getattr(envs, "TPU_DCP_REDUCE_SCATTER_BF16", True)
+
     lse_f32 = lse.astype(jnp.float32)
     gathered = jax.lax.all_gather(lse_f32, axis_name, axis=0, tiled=False)
     finite = jnp.isfinite(gathered)
@@ -1111,6 +1118,8 @@ def _merge_dcp_partials_psum_scatter(
     output_hm = jnp.swapaxes(output, 0, 1)
     mine_hm = jnp.swapaxes(mine, 0, 1)[..., None]
     weighted_hm = output_hm.astype(jnp.float32) * mine_hm
+    if reduce_scatter_bf16:
+        weighted_hm = weighted_hm.astype(output.dtype)
     scattered_hm = jax.lax.psum_scatter(
         weighted_hm, axis_name, scatter_dimension=0, tiled=True
     )

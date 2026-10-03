@@ -40,6 +40,7 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 
 
@@ -99,7 +100,10 @@ def all_gather_q_nope_pe_heads(
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    reduce_scatter_bf16: bool | None = None,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -117,6 +121,9 @@ def merge_lse_partials_scatter_heads(
          and the returned `.transpose(0, 1)` view unwraps back to contiguous
          `[tp_local_num_heads, num_tokens, kv_lora_rank]` for the downstream
          `torch.bmm(outputs_t, w_uv)` projection.
+         Under `reduce_scatter_bf16=True` (b/568555797), the weighted outputs
+         are reduced in `output.dtype` (bfloat16) rather than f32, halving the
+         reduce-scatter payload for a 2x collective speedup.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
@@ -125,6 +132,8 @@ def merge_lse_partials_scatter_heads(
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
+      reduce_scatter_bf16: Whether to reduce-scatter in output.dtype (bf16) rather
+        than f32. Defaults to envs.TPU_DCP_REDUCE_SCATTER_BF16 (True).
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -135,15 +144,26 @@ def merge_lse_partials_scatter_heads(
     if group is None or int(group.world_size) == 1:
         return output
 
-    weighted_hm = _weight_by_lse(output, lse, group)
+    if reduce_scatter_bf16 is None:
+        reduce_scatter_bf16 = getattr(envs, "TPU_DCP_REDUCE_SCATTER_BF16", True)
+
+    weighted_hm = _weight_by_lse(
+        output, lse, group, reduce_scatter_bf16=reduce_scatter_bf16
+    )
     scattered_hm = group.reduce_scatter(weighted_hm, dim=0).to(output.dtype)
     return scattered_hm.transpose(0, 1)
 
 
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
+def _weight_by_lse(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    *,
+    reduce_scatter_bf16: bool = False,
+) -> torch.Tensor:
     """This rank's `softmax_r(lse) * o_r` term, materialized once in head-major
-    `f32[num_heads, num_tokens, kv_lora_rank]` for zero-`movedim`
-    `reduce_scatter(dim=0)`.
+    `[num_heads, num_tokens, kv_lora_rank]` for zero-`movedim` `reduce_scatter(dim=0)`.
+    Under `reduce_scatter_bf16=True`, returns `output.dtype` directly (b/568555797).
     """
     lse_f32 = (
         lse
@@ -182,4 +202,7 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     # so the f32 product is materialized once in head-major `[H, T, D]` layout.
     output_hm = output.transpose(0, 1)
     mine_hm = mine.transpose(0, 1).unsqueeze(-1)
-    return (output_hm.to(torch.float32) * mine_hm).contiguous()
+    weighted = output_hm.to(torch.float32) * mine_hm
+    if reduce_scatter_bf16:
+        return weighted.to(output.dtype).contiguous()
+    return weighted.contiguous()

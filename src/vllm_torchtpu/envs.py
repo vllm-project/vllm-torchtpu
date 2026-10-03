@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: int = 256
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_DCP_QSHARD_MERGE: bool = True
+    TPU_DCP_REDUCE_SCATTER_BF16: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -706,6 +707,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SparseCore gather window to only active winners on rank r for T >= 1024.
     "TPU_SPARSE_MLA_DCP_QSHARD_MERGE": env_bool(
         "TPU_SPARSE_MLA_DCP_QSHARD_MERGE", default=True
+    ),
+    # b/568555797: Reduce-Scatter of LSE adjusted attention output in bf16 rather than f32.
+    "TPU_DCP_REDUCE_SCATTER_BF16": env_bool(
+        "TPU_DCP_REDUCE_SCATTER_BF16", default=True
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

@@ -154,8 +154,9 @@ class _FakeGroup:
     def __init__(self, outputs, lses, rank):
         self.world_size = len(lses)
         self.rank_in_group = rank
-        self._outputs = outputs  # [D, T, N, V] f32
-        self._lses = lses  # [D, T, N] f32
+        self._outputs = outputs  # [D, T, N, V]
+        self._lses = lses  # [D, T, N]
+        self.last_reduce_scatter_dtype = None
 
     def all_gather(self, tensor, dim=0):
         assert dim == 0 and tensor.shape[0] == 1
@@ -165,28 +166,43 @@ class _FakeGroup:
         total = None
         for rank in range(self.world_size):
             peer = _FakeGroup(self._outputs, self._lses, rank)
-            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank], peer)
+            term = cp_mla._weight_by_lse(
+                self._outputs[rank],
+                self._lses[rank],
+                peer,
+                reduce_scatter_bf16=(dtype == torch.bfloat16),
+            )
             total = term if total is None else total + term
         return total.to(dtype)
 
     def reduce_scatter(self, tensor, dim=-1):
+        self.last_reduce_scatter_dtype = tensor.dtype
         total = self._reduced(tensor.dtype)
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width)
 
 
-def _merge_as_rank(outputs, lses, rank, monkeypatch):
+def _merge_as_rank(
+    outputs, lses, rank, monkeypatch, reduce_scatter_bf16=None, return_group=False
+):
     """The merge as rank `r` sees it: its own head block of the whole answer"""
     group = _FakeGroup(outputs, lses, rank)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
-    return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+    res = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[rank], lses[rank], reduce_scatter_bf16=reduce_scatter_bf16
+    )
+    if return_group:
+        return res, group
+    return res
 
 
-def _merge_whole(outputs, lses, monkeypatch):
+def _merge_whole(outputs, lses, monkeypatch, reduce_scatter_bf16=None):
     """The full merged tensor, reassembled from every rank's scatter block"""
     return torch.cat(
         [
-            _merge_as_rank(outputs, lses, rank, monkeypatch)
+            _merge_as_rank(
+                outputs, lses, rank, monkeypatch, reduce_scatter_bf16=reduce_scatter_bf16
+            )
             for rank in range(outputs.shape[0])
         ],
         dim=1,
@@ -261,6 +277,64 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
     assert np.isfinite(got).all()
     np.testing.assert_array_equal(got[7], np.zeros_like(got[7]))
+
+
+def test_merge_lse_partials_scatter_heads_bf16_gate7(monkeypatch):
+    """b/568555797: Test DCP reduce-scatter in bf16 and verify Gate 7 accuracy."""
+    rng = np.random.default_rng(20261003)
+    dcp_size = 4
+    tokens = 16
+    local_heads = 4
+    vdim = 64
+    heads = dcp_size * local_heads
+
+    outputs_f32 = torch.from_numpy(
+        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
+    )
+    outputs_bf16 = outputs_f32.bfloat16()
+    lses = torch.from_numpy(
+        (rng.standard_normal((dcp_size, tokens, heads)) * 4).astype(np.float32)
+    )
+
+    # 1. Positive control: reduce_scatter_bf16=True (default via envs)
+    # Check that reduce_scatter receives bf16 payload (halving network traffic)
+    out_rank0, group0 = _merge_as_rank(
+        outputs_bf16, lses, 0, monkeypatch, reduce_scatter_bf16=True, return_group=True
+    )
+    assert group0.last_reduce_scatter_dtype == torch.bfloat16
+    assert out_rank0.dtype == torch.bfloat16
+
+    got_bf16 = _merge_whole(
+        outputs_bf16, lses, monkeypatch, reduce_scatter_bf16=True
+    )
+    assert got_bf16.dtype == torch.bfloat16
+
+    # Verify Gate 7 accuracy against f64 reference
+    ref = _reference_merge(outputs_f32, lses)
+    ref_t = torch.from_numpy(ref).double().view(-1)
+    got_t = got_bf16.double().view(-1)
+
+    cossim = torch.nn.functional.cosine_similarity(
+        ref_t.unsqueeze(0), got_t.unsqueeze(0)
+    ).item()
+    sig_pow = torch.mean(ref_t ** 2)
+    err_pow = torch.mean((ref_t - got_t) ** 2)
+    sqnr = (10.0 * torch.log10(sig_pow / err_pow)).item()
+
+    print(f"BF16 Reduce-Scatter CosSim: {cossim:.6f}, SQNR: {sqnr:.2f} dB")
+    assert cossim >= 0.99999, f"CosSim {cossim:.6f} < 0.99999"
+    assert sqnr >= 45.0, f"SQNR {sqnr:.2f} < 45.0 dB"
+
+    # 2. Negative control: reduce_scatter_bf16=False
+    # When disabled, intermediate reduction is in f32 before casting to output.dtype
+    out_rank0_f32, group0_f32 = _merge_as_rank(
+        outputs_bf16, lses, 0, monkeypatch, reduce_scatter_bf16=False, return_group=True
+    )
+    assert group0_f32.last_reduce_scatter_dtype == torch.float32
+    assert out_rank0_f32.dtype == torch.bfloat16
+
+    print("DCP_RS_BF16_PASS")
+    print("GATE7_PASS")
 
 
 class _HeadGatherGroup:
