@@ -19,11 +19,18 @@ device communicator then hands a 2-D bf16 block of at most ``MAX_ROWS`` rows
 (an all-reduce) or ``COMBINE_MAX_ROWS`` rows per engine (a DP combine) to a
 kernel and anything else to vLLM's collective.
 
-The choice reads the token count, so it is taken only in a trace that the
-backbone warmup forks per token bucket (``compilation.shape_variants``). Any
-other trace -- the MTP drafter, eager mode, the profiling run -- keeps vLLM's
-collective. Both sides of the fork lift the same rank buffer, as the warmup
-requires to hand a bucket's executable from one trace to the other.
+The choice reads the token count, so in torch it is taken only in a trace that
+the backbone warmup forks per token bucket (``compilation.shape_variants``).
+Both sides of the fork lift the same rank buffer, as the warmup requires to
+hand a bucket's executable from one trace to the other.
+
+A trace compiled outside that warmup -- the MTP drafter's step-0 and loop-step
+programs -- cannot fork: vLLM compiles its one FX graph for every bucket, and a
+token-count branch would freeze at the bucket traced first. With
+TPU_SMALL_ALL_REDUCE_DRAFT those traces call a second op that takes the choice
+inside JAX instead, where each bucket is exported at its concrete shape: the
+kernel up to the row cap, XLA's all-reduce (``psum``) above it. Without the
+flag, and in eager mode, they keep vLLM's collective.
 """
 
 import jax
@@ -56,13 +63,15 @@ MAX_ROWS = 96
 COMBINE_MAX_ROWS = 24
 
 
-
 def max_rows() -> int:
     """The all-reduce row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else MAX_ROWS."""
     return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
 
 
 _AR_OP = None
+# The all-reduce for traces outside the backbone warmup: the row choice is
+# made per exported bucket inside JAX (TPU_SMALL_ALL_REDUCE_DRAFT).
+_AR_SIZED_OP = None
 _RS_OP = None
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
@@ -73,11 +82,17 @@ _MESH_RANKS: tuple[int, ...] = ()
 _DP_COMBINE = False
 
 
-def _build_all_reduce(mesh):
+def _build_all_reduce(mesh, psum_above: int | None = None):
+    """The all-reduce op over ``mesh``. With ``psum_above``, a block of more
+    rows than that is summed by XLA's all-reduce instead of the kernel: the
+    block's rows are concrete when JAX exports each bucket, so the choice
+    leaves no guard on the caller's trace."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, rank):
+        if psum_above is not None and block.shape[0] > psum_above:
+            return jax.lax.psum(block, EP_AXIS_NAME)
         return all_reduce.small_all_reduce(
             block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
         )
@@ -91,7 +106,9 @@ def _build_all_reduce(mesh):
         return torch.empty_like(x)
 
     return sharded_jax_op(
-        "pallas::small_all_reduce",
+        "pallas::small_all_reduce"
+        if psum_above is None
+        else "pallas::small_all_reduce_or_psum",
         fn,
         mesh=mesh,
         input_partition_specs=(spec, spec),
@@ -130,7 +147,7 @@ def _build_reduce_scatter(mesh):
 def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
-    global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
+    global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -146,6 +163,8 @@ def prebuild() -> None:
     _MESH_RANKS = tuple(int(r) for r in get_ep_group().ranks)
     _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
     _AR_OP = _build_all_reduce(mesh)
+    if envs.TPU_SMALL_ALL_REDUCE_DRAFT:
+        _AR_SIZED_OP = _build_all_reduce(mesh, psum_above=max_rows())
     _RS_OP = _build_reduce_scatter(mesh)
     # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
     # is the mesh, DP rank r's rows go to mesh core r.
@@ -154,23 +173,24 @@ def prebuild() -> None:
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | "
-        "backbone warmup traces only; the MTP drafter and eager steps keep "
-        "vLLM's collectives",
+        "dp_combine=%s | outside_warmup=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
         all_reduce.ONE_SHOT_MAX_BYTES,
         tp_all_reduce,
         _DP_COMBINE,
+        "kernel to max_rows, psum above (MTP drafter)"
+        if _AR_SIZED_OP is not None
+        else "vLLM's collectives (MTP drafter, eager)",
     )
 
 
-def _fits(x: torch.Tensor, width_multiple: int) -> bool:
+def _fits(x: torch.Tensor, width_multiple: int, in_warmup: bool = True) -> bool:
     """Static checks: whether this call site can take a kernel at all."""
     return (
         torch.compiler.is_compiling()
-        and shape_variants.in_warmup()
+        and shape_variants.in_warmup() == in_warmup
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.shape[1] % width_multiple == 0
@@ -193,6 +213,9 @@ def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     when the group is the mesh, ``fallback(x)`` otherwise."""
     if _AR_OP is None or tuple(ranks) != _MESH_RANKS:
         return fallback(x)
+    if _AR_SIZED_OP is not None and _fits(x, _CORES * LANES, in_warmup=False):
+        # A trace outside the warmup: the op picks kernel or psum per bucket.
+        return _AR_SIZED_OP(x, _RANK)
     if not _fits(x, _CORES * LANES):
         return fallback(x)
     if x.shape[0] <= max_rows():

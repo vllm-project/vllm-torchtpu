@@ -168,6 +168,106 @@ def test_traces_outside_the_backbone_warmup_keep_the_collective(
     rs.assert_not_called()
 
 
+@pytest.fixture
+def sized(armed, monkeypatch):
+    """TPU_SMALL_ALL_REDUCE_DRAFT: the per-bucket op is built as well."""
+    sized_op = Mock(name="all_reduce_sized_op")
+    monkeypatch.setattr(op, "_AR_SIZED_OP", sized_op)
+    return sized_op
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32, 64, 4096])
+def test_draft_traces_take_the_sized_op_at_every_row_count(
+    armed, sized, monkeypatch, rows
+):
+    """Outside the warmup the op itself picks kernel or psum per exported
+    bucket, so the torch side reads no token count and leaves no guard."""
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    ar, _ = armed
+    fallback = Mock()
+    x = _block(rows)
+    assert op.all_reduce_or(x, MESH, fallback) is sized.return_value
+    (block, rank), _ = sized.call_args
+    assert block is x and rank is op._RANK
+    ar.assert_not_called()
+    fallback.assert_not_called()
+
+
+def test_draft_flag_leaves_the_backbone_warmup_path_alone(armed, sized):
+    ar, _ = armed
+    op.all_reduce_or(_block(16), MESH, _fallback)
+    assert ar.called
+    sized.assert_not_called()
+    out = op.all_reduce_or(x := _block(op.MAX_ROWS + 1), MESH, _fallback)
+    torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
+    sized.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "x,ranks",
+    [
+        (_block(8, dtype=torch.float32), MESH),
+        (_block(8, hidden=HIDDEN + 128), MESH),
+        (_block(8), (0, 1, 2, 3)),
+    ],
+    ids=["fp32", "width", "group"],
+)
+def test_draft_ineligible_blocks_keep_the_collective(
+    armed, sized, monkeypatch, x, ranks
+):
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    fallback = Mock(return_value=object())
+    assert op.all_reduce_or(x, ranks, fallback) is fallback.return_value
+    sized.assert_not_called()
+
+
+def test_draft_flag_leaves_eager_calls_and_the_combine_alone(armed, sized, monkeypatch):
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    _, rs = armed
+    fallback = Mock(return_value=object())
+    assert op.dp_combine_or(_block(8 * CORES), fallback) is fallback.return_value
+    rs.assert_not_called()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    assert op.all_reduce_or(_block(8), MESH, fallback) is fallback.return_value
+    sized.assert_not_called()
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draft):
+    import types
+
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK"):
+        monkeypatch.setattr(op, name, None)
+    monkeypatch.setattr(
+        op,
+        "build_ep_mesh",
+        lambda: types.SimpleNamespace(shape={op.EP_AXIS_NAME: CORES}),
+    )
+    monkeypatch.setattr(
+        op, "get_ep_group", lambda: types.SimpleNamespace(ranks=list(MESH))
+    )
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(op.torch, "tensor", lambda *a, **k: "rank")
+    built = []
+    monkeypatch.setattr(
+        op,
+        "_build_all_reduce",
+        lambda mesh, psum_above=None: built.append(psum_above) or psum_above,
+    )
+    monkeypatch.setattr(op, "_build_reduce_scatter", lambda mesh: "rs")
+    import vllm.distributed.parallel_state as ps
+
+    group = types.SimpleNamespace(ranks=list(MESH))
+    monkeypatch.setattr(ps, "get_dp_group", lambda: group)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: group)
+    op.prebuild()
+    assert built == ([None, 32] if draft else [None])
+    assert (op._AR_SIZED_OP == 32) if draft else op._AR_SIZED_OP is None
+
+
 def test_combine_needs_the_dp_group_to_be_the_mesh(armed, monkeypatch):
     _, rs = armed
     monkeypatch.setattr(op, "_DP_COMBINE", False)

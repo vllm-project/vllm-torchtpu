@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
 
 
 def env_with_choices(
@@ -1254,6 +1255,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
+    # With TPU_SMALL_ALL_REDUCE, also give the small kernel the TP all-reduces
+    # of traces compiled outside the backbone warmup -- the MTP drafter's step-0
+    # and loop-step programs. The row choice is taken per compiled bucket inside
+    # the JAX op (XLA's all-reduce above the cap), so no trace forks.
+    "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT"),
 }
 
 
