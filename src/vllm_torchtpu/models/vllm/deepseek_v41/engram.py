@@ -1,12 +1,18 @@
 """Upstream Engram hashing, request history and TPU embedding lookup."""
 
+import weakref
 from types import SimpleNamespace
 
 import torch
 from vllm.models.deepseek_v41.common import engram as upstream
 
-from .cache import write_cache
-from .ops import bind_device_ops, device_hooks
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_cache import (
+    write_cache,
+)
+from vllm_torchtpu.layers.adapter.upstream_bindings import (
+    bind_device_ops,
+    device_hooks,
+)
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -14,7 +20,7 @@ class NgramHashState(upstream.NgramHashState):
 
     def ensure_cache(self):
         if torch.compiler.is_compiling():
-            # The outer CausalLM calls upstream's initializer before tracing.
+            # The outer CausalLM initializes the cache before tracing.
             # Layer views inside the graph are temporary Python tensor objects;
             # comparing their weakrefs must not reset persistent token history.
             return (
@@ -22,17 +28,32 @@ class NgramHashState(upstream.NgramHashState):
                 if self.use_slot_cache
                 else self.swa_cache_module.kv_cache.numel() > 0
             )
-        kv_cache = self.swa_cache_module.kv_cache
-        if self.use_slot_cache and kv_cache.numel():
-            # Hybrid allocation can grow the physical SWA page beyond the
-            # block size copied at model construction. Match the bound view
-            # used by slot_mapping and block_table before upstream sizes its
-            # generated-token history cache.
-            block_size = self.swa_cache_module.block_size
-            if self.block_size != block_size:
-                self.block_size = block_size
-                self._kv_cache_ref = None
-        return super().ensure_cache()
+        # The kernel property derives a view of the canonical pool. Lifetime
+        # tracking must use the stable allocator object, not that temporary view.
+        kv_cache = self.swa_cache_module.bound_cache
+        if not kv_cache.numel():
+            self._cache = None
+            self._kv_cache_ref = None
+            return False
+        if not self.use_slot_cache:
+            return True
+        # Hybrid allocation can grow the physical SWA page beyond the
+        # block size copied at model construction. Match the bound view
+        # used by slot_mapping and block_table before upstream sizes its
+        # generated-token history cache.
+        block_size = self.swa_cache_module.block_size
+        if self.block_size != block_size:
+            self.block_size = block_size
+            self._kv_cache_ref = None
+        if self._kv_cache_ref is not None and self._kv_cache_ref() is kv_cache:
+            return True
+        self._cache = torch.zeros(
+            kv_cache.shape[0] * self.block_size,
+            dtype=torch.int32,
+            device=kv_cache.device,
+        )
+        self._kv_cache_ref = weakref.ref(kv_cache)
+        return True
 
     def forward(
         self,
@@ -87,6 +108,7 @@ class NgramHashState(upstream.NgramHashState):
                 lookback_dead_mask[reqs, cols], upstream.DEAD_ID
             )
             if self.use_slot_cache:
+                assert self._cache is not None
                 logical = past.clamp(
                     min=0, max=block_table.shape[1] * self.block_size - 1
                 ).long()

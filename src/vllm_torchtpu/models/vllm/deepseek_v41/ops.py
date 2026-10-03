@@ -1,54 +1,8 @@
-"""Scoped upstream device bindings and V4.1 tensor helpers."""
+"""RoPE cache tables and tensor rotary operations."""
 
 import math
-from contextlib import contextmanager
-from threading import RLock
 
 import torch
-
-_lock = RLock()
-
-
-@contextmanager
-def device_hooks(module, **replacements):
-    with _lock:
-        previous = {name: getattr(module, name) for name in replacements}
-        try:
-            for name, value in replacements.items():
-                setattr(module, name, value)
-            yield
-        finally:
-            for name, value in previous.items():
-                setattr(module, name, value)
-
-
-def bind_device_ops(function, **operations):
-    """Reuse upstream bytecode with per-adapter device function bindings.
-
-    Unlike runtime module monkeypatches, bindings are immutable during forward
-    and TorchDynamo can trace them without locks or global mutation.
-    """
-    import sys
-    from types import FunctionType, ModuleType
-
-    # Dynamo guards resolve global functions by module name. A copied globals
-    # dict with the upstream name would make guards inspect the GPU operation.
-    name = f"{__name__}.{function.__qualname__.replace('.', '_')}"
-    namespace = ModuleType(name)
-    namespace.__dict__.update(function.__globals__ | operations | {"__name__": name})
-    sys.modules[name] = namespace
-    bound = FunctionType(
-        function.__code__,
-        namespace.__dict__,
-        function.__name__,
-        function.__defaults__,
-        function.__closure__,
-    )
-    bound.__kwdefaults__ = function.__kwdefaults__
-    bound.__annotations__ = function.__annotations__
-    bound.__qualname__ = function.__qualname__
-    setattr(namespace, function.__name__, bound)
-    return bound
 
 
 def compact_rope_caches(attentions, max_model_len):
@@ -112,21 +66,3 @@ def rotary(x, positions, config, *, compressed, inverse=False):
         (real * cosine - imag * sine, real * sine + imag * cosine), -1
     ).flatten(-2)
     return torch.cat((x[..., :-dim], rotated.to(x.dtype)), -1)
-
-
-def round_fp8_activation(x, block_size=32):
-    if x.shape[-1] % block_size:
-        raise ValueError("FP8 block size must divide contraction dimension")
-    blocks = x.float().unflatten(-1, (-1, block_size))
-    scales = torch.pow(
-        2.0, torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448))
-    )
-    values = (blocks / scales.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-    return (values.float() * scales.unsqueeze(-1)).flatten(-2).to(x.dtype)
-
-
-def rms_norm(x, weight, eps):
-    normalized = x.float() * torch.rsqrt(
-        x.float().square().mean(-1, keepdim=True) + eps
-    )
-    return (normalized * weight.float()).to(x.dtype)

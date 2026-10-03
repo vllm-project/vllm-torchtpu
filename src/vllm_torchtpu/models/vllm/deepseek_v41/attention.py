@@ -3,33 +3,30 @@
 from typing import cast
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_backend as backend_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_cache as cache_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_ced_attention_op as ced_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_compressor as compressor_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_indexer as indexer_ops,
+)
+from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import DeepseekTPUAttentionMixin
 from vllm_torchtpu.runner.kv_cache_dsv4 import deepseek_v41_cache_spec
 
-from .cache import (
-    NativeCacheView,
-    PagedCacheRows,
-    _block_table,
-    _cache_slots,
-    _row_slots,
-    _token_requests,
-    write_cache,
-)
-from .ced import ced_attention
-from .compressor import AttentionBackend, DeepseekCompressor, write_compressed_cache
-from .indexer import (
-    INDEX_HEAD_DIM,
-    INDEX_RECORD_BYTES,
-    IndexCacheRows,
-    paged_indexer,
-    publish_index_keys,
-)
-from .ops import device_hooks, rotary
+from .ops import rotary
 
 
 def indexer_uses_fp4(vllm_config):
@@ -40,77 +37,36 @@ def indexer_uses_fp4(vllm_config):
     return False
 
 
-class SWACache(NativeCacheView, DeepseekV4SWACache):
+class SWACache(cache_ops.NativeCacheBinding, DeepseekV4SWACache):
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
-        kwargs["backend_cls"] = AttentionBackend
+        kwargs["backend_cls"] = backend_ops.AttentionBackend
         super().__init__(*args, **kwargs)
-
-    @property
-    def kv_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
-            return raw.view(self._tpu_kernel_shape)
-        return self._bound_cache
-
-    @kv_cache.setter
-    def kv_cache(self, cache):
-        self._bound_cache = cache
-
-    @property
-    def paged_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        return (
-            PagedCacheRows(raw, self._tpu_cache_layout)
-            if raw is not None
-            else self._bound_cache
-        )
 
     def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
+        self._native = None
         if layout is None:
             raise ValueError("V4.1 SWA binding requires the allocator's logical layout")
+        layout = cache_ops.cache_byte_layout(raw_cache, cache, layout)
+        # Upstream squeezes the head dimension; this is already a native array.
         self.kv_cache = cache
-        self._tpu_raw_cache = raw_cache
-        self._tpu_cache_layout = layout
-        self._tpu_kernel_shape = tuple(cache.shape)
-        self.block_size = layout[0][1]
-
-
-class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
-    def __init__(self, *args, **kwargs):
-        if (
-            get_current_vllm_config().model_config.hf_config.index_head_dim
-            != INDEX_HEAD_DIM
-        ):
-            raise ValueError("V4.1 native index cache requires 128-dimensional keys")
-        kwargs["head_dim"] = INDEX_RECORD_BYTES
-        kwargs["dtype"] = torch.uint8
-        super().__init__(*args, **kwargs)
-
-    @property
-    def kv_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
-            return IndexCacheRows(raw, self._tpu_cache_layout)
-        return self._bound_cache
-
-    @kv_cache.setter
-    def kv_cache(self, cache):
-        self._bound_cache = cache
-
-    def get_attn_backend(self):
-        return AttentionBackend
+        record_layout = (
+            cache_ops.cache_record_layout(raw_cache, layout)
+            if raw_cache is not None
+            else None
+        )
+        self.bind_native(raw_cache, record_layout, kernel_shape=tuple(cache.shape))
+        self.block_size = layout.shape[1]
 
 
 def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-class DeepseekV41Attention(
-    DeepseekTPUAttentionMixin, NativeCacheView, upstream.DeepseekV4Attention
-):
-    backend_cls = AttentionBackend
-    swa_backend_cls = AttentionBackend
+class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attention):
+    tpu_native_kv = True
+    backend_cls = backend_ops.AttentionBackend
+    swa_backend_cls = backend_ops.AttentionBackend
     use_fp8_ds_mla_layout = False
     _ced_decoder = False
     _ced_global_from_encoder = False
@@ -124,9 +80,9 @@ class DeepseekV41Attention(
         with (
             device_hooks(
                 upstream,
-                DeepseekCompressor=DeepseekCompressor,
+                DeepseekCompressor=compressor_ops.DeepseekCompressor,
                 dsa_indexer_uses_fp4=indexer_uses_fp4,
-                DeepseekV4IndexerCache=IndexerCache,
+                DeepseekV4IndexerCache=indexer_ops.IndexerCache,
                 DeepseekV4SWACache=SWACache,
             ),
             device_hooks(torch.cuda, Event=lambda: None),
@@ -166,7 +122,7 @@ class DeepseekV41Attention(
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
+        if raw is not None:
             return raw.view(self._tpu_kernel_shape), self._bound_cache[1]
         return self._bound_cache
 
@@ -181,10 +137,11 @@ class DeepseekV41Attention(
             raise ValueError(
                 "V4.1 compressed KV requires the allocator's logical layout"
             )
+        layout = cache_ops.cache_byte_layout(raw_cache, cache, layout)
         self.kv_cache = cache
         self._tpu_raw_cache = raw_cache
         self._tpu_kernel_shape = tuple(cache[0].shape)
-        self.cache_num_states = layout[0][1]
+        self.cache_num_states = layout.shape[1]
 
     def get_kv_cache_spec(self, vllm_config):
         return deepseek_v41_cache_spec(
@@ -234,8 +191,7 @@ class DeepseekV41Attention(
     def _write_global_kv(self, kv_score, positions, *, defer_index_write=True):
         metadata = get_forward_context().attn_metadata
         latent = self.compressor(kv_score, positions)
-        compressed_slots = _cache_slots(
-            self.kv_cache[0],
+        compressed_slots = cache_ops.cache_slots(
             metadata[self.prefix],
             positions,
             compress_ratio=self.compress_ratio,
@@ -243,7 +199,7 @@ class DeepseekV41Attention(
         )
         valid = (compressed_slots >= 0) & ((positions + 1) % self.compress_ratio == 0)
         group_positions = positions // self.compress_ratio * self.compress_ratio
-        write_compressed_cache(
+        compressor_ops.write_compressed_cache(
             self.kv_cache,
             compressed_slots,
             self._rotate(latent, group_positions),
@@ -253,18 +209,24 @@ class DeepseekV41Attention(
         indexer = self.indexer
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._rotate(keys, group_positions)
-        index_cache = indexer.k_cache.kv_cache
-        index_slots = _cache_slots(
-            index_cache,
+        index_binding = indexer.k_cache.native()
+        index_cache = index_binding.pool
+        index_slots = cache_ops.cache_slots(
             metadata[indexer.k_cache.prefix],
             positions,
             compress_ratio=indexer.k_cache.compress_ratio,
+            rows_per_page=index_binding.layout.page_size,
         )
-        records = index_cache.row_indices(index_slots.clamp(min=0))
-        records = records.masked_fill(~valid | (index_slots < 0), -1)
+        index_slots = index_slots.masked_fill(~valid | (index_slots < 0), -1)
         if defer_index_write and not self._all_indices_fit:
-            return records, keys
-        publish_index_keys(index_cache, records, keys)
+            return index_slots, keys
+        indexer_ops.publish_index_keys(
+            index_cache,
+            index_binding.scales,
+            index_slots,
+            keys,
+            layout=index_binding.layout,
+        )
         return None
 
     def write_encoder_global_kv(self, hidden_states, positions):
@@ -292,9 +254,10 @@ class DeepseekV41Attention(
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
             return
         swa = metadata[self.swa_cache_layer.prefix]
-        swa_cache = self.swa_cache_layer.paged_cache
-        swa_table = _block_table(swa)
-        swa_slots = _cache_slots(swa_cache, swa, positions)
+        swa_table = cache_ops.block_table(swa)
+        swa_slots = cache_ops.cache_slots(
+            swa, positions, rows_per_page=self.swa_cache_layer.block_size
+        )
         q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
         # V4.1 normalizes the low-rank qr before wq_b, but does not normalize
         # the projected query heads. Upstream's fused insert passes
@@ -317,7 +280,9 @@ class DeepseekV41Attention(
                 * self.indexer.n_head**-0.5
             )
         count = positions.shape[0]
-        requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
+        requests = cache_ops.token_requests(swa, positions).clamp(
+            max=swa_table.shape[0] - 1
+        )
         selected = None
         if self.compress_ratio:
             capacity = max(1, self._max_model_len // self.compress_ratio)
@@ -334,17 +299,11 @@ class DeepseekV41Attention(
                     index_q = cast(torch.Tensor, index_q)
                     weights = cast(torch.Tensor, weights)
                     keys_meta = metadata[indexer.k_cache.prefix]
-                    index_cache = indexer.k_cache.kv_cache
-                    slots = _row_slots(
-                        index_cache,
-                        _block_table(keys_meta),
-                        requests,
-                        logical_compressed,
-                    )
                     selected = self._select_paged_indices(
                         index_q,
-                        index_cache,
-                        index_cache.row_indices(slots),
+                        cache_ops.block_table(keys_meta),
+                        requests,
+                        logical_compressed,
                         weights,
                         lengths,
                         swa_slots,
@@ -377,8 +336,9 @@ class DeepseekV41Attention(
     def _select_paged_indices(
         self,
         index_q,
-        index_cache,
-        records,
+        block_table,
+        requests,
+        logical,
         weights,
         lengths,
         swa_slots,
@@ -398,7 +358,7 @@ class DeepseekV41Attention(
         )
         # Padding queries neither select nor publish candidates.
         active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
-        write_records, write_keys = (
+        write_slots, write_keys = (
             pending_index_write
             if pending_index_write is not None
             else (
@@ -406,21 +366,29 @@ class DeepseekV41Attention(
                 index_q.new_empty((0, index_q.shape[-1])),
             )
         )
-        updated_cache, selected, published = paged_indexer(
+        index_binding = indexer.k_cache.native()
+        index_cache = index_binding.pool
+        scale_cache = index_binding.scales
+        updated_cache, updated_scales, selected, published = indexer_ops.paged_indexer(
             index_q,
             index_cache,
-            records,
+            scale_cache,
+            block_table,
+            requests,
+            logical,
             weights,
             active_lengths,
             candidates,
-            write_records,
+            write_slots,
             write_keys,
+            layout=index_binding.layout,
             topk=self._config["index_topk"],
             block_size=max(1, self.candidate_block_size),
             candidate_write=candidate_write,
             candidate_filter=has_candidates and not candidate_write,
         )
-        index_cache.raw.copy_(updated_cache)
+        index_cache.copy_(updated_cache)
+        scale_cache.copy_(updated_scales)
         if candidate_write:
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(
@@ -441,11 +409,16 @@ class DeepseekV41Attention(
         # must not see older keys even when those pages remain in SWA storage.
         metadata = get_forward_context().attn_metadata
         swa = metadata[self.swa_cache_layer.prefix]
-        cache = self.swa_cache_layer.paged_cache
-        slots = _cache_slots(cache, swa, positions)
-        write_cache(cache, slots, kv, slots >= 0)
-        table = _block_table(swa)
-        requests = _token_requests(swa, positions).clamp(max=table.shape[0] - 1)
+        binding = self.swa_cache_layer.native()
+        cache, layout = binding.pool, binding.layout
+        slots = cache_ops.cache_slots(
+            swa, positions, rows_per_page=self.swa_cache_layer.block_size
+        )
+        cache_ops.write_cache(cache, slots, kv, slots >= 0, layout=layout)
+        table = cache_ops.block_table(swa)
+        requests = cache_ops.token_requests(swa, positions).clamp(
+            max=table.shape[0] - 1
+        )
         logical = (
             positions[:, None]
             - self.window_size
@@ -460,8 +433,11 @@ class DeepseekV41Attention(
             & (slots[:, None] >= 0)
             & (logical >= replay_starts[requests, None])
         )
-        records = cache.row_indices(
-            _row_slots(cache, table, requests, logical)
+        window_slots = cache_ops.row_slots(
+            table,
+            requests,
+            logical,
+            rows_per_page=self.swa_cache_layer.block_size,
         ).masked_fill(~valid, -1)
         source = self.main_cache_layer
         if topk_indices is None:
@@ -474,16 +450,17 @@ class DeepseekV41Attention(
             main = source.kv_cache
             source_meta, num_states = metadata[source.prefix], source.cache_num_states
         output.copy_(
-            ced_attention(
+            ced_ops.ced_attention(
                 q,
                 cache,
                 main,
-                records,
+                window_slots,
                 topk_indices,
                 source_meta,
                 self.attn_sink,
                 self.scale,
                 num_states,
+                layout=layout,
             )
         )
 

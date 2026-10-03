@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
-from .ops import rms_norm
+from vllm_torchtpu.layers.adapter.normalization import rms_norm
 
 
 def _pre_gates(

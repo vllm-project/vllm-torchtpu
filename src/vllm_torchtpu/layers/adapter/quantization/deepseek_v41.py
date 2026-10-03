@@ -7,8 +7,8 @@ from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
+from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
-from vllm_torchtpu.models.vllm.deepseek_v41.ops import device_hooks
 
 
 @register_quantization_config("tpu-deepseek_v41_fp8")

@@ -12,15 +12,27 @@ from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_cache as cache_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_ced_attention_op as ced_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_compressor as compressor_ops,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+    deepseek_v41_indexer as indexer_ops,
+)
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
+from vllm_torchtpu.layers.adapter.upstream_bindings import (
+    bind_device_ops,
+    device_hooks,
+)
 from vllm_torchtpu.logger import init_logger
 
-from .attention import DeepseekV41Attention, _block_table, _cache_slots
-from .cache import initialize_cache_ops
-from .ced import initialize_ced_attention, plan_decoder_replay
-from .compressor import initialize_compressor_ops
+from .attention import DeepseekV41Attention
 from .engram import Engram, NgramHashState
-from .indexer import initialize_indexer
 from .mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -29,7 +41,8 @@ from .mhc import (
     pre,
     shifted_post_pre,
 )
-from .ops import bind_device_ops, compact_rope_caches, device_hooks
+from .ops import compact_rope_caches
+from .replay_plan import plan_decoder_replay
 
 logger = init_logger(__name__)
 
@@ -293,12 +306,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     image_mask,
                     lookback_token_ids,
                     upstream.image_sentinel_mask(lookback_token_ids),
-                    _cache_slots(
-                        self.engram_hash.swa_cache_module.paged_cache,
+                    cache_ops.cache_slots(
                         swa_metadata,
                         positions,
+                        rows_per_page=self.engram_hash.swa_cache_module.block_size,
                     ),
-                    _block_table(swa_metadata),
+                    cache_ops.block_table(swa_metadata),
                 )
             elif not self.engram_dp_shared_memory and upstream.get_engram_dp_size() > 1:
                 # DP-sharded lookups are collective, so a replica skipping the
@@ -414,12 +427,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
-        initialize_cache_ops()
+        cache_ops.initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_mhc_post()
-        initialize_compressor_ops()
-        initialize_ced_attention()
-        initialize_indexer()
+        compressor_ops.initialize_compressor_ops()
+        ced_ops.initialize_ced_attention()
+        indexer_ops.initialize_indexer()
         with (
             device_hooks(
                 upstream,

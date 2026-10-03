@@ -1,59 +1,14 @@
-"""Decoder replay planning and its bounded SWA state for shared CSA."""
+"""V4.1 decoder SWA state and native CSA integration."""
 
 import functools
-from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import torch
 
-from .cache import gather_cache_values
+from .deepseek_v41_cache import gather_cache_values, masked_row_indices
 
 _attention_op = None
-
-
-@dataclass(frozen=True)
-class DecoderReplayPlan:
-    indices: tuple[int, ...]
-    query_start_loc: tuple[int, ...]
-    replay_starts: tuple[int, ...]
-    padded_num_tokens: int
-
-
-def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
-    """Keep the same prompt-tail window across every chunk and later decode.
-
-    The encoder publishes global KV for the complete chunk before this plan
-    narrows the decoder batch. Prefix caching must be disabled: a cached prefix
-    may not contain the encoder outputs required to rebuild decoder SWA.
-    """
-    bounds = metadata.query_start_loc_cpu
-    lengths = metadata.seq_lens_cpu
-    prompts = metadata.prompt_lens_cpu
-    if bounds is None or lengths is None or prompts is None:
-        return None  # Profiling/warmup executes both stages at the full bucket.
-    if window < 1 or len(bounds) != len(lengths) + 1 or len(prompts) != len(lengths):
-        raise ValueError("Invalid decoder replay scheduling metadata")
-    if bounds[0] != 0 or bounds[-1] > num_tokens:
-        raise ValueError("Query boundaries exceed the input token bucket")
-    indices, replay_starts, output_bounds = [], [], [0]
-    for start, end, length, prompt in zip(bounds, bounds[1:], lengths, prompts):
-        count = end - start
-        if count < 0 or length < count or prompt < 0:
-            raise ValueError("Invalid scheduled query or prompt length")
-        replay_start = max(0, prompt - window)
-        skip = min(count, max(0, replay_start - (length - count)))
-        indices.extend(range(start + skip, end))
-        replay_starts.append(replay_start)
-        output_bounds.append(len(indices))
-    kept = len(indices)
-    # Each stage dispatches by its own token bucket. Never introduce a second,
-    # independent symbolic token dimension into vLLM's guard-free full graph.
-    buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
-    padded = next(n for n in buckets if n >= kept) if kept else 0
-    return DecoderReplayPlan(
-        tuple(indices), tuple(output_bounds), tuple(replay_starts), padded
-    )
 
 
 def swa_attention_state(q, pool, records, scale):
@@ -111,7 +66,7 @@ def ced_attention_jax(
     swa: jax.Array,
     main_nope: jax.Array,
     main_rope: jax.Array,
-    swa_records: jax.Array,
+    swa_slots: jax.Array,
     selected: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
@@ -120,11 +75,15 @@ def ced_attention_jax(
     *,
     scale: float,
     logical_main_page_size: int,
+    page_size: int,
+    page_stride: int,
+    row_offset: int,
 ) -> jax.Array:
     from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
         deepseek_v4_attention_op as attention_ops,
     )
 
+    swa_records = masked_row_indices(swa_slots, page_size, page_stride, row_offset)
     maximum, denominator, numerator = swa_attention_state(q, swa, swa_records, scale)
     if selected.shape[1] == 0:
         denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
@@ -166,7 +125,7 @@ def initialize_ced_attention():
         swa: jax.Array,
         main_nope: jax.Array,
         main_rope: jax.Array,
-        swa_records: jax.Array,
+        swa_slots: jax.Array,
         selected: jax.Array,
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
@@ -174,12 +133,18 @@ def initialize_ced_attention():
         sink: jax.Array,
         scale: float,
         logical_main_page_size: int,
+        page_size: int,
+        page_stride: int,
+        row_offset: int,
     ) -> jax.Array:
         return jax.shard_map(
             functools.partial(
                 ced_attention_jax,
                 scale=scale,
                 logical_main_page_size=logical_main_page_size,
+                page_size=page_size,
+                page_stride=page_stride,
+                row_offset=row_offset,
             ),
             mesh=mesh,
             in_specs=specs,
@@ -190,7 +155,7 @@ def initialize_ced_attention():
             swa,
             main_nope,
             main_rope,
-            swa_records,
+            swa_slots,
             selected,
             page_indices,
             cu_q_lens,
@@ -202,18 +167,20 @@ def initialize_ced_attention():
         "pallas::deepseek_v41_ced_attention",
         attend,
         mesh=mesh,
-        input_partition_specs=specs + (None, None),
+        input_partition_specs=specs + (None,) * 5,
     )
     _attention_op.register_fake(lambda q, *args: torch.empty_like(q))
 
 
-def ced_attention(q, swa, main, records, selected, metadata, sink, scale, num_states):
+def ced_attention(
+    q, swa, main, slots, selected, metadata, sink, scale, num_states, *, layout
+):
     assert _attention_op is not None
     return _attention_op(
         q,
-        swa.raw,
+        swa,
         *main,
-        records.int(),
+        slots.int(),
         selected.int(),
         metadata.block_tables,
         metadata.query_start_loc,
@@ -221,4 +188,5 @@ def ced_attention(q, swa, main, records, selected, metadata, sink, scale, num_st
         sink,
         scale,
         num_states,
+        *layout.geometry,
     )

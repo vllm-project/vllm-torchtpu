@@ -6,8 +6,8 @@ Model construction, decoder order, checkpoint names and cache ownership are
 inherited from pinned vLLM v0.30.0.
 
 The retained path targets DeepSeek-V4.1-Flash text generation with MXFP4 routed
-experts, FP8 indexer values, BF16 KV storage, TP/EP, PP1 and DP1. Scheduling is
-synchronous, without speculation or EPLB. Vision and alternative expert/indexer
+experts, FP8 indexer keys, BF16 SWA and packed FP8 compressed KV, TP/EP, PP1 and
+DP1. Scheduling is synchronous, without speculation or EPLB. Vision and alternative expert/indexer
 formats are outside this implementation.
 
 ## Runtime files
@@ -15,17 +15,22 @@ formats are outside this implementation.
 | File | Responsibility |
 | --- | --- |
 | `models/vllm/deepseek_v41/model.py` | Model assembly and compiled encoder/decoder stages |
-| `ced.py` | Prompt-tail replay planning across scheduler chunks |
-| `attention.py` | MLA, compressor state and output projection |
-| `attention_kernels.py` | Paged attention, exact index selection and publication |
-| `cache.py` | Native allocation, paged record addressing and mutation |
-| `engram.py` | Upstream hashing, request lookbacks and TPU lookup |
-| `mhc.py` | Delayed mHC, compact Sinkhorn and residual flow |
-| `ops.py` | Scoped device bindings, RoPE and small tensor helpers |
+| `models/vllm/deepseek_v41/replay_plan.py` | Prompt-tail replay planning across scheduler chunks |
+| `models/vllm/deepseek_v41/attention.py` | MLA adapter, cache binding and output projection |
+| `models/vllm/deepseek_v41/engram.py` | Upstream hashing, request lookbacks and TPU lookup |
+| `models/vllm/deepseek_v41/mhc.py` | Delayed mHC, compact Sinkhorn and residual flow |
+| `models/vllm/deepseek_v41/ops.py` | RoPE tables and tensor rotation |
+| `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_cache.py` | Native binding, byte/record and index-page geometry, public slot helpers and cache operations |
+| `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_backend.py` | Shared vLLM backend contract, separate from cache layout arithmetic |
+| `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_ced_attention_op.py` | Read-only CED attention over the selected SWA window and compressed KV |
+| `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_compressor.py` | Upstream compressor/state adapters, C1/C2 pooling and KV packing/publication |
+| `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_indexer.py` | Indexer cache adapter, FP8 publication and index selection |
+| `layers/adapter/upstream_bindings.py` | Scoped device bindings for reused upstream code |
+| `layers/adapter/normalization.py` | Shared Torch RMS normalization with FP32 accumulation |
 | `layers/adapter/quantization/deepseek_v41.py` | V4 quantization dispatch and MoE model bindings |
+| `runner/kv_cache_dsv4.py` | Shared native cache allocation and V4.1 cache specifications |
 
-Paths in the table are relative to `src/vllm_torchtpu/`; model filenames after
-the first row use the same model directory.
+Paths in the table are relative to `src/vllm_torchtpu/`.
 
 V4.1 uses the same quantization methods and runtime kernels as the native
 TorchTPU V4 model. Dense FP8 weights are dequantized and requantized using the
@@ -37,14 +42,31 @@ Shared experts use the V4 MLP and the MoE runner's combined TP reduction;
 runtime FP8 weights and uses V4's fused inverse-RoPE/FP8 output-projection kernel.
 There is no V4.1-specific source-format arithmetic path.
 
-KV storage and ownership remain V4.1's BF16 cache implementation; this does not
-adopt V4's packed SWA/CSA cache layout or change V4.1's compressor architecture.
-Cache kernels use record indices and V4's 128-word row geometry, retaining
-two-dimensional row/lane addressing for large shared pools.
+Cache ownership and compression order remain V4.1's. SWA retains BF16 values;
+compressed KV uses V4's native FP8 NoPE packing with separate BF16 RoPE storage.
+Bindings retain the original tensor owners. Both eager and compiled auxiliary
+operations use the canonical 2D `int32[..., 128]` pool; SWA and main attention
+derive their native 3D kernel shapes from that owner. Cache operations
+derive physical record indices using layout constants validated at binding time.
 Like V4, the attention and compressor paths consume the shared TPU
-`AttentionMetadata`; each cache derives its slot or ring addresses in the model
-from its own block table and compression geometry.
-Engram's checkpoint table format and V4.1 indexer rounding are unchanged.
+`AttentionMetadata`; model adapters select logical slots from each cache's block
+table and compression geometry. The indexer resolves its block table inside the
+existing update-and-select operation, avoiding a Torch-side full-context slot
+matrix. CED derives only its fixed 128-token SWA window on the Torch side, where
+replay masks are already available. Its record conversion stays inside the op.
+Frozen record geometry is unpacked into scalar constants at each JAX bridge.
+Overlay validation checks both arrays by storage identity within each cache
+group; cross-group sharing follows the scheduler's disjoint block ownership.
+Engram retains its separate int32 token
+history, and the indexer uses native FP8 key packing and scoring.
+
+For a 40 KiB physical page, indexers pack 256 128-byte FP8 keys into the
+32 KiB NoPE array. Their E8M0 scale bytes occupy the low byte of 256 int32
+words in the existing 8 KiB RoPE array. The upper bytes of written scale words
+are zero; the remaining companion capacity is padding. This gives 160 allocated
+bytes per key while preserving the common physical block budget and the original
+array bindings. C1 index pages cover 256 tokens and C2 pages cover 512 tokens.
+Main-attention NoPE/RoPE packing and indexer quantization/scoring are unchanged.
 
 Hierarchical reindex builds a compact key-record list before scoring. For a
 fixed candidate pool, later indexers' key reads and QK work are bounded by that
@@ -82,6 +104,5 @@ That configuration sets the V4.1 gather workaround explicitly, without changing
 other models' automatic libtpu flags.
 
 Validation scripts and raw experiment evidence are maintained separately from
-the runtime change. BF16 KV storage differs from the official packed-cache
-numerics. Cache validation alone does not establish full-model numerical
-equivalence or serving performance.
+the runtime change. Cache validation alone does not establish full-model
+numerical equivalence, memory usage or serving performance.

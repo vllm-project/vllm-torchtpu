@@ -1,4 +1,4 @@
-"""V4.1 C1/C2 compression and publication into V4 native cache arrays."""
+"""V4.1 C1/C2 compression and compressed KV publication."""
 
 import jax
 import jax.numpy as jnp
@@ -7,36 +7,20 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.layers.adapter.normalization import rms_norm
+from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 
-from .cache import (
-    NativeCacheView,
-    _cache_slots,
-    _token_requests,
+from .deepseek_v41_backend import AttentionBackend
+from .deepseek_v41_cache import (
+    NativeCacheBinding,
+    cache_slots,
+    read_cache,
     scatter_cache_words,
+    token_requests,
     write_cache,
 )
-from .ops import device_hooks, rms_norm
 
 _write_op = None
-
-
-class AttentionBackend(compressor_upstream.CompressorBackend):
-    @staticmethod
-    def get_name():
-        return "TORCH_TPU_DEEPSEEK_V41"
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks, block_size, num_kv_heads, head_size, *args, **kwargs
-    ):
-        return num_blocks, num_kv_heads, block_size, head_size
-
-
-class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateCache):
-    """Upstream CircularBufferSpec, allocation lifecycle and cache binding."""
-
-    def get_attn_backend(self):
-        return AttentionBackend
 
 
 def save_compress_norm(
@@ -50,6 +34,8 @@ def save_compress_norm(
     eps,
     ratio,
     latent,
+    *,
+    state_layout=None,
 ):
     """Tensor implementation of the compressor_upstream fused compression operation.
 
@@ -66,7 +52,9 @@ def save_compress_norm(
     values = kv_score[:, :dim].float()
     valid = slot_mapping >= 0
     if ratio == 2:
-        capacity = state_cache.shape[1]
+        capacity = (
+            state_layout.page_size if state_layout is not None else state_cache.shape[1]
+        )
         cache = state_cache
         rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
@@ -79,78 +67,19 @@ def save_compress_norm(
         previous = torch.where(
             (rows > starts)[:, None],
             kv_score[(rows - 1).clamp(min=0)].float(),
-            cache[previous_slots // capacity, previous_slots % capacity],
+            read_cache(cache, previous_slots, layout=state_layout),
         )
         scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
         publish = valid & (rows >= ends - capacity)
-        write_cache(cache, slot_mapping, kv_score.float(), publish)
+        write_cache(cache, slot_mapping, kv_score.float(), publish, layout=state_layout)
         valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
     latent.copy_(result.masked_fill(~valid[:, None], 0).to(latent.dtype))
-
-
-class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
-    """Inherit weights and state ownership; consume the shared TPU metadata."""
-
-    def __init__(self, *args, **kwargs):
-        with device_hooks(
-            compressor_upstream, CompressorStateCache=CompressorStateCache
-        ):
-            super().__init__(*args, **kwargs)
-
-    def project(self, hidden_states):
-        from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-
-        layer = self.fused_wkv_wgate
-        weight = layer.weight.float()
-        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            weight = weight.t()
-        # Upstream accumulates the unquantized KV/score projection in FP32.
-        # Keep that precision through pooling and normalization.
-        return torch.mm(hidden_states.float(), weight)
-
-    def forward(self, kv_score, positions):
-        metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict):
-            return None
-        if self.state_cache is None:
-            state_cache = query_start_loc = requests = None
-            source = self._static_forward_context[self.k_cache_prefix]
-            slots = _cache_slots(
-                source.kv_cache[0],
-                metadata[self.k_cache_prefix],
-                positions,
-                rows_per_page=source.cache_num_states,
-            )
-        else:
-            state_metadata = metadata[self.state_cache.prefix]
-            state_cache = self.state_cache.kv_cache
-            slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
-            query_start_loc = state_metadata.query_start_loc
-            requests = _token_requests(state_metadata, positions)
-        latent = torch.empty(
-            (kv_score.shape[0], self.head_dim),
-            dtype=torch.bfloat16,
-            device=kv_score.device,
-        )
-        save_compress_norm(
-            kv_score,
-            positions,
-            state_cache,
-            slots,
-            query_start_loc,
-            requests,
-            self.norm.weight,
-            self.rms_norm_eps,
-            self.compress_ratio,
-            latent,
-        )
-        return latent
 
 
 def pack_csa_values(values: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -231,3 +160,85 @@ def initialize_compressor_ops():
     _write_op.register_fake(
         lambda nope, rope, *args: (torch.empty_like(nope), torch.empty_like(rope))
     )
+
+
+class CompressorStateCache(
+    NativeCacheBinding, compressor_upstream.CompressorStateCache
+):
+    """Upstream state ownership with a shared native cache binding."""
+
+    def get_attn_backend(self):
+        return AttentionBackend
+
+
+class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
+    """Inherit weights and state ownership; consume the shared TPU metadata."""
+
+    def __init__(self, *args, **kwargs):
+        with device_hooks(
+            compressor_upstream, CompressorStateCache=CompressorStateCache
+        ):
+            super().__init__(*args, **kwargs)
+
+    def project(self, hidden_states):
+        from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+        layer = self.fused_wkv_wgate
+        weight = layer.weight.float()
+        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            weight = weight.t()
+        # Upstream accumulates the unquantized KV/score projection in FP32.
+        # Keep that precision through pooling and normalization.
+        return torch.mm(hidden_states.float(), weight)
+
+    def forward(self, kv_score, positions):
+        metadata = get_forward_context().attn_metadata
+        if not isinstance(metadata, dict):
+            return None
+        if self.state_cache is None:
+            state_cache = query_start_loc = requests = None
+            state_layout = None
+            source = self._static_forward_context[self.k_cache_prefix]
+            slots = cache_slots(
+                metadata[self.k_cache_prefix],
+                positions,
+                rows_per_page=source.cache_num_states,
+            )
+        else:
+            state_metadata = metadata[self.state_cache.prefix]
+            binding = (
+                self.state_cache.native() if self.state_cache.has_native_cache else None
+            )
+            state_cache = self.state_cache.kv_cache
+            state_layout = binding.layout if binding is not None else None
+            slots = cache_slots(
+                state_metadata,
+                positions,
+                ring=True,
+                rows_per_page=(
+                    state_layout.page_size
+                    if state_layout is not None
+                    else state_cache.shape[1]
+                ),
+            )
+            query_start_loc = state_metadata.query_start_loc
+            requests = token_requests(state_metadata, positions)
+        latent = torch.empty(
+            (kv_score.shape[0], self.head_dim),
+            dtype=torch.bfloat16,
+            device=kv_score.device,
+        )
+        save_compress_norm(
+            kv_score,
+            positions,
+            state_cache,
+            slots,
+            query_start_loc,
+            requests,
+            self.norm.weight,
+            self.rms_norm_eps,
+            self.compress_ratio,
+            latent,
+            state_layout=state_layout,
+        )
+        return latent

@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -10,14 +10,142 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
 ROW_BYTES = ROW_WORDS * 4
+INDEX_HEAD_DIM = 128
+
+
+@dataclass(frozen=True)
+class IndexPageGeometry:
+    """One compact NoPE key plane and the companion int32 scale plane."""
+
+    nope_bytes: int
+    scale_bytes: int
+    key_bytes = INDEX_HEAD_DIM
+    scale_word_bytes = torch.int32.itemsize
+    state_bytes = key_bytes + scale_word_bytes
+
+    def __post_init__(self):
+        if self.nope_bytes <= 0 or self.nope_bytes % ROW_BYTES:
+            raise ValueError("Index pages require complete native word rows")
+        if self.keys_per_page * self.scale_word_bytes > self.scale_bytes:
+            raise ValueError("V4.1 index scales exceed the companion array budget")
+
+    @property
+    def keys_per_page(self):
+        return self.nope_bytes // self.key_bytes
+
+
+class ByteLayout(NamedTuple):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    page_stride_bytes: int
+    row_offset_bytes: int
+
+
+def cache_byte_layout(raw, cache, layout):
+    """Normalize allocator geometry once at the binding boundary."""
+    if layout is not None:
+        return layout if isinstance(layout, ByteLayout) else ByteLayout(*layout)
+    if raw.device.type != "cpu":
+        raise ValueError("TPU native caches require explicit allocator layout")
+    return ByteLayout(
+        tuple(cache.shape),
+        cache.dtype,
+        cache.stride(0) * cache.element_size(),
+        cache.storage_offset() * cache.element_size(),
+    )
+
+
+@dataclass(frozen=True)
+class RecordLayout:
+    page_size: int
+    page_stride: int
+    row_offset: int
+    elements: int
+    dtype: torch.dtype
+
+    @property
+    def geometry(self):
+        return self.page_size, self.page_stride, self.row_offset
+
+
+@dataclass(frozen=True)
+class NativeBinding:
+    pool: torch.Tensor
+    layout: RecordLayout
+    scales: torch.Tensor | None = None
+    kernel_shape: tuple[int, ...] | None = None
+
+
+class NativeCacheBinding:
+    """Store one validated binding; never wrap tensor reads or writes."""
+
+    tpu_native_kv = True
+    _native: NativeBinding | None = None
+
+    def native(self) -> NativeBinding:
+        if self._native is None:
+            raise RuntimeError(f"{type(self).__name__} requires native cache binding")
+        return self._native
+
+    @property
+    def has_native_cache(self):
+        return self._native is not None
+
+    @property
+    def bound_cache(self):
+        """Stable allocator object for host-side cache lifetime tracking."""
+        return self._bound_cache
+
+    @property
+    def kv_cache(self):
+        if self._native is not None:
+            binding = self._native
+            return (
+                binding.pool.view(binding.kernel_shape)
+                if binding.kernel_shape is not None
+                else binding.pool
+            )
+        return self._bound_cache
+
+    @kv_cache.setter
+    def kv_cache(self, cache):
+        self._bound_cache = cache
+
+    def bind_native(
+        self, raw, layout: RecordLayout | None, *, scales=None, kernel_shape=None
+    ):
+        """Store a pool with record geometry already validated by its owner."""
+        self._native = None
+        if raw is None:
+            return
+        if layout is None:
+            raise ValueError("Native cache binding requires validated record geometry")
+        self._native = NativeBinding(raw, layout, scales, kernel_shape)
+
+    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
+        self._native = None
+        if not isinstance(cache, torch.Tensor):
+            raise TypeError("This cache binding requires a single Tensor")
+        cast(Any, super()).bind_kv_cache(cache)
+        if raw_cache is not None:
+            layout = cache_byte_layout(raw_cache, self.bound_cache, layout)
+            self.bind_native(raw_cache, cache_record_layout(raw_cache, layout))
+
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm_torchtpu.runner.kv_cache_dsv4 import deepseek_v41_cache_spec
+
+        return deepseek_v41_cache_spec(
+            cast(Any, super()).get_kv_cache_spec(vllm_config),
+            vllm_config,
+        )
 
 
 @dataclass
 class MaterializedNativeKVCache:
-    kv_caches: dict[str, torch.Tensor]
+    kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
     raw_tensors: list[torch.Tensor]
     native_raw_cache: dict[str, torch.Tensor] = field(default_factory=dict)
-    native_cache_layouts: dict[str, tuple] = field(default_factory=dict)
+    native_cache_layouts: dict[str, ByteLayout] = field(default_factory=dict)
 
 
 def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
@@ -40,126 +168,80 @@ _write_op = None
 _write_values_op = None
 
 
-class _CacheBinding(Protocol):
-    def bind_kv_cache(self, cache: Any) -> None: ...
+def cache_record_layout(raw, layout):
+    """Validate once at binding and retain geometry in record units."""
+    shape, dtype, stride_bytes, offset_bytes = layout
+    row_bytes = math.prod(shape[2:]) * dtype.itemsize
+    if raw.dtype != torch.int32 or raw.ndim != 2 or raw.shape[1] != ROW_WORDS:
+        raise ValueError("Native cache requires DSV4 int32[..., 128] word rows")
+    if dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Native cache records must be BF16 or FP32")
+    if row_bytes % 4 or (row_bytes % ROW_BYTES and ROW_BYTES % row_bytes):
+        raise ValueError("Cache records must divide or be a multiple of 512 bytes")
+    if stride_bytes % row_bytes or offset_bytes % row_bytes:
+        raise ValueError("Cache pages must be record-aligned")
+    if max(raw.shape[0], raw.nbytes // row_bytes) > torch.iinfo(torch.int32).max:
+        raise ValueError("Native cache row counts must fit int32")
+    return RecordLayout(
+        shape[1],
+        stride_bytes // row_bytes,
+        offset_bytes // row_bytes,
+        math.prod(shape[2:]),
+        dtype,
+    )
 
-    def get_kv_cache_spec(self, vllm_config: Any) -> Any: ...
+
+def row_indices(slots, page_size, page_stride, row_offset):
+    """Map slots using prevalidated record geometry, never pool byte offsets."""
+    return row_offset + slots // page_size * page_stride + slots % page_size
 
 
-class PagedCacheRows:
-    """Map upstream pages to physical record indices, as in DSV4.
+def masked_row_indices(slots, page_size, page_stride, row_offset):
+    import jax.numpy as jnp
 
-    The shared owner stays in DSV4's native int32[..., 128] layout. Only
-    gathered records are reinterpreted. Byte geometry is converted once to
-    record units, before any device arithmetic or int32 index conversion.
-    """
+    records = row_indices(jnp.maximum(slots, 0), page_size, page_stride, row_offset)
+    return jnp.where(slots >= 0, records, -1)
 
-    def __init__(self, raw, layout):
-        self.raw = raw
-        self.shape, self.dtype, stride_bytes, offset_bytes = layout
-        self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
-        if raw.dtype != torch.int32 or raw.ndim != 2 or raw.shape[1] != ROW_WORDS:
-            raise ValueError("Native cache requires DSV4 int32[..., 128] word rows")
-        if self.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("Native cache records must be BF16 or FP32")
-        if self.row_bytes % 4 or (
-            self.row_bytes % ROW_BYTES and ROW_BYTES % self.row_bytes
-        ):
-            raise ValueError("Cache records must divide or be a multiple of 512 bytes")
-        if stride_bytes % self.row_bytes or offset_bytes % self.row_bytes:
-            raise ValueError("Cache pages must be record-aligned")
-        if (
-            max(raw.shape[0], raw.nbytes // self.row_bytes)
-            > torch.iinfo(torch.int32).max
-        ):
-            raise ValueError("Native cache row counts must fit int32")
-        self.page_stride = stride_bytes // self.row_bytes
-        self.row_offset = offset_bytes // self.row_bytes
 
-    def numel(self):
-        return math.prod(self.shape)
-
-    def row_indices(self, slots):
+def read_cache(cache, slots, *, layout=None):
+    """Read old state through the existing cache-read operation."""
+    if layout is None:
+        return cache[slots // cache.shape[1], slots % cache.shape[1]]
+    page_size, page_stride, row_offset = layout.geometry
+    elements, dtype = layout.elements, layout.dtype
+    if cache.device.type == "cpu":
+        records = row_indices(slots, page_size, page_stride, row_offset)
+        pool = cache.view(torch.int8).reshape(-1, elements * dtype.itemsize)
         return (
-            self.row_offset
-            + slots // self.shape[1] * self.page_stride
-            + slots % self.shape[1]
+            pool[records.long()]
+            .contiguous()
+            .view(dtype)
+            .reshape(*slots.shape, elements)
         )
-
-    def __getitem__(self, indices):
-        blocks, rows = indices
-        records = self.row_indices(blocks * self.shape[1] + rows)
-        if self.raw.device.type == "cpu":
-            pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
-            return (
-                pool[records.long()]
-                .contiguous()
-                .view(self.dtype)
-                .reshape(*records.shape, *self.shape[2:])
-            )
-        assert _read_values_op is not None
-        gathered = _read_values_op(
-            self.raw,
-            records.flatten().int(),
-            self.row_bytes // self.dtype.itemsize,
-            self.dtype == torch.float32,
-        )
-        return gathered.reshape(*records.shape, *self.shape[2:])
-
-    def write(self, slots, values):
-        records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
-        values = values.to(self.dtype).reshape(
-            slots.shape[0], self.row_bytes // self.dtype.itemsize
-        )
-        if self.raw.device.type == "cpu":
-            pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
-            valid = slots >= 0
-            pool.index_copy_(
-                0, records[valid].long(), values[valid].contiguous().view(torch.int8)
-            )
-        else:
-            assert _write_values_op is not None
-            self.raw.copy_(_write_values_op(self.raw, records.int(), values))
+    assert _read_values_op is not None
+    gathered = _read_values_op(
+        cache,
+        slots.flatten().int(),
+        elements,
+        dtype == torch.float32,
+        page_size,
+        page_stride,
+        row_offset,
+    )
+    return gathered.reshape(*slots.shape, elements)
 
 
-class NativeCacheView:
-    """Expose each shared physical pool once, deriving layer views in the graph."""
-
-    tpu_native_kv = True
-
-    def get_kv_cache_spec(self, vllm_config):
-        from vllm_torchtpu.runner.kv_cache_dsv4 import deepseek_v41_cache_spec
-
-        return deepseek_v41_cache_spec(
-            cast(_CacheBinding, super()).get_kv_cache_spec(vllm_config), vllm_config
-        )
-
-    @property
-    def kv_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
-            return PagedCacheRows(raw, self._tpu_cache_layout)
-        return self._bound_cache
-
-    @kv_cache.setter
-    def kv_cache(self, cache):
-        self._bound_cache = cache
-
-    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
-        cast(_CacheBinding, super()).bind_kv_cache(cache)
-        self._tpu_raw_cache = raw_cache
-        if layout is not None:
-            self._tpu_cache_layout = layout
-            return
-        if raw_cache is not None and raw_cache.device.type != "cpu":
-            raise ValueError("TPU native caches require explicit allocator layout")
-        view = self._bound_cache
-        self._tpu_cache_layout = (
-            tuple(view.shape),
-            view.dtype,
-            view.stride(0) * view.element_size(),
-            view.storage_offset() * view.element_size(),
-        )
+def read_cache_values(
+    cache: jax.Array,
+    slots: jax.Array,
+    elements: int,
+    fp32: bool,
+    page_size: int,
+    page_stride: int,
+    row_offset: int,
+) -> jax.Array:
+    records = row_indices(slots, page_size, page_stride, row_offset)
+    return gather_cache_values(cache, records, elements, fp32)
 
 
 def _scatter_rows(cache: jax.Array, slots: jax.Array, values: jax.Array) -> jax.Array:
@@ -222,13 +304,13 @@ def initialize_cache_ops():
 
     _read_values_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_read_values",
-        gather_cache_values,
+        read_cache_values,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), None, None),
+        input_partition_specs=(P(), P(), None, None, None, None, None),
     )
     _read_values_op.register_fake(
-        lambda cache, records, elements, fp32=False: cache.new_empty(
-            (records.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
+        lambda cache, slots, elements, fp32, *geometry: cache.new_empty(
+            (slots.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
         )
     )
     _write_op = pallas.jax_op(
@@ -241,32 +323,58 @@ def initialize_cache_ops():
     mesh = get_vllm_model_wrapper_context().mesh
     # Pallas DMA runs independently on each device's replicated cache.
     # Mosaic calls require explicit manual partitioning on a multi-device mesh.
-    write_values = jax.shard_map(
+    scatter_values = jax.shard_map(
         scatter_cache_values,
         mesh=mesh,
         in_specs=(P(), P(), P()),
         out_specs=P(),
         check_vma=False,
     )
+
+    def write_values(
+        cache: jax.Array,
+        slots: jax.Array,
+        values: jax.Array,
+        page_size: int,
+        page_stride: int,
+        row_offset: int,
+    ) -> jax.Array:
+        records = masked_row_indices(slots, page_size, page_stride, row_offset)
+        return scatter_values(cache, records, values)
+
     _write_values_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_write_values",
         write_values,
         donate_argnums=(0,),
         mesh=mesh,
-        input_partition_specs=(P(), P(), P()),
+        input_partition_specs=(P(), P(), P(), None, None, None),
     )
     _write_values_op.register_fake(
-        lambda cache, records, values: torch.empty_like(cache)
+        lambda cache, slots, values, *geometry: torch.empty_like(cache)
     )
 
 
-def write_cache(cache, slots, values, valid):
+def write_cache(cache, slots, values, valid, *, layout=None):
     """Valid destinations must be unique; invalid rows have no side effects."""
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
     slots = slots.masked_fill(~valid, -1).long()
-    if isinstance(cache, PagedCacheRows):
-        cache.write(slots, values)
+    if layout is not None:
+        page_size, page_stride, row_offset = layout.geometry
+        elements, dtype = layout.elements, layout.dtype
+        values = values.to(dtype).reshape(slots.shape[0], elements)
+        if cache.device.type == "cpu":
+            records = row_indices(
+                slots.clamp(min=0), page_size, page_stride, row_offset
+            )
+            pool = cache.view(torch.int8).reshape(-1, elements * dtype.itemsize)
+            valid = slots >= 0
+            pool.index_copy_(
+                0, records[valid].long(), values[valid].contiguous().view(torch.int8)
+            )
+        else:
+            assert _write_values_op is not None
+            cache.copy_(_write_values_op(cache, slots.int(), values, *layout.geometry))
         return
     if cache.device.type == "cpu":
         selected = slots[valid]
@@ -369,24 +477,21 @@ def scatter_cache_words(
     )(records, words.reshape(-1), cache)
 
 
-def _block_table(metadata):
+def block_table(metadata):
     return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
 
 
-def _token_requests(metadata, positions):
+def token_requests(metadata, positions):
     rows = torch.arange(positions.shape[0], device=positions.device)
     return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
 
 
-def _cache_slots(
-    cache, metadata, positions, *, compress_ratio=1, ring=False, rows_per_page=None
-):
+def cache_slots(metadata, positions, *, rows_per_page, compress_ratio=1, ring=False):
     """Derive this cache's addresses from the shared TPU metadata contract."""
     if metadata.seq_lens.numel() == 0:
         return torch.full_like(positions, -1)
-    table = _block_table(metadata)
-    requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
-    rows_per_page = rows_per_page or cache.shape[1]
+    table = block_table(metadata)
+    requests = token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
     logical = positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
     blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
@@ -397,8 +502,8 @@ def _cache_slots(
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 
-def _row_slots(cache, block_table, requests, logical):
+def row_slots(block_table, requests, logical, *, rows_per_page):
     """Gather fixed-width token rows without inspecting device values on host."""
-    safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
-    blocks = block_table[requests[:, None], safe // cache.shape[1]].long()
-    return blocks * cache.shape[1] + safe % cache.shape[1]
+    safe = logical.clamp(min=0, max=block_table.shape[1] * rows_per_page - 1)
+    blocks = block_table[requests[:, None], safe // rows_per_page].long()
+    return blocks * rows_per_page + safe % rows_per_page
