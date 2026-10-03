@@ -232,6 +232,36 @@ def test_draft_flag_leaves_eager_calls_and_the_combine_alone(armed, sized, monke
     sized.assert_not_called()
 
 
+@pytest.mark.parametrize("warmup,traces", [(False, 1), (True, 2)])
+def test_draft_route_leaves_no_token_count_guard(monkeypatch, warmup, traces):
+    """A dynamic trace outside the warmup serves every row count from one
+    graph, as vLLM's compile of the drafter requires; the warmup route's
+    row branch guards the token count, so the same calls retrace there (the
+    control)."""
+    monkeypatch.setattr(op, "_AR_OP", lambda x, rank: x * 3)
+    monkeypatch.setattr(op, "_AR_SIZED_OP", lambda x, rank: x * 5)
+    monkeypatch.setattr(op, "_RANK", torch.tensor([3], dtype=torch.int32))
+    monkeypatch.setattr(op, "_CORES", 1)
+    monkeypatch.setattr(op, "_MESH_RANKS", MESH)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: warmup)
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm
+
+    torch._dynamo.reset()
+    fn = torch.compile(
+        lambda x: op.all_reduce_or(x, MESH, _fallback), backend=backend, dynamic=True
+    )
+    for rows in (16, 4096):
+        x = _block(rows, hidden=128)
+        torch._dynamo.mark_dynamic(x, 0)
+        fn(x)
+    torch._dynamo.reset()
+    assert len(graphs) == traces
+
+
 @pytest.mark.parametrize("draft", [False, True])
 def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draft):
     import types
