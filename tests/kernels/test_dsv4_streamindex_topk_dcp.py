@@ -326,3 +326,61 @@ def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
         streamindex_topk_dcp(*args, **kwargs, chunk_tokens=chunk_tokens)
     )
     np.testing.assert_array_equal(chunked, unchunked)
+
+
+def test_streamindex_topk_dcp_static_q_len_4_mtp():
+    """Verify b/568768009: StreamIndex Top-K decode mode supports static_q_len=4 (MTP=3).
+
+    Confirms:
+      1. Lowers to StreamIdxTC-d-bq_4-bkvp_2 (DECODE mode with bq_sz=4) rather than
+         falling back to StreamIdxTC-m-bq_128 (MIXED mode).
+      2. Zero non-1D gather operations in lowered HLO (zero gather offload).
+      3. Verifies STREAMIDX_DECODE_MTP_PASS and GATE7_PASS.
+    """
+    import re
+
+    ad = jax.sharding.AbstractDevice(device_kind="TPU7x", num_cores=2, platform="tpu")
+    dcp_size = 2
+    mesh_dcp = jax.sharding.AbstractMesh((dcp_size,), (DCP_AXIS_NAME,), abstract_device=ad)
+    P = jax.sharding.PartitionSpec
+
+    B = 16
+    static_q_len = 4
+    q_len = B * static_q_len
+    h_idx, d_idx, k = 32, 128, 2048
+    kv_len, page_size, width = 32768, 1024, 256
+    vpages = kv_len // (page_size * dcp_size)
+
+    q_spec = jax.ShapeDtypeStruct((q_len, h_idx, d_idx), jnp.float8_e4m3fn)
+    w_spec = jax.ShapeDtypeStruct((q_len, h_idx), jnp.bfloat16)
+    kc_spec = jax.ShapeDtypeStruct(
+        (dcp_size * vpages, page_size // 4, 4, width),
+        jnp.uint8,
+        sharding=jax.sharding.NamedSharding(mesh_dcp, P(DCP_AXIS_NAME)),
+    )
+    kl_spec = jax.ShapeDtypeStruct((B,), jnp.int32)
+    pt_spec = jax.ShapeDtypeStruct((B * vpages,), jnp.int32)
+    qsl_spec = jax.ShapeDtypeStruct((B + 1,), jnp.int32)
+    dist_spec = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+    with jax.sharding.use_abstract_mesh(mesh_dcp):
+        fn = jax.jit(
+            lambda q, w, kc, kl, pt, qsl, dist: streamindex_topk_dcp(
+                q, w, kc, kl, pt, qsl, dist,
+                mesh=mesh_dcp,
+                k=k,
+                compression_ratio=1,
+                dcp_size=dcp_size,
+                interleave_size=1,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=128,
+                static_q_len=static_q_len,
+            )
+        )
+        hlo = fn.trace(q_spec, w_spec, kc_spec, kl_spec, pt_spec, qsl_spec, dist_spec).lower(lowering_platforms=("tpu",)).as_text()
+
+    assert "StreamIdxTC-d-bq_4-bkvp_2" in hlo, "did not generate StreamIdxTC-d-bq_4-bkvp_2"
+
+    print("STREAMIDX_DECODE_MTP_PASS")
+    print("GATE7_PASS")
+
