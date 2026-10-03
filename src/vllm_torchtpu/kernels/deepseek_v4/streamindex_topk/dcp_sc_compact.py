@@ -88,6 +88,16 @@ def _pack_body(
     )(vals_hbm, out_hbm)
 
 
+def pack_nonnegative_ref(vals: jax.Array) -> jax.Array:
+    """CPU reference implementation of pack_nonnegative."""
+    num_rows, width = vals.shape
+    keep = vals >= 0
+    slot = jnp.cumsum(keep, axis=1, dtype=jnp.int32) - keep
+    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
+    out = jnp.full_like(vals, -1)
+    return out.at[rows, slot].set(jnp.where(keep, vals, -1))
+
+
 def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
     """Left-packs each row's non-negative entries into a `-1` padded prefix.
 
@@ -97,9 +107,12 @@ def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
     b, width = vals.shape
     if vals.dtype != jnp.int32:
         raise ValueError(f"vals must be int32, got {vals.dtype}")
-    sc = pltpu.get_tpu_info().sparse_core
+    try:
+        sc = pltpu.get_tpu_info().sparse_core
+    except Exception:
+        sc = None
     if sc is None:
-        raise NotImplementedError("SparseCore is not available")
+        return pack_nonnegative_ref(vals)
 
     # Geometry off the chip: a row per subcore, a chunk per lane.
     lanes = sc.num_lanes
@@ -245,9 +258,17 @@ def resolve_owned_winners(
             f"Expected local_idxs and slots of shape ({b}, {k}), "
             f"got {local_idxs.shape} and {slots.shape}"
         )
-    sc = pltpu.get_tpu_info().sparse_core
+    try:
+        sc = pltpu.get_tpu_info().sparse_core
+    except Exception:
+        sc = None
+
     if sc is None:
-        raise NotImplementedError("SparseCore is not available")
+        dcp_rank_i32 = jnp.asarray(dcp_rank, dtype=jnp.int32)
+        ours = (slots >= dcp_rank_i32 * k) & (slots < (dcp_rank_i32 + 1) * k)
+        cols = jnp.mod(jnp.maximum(slots, 0), k)
+        vals = jnp.where(ours, jnp.take_along_axis(local_idxs, cols, axis=1), -1)
+        return pack_nonnegative_ref(vals)
 
     lanes = sc.num_lanes
     rows_per_wave = sc.num_cores * sc.num_subcores

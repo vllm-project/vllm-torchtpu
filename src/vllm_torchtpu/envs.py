@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV: int = 16384
+    TPU_STREAMIDX_DCP_SHARDED_TOPK: bool = False
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
@@ -685,6 +686,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV": env_nonnegative_int(
         "TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", 16384
+    ),
+    "TPU_STREAMIDX_DCP_SHARDED_TOPK": env_bool(
+        "TPU_STREAMIDX_DCP_SHARDED_TOPK", default=False
     ),
     "TPU_SC_TOPK_FUSED_PAYLOAD": env_bool("TPU_SC_TOPK_FUSED_PAYLOAD", default=False),
     "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
