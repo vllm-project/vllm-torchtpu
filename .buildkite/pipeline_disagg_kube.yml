@@ -69,11 +69,8 @@ steps:
         --env CI_RUNNER
         --env CREATED_BY
 
-  # Kimi-K3 1P1D on two 2x2x4 slices, 32 chips, beside the Qwen benchmark
-  # above: the two use different queues and together fill the v7x fleet. The
-  # pipeline is scheduled once a day, at 02:00 PT, ahead of the 03:00 Kimi-K3
-  # step in pipeline_perf_kube.yml, which needs one of the same slices; the
-  # slices also serve Kimi-K3 development, so CI keeps to that window.
+  # Kimi-K3 1P1D: prefill TP8 x DP4 x EP32 to decode TP8 x DP4 x EP32, each on
+  # its own 2x2x4 slice.
   - label: ":kubernetes: :tpu: Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
     depends_on: "build_kube_disagg_image"
     timeout_in_minutes: 1440
@@ -83,4 +80,4 @@ steps:
       - kubernetes:
           podTemplate: tpu-launcher
     commands:
-      - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d.yaml
+      - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml

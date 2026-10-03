@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import nn
 from vllm.model_executor.models.kimi_k25_vit import MoonViT3dPretrainedModel
@@ -40,7 +42,7 @@ def _materialize_vision_qkv(
 class KimiK3MoonViT3dPretrainedModel(MoonViT3dPretrainedModel):
     """Upstream K3 MoonViT with TPU-safe compilation boundaries."""
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         for block in self.encoder.blocks:
             block.wqkv.register_forward_hook(_materialize_vision_qkv)

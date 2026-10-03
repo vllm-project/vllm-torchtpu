@@ -311,11 +311,6 @@
       "concise_description": "`descriptors` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/executors/kv_block_override.py",
-      "name": "bad-specialization",
-      "concise_description": "`int | None` is not assignable to upper bound `SupportsDunderGT[Any] | SupportsDunderLT[Any]` of type variable `SupportsRichComparisonT`"
-    },
-    {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
       "name": "not-iterable",
       "concise_description": "Type `None` is not iterable"
@@ -1383,52 +1378,12 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `numel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `cache_config`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "missing-attribute",
       "concise_description": "Object of type `object | None` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `variance_epsilon`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `weight`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
@@ -1444,61 +1399,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "unbound-name",
       "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[tuple[str, Unknown, Unknown, tuple[Unknown, ...], tuple[Unknown, ...]], Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `devices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_gather`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `TokenShardCollectives | Unknown | None` has no attribute `all_reduce`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -1546,21 +1446,6 @@
       "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
     },
     {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `gather_moe_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reduce_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `all_reduce`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_qwen3_vl_rope_index_patch`"
@@ -1589,66 +1474,6 @@
       "path": "src/vllm_torchtpu/omni/platform.py",
       "name": "bad-override",
       "concise_description": "Class member `OmniTpuPlatform.dist_backend` overrides parent class `TpuPlatform` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `object` is not assignable to parameter `value` with type `int | None` in function `_optional_log_value`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, Sequence[object] | int | str | None]` is not assignable to parameter `derivation` with type `dict[str, object]` in function `_log_tpu_block_size_derivation`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_block_size_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[object] | int | str | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
     },
     {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
