@@ -46,9 +46,11 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
     dp_lockstep_num_reqs,
+    install_vocab_parallel_draft_argmax,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    vocab_parallel_argmax,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -280,6 +282,7 @@ class Eagle3Proposer:
         # mtp_fused_loop.py), and whether it has run once. Built in
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
+        self._vocab_parallel_argmax = None
         self._mtp_fused_loop_warm = False
 
     @property
@@ -327,6 +330,22 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        # TPU_DRAFT_VOCAB_PARALLEL_ARGMAX: the greedy draft argmax reduces per logit
+        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
+        # The fused draft loop also argmaxes compute_logits; it keeps the
+        # full-logit path.
+        self._vocab_parallel_argmax = None
+        if (
+            envs.TPU_DRAFT_VOCAB_PARALLEL_ARGMAX
+            and not envs.VLLM_TPU_FUSED_DRAFT_LOOP
+            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
+        ):
+            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
+                self.draft_model
+            )
+            logger.info(
+                "Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax
+            )
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -1119,6 +1138,11 @@ class Eagle3Proposer:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
+            if self._vocab_parallel_argmax is not None:
+                return vocab_parallel_argmax(
+                    self.draft_model.compute_logits(hidden),
+                    self._vocab_parallel_argmax,
+                )
             return (
                 self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
             )

@@ -458,6 +458,87 @@ def maybe_share_lm_head(
         lp._gather_logits = lambda logits: logits
 
 
+@dataclass(frozen=True)
+class VocabParallelArgmax:
+    """This rank's slice of a vocab-parallel lm_head, for an argmax that
+    all-gathers one (max, index) pair per row instead of the full logits."""
+
+    org_vocab_start: int  # global id of local column 0
+    num_org_local: int  # local columns that are real (not padding / added)
+    tp_size: int
+
+
+def install_vocab_parallel_draft_argmax(
+    draft_model: torch.nn.Module,
+) -> VocabParallelArgmax | None:
+    """Make the draft's compute_logits return this rank's logit shard.
+
+    For a draft whose head is a TP-sharded VocabParallelEmbedding (the target's
+    lm_head, shared), replaces its LogitsProcessor._gather_logits with the
+    identity -- the full-logit all-gather -- so `vocab_parallel_argmax` can
+    reduce per shard. Only a draft whose logits feed nothing but an argmax may
+    take this. Returns None (and changes nothing) when it does not apply.
+    """
+    lp = resolve_draft_logits_processor(draft_model)
+    heads = [sh.head for sh in iter_mtp_shared_heads(draft_model)]
+    if not heads:
+        head = getattr(draft_model, "lm_head", None) or getattr(
+            getattr(draft_model, "model", None), "lm_head", None
+        )
+        heads = [head] if head is not None else []
+    if (
+        lp is None
+        or not hasattr(lp, "_gather_logits")
+        or len({id(h) for h in heads}) != 1
+        or getattr(heads[0], "shard_indices", None) is None
+        or getattr(heads[0], "tp_size", 1) <= 1
+        or getattr(lp, "logits_as_input", False)
+        or not getattr(lp, "scale", 1.0) > 0.0
+    ):
+        return None
+    shard = heads[0].shard_indices
+    lp._gather_logits = lambda logits: logits
+    return VocabParallelArgmax(
+        org_vocab_start=int(shard.org_vocab_start_index),
+        num_org_local=int(shard.org_vocab_end_index - shard.org_vocab_start_index),
+        tp_size=int(heads[0].tp_size),
+    )
+
+
+def vocab_parallel_argmax(
+    local_logits: torch.Tensor, info: VocabParallelArgmax
+) -> torch.Tensor:
+    """argmax over the full vocab from this rank's [rows, V/tp] logit shard.
+
+    Equal to torch.argmax over the all-gathered logits, ties included: the
+    local argmax is the first maximum within the shard, and the cross-rank
+    argmax is the first maximal rank, i.e. the lowest global id.
+    """
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    rows, width = local_logits.shape
+    if info.num_org_local < width:
+        pos = torch.arange(width, device=local_logits.device)
+        local_logits = torch.where(
+            pos < info.num_org_local,
+            local_logits,
+            torch.tensor(
+                float("-inf"), dtype=local_logits.dtype, device=local_logits.device
+            ),
+        )
+    local_idx = torch.argmax(local_logits, dim=-1, keepdim=True)
+    local_max = torch.gather(local_logits, -1, local_idx)
+    # f32 holds every vocab id exactly (< 2**24) and every bf16 logit.
+    pair = torch.cat(
+        [local_max.float(), (local_idx + info.org_vocab_start).float()], dim=-1
+    )
+    gathered = tensor_model_parallel_all_gather(pair, dim=0).view(
+        info.tp_size, rows, 2
+    )
+    best_rank = torch.argmax(gathered[..., 0], dim=0, keepdim=True)
+    return torch.gather(gathered[..., 1], 0, best_rank).view(rows).to(torch.int32)
+
+
 # Noise-token id resolution order, mirroring upstream
 # vllm/v1/worker/gpu/spec_decode/utils.py.
 _NOISE_TOKEN_KEYS = (

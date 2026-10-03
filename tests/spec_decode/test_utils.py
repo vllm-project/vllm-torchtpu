@@ -201,3 +201,76 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+# --- TPU_DRAFT_VOCAB_PARALLEL_ARGMAX: vocab-parallel draft argmax ---
+
+
+def _fake_sharded_head(start: int, end: int, tp: int):
+    head = torch.nn.Module()
+    head.tp_size = tp
+    head.shard_indices = SimpleNamespace(
+        org_vocab_start_index=start, org_vocab_end_index=end
+    )
+    return head
+
+
+def test_install_vocab_parallel_draft_argmax_on_mtp_draft():
+    draft = _make_mtp_draft(num_layers=1)
+    draft.model.logits_processor.scale = 1.0
+    head = _fake_sharded_head(9680 * 3, 9680 * 4, 16)
+    for sh in utils.iter_mtp_shared_heads(draft):
+        sh.head = head
+    info = utils.install_vocab_parallel_draft_argmax(draft)
+    assert info == utils.VocabParallelArgmax(9680 * 3, 9680, 16)
+    logits = torch.randn(2, 3)
+    assert draft.model.logits_processor._gather_logits(logits) is logits
+
+
+def test_install_vocab_parallel_draft_argmax_skips_unsharded_head():
+    draft = _make_mtp_draft(num_layers=1)
+    draft.model.logits_processor.scale = 1.0
+    gather = draft.model.logits_processor._gather_logits
+    assert utils.install_vocab_parallel_draft_argmax(draft) is None
+    assert draft.model.logits_processor._gather_logits is gather
+
+
+@pytest.mark.parametrize("tp,width,pad", [(16, 9680, 0), (4, 37, 5), (2, 8, 0)])
+def test_vocab_parallel_argmax_matches_full_argmax(monkeypatch, tp, width, pad):
+    """Each rank reduces its shard and all-gathers (max, id); the result must be
+    the full-vocab torch.argmax, first-occurrence ties across and within
+    shards included, with padding columns never chosen."""
+    import vllm.distributed as vd
+
+    rows = 16
+    g = torch.Generator().manual_seed(tp * 100 + width)
+    full = torch.randn(rows, tp * width, generator=g).to(torch.bfloat16)
+    org = tp * width - pad
+    full[0, :] = 1.0  # all tied -> id 0
+    full[1, width - 1] = full[1, width + 1] = 50.0  # tie across shards
+    full[2, 3] = full[2, 5] = 50.0  # tie within a shard
+    if pad:
+        full[3, org:] = 100.0  # padding must lose
+    shards = list(full.split(width, dim=-1))  # padding: end of global vocab
+    infos = [
+        utils.VocabParallelArgmax(r * width, max(0, min(width, org - r * width)), tp)
+        for r in range(tp)
+    ]
+    pairs = []
+    monkeypatch.setattr(
+        vd,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: pairs.append(x) or x.repeat(tp, 1),
+    )
+    for r in range(tp):
+        utils.vocab_parallel_argmax(shards[r], infos[r])
+    gathered = torch.cat(pairs, dim=0)
+    monkeypatch.setattr(
+        vd, "tensor_model_parallel_all_gather", lambda x, dim=0: gathered
+    )
+    masked = full.clone()
+    masked[:, org:] = float("-inf")
+    expected = torch.argmax(masked, dim=-1).to(torch.int32)
+    for r in range(tp):
+        out = utils.vocab_parallel_argmax(shards[r], infos[r])
+        assert torch.equal(out, expected), (r, out, expected)
