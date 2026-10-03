@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import os
 from typing import Any
 
 import jax
@@ -155,6 +156,49 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+def select_adaptive_streamidx_q_block(num_tokens: int) -> int:
+    """Adaptive bucket-aware q_block selection for streamindex_topk.
+
+    Decode buckets (T <= 64): q_block = 16 (eliminates 75% query padding waste).
+    Intermediate buckets (64 < T <= 128): q_block = 32.
+    Prefill buckets (T > 128): q_block = 64 (slashes KV cache re-streaming passes 4x).
+    """
+    if num_tokens <= 64:
+        return 16
+    elif num_tokens <= 128:
+        return 32
+    else:
+        return 64
+
+
+def _mixed_q_block(num_tokens: int) -> int:
+    """Indexer MIXED-pass query block for a static token bucket."""
+    if envs.TPU_STREAMIDX_ADAPTIVE_Q_BLOCK and os.getenv("TPU_STREAMIDX_MIXED_Q_BLOCK") is None:
+        block = select_adaptive_streamidx_q_block(num_tokens)
+        logger.info_once(
+            "Applied TPU patch: TPU_STREAMIDX_ADAPTIVE_Q_BLOCK=%d for the "
+            "%d-token indexer MIXED pass.",
+            block,
+            num_tokens,
+        )
+        return block
+    max_tokens = envs.TPU_STREAMIDX_MIXED_Q_BLOCK_MAX_TOKENS
+    if max_tokens and num_tokens > max_tokens:
+        return 128
+    block = envs.TPU_STREAMIDX_MIXED_Q_BLOCK
+    if block != 128:
+        # Trace time only (static bucket): once per bucket.
+        logger.info_once(
+            "Applied TPU patch: TPU_STREAMIDX_MIXED_Q_BLOCK=%d for the "
+            "%d-token indexer MIXED pass "
+            "(TPU_STREAMIDX_MIXED_Q_BLOCK_MAX_TOKENS=%d).",
+            block,
+            num_tokens,
+            max_tokens,
+        )
+    return block
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -239,7 +283,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 # The following parameters are tuned based on microbenchmark
                 # results.
                 num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_queries_per_block=(1, 128, _mixed_q_block(q.shape[0])),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 chunk_tokens=chunk_tokens,
             )
@@ -316,7 +360,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_queries_per_block=(1, 128, _mixed_q_block(q.shape[0])),
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, local_topk

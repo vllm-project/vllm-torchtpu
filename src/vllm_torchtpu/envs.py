@@ -82,6 +82,9 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_MIXED_Q_BLOCK: int = 128
+    TPU_STREAMIDX_MIXED_Q_BLOCK_MAX_TOKENS: int = 0
+    TPU_STREAMIDX_ADAPTIVE_Q_BLOCK: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -673,6 +676,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Query rows per block in the sparse-MLA indexer's MIXED pass, which also
+    # scores MTP verify rows (gamma + 1 per sequence). Each block streams the
+    # sequence's whole KV, so a 128-row block costs the same for 4 valid rows
+    # as for 128; smaller blocks cut decode cost and add KV passes to prefill.
+    "TPU_STREAMIDX_MIXED_Q_BLOCK": env_int("TPU_STREAMIDX_MIXED_Q_BLOCK", 128),
+    # Apply TPU_STREAMIDX_MIXED_Q_BLOCK only to token buckets of at most this
+    # many rows; larger (prefill-sized) buckets keep the 128-row block, where a
+    # small block multiplies the KV passes (~10x slower at 4096 tokens).
+    # 0 applies it to every bucket.
+    "TPU_STREAMIDX_MIXED_Q_BLOCK_MAX_TOKENS": env_int(
+        "TPU_STREAMIDX_MIXED_Q_BLOCK_MAX_TOKENS", 0
+    ),
+    # Dynamically select q_block per token bucket T (16 for T<=64, 32 for T<=128, 64 for T>128).
+    "TPU_STREAMIDX_ADAPTIVE_Q_BLOCK": env_bool(
+        "TPU_STREAMIDX_ADAPTIVE_Q_BLOCK", default=True
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
