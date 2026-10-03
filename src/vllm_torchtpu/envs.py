@@ -3,6 +3,7 @@
 
 import functools
 import os
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -678,7 +679,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
-    #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout.
+    #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
+    #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
+    #     is active with the default mode; an explicit "sal" with Raiden GLM
+    #     admission raises ValueError).
     #   "has": Pallas coalesced_kv_append(_dcp) in HEAD_ALONG_SUBLANE layout.
     #   "xla": XLA .at[].set scatter in HEAD_ALONG_SUBLANE layout.
     "VLLM_TPU_INDEXER_KV_CACHE_MODE": lambda: (
@@ -909,3 +913,14 @@ def enable_envs_cache() -> None:
 
 def __dir__() -> list[str]:
     return list(environment_variables.keys())
+
+
+def use_raiden_glm_admission() -> bool:
+    """True when Raiden KV-cache manager and GLM Stage-3 admission are both enabled."""
+    mod = sys.modules[__name__]
+    return bool(mod.TPU_USE_RAIDEN_KV_CACHE_MANAGER and mod.TPU_RAIDEN_GLM_ADMISSION)
+
+
+def is_indexer_kv_cache_mode_explicit() -> bool:
+    """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
+    return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ

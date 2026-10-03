@@ -174,7 +174,12 @@ def _resolve_indexer_kv_cache_mode(
         if int(cache_kv.shape[1]) == sal_sublane_groups
         else int(cache_kv.shape[1]) * 4
     )
-    kv_layout = indexer_kv_layout(block_size, mode=resolved)
+    kv_layout = indexer_kv_layout(block_size, mode=mode)
+    effective_mode = (
+        "has"
+        if resolved == "sal" and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+        else resolved
+    )
     expected_shape = get_kv_cache_shape(
         int(cache_kv.shape[0]),
         block_size,
@@ -188,8 +193,8 @@ def _resolve_indexer_kv_cache_mode(
             f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r}."
         )
 
-    if resolved == "xla":
-        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+    if effective_mode == "xla":
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
         return "xla", kv_layout
 
     reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, kv_layout)
@@ -199,11 +204,11 @@ def _resolve_indexer_kv_cache_mode(
                 f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r} with layout "
                 f"{kv_layout.name} cannot fall back to 'xla': {reason}"
             )
-        _warn_indexer_kv_cache_fallback_once(resolved, reason)
-        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+        _warn_indexer_kv_cache_fallback_once(effective_mode, reason)
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
         return "xla", kv_layout
 
-    _log_indexer_kv_cache_once(resolved, "pallas", kv_layout, cache_kv.shape)
+    _log_indexer_kv_cache_once(effective_mode, "pallas", kv_layout, cache_kv.shape)
     return "pallas", kv_layout
 
 
@@ -349,7 +354,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
-        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -455,7 +464,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
-        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q

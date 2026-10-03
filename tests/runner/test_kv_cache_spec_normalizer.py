@@ -5,6 +5,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 
 
@@ -406,7 +407,6 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
     import importlib
 
     from vllm_torchtpu import envs
-    from vllm_torchtpu.layers.adapter.attention import VllmTPUDeepseekV32IndexerBackend
 
     st_mod = importlib.import_module(
         "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
@@ -421,11 +421,12 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
         page_size_padded=None,
     )
 
+    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
 
     for mode in ("xla", "has"):
-        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
         shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
             nb, block_size, 1, head_size, torch.uint8
         )
@@ -453,7 +454,7 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
         assert norm.state_content_bytes == 256
         assert norm.page_size_bytes == block_size * 256
 
-    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     sal_shape = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
         nb, block_size, 1, head_size, torch.uint8
     )
@@ -503,8 +504,6 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
 def test_non_indexer_mla_specs_unaffected_by_indexer_kv_cache_mode(monkeypatch) -> None:
     """Sparse-MLA, dense-MLA, and DSv4 specs normalize identically across
     xla, has, and sal."""
-    from vllm_torchtpu import envs
-
     dense_mla = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
@@ -533,17 +532,105 @@ def test_non_indexer_mla_specs_unaffected_by_indexer_kv_cache_mode(monkeypatch) 
         "dsv4_packed": dsv4_packed,
     }
 
-    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "xla")
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "xla")
     baseline = normalize_kv_cache_specs_for_tpu(
         specs,
         torch.float8_e4m3fn,
         attention_backend=PallasAttentionBackend,
     )
     for mode in ("has", "sal"):
-        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
         current = normalize_kv_cache_specs_for_tpu(
             specs,
             torch.float8_e4m3fn,
             attention_backend=PallasAttentionBackend,
         )
         assert current == baseline
+
+
+def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
+    monkeypatch, caplog
+) -> None:
+    """Default 'sal' falls back to HAS shape/page size when Raiden GLM admission
+    is enabled, while explicit 'sal' raises ValueError and DSv4 admission alone
+    does not downgrade."""
+    import importlib
+    import logging
+
+    from vllm_torchtpu import envs
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    monkeypatch.delenv("TPU_RAIDEN_GLM_ADMISSION", raising=False)
+    monkeypatch.delenv("TPU_RAIDEN_DSV4_ADMISSION", raising=False)
+
+    nb, block_size, head_size = 8, 256, 132
+    indexer_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.uint8,
+        page_size_padded=None,
+    )
+
+    # 1. Default 'sal' + Raiden GLM admission -> HAS shape (nb, 64, 4, 256)
+    #    and 256 B/token.
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
+    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    caplog.clear()
+    shape_fallback = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        nb, block_size, 1, head_size, torch.uint8
+    )
+    assert shape_fallback == (nb, 64, 4, 256)
+    page_fallback = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes(
+        block_size, 1, head_size, torch.uint8
+    )
+    assert page_fallback == block_size * 256
+    norm_fallback = normalize_kv_cache_specs_for_tpu(
+        {"indexer": indexer_spec},
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )["indexer"]
+    assert norm_fallback.state_content_bytes == 256
+    assert norm_fallback.page_size_bytes == 65536
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "incompatible with Raiden GLM admission" in r.message
+    ]
+    assert len(warnings) == 1
+
+    # 2. Explicit 'sal' + Raiden GLM admission -> ValueError.
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+            nb, block_size, 1, head_size, torch.uint8
+        )
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        normalize_kv_cache_specs_for_tpu(
+            {"indexer": indexer_spec},
+            torch.float8_e4m3fn,
+            attention_backend=PallasAttentionBackend,
+        )
+
+    # 3. DSv4 admission alone (with GLM admission off) -> keeps SAL (132 B/token).
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "0")
+    monkeypatch.setenv("TPU_RAIDEN_DSV4_ADMISSION", "1")
+    shape_dsv4 = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        nb, block_size, 1, head_size, torch.uint8
+    )
+    assert shape_dsv4 == (nb, 33, 4, 256)
+    norm_dsv4 = normalize_kv_cache_specs_for_tpu(
+        {"indexer": indexer_spec},
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )["indexer"]
+    assert norm_dsv4.state_content_bytes == 132
+    assert norm_dsv4.page_size_bytes == 256 * 132

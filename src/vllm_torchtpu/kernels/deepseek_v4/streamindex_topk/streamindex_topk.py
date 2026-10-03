@@ -512,7 +512,7 @@ def prepare_outputs(out):
 KV_PACKING = 4
 
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
-_INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int]] = set()
+_INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int | str]] = set()
 
 
 def indexer_kv_layout(
@@ -521,20 +521,32 @@ def indexer_kv_layout(
 ) -> KVLayout:
     """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
 
-    `sal` requires `block_size` to be a positive multiple of 128. When
-    `block_size < 128` or `block_size % 128 != 0`, this helper selects
+    `sal` requires `block_size` to be a positive multiple of 128 and is not
+    supported by Raiden GLM Stage-3 admission (`build_glm_mla_pool_manifest` /
+    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry).
+    When `sal` is selected by default and Raiden GLM admission is enabled, or
+    when `block_size < 128` or `block_size % 128 != 0`, this helper selects
     `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
-    allocation and op execution always agree on the layout.
+    allocation and op execution always agree on the layout. Explicitly
+    requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
     """
-    if mode is None:
-        try:
-            from vllm_torchtpu import envs
+    try:
+        from vllm_torchtpu import envs
 
-            raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
-        except ImportError:
-            raw_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+        raiden_glm_admission = envs.use_raiden_glm_admission()
+        explicit_env = envs.is_indexer_kv_cache_mode_explicit()
+        env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+    except ImportError:
+        raiden_glm_admission = False
+        explicit_env = False
+        env_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+
+    if mode is None:
+        raw_mode = env_mode
+        explicit_mode = explicit_env
     else:
         raw_mode = mode
+        explicit_mode = True
     resolved = raw_mode.strip().lower()
     if resolved not in ("xla", "has", "sal"):
         raise ValueError(
@@ -542,6 +554,27 @@ def indexer_kv_layout(
             "expected one of ('xla', 'has', 'sal')."
         )
     if resolved == "sal":
+        if raiden_glm_admission:
+            if explicit_mode:
+                raise ValueError(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible with "
+                    "Raiden GLM admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and "
+                    "TPU_RAIDEN_GLM_ADMISSION=1), which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or unset it to allow "
+                    "automatic fallback)."
+                )
+            key: tuple[str, int | str] = (resolved, "raiden_glm_admission")
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible "
+                    "with Raiden GLM admission (which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
         if block_size < 128 or block_size % 128 != 0:
             key = (resolved, int(block_size))
             if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:

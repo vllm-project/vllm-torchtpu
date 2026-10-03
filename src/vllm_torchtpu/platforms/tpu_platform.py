@@ -406,6 +406,9 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_KV_RESHARD_TRANSPORT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

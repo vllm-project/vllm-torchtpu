@@ -1005,6 +1005,9 @@ def test_indexer_kv_cache_mode_env_validation(monkeypatch):
         "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
     )
     assert "VLLM_TPU_INDEXER_KV_CACHE_MODE" in TpuPlatform.additional_env_vars
+    assert "TPU_USE_RAIDEN_KV_CACHE_MANAGER" in TpuPlatform.additional_env_vars
+    assert "TPU_RAIDEN_GLM_ADMISSION" in TpuPlatform.additional_env_vars
+    assert "TPU_KV_RESHARD_TRANSPORT" in TpuPlatform.additional_env_vars
     assert (
         envs.DEFAULT_INDEXER_KV_CACHE_MODE
         == st_mod.DEFAULT_INDEXER_KV_CACHE_MODE
@@ -1209,13 +1212,14 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
     cu_q_lens = jnp.array([0, 2, 6], dtype=jnp.int32)
     distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
 
+    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     results = {}
     for mode, init_cache in [
         ("xla", init_has),
         ("has", init_has),
         ("sal", init_sal),
     ]:
-        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
         indexer = mla_attention_op.VllmTPUSparseAttnIndexer.__new__(
             mla_attention_op.VllmTPUSparseAttnIndexer
         )
@@ -1352,3 +1356,100 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             **common_kw,
         )
+
+
+def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):
+    """Raiden GLM admission downgrades default 'sal' to HAS with a one-time
+    warning, rejects explicit 'sal' with ValueError, and leaves 'has'/'xla' and
+    DSv4 admission unaffected."""
+    import importlib
+    import logging
+
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+
+    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
+    monkeypatch.delenv("TPU_RAIDEN_GLM_ADMISSION", raising=False)
+    monkeypatch.delenv("TPU_RAIDEN_DSV4_ADMISSION", raising=False)
+
+    # 1. No Raiden flags -> default 'sal' selects SEQ_ALONG_LANE.
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    # 2. Only one of the two flags or DSv4 admission alone -> still SEQ_ALONG_LANE.
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
+    monkeypatch.setenv("TPU_RAIDEN_DSV4_ADMISSION", "1")
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "0")
+    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    # 3. Default 'sal' + Raiden GLM admission -> HEAD_ALONG_SUBLANE + one warning.
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
+    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    assert envs.use_raiden_glm_admission()
+    assert not envs.is_indexer_kv_cache_mode_explicit()
+    caplog.clear()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "incompatible with Raiden GLM admission" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "VLLM_TPU_INDEXER_KV_CACHE_MODE=has" in warnings[0]
+
+    # 4. Explicit 'has' and 'xla' + Raiden GLM admission -> HAS, no warning.
+    for explicit_mode in ("has", "xla"):
+        caplog.clear()
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        assert envs.is_indexer_kv_cache_mode_explicit()
+        assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+        assert not [
+            r.message
+            for r in caplog.records
+            if "incompatible with Raiden GLM admission" in r.message
+        ]
+
+    # 5. Explicit 'sal' (env or mode arg) + Raiden GLM admission -> ValueError.
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    assert envs.is_indexer_kv_cache_mode_explicit()
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        st_mod.indexer_kv_layout(256)
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        st_mod.indexer_kv_layout(256, mode="sal")
+
+    # 6. _resolve_indexer_kv_cache_mode under the downgrade returns
+    #    ('pallas', HEAD_ALONG_SUBLANE) on TPU and ('xla', HEAD_ALONG_SUBLANE) on CPU.
+    cache_has = jnp.zeros((4, 64, 4, 256), dtype=jnp.uint8)
+    k_packed = jnp.zeros((8, 129), dtype=jnp.uint8)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed) == (
+        "pallas",
+        KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed) == (
+        "xla",
+        KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
