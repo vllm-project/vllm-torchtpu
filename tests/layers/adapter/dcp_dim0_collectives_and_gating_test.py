@@ -741,7 +741,7 @@ picked = [
     and n.name in {{"_merge_dcp_partials_a2a", "_merge_dcp_partials_psum_scatter"}}
 ]
 assert len(picked) == 2, f"Expected 2 merge functions, got {{len(picked)}}"
-ns = {{"jax": jax, "jnp": jnp}}
+ns = {{"jax": jax, "jnp": jnp, "envs": type("_Envs", (), {{"TPU_DCP_REDUCE_SCATTER_BF16": True}})()}}
 exec(compile(ast.fix_missing_locations(ast.Module(body=picked, type_ignores=[])), path, "exec"), ns)
 
 mesh = Mesh(np.array(jax.devices()[:4]), ("dcp",))

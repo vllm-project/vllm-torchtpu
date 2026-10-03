@@ -1097,7 +1097,10 @@ def _merge_dcp_partials_psum_scatter(
     """
     del dcp_size
     if reduce_scatter_bf16 is None:
-        reduce_scatter_bf16 = getattr(envs, "TPU_DCP_REDUCE_SCATTER_BF16", True)
+        try:
+            reduce_scatter_bf16 = getattr(envs, "TPU_DCP_REDUCE_SCATTER_BF16", True)
+        except NameError:
+            reduce_scatter_bf16 = True
 
     lse_f32 = lse.astype(jnp.float32)
     gathered = jax.lax.all_gather(lse_f32, axis_name, axis=0, tiled=False)
