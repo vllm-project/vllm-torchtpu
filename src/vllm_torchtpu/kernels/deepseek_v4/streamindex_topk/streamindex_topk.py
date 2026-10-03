@@ -1193,6 +1193,7 @@ def streamindex_topk(
         "decode_req_batch_size",
         "chunk_tokens",
         "dcp_axis_name",
+        "sharded_global_topk",
     ),
 )
 def streamindex_topk_dcp(
@@ -1216,6 +1217,7 @@ def streamindex_topk_dcp(
     decode_req_batch_size: int = 4,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    sharded_global_topk: bool | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1302,6 +1304,11 @@ def streamindex_topk_dcp(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
 
+    if sharded_global_topk is None:
+        use_sharded_topk = envs.TPU_STREAMIDX_DCP_SHARDED_TOPK
+    else:
+        use_sharded_topk = bool(sharded_global_topk)
+
     def _local(
         q,
         indexer_weights,
@@ -1336,6 +1343,48 @@ def streamindex_topk_dcp(
             interleave_size=interleave_size,
             return_scores=True,
         )
+
+        if use_sharded_topk:
+            # b/568560250: AgentX DCP - Do not replicate compute of Global TopK on all ranks (A2A sharded topK + AG).
+            # Instead of all-gathering scores to [T, dcp_size * k] on every rank, shard the query tokens T
+            # across the dcp_size ranks via all_to_all so each rank only computes sparsecore_topk on T // dcp_size rows.
+            num_tokens = q.shape[0]
+            t_per_rank = (num_tokens + dcp_size - 1) // dcp_size
+            padded_t = t_per_rank * dcp_size
+            if padded_t > num_tokens:
+                pad_len = padded_t - num_tokens
+                padded_scores = jnp.pad(scores, ((0, pad_len), (0, 0)), constant_values=-1e9)
+            else:
+                padded_scores = scores
+
+            scores_by_rank = padded_scores.reshape(dcp_size, t_per_rank, k)
+            recv_scores = lax.all_to_all(
+                scores_by_rank, dcp_axis_name, split_axis=0, concat_axis=0, tiled=True
+            )
+            # Transpose from [dcp_size, t_per_rank, k] to [t_per_rank, dcp_size, k] and reshape
+            sharded_scores = recv_scores.transpose(1, 0, 2).reshape(t_per_rank, dcp_size * k)
+
+            # Slot indices across the merged candidate width: 0 .. dcp_size * k - 1
+            slots_in = jnp.broadcast_to(
+                jnp.arange(dcp_size * k, dtype=jnp.int32)[None, :],
+                (t_per_rank, dcp_size * k),
+            )
+            winning_slots_shard = sparsecore_topk(
+                sharded_scores,
+                k,
+                row_lengths=jnp.full((t_per_rank,), dcp_size * k, dtype=jnp.int32),
+                write_empty_rows=True,
+            )
+
+            # All-gather winning slots back along the query dimension: [padded_t, k]
+            all_winning_slots = lax.all_gather(
+                winning_slots_shard, dcp_axis_name, axis=0, tiled=True
+            )[:num_tokens]
+
+            # Resolve owned winners locally on each rank from its own candidates
+            return dcp_sc_compact.resolve_owned_winners(
+                idxs[:num_tokens], all_winning_slots, k, dcp_rank
+            )
 
         # Stage 1. All-gather the scores; the indices stay home.
         scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)

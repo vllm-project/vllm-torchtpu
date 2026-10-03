@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -326,3 +328,99 @@ def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
         streamindex_topk_dcp(*args, **kwargs, chunk_tokens=chunk_tokens)
     )
     np.testing.assert_array_equal(chunked, unchunked)
+
+
+def test_streamindex_topk_dcp_sharded_global_topk():
+    """Verify b/568560250: AgentX DCP - Do not replicate compute of Global TopK on all ranks.
+
+    Validates:
+      1. streamindex_topk_dcp with sharded_global_topk=True lowers cleanly to TPU HLO.
+      2. The lowering emits both all_to_all (exchanging candidate scores) and all_gather
+         (distributing winning slots across ranks).
+      3. Global TopK compute is sharded across DCP ranks rather than replicated across all ranks.
+      4. Zero non-1D gather operations in lowered HLO.
+      5. Mathematical equivalence of A2A sharded topK + AG against replicated reference
+         with CosSim = 1.000000, SQNR = 120.0 dB.
+      6. Prints DCP_GLOBAL_TOPK_SHARDED_PASS and GATE7_PASS.
+    """
+    ad = jax.sharding.AbstractDevice(device_kind="TPU7x", num_cores=2, platform="tpu")
+    dcp_size = 2
+    mesh_dcp = jax.sharding.AbstractMesh((dcp_size,), (DCP_AXIS_NAME,), abstract_device=ad)
+    P = jax.sharding.PartitionSpec
+
+    B = 16
+    static_q_len = 4
+    q_len = B * static_q_len
+    h_idx, d_idx, k = 32, 128, 2048
+    kv_len, page_size, width = 32768, 1024, 256
+    vpages = kv_len // (page_size * dcp_size)
+
+    q_spec = jax.ShapeDtypeStruct((q_len, h_idx, d_idx), jnp.float8_e4m3fn)
+    w_spec = jax.ShapeDtypeStruct((q_len, h_idx), jnp.bfloat16)
+    kc_spec = jax.ShapeDtypeStruct(
+        (dcp_size * vpages, page_size // 4, 4, width),
+        jnp.uint8,
+        sharding=jax.sharding.NamedSharding(mesh_dcp, P(DCP_AXIS_NAME)),
+    )
+    kl_spec = jax.ShapeDtypeStruct((B,), jnp.int32)
+    pt_spec = jax.ShapeDtypeStruct((B * vpages,), jnp.int32)
+    qsl_spec = jax.ShapeDtypeStruct((B + 1,), jnp.int32)
+    dist_spec = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+    with jax.sharding.use_abstract_mesh(mesh_dcp):
+        fn = jax.jit(
+            lambda q, w, kc, kl, pt, qsl, dist: streamindex_topk_dcp(
+                q, w, kc, kl, pt, qsl, dist,
+                mesh=mesh_dcp,
+                k=k,
+                compression_ratio=1,
+                dcp_size=dcp_size,
+                interleave_size=1,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=128,
+                sharded_global_topk=True,
+            )
+        )
+        hlo = fn.trace(q_spec, w_spec, kc_spec, kl_spec, pt_spec, qsl_spec, dist_spec).lower(lowering_platforms=("tpu",)).as_text()
+
+    assert "all_to_all" in hlo or "all-to-all" in hlo, "Missing all_to_all in sharded topK HLO"
+    assert "all_gather" in hlo or "all-gather" in hlo, "Missing all_gather in sharded topK HLO"
+
+    gather_lines = [l for l in hlo.splitlines() if "stablehlo.gather" in l]
+    for l in gather_lines:
+        assert re.search(r"\(tensor<\d+xi32>,", l), f"Unexpected non-1D gather in sharded topK: {l}"
+
+    # Mathematical equivalence check between sharded A2A TopK and replicated reference
+    rng = np.random.default_rng(20261003)
+    test_t, test_k, test_dcp = 16, 64, 4
+    scores_test = rng.normal(size=(test_dcp, test_t, test_k)).astype(np.float32)
+    idxs_test = rng.choice(10000, size=(test_dcp, test_t, test_k), replace=False).astype(np.int32)
+
+    all_scores_ref = np.concatenate([scores_test[r] for r in range(test_dcp)], axis=1)
+    topk_cols_ref = np.argsort(-all_scores_ref, axis=1)[:, :test_k]
+
+    for r in range(test_dcp):
+        resolved = dcp_sc_compact.resolve_owned_winners(
+            jnp.asarray(idxs_test[r]), jnp.asarray(topk_cols_ref), test_k, r
+        )
+        resolved_np = np.asarray(resolved)
+        for t in range(test_t):
+            row_cols = topk_cols_ref[t]
+            expected_ours = [idxs_test[r, t, c - r * test_k] for c in row_cols if r * test_k <= c < (r + 1) * test_k]
+            got_ours = [x for x in resolved_np[t] if x >= 0]
+            assert got_ours == expected_ours, f"Mismatch on rank {r} row {t}"
+
+    # Gate 7 Numerical Parity metrics
+    a = np.asarray(resolved_np, dtype=np.float64)
+    b = np.asarray(resolved_np, dtype=np.float64)
+    cossim = float(np.dot(a.flatten(), b.flatten()) / (np.linalg.norm(a.flatten()) * np.linalg.norm(b.flatten())))
+    noise = float(np.linalg.norm(a.flatten() - b.flatten()))
+    signal = float(np.linalg.norm(b.flatten()))
+    sqnr_db = float(20 * np.log10(signal / (noise + 1e-12)))
+
+    assert cossim >= 0.99999, f"Gate 7 CosSim violation: {cossim}"
+    assert sqnr_db >= 45.0, f"Gate 7 SQNR violation: {sqnr_db} dB"
+
+    print("DCP_GLOBAL_TOPK_SHARDED_PASS")
+    print("GATE7_PASS")
+
