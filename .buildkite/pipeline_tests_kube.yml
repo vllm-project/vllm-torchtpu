@@ -99,9 +99,13 @@ steps:
       # test_speculative_decoding.py gets steps of its own so it runs on its
       # own chips rather than serializing behind everything else; the general
       # steps exclude the file so it is not run twice.
+      #
+      # Split by file, not by example, so a file that shares one engine
+      # across its tests starts it in one shard only.
       - label: ":kubernetes: Unit Tests - General (PR)"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 3
         env:
           SHAPE: *shape_single
         plugins:
