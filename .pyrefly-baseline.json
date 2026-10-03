@@ -67,23 +67,8 @@
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/__init__.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_same_step_prefix_hit_patch`"
-    },
-    {
-      "path": "src/vllm_torchtpu/__init__.py",
-      "name": "unbound-name",
-      "concise_description": "`input_mask` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/compilation/tpu_compiler.py",
@@ -1026,54 +1011,9 @@
       "concise_description": "Function declared to return `tuple[Unknown, Unknown]` but is missing an explicit `return`"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `cache_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `cache_config`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
-      "name": "unbound-name",
-      "concise_description": "`k_pe` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
-      "name": "unbound-name",
-      "concise_description": "`kv_c_normed` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
-      "name": "unbound-name",
-      "concise_description": "`query_pass` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
-      "name": "unbound-name",
-      "concise_description": "`key_pass` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/moe_routing.py",
@@ -1159,21 +1099,6 @@
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `cache_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `object | None` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`gate_input` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
@@ -1273,27 +1198,12 @@
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `end_forward`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `end_forward`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_speculative_tokens`"
     },
     {
       "path": "src/vllm_torchtpu/runner/utils.py",
@@ -1324,11 +1234,6 @@
       "path": "src/vllm_torchtpu/runner/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

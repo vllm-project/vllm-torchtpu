@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import zlib
+from typing import cast
 
 import torch
 from torch import nn
@@ -186,7 +187,9 @@ class KimiMoE(nn.Module):
                 topk_group=config.topk_group,
                 prefix=f"{prefix}.experts",
                 scoring_func=config.moe_router_activation_func,
-                e_score_correction_bias=self.gate.e_score_correction_bias,
+                e_score_correction_bias=cast(
+                    torch.Tensor, self.gate.e_score_correction_bias
+                ),
                 routed_scaling_factor=config.routed_scaling_factor,
                 routed_input_transform=self.routed_expert_down_proj,
                 routed_output_transform=routed_output_transform,
@@ -199,10 +202,10 @@ class KimiMoE(nn.Module):
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
             if w13_weight is None:
-                w13_weight = routed_experts.w13_weight_packed
+                w13_weight = cast(torch.Tensor, routed_experts.w13_weight_packed)
             w2_weight = getattr(routed_experts, "w2_weight", None)
             if w2_weight is None:
-                w2_weight = routed_experts.w2_weight_packed
+                w2_weight = cast(torch.Tensor, routed_experts.w2_weight_packed)
             w13_weight.data.zero_()
             w2_weight.data.zero_()
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
@@ -222,23 +225,25 @@ class KimiMoE(nn.Module):
         generator = torch.Generator(device="cpu").manual_seed(
             1234 + zlib.crc32(self.prefix.encode())
         )
+        bias_param = cast(torch.Tensor, self.gate.e_score_correction_bias)
         bias = (
             torch.randn(
-                self.gate.e_score_correction_bias.shape,
+                bias_param.shape,
                 generator=generator,
                 dtype=torch.float32,
             )
             * 0.02
         )
+        weight_param = cast(torch.Tensor, self.gate.weight)
         weight = torch.randn(
-            self.gate.weight.shape, generator=generator, dtype=torch.float32
+            weight_param.shape, generator=generator, dtype=torch.float32
         )
         # The TPU dense loader transposes weights to [input, output]. Use
         # the logical fan-in rather than depending on the stored layout.
         weight *= self.gate.input_size**-0.5
         with torch.no_grad():
-            self.gate.e_score_correction_bias.copy_(bias)
-            self.gate.weight.copy_(weight)
+            bias_param.copy_(bias)
+            weight_param.copy_(weight)
 
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False

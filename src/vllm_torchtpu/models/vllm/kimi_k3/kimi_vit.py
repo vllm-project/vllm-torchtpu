@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -45,4 +45,4 @@ class KimiK3MoonViT3dPretrainedModel(MoonViT3dPretrainedModel):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         for block in self.encoder.blocks:
-            block.wqkv.register_forward_hook(_materialize_vision_qkv)
+            cast(nn.Module, block.wqkv).register_forward_hook(_materialize_vision_qkv)

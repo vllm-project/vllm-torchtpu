@@ -985,7 +985,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             return
         profiler_config = self.vllm_config.profiler_config
-        additional_config = self.vllm_config.additional_config
+        additional_config = cast(dict[str, Any], self.vllm_config.additional_config)
         decode_kv_len_threshold = additional_config.get(
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
@@ -2071,6 +2071,7 @@ class TPUModelRunner(GPUModelRunner):
         every rank copies its own slice under the same block ids). The MLA
         latent cache and the DSA indexer cache are both such tensors.
         """
+        assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
         pool_sets: dict[int, list[torch.Tensor]] = {}
         seen: set[int] = set()
@@ -5163,6 +5164,7 @@ class TPUModelRunner(GPUModelRunner):
                 if through_handoff:
                     # The output leaves padded to the hand-off buffer; it is
                     # submitted without waiting, as between serving steps.
+                    assert self._pp_wave is not None
                     self._pp_wave.end_forward(
                         self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
                     )
@@ -5173,6 +5175,7 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(list(out.tensors.values()))
                 return (time.perf_counter() - started) * 1000.0 if profiling else None
             if through_handoff:
+                assert self._pp_wave is not None
                 self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
