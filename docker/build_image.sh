@@ -14,7 +14,7 @@ set -e
 
 # Default values
 IMAGE_TAG="vllm-torchtpu-local"
-BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
+BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-20260915"
 VLLM_SOURCE=""
 TARGET="prod"
 

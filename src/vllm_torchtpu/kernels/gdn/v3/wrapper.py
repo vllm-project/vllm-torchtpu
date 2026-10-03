@@ -107,6 +107,11 @@ def inner_kernel(
         cfg=cfg,
     )
 
+    if carry_conv_scratch_ref is not None:
+        # The next tile resumes from the state after this tile's last token,
+        # which is the final checkpoint.
+        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
+
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
     else:
@@ -114,10 +119,6 @@ def inner_kernel(
         legacy_unified.store_external_state(conv_state_slot_ref,
                                             cfg.state_plan.conv,
                                             new_conv_state, cfg)
-    if carry_conv_scratch_ref is not None:
-        # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
-        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -190,6 +191,9 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    if carry_recurrent_scratch_ref is not None:
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
     if cfg.state_plan is None:
         recurrent_slot_ref[...] = new_recurrent_state.astype(
             recurrent_slot_ref.dtype)
@@ -198,9 +202,6 @@ def inner_kernel(
         legacy_unified.store_external_state(recurrent_slot_ref,
                                             cfg.state_plan.recurrent,
                                             new_recurrent_state, cfg)
-
-    if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def outer_kernel(

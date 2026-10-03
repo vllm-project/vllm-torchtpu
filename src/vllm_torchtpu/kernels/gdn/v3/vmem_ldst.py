@@ -40,13 +40,19 @@ def load_strided_heads(vmem_ref: jax.Ref,
     lanes_per_head = head_dim // num_lanes
 
     flat_ref = vmem_ref.reshape(-1, num_lanes)
-    head_list = []
-    for head in range(num_heads):
-        head_lanes = [
-            flat_ref[lane_offset + head * lanes_per_head + lane::lanes_per_col]
-            for lane in range(lanes_per_head)
+    if lanes_per_head == 1:
+        head_list = [
+            flat_ref[lane_offset + head::lanes_per_col]
+            for head in range(num_heads)
         ]
-        head_list.append(jnp.concat(head_lanes, axis=-1))
+    else:
+        head_list = []
+        for head in range(num_heads):
+            head_lanes = [
+                flat_ref[lane_offset + head * lanes_per_head +
+                         lane::lanes_per_col] for lane in range(lanes_per_head)
+            ]
+            head_list.append(jnp.concat(head_lanes, axis=-1))
     return jnp.stack(head_list, axis=0)
 
 
@@ -83,6 +89,8 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     new_shape = vmem_ref.shape[:-2] + (col_size, )
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
+    if col_size <= num_lanes:
+        return vmem_ref.reshape(new_shape)[...]
 
     vreg_list = []
     vmem_ref = vmem_ref.reshape(-1, col_size)

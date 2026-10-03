@@ -35,21 +35,13 @@ def causal_conv1d(
 
     assert lhs.ndim == 4
 
-    out_list = []
-
-    for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
-
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k:k + 1]
-
-        if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
-
-        out_list.append(out)
+    base = 1 + cfg.prev_kernel_size - cfg.kernel_size
+    out = lhs[:, base:base + cfg.chunk_size] * conv_weight[None, 0:1]
+    for k in range(1, cfg.kernel_size):
+        out = out + (lhs[:, base + k:base + k + cfg.chunk_size] *
+                     conv_weight[None, k:k + 1])
+    if conv_bias is not None:
+        out = out + conv_bias.reshape(1, 1, 1, -1)
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last
@@ -63,15 +55,32 @@ def causal_conv1d(
     # static loops, compiler will perform loop fusion.
     for w_idx in range(cfg.window_size):
         last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
-        # Checkpoint of sequences whose last real token is at or past this
-        # window position; shorter ones are picked by the masking loop below.
-        new_conv_state = lhs[:, last_row:last_row + cfg.prev_kernel_size]
-        for c_idx in range(1, last_row):
-            new_conv_state = jnp.where(
-                c_idx == real_sizes,
-                lhs[:, c_idx:c_idx + cfg.prev_kernel_size],
-                new_conv_state,
+        if last_row > 1 and (last_row & (last_row - 1)) == 0:
+            pos = jnp.where(
+                (real_sizes >= 1) & (real_sizes < last_row),
+                real_sizes - 1,
+                last_row - 1,
             )
+            buf = lhs[:, 1:last_row + cfg.prev_kernel_size]
+            step = last_row >> 1
+            while step >= 1:
+                keep = step + cfg.prev_kernel_size - 1
+                buf = jnp.where((pos & step) != 0, buf[:, step:step + keep],
+                                buf[:, :keep])
+                step >>= 1
+            new_conv_state = buf
+        else:
+            # Checkpoint of sequences whose last real token is at or past this
+            # window position; shorter ones are picked by the masking loop below.
+            new_conv_state = lhs[:, last_row:last_row + cfg.prev_kernel_size]
+            for c_idx in range(1, last_row):
+                new_conv_state = jnp.where(
+                    c_idx == real_sizes,
+                    lhs[:, c_idx:c_idx + cfg.prev_kernel_size],
+                    new_conv_state,
+                )
         state_list.append(new_conv_state)
 
-    return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
+    state = (state_list[0][:, None]
+             if cfg.window_size == 1 else jnp.stack(state_list, axis=1))
+    return out, state

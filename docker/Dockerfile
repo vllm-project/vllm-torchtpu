@@ -2,7 +2,7 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
-ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
+ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-20260915"
 
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
