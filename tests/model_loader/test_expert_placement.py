@@ -289,3 +289,142 @@ def test_unsupported_configs_are_refused_at_construction(
     _load_format(monkeypatch, "dummy" if refusal == "load_format" else "auto")
     with pytest.raises(NotImplementedError):
         RoutedExperts.update_expert_map_info(layer)
+
+
+# GLM-5.2 checkpoint names: of its 78 decoder layers, 0-2 are dense and 3-77
+# route over 256 experts (sigmoid scores, top 8, a single expert group). The
+# router is `.mlp.gate`, with its selection bias `.mlp.gate.e_score_correction_bias`.
+# The MTP layer is stored as layer 78 under the same names, and vLLM builds its
+# experts as `model.layers.78.mlp.experts`: no `mtp` module in either name.
+GLM_GATE = "model.layers.{}.mlp.gate.weight"
+GLM_BIAS = "model.layers.{}.mlp.gate.e_score_correction_bias"
+GLM_MTP_EXPERTS = "model.layers.78.mlp.experts"
+GLM_EXPERTS, GLM_RANKS = 256, 16
+GLM_OWNED = GLM_EXPERTS // GLM_RANKS
+
+
+def _glm_table(layers, seed=0):
+    """A GLM-5.2-shaped table, 16 ranks x 16 experts: a random permutation per
+    listed layer."""
+    generator = torch.Generator().manual_seed(seed)
+    entries = {}
+    for layer in layers:
+        perm = torch.randperm(GLM_EXPERTS, generator=generator).tolist()
+        cores = [perm[r * GLM_OWNED : (r + 1) * GLM_OWNED] for r in range(GLM_RANKS)]
+        entries[str(layer)] = {"cores": cores}
+    return {
+        "shards": GLM_RANKS,
+        "experts": GLM_EXPERTS,
+        "slots_per_core": GLM_OWNED,
+        "owned_per_core": GLM_OWNED,
+        "layers": entries,
+    }
+
+
+def test_glm52_router_rows_follow_the_table(use_table):
+    use_table(_glm_table(range(3, 78)))
+    table = ep.placement()
+    rows = torch.arange(float(GLM_EXPERTS))
+    order = ep.virtual_order(table, 40)
+    for name in (GLM_GATE, GLM_BIAS):
+        placed = ep.permute_router_rows(name.format(40), rows)
+        assert placed.tolist() == [float(e) for e in order]
+        assert ep.permute_router_rows(name.format(78), rows) is rows
+    # Router row v is held by rank v // 16, in local slot v % 16.
+    for row, expert in enumerate(order):
+        rank, slot = divmod(row, GLM_OWNED)
+        assert ep.expert_map(table, 40, rank)[expert] == slot
+    for name in (
+        "model.layers.1.mlp.gate_proj.weight",
+        "model.layers.40.mlp.shared_experts.gate_proj.weight",
+        "model.layers.40.mlp.experts.3.gate_proj.weight",
+        "model.layers.40.mlp.experts.3.gate_proj.weight_scale_inv",
+    ):
+        assert ep.permute_router_rows(name, rows) is rows
+    assert ep.layer_index("model.layers.40.mlp.experts") == 40
+    assert ep.layer_index("model.layers.1.mlp") is None
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_glm52_mtp_layer_is_placed_only_when_listed(use_table, listed):
+    """The MTP layer's router rows and its experts resolve to the same layer."""
+    use_table(_glm_table([40, 78] if listed else [40]))
+    rows = torch.arange(float(GLM_EXPERTS))
+    assert ep.layer_index(GLM_MTP_EXPERTS) == (78 if listed else None)
+    for name in (GLM_GATE, GLM_BIAS):
+        assert ep.layer_index(name.format(78)) == (78 if listed else None)
+        moved = ep.permute_router_rows(name.format(78), rows) is not rows
+        assert moved == listed
+
+
+def test_glm52_weight_streams_place_the_router(use_table, installed, monkeypatch):
+    use_table(_glm_table([40]))
+    order = [float(e) for e in ep.virtual_order(ep.placement(), 40)]
+    rows = torch.arange(float(GLM_EXPERTS))
+    scale_name = "model.layers.40.mlp.experts.7.down_proj.weight_scale_inv"
+    scale = torch.ones(2)
+    weights = [
+        (GLM_GATE.format(40), rows),
+        (GLM_BIAS.format(40), rows),
+        (GLM_GATE.format(78), rows),
+        (scale_name, scale),
+    ]
+    loader = default_loader.DefaultModelLoader
+    streamer = runai_streamer_loader.RunaiModelStreamerLoader
+    monkeypatch.setattr(loader, "get_all_weights", lambda *a: iter(weights))
+    monkeypatch.setattr(streamer, "_get_weights_iterator", lambda *a: iter(weights))
+    installed()
+    for stream in (
+        loader.get_all_weights(None, None, None),
+        streamer._get_weights_iterator(None, None, None),
+    ):
+        got = dict(stream)
+        assert got[GLM_GATE.format(40)].tolist() == order
+        assert got[GLM_BIAS.format(40)].tolist() == order
+        assert got[GLM_GATE.format(78)] is rows
+        assert got[scale_name] is scale
+
+
+def _glm_moe(x, gate, bias, expert_scale, top_k=8, scaling=2.5):
+    """GLM-5.2 routing with scalar experts: the bias picks the experts, the
+    sigmoid scores weigh them, renormalized and scaled."""
+    scores = (x @ gate.T).sigmoid()
+    ids = (scores + bias).topk(top_k, dim=-1).indices
+    weights = scores.gather(-1, ids)
+    weights = weights / weights.sum(-1, keepdim=True) * scaling
+    return (weights * expert_scale[ids]).sum(-1, keepdim=True) * x
+
+
+def _glm_placed_experts(table, layer, per_expert):
+    """The ranks' local slots, rank-major, filled through the expert map as the
+    EP weight loader fills them; the grouped path reads row v on rank v // 16."""
+    placed = torch.full_like(per_expert, float("nan"))
+    for rank in range(table.ranks):
+        for expert, slot in enumerate(ep.expert_map(table, layer, rank)):
+            if slot >= 0:
+                placed[rank * table.slots + slot] = per_expert[expert]
+    return placed
+
+
+def test_glm52_placed_layer_matches_the_unplaced_layer(use_table):
+    """Placing the router weight, its bias and the experts keeps a GLM-5.2
+    layer's output; leaving any one of them in checkpoint order does not."""
+    use_table(_glm_table([40]))
+    table = ep.placement()
+    torch.manual_seed(0)
+    x = torch.randn(32, 8, dtype=torch.float64)
+    gate = torch.randn(GLM_EXPERTS, 8, dtype=torch.float64)
+    # Large next to the (0, 1) scores, so the bias changes which experts win.
+    bias = torch.randn(GLM_EXPERTS, dtype=torch.float64)
+    scale = torch.arange(1.0, GLM_EXPERTS + 1, dtype=torch.float64)
+    ref = _glm_moe(x, gate, bias, scale)
+
+    placed = {
+        "gate": ep.permute_router_rows(GLM_GATE.format(40), gate),
+        "bias": ep.permute_router_rows(GLM_BIAS.format(40), bias),
+        "expert_scale": _glm_placed_experts(table, 40, scale),
+    }
+    torch.testing.assert_close(_glm_moe(x, **placed), ref)
+    # Negative controls: one piece left in checkpoint order.
+    for piece, unplaced in (("gate", gate), ("bias", bias), ("expert_scale", scale)):
+        assert not torch.allclose(_glm_moe(x, **{**placed, piece: unplaced}), ref)
