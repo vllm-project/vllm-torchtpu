@@ -6374,7 +6374,15 @@ class TPURaidenConnectorWorker:
         return f"{host}:{self._rank_control_port(base_port)}"
 
     def _max_request_blocks(self) -> int:
-        block_size = self.vllm_config.cache_config.block_size
+        # Block ids address rank-local attention pages. PCP/DCP partition
+        # the same context axis, so one logical page spans all CP ranks.
+        # Their supported configurations use at most one of PCP/DCP > 1.
+        parallel = self.vllm_config.parallel_config
+        cp_size = max(
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        )
+        block_size = self.vllm_config.cache_config.block_size * cp_size
         max_model_len = self.vllm_config.model_config.max_model_len
         return max(1, (max_model_len + block_size - 1) // block_size)
 
