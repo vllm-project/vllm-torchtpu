@@ -1420,6 +1420,56 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
+        dcp_configured = (
+            parallel_config is not None
+            and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+        )
+        if pcp_configured and dcp_configured:
+            interleave = getattr(parallel_config, "cp_kv_cache_interleave_size", 1)
+            if interleave % kv_cache_utils.WORD_BYTES != 0:
+                raise ValueError(
+                    "PCP+DCP mixed mode needs --cp-kv-cache-interleave-size to be "
+                    f"a multiple of {kv_cache_utils.WORD_BYTES} "
+                    f"(kv_cache_utils.WORD_BYTES), got {interleave}."
+                )
+            self._validate_pcp_streaming_support(skip_kv_update)
+            self.decode_query_size = 1
+            self._pcp_streaming = True
+            self.rpa_kernel = self._build_rpa_kernel(
+                q_scale,
+                k_scale,
+                v_scale,
+                skip_kv_update=skip_kv_update,
+                use_pcp_streaming=True,
+                cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
+                block_major=self._bm_kernel,
+            )
+            if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and (
+                not isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+                or self.head_size == 64
+            ):
+                raise NotImplementedError(
+                    "DCP with HND requires the CUSTOM attention backend "
+                    "and head_size != 64."
+                )
+            dcp_group = _get_dcp_group()
+            if dcp_group is not None:
+                self.dcp_world_size = int(dcp_group.world_size)
+                self.dcp_rank = int(dcp_group.rank_in_group)
+                self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = _build_dcp_kernels(
+                    sliding_window=self.sliding_window,
+                    sm_scale=self.scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    cp_group_size=self.dcp_world_size,
+                    cp_rank=self.dcp_rank,
+                    kv_layout=self.kv_layout,
+                    decode_query_size=self.decode_query_size,
+                )
+            return
+
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
@@ -1598,7 +1648,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         vllm_config = ctx.vllm_config
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
 
-        if self.dcp_world_size > 1:
+        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+        if self.dcp_world_size > 1 and not use_pcp_streaming:
             if sink is not None or ctx.kv_cache_bundle is not None:
                 raise NotImplementedError(
                     "DCP attention does not support attention sinks or "
@@ -1615,12 +1666,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output.copy_(outputs)
             return outputs
 
-        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
         pcp_configured = (
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
-        if pcp_configured and not use_pcp_streaming:
+        if pcp_configured and not use_pcp_streaming and self.dcp_world_size <= 1:
             raise RuntimeError(
                 "PCP is configured, but attention metadata does not use "
                 "the PCP streaming sequence layout."
@@ -2004,6 +2054,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        self.pcp_size = pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+        self._pcp_mesh = None
         # Whether the DCP sparse-MLA op returns merged head slices itself.
         self.sparse_mla_dcp_merges_partials = (
             self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_A2A_MERGE
@@ -2033,18 +2086,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "zero-movedim layout, dcp=%d).",
                 self.dcp_size,
             )
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
-            pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-            if isinstance(pcp_size, int) and pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
-                    "both >1; sparse MLA has one KV-position interleave, "
-                    "not two."
-                )
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
+                mode_str = "PCP+DCP mixed mode" if self.pcp_size > 1 else "DCP sparse MLA"
                 raise ValueError(
-                    "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
+                    f"{mode_str} needs --cp-kv-cache-interleave-size to be "
                     f"a multiple of {kv_cache_utils.WORD_BYTES} "
                     f"(kv_cache_utils.WORD_BYTES), got "
                     f"{self.dcp_interleave_size}. It is also the best value for "
@@ -2052,6 +2097,19 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     "let a contiguous run of winners land on fewer ranks."
                 )
             self._dcp_mesh = get_or_create_dcp_mesh()
+            if self.pcp_size > 1:
+                try:
+                    self._pcp_mesh = get_pcp_streaming_mesh()
+                except Exception:
+                    self._pcp_mesh = None
+                logger.info_once(
+                    "Applied TPU patch: PCP+DCP mixed mode enabled (pcp=%d, dcp=%d, "
+                    "interleave_size=%d). Prefill queries route via PCP sequence parallelism, "
+                    "decode KV cache routes via DCP position interleaving.",
+                    self.pcp_size,
+                    self.dcp_size,
+                    self.dcp_interleave_size,
+                )
 
     def _get_kv_scales(
         self, layer: Any
@@ -2117,6 +2175,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
             )
+            mesh = (
+                self._pcp_mesh
+                if (self.pcp_size > 1 and self._pcp_mesh is not None)
+                else getattr(metadata, "pcp_mesh", None) or vllm_context.mesh
+            )
             return mla_attention(
                 q_nope,
                 q_pe,
@@ -2124,7 +2187,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_pe,
                 kv_cache,
                 metadata,
-                vllm_context.mesh,
+                mesh,
                 layer.num_heads,
                 layer.qk_nope_head_dim,
                 sm_scale=layer.scale,

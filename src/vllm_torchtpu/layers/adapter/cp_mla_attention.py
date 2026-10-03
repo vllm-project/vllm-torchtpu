@@ -206,3 +206,69 @@ def _weight_by_lse(
     if reduce_scatter_bf16:
         return weighted.to(output.dtype).contiguous()
     return weighted.contiguous()
+
+
+def is_pcp_dcp_mixed_mode(parallel_config: Any) -> bool:
+    """Return whether both PCP and DCP are enabled concurrently."""
+    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+    dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+    return (
+        isinstance(pcp_size, int)
+        and pcp_size > 1
+        and isinstance(dcp_size, int)
+        and dcp_size > 1
+    )
+
+
+def validate_pcp_dcp_mixed_mode(parallel_config: Any) -> dict[str, Any]:
+    """Validate and return execution parameters for PCP+DCP mixed mode."""
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    interleave_size = int(
+        getattr(parallel_config, "cp_kv_cache_interleave_size", 1) or 1
+    )
+
+    if pcp_size > 1 and dcp_size > 1:
+        if interleave_size % kv_cache_utils.WORD_BYTES != 0:
+            raise ValueError(
+                "PCP+DCP mixed mode requires cp_kv_cache_interleave_size to be a "
+                f"multiple of {kv_cache_utils.WORD_BYTES} "
+                f"(kv_cache_utils.WORD_BYTES), got {interleave_size}."
+            )
+
+    return {
+        "is_mixed_mode": pcp_size > 1 and dcp_size > 1,
+        "pcp_size": pcp_size,
+        "dcp_size": dcp_size,
+        "interleave_size": interleave_size,
+    }
+
+
+def get_mixed_mode_mesh_routing(
+    parallel_config: Any,
+    *,
+    is_prefill: bool,
+    default_mesh: Any = None,
+) -> tuple[str, Any]:
+    """Route mixed mode execution to the appropriate communication mesh.
+
+    Prefill queries route to PCP sequence parallel mesh; decode KV cache
+    routes to DCP KV cache mesh.
+    """
+    from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+        get_pcp_streaming_mesh,
+    )
+
+    if not is_pcp_dcp_mixed_mode(parallel_config):
+        return ("default", default_mesh)
+
+    if is_prefill:
+        try:
+            return ("pcp", get_pcp_streaming_mesh())
+        except Exception:
+            return ("pcp_fallback", default_mesh)
+    else:
+        return ("dcp", get_or_create_dcp_mesh())

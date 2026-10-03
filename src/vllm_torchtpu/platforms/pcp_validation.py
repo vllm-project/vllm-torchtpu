@@ -82,8 +82,11 @@ class PcpStaticSupportValidator:
         if not config.enabled:
             return config
 
-        if config.dcp_size > 1:
-            raise NotImplementedError("PCP runner path does not support DCP yet.")
+        if config.dcp_size > 1 and config.dcp_size != config.pcp_size:
+            raise NotImplementedError(
+                f"PCP runner path requires pcp_size ({config.pcp_size}) == dcp_size ({config.dcp_size}) "
+                "for mixed PCP+DCP mode; differing parallel degrees are not supported."
+            )
         if config.pipeline_parallel_size != 1:
             raise NotImplementedError(
                 "PCP runner path does not support pipeline parallelism yet."

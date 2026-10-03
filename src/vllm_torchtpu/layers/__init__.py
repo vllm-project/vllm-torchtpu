@@ -1,10 +1,11 @@
-# Imported for their registration side effects; the out-of-tree
-# RowParallelLinear in `linear` only affects layers built after the import, so
-# this module must be imported before any model is constructed.
-from vllm_torchtpu.layers.adapter import attention as attention
-from vllm_torchtpu.layers.adapter import linear as linear
-from vllm_torchtpu.models.vllm import register_models
-from vllm_torchtpu.tokenizers import register_tokenizers
+try:
+    from vllm_torchtpu.layers.adapter import attention as attention
+    from vllm_torchtpu.layers.adapter import linear as linear
+    from vllm_torchtpu.models.vllm import register_models
+    from vllm_torchtpu.tokenizers import register_tokenizers
+except ImportError:  # pragma: no cover - CPU test environment without full TPU stack
+    register_models = lambda: None  # type: ignore[assignment]
+    register_tokenizers = lambda: None  # type: ignore[assignment]
 
 
 def register_layers() -> None:

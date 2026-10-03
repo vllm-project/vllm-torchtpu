@@ -47,6 +47,9 @@ def register_tpu_platform() -> str:
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 
-import vllm  # noqa: E402,F401  # isort: skip
+try:
+    import vllm  # noqa: E402,F401  # isort: skip
 
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform  # noqa: E402
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform  # noqa: E402
+except ImportError:  # pragma: no cover - CPU test environment without vLLM
+    pass

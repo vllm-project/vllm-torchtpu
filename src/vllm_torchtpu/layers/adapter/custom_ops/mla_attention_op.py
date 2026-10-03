@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -63,7 +64,10 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -204,13 +208,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         dcp_size = dcp_size if isinstance(dcp_size, int) else 1
         self.topk_op_dcp = None
         self.dcp_size = dcp_size
+        self.pcp_size = pcp_size
         if dcp_size > 1:
             if pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={dcp_size} are both >1; "
-                    "the sparse indexer shards its K cache by position on "
-                    "whichever axis it is given and has no layout for two at "
-                    "once."
+                interleave = getattr(parallel_config, "cp_kv_cache_interleave_size", 1)
+                if interleave % kv_cache_utils.WORD_BYTES:
+                    raise ValueError(
+                        "PCP+DCP mixed mode needs --cp-kv-cache-interleave-size to be "
+                        f"a multiple of {kv_cache_utils.WORD_BYTES} "
+                        f"(kv_cache_utils.WORD_BYTES), got {interleave}."
+                    )
+                logger.info_once(
+                    "Applied TPU patch: PCP+DCP mixed mode enabled in VllmTPUSparseAttnIndexer "
+                    "(pcp=%d, dcp=%d, interleave=%d).",
+                    pcp_size,
+                    dcp_size,
+                    interleave,
                 )
             assert parallel_config is not None
             self.topk_op_dcp = self._build_streamidx_dcp_op(
