@@ -104,6 +104,26 @@ def test_all_reduce_cap_is_96_rows(armed, rows, armed_expected):
     assert ar.called is armed_expected
 
 
+@pytest.mark.parametrize(
+    "rows,armed_expected", [(16, True), (32, True), (33, False), (4096, False)]
+)
+def test_all_reduce_cap_follows_the_env(armed, monkeypatch, rows, armed_expected):
+    """TPU_SMALL_ALL_REDUCE_MAX_ROWS moves the cap; a mixed-step block above
+    it keeps vLLM's collective (with the rank read)."""
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    ar, _ = armed
+    x = _block(rows, hidden=2 * CORES * 128)
+    out = op.all_reduce_or(x, MESH, _fallback)
+    assert ar.called is armed_expected
+    if not armed_expected:
+        torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
+
+
+def test_all_reduce_cap_env_zero_keeps_the_default(armed, monkeypatch):
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0)
+    assert op.max_rows() == op.MAX_ROWS
+
+
 def test_large_block_fallback_depends_on_the_rank_buffer(armed, monkeypatch):
     """The retain is a live read: a NaN rank buffer poisons the result, which a
     read the compiler could drop would not."""

@@ -55,6 +55,13 @@ MAX_ROWS = 96
 # XLA through 24 rows, ties at 32 and loses at 64 (j-de6349e8).
 COMBINE_MAX_ROWS = 24
 
+
+
+def max_rows() -> int:
+    """The all-reduce row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else MAX_ROWS."""
+    return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
+
+
 _AR_OP = None
 _RS_OP = None
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
@@ -151,7 +158,7 @@ def prebuild() -> None:
         "backbone warmup traces only; the MTP drafter and eager steps keep "
         "vLLM's collectives",
         _CORES,
-        MAX_ROWS,
+        max_rows(),
         COMBINE_MAX_ROWS,
         all_reduce.ONE_SHOT_MAX_BYTES,
         tp_all_reduce,
@@ -188,7 +195,7 @@ def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
         return fallback(x)
     if not _fits(x, _CORES * LANES):
         return fallback(x)
-    if x.shape[0] <= MAX_ROWS:
+    if x.shape[0] <= max_rows():
         return _AR_OP(x, _RANK)
     return retain(fallback(x))
 
