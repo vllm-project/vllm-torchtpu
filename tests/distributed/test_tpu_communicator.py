@@ -96,3 +96,38 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+def test_all_reduce_goes_through_the_small_collective_bridge(monkeypatch, communicator):
+    base = Mock(return_value=torch.tensor([7.0]))
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", base)
+    bridge = Mock(side_effect=lambda x, ranks, fallback: fallback(x))
+    monkeypatch.setattr(comm.small_all_reduce_op, "all_reduce_or", bridge)
+    communicator.ranks = [0, 1]
+    x = torch.ones(2, 4)
+    assert communicator.all_reduce(x) is base.return_value
+    (block, ranks, _), _ = bridge.call_args
+    assert block is x and ranks == [0, 1]
+    base.assert_called_once_with(x)
+
+
+def test_all_reduce_unarmed_is_the_base_all_reduce(monkeypatch, communicator):
+    base = Mock(return_value=torch.tensor([7.0]))
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", base)
+    monkeypatch.setattr(comm.small_all_reduce_op, "_AR_OP", None)
+    communicator.ranks = [0, 1]
+    x = torch.ones(2, 4, dtype=torch.bfloat16)
+    assert communicator.all_reduce(x) is base.return_value
+    base.assert_called_once_with(x)
+
+
+def test_combine_goes_through_the_small_collective_bridge(monkeypatch, communicator):
+    group = Mock(world_size=2)
+    group.reduce_scatter.return_value = torch.tensor([[11.0, 12.0]])
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    bridge = Mock(side_effect=lambda x, fallback: fallback(x))
+    monkeypatch.setattr(comm.small_all_reduce_op, "dp_combine_or", bridge)
+    x = torch.ones(2, 2)
+    assert communicator.combine(x) is group.reduce_scatter.return_value
+    assert bridge.call_args.args[0] is x
+    group.reduce_scatter.assert_called_once_with(x, dim=0)
