@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.runner.structured_decoding_manager import StructuredDecodingManager
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 
 VOCAB_SIZE = 64  # 2 packed int32 words per bitmask row.
 ALLOW_ALL = -1  # All 32 bits set.

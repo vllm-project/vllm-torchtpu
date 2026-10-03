@@ -136,7 +136,6 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
-from vllm_torchtpu.runner.structured_decoding_manager import StructuredDecodingManager
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -159,6 +158,7 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, normalize_draft_config
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
