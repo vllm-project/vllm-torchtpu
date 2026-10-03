@@ -22,13 +22,16 @@ the exported op.
 Each DCP rank stores a shard of the KV cache, so it can only produce a
 *partial* attention result.
 
-  1. `all_gather_heads` widens this rank's query head slice to the whole
-     group's heads, so every rank's heads are attended against every rank's
-     KV shard.
+  1. `all_gather_heads` / `all_gather_q_nope_pe_heads` widens this rank's
+     query head slice to the whole group's heads using head-major `dim=0`
+     collectives so `DeviceCommunicatorBase.all_gather` performs zero
+     post-collective `movedim(0, 1)` layout copies.
   2. the kernel runs against this rank's shard alone, returning a partial
      output and its log-sum-exp.
   3. `merge_lse_partials_scatter_heads` folds the partials into the exact
-     whole-context result and narrows the head axis back to this rank's own.
+     whole-context result in head-major `[H, T, D]` layout and scatters along
+     `dim=0`, eliminating `DeviceCommunicatorBase.reduce_scatter`'s pre- and
+     post-collective `movedim(0, 1).contiguous()` copies (`OFFLOAD_DATA_FORMATTING`).
 """
 
 from __future__ import annotations
@@ -47,6 +50,13 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     reallocates dcp ways from heads to sequence positions, reducing
     head sharding from tp to tp // dcp.
 
+    Runs the underlying collective along `dim=0` on head-major
+    `[tp_local_num_heads, num_tokens, dim]` so `DeviceCommunicatorBase.all_gather`
+    returns a zero-copy view of `dist.all_gather_into_tensor` without an extra
+    `movedim(0, 1).reshape(...)` copy. When `q` comes from `torch.bmm(q_nope_t, w_uk_t)`
+    transposed from `[H_local, T, D]`, `q.transpose(0, 1).contiguous()` is also a
+    zero-copy no-op.
+
     Args:
       q: `[num_tokens, tp_local_num_heads, dim]`, this rank's head slice.
 
@@ -57,7 +67,35 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return q
-    return group.all_gather(q.contiguous(), dim=1)
+    q_hm = q.transpose(0, 1).contiguous()
+    gathered_hm = group.all_gather(q_hm, dim=0)
+    return gathered_hm.transpose(0, 1).contiguous()
+
+
+def all_gather_q_nope_pe_heads(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused head-major `dim=0` all-gather of `(ql_nope, q_pe)` across DCP ranks.
+
+    Eliminates the intermediate contiguous `q_dcp` materialization inside
+    `DeviceCommunicatorBase.all_gather(..., dim=1)` by:
+      1. Concatenating `(ql_nope, q_pe)` directly in head-major
+         `[H_local, T, D_nope + D_pe]`.
+      2. Gathering along `dim=0` so `DeviceCommunicatorBase.all_gather` returns a
+         zero-copy view of the collective output buffer (`[H_dcp, T, D_nope + D_pe]`).
+      3. Slicing `ql_nope_dcp` and `q_pe_dcp` and transposing to `[T, H_dcp, D]`
+         in a single materialization pass.
+    """
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return ql_nope, q_pe
+    q_cat_hm = torch.cat([ql_nope.transpose(0, 1), q_pe.transpose(0, 1)], dim=-1)
+    q_dcp_hm = group.all_gather(q_cat_hm, dim=0)
+    ql_nope_dcp = q_dcp_hm[..., :kv_lora_rank].transpose(0, 1).contiguous()
+    q_pe_dcp = q_dcp_hm[..., kv_lora_rank:].transpose(0, 1).contiguous()
+    return ql_nope_dcp, q_pe_dcp
 
 
 def merge_lse_partials_scatter_heads(
@@ -73,7 +111,12 @@ def merge_lse_partials_scatter_heads(
 
       1. all-gather the log-sum-exps. They are `[num_tokens, num_heads]` f32 --
          Leaves every rank holding every `lse_r`.
-      2. reduce-scatter the weighted outputs
+      2. reduce-scatter the weighted outputs in head-major `[num_heads, num_tokens, D]`
+         along `dim=0`, so `DeviceCommunicatorBase.reduce_scatter`'s pre- and
+         post-collective `movedim(0, dim).contiguous()` calls are zero-copy no-ops,
+         and the returned `.transpose(0, 1)` view unwraps back to contiguous
+         `[tp_local_num_heads, num_tokens, kv_lora_rank]` for the downstream
+         `torch.bmm(outputs_t, w_uv)` projection.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
@@ -85,19 +128,28 @@ def merge_lse_partials_scatter_heads(
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
-      this rank's head slice of the whole-context result.
+      this rank's head slice of the whole-context result (backed by contiguous
+      head-major `[tp_local_num_heads, num_tokens, kv_lora_rank]` storage).
     """
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return output
 
-    weighted = _weight_by_lse(output, lse, group)
-    return group.reduce_scatter(weighted, dim=1).to(output.dtype)
+    weighted_hm = _weight_by_lse(output, lse, group)
+    scattered_hm = group.reduce_scatter(weighted_hm, dim=0).to(output.dtype)
+    return scattered_hm.transpose(0, 1)
 
 
 def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """This rank's `softmax_r(lse) * o_r` term, in f32."""
-    lse_f32 = lse.to(torch.float32).contiguous()
+    """This rank's `softmax_r(lse) * o_r` term, materialized once in head-major
+    `f32[num_heads, num_tokens, kv_lora_rank]` for zero-`movedim`
+    `reduce_scatter(dim=0)`.
+    """
+    lse_f32 = (
+        lse
+        if (lse.dtype == torch.float32 and lse.is_contiguous())
+        else lse.to(torch.float32).contiguous()
+    )
     # [world_size, num_tokens, num_heads]: small, and it removes the need for
     # any further reduction over the denominator.
     gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
@@ -105,19 +157,15 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
         gathered = torch.cat(list(gathered), dim=0)
 
     finite = torch.isfinite(gathered)
-    shift = torch.where(
-        finite, gathered, torch.full_like(gathered, float("-inf"))
-    ).amax(dim=0)
+    shift = torch.where(finite, gathered, -float("inf")).amax(dim=0)
     # A token with no contributor on any rank would give inf - inf; pin the
     # shift to 0 there and let the zero denominator carry the result to zero.
     empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, torch.zeros_like(shift), shift)
+    shift = torch.where(empty, 0.0, shift)
 
-    weights = torch.where(
-        finite, torch.exp(gathered - shift.unsqueeze(0)), torch.zeros_like(gathered)
-    )
+    weights = torch.where(finite, torch.exp(gathered - shift.unsqueeze(0)), 0.0)
     denom = weights.sum(dim=0)
-    safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+    safe_denom = torch.where(denom > 0, denom, 1.0)
 
     # This rank's row of `gathered` is `lse_f32` itself. Weighting from the
     # local copy instead of indexing by rank keeps the rank out of the traced
@@ -126,8 +174,12 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
         torch.where(
             torch.isfinite(lse_f32),
             torch.exp(lse_f32 - shift),
-            torch.zeros_like(lse_f32),
+            0.0,
         )
         / safe_denom
     )
-    return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
+    # Transpose bf16 `output` and f32 `mine` as zero-copy views before upcasting
+    # so the f32 product is materialized once in head-major `[H, T, D]` layout.
+    output_hm = output.transpose(0, 1)
+    mine_hm = mine.transpose(0, 1).unsqueeze(-1)
+    return (output_hm.to(torch.float32) * mine_hm).contiguous()
