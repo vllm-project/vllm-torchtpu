@@ -1304,9 +1304,15 @@ def streamindex_topk_dcp(
 
     parsed_layout = KVLayout.parse(kv_layout)
     if single_stage_score_ag is None:
-        max_kv_env = int(
-            os.environ.get("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "0") or "0"
-        )
+        try:
+            from vllm_torchtpu import envs
+
+            max_kv_env = int(envs.TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV)
+        except Exception:
+            max_kv_env = int(
+                os.environ.get("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "16384")
+                or "16384"
+            )
         page_sz = (
             cache_kv.shape[3]
             if parsed_layout == KVLayout.SEQ_ALONG_LANE

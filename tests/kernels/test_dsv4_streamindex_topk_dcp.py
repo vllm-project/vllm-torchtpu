@@ -343,12 +343,12 @@ def test_dcp_tpu7x_lowering_zero_2d_gather_and_single_stage_score_ag(monkeypatch
 
     # Verify env threshold `TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV`.
     monkeypatch.setenv("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "32768")
-    streamindex_topk_dcp._clear_cache()
+    jax.clear_caches()
     hlo_env_enabled = _lower_dcp()
     assert "(tensor<128x16384xi32>) -> tensor<128x32768xi32>" in hlo_env_enabled
 
     monkeypatch.setenv("TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", "16384")
-    streamindex_topk_dcp._clear_cache()
+    jax.clear_caches()
     hlo_env_disabled = _lower_dcp()
     assert "(tensor<128x2048xi32>) -> tensor<128x4096xi32>" in hlo_env_disabled
 
