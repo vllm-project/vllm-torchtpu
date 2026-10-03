@@ -243,6 +243,8 @@ def kernel(
 
     def transpose_to_head_major(bq_rows, n_tok):
         """[n_tok*H, D] head-minor rows -> [H*n_tok, D] head-major rows."""
+        if bq_rows.ndim == 2:
+            bq_rows = bq_rows.reshape(n_tok, num_q_heads, head_dim)
         return bq_rows.transpose(1, 0, 2).reshape(num_q_heads * n_tok, head_dim)
 
     def reduce_heads(bq_rows, bkv, bq_weights, head_major=False):
@@ -624,6 +626,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "return_raw_scores",
+        "static_q_len",
     ),
 )
 def streamindex_topk(
@@ -654,6 +657,7 @@ def streamindex_topk(
     values: jax.Array | None = None,
     return_scores: bool = False,
     return_raw_scores: bool = False,
+    static_q_len: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -772,10 +776,11 @@ def streamindex_topk(
             f"buffer_count must be a 3-tuple or a single integer, got {buffer_count}"
         )
 
-    if chunk_tokens is not None and chunk_tokens % decode_req_batch_size:
+    decode_tile_tokens = decode_req_batch_size * (static_q_len or 1)
+    if chunk_tokens is not None and chunk_tokens % decode_tile_tokens:
         raise ValueError(
             f"chunk_tokens ({chunk_tokens}) must be a multiple of"
-            f" decode_req_batch_size ({decode_req_batch_size}), or a cut can"
+            f" decode_tile_tokens ({decode_tile_tokens}), or a cut can"
             " fall inside a decode block and split it across two chunks."
         )
 
@@ -853,11 +858,10 @@ def streamindex_topk(
         chunk_idx=0,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
-        # Only support batching for decode sequences.
-        # TODO: support batching for decode sequences with speculative decoding
-        # enabled, e.g. static_q_len = gamma + 1.
+        # Support batching for decode sequences (including speculative decoding
+        # with static_q_len = gamma + 1, e.g. static_q_len = 4 for MTP=3).
         if seq_batch_size > 1:
-            assert static_q_len == 1
+            assert static_q_len in (1, 2, 4, 8) or static_q_len is None
 
         chunked = chunk_token_start is not None
         if not chunked:
@@ -954,11 +958,12 @@ def streamindex_topk(
 
     def _pass_specs(decode_batch_end):
         """`run_scores_kernel` kwargs for the three passes over the batch."""
+        decode_static_q_len = static_q_len if static_q_len is not None else 1
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
             buffer_count=buffer_counts[0],
-            static_q_len=1,
+            static_q_len=decode_static_q_len,
             case=MlaCase.DECODE,
         )
         return (
@@ -1236,6 +1241,7 @@ def streamindex_topk(
         "dcp_axis_name",
         "single_stage_score_ag",
         "single_stage_return_global",
+        "static_q_len",
     ),
 )
 def streamindex_topk_dcp(
@@ -1262,6 +1268,7 @@ def streamindex_topk_dcp(
     dcp_axis_name: str = DCP_AXIS_NAME,
     single_stage_score_ag: bool | None = None,
     single_stage_return_global: bool = False,
+    static_q_len: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1360,6 +1367,7 @@ def streamindex_topk_dcp(
                 interleave_size=interleave_size,
                 return_scores=False,
                 return_raw_scores=True,
+                static_q_len=static_q_len,
             )
             all_scores = lax.all_gather(
                 local_scores, dcp_axis_name, axis=1, tiled=True
@@ -1431,6 +1439,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            static_q_len=static_q_len,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
