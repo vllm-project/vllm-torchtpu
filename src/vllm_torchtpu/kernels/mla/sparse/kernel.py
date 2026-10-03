@@ -555,6 +555,7 @@ def prepare_outputs(
         "sparsecore_atoms_per_batch",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
+        "is_dcp_mode",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -581,6 +582,7 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    is_dcp_mode: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -697,6 +699,7 @@ def sparse_ragged_paged_attention(
         cu_q_lens,
         page_size=page_size,
         total_num_pages=cache_kv_nope.shape[0],
+        is_dcp_mode=is_dcp_mode,
     )
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
@@ -732,6 +735,7 @@ def sparse_ragged_paged_attention(
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+            is_dcp_mode=is_dcp_mode,
         )
         if return_lse:
             q, lse = result
@@ -752,6 +756,7 @@ def prepare_gather_indices(
     *,
     page_size: int,
     total_num_pages: int,
+    is_dcp_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Per-token valid top-k counts and flat cache row indices to gather.
 
@@ -782,16 +787,26 @@ def prepare_gather_indices(
             page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
         )
 
-        # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
-        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
-        physical_indices = page_ids * page_size + token_offset
+        if is_dcp_mode:
+            physical_indices = jnp.where(
+                is_padding, dsa_gather.SKIP_INDEX, page_ids * page_size + token_offset
+            )
+        else:
+            # Scatter "-1" padding across the cache to avoid read hot spots.
+            scattered_page_ids = (flat_element_index * 104729) % total_num_pages
+            scattered_token_offset = (flat_element_index * 15485863) % page_size
+            page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+            token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
+            physical_indices = page_ids * page_size + token_offset
     else:
-        total_tokens = total_num_pages * page_size
-        scattered_physical = (flat_element_index * 15485863) % total_tokens
-        physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
+        if is_dcp_mode:
+            physical_indices = jnp.where(
+                is_padding, dsa_gather.SKIP_INDEX, topk_indices
+            )
+        else:
+            total_tokens = total_num_pages * page_size
+            scattered_physical = (flat_element_index * 15485863) % total_tokens
+            physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)
     return kv_lens, physical_indices
@@ -821,6 +836,7 @@ def sparse_attention_chunk(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    is_dcp_mode: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -993,6 +1009,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=sparsecore_atoms_per_batch,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                is_dcp_mode=is_dcp_mode,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
@@ -1005,6 +1022,7 @@ def sparse_attention_chunk(
             cache_kv_rope,
             indices.reshape(-1),
             num_valid_indices=num_valid_indices,
+            is_dcp_mode=is_dcp_mode,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,
@@ -1025,3 +1043,139 @@ def sparse_attention_chunk(
         kernel_batch_size=kernel_batch_size,
         lse=lse,
     )
+
+
+_PREFILL_QSHARD_RUNGS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
+
+
+def select_qshard_slice_rung(max_k: jax.Array) -> jax.Array:
+    """Select the active dynamic KV slice rung index in [0, len(_PREFILL_QSHARD_RUNGS)].
+
+    0: max_k == 0 (0-Bypass fastpath; no kernel launch).
+    1..6: Rung in (64, 128, 256, 512, 1024, 2048).
+    """
+    branch_idx = jnp.int32(0)
+    for idx, rung in enumerate(_PREFILL_QSHARD_RUNGS, start=1):
+        prev_rung = _PREFILL_QSHARD_RUNGS[idx - 2] if idx > 1 else 0
+        branch_idx = jnp.where(max_k > prev_rung, jnp.int32(idx), branch_idx)
+    return jnp.clip(branch_idx, 0, len(_PREFILL_QSHARD_RUNGS))
+
+
+def filter_padding_and_bound_gather_window(
+    topk_indices: jax.Array,
+    rung: int,
+) -> jax.Array:
+    """Bounds the SparseCore gather window by slicing or padding topk_indices to rung width.
+
+    In DCP prefill mode (global topk=2048 under DCP=16), each rank owns ~1/16 of winners.
+    This function slices topk_indices to the active rung width (e.g. 64, 128, 256, 512, 1024, 2048),
+    eliminating ~15/16 gather padding slots and bounding SparseCore DMA to active winners.
+    """
+    if topk_indices.shape[-1] >= rung:
+        return topk_indices[:, :rung]
+    return jnp.pad(
+        topk_indices,
+        ((0, 0), (0, rung - topk_indices.shape[-1])),
+        constant_values=-1,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "k_scale",
+        "attention_kernel_batch_size",
+        "gather_and_attention_chunk_size",
+        "vmem_limit_bytes",
+        "cache_layout",
+        "sparsecore_atoms_per_batch",
+        "sparsecore_gather_wait_mode",
+        "sparsecore_gather_pipelined",
+        "is_dcp_mode",
+    ),
+)
+def dispatch_sparse_mla_prefill_qshard(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array | None,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    gather_and_attention_chunk_size: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    cache_layout: str = TENSORCORE_CACHE_LAYOUT,
+    sparsecore_atoms_per_batch: int = 16,
+    sparsecore_gather_wait_mode: str = "overlap_rope",
+    sparsecore_gather_pipelined: bool = True,
+    is_dcp_mode: bool = True,
+    owns: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Gen-21 Prefill SparseCore QSHARD Merge & 15/16 Padding Elimination.
+
+    Under DCP=16 (e.g. 4096-token prefill), each rank receives global topk=2048 slots per query
+    even though each rank only owns ~1/16 of the winners, resulting in ~15/16 gather padding slots.
+    This dispatch:
+    1. Computes `max_k` across tokens owned by this rank.
+    2. Branch 0 (max_k == 0): 0-Bypass fastpath returning zeros and -inf LSE immediately.
+    3. Branches 1..6: Selects the smallest rung in `(64, 128, 256, 512, 1024, 2048)` >= max_k,
+       bounds topk_indices to `rung` width via `filter_padding_and_bound_gather_window`,
+       and launches `sparse_ragged_paged_attention` with `is_dcp_mode=True`, eliminating up to
+       15/16 of SparseCore gather and TensorCore VMEM/Einsum overhead.
+    """
+    if owns is None:
+        owns = jnp.any(topk_indices >= 0, axis=-1)
+
+    actual_k = jnp.where(owns, jnp.sum(topk_indices >= 0, axis=-1), jnp.int32(0))
+    max_k = jnp.max(actual_k)
+
+    branch_idx = select_qshard_slice_rung(max_k)
+
+    num_tokens, actual_num_q_heads, actual_head_dim = q.shape
+
+    # For unowned rows, set dummy index 0 so that sliced sub_topk still has kv_len >= 1
+    # for any non-zero branch that executes.
+    safe_topk_indices = topk_indices.at[:, 0].set(
+        jnp.where(owns, topk_indices[:, 0], jnp.int32(0))
+    )
+
+    def _branch_0(_):
+        out = jnp.zeros(
+            (num_tokens, actual_num_q_heads, actual_head_dim), dtype=q.dtype
+        )
+        lse = jnp.full((num_tokens, actual_num_q_heads), -jnp.inf, dtype=jnp.float32)
+        return out, lse
+
+    def _make_rung_branch(rung: int):
+        def _branch(_):
+            sub_topk = filter_padding_and_bound_gather_window(safe_topk_indices, rung)
+            return sparse_ragged_paged_attention(
+                q,
+                cache_kv_nope,
+                cache_kv_rope,
+                sub_topk,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+                attention_kernel_batch_size=attention_kernel_batch_size,
+                vmem_limit_bytes=vmem_limit_bytes,
+                return_lse=True,
+                cache_layout=cache_layout,
+                sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+                sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
+                sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+                is_dcp_mode=is_dcp_mode,
+            )
+        return _branch
+
+    branches = [_branch_0] + [_make_rung_branch(r) for r in _PREFILL_QSHARD_RUNGS]
+    return jax.lax.switch(branch_idx, branches, None)
+

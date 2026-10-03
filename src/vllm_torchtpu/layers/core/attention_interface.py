@@ -1312,7 +1312,6 @@ def sparse_mla_attention_dcp(
         # cheapest dummy; the softmax it produces is real but meaningless, and
         # `owns` below is what keeps it out of the merge.
         owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         # Virtual page ordinal -> physical block in this rank's own shard, the
@@ -1333,9 +1332,44 @@ def sparse_mla_attention_dcp(
                 return_lse=True,
                 # The kernel defaults to tensorcore; the caches follow the spec.
                 cache_layout=cache_layout,
+                is_dcp_mode=True,
             )
 
-        output, lse = _attend(topk_idx)
+        # Gen-21 Prefill SparseCore QSHARD Merge & 15/16 Padding Elimination:
+        # Gated by TPU_SPARSE_MLA_DCP_QSHARD_MERGE, num_tokens >= 1024, and prefill distribution.
+        use_qshard_static = (
+            envs.TPU_SPARSE_MLA_DCP_QSHARD_MERGE and (num_tokens >= 1024)
+        )
+        if use_qshard_static:
+            is_prefill = request_distribution_[0] < request_distribution_[2]
+            output, lse = jax.lax.cond(
+                is_prefill,
+                lambda: sparse_mla_kernel.dispatch_sparse_mla_prefill_qshard(
+                    q,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    topk_idx,
+                    local_block_tables,
+                    query_start_loc_,
+                    request_distribution_,
+                    sm_scale=sm_scale or 1.0,
+                    k_scale=dequant_scale,
+                    cache_layout=cache_layout,
+                    is_dcp_mode=True,
+                    owns=owns,
+                ),
+                lambda: _attend(
+                    topk_idx.at[:, 0].set(
+                        jnp.where(owns, topk_idx[:, 0], jnp.int32(0))
+                    )
+                ),
+            )
+        else:
+            topk_idx = topk_idx.at[:, 0].set(
+                jnp.where(owns, topk_idx[:, 0], jnp.int32(0))
+            )
+            output, lse = _attend(topk_idx)
+
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         output = output[..., : ql_nope.shape[-1]]

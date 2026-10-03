@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_A2A_MERGE: bool = False
     TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: int = 256
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
+    TPU_SPARSE_MLA_DCP_QSHARD_MERGE: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -696,6 +697,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
+    # Gen-21 Prefill SparseCore QSHARD Merge: filter padding slots and bound
+    # SparseCore gather window to only active winners on rank r for T >= 1024.
+    "TPU_SPARSE_MLA_DCP_QSHARD_MERGE": env_bool(
+        "TPU_SPARSE_MLA_DCP_QSHARD_MERGE", default=True
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

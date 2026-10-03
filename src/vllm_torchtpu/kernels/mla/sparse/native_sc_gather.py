@@ -58,6 +58,7 @@ def _kernel(
     batches_per_owner: int,
     wait_mode: str,
     serve_pipelined: bool,
+    is_dcp_mode: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
 
@@ -135,17 +136,34 @@ def _kernel(
             (QUADS_PER_ATOM, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
-        pltpu.emit_pipeline(
-            body,
-            grid=(atoms_per_batch,),
-            in_specs=nope_specs + rope_specs,
-            out_specs=(rope_out_spec,),
-            no_pipelining=not serve_pipelined,
-        )(
-            *([nope_hbm_ref] * ROPE_PACKING),
-            *([rope_hbm_ref] * ROPE_PACKING),
-            rope_out_hbm_ref,
-        )
+        if is_dcp_mode:
+            first = indices_ref[0, 0, 0, :][0]
+
+            @pl.when(first >= 0)
+            def _run_atoms():
+                pltpu.emit_pipeline(
+                    body,
+                    grid=(atoms_per_batch,),
+                    in_specs=nope_specs + rope_specs,
+                    out_specs=(rope_out_spec,),
+                    no_pipelining=not serve_pipelined,
+                )(
+                    *([nope_hbm_ref] * ROPE_PACKING),
+                    *([rope_hbm_ref] * ROPE_PACKING),
+                    rope_out_hbm_ref,
+                )
+        else:
+            pltpu.emit_pipeline(
+                body,
+                grid=(atoms_per_batch,),
+                in_specs=nope_specs + rope_specs,
+                out_specs=(rope_out_spec,),
+                no_pipelining=not serve_pipelined,
+            )(
+                *([nope_hbm_ref] * ROPE_PACKING),
+                *([rope_hbm_ref] * ROPE_PACKING),
+                rope_out_hbm_ref,
+            )
 
     indices_spec = pl.BlockSpec(
         (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
@@ -165,6 +183,7 @@ def _kernel(
         "atoms_per_batch",
         "wait_mode",
         "serve_pipelined",
+        "is_dcp_mode",
     ),
 )
 def dsa_gather_native_sc(
@@ -176,6 +195,7 @@ def dsa_gather_native_sc(
     atoms_per_batch: int = 16,
     wait_mode: str = "overlap_rope",
     serve_pipelined: bool = True,
+    is_dcp_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -183,6 +203,16 @@ def dsa_gather_native_sc(
     128-word row per group of four tokens; each token owns a consecutive
     32-word quarter. The returned ROPE is register-transposed into the grouped
     TensorCore format expected by the shared attention consumer.
+
+    Args:
+      nope_cache: explicit native-SC uint32[..., 128] cache.
+      rope_cache: quarter-major uint32[..., 128] cache.
+      indices: int32[query, topk] token indices.
+      out_size: total number of gathered tokens (indices.size).
+      atoms_per_batch: number of atoms per batch.
+      wait_mode: "overlap_rope" or "before_rope".
+      serve_pipelined: whether to pipeline the gather serving loop.
+      is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -235,6 +265,7 @@ def dsa_gather_native_sc(
             batches_per_owner=batches_per_owner,
             wait_mode=wait_mode,
             serve_pipelined=serve_pipelined,
+            is_dcp_mode=is_dcp_mode,
         ),
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
