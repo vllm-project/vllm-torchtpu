@@ -917,6 +917,7 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     assert torch.cumsum is original_cumsum
 
 
+@pytest.mark.tpu_test
 class TestQwen3VLModelPatches:
     """Tests for Qwen3-VL platform and model-level patches."""
 

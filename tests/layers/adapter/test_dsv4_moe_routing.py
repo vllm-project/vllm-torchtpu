@@ -16,7 +16,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -188,7 +187,6 @@ def test_non_grouped_plain_path_matches_manual_topk():
     torch.testing.assert_close(weights, expected_w.to(weights.dtype))
 
 
-@pytest.mark.cpu_test
 def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
     """The runner owns the gate; DSv4 must forward tokens without a second GEMM."""
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config

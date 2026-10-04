@@ -150,6 +150,7 @@ def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
         )
 
 
+@pytest.mark.tpu_test
 class TestKVCacheManager:
     def setup_method(self):
         self.mock_device = torch.device("cpu")

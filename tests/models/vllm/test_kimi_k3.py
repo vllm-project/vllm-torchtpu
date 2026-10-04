@@ -45,7 +45,7 @@ def _cpu_model_tests(monkeypatch):
     # queries registered devices; keep it from opening a distributed TPU
     # client merely to inspect the current device while tracing CPU code.
     #
-    # torch.tpu is registered by importing torch_tpu, which the cpu_test job
+    # torch.tpu is registered by importing torch_tpu, which the CPU test job
     # never does: tests/conftest.py imports it only under --use-tpu, and
     # importing it here would claim the accelerator in the pytest parent and
     # lock out every spawned child. With no device module registered there is
@@ -212,7 +212,6 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     assert weight.shard_id == 0
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
 def test_weight_loader_preserves_lm_head_skip_and_streaming(tied) -> None:
     model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
@@ -513,6 +512,7 @@ def test_model_is_registered_for_torch_compile() -> None:
     assert TorchCompileWithNoGuardsWrapper in KimiModel.__bases__
 
 
+@pytest.mark.tpu_test
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,6 +586,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     )
 
 
+@pytest.mark.tpu_test
 def test_mla_fuses_output_gate_with_lora_a_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,6 +697,7 @@ def _mla_config(**overrides) -> KimiLinearConfig:
     return KimiLinearConfig(**kwargs)
 
 
+@pytest.mark.tpu_test
 def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
     """The TPU MLA layer only implements the NoPE variant. A config that
     asks for the RoPE-inside-MLA variant is rejected up front."""
@@ -705,6 +707,7 @@ def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="a")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """All four MLA head dimensions must be set. Leaving one as `None`
     produces an error that lists every field, so the user can see which
@@ -715,6 +718,7 @@ def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="b")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_heads_not_divisible_by_tp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Attention heads are split evenly across tensor-parallel ranks, so
     4 heads cannot be spread over 3 ranks."""
@@ -1005,6 +1009,7 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_wires_projections_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1037,6 +1042,7 @@ def test_kda_construction_wires_projections_and_state(
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_full_rank_gate_builds_separate_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1058,6 +1064,7 @@ def test_kda_construction_full_rank_gate_builds_separate_projections(
     assert layer.g_b_proj is None
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_rejects_duplicate_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1078,6 +1085,7 @@ def test_kda_construction_rejects_duplicate_prefix(
             )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_spec_tokens", [0, 5, 7])
 def test_kda_construction_passes_speculative_window_to_op(
     monkeypatch: pytest.MonkeyPatch, num_spec_tokens: int
@@ -2422,7 +2430,6 @@ def _encoder_cudagraph_stub(merge=(2, 2)) -> SimpleNamespace:
     )
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_opts_into_encoder_cudagraph() -> None:
     # This is the switch MMEncoderManager keys on: without it,
     # cudagraph_mm_encoder is silently inert for Kimi and MoonViT stays eager,
@@ -2432,7 +2439,6 @@ def test_kimi_k3_opts_into_encoder_cudagraph() -> None:
     assert supports_encoder_cudagraph(KimiK3ForConditionalGeneration)
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_encoder_cudagraph_item_specs() -> None:
     stub = _encoder_cudagraph_stub()
     grid = torch.tensor([[1, 4, 6], [1, 2, 2], [2, 8, 4]])
@@ -2446,7 +2452,6 @@ def test_kimi_k3_encoder_cudagraph_item_specs() -> None:
     assert [s.output_tokens for s in specs] == [6, 1, 16]
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_select_encoder_cudagraph_items_gathers_each_items_patches() -> None:
     stub = _encoder_cudagraph_stub()
     grid = torch.tensor([[1, 2, 2], [1, 4, 2], [1, 2, 6]])
@@ -2473,7 +2478,6 @@ def test_kimi_k3_select_encoder_cudagraph_items_gathers_each_items_patches() -> 
     assert empty["grid_thws"].shape == (0, 3)
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("batched", "model_len", "expected_max"), [(8192, 24576, 8192), (8192, 4096, 4096)]
 )
@@ -2492,7 +2496,6 @@ def test_kimi_k3_encoder_cudagraph_budget_range(
     assert budget_range == (64, expected_max)
 
 
-@pytest.mark.cpu_test
 def test_kimi_vision_qkv_materialization_is_skipped_while_compiling(
     monkeypatch,
 ) -> None:
@@ -2511,7 +2514,6 @@ def test_kimi_vision_qkv_materialization_is_skipped_while_compiling(
     assert kimi_vit._materialize_vision_qkv(None, (), (qkv, None)) is None
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("budget", "items", "grid"),
     [
@@ -2552,7 +2554,6 @@ def test_kimi_k3_encoder_cudagraph_capture_grid_fits_rope_table(
     assert inputs.values["pixel_values"].shape[0] == items * t * h * w
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> None:
     stub = _encoder_cudagraph_stub()
     stub.vision_tower.encoder = SimpleNamespace(

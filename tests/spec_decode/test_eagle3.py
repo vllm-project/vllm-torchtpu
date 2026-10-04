@@ -77,6 +77,7 @@ def _fake_gather_sharded_weight(module):
     return weight, weight.shape[0], weight.shape[1], weight.device
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "data, target_len, expected",
     [
@@ -95,6 +96,7 @@ def test_maybe_pad_dim0(device, data, target_len, expected):
     assert torch.equal(out, torch.tensor(expected, device=device))
 
 
+@pytest.mark.tpu_test
 def test_maybe_pad_dim0_rejects_3d(device):
     with pytest.raises(ValueError):
         _maybe_pad_dim0(torch.zeros((2, 2, 2), device=device), 4)
@@ -310,6 +312,7 @@ class _CarryAggregationAfterGatherPlan:
         return tensor
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
@@ -359,6 +362,7 @@ def test_prepare_draft_inputs(device):
     assert torch.equal(draft_input_ids, expected_ids)
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_chunk_offset(device):
     """A non-zero start_index must slice the batch-level sampled tokens and
     rejection counts by the chunk's offset."""
@@ -406,6 +410,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     assert torch.equal(draft_input_ids, expected_ids)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("seed_source", ["host", "device_seed", "next_tokens_device"])
 def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     device, seed_source
@@ -477,6 +482,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
         assert np.array_equal(rejected, np.zeros(2, dtype=np.int32))
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monkeypatch):
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
@@ -586,6 +592,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
     assert events == ["gather", "aggregate", "propose_token"]
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_async_device(device):
     """Async device path derives the seed token, the seed *position*
     (last_token_indices) and the rejected count from the on-device rejection
@@ -652,6 +659,7 @@ def test_prepare_draft_inputs_async_device(device):
     assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
 @pytest.mark.parametrize("return_device", [False, True])
@@ -812,6 +820,7 @@ def test_draft_combine_input_size_with_aux_hidden_state():
     assert proposer._draft_combine_input_size() == 24576
 
 
+@pytest.mark.tpu_test
 def test_propose_without_aux_hidden_state(device):
     hidden_size = 8
     proposer = _make_proposer(draft_tp=1)
@@ -897,6 +906,7 @@ def test_propose_empty_batch():
     )
 
 
+@pytest.mark.tpu_test
 def test_propose_pads_to_coordinated_chunk_bound(device):
     """Under EP-DP lockstep, a rank with fewer chunks than the coordinated
     bound must pad with run_dp_dummy_draft chunks so draft-forward counts pair
@@ -1151,6 +1161,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_m
     assert first["chunk"].attn_ctx.position_ids_override.shape == (64,)
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_loop_cache(device):
     """Loop iterations >= 2 must reuse the step-1 metadata objects with only
     seq_lens swapped (advanced by +1), value-identical to a full rebuild."""
@@ -1239,6 +1250,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
     assert dc.is_dataclass(md2["draft.attn.0"])
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""
@@ -1341,6 +1353,7 @@ def _md_reuse_runner(device):
     )
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_reuses_target_metadata(device):
     """With the target forward's metadata on the chunk, step 0 returns its
     draft-layer entries and loop steps swap only seq_lens / query_start_loc /
@@ -1411,6 +1424,7 @@ def test_build_draft_attn_metadata_reuses_target_metadata(device):
     assert shared.query_start_loc is chunk_ctx.query_start_loc
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "gap", ["missing_draft_layer", "dummy_chunk", "kv_shared_draft"]
 )
@@ -1453,6 +1467,7 @@ def test_build_draft_attn_metadata_rebuilds_without_target_coverage(device, gap)
     assert out == {"draft.attn.0": rebuilt}
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("kv_shared", [False, True], ids=["advancing", "kv_shared"])
 def test_build_draft_attn_metadata_loop_cache_follows_seq_lens_delta(device, kv_shared):
     """A rebuilt loop step is reused by the steps after it, with seq_lens
@@ -1542,6 +1557,7 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     assert wrapper_configs == [proposer.draft_vllm_config]
 
 
+@pytest.mark.tpu_test
 def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, device):
     """Both vLLM forward metadata and the TPU wrapper must observe the saved
     draft config so PCP descriptor and interleave configuration agree."""
@@ -1615,6 +1631,7 @@ def test_pcp_mtp_draft_cache_specs_require_full_attention():
         proposer._validate_pcp_draft_model(draft_attn_layer_names)
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     """A new propose() run must not reuse a previous step's cached metadata
     for a recycled chunk id — the cache is cleared at propose entry."""

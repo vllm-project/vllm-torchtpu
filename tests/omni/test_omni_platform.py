@@ -19,7 +19,7 @@ from vllm_torchtpu.omni.patches import (
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.cpu_test, pytest.mark.omni]
+pytestmark = pytest.mark.omni
 
 
 @pytest.fixture(scope="module", autouse=True)

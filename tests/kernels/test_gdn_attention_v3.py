@@ -15,9 +15,12 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:

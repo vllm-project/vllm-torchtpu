@@ -210,6 +210,7 @@ def test_shape_derivation_matches_max_model_len():
     assert _topk_n(1048576, page_size=256) == N_1M
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("b,k", [(64, 2048), (128, 2048)])
 def test_exact_topk_when_stage_two_needs_its_own_partition(b, k):
     """`p * k_p` past one slice must recurse, not overflow SparseCore.
@@ -241,6 +242,7 @@ def test_partition_factor_is_what_these_tests_assume(b, n, k, expected_p):
     assert _pick_partition(b, n, k) == expected_p
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 @pytest.mark.parametrize("kind", ["strict_desc", "random", "heavy_ties"])
 def test_exact_topk_full_rows(b, n, k, expected_p, kind):
@@ -250,6 +252,7 @@ def test_exact_topk_full_rows(b, n, k, expected_p, kind):
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_p):
     """Ragged lengths are the chunked-prefill case and the two-stage risk.
@@ -285,6 +288,7 @@ def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
 def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
     """`-inf` is never eligible, so every output slot must be `-1`."""
@@ -296,6 +300,7 @@ def test_all_neg_inf_rows_return_no_selection(b, n, k, expected_p):
     assert _mismatch(scores, idx, k, row_lengths) is None
 
 
+@pytest.mark.tpu_test
 def test_topk_concentrated_in_the_last_partition():
     """The two-stage path's own failure mode.
 
@@ -312,6 +317,7 @@ def test_topk_concentrated_in_the_last_partition():
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "corruption", ["worst_index", "drop_one", "duplicate", "negative"]
 )
@@ -352,6 +358,7 @@ def test_comparison_detects_a_wrong_index(corruption):
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "b,n,k",
     [
@@ -401,7 +408,7 @@ def test_return_scores(b: int, n: int, k: int):
 # caller left unannotated, which would pin two stages into one group and
 # serialise the overlap it was added to create), or it perturbs the selection.
 # One test each. Which stage gets which id is decided before any kernel is
-# built, so that half is a `cpu_test` and only the other two need a TPU.
+# built, so that half runs on CPU and only the other two need a TPU.
 
 # `b=16, n=N_128K` is the two-stage shape; `b=64, n=N_SHORT` is single-stage.
 TWO_STAGE = (16, N_128K, 2048)
@@ -427,7 +434,6 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     return seen
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "shape,kwargs,expected",
     [
@@ -452,6 +458,7 @@ def test_each_stage_gets_the_group_id_it_was_given(
     assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
 
 
+@pytest.mark.tpu_test
 def test_scheduling_group_ids_reach_the_lowered_hlo():
     """The stub test above proves the plumbing; this proves the plumbing does
     something. Both ids have to survive as frontend attributes, or the stages
@@ -475,6 +482,7 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
     assert "_scheduling_group_id" not in _text()
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("kind", ["random", "heavy_ties"])
 def test_scheduling_group_ids_do_not_change_the_selection(kind):
     """A scheduling hint that changed the answer would be a correctness bug."""

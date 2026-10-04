@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
@@ -30,6 +31,7 @@ class FakeRoutedExperts(RoutedExperts):
         return expert_id
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_create_weights_and_process():
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
@@ -204,6 +206,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
     assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     """The decode-shaped MoE call must not mix otherwise identical rows."""
     moe_config = MagicMock(w13_num_shards=2)
@@ -336,6 +339,7 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
         assert hasattr(layer, name)
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_processes_directly_materialized_dummy_weights():
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
@@ -493,6 +497,7 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w2_scale[:, :, 1:].any()
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_requantize_block():
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed,

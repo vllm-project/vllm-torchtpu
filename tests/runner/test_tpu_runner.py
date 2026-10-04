@@ -122,7 +122,6 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     return runner
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "dcp_size,kernel_page_size,expected_cap,expected_pages,most_pages",
     [(1, 384, 47, 2731, 171), (8, 384, 64, 342, 22), (8, 16, 15, 8208, 528)],
@@ -165,7 +164,6 @@ def test_smem_caps_match_metadata_and_schedule_geometry(
         assert seqs == (expected_cap if use_max else 64)
 
 
-@pytest.mark.cpu_test
 def test_smem_caps_follow_widest_attention_group():
     runner = _smem_runner()
     runner.input_batch.block_table.extend(
@@ -190,7 +188,6 @@ def test_smem_caps_follow_widest_attention_group():
     assert runner.num_reqs_max_model_len == 32
 
 
-@pytest.mark.cpu_test
 def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner = _smem_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
@@ -773,6 +770,7 @@ class TestStartStopPhasedProfiling:
         assert runner.phase_based_profiler is None
 
 
+@pytest.mark.tpu_test
 class TestTPURunner:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
@@ -1956,6 +1954,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     assert vllm_config.cache_config.block_size in (128, 256)
 
 
+@pytest.mark.tpu_test
 def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
@@ -2442,6 +2441,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         assert runner.input_batch.num_tokens_no_spec[1] == 15
 
 
+@pytest.mark.tpu_test
 def test_upload_unless_unchanged_reuses_only_identical_values(device):
     """Spec steps reuse the previous upload of a small tensor while its values
     repeat. New values, dtype or shape upload again, and slots never share an

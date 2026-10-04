@@ -20,7 +20,6 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "max_model_len,expected_budget,expected_chunks",
     [(1048576, 47, [47, 17]), (65536, 766, [64])],

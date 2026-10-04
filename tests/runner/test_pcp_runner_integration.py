@@ -33,7 +33,6 @@ _PCP_LAYOUT_WORLD_SIZE = (
 )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize(
     "computed,prompt,scheduled,pcp_size,mtp_enabled,rejected",
@@ -84,7 +83,6 @@ def test_execute_model_pcp_mtp_prefill_only_boundary(
             TPUModelRunner.execute_model(runner, _scheduler_output(scheduled_tokens))
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("bucket", [1, 4])
 @pytest.mark.parametrize("chunk_size", [1, 2, 8])
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -719,7 +717,6 @@ def _make_attention_capacity_runner(monkeypatch, pcp_size):
     return runner
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "q_lens,kv_lens,num_decode",
     [

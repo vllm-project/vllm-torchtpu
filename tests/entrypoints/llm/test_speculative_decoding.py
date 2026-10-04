@@ -40,6 +40,8 @@ from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture(autouse=True)
 def _release_tpu_between_tests(request):
