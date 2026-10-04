@@ -499,6 +499,70 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
+def test_pallas_combine_kernel_ignores_nan_arrivals_on_zero_weight_padded_tokens(
+    wire_dtype,
+):
+    """Pallas `_build_combine_kernel` must mask NaN arrival rows when `coef == 0`.
+
+    In `fused_ep_moe_v2`, a freshly allocated `arrivals` buffer may contain
+    zeroes on TPU rather than `NaN`, which would let an unguarded Pallas
+    combine kernel pass end-to-end tests. This single-chip test calls
+    `layer._combine_arrivals` directly at `t_local = COMBINE_MIN_TOKENS` (256),
+    where `kernel.combine_step_tokens(t_local) > 0` dispatches to the Pallas
+    DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
+    `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions.
+    """
+    t_local = kernel.COMBINE_MIN_TOKENS
+    assert kernel.combine_step_tokens(t_local) > 0
+    topk, lane_blocks, lanes, tile_m = 4, 2, 128, 128
+    hidden = lane_blocks * lanes
+    block = host.routing_block(t_local, topk)
+    recv_rows = block + 64
+    active = t_local // 2
+    padded = t_local - active
+
+    with jax.default_device(jax.devices()[0]):
+        arrivals_f32 = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
+        arrivals_f32[:block] = np.nan
+        arrivals = jnp.asarray(arrivals_f32).astype(wire_dtype)
+        assert np.isnan(np.asarray(arrivals[:block].astype(jnp.float32))).all()
+
+        scales_f32 = np.ones((4, tile_m), dtype=np.float32)
+        scales_f32[: block // tile_m, :] = np.nan
+        arrival_scales = jnp.asarray(scales_f32)
+
+        pos = np.full((t_local, topk), block, dtype=np.int32)
+        mirror_pos = np.full((t_local, topk), block, dtype=np.int32)
+        topk_weights = np.full((t_local, topk), 1.0 / topk, dtype=np.float32)
+
+        # Sentinel pairs receive their rank in `[0, block)` within each routing block.
+        sentinel_ranks = (
+            np.arange(padded * topk, dtype=np.int32).reshape(padded, topk) % block
+        )
+        pos[active:] = sentinel_ranks
+        mirror_pos[active:] = sentinel_ranks
+        topk_weights[active:] = 0.0
+
+        out = np.asarray(
+            layer._combine_arrivals(
+                arrivals,
+                arrival_scales,
+                jnp.asarray(pos),
+                jnp.asarray(mirror_pos),
+                jnp.asarray(topk_weights),
+                jnp.bfloat16,
+            )
+        )
+
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out[:active].astype(np.float32), 1.0)
+    np.testing.assert_array_equal(
+        out[active:].astype(np.float32),
+        np.zeros((padded, hidden), dtype=np.float32),
+    )
+
+
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
@@ -563,7 +627,8 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
         np.zeros_like(masked[~valid_mask]),
     )
 
-    # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every shard is NaN.
+    # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every
+    # shard is NaN.
     gating_all_nan = jax.device_put(
         np.full_like(gating_host, np.nan), token_sharding
     )
