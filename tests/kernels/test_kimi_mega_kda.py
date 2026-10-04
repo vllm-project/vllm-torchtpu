@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import (
@@ -22,7 +23,10 @@ def test_fused_kda_passes_window_distribution(monkeypatch, spec_tokens):
 
     def fake_kernel(**kwargs):
         calls.append(kwargs)
-        return (kwargs["conv_state"], kwargs["recurrent_state"]), jnp.zeros((8, 2))
+        return (
+            kwargs["conv_state"] + 1,
+            kwargs["recurrent_state"] + 2,
+        ), jnp.arange(16, dtype=jnp.float32).reshape(8, 2)
 
     monkeypatch.setattr(kda_attention_op.gdn_wrapper, "fused_conv1d_gdn", fake_kernel)
     monkeypatch.setattr(kda_attention_op, "_check_kda_abi", lambda *args: (8, 2, 1, 2))
@@ -31,7 +35,7 @@ def test_fused_kda_passes_window_distribution(monkeypatch, spec_tokens):
     )
     core = kda_attention_op._build_fused_core(-5.0, 1e-6, spec_tokens)
     with jax.disable_jit():
-        core(
+        out, conv, recurrent = core(
             jnp.zeros((8, 6)),
             jnp.zeros((8, 2)),
             jnp.zeros((8, 1)),
@@ -52,6 +56,11 @@ def test_fused_kda_passes_window_distribution(monkeypatch, spec_tokens):
     assert len(calls) == 1
     assert calls[0]["distribution"].tolist() == [1, 2, 2]
     assert calls[0]["num_spec_tokens"] == spec_tokens
+    np.testing.assert_array_equal(conv, jnp.ones_like(conv))
+    np.testing.assert_array_equal(recurrent, jnp.full_like(recurrent, 2))
+    np.testing.assert_array_equal(
+        out, jnp.arange(16, dtype=jnp.float32).reshape(8, 1, 2)
+    )
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,8 @@ weights, so each needs its own oracle.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -29,6 +31,82 @@ from absl.testing import parameterized
 from vllm_torchtpu.kernels.gdn.v3 import config, wrapper
 
 pytestmark = pytest.mark.tpu_test
+
+
+@pytest.mark.parametrize(
+    "q_loc,window_end,expected_modes",
+    [
+        ([0, 6, 8], 0, [config.GDNMode.PER_SEQ]),
+        ([0, 6, 6], 1, [config.GDNMode.BATCHED]),
+        ([0, 6, 8], 1, [config.GDNMode.BATCHED, config.GDNMode.PER_SEQ]),
+        ([0, 0, 0], 0, []),
+    ],
+    ids=["prefill_only", "verify_only", "mixed", "empty"],
+)
+def test_speculative_segment_dispatch(monkeypatch, q_loc, window_end, expected_modes):
+    """Exercise wrapper guards and state chaining without executing TPU kernels."""
+    calls = []
+    monkeypatch.setattr(
+        wrapper.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=128, vmem_capacity_bytes=128 * 1024**2),
+    )
+
+    def fake_pallas_call(kernel, **kwargs):
+        cfg = kernel.keywords["cfg"]
+
+        def run(_metadata, _qkv, _b, _a, conv, recurrent, out, _weights):
+            calls.append(cfg.mode)
+            increment = 1 if cfg.mode == config.GDNMode.BATCHED else 10
+            if out is None:
+                out = jnp.zeros(cfg.get_out_shape().shape, cfg.dtypes.act_out)
+            rows = jnp.arange(cfg.batch_size)
+            boundary = q_loc[window_end]
+            active = (
+                rows < boundary
+                if cfg.mode == config.GDNMode.BATCHED
+                else (rows >= boundary) & (rows < q_loc[-1])
+            )
+            out = jnp.where(active[:, None, None], increment, out)
+            return out, conv + increment, recurrent + 2 * increment
+
+        return run
+
+    monkeypatch.setattr(wrapper.pl, "pallas_call", fake_pallas_call)
+    with jax.disable_jit():
+        (conv, recurrent), out = wrapper.fused_conv1d_gdn(
+            qkv=jnp.zeros((8, 384), jnp.bfloat16),
+            b=jnp.zeros((8, 1), jnp.bfloat16),
+            a=jnp.zeros((8, 128), jnp.bfloat16),
+            conv_state=jnp.full((13, 3, 384), 3.0),
+            recurrent_state=jnp.full((13, 1, 128, 128), 7.0),
+            conv_weight=jnp.zeros((384, 1, 4)),
+            conv_bias=None,
+            a_log=jnp.zeros((1,)),
+            dt_bias=jnp.zeros((1, 128)),
+            query_start_loc=jnp.asarray(q_loc),
+            state_indices=jnp.asarray([1, 7]),
+            distribution=jnp.asarray([window_end, 2, 2]),
+            seq_lens=jnp.diff(jnp.asarray(q_loc)),
+            read_offsets=jnp.zeros((2,), jnp.int32),
+            num_spec_tokens=5,
+            n_kq=1,
+            n_v=1,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            attention_mode=config.AttentionMode.KDA,
+        )
+    assert calls == expected_modes
+    increment = sum(1 if m == config.GDNMode.BATCHED else 10 for m in expected_modes)
+    np.testing.assert_array_equal(conv, jnp.full((13, 3, 384), 3 + increment))
+    np.testing.assert_array_equal(
+        recurrent, jnp.full((13, 1, 128, 128), 7 + 2 * increment)
+    )
+    expected_out = np.zeros((8, 128))
+    expected_out[: q_loc[window_end]] = 1
+    expected_out[q_loc[window_end] : q_loc[-1]] = 10
+    np.testing.assert_array_equal(out, expected_out)
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -96,7 +174,7 @@ def kda_attention_ref(
     num_tokens = qkv.shape[0]
     num_valid_seqs = int(distribution[2])
 
-    out_mixed_qkv = jnp.zeros_like(qkv)
+    out_mixed_qkv = jnp.zeros(qkv.shape, dtype=jnp.float32)
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     output = np.zeros((num_tokens, n_v * d_v), np.float64)
@@ -129,7 +207,7 @@ def kda_attention_ref(
         if conv_bias is not None:
             acc += conv_bias.astype(jnp.float32)[None, :]
         new_conv_state = new_conv_state.at[s].set(x_full[-(kernel_size - 1) :])
-        out_mixed_qkv = out_mixed_qkv.at[start:end].set(acc.astype(qkv.dtype))
+        out_mixed_qkv = out_mixed_qkv.at[start:end].set(acc)
 
     out_mixed_qkv = jax.nn.silu(out_mixed_qkv)
 
@@ -268,10 +346,9 @@ def kda_attention_spec_ref(
             k_seq = np.repeat(k_seq, repeat_factor, axis=1)
         q_seq = _l2_normalize(q_seq) * float(d_k**-0.5)
         k_seq = _l2_normalize(k_seq)
-        # Production activates beta in fp32, then stores it in the model
-        # activation dtype before the recurrent update.
+        # Keep sigmoid in FP32, matching the fused recurrence.
         beta_seq = np.asarray(
-            jax.nn.sigmoid(b[start:end].astype(jnp.float32)).astype(b.dtype),
+            jax.nn.sigmoid(b[start:end].astype(jnp.float32)),
             np.float64,
         )
         a_seq = np.asarray(a[start:end], np.float64).reshape(query_len, n_v, d_k)
