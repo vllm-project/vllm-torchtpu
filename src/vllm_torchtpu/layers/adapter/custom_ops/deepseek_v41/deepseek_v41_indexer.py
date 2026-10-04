@@ -6,6 +6,14 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.models.deepseek_v41 import attention as upstream
 
+from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_index_cache
+from vllm_torchtpu.kernels.deepseek_v41.indexer import (
+    QUERY_TILE,
+    native_paged_scores,
+    paged_scores,
+    pipeline_score_topk,
+)
+
 from .deepseek_v41_backend import AttentionBackend
 from .deepseek_v41_cache import (
     INDEX_HEAD_DIM,
@@ -209,6 +217,34 @@ _indexer_op = None
 _write_index_op = None
 
 
+def _select_topk(scores, topk, *, sparsecore, row_lengths=None):
+    """Select without a context-wide sort; keep XLA's low-index tie/pad ABI."""
+    k = min(topk, scores.shape[1])
+    if not sparsecore or k % 16 or k > 4096:
+        return jax.lax.top_k(scores, k)
+    from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
+
+    padded = jnp.pad(
+        scores, ((0, 0), (0, -scores.shape[1] % 16)), constant_values=-jnp.inf
+    )
+    indices, words = sparsecore_topk(
+        padded, k, row_lengths=row_lengths, return_scores=True
+    )
+    values = jax.lax.bitcast_convert_type(words, jnp.float32)
+    valid = indices >= 0
+    # XLA fills an underfull selection with the lowest unselected -inf columns.
+    # Recreate those columns before the caller's logical sort, using only O(K).
+    occupied = jnp.zeros((scores.shape[0], k + 1), jnp.bool_)
+    occupied_ids = jnp.where(valid & (indices < k), indices, k)
+    occupied = occupied.at[jnp.arange(scores.shape[0])[:, None], occupied_ids].set(True)
+    fillers = jnp.sort(
+        jnp.where(~occupied[:, :k], jnp.arange(k), scores.shape[1]), axis=-1
+    )
+    rank = jnp.maximum(jnp.arange(k) - valid.sum(-1)[:, None], 0)
+    indices = jnp.where(valid, indices, jnp.take_along_axis(fillers, rank, axis=1))
+    return values, indices
+
+
 def select_indices_jax(
     scores: jax.Array,
     lengths: jax.Array,
@@ -217,6 +253,9 @@ def select_indices_jax(
     block_size: int,
     candidate_write: bool,
     candidate_filter: bool,
+    *,
+    sparsecore: bool = False,
+    scores_masked: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Source publishes candidates without filtering its own selection."""
     count, width = scores.shape
@@ -229,7 +268,8 @@ def select_indices_jax(
     lengths = jnp.clip(lengths.reshape(count), 0, width)
     logical = jnp.arange(width)[None, :]
     visible = logical < lengths[:, None]
-    scores = jnp.where(visible, scores, -jnp.inf)
+    if not scores_masked or candidate_write or candidate_filter:
+        scores = jnp.where(visible, scores, -jnp.inf)
     published = candidates
     # When the candidate buffer covers every block, publication/filtering are
     # identities. Keep the caller's buffer untouched in this static case.
@@ -251,7 +291,9 @@ def select_indices_jax(
             block_scores = jnp.where(
                 jnp.arange(blocks)[None] == last[:, None], jnp.inf, block_scores
             )
-            values, ids = jax.lax.top_k(block_scores, candidates.shape[1])
+            values, ids = _select_topk(
+                block_scores, candidates.shape[1], sparsecore=sparsecore
+            )
             published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
         else:
             # One extra column absorbs invalid candidate IDs; no 3-D membership
@@ -263,11 +305,67 @@ def select_indices_jax(
             allowed = jnp.take_along_axis(membership, logical // block_size, axis=1)
             # Match the upstream batch-wide short-context bypass.
             scores = jnp.where(allowed | (lengths.max() <= topk), scores, -jnp.inf)
-    values, indices = jax.lax.top_k(scores, min(topk, width))
+    values, indices = _select_topk(
+        scores, min(topk, width), sparsecore=sparsecore, row_lengths=lengths
+    )
     # Preserve V4.1's logical order and therefore attention accumulation order.
-    indices = jnp.sort(indices, axis=-1)
-    values = jnp.take_along_axis(scores, indices, axis=1)
+    order = jnp.argsort(indices, axis=-1)
+    indices = jnp.take_along_axis(indices, order, axis=1)
+    values = jnp.take_along_axis(values, order, axis=1)
     return jnp.where(values > -jnp.inf, indices, -1).astype(jnp.int32), published
+
+
+def _compact_candidate_indices(
+    q,
+    pool,
+    scales,
+    compact,
+    weights,
+    lengths,
+    logical,
+    candidates,
+    topk,
+    capacity,
+    page_stride,
+    *,
+    sparsecore,
+):
+    """Score compact records and retain dense-reference tie and padding order."""
+    # This bounds both key reads and QK work by the candidate pool size.
+    compact_lengths = jnp.full_like(lengths, compact.shape[1])
+    scores = paged_index_scores_jax(
+        q, pool, scales, compact, weights, compact_lengths, page_stride
+    )
+    scores = jnp.where(compact >= 0, scores, -jnp.inf)
+    output_width = min(topk, capacity)
+    padding = max(0, output_width - scores.shape[1])
+    scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=-jnp.inf)
+    logical = jnp.pad(logical, ((0, 0), (0, padding)), constant_values=capacity)
+    values, indices = _select_topk(scores, output_width, sparsecore=sparsecore)
+    selected = jnp.take_along_axis(logical, indices, axis=1)
+    selected_valid = values > -jnp.inf
+    # The dense reference fills an underfull top-k with the lowest logical
+    # -inf positions, then sorts all positions before masking them. Preserve
+    # those padding locations in the logical buffer shared by reuse layers.
+    occupied = jnp.zeros((q.shape[0], output_width + 1), jnp.bool_)
+    occupied_ids = jnp.where(
+        selected_valid & (selected < output_width), selected, output_width
+    )
+    occupied = occupied.at[jnp.arange(q.shape[0])[:, None], occupied_ids].set(True)
+    fillers = jnp.sort(
+        jnp.where(~occupied[:, :output_width], jnp.arange(output_width), capacity),
+        axis=-1,
+    )
+    filler_rank = jnp.maximum(
+        jnp.arange(output_width) - selected_valid.sum(-1)[:, None], 0
+    )
+    selected = jnp.where(
+        selected_valid, selected, jnp.take_along_axis(fillers, filler_rank, axis=1)
+    )
+    order = jnp.argsort(selected, axis=-1)
+    selected = jnp.take_along_axis(selected, order, axis=1)
+    selected_valid = jnp.take_along_axis(selected_valid, order, axis=1)
+    return jnp.where(selected_valid, selected, -1).astype(jnp.int32), candidates
 
 
 def paged_indexer_jax(
@@ -283,6 +381,9 @@ def paged_indexer_jax(
     candidate_write: bool,
     candidate_filter: bool,
     page_stride: int,
+    *,
+    sparsecore: bool = False,
+    short_context=None,
 ) -> tuple[jax.Array, jax.Array]:
     def full_context(_):
         scores = paged_index_scores_jax(
@@ -297,6 +398,7 @@ def paged_indexer_jax(
             block_size,
             candidate_write,
             candidate_filter,
+            sparsecore=sparsecore,
         )
 
     width = records.shape[1]
@@ -323,47 +425,211 @@ def paged_indexer_jax(
         valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
         compact = jnp.take_along_axis(records, jnp.minimum(logical, width - 1), axis=1)
         compact = jnp.where(valid, compact, -1)
-        # This bounds both key reads and QK work by the candidate pool size.
-        compact_lengths = jnp.full_like(lengths, compact.shape[1])
-        scores = paged_index_scores_jax(
-            q, pool, scales, compact, weights, compact_lengths, page_stride
+        return _compact_candidate_indices(
+            q,
+            pool,
+            scales,
+            compact,
+            weights,
+            lengths,
+            logical,
+            candidates,
+            topk,
+            width,
+            page_stride,
+            sparsecore=sparsecore,
         )
-        scores = jnp.where(compact >= 0, scores, -jnp.inf)
-        output_width = min(topk, width)
-        padding = max(0, output_width - scores.shape[1])
-        scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=-jnp.inf)
-        logical = jnp.pad(logical, ((0, 0), (0, padding)), constant_values=width)
-        values, indices = jax.lax.top_k(scores, output_width)
-        selected = jnp.take_along_axis(logical, indices, axis=1)
-        selected_valid = values > -jnp.inf
-        # The dense reference fills an underfull top-k with the lowest logical
-        # -inf positions, then sorts all positions before masking them. Preserve
-        # those padding locations in the logical buffer shared by reuse layers.
-        occupied = jnp.zeros((records.shape[0], output_width + 1), jnp.bool_)
-        occupied_ids = jnp.where(
-            selected_valid & (selected < output_width), selected, output_width
-        )
-        occupied = occupied.at[jnp.arange(records.shape[0])[:, None], occupied_ids].set(
-            True
-        )
-        fillers = jnp.sort(
-            jnp.where(~occupied[:, :output_width], jnp.arange(output_width), width),
-            axis=-1,
-        )
-        filler_rank = jnp.maximum(
-            jnp.arange(output_width) - selected_valid.sum(-1)[:, None], 0
-        )
-        selected = jnp.where(
-            selected_valid, selected, jnp.take_along_axis(fillers, filler_rank, axis=1)
-        )
-        order = jnp.argsort(selected, axis=-1)
-        selected = jnp.take_along_axis(selected, order, axis=1)
-        selected_valid = jnp.take_along_axis(selected_valid, order, axis=1)
-        return jnp.where(selected_valid, selected, -1).astype(jnp.int32), candidates
 
     # Preserve the reference's batch-wide short-context bypass. That branch
     # scans at most topk keys; long contexts never enter the full-history path.
-    return jax.lax.cond(lengths.max() <= topk, full_context, candidate_context, None)
+    short_context = lengths.max() <= topk if short_context is None else short_context
+    return jax.lax.cond(short_context, full_context, candidate_context, None)
+
+
+def bounded_indexer_jax(
+    q,
+    pool,
+    scales,
+    block_table,
+    weights,
+    lengths,
+    candidates,
+    requests,
+    capacity,
+    topk,
+    block_size,
+    candidate_write,
+    candidate_filter,
+    page_size,
+    page_stride,
+    row_offset,
+):
+    """Keep only one query tile's scores and top-k scratch alive at a time."""
+    count = q.shape[0]
+    lengths = jnp.clip(lengths, 0, min(capacity, block_table.shape[1] * page_size))
+    tile = min(QUERY_TILE, count)
+    padded_count = (count + tile - 1) // tile * tile
+    padding = padded_count - count
+    lengths_padded = jnp.pad(lengths, (0, padding))
+    requests_padded = jnp.pad(requests, (0, padding))
+    candidates_padded = jnp.pad(candidates, ((0, padding), (0, 0)), constant_values=-1)
+    q_padded = jnp.pad(q, ((0, padding), (0, 0), (0, 0)))
+    weights_padded = jnp.pad(weights, ((0, padding), (0, 0)))
+    selected = jnp.full((padded_count, min(topk, capacity)), -1, jnp.int32)
+    published = candidates_padded
+    sparsecore = jax.default_backend() == "tpu"
+    short_context = lengths.max() <= topk
+
+    if not candidate_write and not candidate_filter:
+
+        def prepare(index):
+            start = index * tile
+            return (
+                jax.lax.dynamic_slice_in_dim(q_padded, start, tile),
+                jax.lax.dynamic_slice_in_dim(weights_padded, start, tile),
+                jax.lax.dynamic_slice_in_dim(lengths_padded, start, tile),
+                jax.lax.dynamic_slice_in_dim(requests_padded, start, tile),
+            )
+
+        def score(prepared):
+            query, gates, lens, reqs = prepared
+            return native_paged_scores(
+                query,
+                gates,
+                pool,
+                scales,
+                block_table,
+                reqs,
+                lens,
+                capacity,
+                page_size=page_size,
+                page_stride=page_stride,
+                row_offset=row_offset,
+                interpret=not sparsecore,
+            )
+
+        def select(index, scores):
+            lens = jax.lax.dynamic_slice_in_dim(lengths_padded, index * tile, tile)
+            cand = jax.lax.dynamic_slice_in_dim(candidates_padded, index * tile, tile)
+            return select_indices_jax(
+                scores,
+                lens,
+                cand,
+                topk,
+                block_size,
+                False,
+                False,
+                sparsecore=sparsecore,
+                scores_masked=sparsecore,
+            )[0]
+
+        def write(index, chosen, result):
+            return jax.lax.dynamic_update_slice_in_dim(
+                result, chosen, index * tile, axis=0
+            )
+
+        selected = pipeline_score_topk(
+            padded_count // tile, prepare, score, select, write, selected
+        )
+        return selected[:count], published[:count]
+
+    def step(index, output):
+        start = index * tile
+        lens = jax.lax.dynamic_slice_in_dim(lengths_padded, start, tile)
+        reqs = jax.lax.dynamic_slice_in_dim(requests_padded, start, tile)
+        cand = jax.lax.dynamic_slice_in_dim(candidates_padded, start, tile)
+
+        def full_context(_):
+            query = jax.lax.dynamic_slice_in_dim(q_padded, start, tile)
+            gates = jax.lax.dynamic_slice_in_dim(weights_padded, start, tile)
+            quantized, query_scales, _ = quantize_index_rows(query)
+            scores = paged_scores(
+                quantized,
+                gates.astype(jnp.float32) * query_scales,
+                pool,
+                scales,
+                block_table,
+                reqs,
+                lens,
+                capacity,
+                page_size=page_size,
+                page_stride=page_stride,
+                row_offset=row_offset,
+                interpret=not sparsecore,
+            )
+            return select_indices_jax(
+                scores,
+                lens,
+                cand,
+                topk,
+                block_size,
+                candidate_write,
+                False,
+                sparsecore=sparsecore,
+                scores_masked=True,
+            )
+
+        if candidate_filter and candidates.shape[1] * block_size < capacity:
+
+            def candidate_context(_):
+                # Form only candidate addresses. A dense [tile, capacity]
+                # table gather otherwise costs more than scoring the candidates.
+                blocks = (capacity + block_size - 1) // block_size
+                ids = jnp.sort(
+                    jnp.where((cand >= 0) & (cand < blocks), cand, blocks), axis=-1
+                )
+                unique = jnp.concatenate(
+                    (
+                        jnp.ones_like(ids[:, :1], dtype=jnp.bool_),
+                        ids[:, 1:] != ids[:, :-1],
+                    ),
+                    axis=-1,
+                )
+                logical = (
+                    ids[..., None] * block_size + jnp.arange(block_size)
+                ).reshape(tile, -1)
+                valid = logical < lens[:, None]
+                valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
+                safe = jnp.minimum(logical, capacity - 1)
+                pages = block_table[reqs[:, None], safe // page_size]
+                records = row_indices(
+                    pages * page_size + safe % page_size,
+                    page_size,
+                    page_stride,
+                    row_offset,
+                )
+                records = jnp.where(valid, records, -1)
+                return _compact_candidate_indices(
+                    jax.lax.dynamic_slice_in_dim(q_padded, start, tile),
+                    pool,
+                    scales,
+                    records,
+                    jax.lax.dynamic_slice_in_dim(weights_padded, start, tile),
+                    lens,
+                    logical,
+                    cand,
+                    topk,
+                    capacity,
+                    page_stride,
+                    sparsecore=sparsecore,
+                )
+
+            chosen, blocks = jax.lax.cond(
+                short_context, full_context, candidate_context, None
+            )
+        else:
+            chosen, blocks = full_context(None)
+        indices, candidate_output = output
+        indices = jax.lax.dynamic_update_slice_in_dim(indices, chosen, start, axis=0)
+        candidate_output = jax.lax.dynamic_update_slice_in_dim(
+            candidate_output, blocks, start, axis=0
+        )
+        return indices, candidate_output
+
+    selected, published = jax.lax.fori_loop(
+        0, padded_count // tile, step, (selected, published)
+    )
+    return selected[:count], published[:count]
 
 
 def write_index_keys(
@@ -380,6 +646,8 @@ def write_index_keys(
         raise ValueError("One physical record index per key is required")
     if not keys.shape[0]:
         return pool, scales
+    if jax.default_backend() == "tpu":
+        return write_index_cache(pool, scales, write_records, keys, page_stride)
     packed, scale_words = pack_index_keys(keys)
     records = jnp.maximum(write_records, 0)
     rows = records // KEYS_PER_WORD_ROW
@@ -423,7 +691,7 @@ def update_and_select_jax(
     write_slots: jax.Array,
     keys: jax.Array,
     requests: jax.Array,
-    logical: jax.Array,
+    capacity: int,
     topk: int,
     block_size: int,
     candidate_write: bool,
@@ -433,27 +701,27 @@ def update_and_select_jax(
     row_offset: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     # Donate both original arrays; no slice/view of the companion pool escapes.
-    safe = jnp.clip(logical, 0, block_table.shape[1] * page_size - 1)
-    blocks = block_table[requests[:, None], safe // page_size]
-    slots = blocks * page_size + safe % page_size
-    records = row_indices(slots, page_size, page_stride, row_offset)
     write_records = masked_row_indices(write_slots, page_size, page_stride, row_offset)
     updated, updated_scales = write_index_keys(
         pool, scales, write_records, keys, page_stride
     )
-    selected, published = paged_indexer_jax(
+    selected, published = bounded_indexer_jax(
         q,
         updated,
         updated_scales,
-        records,
+        block_table,
         weights,
         lengths,
         candidates,
+        requests,
+        capacity,
         topk,
         block_size,
         candidate_write,
         candidate_filter,
+        page_size,
         page_stride,
+        row_offset,
     )
     return updated, updated_scales, selected, published
 
@@ -474,7 +742,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1, 2),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 7,
+        input_partition_specs=(P(),) * 10 + (None,) * 8,
     )
 
     def fake(
@@ -488,7 +756,7 @@ def initialize_indexer():
         write_slots,
         keys,
         requests,
-        logical,
+        capacity,
         topk,
         block_size,
         candidate_write,
@@ -500,9 +768,7 @@ def initialize_indexer():
         return (
             torch.empty_like(pool),
             torch.empty_like(scales),
-            logical.new_empty(
-                (q.shape[0], min(topk, logical.shape[1])), dtype=torch.int32
-            ),
+            q.new_empty((q.shape[0], min(topk, capacity)), dtype=torch.int32),
             torch.empty_like(candidates),
         )
 
@@ -537,7 +803,7 @@ def paged_indexer(
     scales,
     block_table,
     requests,
-    logical,
+    capacity,
     weights,
     lengths,
     candidates,
@@ -562,7 +828,7 @@ def paged_indexer(
         write_slots.int(),
         keys,
         requests.int(),
-        logical.int(),
+        capacity,
         topk,
         block_size,
         candidate_write,

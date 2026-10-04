@@ -286,11 +286,11 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         selected = None
         if self.compress_ratio:
             capacity = max(1, self._max_model_len // self.compress_ratio)
-            logical_compressed = torch.arange(capacity, device=positions.device)
-            logical_compressed = logical_compressed[None, :].expand(count, -1)
             lengths = ((positions + 1) // self.compress_ratio)[:, None]
             if self.indexer is not None:
                 if self._all_indices_fit:
+                    logical_compressed = torch.arange(capacity, device=positions.device)
+                    logical_compressed = logical_compressed[None, :].expand(count, -1)
                     selected = logical_compressed.masked_fill(
                         logical_compressed >= lengths, -1
                     ).int()
@@ -303,7 +303,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
                         index_q,
                         cache_ops.block_table(keys_meta),
                         requests,
-                        logical_compressed,
+                        capacity,
                         weights,
                         lengths,
                         swa_slots,
@@ -338,7 +338,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         index_q,
         block_table,
         requests,
-        logical,
+        capacity,
         weights,
         lengths,
         swa_slots,
@@ -375,7 +375,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             scale_cache,
             block_table,
             requests,
-            logical,
+            capacity,
             weights,
             active_lengths,
             candidates,

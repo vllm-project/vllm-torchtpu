@@ -425,6 +425,10 @@ def scatter_cache_words(
         return cache
     width = words.shape[1]
     assert width % ROW_WORDS == 0 or ROW_WORDS % width == 0
+    if width < ROW_WORDS and jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_cache_words
+
+        return write_cache_words(cache, records, words)
     if width < ROW_WORDS or jax.default_backend() != "tpu":
         columns = jnp.arange(width)[None]
         if width < ROW_WORDS:
