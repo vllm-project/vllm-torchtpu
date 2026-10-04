@@ -1,4 +1,3 @@
-import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
@@ -7,8 +6,6 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
 )
-
-pytestmark = pytest.mark.cpu_test
 
 
 def test_attention_spec_with_bf16_normalizes_to_fp8_without_inflation():

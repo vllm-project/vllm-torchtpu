@@ -14,7 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +26,10 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    DCPGroupColumnParallelLinear,
+)
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
@@ -53,6 +56,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -180,6 +184,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     "whichever axis it is given and has no layout for two at "
                     "once."
                 )
+            assert parallel_config is not None
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
@@ -498,7 +503,7 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
-        return indexer
+        return cast("VllmTPUIndexer", indexer)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -658,8 +663,9 @@ class VllmTPUMLAAttention(MLAAttention):
         # lines below once `W_UK_T`/`W_UV` are extracted, and it never runs a
         # forward pass, so this view is the only consumer either way.
         flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
+        kv_b_weight = None
         if flipped:
-            kv_b_weight = self.kv_b_proj.weight
+            kv_b_weight = cast(torch.Tensor, self.kv_b_proj.weight)
             self.kv_b_proj.weight = Parameter(
                 kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
             )
@@ -667,6 +673,7 @@ class VllmTPUMLAAttention(MLAAttention):
             super().process_weights_after_loading(act_dtype)
         finally:
             if flipped:
+                assert kv_b_weight is not None
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
 
         device = torch.device("tpu")
@@ -739,17 +746,18 @@ class VllmTPUMLAAttention(MLAAttention):
             )
             synchronize_tensors(tensors)
 
-        q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
-        self.mla_op = self.impl._build_mla_op(
+        impl = cast(PallasMLAttentionBackendImpl, self.impl)
+        q_scale, k_scale, v_scale = impl._get_kv_scales(self)
+        self.mla_op = impl._build_mla_op(
             self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
-        self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
+        self.sparse_mla_op = impl._build_sparse_mla_op(self)
 
-        dcp_size = getattr(self.impl, "dcp_size", 1)
+        dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         if dcp_size > 1:
-            self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
-                self, dcp_size, self.impl.dcp_interleave_size
+            self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
+                self, dcp_size, impl.dcp_interleave_size
             )
 
     def forward(
@@ -762,7 +770,7 @@ class VllmTPUMLAAttention(MLAAttention):
     ) -> torch.Tensor:
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
-        return self.impl.forward(
+        return cast(PallasMLAttentionBackendImpl, self.impl).forward(
             layer=self,
             q=q,
             kv_c_normed=kv_c_normed,
@@ -835,7 +843,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # including `DeepseekV2MLAAttention.indexer`.
         indexer = mla_modules.indexer
         if indexer is not None:
-            indexer = VllmTPUIndexer.rebind(indexer)
+            indexer = VllmTPUIndexer.rebind(cast(Indexer, indexer))
         self.indexer = indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
@@ -865,7 +873,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            kv_b_proj=self.kv_b_proj,
+            kv_b_proj=cast(ColumnParallelLinear, self.kv_b_proj),
             dcp_q_replicate=self.dcp_q_replicate and self.is_sparse,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
@@ -881,6 +889,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
+            # torch's stubs resolve this hasattr-guarded method as a Tensor.
+            # pyrefly: ignore[not-callable]
             super().process_weights_after_loading(act_dtype)
         if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
             device = torch.device("tpu")
@@ -898,6 +908,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         output_gate = None
 
         if self.kimi_preprocess is not None:
+            assert self.fused_qkv_a_proj is not None
+            assert self.q_a_layernorm is not None
+            assert self.q_b_proj is not None
             q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
                 hidden_states,
                 self.fused_qkv_a_proj.weight,
@@ -946,6 +959,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q = self.q_proj(hidden_states)[0]
 
         if self.kimi_preprocess is None:
+            # Set by the earlier `kimi_preprocess is None` branch.
+            assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -978,6 +993,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
+            assert topk_index is not None
             topk_indices = topk_index[: hidden_states.shape[0]]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
@@ -992,7 +1008,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.dcp_q_replicate:
             if self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
-            local_view = self._q_proj_layer()._local_view
+            local_view = cast(
+                DCPGroupColumnParallelLinear, self._q_proj_layer()
+            )._local_view
             q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
         attn_out = self.mla_attn(

@@ -20,6 +20,8 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 NUM_KV_HEADS = 2
 NUM_Q_HEADS = 4
 HEAD_DIM = 128

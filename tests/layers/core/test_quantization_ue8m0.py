@@ -13,9 +13,12 @@
 # limitations under the License.
 """Tests for the UE8M0 (power-of-two) block scales in `quantize_tensor`."""
 
+import pytest
 import torch
 
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32, quantize_tensor
+
+pytestmark = pytest.mark.tpu_test
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)

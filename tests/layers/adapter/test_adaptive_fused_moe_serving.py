@@ -15,8 +15,6 @@ from vllm_torchtpu.layers.adapter import fused_moe_ep as legacy
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.quantization import fp8, nvfp4
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.mark.parametrize(
     "selection,old,enabled",

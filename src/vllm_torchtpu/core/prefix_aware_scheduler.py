@@ -29,10 +29,15 @@ Enable with:
 """
 
 from itertools import islice
+from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
+from vllm.v1.core.sched.request_queue import (
+    FCFSRequestQueue,
+    RequestQueue,
+    SchedulingPolicy,
+)
 from vllm.v1.request import Request
 
 logger = init_logger("vllm." + __name__)
@@ -105,7 +110,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
 
         if best is not head and best_rank < scored[0][0][0]:
-            queue.remove(best)
+            # Only FCFS reaches here (see the early return above).
+            cast(FCFSRequestQueue, queue).remove(best)
             queue.prepend_request(best)
 
         self._paw_n += 1

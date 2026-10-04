@@ -162,6 +162,7 @@ def test_precompile_skips_sub_block_draft_forward():
     ] == [8, 16, 512]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
 def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes
@@ -287,6 +288,7 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     assert torch.allclose(all_v, expected_v_all, atol=1e-5)
 
 
+@pytest.mark.tpu_test
 def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
     proposer = _make_proposer(draft_tp=1)
     hidden_states = torch.randn(3, 32, device=device)
@@ -348,6 +350,7 @@ def _make_chunk(
     )
 
 
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -390,6 +393,7 @@ def test_prepare_dflash_inputs(device):
     )
 
 
+@pytest.mark.tpu_test
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
@@ -435,6 +439,7 @@ def test_update_draft_kv_cache_from_target_unit(device):
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
 
+@pytest.mark.tpu_test
 def test_propose_unit(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -543,6 +548,7 @@ def test_dp_lockstep_run_dummy_draft():
     assert proposer._dp_dummy_forward.call_count == 2
 
 
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs_dp_lockstep(device):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     K = 3

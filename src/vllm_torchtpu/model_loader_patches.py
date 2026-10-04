@@ -50,7 +50,11 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
+import json
 import os
+import struct
+import threading
+import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -63,8 +67,9 @@ logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
+# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
+_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
@@ -78,7 +83,9 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     return expert_id not in local_expert_ids
 
 
-def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
+def _should_skip_weight_tpu(
+    weight_name: str, local_expert_ids: set[int] | None
+) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
@@ -88,7 +95,7 @@ def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> boo
     """
     if local_expert_ids is None:
         return False
-    return _should_skip(name, local_expert_ids)
+    return _should_skip(weight_name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -198,6 +205,8 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
+                # run_start is set whenever a size is appended to run_sizes.
+                assert run_start is not None
                 requests.append(FileChunks(len(requests), path, run_start, run_sizes))
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
@@ -354,17 +363,142 @@ def patch_default_loader_ep_weight_filter() -> None:
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
     """
-    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
 
     if getattr(weight_utils, "_tpu_ep_filter_patch", False):
         return
     weight_utils.should_skip_weight = _should_skip_weight_tpu
     ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
+
+    # With the filter on, upstream's "prefetch" strategy still reads whole
+    # files: rank r reads sorted_files[r::world_size] in full, every expert
+    # included. Under EP across hosts that pulls the other hosts' experts into
+    # this host's page cache, while the files another host's ranks prefetched
+    # are read here through mmap page faults. Prefetch only the byte ranges of
+    # the tensors this rank keeps instead, across every file.
+    original_iterator = weight_utils.safetensors_weights_iterator
+
+    @functools.wraps(original_iterator)
+    def safetensors_weights_iterator(
+        hf_weights_files,
+        use_tqdm_on_load,
+        safetensors_load_strategy=None,
+        local_expert_ids=None,
+        **kwargs,
+    ):
+        if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+            _start_ep_range_prefetch(
+                sorted(hf_weights_files, key=weight_utils._natural_sort_key),
+                local_expert_ids,
+                kwargs.get(
+                    "safetensors_prefetch_num_threads",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+                ),
+                kwargs.get(
+                    "safetensors_prefetch_block_size",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+                ),
+            )
+            safetensors_load_strategy = "lazy"
+        return original_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            safetensors_load_strategy,
+            local_expert_ids,
+            **kwargs,
+        )
+
+    weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.safetensors_weights_iterator = safetensors_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
+        "local tensors (DefaultModelLoader)."
     )
+
+
+def _local_tensor_ranges(
+    path: str, local_expert_ids: set[int]
+) -> list[tuple[int, int]]:
+    """Merged [start, end) file offsets of the tensors this rank keeps."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    base = 8 + header_len
+    spans = sorted(
+        (base + v["data_offsets"][0], base + v["data_offsets"][1])
+        for name, v in header.items()
+        if name != "__metadata__" and not _should_skip(name, local_expert_ids)
+    )
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _start_ep_range_prefetch(
+    sorted_files: list[str],
+    local_expert_ids: set[int],
+    num_threads: int,
+    block_size: int,
+) -> None:
+    """Read this rank's tensors into the page cache in a background thread.
+
+    Reads go in the iterator's file order, in ``block_size`` chunks over
+    ``num_threads`` threads, so the lazy safetensors iterator that follows
+    finds its pages cached. Dense tensors are kept by every rank; ranks on
+    one host share those pages.
+    """
+
+    def run() -> None:
+        start = time.perf_counter()
+        fds: list[int] = []
+        jobs: list[tuple[int, int, int]] = []
+        try:
+            for path in sorted_files:
+                fd = os.open(path, os.O_RDONLY)
+                fds.append(fd)
+                for lo, hi in _local_tensor_ranges(path, local_expert_ids):
+                    jobs.extend(
+                        (fd, off, min(block_size, hi - off))
+                        for off in range(lo, hi, block_size)
+                    )
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                total = sum(
+                    executor.map(lambda j: len(os.pread(j[0], j[2], j[1])), jobs)
+                )
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
+                "%.1f s (%.2f GiB/s)",
+                total / 2**30,
+                len(sorted_files),
+                elapsed,
+                total / 2**30 / max(elapsed, 1e-9),
+            )
+        except Exception:
+            logger.warning("[ep-prefetch] prefetch failed", exc_info=True)
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    logger.info(
+        "[ep-prefetch] started: %d files, %d local experts, num_threads=%d, "
+        "block_size=%d bytes",
+        len(sorted_files),
+        len(local_expert_ids),
+        num_threads,
+        block_size,
+    )
+    threading.Thread(target=run, name="ep-range-prefetch", daemon=True).start()
 
 
 def _evict_one_checkpoint_file(fpath: str) -> float | None:

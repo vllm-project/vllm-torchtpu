@@ -367,9 +367,11 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         # The kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
-        if num_spec_tokens > 0 and slot_read_offsets is None:
-            raise ValueError("slot_read_offsets are required for KDA verify")
-        read_offsets = slot_read_offsets[state_indices] if num_spec_tokens > 0 else None
+        read_offsets = None
+        if num_spec_tokens > 0:
+            if slot_read_offsets is None:
+                raise ValueError("slot_read_offsets are required for KDA verify")
+            read_offsets = slot_read_offsets[state_indices]
 
         def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
             return gdn_wrapper.fused_conv1d_gdn(

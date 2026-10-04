@@ -20,8 +20,6 @@ from .raiden_test_utils import (
     kimi_pool_manifest,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
     return types.SimpleNamespace(

@@ -360,7 +360,10 @@ def test_real_patch_entrypoints_in_spawned_processes():
 
     probe = Path(__file__).resolve()
     source = probe.parents[2] / "src"
-    env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
+    pythonpath = os.pathsep.join(
+        filter(None, [str(source), os.environ.get("PYTHONPATH")])
+    )
+    env = dict(os.environ, PYTHONPATH=pythonpath, JAX_PLATFORMS="tpu")
     result = subprocess.run(
         [sys.executable, str(probe)],
         env=env,

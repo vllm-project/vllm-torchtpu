@@ -137,7 +137,6 @@ def test_default_shape_matches_inherited(
 KERNEL_BLOCK_SIZES = [128, 256]
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 @pytest.mark.parametrize("head_dim", [64, 256, 512])
@@ -231,6 +230,7 @@ def test_bf16_pages_are_identical_across_layouts(hnd, num_kv_heads, head_size):
 # Shape contracts the rest of the stack depends on
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 def test_shape_matches_the_kernel_wrapper(hnd, num_kv_heads, head_size, dtype):
@@ -383,6 +383,7 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
 # Head width read off the cache
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("head_size", [80, 128, 256])
 @pytest.mark.parametrize("layout", ["HND", None])
 def test_page_carries_head_width_where_forward_reads_it(monkeypatch, layout, head_size):

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -282,33 +282,36 @@ def csa_gather(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    nope_out, rope_out = pl.kernel(
-        functools.partial(
-            main_kernel,
-            core_axis_name=vector_mesh.core_axis_name,
-            subcore_axis_name=vector_mesh.subcore_axis_name,
-            num_row_subchunks=num_row_subchunks,
-            num_streams=num_streams,
-            top_k=top_k,
-        ),
-        out_type=(
-            jax.ShapeDtypeStruct(
-                (out_size + out_pad_size, csa_cache_layout.ROW_WORDS), jnp.int32
+    nope_out, rope_out = cast(
+        Any,
+        pl.kernel(
+            functools.partial(
+                main_kernel,
+                core_axis_name=vector_mesh.core_axis_name,
+                subcore_axis_name=vector_mesh.subcore_axis_name,
+                num_row_subchunks=num_row_subchunks,
+                num_streams=num_streams,
+                top_k=top_k,
             ),
-            jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) // 4, csa_cache_layout.ROW_WORDS),
-                jnp.int32,
+            out_type=(
+                jax.ShapeDtypeStruct(
+                    (out_size + out_pad_size, csa_cache_layout.ROW_WORDS), jnp.int32
+                ),
+                jax.ShapeDtypeStruct(
+                    ((out_size + out_pad_size) // 4, csa_cache_layout.ROW_WORDS),
+                    jnp.int32,
+                ),
             ),
-        ),
-        # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
-        # copies issued in `main_kernel`.
-        scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
-        mesh=vector_mesh,
-        name="sc_csa_gather",
-    )(nope_cache, rope_cache, indices, valid_indices)
+            # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
+            # copies issued in `main_kernel`.
+            scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=False,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            mesh=vector_mesh,
+            name="sc_csa_gather",
+        )(nope_cache, rope_cache, indices, valid_indices),
+    )  # pyrefly: ignore[not-iterable]
     return nope_out[:out_size], rope_out[: out_size // 4]

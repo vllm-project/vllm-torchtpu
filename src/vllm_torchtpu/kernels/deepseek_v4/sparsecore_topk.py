@@ -31,6 +31,7 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
 
 import functools
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -462,7 +463,7 @@ def _sc_topk_direct(
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
-    slots, keys = out
+    slots, keys = cast(Any, out)  # pyrefly: ignore[not-iterable]
     slots_2d = slots.reshape(padded_b, k)[:b]
     keys_2d = keys.reshape(padded_b, k)[:b]
     return slots_2d, keys_2d
