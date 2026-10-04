@@ -413,8 +413,10 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   helpers out of giant tests; verify parametrization actually flows into the
   code under test (a decorator param that is silently ignored still passes).
 - **R-8.4** **Verify tests are wired into CI.** Green CI ≠ code exercised —
-  check the pipeline yml ignore lists and markers (`nightly`, `multichip`).
-  Mark tests correctly: a mock-only test must not require a multichip agent.
+  check the pipeline yml ignore lists and markers (`tpu_test`, `multichip`,
+  `nightly`). Unmarked tests run on the CPU agent. Mark tests correctly: a
+  test that needs a TPU must carry `tpu_test`, and a mock-only test must not
+  require a TPU or multichip agent.
 - **R-8.5** **Tests must run on the smallest hardware that exercises the
   behavior.** Coverage that only exists on large/pod configurations doesn't
   count as coverage.

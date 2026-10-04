@@ -16,11 +16,14 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax import lax
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import csa_gather
+
+pytestmark = pytest.mark.tpu_test
 
 
 def gather_nope_ref_impl(cache, indices):

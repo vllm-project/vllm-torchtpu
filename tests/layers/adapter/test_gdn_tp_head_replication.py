@@ -21,8 +21,6 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
 from vllm_torchtpu.platforms.tpu_block_size_utils import _hybrid_mamba_state_layout
 
-pytestmark = pytest.mark.cpu_test
-
 K_HEADS = 4
 V_HEADS = 32
 HEAD_DIM = 128

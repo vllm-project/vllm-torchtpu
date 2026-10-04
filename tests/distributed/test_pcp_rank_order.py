@@ -20,8 +20,6 @@ import pytest
 
 from vllm_torchtpu.distributed import pcp_rank_order as order_mod
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _config(**kwargs):
     parallel = SimpleNamespace(

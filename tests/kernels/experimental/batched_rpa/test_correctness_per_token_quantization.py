@@ -18,6 +18,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
@@ -31,6 +32,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
 from vllm_torchtpu.kernels.experimental.batched_rpa.wrapper import (
     ragged_paged_attention,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 jax.config.parse_flags_with_absl()
 

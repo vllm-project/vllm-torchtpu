@@ -169,6 +169,7 @@ def test_explicit_block_sizes_take_precedence(monkeypatch: pytest.MonkeyPatch) -
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("num_heads", "seq_len", "head_dim", "has_tuning"),
     (

@@ -40,6 +40,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
 from .tpu_test_utils import run_in_isolated_process
 
+pytestmark = pytest.mark.tpu_test
+
 
 def _can_allocate_tpu_tensor() -> tuple[bool, str]:
     probe = (

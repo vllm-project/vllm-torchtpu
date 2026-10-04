@@ -22,8 +22,6 @@ from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
     get_tpu_bundles_for_indices,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 class MockParallelConfig:
     def __init__(self):

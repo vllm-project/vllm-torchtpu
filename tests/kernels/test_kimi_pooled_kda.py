@@ -230,6 +230,7 @@ def _run_pooled(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
@@ -252,6 +253,7 @@ def test_pooled_kda_matches_dense_bitwise(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "conv_shard_heads", [None, 1], ids=["one-shard", "rank-blocked"]
 )
@@ -346,6 +348,7 @@ def test_pooled_kda_rejects_oversized_state():
         )
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_manager_block_split():
     """Manager ids on a pool born at kernel-block granularity (split > 1).
 
@@ -411,6 +414,7 @@ def test_pooled_kda_manager_block_split():
             np.testing.assert_array_equal(after[block], seed[block])
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_multistep_state_evolution():
     """State must round-trip the pool across a chunked prefill and decodes.
 

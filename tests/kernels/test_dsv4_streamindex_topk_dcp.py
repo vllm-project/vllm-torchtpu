@@ -29,6 +29,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk_dcp,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 P = jax.sharding.PartitionSpec
 
 

@@ -15,9 +15,12 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope, rope, rope_quant
+
+pytestmark = pytest.mark.tpu_test
 
 # DeepSeek-V4-Flash: head_dim 512, qk_rope_head_dim 64, 64 attention heads.
 HEAD_DIM = 512

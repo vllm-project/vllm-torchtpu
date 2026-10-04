@@ -26,6 +26,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
+@pytest.mark.tpu_test
 def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
@@ -266,6 +267,7 @@ def _fresh_metadata_manager(device, input_ids):
     return SpeculativeDecodingManager(mock_runner)
 
 
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     # Same (num_draft_tokens, cu_num_scheduled_tokens, padded_num_reqs) ->
     # the 7 index tensors are reused (same device objects, no re-transfer),
@@ -297,6 +299,7 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
 
 
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_deferred_draft_token_ids(device):
     # Deferral leaves draft_token_ids unset and keeps its host copy, on the
     # uncached and the cached path; uploading that copy gives the values the
@@ -318,6 +321,7 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
 
 
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
     # Any change in the key inputs must rebuild, with values matching an
     # uncached build.

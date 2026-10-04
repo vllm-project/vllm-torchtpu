@@ -26,8 +26,6 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu import _patch_vllm_same_step_prefix_hits
 
-pytestmark = pytest.mark.cpu_test
-
 BLOCK_SIZE = 16
 # One full block plus a partial one: the most a hit can cover is one block.
 PROMPT = list(range(BLOCK_SIZE + 8))

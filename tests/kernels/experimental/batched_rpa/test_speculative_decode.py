@@ -8,6 +8,8 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.mark.parametrize(
     ("bucket", "q_lens", "kv_lengths"),

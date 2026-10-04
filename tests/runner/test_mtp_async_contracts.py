@@ -24,6 +24,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture
 def device():

@@ -1,8 +1,4 @@
-import pytest
-
 from vllm_torchtpu.distributed import utils
-
-pytestmark = pytest.mark.cpu_test
 
 
 def test_kv_transfer_names_default(monkeypatch):

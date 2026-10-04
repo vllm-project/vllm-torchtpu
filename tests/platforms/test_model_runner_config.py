@@ -9,8 +9,6 @@ from vllm.config.compilation import CompilationMode
 
 import vllm_torchtpu as plugin
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _config(device="tpu", method=None, pcp=1):
     # Exercise the native validator/property without loading a model or devices.

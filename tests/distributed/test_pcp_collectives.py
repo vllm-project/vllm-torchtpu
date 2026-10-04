@@ -255,6 +255,7 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     return get_pallas_mesh
 
 
+@pytest.mark.tpu_test
 def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 1), (30, 10), 0, 2)]
     get_pallas_mesh = _pcp_mesh_environment(monkeypatch, holder)
@@ -271,6 +272,7 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     assert get_pallas_mesh.call_count == 3
 
 
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 1), (30, 10), 0, 2)]
     get_pallas_mesh = _pcp_mesh_environment(monkeypatch, holder, world_size=2)
@@ -282,6 +284,7 @@ def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     assert pcp._MESH_CACHE == {}
 
 
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     monkeypatch.setattr(pcp, "_MESH_CACHE", {})
     # rank_in_group 0 is PyTorch rank 2, but the kernel's partition 0 is
@@ -294,6 +297,7 @@ def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     assert pcp._MESH_CACHE == {}
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("pcp_size,tp_size", [(4, 2), (8, 1), (1, 8), (16, 2)])
 def test_pcp_tp_mesh_uses_runtime_rank_factorization(monkeypatch, pcp_size, tp_size):
     for rank in range(pcp_size * tp_size):
@@ -321,6 +325,7 @@ def test_pcp_tp_mesh_uses_runtime_rank_factorization(monkeypatch, pcp_size, tp_s
         pcp._MESH_CACHE.clear()
 
 
+@pytest.mark.tpu_test
 def test_pcp_tp_mesh_rejects_wrong_tp_rank_order(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 2, 4, 6), (0, 4, 6, 2), 0, 4)]
     native = _pcp_mesh_environment(monkeypatch, holder, 8)

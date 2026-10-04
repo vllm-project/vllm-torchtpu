@@ -27,8 +27,6 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import RegionSpe
 from .raiden_test_utils import KIMI_KV_ITEMSIZE, kimi_pool_manifest
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
 
-pytestmark = pytest.mark.cpu_test
-
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.
 _CONV_REGIONS_PAIR_TP8 = (

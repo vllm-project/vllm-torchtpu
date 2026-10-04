@@ -21,8 +21,6 @@ import vllm  # noqa: F401
 
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _vllm_config(
     *,

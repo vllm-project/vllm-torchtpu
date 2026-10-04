@@ -48,7 +48,6 @@ def test_dspark_draft_model_registration():
 # draft loader skips. Name shapes follow the DeepSeek-V4-Flash-DSpark
 # inventory: three full-layer stages under mtp.{0,1,2}, the combiner on
 # stage 0, the head stack and confidence head on the last stage.
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "expert_dtype,name,expected",
     [
@@ -174,7 +173,6 @@ def tiny_fc(monkeypatch, request):
         )
 
 
-@pytest.mark.cpu_test
 def test_construction_wiring(tiny_fc):
     model = tiny_fc.model
     # vLLM prefixes continue the target's numbering so the KV-cache layer
@@ -195,7 +193,6 @@ def test_construction_wiring(tiny_fc):
     assert model.main_proj.weight.shape == (HIDDEN, HIDDEN * len(TARGET_LAYER_IDS))
 
 
-@pytest.mark.cpu_test
 def test_block_must_fit_the_sliding_window(monkeypatch, request):
     """The non-causal block mode only reaches keys inside the window's
     key-block walk, so construction rejects a block that cannot fit."""
@@ -210,7 +207,6 @@ def test_block_must_fit_the_sliding_window(monkeypatch, request):
         dspark_mod.DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config, prefix="")
 
 
-@pytest.mark.cpu_test
 def test_weight_load_round_trip(tiny_fc):
     """mtp.* names -> rewrite -> params, reported under the wrapper's prefix."""
     model = tiny_fc.model

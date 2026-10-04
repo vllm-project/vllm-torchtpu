@@ -51,7 +51,6 @@ def test_fp8_config_rejects_store_dtype():
         )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "block_size,shard_size,deepseek_v4",
     [
@@ -225,6 +224,7 @@ class FakeFusedMoELayer(torch.nn.Module):
         return cls
 
 
+@pytest.mark.tpu_test
 class TestFp8MoEScaleReshape:
     """Tests for block-quantized FP8 MoE scale reshaping."""
 
@@ -303,6 +303,7 @@ class TestFp8MoEScaleReshape:
                     )
 
 
+@pytest.mark.tpu_test
 class TestFp8LinearRuntimeQuant:
     """Tests for ullm-style runtime FP8 dense linear weights."""
 
@@ -539,6 +540,7 @@ class TestFp8LinearRuntimeQuant:
             _quantized_matmul_jax(x, w_q, w_scale)
 
 
+@pytest.mark.tpu_test
 class TestFp8WeightTranspose:
     """Tests for weight transpose in MoE processing."""
 
@@ -594,6 +596,7 @@ class TestFp8WeightTranspose:
         assert torch.all(w13_scale_deinterleaved[:, inter:, :] == 2.0)
 
 
+@pytest.mark.tpu_test
 class TestOnlineFp8Quantization:
     """Tests for _quantize_bf16_moe_weights."""
 
@@ -752,6 +755,7 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+@pytest.mark.tpu_test
 class TestMoERequantizationChunks:
     """Requantizing a few experts at a time must give the whole-tensor
     result."""

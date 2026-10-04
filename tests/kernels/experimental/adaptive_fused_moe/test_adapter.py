@@ -11,8 +11,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter as bridge
 
-pytestmark = pytest.mark.cpu_test
-
 
 def layer(fp4=False):
     e, h, i = 4, 512, 256

@@ -39,6 +39,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
 
+pytestmark = pytest.mark.tpu_test
+
 jax.config.parse_flags_with_absl()
 
 

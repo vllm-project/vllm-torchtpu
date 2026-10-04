@@ -18,7 +18,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import
 )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
 @pytest.mark.parametrize("rows", [1, 7, 17, 257])
 def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
@@ -103,7 +102,6 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
     )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "groups", [(), ((0, 1),), ((0, 0), (2, 3)), ((0,), (1, 2, 3)), ((0, 1), (2, 4))]
 )

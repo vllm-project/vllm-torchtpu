@@ -23,6 +23,8 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 _DECODE_BLOCKS = configs.BlockSizes(
     bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
 )

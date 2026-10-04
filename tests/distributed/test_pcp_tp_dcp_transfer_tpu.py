@@ -28,6 +28,8 @@ from .test_raiden_fa_layout_calibration_tpu import (
 )
 from .tpu_test_utils import run_in_isolated_process
 
+pytestmark = pytest.mark.tpu_test
+
 
 def _store(name):
     from tpu_sync.api.torch import reshard_store as rs

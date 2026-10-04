@@ -24,6 +24,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.exceptions import VLLMValidationError
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 PROMPTS = [

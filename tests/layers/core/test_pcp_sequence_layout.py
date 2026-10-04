@@ -355,7 +355,6 @@ def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
     torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "num_tokens,expected_gathers",
     [

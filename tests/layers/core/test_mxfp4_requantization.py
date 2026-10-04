@@ -47,6 +47,8 @@ from vllm_torchtpu.layers.core.quantization import (  # isort: skip
     unpack_uint8_to_fp4,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 # ============================================================================
 # JAX REFERENCE IMPLEMENTATION (from legacy vllm_torchtpu)
 # These are copied here ONLY for comparison in tests.

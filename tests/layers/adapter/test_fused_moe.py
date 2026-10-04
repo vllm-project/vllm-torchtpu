@@ -56,6 +56,7 @@ def test_get_fused_moe_activation_requires_situ_beta():
         get_fused_moe_activation("situ", moe_config)
 
 
+@pytest.mark.tpu_test
 def test_get_fused_moe_activation_compiles():
     @torch.compile(fullgraph=True)
     def compiled_fn(x, activation):

@@ -1,9 +1,12 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEFactory
 
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _build_layer_and_method(device):

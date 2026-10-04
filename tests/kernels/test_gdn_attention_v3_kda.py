@@ -23,9 +23,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.gdn.v3 import config, wrapper
+
+pytestmark = pytest.mark.tpu_test
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:

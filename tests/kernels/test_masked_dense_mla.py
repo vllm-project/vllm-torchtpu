@@ -36,6 +36,7 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
@@ -283,6 +284,7 @@ class MaskedDenseCacheSetupTest(parameterized.TestCase):
                 np.testing.assert_array_equal(np.asarray(rows[page, length:]), 0)
 
 
+@pytest.mark.tpu_test
 class MaskedDenseMlaTest(MaskedDenseTestBase):
     """Correctness of the kernel against a float32 numpy reference."""
 
@@ -516,6 +518,7 @@ class MaskedDenseMlaTest(MaskedDenseTestBase):
         np.testing.assert_allclose(dense, sparse, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.tpu_test
 class AnalyticCausalMaskTest(MaskedDenseTestBase):
     """`max_kv_len <= topk`: the CSA mask degenerates to the causal mask.
 
@@ -632,6 +635,7 @@ class AnalyticCausalMaskTest(MaskedDenseTestBase):
             )
 
 
+@pytest.mark.tpu_test
 class SparseChunkRowContractTest(MaskedDenseTestBase):
     """Rows the sparse kernel may write past its token end.
 

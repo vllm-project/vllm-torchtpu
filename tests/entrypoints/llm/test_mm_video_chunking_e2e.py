@@ -52,6 +52,8 @@ from vllm.assets.video import VideoAsset
 
 from vllm_torchtpu import tpu_info
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 CHUNK_ENV = "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE"
 

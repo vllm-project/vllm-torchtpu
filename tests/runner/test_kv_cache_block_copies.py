@@ -14,8 +14,6 @@ import vllm_torchtpu.runner.tpu_runner as runner_mod
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _runner_with_raw_tensors(raw_tensors):
     runner = object.__new__(TPUModelRunner)

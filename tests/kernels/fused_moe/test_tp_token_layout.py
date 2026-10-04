@@ -16,7 +16,6 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
 @pytest.mark.parametrize("rows", [1, 7, 17, 257])
 def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
@@ -36,6 +35,7 @@ def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, 
     assert layout.local_rows == rows
 
 
+@pytest.mark.multichip
 @pytest.mark.parametrize(
     "groups",
     [

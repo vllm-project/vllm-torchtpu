@@ -16,10 +16,13 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout
+
+pytestmark = pytest.mark.tpu_test
 
 NOPE_DIM = 512
 ROPE_DIM = 64

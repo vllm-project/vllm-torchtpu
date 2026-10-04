@@ -16,6 +16,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
@@ -30,6 +31,8 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     project_and_save_state_ref as proj_and_save_state_ref,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 
 def generate_kv_slot_mapping(

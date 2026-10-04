@@ -28,10 +28,13 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.layers.core import gdn_attention
+
+pytestmark = pytest.mark.tpu_test
 
 # Measured 1.043-1.049x over five runs; a per-tile decode lands near 2.2x.
 # Arms are timed best-of-N because each is only ~7.5 ms.

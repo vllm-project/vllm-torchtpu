@@ -635,6 +635,7 @@ class TestStartStopPhasedProfiling:
         assert runner.phase_based_profiler is None
 
 
+@pytest.mark.tpu_test
 class TestTPURunner:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
@@ -1815,6 +1816,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     assert vllm_config.cache_config.block_size in (128, 256)
 
 
+@pytest.mark.tpu_test
 def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
@@ -2301,6 +2303,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         assert runner.input_batch.num_tokens_no_spec[1] == 15
 
 
+@pytest.mark.tpu_test
 def test_upload_unless_unchanged_reuses_only_identical_values(device):
     """Spec steps reuse the previous upload of a small tensor while its values
     repeat. New values, dtype or shape upload again, and slots never share an
