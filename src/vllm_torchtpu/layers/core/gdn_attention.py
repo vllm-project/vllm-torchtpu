@@ -17,7 +17,6 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -26,12 +25,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
-from vllm_torchtpu.gdn_pool_layout import (
-    derive_pooled_gdn_state_layout,
-    pooled_gdn_conv_state_bytes,
-    pooled_gdn_ssm_state_bytes,
-)
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -792,65 +785,6 @@ def _is_seq_along_lane_pool() -> bool:
     """True if pool uses the SEQ_ON_LANE
     (nb, heads2, packed_d, pack, page_size) layout."""
     return envs.VLLM_KV_CACHE_LAYOUT == "HND"
-
-
-def _build_v3_pool_state_plan(
-    pool: jnp.ndarray,
-    *,
-    conv_dim: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
-    pool_block_tokens: int,
-    qk_pair_layout: bool,
-    recurrent_state_dtype: jnp.dtype = jnp.float32,
-):
-    """Describe this rank's GDN state regions in the unified pool."""
-    block_size, payload, lanes = pool_adapters._pool_geometry(pool)
-    if pool_block_tokens % block_size != 0:
-        raise ValueError(
-            "Manager block size must be divisible by the unified "
-            f"pool kernel block size: {pool_block_tokens} and "
-            f"{block_size}."
-        )
-    split = pool_block_tokens // block_size
-    if _is_seq_along_lane_pool():
-        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
-    else:
-        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
-    state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=pooled_gdn_ssm_state_bytes(
-            num_v_heads=n_v,
-            head_k_dim=d_k,
-            head_v_dim=d_v,
-            dtype=jnp.dtype(recurrent_state_dtype),
-        ),
-        conv_bytes=pooled_gdn_conv_state_bytes(
-            kernel_size=kernel_size, conv_dim=conv_dim
-        ),
-        token_bytes=tok_bytes,
-    )
-    if state_layout.required_tokens > pool_block_tokens:
-        raise ValueError(
-            "GDN state does not fit in the unified pool manager "
-            f"block: {state_layout.required_tokens} > "
-            f"{pool_block_tokens}."
-        )
-    return pool_adapters.v3_state_source(
-        pool,
-        split=split,
-        ssm_ntok=state_layout.ssm_tokens,
-        conv_tok0=state_layout.ssm_tokens,
-        conv_ntok=state_layout.conv_tokens,
-        conv_dim=conv_dim,
-        n_v=n_v,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
-        qk_pair_layout=qk_pair_layout,
-        recurrent_state_dtype=recurrent_state_dtype,
-    )
 
 
 def _as_logical_block_pool(

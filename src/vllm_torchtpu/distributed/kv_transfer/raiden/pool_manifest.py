@@ -491,7 +491,7 @@ def _pooled_gdn_state_views(
     """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
 
     The state geometry is tied to the pooled GDN kernel's byte model
-    (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
+    (``gdn_pool_layout`` — the same helpers the pooled slot sizing
     uses), NOT to the layer's declared MambaSpec shapes or Conv dtype.  The
     pooled kernel never reads those declarations, so only the kernel model
     describes the geometry and Conv bytes that actually move; a declaration

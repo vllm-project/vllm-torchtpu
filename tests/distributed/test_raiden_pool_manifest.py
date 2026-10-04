@@ -603,7 +603,7 @@ def test_unified_pool_conv_region_matches_kernel_state_plan():
     """Pin the manifest's state model to the pooled kernel's state plan.
 
     Uses the live Qwen3.5 full-width geometry and the same
-    ``gdn_pool_layout`` helpers ``_build_v3_pool_state_plan`` consumes, so a
+    ``gdn_pool_layout`` helpers the pooled kernel's slot sizing consumes, so a
     kernel-side layout change breaks this test instead of the nightly
     reshard pair.
     """

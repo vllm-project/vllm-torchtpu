@@ -879,9 +879,18 @@ class TestPooledCallerV3:
         )
         assert jnp.array_equal(new_pool.view(jnp.int16), pool_rt.view(jnp.int16))
 
-    @pytest.mark.parametrize("page_size", [128, 256])
+    @pytest.mark.parametrize("page_size", [128, 256, 512])
+    @pytest.mark.parametrize(
+        ("num_kv_heads", "kv_packing", "head_dim", "pool_dtype"),
+        [
+            (1, 4, 256, jnp.float8_e4m3fn),
+            (1, 2, 256, jnp.bfloat16),
+            (2, 2, 256, jnp.bfloat16),
+            (4, 4, 256, jnp.float8_e4m3fn),
+        ],
+    )
     def test_caller_matches_dense_with_native_seq_along_lane_pool(
-        self, monkeypatch, page_size
+        self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim, pool_dtype
     ):
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
@@ -889,12 +898,19 @@ class TestPooledCallerV3:
         pool_idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         dense_idx = jnp.arange(n, dtype=jnp.int32)
 
-        # split must provide at least 1056 tokens per manager block (SSM=1024 + Conv=32)
+        # A 1536-token manager block holds the state for every geometry here:
+        # the smallest token row (one fp8 KV head pair, 512 B) needs
+        # SSM=1024 + Conv=64 tokens.
         split = 1536 // page_size
-        num_kv_heads_x2, packed_d, pack = 2, 64, 4  # head_dim = 64 * 4 = 256
         pool = jnp.zeros(
-            (NUM_MGR * split, num_kv_heads_x2, packed_d, pack, page_size),
-            dtype=jnp.float8_e4m3fn,
+            (
+                NUM_MGR * split,
+                num_kv_heads * 2,
+                head_dim // kv_packing,
+                kv_packing,
+                page_size,
+            ),
+            dtype=pool_dtype,
         )
         conv = jnp.zeros((n, KERNEL_SIZE - 1, DIM), dtype=jnp.float32)
         recurrent_f32 = jnp.zeros((n, N_V, D_K, D_V), dtype=jnp.float32)

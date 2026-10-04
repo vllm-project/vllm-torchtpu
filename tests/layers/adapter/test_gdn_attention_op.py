@@ -111,44 +111,6 @@ def _qwen38_gdn_attn(prefix: str, *, tp_size: int = 1):
 
 
 class TestVllmGatedDeltaNetAttention:
-    @pytest.mark.parametrize("page_size", [128, 256, 512])
-    @pytest.mark.parametrize(
-        "num_kv_heads,kv_packing,head_dim,dtype",
-        [
-            (1, 4, 256, jnp.float8_e4m3fn),
-            (1, 2, 256, jnp.bfloat16),
-            (2, 2, 256, jnp.bfloat16),
-            (4, 4, 256, jnp.float8_e4m3fn),
-        ],
-    )
-    def test_seq_on_lane_native_pool_plan(
-        self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim, dtype
-    ):
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
-
-        manager_block_size = 4096 if page_size == 512 else 4352
-        num_kv_heads_x2 = num_kv_heads * 2
-        packed_head_dim = head_dim // kv_packing
-        shape = (10, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
-        pool = jnp.zeros(shape, dtype=dtype)
-
-        plan = _build_v3_pool_state_plan(
-            pool,
-            conv_dim=1536,
-            n_v=8,
-            d_k=128,
-            d_v=128,
-            kernel_size=4,
-            pool_block_tokens=manager_block_size,
-            qk_pair_layout=False,
-            recurrent_state_dtype=jnp.float32,
-        )
-        assert plan.stride == manager_block_size // page_size
-        assert plan.recurrent.view_dtype == jnp.float32
-        assert plan.conv.view_dtype == jnp.bfloat16
-        assert plan.whole_block_dma is True
-
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
         "run_jax_gdn_attention_pcp_tp_prefill"
