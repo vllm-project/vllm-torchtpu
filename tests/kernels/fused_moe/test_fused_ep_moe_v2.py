@@ -632,9 +632,7 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
 
     # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every
     # shard is non-finite.
-    gating_all_nan = jax.device_put(
-        np.full_like(gating_host, np.nan), token_sharding
-    )
+    gating_all_nan = jax.device_put(np.full_like(gating_host, np.nan), token_sharding)
     all_padded_out = np.asarray(
         fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_all_nan, **common)
     )

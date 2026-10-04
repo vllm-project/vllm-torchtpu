@@ -397,3 +397,22 @@ def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
     np.testing.assert_array_equal(
         out[4:].astype(np.float32), np.zeros((4, lane_blocks * lanes), np.float32)
     )
+
+
+@pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
+    """Both NaN-masked rows and -inf replica-padded rows must return False."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _apply_scoring_fn, _row_routes
+
+    gate_l = jnp.asarray(
+        [
+            [0.5, -0.2, 1.1, 0.0],
+            [np.nan, np.nan, np.nan, np.nan],
+            [-np.inf, -np.inf, -np.inf, -np.inf],
+            [-np.inf, 0.0, -np.inf, -np.inf],
+        ],
+        dtype=jnp.float32,
+    )
+    scores = _apply_scoring_fn(gate_l, scoring_fn)
+    routes = np.asarray(_row_routes(scores, gate_l))
+    np.testing.assert_array_equal(routes, np.array([[True], [False], [False], [True]]))

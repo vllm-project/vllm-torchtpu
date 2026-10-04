@@ -78,6 +78,18 @@ def _apply_scoring_fn(logits, scoring_fn):
     )
 
 
+def _row_routes(scores, gate_l):
+    """Per-token `[rows, 1]` mask: True iff the row has a finite score and logit.
+
+    `gate_l` is checked too: under sigmoid/sqrtsoftplus a `-inf` logit scores a
+    finite `0`, so replica padding (`token_layout.split(..., fill_value=-jnp.inf)`)
+    would otherwise pass the score check.
+    """
+    return jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & jnp.any(
+        jnp.isfinite(gate_l), axis=-1, keepdims=True
+    )
+
+
 def _combine_arrivals(
     arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
@@ -525,9 +537,9 @@ def fused_ep_moe_v2(
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & jnp.any(
-            jnp.isfinite(gate_l), axis=-1, keepdims=True
-        )
+        # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
+        # a finite 0, so replica padding would otherwise pass the score check.
+        row_routes = _row_routes(scores, gate_l)
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
