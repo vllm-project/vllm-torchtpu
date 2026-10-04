@@ -113,7 +113,9 @@ def _combine_arrivals(
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
-    coef = row_scales * topk_weights.astype(jnp.float32)
+    coef = jnp.where(
+        topk_weights != 0, row_scales * topk_weights.astype(jnp.float32), 0.0
+    )
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
             t_local=t_local,
@@ -132,7 +134,13 @@ def _combine_arrivals(
             rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
-        terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
+        terms.append(
+            jnp.where(
+                slot_coef[:, None, None] != 0,
+                slot_rows.astype(jnp.float32) * slot_coef[:, None, None],
+                0.0,
+            )
+        )
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
 
@@ -524,6 +532,7 @@ def fused_ep_moe_v2(
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,

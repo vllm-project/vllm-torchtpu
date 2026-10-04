@@ -615,7 +615,12 @@ def build_routing_tables(
         mirror_blocks, expert_blocks, bins
     ).reshape(-1)
 
-    slab_row = base_of_pair + slot  # always < total
+    on_valid = (expert_of_pair >= 0) & (expert_of_pair < e_total)
+    slab_row = jnp.where(
+        on_valid,
+        base_of_pair + slot,
+        jnp.int32(off_shard_slab_row(shard_stride, ep)),
+    )
 
     return RoutingTables(
         arrival_row=pos.reshape(T, K),

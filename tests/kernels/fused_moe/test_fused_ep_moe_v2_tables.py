@@ -250,3 +250,111 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}"
         )
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+def test_padded_tokens_are_dropped_from_routing_tables(ep, t_local, g_local, topk):
+    """Tokens with sentinel expert `e_total` add zero work and match across plans."""
+    idx_jnp, kwargs = _routing_inputs(ep, t_local, g_local, topk, skew=False, seed=11)
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    idx = np.asarray(idx_jnp).copy()
+
+    # Mark the second half of each shard's tokens as padded (`topk_idx = e_total`),
+    # and mark shard 1 as completely padded (`0` active tokens).
+    for d in range(ep):
+        start = d * t_local if d == 1 else d * t_local + t_local // 2
+        idx[start : (d + 1) * t_local, :] = e_total
+    idx_padded = jnp.asarray(idx)
+
+    whole = host.build_routing_tables(idx_padded, **kwargs)
+    off_shard = host.off_shard_slab_row(stride, ep)
+
+    # Every padded pair's slab_row must be the off-shard sentinel.
+    padded_pair_mask = idx.reshape(-1) == e_total
+    np.testing.assert_array_equal(
+        np.asarray(whole.slab_row)[padded_pair_mask],
+        np.full(padded_pair_mask.sum(), off_shard, dtype=np.int32),
+    )
+    # Shard 1 has 0 valid tokens, so it sends 0 rows to every expert.
+    np.testing.assert_array_equal(
+        np.asarray(whole.run_rows)[:, 1], np.zeros(e_total, dtype=np.int32)
+    )
+
+    counts = np.stack(
+        [
+            np.bincount(
+                idx[d * t_local : (d + 1) * t_local][
+                    idx[d * t_local : (d + 1) * t_local] < e_total
+                ],
+                minlength=e_total,
+            )
+            for d in range(ep)
+        ]
+    ).astype(np.int32)
+
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx_padded,
+            jnp.int32(me),
+            all_gather_rows=lambda _row: jnp.asarray(counts),
+            **kwargs,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(host.local_slab_rows(whole, me, shard_stride=stride)),
+            np.asarray(host.local_slab_rows(shard, me, shard_stride=stride)),
+        )
+        for builder in (
+            host.shard_transport_tables_in_blocks,
+            host.shard_push_tables_in_rows,
+            host.shard_expert_slabs,
+        ):
+            _assert_arrays_equal(
+                builder(whole, me, e_total=e_total, ep=ep),
+                builder(shard, me, e_total=e_total, ep=ep),
+                shard=me,
+            )
+        np.testing.assert_array_equal(
+            np.asarray(host.shard_token_gather(whole, me, shard_stride=stride)),
+            np.asarray(host.shard_token_gather(shard, me, shard_stride=stride)),
+        )
+
+
+def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
+    """Zero-weight padded tokens must not propagate NaN from uninitialized arrivals."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
+
+    # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
+    # on CPU without invoking the Pallas TPU combine kernel.
+    t_local, topk, lane_blocks, lanes, tile_m = 8, 4, 2, 128, 128
+    recv_rows = 32
+    arrivals = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
+    arrival_scales = np.ones((4, tile_m), dtype=np.float32)
+    # Poison row 0 (where unrouted tokens' pos=0, mirror_pos=0 point) with NaN.
+    arrivals[0] = np.nan
+    arrival_scales[0, 0] = np.nan
+
+    pos = np.ones((t_local, topk), dtype=np.int32)
+    mirror_pos = np.ones((t_local, topk), dtype=np.int32)
+    topk_weights = np.full((t_local, topk), 0.25, dtype=np.float32)
+
+    # Mark rows 4..7 as padded: pos=0, mirror_pos=0, topk_weights=0.0.
+    pos[4:] = 0
+    mirror_pos[4:] = 0
+    topk_weights[4:] = 0.0
+
+    out = np.asarray(
+        _combine_arrivals(
+            jnp.asarray(arrivals),
+            jnp.asarray(arrival_scales),
+            jnp.asarray(pos),
+            jnp.asarray(mirror_pos),
+            jnp.asarray(topk_weights),
+            jnp.bfloat16,
+        )
+    )
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out[:4].astype(np.float32), 1.0)
+    np.testing.assert_array_equal(
+        out[4:].astype(np.float32), np.zeros((4, lane_blocks * lanes), np.float32)
+    )

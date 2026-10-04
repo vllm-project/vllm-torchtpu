@@ -108,3 +108,17 @@ def test_zero_routing_weights_for_padding_is_local_tensor(monkeypatch):
         assert float(w2[1].abs().sum()) == 0.0
     finally:
         token_padding.set_padding_state(None)
+
+
+def test_mask_router_logits_for_padding():
+    provider = TokenPaddingState(local_padding_mask=torch.zeros(4, dtype=torch.bool))
+    token_padding.set_padding_state(provider)
+    try:
+        provider.update(1, 4)
+        logits = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        masked = token_padding.mask_router_logits_for_padding(logits)
+        assert torch.equal(masked[0], logits[0])
+        assert torch.isnan(masked[1:]).all()
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.mask_router_logits_for_padding(logits) is logits
