@@ -428,20 +428,32 @@ def _patch_vllm_compile_all_ranges() -> None:
         logger.info("Applied TPU patch: compile_all_ranges.")
 
 
-def _patch_disable_sequence_parallel_moe() -> None:
-    """Disable vLLM's sequence-parallel MoE on TPU.
+def _patch_sequence_parallel_moe_admission() -> None:
+    """Gate vLLM's sequence-parallel MoE on TPU.
 
-    The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
+    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at DP1
+    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
+    not apply on TPU. EP is required: without it the row-parallel expert sum
+    is never reduced.
     """
     from vllm.config.parallel import ParallelConfig
 
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
-    ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
+    if envs.TPU_MOE_SEQUENCE_PARALLEL:
+        ParallelConfig.use_sequence_parallel_moe = property(
+            lambda self: self.enable_expert_parallel
+            and self.tensor_parallel_size > 1
+            and self.data_parallel_size == 1
+        )
+    else:
+        ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
-    logger.info("Applied TPU patch: disable sequence-parallel MoE.")
+    logger.info(
+        "Applied TPU patch: sequence-parallel MoE %s.",
+        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
+    )
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:

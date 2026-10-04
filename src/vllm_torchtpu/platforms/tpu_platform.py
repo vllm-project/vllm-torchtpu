@@ -746,6 +746,10 @@ class TpuPlatform(Platform):
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+
+        if envs.TPU_MOE_SEQUENCE_PARALLEL:
+            _configure_sequence_parallel_moe(vllm_config)
+
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
@@ -1196,3 +1200,68 @@ def _get_token_paddings(
         )
     logger.info("Using token paddings: %s", paddings)
     return paddings
+
+
+def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
+    # Each rank receives size // tp rows; require 8-token alignment or
+    # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
+    # to avoid single-token shape specialization in Dynamo.
+    rows, rem = divmod(size, tp)
+    return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
+
+
+def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
+    """Validate architecture and filter compile buckets for sequence-parallel MoE.
+
+    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
+    shard or a validated power-of-two decode shard (2, 4 rows).
+    """
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.use_sequence_parallel_moe:
+        return
+    if vllm_config.speculative_config is not None:
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 does not yet cover the speculative "
+            "drafter; disable speculative decoding or wait for #1562."
+        )
+    archs = vllm_config.model_config.architectures or []
+    if not any(a.startswith("Qwen3_5Moe") for a in archs):
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3.5 MoE, "
+            f"got {archs}."
+        )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 does not support pipeline parallelism "
+            f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
+        )
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        logger.warning(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
+            "moves the same collective bytes as the default path."
+        )
+    tp = parallel_config.tensor_parallel_size
+    cc = vllm_config.compilation_config
+    if cc.compile_sizes is None:
+        return
+    original = [int(s) for s in cc.compile_sizes]
+    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
+    if not kept:
+        raise ValueError(
+            f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "
+            f"for tp={tp}: {original}"
+        )
+    if max(kept) != max(original):
+        raise ValueError(
+            f"TPU_MOE_SEQUENCE_PARALLEL=1 dropped largest compile size "
+            f"{max(original)} (tp={tp}): {original} -> {kept}. The largest "
+            "compile size must split into 2, 4, or a multiple of 8 rows per "
+            "TP rank."
+        )
+    if dropped := sorted(set(original) - set(kept)):
+        logger.info(
+            "Sequence-parallel MoE dropped compile sizes %s (tp=%d).",
+            dropped,
+            tp,
+        )
+    cc.compile_sizes = cast(list[int | str], kept)

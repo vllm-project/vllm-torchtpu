@@ -96,3 +96,50 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+def test_moe_group_with_sequence_parallel(monkeypatch, communicator):
+    ep_group = Mock(world_size=8)
+    dp_group = Mock(world_size=1)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    assert communicator._moe_group(is_sequence_parallel=True) is ep_group
+
+
+def test_moe_group_without_sequence_parallel(monkeypatch, communicator):
+    dp_group_1 = Mock(world_size=1)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group_1)
+    assert communicator._moe_group(is_sequence_parallel=False) is None
+
+    dp_group_4 = Mock(world_size=4)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group_4)
+    assert communicator._moe_group(is_sequence_parallel=False) is dp_group_4
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+def test_dispatch_and_combine_with_sequence_parallel(
+    monkeypatch, communicator, method, count
+):
+    ep_group = Mock(world_size=8)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    ep_group.reduce_scatter.return_value = torch.tensor([[11, 12]])
+
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    if method == "combine":
+        ep_group.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
+        assert result is ep_group.reduce_scatter.return_value
+        ep_group.all_gather.assert_not_called()
+    else:
+        assert len(result) == count
+        for actual, expected, invocation in zip(
+            result, tensors, ep_group.all_gather.call_args_list
+        ):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
+            assert invocation.args[0] is expected
+            assert invocation.kwargs == {"dim": 0}
+        assert ep_group.all_gather.call_count == count
+        ep_group.reduce_scatter.assert_not_called()

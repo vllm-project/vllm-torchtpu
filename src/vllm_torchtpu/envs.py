@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -526,6 +527,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD": env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Shard tokens over TP between attention and MoE: attention reduce-scatters
+    # instead of all-reducing, the router, shared expert, and experts run on
+    # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
+    # EP and TP > 1 only.
+    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
