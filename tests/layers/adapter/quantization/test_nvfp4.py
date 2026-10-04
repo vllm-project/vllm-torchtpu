@@ -36,7 +36,6 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4LinearMethod,
     VllmNvfp4MoEMethod,
     _fresh,
-    _NullInputQuantKernel,
     _requant_moe_w4a8,
     _to_kernel_scale,
 )
@@ -218,25 +217,27 @@ class TestNvfp4Config:
 class TestNvfp4LinearMethod:
     """Tests for VllmNvfp4LinearMethod weight creation, processing, and apply."""
 
-    def test_null_input_quant_kernel(self):
-        kernel = _NullInputQuantKernel()
-        assert kernel.input_quant_key() is None
-
     def test_create_weights_registers_scalar_loader(self):
-        quant_config = MagicMock(group_size=16)
-        linear_config = MagicMock()
-        method = VllmNvfp4LinearMethod(quant_config, linear_config)
+        quant_config = VllmNvfp4Config.from_config({"quant_algo": "NVFP4"})
+        method = VllmNvfp4LinearMethod(quant_config, MagicMock())
         layer = make_linear_layer(64, 32)
-
-        def mock_base_create_weights(self, lyr, *args, **kwargs):
-            lyr.input_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-            lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-
-        with patch(
-            "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights",
-            mock_base_create_weights,
+        with (
+            patch(
+                "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
         ):
             method.create_weights(layer, 64, [32], 64, 32, torch.bfloat16)
+        assert layer.weight.shape == (32, 32)
+        assert layer.weight.dtype == torch.uint8
+        assert layer.weight_scale.shape == (32, 4)
+        assert layer.weight_scale.dtype == torch.float8_e4m3fn
+        assert method.kernel is None
+        assert not hasattr(layer, "input_quant_key")
 
         assert hasattr(layer.input_scale, "weight_loader")
         assert hasattr(layer.weight_scale_2, "weight_loader")
@@ -265,7 +266,9 @@ class TestNvfp4LinearMethod:
             torch.tensor([1.0], dtype=torch.float32), requires_grad=False
         )
 
-        method = VllmNvfp4LinearMethod(MagicMock(group_size=group_size), MagicMock())
+        method = VllmNvfp4LinearMethod(
+            MagicMock(group_size=group_size, quant_method="NVFP4"), MagicMock()
+        )
 
         with patch(
             "vllm_torchtpu.layers.adapter.quantization.nvfp4.load_kmajor_fp4"
@@ -287,7 +290,9 @@ class TestNvfp4LinearMethod:
         layer.weight_scale_2 = torch.nn.Parameter(
             torch.tensor([1.0, 2.0]), requires_grad=False
         )
-        method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
+        method = VllmNvfp4LinearMethod(
+            MagicMock(group_size=16, quant_method="NVFP4"), MagicMock()
+        )
 
         with pytest.raises(
             AssertionError, match="Fused NVFP4 projections must share one global scale"
@@ -301,7 +306,9 @@ class TestNvfp4LinearMethod:
             torch.empty(1, 4, 1, 32), requires_grad=False
         )
         x = torch.randn(4, 64)
-        method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
+        method = VllmNvfp4LinearMethod(
+            MagicMock(group_size=16, quant_method="NVFP4"), MagicMock()
+        )
 
         with patch(
             "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4"
@@ -319,7 +326,9 @@ class TestNvfp4LinearMethod:
         )
         x = torch.randn(4, 64)
         bias = torch.full((32,), 3.0)
-        method = VllmNvfp4LinearMethod(MagicMock(group_size=16), MagicMock())
+        method = VllmNvfp4LinearMethod(
+            MagicMock(group_size=16, quant_method="NVFP4"), MagicMock()
+        )
 
         with patch(
             "vllm_torchtpu.layers.adapter.quantization.nvfp4.quantized_matmul_fp4",

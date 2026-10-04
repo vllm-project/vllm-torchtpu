@@ -1005,6 +1005,14 @@ class TpuPlatform(Platform):
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
+        if "DeepseekV41ForCausalLM" in (
+            vllm_config.model_config.hf_config.architectures or []
+        ):
+            # V4.1 uses upstream cache geometry; its TPU kernels currently
+            # accept 16-token pages rather than the dense RPA page constraint.
+            if not cache_config.user_specified_block_size:
+                cache_config.block_size = 16
+            return
         backend_cls = cast(
             "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)
         )

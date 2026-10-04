@@ -527,6 +527,12 @@ class TPUModelRunner(GPUModelRunner):
         return drafter
 
     @property
+    def _is_deepseek_v41(self) -> bool:
+        return "DeepseekV41ForCausalLM" in (
+            self.model_config.hf_config.architectures or []
+        )
+
+    @property
     def _is_async_drafter(self) -> bool:
         if not self.speculative_config:
             return False
@@ -3090,6 +3096,32 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            query_start_loc_cpu=(
+                tuple(int(v) for v in self.query_start_loc_np[: target_num_reqs + 1])
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            seq_lens_cpu=(
+                (
+                    tuple(int(v) for v in self.seq_lens_np[:num_reqs])
+                    + (0,) * (target_num_reqs - num_reqs)
+                )
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            prompt_lens_cpu=(
+                (
+                    tuple(
+                        int(v)
+                        for v in self.input_batch.num_prompt_tokens[
+                            start_index : start_index + num_reqs
+                        ]
+                    )
+                    + (0,) * (target_num_reqs - num_reqs)
+                )
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -4735,6 +4767,13 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self._is_deepseek_v41:
+            depth = getattr(model, "token_lookback_depth", 0)
+            self.lookback_token_ids = (
+                self._make_buffer(self.max_num_reqs, depth, dtype=torch.int32)
+                if depth
+                else None
+            )
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6650,6 +6689,11 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        if self._is_deepseek_v41 and self.lookback_token_ids is not None:
+            # Request-sized history retains its fixed shape across token buckets.
+            kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                self.input_batch.num_reqs
+            )
         out = self.model(
             input_ids=input_ids,
             positions=positions,

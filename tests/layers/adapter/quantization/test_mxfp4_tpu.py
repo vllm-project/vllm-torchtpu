@@ -62,6 +62,7 @@ def _build_layer_and_method(device):
             all2all_backend="allgather_reducescatter",
             enable_eplb=False,
             expert_placement_strategy="linear",
+            elastic_ep_max_dp_size=None,
         ),
         compilation_config=SimpleNamespace(
             static_forward_context={},

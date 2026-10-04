@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 
 import torch
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 _padding_state: "TokenPaddingState | None" = None
 
@@ -66,6 +67,13 @@ def zero_routing_weights_for_padding(
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
             with routing weights zeroed for padded tokens.
     """
+    # A model may compact a sub-batch after the runner prepared its persistent
+    # mask. Such a stage supplies a mask in its own routing-row layout; do not
+    # reuse the enclosing batch's valid-token prefix for these rows.
+    if is_forward_context_available():
+        stage_mask = get_forward_context().additional_kwargs.get("token_padding_mask")
+        if stage_mask is not None:
+            return topk_ids, topk_weights.masked_fill(stage_mask[:, None], 0)
     if _padding_state is None:
         return topk_ids, topk_weights
     num_tokens = topk_ids.shape[0]

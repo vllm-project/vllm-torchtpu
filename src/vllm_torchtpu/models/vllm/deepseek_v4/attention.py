@@ -139,137 +139,34 @@ def _live_cache(entry: Any) -> torch.Tensor | None:
     return entry if isinstance(entry, torch.Tensor) and entry.numel() > 0 else None
 
 
-class VllmDeepseekV4MLAAttention(
-    dsv4_attention.DeepseekV4Attention, AttentionLayerBase
-):
-    """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+class DeepseekTPUAttentionMixin:
+    """Shared TPU SWA/CSA/HCA dispatch, rotary and output projection ops."""
 
-    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
-    mla_attn: VllmDeepseekV4MLAAttention
-    # Set to True on DSpark draft layers; read with getattr(..., False).
-    non_causal_multi_token_decode: bool
+    # Both upstream attention classes own these weights and dimensions.
+    prefix: str
+    custom_prefix: str
+    compress_ratio: int
+    window_size: int
+    head_dim: int
+    n_local_heads: int
+    n_local_groups: int
+    o_lora_rank: int
+    attn_sink: torch.Tensor
+    swa_cache_layer: Any
+    wo_a: Any
+    rotary_emb: Any
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream_list: list | None = None,
-    ) -> None:
-        # Route submodule instantiation to TorchTPU-native implementations. The
-        # base constructors allocate torch.cuda.Event for an aux-stream fan-out
-        # this backend replaces, so the events are stubbed out for the call.
-        orig_indexer = dsv4_attention.DeepseekV4Indexer
-        orig_compressor = dsv4_attention.DeepseekCompressor
-        orig_swa_cache = dsv4_attention.DeepseekV4SWACache
-        orig_cuda_event = torch.cuda.Event
-        dsv4_attention.DeepseekV4Indexer = VllmDeepseekV4Indexer
-        dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
-        dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
-        torch.cuda.Event = lambda *args, **kwargs: None
+    @property
+    def attention_kind(self) -> str:
+        raise NotImplementedError
 
-        try:
-            super().__init__(
-                vllm_config,
-                prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
-                aux_stream_list=aux_stream_list,
-            )
-            self.custom_prefix = prefix
-            object.__setattr__(self, "mla_attn", self)
-            for module in self.modules():
-                if (
-                    module is not self
-                    and hasattr(module, "get_kv_cache_spec")
-                    and module.__class__.__name__ == "DeepseekV4Attention"
-                ):
-                    module.get_kv_cache_spec = self.get_kv_cache_spec
-        finally:
-            dsv4_attention.DeepseekV4Indexer = orig_indexer
-            dsv4_attention.DeepseekCompressor = orig_compressor
-            dsv4_attention.DeepseekV4SWACache = orig_swa_cache
-            torch.cuda.Event = orig_cuda_event
+    @property
+    def main_cache_layer(self):
+        return self
 
-        # Bind compressor key-cache reference to SWA or main layer depending on
-        # compression ratio.
-        if hasattr(self, "compressor") and self.compressor is not None:
-            if self.compress_ratio <= 1:
-                object.__setattr__(self.compressor, "k_cache", self.swa_cache_layer)
-            else:
-                object.__setattr__(self.compressor, "k_cache", self)
-
-        # Set up TP-aware weight loader for attention sink parameters.
-        if hasattr(self, "attn_sink") and self.attn_sink is not None:
-
-            def _attn_sink_loader(param, loaded_weight):
-                tp_size = get_tensor_model_parallel_world_size()
-                tp_rank = get_tensor_model_parallel_rank()
-                n_local = loaded_weight.shape[0] // tp_size
-                narrow = loaded_weight[tp_rank * n_local : (tp_rank + 1) * n_local]
-                param[: narrow.shape[0]].copy_(narrow)
-
-            self.attn_sink.weight_loader = _attn_sink_loader
-
-        hf_config = vllm_config.model_config.hf_config
-        object.__setattr__(
-            self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim
-        )
-        self.num_layers = hf_config.num_hidden_layers
-
-        # Register submodules into static forward context for torch.compile tracking.
-        compilation_config = vllm_config.compilation_config
-        if compilation_config is not None:
-            compilation_config.static_forward_context[prefix] = self
-            if hasattr(self.mla_attn, "swa_cache_layer"):
-                compilation_config.static_forward_context[
-                    self.mla_attn.swa_cache_layer.prefix
-                ] = self.mla_attn.swa_cache_layer
-            if hasattr(self.mla_attn, "indexer") and hasattr(
-                self.mla_attn.indexer, "k_cache"
-            ):
-                compilation_config.static_forward_context[
-                    self.mla_attn.indexer.k_cache.prefix
-                ] = self.mla_attn.indexer.k_cache
-            if hasattr(self.mla_attn, "compressor") and hasattr(
-                self.mla_attn.compressor, "state_cache"
-            ):
-                compilation_config.static_forward_context[
-                    self.mla_attn.compressor.state_cache.prefix
-                ] = self.mla_attn.compressor.state_cache
-
-    @classmethod
-    def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        return num_heads
-
-    def get_attn_backend(self) -> type[AttentionBackend]:
-        return DeepseekV4TPUAttentionBackend
-
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        """Derive the main compressed-KV cache spec, or None for SWA-only layers."""
-        if self.compress_ratio <= 1:
-            return None
-
-        block_size = vllm_config.cache_config.block_size
-        comp_ratio = max(1, self.compress_ratio)
-        hf_config = vllm_config.model_config.hf_config
-        if comp_ratio == 4:  # noqa: SIM108 (one comment per branch)
-            # CSA (`sparse_mla`) reads the NoPE record from this array and the
-            # RoPE channels from the companion `{prefix}_rope` array; the
-            # packed width here budgets for both.
-            head_size = get_packed_mla_head_size(hf_config)
-        else:
-            # HCA (`mla`) stores raw bf16 latents rather than pay for DSv4 FP8
-            # quantization and dequantization on every access. Its cache is a
-            # small share of the total, so the extra width is cheap.
-            head_size = 512 * 2
-        return MLAAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=head_size,
-            dtype=torch.uint8,
-            tokens_per_state=min(comp_ratio, block_size),
-            alignment=None,
-        )
+    @property
+    def swa_page_size(self):
+        return self.swa_cache_layer.block_size
 
     @property
     def attn_op(self):
@@ -280,7 +177,7 @@ class VllmDeepseekV4MLAAttention(
             return op
 
         swa_tensor = _live_cache(
-            getattr(getattr(self.mla_attn, "swa_cache_layer", None), "kv_cache", None)
+            getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         )
         if swa_tensor is None:
             prof = self.__dict__.get("_attn_op_prof_instance")
@@ -299,17 +196,17 @@ class VllmDeepseekV4MLAAttention(
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
 
-        swa_only = self.compress_ratio <= 1
-        is_csa = self.compress_ratio == 4
+        swa_only = self.attention_kind == "swa"
+        is_csa = self.attention_kind == "csa"
 
-        swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
+        swa_cache = getattr(self, "swa_cache_layer", None)
         if swa_cache is None:
             raise RuntimeError(
                 f"{self.custom_prefix}: swa_cache_layer unavailable at "
                 "attention-op build time."
             )
 
-        logical_page_size = swa_cache.block_size
+        logical_page_size = self.swa_page_size
         if logical_page_size <= 0:
             raise RuntimeError(
                 f"{self.custom_prefix}: SWA logical page size is "
@@ -319,7 +216,7 @@ class VllmDeepseekV4MLAAttention(
         # Detect whether SWA and main KV caches share the same underlying memory buffer.
         # A CSA layer binds a `(nope, rope)` pair; the SWA cache overlays the
         # NoPE array, so that is the one to compare.
-        main_entry = getattr(self.mla_attn, "kv_cache", None)
+        main_entry = getattr(self.main_cache_layer, "kv_cache", None)
         main_cache = _live_cache(
             main_entry[0] if isinstance(main_entry, tuple) else main_entry
         )
@@ -335,18 +232,10 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
-        cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
-        )
-        if cfg_lps != logical_page_size:
-            logical_page_size = cfg_lps
-
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (
-            getattr(self.mla_attn, "scale", None)
-            or getattr(self.mla_attn, "softmax_scale", None)
+            getattr(self, "scale", None)
             or getattr(self, "softmax_scale", None)
-            or getattr(self, "scale", None)
             or (hf_config.head_dim**-0.5 if hasattr(hf_config, "head_dim") else None)
         )
         if sm_scale is None:
@@ -363,6 +252,8 @@ class VllmDeepseekV4MLAAttention(
         # attribute a layer stays causal, so target layers are unaffected.
         non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
 
+        csa_batch_size = getattr(self, "csa_kernel_batch_size", 16)
+        main_page_size = getattr(self.main_cache_layer, "cache_num_states", None)
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
             sm_scale=sm_scale,
@@ -371,6 +262,14 @@ class VllmDeepseekV4MLAAttention(
             swa_only=swa_only,
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
+            **(
+                {
+                    "attention_kernel_batch_size": csa_batch_size,
+                    "logical_main_page_size": main_page_size,
+                }
+                if is_csa
+                else {}
+            ),
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
@@ -378,7 +277,8 @@ class VllmDeepseekV4MLAAttention(
         # causality, and profiling stage.
         op_name = (
             f"pallas::deepseek_v4_attention_{op_type}"
-            f"_p{logical_page_size}"
+            f"_p{logical_page_size}_w{self.window_size}_s{_name_float(sm_scale)}"
+            f"_b{csa_batch_size}_m{main_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
@@ -436,7 +336,7 @@ class VllmDeepseekV4MLAAttention(
             """Abstract fake tensor implementation for PyTorch Dynamo graph tracing."""
             num_tokens = q.shape[0]
             out_tensor = torch.empty(
-                (num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim),
+                (num_tokens, self.n_local_heads, self.head_dim),
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -445,44 +345,6 @@ class VllmDeepseekV4MLAAttention(
         attn_jax_op.register_fake(_fake_attn)
         _pallas_op_cache[op_name] = attn_jax_op
         return attn_jax_op, built_from_real_caches
-
-    def attn_gemm(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-
-        if self.indexer is not None:
-            indexer_weights, _ = self.indexer.weights_proj(hidden_states)
-        else:
-            indexer_weights = None
-
-        return qr_kv, indexer_weights
-
-    @property
-    def qnorm_rope_op(self):
-        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
-        op = self.__dict__.get("_qnorm_rope_op_instance")
-        if op is not None:
-            return op
-
-        eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
-        op = _pallas_op_cache.get(op_name)
-        if op is None:
-            op = pallas.jax_op(
-                op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
-                input_partition_specs=(
-                    P(None, "model", None),  # q
-                    P(),  # positions
-                    P(),  # cos_sin_cache
-                ),
-            )
-            op.register_fake(_fake_rope)
-            _pallas_op_cache[op_name] = op
-        object.__setattr__(self, "_qnorm_rope_op_instance", op)
-        return op
 
     @property
     def kv_rope_op(self):
@@ -509,61 +371,6 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
-    def qnorm_rope(
-        self,
-        q: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply RMSNorm and scaling RoPE to query head states."""
-        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
-
-    def kv_rope(
-        self,
-        kv: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply scaling RoPE to decoupled key states."""
-        return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
-
-    def attention_impl(
-        self,
-        hidden_states: torch.Tensor,
-        qr: torch.Tensor,
-        kv: torch.Tensor,
-        indexer_weights: torch.Tensor | None,
-        positions: torch.Tensor,
-        out: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
-
-        topk_indices = None
-        compressor = getattr(self.mla_attn, "compressor", None)
-        if self.indexer is not None:
-            indexer_emb = getattr(
-                self.mla_attn,
-                "indexer_rotary_emb",
-                getattr(self.mla_attn, "rotary_emb", None),
-            )
-            topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
-            )
-        if compressor is not None:
-            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
-
-        res = self.forward_mqa(
-            q,
-            kv,
-            positions,
-            None,
-            topk_indices=topk_indices,
-        )
-        return res
-
     @staticmethod
     def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
         """Bitcast 1-byte cache allocations to uint8 required by Pallas kernels."""
@@ -575,14 +382,14 @@ class VllmDeepseekV4MLAAttention(
 
     def _get_active_sw_cache(self) -> torch.Tensor | None:
         """Retrieve active sliding-window cache buffer if allocated."""
-        swa_cache_layer = getattr(self.mla_attn, "swa_cache_layer", None)
+        swa_cache_layer = getattr(self, "swa_cache_layer", None)
         if swa_cache_layer is None:
             raise RuntimeError(f"{self.custom_prefix}: swa_cache_layer unavailable.")
         return self._as_kernel_cache_view(
             _live_cache(getattr(swa_cache_layer, "kv_cache", None))
         )
 
-    def forward_mqa(
+    def _run_mqa(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -594,7 +401,7 @@ class VllmDeepseekV4MLAAttention(
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
         main_prefix = getattr(
-            self.mla_attn, "prefix", getattr(self, "custom_prefix", "")
+            self.main_cache_layer, "prefix", getattr(self, "custom_prefix", "")
         )
 
         def _get_field(meta, field_name):
@@ -605,7 +412,7 @@ class VllmDeepseekV4MLAAttention(
             return getattr(meta, field_name, None)
 
         if isinstance(attn_ctx, dict):
-            swa_cache_layer = getattr(self.mla_attn, "swa_cache_layer", None)
+            swa_cache_layer = getattr(self, "swa_cache_layer", None)
             swa_layer_name = getattr(swa_cache_layer, "prefix", None)
             if swa_layer_name not in attn_ctx:
                 raise RuntimeError(
@@ -623,14 +430,14 @@ class VllmDeepseekV4MLAAttention(
         if sw_cache is None:
             # 0-token placeholder cache used during profiling forward passes.
             sw_cache = torch.zeros(
-                (0, 1, 1, self.mla_attn.head_dim), dtype=torch.uint8, device=q.device
+                (0, 1, 1, self.head_dim), dtype=torch.uint8, device=q.device
             )
 
-        swa_only = self.compress_ratio <= 1
-        is_csa = self.compress_ratio == 4
+        swa_only = self.attention_kind == "swa"
+        is_csa = self.attention_kind == "csa"
 
         # A CSA layer's KV entry is a `(nope, rope)` pair.
-        kv_entry = getattr(self, "kv_cache", None)
+        kv_entry = getattr(self.main_cache_layer, "kv_cache", None)
         nope_entry, rope_entry = (
             kv_entry if isinstance(kv_entry, tuple) else (kv_entry, None)
         )
@@ -680,7 +487,7 @@ class VllmDeepseekV4MLAAttention(
             assert topk_indices is not None
             extra = topk_indices
         else:
-            extra = (positions + 1).to(torch.int32) // self.compress_ratio
+            extra = (positions + 1).to(torch.int32) // max(1, self.compress_ratio)
 
         operands = (
             q,
@@ -832,6 +639,250 @@ class VllmDeepseekV4MLAAttention(
         assert rotary_dim % 2 == 0 and rotary_dim <= 128, (
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
+
+
+class VllmDeepseekV4MLAAttention(
+    DeepseekTPUAttentionMixin, dsv4_attention.DeepseekV4Attention, AttentionLayerBase
+):
+    """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+
+    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
+    mla_attn: VllmDeepseekV4MLAAttention
+    # Set to True on DSpark draft layers; read with getattr(..., False).
+    non_causal_multi_token_decode: bool
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list | None = None,
+    ) -> None:
+        # Route submodule instantiation to TorchTPU-native implementations. The
+        # base constructors allocate torch.cuda.Event for an aux-stream fan-out
+        # this backend replaces, so the events are stubbed out for the call.
+        orig_indexer = dsv4_attention.DeepseekV4Indexer
+        orig_compressor = dsv4_attention.DeepseekCompressor
+        orig_swa_cache = dsv4_attention.DeepseekV4SWACache
+        orig_cuda_event = torch.cuda.Event
+        dsv4_attention.DeepseekV4Indexer = VllmDeepseekV4Indexer
+        dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
+        dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
+        torch.cuda.Event = lambda *args, **kwargs: None
+
+        try:
+            super().__init__(
+                vllm_config,
+                prefix=prefix,
+                topk_indices_buffer=topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
+            )
+            self.custom_prefix = prefix
+            object.__setattr__(self, "mla_attn", self)
+            for module in self.modules():
+                if (
+                    module is not self
+                    and hasattr(module, "get_kv_cache_spec")
+                    and module.__class__.__name__ == "DeepseekV4Attention"
+                ):
+                    module.get_kv_cache_spec = self.get_kv_cache_spec
+        finally:
+            dsv4_attention.DeepseekV4Indexer = orig_indexer
+            dsv4_attention.DeepseekCompressor = orig_compressor
+            dsv4_attention.DeepseekV4SWACache = orig_swa_cache
+            torch.cuda.Event = orig_cuda_event
+
+        # Bind compressor key-cache reference to SWA or main layer depending on
+        # compression ratio.
+        if hasattr(self, "compressor") and self.compressor is not None:
+            if self.compress_ratio <= 1:
+                object.__setattr__(self.compressor, "k_cache", self.swa_cache_layer)
+            else:
+                object.__setattr__(self.compressor, "k_cache", self)
+
+        # Set up TP-aware weight loader for attention sink parameters.
+        if hasattr(self, "attn_sink") and self.attn_sink is not None:
+
+            def _attn_sink_loader(param, loaded_weight):
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+                n_local = loaded_weight.shape[0] // tp_size
+                narrow = loaded_weight[tp_rank * n_local : (tp_rank + 1) * n_local]
+                param[: narrow.shape[0]].copy_(narrow)
+
+            self.attn_sink.weight_loader = _attn_sink_loader
+
+        hf_config = vllm_config.model_config.hf_config
+        object.__setattr__(
+            self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim
+        )
+        self.num_layers = hf_config.num_hidden_layers
+
+        # Register submodules into static forward context for torch.compile tracking.
+        compilation_config = vllm_config.compilation_config
+        if compilation_config is not None:
+            compilation_config.static_forward_context[prefix] = self
+            if hasattr(self.mla_attn, "swa_cache_layer"):
+                compilation_config.static_forward_context[
+                    self.mla_attn.swa_cache_layer.prefix
+                ] = self.mla_attn.swa_cache_layer
+            if hasattr(self.mla_attn, "indexer") and hasattr(
+                self.mla_attn.indexer, "k_cache"
+            ):
+                compilation_config.static_forward_context[
+                    self.mla_attn.indexer.k_cache.prefix
+                ] = self.mla_attn.indexer.k_cache
+            if hasattr(self.mla_attn, "compressor") and hasattr(
+                self.mla_attn.compressor, "state_cache"
+            ):
+                compilation_config.static_forward_context[
+                    self.mla_attn.compressor.state_cache.prefix
+                ] = self.mla_attn.compressor.state_cache
+
+    @property
+    def swa_page_size(self):
+        return VllmDeepseekV4SWACache._swa_block_size(
+            get_vllm_model_wrapper_context().vllm_config.cache_config.block_size,
+            self.window_size,
+        )
+
+    @property
+    def attention_kind(self):
+        return (
+            "swa"
+            if self.compress_ratio <= 1
+            else ("csa" if self.compress_ratio == 4 else "hca")
+        )
+
+    def forward_mqa(self, q, kv, positions, output, *, topk_indices):
+        return self._run_mqa(q, kv, positions, output, topk_indices=topk_indices)
+
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        return num_heads
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return DeepseekV4TPUAttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """Derive the main compressed-KV cache spec, or None for SWA-only layers."""
+        if self.compress_ratio <= 1:
+            return None
+
+        block_size = vllm_config.cache_config.block_size
+        comp_ratio = max(1, self.compress_ratio)
+        hf_config = vllm_config.model_config.hf_config
+        if comp_ratio == 4:  # noqa: SIM108 (one comment per branch)
+            # CSA (`sparse_mla`) reads the NoPE record from this array and the
+            # RoPE channels from the companion `{prefix}_rope` array; the
+            # packed width here budgets for both.
+            head_size = get_packed_mla_head_size(hf_config)
+        else:
+            # HCA (`mla`) stores raw bf16 latents rather than pay for DSv4 FP8
+            # quantization and dequantization on every access. Its cache is a
+            # small share of the total, so the extra width is cheap.
+            head_size = 512 * 2
+        return MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            tokens_per_state=min(comp_ratio, block_size),
+            alignment=None,
+        )
+
+    def attn_gemm(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+
+        if self.indexer is not None:
+            indexer_weights, _ = self.indexer.weights_proj(hidden_states)
+        else:
+            indexer_weights = None
+
+        return qr_kv, indexer_weights
+
+    @property
+    def qnorm_rope_op(self):
+        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
+        op = self.__dict__.get("_qnorm_rope_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qnorm_rope_jax, eps=eps),
+                mesh=get_vllm_model_wrapper_context().mesh,
+                input_partition_specs=(
+                    P(None, "model", None),  # q
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+            )
+            op.register_fake(_fake_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qnorm_rope_op_instance", op)
+        return op
+
+    def qnorm_rope(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RMSNorm and scaling RoPE to query head states."""
+        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+
+    def kv_rope(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply scaling RoPE to decoupled key states."""
+        return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+
+    def attention_impl(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        indexer_weights: torch.Tensor | None,
+        positions: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Execute indexing, state compression, and kernel attention dispatch."""
+        q = self.wq_b(qr).view(
+            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        )
+        q = self.qnorm_rope(q, positions)
+        kv = self.kv_rope(kv, positions)
+
+        topk_indices = None
+        compressor = getattr(self.mla_attn, "compressor", None)
+        if self.indexer is not None:
+            indexer_emb = getattr(
+                self.mla_attn,
+                "indexer_rotary_emb",
+                getattr(self.mla_attn, "rotary_emb", None),
+            )
+            topk_indices = self.indexer(
+                hidden_states, qr, indexer_weights, positions, indexer_emb
+            )
+        if compressor is not None:
+            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
+
+        res = self.forward_mqa(
+            q,
+            kv,
+            positions,
+            None,
+            topk_indices=topk_indices,
+        )
+        return res
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""

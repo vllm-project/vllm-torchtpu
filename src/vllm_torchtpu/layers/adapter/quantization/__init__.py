@@ -67,6 +67,15 @@ def get_tpu_quantization_config(
         NotImplementedError: If the quantization method is not supported on TPU.
     """
     model_config = copy.deepcopy(vllm_config.model_config)
+    if getattr(model_config.hf_config, "model_type", "") in (
+        "deepseek_v41",
+        "deepseek_v41_text",
+    ):
+        from .deepseek_v41 import VllmDeepseekV41Fp8Config
+
+        VllmDeepseekV41Fp8Config.set_configs(vllm_config)
+        model_config.quantization = "tpu-deepseek_v41_fp8"
+        return VllmConfig.get_quantization_config(model_config, vllm_config.load_config)
 
     # Map from quant method name to TPU config class
     method_to_config: dict[str | None, type[VllmQuantConfig]] = {

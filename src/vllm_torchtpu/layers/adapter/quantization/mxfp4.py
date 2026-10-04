@@ -45,6 +45,7 @@ scaling.
    - Returns output tensor
 """
 
+from math import lcm
 from typing import TYPE_CHECKING, Any, cast
 
 import jax.numpy as jnp
@@ -536,7 +537,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         orig_intermediate_size = w2_weight.shape[1]
         w13_block_size = REQUANTIZED_BLOCK_SIZE
 
-        intermediate_padded = -(-orig_intermediate_size // 128) * 128
+        # W13's output needs the GMM tile alignment; W2 contracts over the
+        # same dimension and must also contain complete requantization blocks.
+        # V4.1's 2304 channels satisfy the former but not a block of 512.
+        w2_block_size = min(w13_block_size, orig_intermediate_size)
+        intermediate_alignment = lcm(128, w2_block_size)
+        intermediate_padded = (
+            -(-orig_intermediate_size // intermediate_alignment)
+            * intermediate_alignment
+        )
         hidden_padded = -(-orig_hidden_size // w13_block_size) * w13_block_size
 
         w1_weight = w13_weight[:, :, :orig_intermediate_size]

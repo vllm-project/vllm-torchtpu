@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_DEEPSEEK_V41_CED: bool = False
     TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -347,6 +348,9 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Decoder SWA bounded replay is approximate. Keep full-forward as the
+    # default/reference until matched model-quality and performance validation.
+    "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave

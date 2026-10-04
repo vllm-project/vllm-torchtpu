@@ -20,6 +20,10 @@ def register_models() -> None:
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
+    ModelRegistry.register_model(
+        "DeepseekV41ForCausalLM",
+        "vllm_torchtpu.models.vllm.deepseek_v41.model:DeepseekV41ForCausalLM",
+    )
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

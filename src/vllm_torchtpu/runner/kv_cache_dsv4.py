@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
@@ -28,6 +30,54 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def deepseek_v41_cache_spec(spec, vllm_config, *, compressed=False, indexer=False):
+    """Budget separate NoPE/RoPE arrays and the auxiliary NoPE overlays.
+
+    Each physical region must hold a BF16 SWA page or the C2 compressor's
+    eight FP32 state rows (KV plus scores). Reserve the companion RoPE array
+    explicitly, so splitting the native arrays never exceeds vLLM's budget.
+    Each logical page uses its array's full record capacity; the fixed
+    compressor ring retains its upstream lifetime and row count.
+    """
+    if spec is None:
+        return None
+    block_size = vllm_config.cache_config.block_size
+    nope_bytes = max(block_size * 512 * 2, 8 * 1024 * 4)
+    page_bytes = nope_bytes * 5 // 4
+    changes: dict[str, Any] = {"page_size_padded": page_bytes}
+    if hasattr(spec, "alignment"):
+        changes["alignment"] = None
+    if indexer:
+        # Four 128-byte keys share each NoPE word row. Each key's E8M0
+        # scale occupies one int32 word in the companion RoPE allocation.
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+            deepseek_v41_cache as cache_ops,
+        )
+
+        geometry = cache_ops.IndexPageGeometry(nope_bytes, page_bytes - nope_bytes)
+        states = geometry.keys_per_page
+        changes.update(
+            dtype=torch.uint8,
+            state_content_bytes=geometry.state_bytes,
+            block_size=int(states * spec.tokens_per_state),
+        )
+    elif compressed:
+        changes.update(
+            dtype=torch.uint8,
+            state_content_bytes=640,
+            block_size=int(nope_bytes // 512 * spec.tokens_per_state),
+        )
+    elif not isinstance(spec, CircularBufferSpec):
+        changes["block_size"] = int(
+            nope_bytes // spec.state_content_size_bytes * spec.tokens_per_state
+        )
+    result = replace(spec, **changes)
+    budget = page_bytes if compressed or indexer else nope_bytes
+    if result.unpadded_page_size_bytes > budget:
+        raise ValueError(f"V4.1 cache page exceeds its native array budget: {result}")
+    return result
+
+
 class DsV4KVCacheAllocator:
     """Owns the DeepSeek-V4 special cases in KV-cache allocation."""
 
@@ -39,6 +89,99 @@ class DsV4KVCacheAllocator:
 
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+
+    def initialize_v41(self, kv_cache_config, per_layer_spec):
+        """Bind V4.1 source caches as V4 `(nope, rope)` arrays.
+
+        Retain vLLM's physical-region assignments, including overlays across
+        groups. SWA and compressor state use the NoPE array; indexers use
+        NoPE for keys and the companion RoPE allocation for scale words.
+        """
+        from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+            deepseek_v41_cache as cache_ops,
+        )
+
+        regions = layer_to_pool_index(kv_cache_config)
+        page_bytes = {
+            group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_config.kv_cache_groups
+        }
+        if len(page_bytes) != 1:
+            raise ValueError(
+                "V4.1 native arrays require a uniform physical page budget"
+            )
+        page_bytes = page_bytes.pop()
+        if page_bytes % 2560:
+            raise ValueError("V4.1 page budget must contain complete NoPE/RoPE rows")
+        nope_bytes = page_bytes * 4 // 5
+        index_geometry = cache_ops.IndexPageGeometry(
+            nope_bytes, page_bytes - nope_bytes
+        )
+        rows = nope_bytes // 512
+        num_blocks = kv_cache_config.num_blocks
+        pairs = [
+            (
+                torch.zeros(
+                    (num_blocks, rows, 128),
+                    dtype=torch.int32,
+                    device=self.runner.device,
+                ),
+                torch.zeros(
+                    (num_blocks, rows // 4, 128),
+                    dtype=torch.int32,
+                    device=self.runner.device,
+                ),
+            )
+            for _ in range(max(regions.values()) + 1)
+        ]
+        # Every layer must capture the same Tensor object for a shared pool.
+        # Capture only its word rows; derive kernel shapes inside the graph.
+        # Capturing separate 2D/3D views makes AOT synthesize as_strided_scatter
+        # updates of the entire pool for every cache mutation.
+        raw_nope = [nope.flatten(0, 1) for nope, _ in pairs]
+        result = cache_ops.MaterializedNativeKVCache(
+            {}, [t for pair in pairs for t in pair]
+        )
+        for name, region in regions.items():
+            spec = per_layer_spec(name)
+            nope, rope = pairs[region]
+            raw = raw_nope[region]
+            is_indexer = name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX)
+            is_main = isinstance(spec, MLAAttentionSpec) and not is_indexer
+            shape = (
+                num_blocks,
+                spec.num_states,
+                index_geometry.key_bytes
+                if is_indexer
+                else spec.state_content_size_bytes // spec.dtype.itemsize,
+            )
+            if is_indexer and spec.num_states != index_geometry.keys_per_page:
+                raise ValueError("Index spec and native page geometry disagree")
+            layout = cache_ops.ByteLayout(shape, spec.dtype, nope_bytes, 0)
+            result.native_raw_cache[name] = raw
+            result.native_cache_layouts[name] = layout
+            if is_main:
+                result.kv_caches[name] = (nope, rope)
+            elif self._is_ds_v4_swa_layer(name, spec):
+                result.kv_caches[name] = nope
+            else:
+                view = cache_ops.native_cache_view(
+                    raw.view(torch.int8).flatten(),
+                    (num_blocks, 1, *shape[1:]),
+                    spec.dtype,
+                    nope_bytes,
+                    0,
+                )
+                result.kv_caches[name] = (view, rope) if is_indexer else view
+        self._validate_ds_v4_overlay(kv_cache_config, result.kv_caches)
+        allocated_bytes = sum(t.nbytes for t in result.raw_tensors)
+        budget_bytes = max(t.size for t in kv_cache_config.kv_cache_tensors)
+        if allocated_bytes > budget_bytes:
+            raise ValueError(
+                f"V4.1 native cache allocation {allocated_bytes} exceeds {budget_bytes}"
+            )
+        return result
 
     @staticmethod
     def _ds_v4_compressed_kv_layer_name(state_cache_name: str) -> str:
@@ -302,11 +445,9 @@ class DsV4KVCacheAllocator:
     def _ds_v4_cache_arrays(entry) -> tuple[torch.Tensor, ...]:
         """Every array a bound DSv4 KV entry holds.
 
-        A CSA layer binds a `(nope, rope)` pair -- one layer, two arrays under
-        one block table -- while every other role binds a bare tensor. This is
-        the producer side of that convention; the two consumers that can see a
-        pair (the compressor's `k_cache` and the attention layer's own entry)
-        unpack it inline.
+        CSA binds `(nope, rope)` under one block table. V4.1 indexers bind
+        `(key_view, scale_pool)`, using the same region-wide companion array
+        for scales. SWA and compressor state bind only their NoPE array.
         """
         return tuple(entry) if isinstance(entry, tuple) else (entry,)
 
@@ -325,15 +466,16 @@ class DsV4KVCacheAllocator:
                 cache = kv_caches.get(layer_name)
                 if cache is None:
                     continue
-                cache = cls._ds_v4_cache_arrays(cache)[0]
-                ptr = id(cache)
-                if ptr in hosts:
-                    raise ValueError(
-                        "DeepSeek-V4 KV cache overlay put two layers of one "
-                        "cache group on the same array; they share a block "
-                        f"table, so they would corrupt each other: "
-                        f"{layer_name} and {hosts[ptr]} both map to the array "
-                        f"of shape {tuple(cache.shape)}. Group "
-                        f"layers={group.layer_names}"
-                    )
-                hosts[ptr] = layer_name
+                for array in cls._ds_v4_cache_arrays(cache):
+                    # Storage identity sees through dtype/shape views without
+                    # requesting a host-accessible pointer from a TPU tensor.
+                    storage = array.untyped_storage()._cdata
+                    if storage in hosts and hosts[storage] != layer_name:
+                        raise ValueError(
+                            "DeepSeek-V4 KV cache overlay put two layers of one "
+                            "cache group on the same array or the same storage; "
+                            "they share a block "
+                            f"table: {layer_name} and {hosts[storage]}. "
+                            f"Group layers={group.layer_names}"
+                        )
+                    hosts[storage] = layer_name

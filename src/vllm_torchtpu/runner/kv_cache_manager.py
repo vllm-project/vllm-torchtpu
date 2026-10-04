@@ -89,6 +89,8 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     These build their own specs in the TPU's packed layout, so the specs must
     reach vLLM verbatim rather than through `_normalize_one_spec`.
     """
+    if getattr(attn_module, "tpu_native_kv", False) is True:
+        return False
     return isinstance(
         attn_module,
         (
@@ -213,7 +215,10 @@ class KVCacheManager:
                     kv_cache_spec[layer_name] = spec
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
-            elif is_cache_for_ds_v4(attn_module):
+            elif (
+                is_cache_for_ds_v4(attn_module)
+                or getattr(attn_module, "tpu_native_kv", False) is True
+            ):
                 ds_v4_layers.add(layer_name)
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
@@ -1349,7 +1354,38 @@ class KVCacheManager:
                 else:
                     layer_name_to_spec[layer_name] = group.kv_cache_spec
 
+        use_upstream_allocator = bool(layer_name_to_spec) and all(
+            getattr(
+                self.runner.vllm_config.compilation_config.static_forward_context.get(
+                    name
+                ),
+                "tpu_native_kv",
+                False,
+            )
+            is True
+            for name in layer_name_to_spec
+        )
         kv_caches: dict[str, torch.Tensor] = {}
+        native_raw_cache = None
+        native_cache_layouts = None
+        if use_upstream_allocator:
+            materialized = self.ds_v4.initialize_v41(
+                kv_cache_config, layer_name_to_spec.__getitem__
+            )
+            kv_caches = materialized.kv_caches
+            # Match the shared pool path: donation must start only after
+            # allocation/view initialization has finished on the device.
+            synchronize_tensors(materialized.raw_tensors)
+            logger.info(
+                "Native KV materialization: %d layer views, %d physical "
+                "TPU buffers, %d total bytes, layout=%s",
+                len(kv_caches),
+                len(materialized.raw_tensors),
+                sum(raw.nbytes for raw in materialized.raw_tensors),
+                self.runner.cache_config.get_resolved_kv_cache_layout().name,
+            )
+            native_raw_cache = materialized.native_raw_cache
+            native_cache_layouts = materialized.native_cache_layouts
         # Actual leading-dim block count used for mamba state arrays, captured
         # at allocation time so the slot pool below is sized to exactly what
         # was allocated (compact `_mamba_num_blocks`, or uniform `num_blocks`).
@@ -1522,7 +1558,12 @@ class KVCacheManager:
             return caches
 
         shared_attention_caches: dict[tuple[int, int], torch.Tensor] = {}
-        if share_attention_regions and not use_block_major and not _is_ds_v4:
+        if (
+            share_attention_regions
+            and not use_block_major
+            and not _is_ds_v4
+            and not use_upstream_allocator
+        ):
             region_specs: dict[tuple[int, int], list[tuple[str, KVCacheSpec]]] = {}
             for tensor in kv_cache_config.kv_cache_tensors:
                 for index, name in enumerate(tensor.layers):
@@ -1557,7 +1598,11 @@ class KVCacheManager:
                     device=self.runner.device,
                 )
 
-        for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in (
+            []
+            if _is_ds_v4 or use_upstream_allocator
+            else kv_cache_config.kv_cache_tensors
+        ):
             # Each descriptor names layers within the whole backing allocation;
             # its size is not a per-layer budget. TPU's separate typed caches
             # use the scheduler's block count and the normalized page geometry.
@@ -1689,6 +1734,8 @@ class KVCacheManager:
             kv_caches,
             self.runner.vllm_config.compilation_config.static_forward_context,
             self.runner.kv_caches,
+            native_raw_cache=native_raw_cache,
+            native_cache_layouts=native_cache_layouts,
         )
 
         # Pre-build and cache bundled RPA kernels across all attention layers before

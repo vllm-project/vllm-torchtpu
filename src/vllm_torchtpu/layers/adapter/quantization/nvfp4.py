@@ -53,9 +53,13 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    ACT,
+    WEIGHT,
+    ModelOptLinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
-    ModelOptNvFp4LinearMethod,
+    Shapes,
+    resolve,
 )
 from vllm.model_executor.utils import replace_parameter
 
@@ -574,20 +578,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         return fused_moe_gmm(**kwargs)
 
 
-class _NullInputQuantKernel:
-    """Placeholder kernel so upstream create_weights' expose_input_quant_key
-    is a no-op. TPU NVFP4 is W4A16: activations are not pre-quantized, so the
-    layer advertises no input_quant_key."""
-
-    @staticmethod
-    def input_quant_key():
-        return None
-
-
-class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
+class VllmNvfp4LinearMethod(ModelOptLinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
-    Reuses upstream create_weights for parameter registration; fuses the block
+    Reuses upstream quantization schemes for parameter registration; fuses the block
     and global scales in PyTorch and unpacks the weight to native fp4 (K-major)
     at load. apply runs the native-fp4 weight through `quantized_matmul_fp4` ->
     `gmm_v2`.
@@ -596,14 +590,12 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     def __init__(
         self, quant_config: VllmNvfp4Config, linear_config: VllmQuantLinearConfig
     ):
-        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
-        # unavailable on TPU). create_weights only needs kernel.input_quant_key.
+        # Resolve the checkpoint schema upstream. Kernel selection stays on TPU;
+        # the generic upstream create_weights also selects a GPU kernel.
+        super().__init__(*resolve(quant_config.quant_method, quant_config, ""))
         self.quant_config = quant_config
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
-        # vLLM types this as an NvFp4LinearKernel; TPU installs a stand-in.
-        # pyrefly: ignore[bad-assignment]
-        self.kernel = _NullInputQuantKernel()
 
     def create_weights(
         self,
@@ -615,16 +607,18 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         params_dtype,
         **extra_weight_attrs,
     ):
-        ModelOptNvFp4LinearMethod.create_weights(
-            self,
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = sum(output_partition_sizes)
+        layer.output_partition_sizes = output_partition_sizes
+        if not hasattr(layer, "has_bias"):
+            layer.has_bias = getattr(layer, "bias", None) is not None
+        shapes = Shapes(output_partition_sizes, input_size_per_partition, params_dtype)
+        loader = extra_weight_attrs.get("weight_loader")
+        self.wkey.create_weights(layer, WEIGHT, self.ctx, shapes, loader)
+        if self.akey is not None:
+            self.akey.create_weights(layer, ACT, self.ctx, shapes, loader)
+        self.fmt.extra_weights(layer, shapes, self.ctx, loader)
 
         # input_scale / weight_scale_2 are per-tensor (no output_dim); vLLM's
         # fused QKV/MergedColumn stacked loader cannot place the per-projection

@@ -61,7 +61,7 @@ def attention_block_table_width(
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
+    drop_fields=["query_start_loc_cpu", "seq_lens_cpu", "prompt_lens_cpu"],
 )
 @dataclass
 class AttentionMetadata:
@@ -110,8 +110,11 @@ class AttentionMetadata:
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
 
-    query_start_loc_cpu: Any = field(init=False)
-    seq_lens_cpu: Any = field(init=False)
+    # Immutable host scheduling snapshots for model-side input planning. They
+    # never participate in device graphs and require no device-to-host reads.
+    query_start_loc_cpu: tuple[int, ...] | None = field(default=None, init=False)
+    seq_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
+    prompt_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
 
 
 @dataclass
@@ -133,6 +136,9 @@ class AttentionMetadataBuilderContext:
     query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
+    query_start_loc_cpu: tuple[int, ...] | None = None
+    seq_lens_cpu: tuple[int, ...] | None = None
+    prompt_lens_cpu: tuple[int, ...] | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -343,6 +349,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     target_num_blocks + ctx.mamba_ckpt_window - 1,
                     block_table_obj.max_num_blocks_per_req,
                 )
+        # A spec may bound its table independently of sequence length (for
+        # example, a circular state buffer owns one block per request).
+        target_num_blocks = min(
+            target_num_blocks, block_table_obj.max_num_blocks_per_req
+        )
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
@@ -453,7 +464,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
-        return AttentionMetadata(
+        metadata = AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
             seq_lens=ctx.seq_lens,
@@ -467,6 +478,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+        metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
+        metadata.seq_lens_cpu = ctx.seq_lens_cpu
+        metadata.prompt_lens_cpu = ctx.prompt_lens_cpu
+        return metadata
 
 
 def stage_block_table_uploads(

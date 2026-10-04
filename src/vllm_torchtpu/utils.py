@@ -272,6 +272,8 @@ def tpu_bind_kv_cache(
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
+    native_raw_cache: torch.Tensor | dict[str, torch.Tensor] | None = None,
+    native_cache_layouts: Mapping[str, tuple] | None = None,
 ) -> None:
     """Bind kv_caches to ModelRunner and forward context."""
     assert len(runner_kv_caches) == 0
@@ -293,7 +295,21 @@ def tpu_bind_kv_cache(
                 runner_kv_caches.append(cache)
 
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        layer = forward_context[layer_name]
+        if getattr(layer, "tpu_native_kv", False) is True:
+            raw = (
+                native_raw_cache.get(layer_name)
+                if isinstance(native_raw_cache, dict)
+                else native_raw_cache
+            )
+            if native_cache_layouts is None:
+                layer.bind_kv_cache(kv_cache, raw_cache=raw)
+            else:
+                layer.bind_kv_cache(
+                    kv_cache, raw_cache=raw, layout=native_cache_layouts[layer_name]
+                )
+        else:
+            layer.kv_cache = kv_cache
 
 
 def synchronize_device() -> None:
