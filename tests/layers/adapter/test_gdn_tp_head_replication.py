@@ -159,9 +159,9 @@ def test_unified_pool_declares_complete_qk_conv_state(make_gdn_attention, tp_siz
     spec = attention.get_kv_cache_spec(vllm_config)
 
     assert spec.shapes == ((taps, 1, conv_dim), (len(v_heads), HEAD_DIM, HEAD_DIM))
-    assert spec.dtypes == (torch.bfloat16, torch.float32)
+    assert spec.dtypes == (torch.float32, torch.float32)
     assert spec.page_size_bytes == (
-        taps * conv_dim * 2 + len(v_heads) * HEAD_DIM * HEAD_DIM * 4
+        taps * conv_dim * 4 + len(v_heads) * HEAD_DIM * HEAD_DIM * 4
     )
     # The NHD pool used by the failing startup has 256 lanes per row.
     assert conv_dim % 256 == 0
@@ -182,7 +182,7 @@ def test_pool_budget_includes_replicated_qk_state(
     layout = _hybrid_mamba_state_layout(vllm_config, fa_physical_bytes_per_token=1024)
     k_heads, v_heads = _owned_heads(tp_size, 0)
     conv_dim = (2 * len(k_heads) + len(v_heads)) * HEAD_DIM
-    assert layout.conv_bytes == (CONV_KERNEL_SIZE - 1) * conv_dim * 2
+    assert layout.conv_bytes == (CONV_KERNEL_SIZE - 1) * conv_dim * 4
     assert layout.ssm_bytes == len(v_heads) * HEAD_DIM * HEAD_DIM * 4
 
 

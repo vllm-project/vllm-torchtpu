@@ -21,9 +21,8 @@ import torch
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from kernels.gdn.v3.gdn_pool_state_utils import read_states, write_states
 
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.gdn_attention import run_jax_gdn_attention_pooled_local
@@ -171,62 +170,35 @@ def _load_weights(
     }
 
 
-def _state_layout(n_v, conv_dim):
-    return derive_pooled_gdn_state_layout(
-        ssm_bytes=n_v * HEAD_DIM * HEAD_DIM * 4,
-        conv_bytes=(KERNEL_SIZE - 1) * conv_dim * 2,
-        token_bytes=TOKEN_BYTES,
-    )
+def _pool():
+    return np.zeros((3 * SPLIT, BLOCK_TOKENS, 1, 4, LANES), np.int8)
 
 
 def _pack_states(conv, recurrent):
-    n_seqs, n_v = recurrent.shape[:2]
-    layout = _state_layout(n_v, conv.shape[-1])
-    pool = jnp.zeros((3 * SPLIT, BLOCK_TOKENS, 1, 4, LANES), jnp.int8)
-    pool = pool_adapters.scatter_region(
-        pool,
-        recurrent.reshape(n_seqs, n_v * HEAD_DIM, HEAD_DIM),
-        STATE_INDICES,
-        tok0=0,
-        ntok=layout.ssm_tokens,
-        split=SPLIT,
-    )
-    rows = conv.reshape(n_seqs, -1, LANES)
-    capacity = layout.conv_tokens * TOKEN_BYTES // (2 * LANES)
-    rows = jnp.pad(rows, ((0, 0), (0, capacity - rows.shape[1]), (0, 0)))
-    return pool_adapters.scatter_region(
-        pool,
-        rows,
-        STATE_INDICES,
-        tok0=layout.ssm_tokens,
-        ntok=layout.conv_tokens,
-        split=SPLIT,
+    """One rank's pool holding `recurrent`/`conv` in the V3 state layout.
+
+    The pool stores the conv state as fp32; the BF16 test values widen
+    exactly, so TP1 and the sharded ranks start from identical state bits.
+    """
+    return np.asarray(
+        write_states(
+            _pool(),
+            recurrent,
+            conv,
+            STATE_INDICES,
+            split=SPLIT,
+        )
     )
 
 
 def _unpack_states(pool, n_v, conv_dim):
-    layout = _state_layout(n_v, conv_dim)
-    recurrent = pool_adapters.gather_region(
+    return read_states(
         pool,
         STATE_INDICES,
-        tok0=0,
-        ntok=layout.ssm_tokens,
         split=SPLIT,
-        out_dtype=jnp.float32,
-        out_lanes=HEAD_DIM,
-    ).reshape(2, n_v, HEAD_DIM, HEAD_DIM)
-    conv = pool_adapters.gather_region(
-        pool,
-        STATE_INDICES,
-        tok0=layout.ssm_tokens,
-        ntok=layout.conv_tokens,
-        split=SPLIT,
-        out_dtype=jnp.bfloat16,
+        recurrent_shape=(n_v, HEAD_DIM, HEAD_DIM),
+        conv_shape=(KERNEL_SIZE - 1, conv_dim),
     )
-    conv = conv[:, : (KERNEL_SIZE - 1) * conv_dim // LANES].reshape(
-        2, KERNEL_SIZE - 1, conv_dim
-    )
-    return conv, recurrent
 
 
 def _build_spmd(devices, weights, conv, recurrent):
@@ -236,17 +208,9 @@ def _build_spmd(devices, weights, conv, recurrent):
     weights = jax.tree.map(
         lambda *xs: jax.device_put(np.stack(xs), rank_sharding), *weights
     )
-    pool = jax.jit(
-        shard_map(
-            lambda c, r: _pack_states(c[0], r[0])[None],
-            mesh=mesh,
-            in_specs=(P("tp"), P("tp")),
-            out_specs=P("tp"),
-            check_rep=False,
-        )
-    )(
-        jax.device_put(np.stack(conv), rank_sharding),
-        jax.device_put(np.stack(recurrent), rank_sharding),
+    pool = jax.device_put(
+        np.stack([_pack_states(c, r) for c, r in zip(conv, recurrent)]),
+        rank_sharding,
     )
 
     @jax.jit
@@ -288,18 +252,26 @@ def _build_spmd(devices, weights, conv, recurrent):
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=MANAGER_TOKENS,
         )
-        conv_out, recurrent_out = _unpack_states(new_pool, n_v, conv_dim)
         outputs = dict(
             projection=projected,
             ba=ba,
             output=output.reshape(hidden.shape[0], n_v, HEAD_DIM),
-            conv=conv_out,
-            recurrent=recurrent_out,
         )
         return new_pool[None], jax.tree.map(lambda x: x[None], outputs)
 
+    # weights now carries a leading rank axis; dim 1 is the per-rank size.
+    n_v = weights["a_log"].shape[1]
+    conv_dim = weights["conv"].shape[1]
+
     def run(pool, hidden, starts, lengths, distribution):
-        return step(pool, weights, hidden, starts, lengths, distribution)
+        pool, outputs = step(pool, weights, hidden, starts, lengths, distribution)
+        states = [
+            _unpack_states(np.asarray(rank_pool), n_v, conv_dim)
+            for rank_pool in np.asarray(pool)
+        ]
+        outputs["recurrent"] = np.stack([np.asarray(r) for r, _ in states])
+        outputs["conv"] = np.stack([np.asarray(c) for _, c in states])
+        return pool, outputs
 
     return run, pool
 
