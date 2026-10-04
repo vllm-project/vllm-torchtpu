@@ -607,12 +607,15 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
         fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
     )
 
-    # Mask the second half of each shard's rows (and all of shard 1's rows) to NaN.
+    # Mask the second half of each shard's rows (and all of shard 1's rows):
+    # use NaN on even shards and -inf on odd shards (matching token_layout.split
+    # replica padding) so both non-finite forms are verified under every scoring_fn.
     gating_host = np.asarray(gating).copy()
     valid_mask = np.ones(tokens, dtype=bool)
     for d in range(EP):
         start = d * t_local if d == 1 else d * t_local + t_local // 2
-        gating_host[start : (d + 1) * t_local, :] = np.nan
+        fill = np.nan if d % 2 == 0 else -np.inf
+        gating_host[start : (d + 1) * t_local, :] = fill
         valid_mask[start : (d + 1) * t_local] = False
     token_sharding = NamedSharding(mesh, P(AXIS))
     gating_masked = jax.device_put(gating_host, token_sharding)
@@ -628,7 +631,7 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
     )
 
     # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every
-    # shard is NaN.
+    # shard is non-finite.
     gating_all_nan = jax.device_put(
         np.full_like(gating_host, np.nan), token_sharding
     )

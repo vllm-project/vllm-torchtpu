@@ -525,7 +525,9 @@ def fused_ep_moe_v2(
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & jnp.any(
+            jnp.isfinite(gate_l), axis=-1, keepdims=True
+        )
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
