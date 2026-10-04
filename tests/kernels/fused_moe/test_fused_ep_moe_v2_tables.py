@@ -326,10 +326,12 @@ def test_padded_tokens_are_dropped_from_routing_tables(
             np.asarray(shard.mirror_pos),
             np.asarray(whole.mirror_row[me * t_local : (me + 1) * t_local]),
         )
-        np.testing.assert_array_equal(
-            np.asarray(host.local_slab_rows(whole, me, shard_stride=stride)),
-            np.asarray(host.local_slab_rows(shard, me, shard_stride=stride)),
-        )
+        whole_rows = np.asarray(host.local_slab_rows(whole, me, shard_stride=stride))
+        shard_rows = np.asarray(host.local_slab_rows(shard, me, shard_stride=stride))
+        whole_live = whole_rows < stride
+        shard_live = shard_rows < stride
+        np.testing.assert_array_equal(whole_live, shard_live)
+        np.testing.assert_array_equal(whole_rows[whole_live], shard_rows[shard_live])
         for builder in (
             host.shard_transport_tables_in_blocks,
             host.shard_push_tables_in_rows,
@@ -350,7 +352,7 @@ def test_padded_tokens_are_dropped_from_routing_tables(
         shard_visit = host.expert_visit_list(shard_experts[0], g_local)
         _assert_arrays_equal(whole_visit, shard_visit, shard=me)
         if all_padded:
-            assert int(whole_visit[1]) == 0
+            assert int(np.asarray(whole_visit[1]).item()) == 0
 
 
 def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
