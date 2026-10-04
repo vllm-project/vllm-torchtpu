@@ -2019,6 +2019,31 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
         self.assertEqual(worker.get_finished(), [])
         self.assertIsNone(worker.wait({1, 2}))
 
+    def test_controller_probe_needs_a_listener(self):
+        import socket
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            worker._controller_address = f"127.0.0.1:{server.getsockname()[1]}"
+            self.assertTrue(worker._controller_reachable())
+        self.assertFalse(worker._controller_reachable())
+
+    def test_controller_probe_rejects_self_connect(self):
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._controller_address = "127.0.0.1:47800"
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.getsockname.return_value = ("127.0.0.1", 47800)
+        sock.getpeername.return_value = ("127.0.0.1", 47800)
+        with patch("socket.create_connection", return_value=sock):
+            self.assertFalse(worker._controller_reachable())
+
 
 if __name__ == "__main__":
     unittest.main()

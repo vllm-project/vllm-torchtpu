@@ -1565,8 +1565,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         host, _, port = self._controller_address.rpartition(":")
         host = host.strip("[]")
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
-                return True
+            with socket.create_connection((host, int(port)), timeout=1.0) as sock:
+                # On loopback, a connect whose kernel-picked source port equals
+                # the destination port joins the socket to itself and succeeds
+                # with nothing listening. KVCacheManager then fails to register
+                # without raising, so trusting the probe loses the rank for good.
+                return sock.getsockname() != sock.getpeername()
         except OSError:
             return False
 
