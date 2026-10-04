@@ -25,12 +25,13 @@ ENABLE_PREFIX_CACHING=true
 # One prefill chunk is one KV block, so a request resumed from a prefix hit
 # runs the cold run's chunk shapes and the stages can compare tokens. The block
 # is the one the engine settles on, four times the TP32 pair's for a TP8 rank's
-# KDA state: 648 for bf16 (observed), 1296 for fp8 (derived from TP32's 324);
-# the stages verify it against /metrics.
+# KDA state: 340 packed rows (308 f32 SSM + 32 f32 conv), so 680 tokens for
+# bf16 and 1360 for fp8 (derived from the pool layout; 648 was observed for
+# bf16 when the conv state was bf16); the stages verify it against /metrics.
 if [ "$KV_CACHE_DTYPE" = "fp8" ]; then
-    MAX_NUM_BATCHED_TOKENS=1296
+    MAX_NUM_BATCHED_TOKENS=1360
 else
-    MAX_NUM_BATCHED_TOKENS=648
+    MAX_NUM_BATCHED_TOKENS=680
 fi
 _before="$EXTRA_SERVE_ARGS"
 EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed "s/\"compile_sizes\":\[1,8,8192\]/\"compile_sizes\":[1,8,${MAX_NUM_BATCHED_TOKENS}]/")

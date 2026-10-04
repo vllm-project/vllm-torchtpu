@@ -290,7 +290,7 @@ def test_kimi_fa_row_spans_trim_the_tail_to_the_dtype_row(
     )
 
     full_page, tail = registration.spans
-    assert full_page.size_bytes == fa.live_bytes_per_block == 207360
+    assert full_page.size_bytes == fa.live_bytes_per_block == 217600
     assert tail.size_bytes == tail_rows * 2560
 
 

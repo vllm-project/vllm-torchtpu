@@ -24,16 +24,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
 
 # Kimi-Linear TP8 shard geometry on an MLA pool.
 NUM_HEADS, HEAD_DIM, KERNEL_SIZE = 4, 128, 4
-NUM_BLOCKS, BLOCK_SIZE, PACK, LANES = 5, 107, 2, 640
+# BLOCK_SIZE is the smallest row count that holds the fp32 SSM (103 rows)
+# plus the fp32 conv region (8 rows).
+NUM_BLOCKS, BLOCK_SIZE, PACK, LANES = 5, 111, 2, 640
 TOK_BYTES = PACK * LANES * 2  # bf16; an fp8 pool packs 4 tokens in the same row
 
 SSM_ELEMS = NUM_HEADS * HEAD_DIM * HEAD_DIM
 CONV_ELEMS = (KERNEL_SIZE - 1) * 3 * NUM_HEADS * HEAD_DIM
 LAYOUT = derive_pooled_gdn_state_layout(
-    ssm_bytes=SSM_ELEMS * 4, conv_bytes=CONV_ELEMS * 2, token_bytes=TOK_BYTES
+    ssm_bytes=SSM_ELEMS * 4, conv_bytes=CONV_ELEMS * 4, token_bytes=TOK_BYTES
 )
 SSM_REGION_ROWS = LAYOUT.ssm_tokens * TOK_BYTES // (4 * HEAD_DIM)
-CONV_REGION_ROWS = LAYOUT.conv_tokens * TOK_BYTES // (2 * LANES)
+CONV_REGION_ROWS = LAYOUT.conv_tokens * TOK_BYTES // (4 * LANES)
 
 LOWER_BOUND = None
 EPS = 1e-5
@@ -68,13 +70,18 @@ def _inputs(rng, query_lens, seq_lens):
 
 
 def _initial_states(rng, num_seqs):
+    # The conv state holds past pre-convolution inputs: BF16 activations
+    # widened to fp32, so every word's low half is zero. Arbitrary fp32 bits
+    # would not survive the BF16 pool: TPU canonicalizes BF16 NaN payloads
+    # and flushes BF16 denormals when it moves the pool, which would rewrite
+    # the low half of about 1% of the words.
     conv = jnp.asarray(
         rng.standard_normal((num_seqs, KERNEL_SIZE - 1, 3, NUM_HEADS, HEAD_DIM)).astype(
             np.float32
         )
         * 0.5,
         dtype=jnp.bfloat16,
-    )
+    ).astype(jnp.float32)
     ssm = jnp.asarray(
         rng.standard_normal((num_seqs, NUM_HEADS, HEAD_DIM, HEAD_DIM)).astype(
             np.float32
@@ -143,7 +150,7 @@ def _unpack_pool(pool, block_ids, split=1, conv_shard_heads=None):
         idx,
         tok0=LAYOUT.ssm_tokens,
         ntok=LAYOUT.conv_tokens,
-        out_dtype=jnp.bfloat16,
+        out_dtype=jnp.float32,
         split=split,
     )
     shard_heads = NUM_HEADS if conv_shard_heads is None else conv_shard_heads
@@ -257,9 +264,9 @@ def test_pooled_kda_matches_dense_bitwise(
 @pytest.mark.parametrize(
     "conv_shard_heads", [None, 1], ids=["one-shard", "rank-blocked"]
 )
-def test_pooled_kda_fp8_pool_keeps_bf16_conv(conv_shard_heads):
+def test_pooled_kda_fp8_pool_keeps_fp32_conv(conv_shard_heads):
     """An fp8 KV pool changes how many tokens an attention row packs, not the
-    KDA state. Conv stays bf16 in the rows that block sizing and the Raiden
+    KDA state. Conv stays fp32 in the rows that block sizing and the Raiden
     manifest reserve for it, so it round-trips the pool bit for bit."""
     _check_pooled_matches_dense(
         [1, 5, 3], [9, 5, 11], 1, conv_shard_heads, jnp.float8_e4m3fn
@@ -306,8 +313,8 @@ def _check_pooled_matches_dense(
     )
     # The conv state update is pure data movement: bitwise equal.
     np.testing.assert_array_equal(
-        np.asarray(conv_back.view(jnp.uint16)),
-        np.asarray(conv_dense[1:].view(jnp.uint16)),
+        np.asarray(conv_back.view(jnp.uint32)),
+        np.asarray(conv_dense[1:].view(jnp.uint32)),
     )
     np.testing.assert_allclose(
         np.asarray(ssm_back, np.float32),
@@ -333,7 +340,7 @@ def _check_pooled_matches_dense(
 def test_pooled_kda_rejects_oversized_state():
     inputs = _inputs(np.random.default_rng(0), [2], [2])
     layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=SSM_ELEMS * 4, conv_bytes=CONV_ELEMS * 2, token_bytes=TOK_BYTES
+        ssm_bytes=SSM_ELEMS * 4, conv_bytes=CONV_ELEMS * 4, token_bytes=TOK_BYTES
     )
     tiny_pool = jnp.zeros(
         (2, layout.required_tokens - 1, PACK, LANES), dtype=jnp.bfloat16
@@ -394,7 +401,7 @@ def test_pooled_kda_manager_block_split():
     conv_split, ssm_split = _unpack_pool(pool_split_after, block_ids, split=split)
     conv_ref, ssm_ref = _unpack_pool(pool_ref, block_ids)
     np.testing.assert_array_equal(
-        np.asarray(conv_split.view(jnp.uint16)), np.asarray(conv_ref.view(jnp.uint16))
+        np.asarray(conv_split.view(jnp.uint32)), np.asarray(conv_ref.view(jnp.uint32))
     )
     np.testing.assert_allclose(
         np.asarray(ssm_split, np.float32),
@@ -461,8 +468,8 @@ def test_pooled_kda_multistep_state_evolution():
     conv_back, ssm_back = _unpack_pool(pool, [1])
     # Conv state is pure data movement through the seam: bitwise equal.
     np.testing.assert_array_equal(
-        np.asarray(conv_back.view(jnp.uint16)),
-        np.asarray(conv_buf[1:].view(jnp.uint16)),
+        np.asarray(conv_back.view(jnp.uint32)),
+        np.asarray(conv_buf[1:].view(jnp.uint32)),
     )
     np.testing.assert_allclose(
         np.asarray(ssm_back, np.float32),

@@ -1185,22 +1185,22 @@ def test_kimi_fp8_pool_keeps_the_bf16_pool_byte_geometry():
     bf16 = kimi_pool_manifest(3, kv_dtype="bfloat16")
     fp8 = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
 
-    assert bf16.storages[0].shape[1:] == (81, 2, 640)
-    assert fp8.storages[0].shape[1:] == (81, 4, 640)
+    assert bf16.storages[0].shape[1:] == (85, 2, 640)
+    assert fp8.storages[0].shape[1:] == (85, 4, 640)
     assert [pool.tag for pool in fp8.pools] == [pool.tag for pool in bf16.pools]
     for bf16_pool, fp8_pool in zip(bf16.pools, fp8.pools):
         assert fp8_pool.base_offset_bytes == bf16_pool.base_offset_bytes
-        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 207360
+        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 217600
         assert fp8_pool.regions == bf16_pool.regions
         assert (bf16_pool.dtype_tag, fp8_pool.dtype_tag) == (
             "bfloat16",
             "float8_e4m3fn",
         )
     conv, ssm, fa = fp8.pools
-    # SSM is f32 and conv is bf16 whatever the pool dtype: 77 + 4 rows.
+    # SSM and conv are both f32 whatever the pool dtype: 77 + 8 rows.
     assert ssm.live_bytes_per_block == 3 * 128 * 128 * 4
     assert conv.base_offset_bytes == 77 * 2560
-    assert conv.live_bytes_per_block == 4 * 2560
+    assert conv.live_bytes_per_block == 8 * 2560
     assert fa.regions[0].unit_bytes == 2560
 
 

@@ -21,6 +21,8 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_state_bytes,
+    pooled_gdn_ssm_state_bytes,
     pooled_gdn_state_itemsize,
 )
 from vllm_torchtpu.kernels import pool_adapters
@@ -543,13 +545,18 @@ def _pooled_kda_core(
     kernel_size = conv_weight.shape[0]
     # The pool dtype is the attention KV dtype. The state regions keep the
     # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
-    # sizing, the Raiden manifest), so an fp8 pool still holds bf16 conv rows.
+    # sizing, the Raiden manifest), so an fp8 pool still holds fp32 conv rows,
+    # the only conv dtype the fused kernel accepts.
     conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
     conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
     tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=num_heads * head_dim * head_dim * 4,
-        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * conv_elem_bytes,
+        ssm_bytes=pooled_gdn_ssm_state_bytes(
+            num_v_heads=num_heads, head_k_dim=head_dim, head_v_dim=head_dim
+        ),
+        conv_bytes=pooled_gdn_conv_state_bytes(
+            kernel_size=kernel_size, conv_dim=3 * num_heads * head_dim
+        ),
         token_bytes=tok_bytes,
     )
     # state_indices are MANAGER block ids, and the region offsets are
@@ -597,7 +604,7 @@ def _pooled_kda_core(
     )
 
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
-    # shard keeps the source's BF16 lane packing, so Raiden can concatenate
+    # shard occupies whole pool rows, so Raiden can concatenate
     # aligned byte ranges without half-word scatter/gather. Restore logical
     # (taps, qkv, heads, dim) order in the existing pooled adapter, just as
     # Qwen's pair-blocked layout does. Ordinary serving has one shard.
