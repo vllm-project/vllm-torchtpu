@@ -499,6 +499,80 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
+    sharded_plan, scoring_fn
+):
+    """Padded rows become exact zero and leave active rows bit-identical.
+
+    Runs at `t_local = 256` (`tokens = EP * 256 = 2048`), where
+    `kernel.combine_step_tokens(t_local) > 0` selects the Pallas combine
+    kernel (`_build_combine_kernel`) rather than the XLA epilogue. Also gates
+    the warmup (`_dummy_run`) case where every row on every shard is NaN-masked.
+    """
+    t_local = kernel.COMBINE_MIN_TOKENS
+    assert kernel.combine_step_tokens(t_local) > 0
+    tokens = EP * t_local
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        24,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        25,
+        tokens=tokens,
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+        scoring_fn=scoring_fn,
+    )
+    unmasked = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    )
+
+    # Mask the second half of each shard's rows (and all of shard 1's rows) to NaN.
+    gating_host = np.asarray(gating).copy()
+    valid_mask = np.ones(tokens, dtype=bool)
+    for d in range(EP):
+        start = d * t_local if d == 1 else d * t_local + t_local // 2
+        gating_host[start : (d + 1) * t_local, :] = np.nan
+        valid_mask[start : (d + 1) * t_local] = False
+    token_sharding = NamedSharding(mesh, P(AXIS))
+    gating_masked = jax.device_put(gating_host, token_sharding)
+
+    masked = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_masked, **common)
+    )
+    assert np.isfinite(masked).all()
+    np.testing.assert_array_equal(masked[valid_mask], unmasked[valid_mask])
+    np.testing.assert_array_equal(
+        masked[~valid_mask],
+        np.zeros_like(masked[~valid_mask]),
+    )
+
+    # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every shard is NaN.
+    gating_all_nan = jax.device_put(
+        np.full_like(gating_host, np.nan), token_sharding
+    )
+    all_padded_out = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_all_nan, **common)
+    )
+    np.testing.assert_array_equal(all_padded_out, np.zeros_like(all_padded_out))
+
+
 def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     """Physical expert placement may follow device order, not EP-rank order.
 

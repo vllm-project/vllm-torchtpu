@@ -253,18 +253,25 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
 
 
 @pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
-def test_padded_tokens_are_dropped_from_routing_tables(ep, t_local, g_local, topk):
+@pytest.mark.parametrize("all_padded", [False, True], ids=["partial", "all_padded"])
+def test_padded_tokens_are_dropped_from_routing_tables(
+    ep, t_local, g_local, topk, all_padded
+):
     """Tokens with sentinel expert `e_total` add zero work and match across plans."""
     idx_jnp, kwargs = _routing_inputs(ep, t_local, g_local, topk, skew=False, seed=11)
     e_total = kwargs["e_total"]
     stride = kwargs["shard_stride"]
     idx = np.asarray(idx_jnp).copy()
 
-    # Mark the second half of each shard's tokens as padded (`topk_idx = e_total`),
-    # and mark shard 1 as completely padded (`0` active tokens).
-    for d in range(ep):
-        start = d * t_local if d == 1 else d * t_local + t_local // 2
-        idx[start : (d + 1) * t_local, :] = e_total
+    if all_padded:
+        # Warmup (`_dummy_run`) marks every token on every shard as padded.
+        idx[:, :] = e_total
+    else:
+        # Mark the second half of each shard's tokens as padded (`topk_idx = e_total`),
+        # and mark shard 1 as completely padded (`0` active tokens).
+        for d in range(ep):
+            start = d * t_local if d == 1 else d * t_local + t_local // 2
+            idx[start : (d + 1) * t_local, :] = e_total
     idx_padded = jnp.asarray(idx)
 
     whole = host.build_routing_tables(idx_padded, **kwargs)
@@ -276,10 +283,21 @@ def test_padded_tokens_are_dropped_from_routing_tables(ep, t_local, g_local, top
         np.asarray(whole.slab_row)[padded_pair_mask],
         np.full(padded_pair_mask.sum(), off_shard, dtype=np.int32),
     )
-    # Shard 1 has 0 valid tokens, so it sends 0 rows to every expert.
-    np.testing.assert_array_equal(
-        np.asarray(whole.run_rows)[:, 1], np.zeros(e_total, dtype=np.int32)
-    )
+    if all_padded:
+        np.testing.assert_array_equal(
+            np.asarray(whole.run_rows), np.zeros((e_total, ep), dtype=np.int32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(whole.expert_rows_aligned), np.zeros(e_total, dtype=np.int32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(whole.recv_rows), np.zeros(ep, dtype=np.int32)
+        )
+    else:
+        # Shard 1 has 0 valid tokens, so it sends 0 rows to every expert.
+        np.testing.assert_array_equal(
+            np.asarray(whole.run_rows)[:, 1], np.zeros(e_total, dtype=np.int32)
+        )
 
     counts = np.stack(
         [
@@ -301,6 +319,14 @@ def test_padded_tokens_are_dropped_from_routing_tables(ep, t_local, g_local, top
             **kwargs,
         )
         np.testing.assert_array_equal(
+            np.asarray(shard.pos),
+            np.asarray(whole.arrival_row[me * t_local : (me + 1) * t_local]),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(shard.mirror_pos),
+            np.asarray(whole.mirror_row[me * t_local : (me + 1) * t_local]),
+        )
+        np.testing.assert_array_equal(
             np.asarray(host.local_slab_rows(whole, me, shard_stride=stride)),
             np.asarray(host.local_slab_rows(shard, me, shard_stride=stride)),
         )
@@ -318,6 +344,13 @@ def test_padded_tokens_are_dropped_from_routing_tables(ep, t_local, g_local, top
             np.asarray(host.shard_token_gather(whole, me, shard_stride=stride)),
             np.asarray(host.shard_token_gather(shard, me, shard_stride=stride)),
         )
+        whole_experts = host.shard_expert_slabs(whole, me, e_total=e_total, ep=ep)
+        shard_experts = host.shard_expert_slabs(shard, me, e_total=e_total, ep=ep)
+        whole_visit = host.expert_visit_list(whole_experts[0], g_local)
+        shard_visit = host.expert_visit_list(shard_experts[0], g_local)
+        _assert_arrays_equal(whole_visit, shard_visit, shard=me)
+        if all_padded:
+            assert int(whole_visit[1]) == 0
 
 
 def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
@@ -330,17 +363,21 @@ def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
     recv_rows = 32
     arrivals = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
     arrival_scales = np.ones((4, tile_m), dtype=np.float32)
-    # Poison row 0 (where unrouted tokens' pos=0, mirror_pos=0 point) with NaN.
-    arrivals[0] = np.nan
-    arrival_scales[0, 0] = np.nan
 
-    pos = np.ones((t_local, topk), dtype=np.int32)
-    mirror_pos = np.ones((t_local, topk), dtype=np.int32)
+    # Sentinel pairs receive `pos = mirror_pos =` their rank among sentinel pairs
+    # within the routing block (`[0, block)`). Poison the entire range `[0, 16)`
+    # that the 4 padded tokens (`4 * topk = 16` pairs) index into.
+    sentinel_ranks = np.arange(4 * topk, dtype=np.int32).reshape(4, topk)
+    arrivals[: 4 * topk] = np.nan
+    arrival_scales[0, : 4 * topk] = np.nan
+
+    pos = np.full((t_local, topk), 16, dtype=np.int32)
+    mirror_pos = np.full((t_local, topk), 16, dtype=np.int32)
     topk_weights = np.full((t_local, topk), 0.25, dtype=np.float32)
 
-    # Mark rows 4..7 as padded: pos=0, mirror_pos=0, topk_weights=0.0.
-    pos[4:] = 0
-    mirror_pos[4:] = 0
+    # Mark rows 4..7 as padded: pos and mirror_pos span [0, 16), topk_weights=0.0.
+    pos[4:] = sentinel_ranks
+    mirror_pos[4:] = sentinel_ranks
     topk_weights[4:] = 0.0
 
     out = np.asarray(
