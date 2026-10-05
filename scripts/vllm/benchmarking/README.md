@@ -112,6 +112,34 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 ```
 
+## Decode Throughput (Sliding Window)
+
+`benchmark_serving.py` averages over a whole run, so with long prompts its
+output throughput mixes prefill and decode. `bench_decode_sliding_window.py`
+sends `--concurrency` requests at once, each with a distinct prompt of
+`--prefill-tokens` tokens and `--decode-tokens` decoded tokens, and reports
+throughput and TPOT over 10 s windows where (nearly) all requests decode
+together. It also samples the server's `/metrics` to show whether KV capacity
+(waiting requests, preemptions) limited a round. It works with any model
+served through the OpenAI-compatible API:
+
+```bash
+python3 scripts/vllm/benchmarking/bench_decode_sliding_window.py \
+  --base-url http://127.0.0.1:8000 --model <served-model-name> \
+  --output-dir <DIR> --concurrency 16 \
+  --prefill-tokens 100000 --decode-tokens 2048 \
+  --max-num-batched-tokens <server's value>
+```
+
+`run_decode_benchmark.sh` serves a config with `run_benchmarks.sh --serve-only`
+and runs the benchmark for each `ISL_OSL_CONFIGS` x `CONCURRENCY_OPTIONS`
+entry of that config, writing `<results-dir>/decode/sweep.md`:
+
+```bash
+./scripts/vllm/benchmarking/run_decode_benchmark.sh \
+  --config deepseek-v41-flash-tp8-ep-100k-decode --results-dir <DIR>
+```
+
 ## Prerequisites
 
 - vLLM installed (provides `benchmark_serving.py`)
