@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import torch
 from vllm.models.deepseek_v41.common import engram as upstream
 
+from vllm_torchtpu.model_loader_patches import register_row_slice
+
 from .cache import write_cache
 from .ops import bind_device_ops, device_hooks
 
@@ -121,6 +123,11 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     @staticmethod
     def _weight_loader(param, loaded_weight):
         loader = upstream.ParallelEngramEmbedding._weight_loader
+        if loaded_weight.shape[0] == param.shape[0]:
+            # Already this rank's rows: the sharded Run:AI stream fetches only
+            # them (see Engram._create_embedding). A full table has as many
+            # rows only with a single shard, where both loaders agree.
+            loader = _load_local_rows
         if param.device.type != "tpu":
             return loader(param, loaded_weight)
         from vllm_torchtpu.model_loader_patches import ExpertParamStager
@@ -162,6 +169,17 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         out.copy_((values * scale).masked_fill(~valid[:, :, None], 0).to(out.dtype))
 
 
+def _load_local_rows(param, loaded_weight):
+    """Upstream's head-shard loader for a tensor holding only this rank's rows."""
+    if loaded_weight.dtype == torch.float8_e8m0fnu:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    assert loaded_weight.shape == param.shape, (
+        f"engram shard {tuple(loaded_weight.shape)} does not fit param "
+        f"{tuple(param.shape)}"
+    )
+    param.data.copy_(loaded_weight)
+
+
 def _gather_engram_rows(rows, dim):
     # Retain the existing 128-lane width alignment for narrow fixtures.
     # This does not fix the native Engram NaN: it also reproduces at width
@@ -182,11 +200,21 @@ class Engram(upstream.Engram):
     )
 
     def _create_embedding(self, layout, layer_hash_index):
-        return ParallelEngramEmbedding(
+        embedding = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
         )
+        # Each table is ~98 GB in one tensor, over the Run:AI streamer's
+        # per-tensor memory limit, and a rank keeps only its heads' rows.
+        layer_id = layout.layer_ids[layer_hash_index]
+        for leaf in ("weight", "scale"):
+            register_row_slice(
+                f"layers.{layer_id}.engram.embed.{leaf}",
+                embedding.vocab_start_idx,
+                embedding.part_num_embeddings,
+            )
+        return embedding
 
     def forward(self, hidden_states, hash_ids, token_mask=None):
         if self.use_sequence_parallel:
