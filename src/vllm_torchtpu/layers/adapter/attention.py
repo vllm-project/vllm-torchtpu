@@ -2401,18 +2401,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 )
                 # The scatter undoes the head all-gather above.
                 #
-                # `per_bucket` lets the merge pick its collective by token
-                # count (all-to-all for small decode buckets, reduce-scatter
-                # above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS). That is only safe
-                # when each bucket gets its own trace, which is true for the
-                # backbone. The spec-decode draft is traced once for all
-                # buckets: a token-count branch there becomes a shape guard,
-                # and larger buckets then fail with ShapeSpecializationError.
-                # So the draft passes False and always uses the all-to-all.
+                # Only the backbone may use the all-to-all merge. It picks the
+                # merge by comparing the token count to
+                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, which is
+                # safe only because the backbone is re-traced per bucket
+                # group (`_precompile_backbone`). The spec-decode draft
+                # (model_tag "eagle_head", MTP included) is traced once for
+                # every bucket: the comparison would pin that graph to its
+                # first size, and the large buckets fail with
+                # ShapeSpecializationError. So the draft keeps the
+                # reduce-scatter, exactly as with the flag off.
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
-                    per_bucket=vllm_compilation_backends.model_tag == "backbone",
+                    allow_a2a=vllm_compilation_backends.model_tag == "backbone",
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:

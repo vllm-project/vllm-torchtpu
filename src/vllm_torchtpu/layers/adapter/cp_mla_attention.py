@@ -62,7 +62,7 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, per_bucket: bool = True
+    output: torch.Tensor, lse: torch.Tensor, allow_a2a: bool = True
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -76,6 +76,10 @@ def merge_lse_partials_scatter_heads(
          Leaves every rank holding every `lse_r`.
       2. reduce-scatter the weighted outputs
 
+    With TPU_DCP_LSE_MERGE_A2A set and `allow_a2a`, steps of at most
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens instead take
+    `merge_lse_partials_all_to_all`, which gives the same result.
+
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
         this rank's partial.
@@ -83,12 +87,14 @@ def merge_lse_partials_scatter_heads(
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
-      per_bucket: True if the caller is compiled separately for each token
-        bucket, so the merge may choose all-to-all vs reduce-scatter by
-        `num_tokens`. Pass False when one trace serves every bucket (the
-        spec-decode draft): branching on the token count there would
-        specialize the graph to one size. With False and
-        TPU_DCP_LSE_MERGE_A2A set, the all-to-all is used at every size.
+      allow_a2a: Only matters with TPU_DCP_LSE_MERGE_A2A set.
+        True: use the all-to-all for steps of at most
+        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens, the reduce-scatter above.
+        The token count is compared while tracing, so pass True only from a
+        caller traced separately per token bucket (the backbone).
+        False: never use the all-to-all; always the reduce-scatter. For a
+        caller traced once for all buckets (the spec-decode draft), where the
+        comparison would pin the one graph to the size it was traced at.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -98,11 +104,15 @@ def merge_lse_partials_scatter_heads(
     if group is None or int(group.world_size) == 1:
         return output
 
-    # Shapes are static per compiled bucket, so this picks a path per bucket.
-    # A single-trace caller must not branch on the token count: it takes the
-    # exchange everywhere, which costs it only its rare large buckets.
-    if envs.TPU_DCP_LSE_MERGE_A2A and (
-        not per_bucket or output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    # This `if` runs while tracing, so each bucket's compiled graph keeps the
+    # path chosen for its size: the all-to-all wins at decode sizes, the
+    # reduce-scatter above them because it sums in the network. The token
+    # count is compared last, so with `allow_a2a` False it is never read and
+    # a single-trace caller's graph stays valid for every size.
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and allow_a2a
+        and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
