@@ -138,7 +138,7 @@ class RejectionSampler:
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
         if do_sampling:
-            if target_argmax is not None:
+            if target_argmax is not None or target_logits is None:
                 raise ValueError(
                     "Non-greedy rejection sampling needs target_logits, not "
                     "target_argmax."
@@ -185,6 +185,10 @@ class RejectionSampler:
                 accept_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+            )
+        if target_logits is None:
+            raise ValueError(
+                "Greedy rejection sampling needs target_logits or target_argmax."
             )
         return _greedy_rejection_sample_with_segment(
             draft_token_ids,

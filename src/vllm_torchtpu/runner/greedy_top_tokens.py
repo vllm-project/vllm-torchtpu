@@ -14,13 +14,17 @@ lower ids.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
@@ -70,7 +74,9 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
 def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """The greedy token of each row, ``[rows, 1]`` int64 like
     ``torch.argmax(logits, dim=-1, keepdim=True)``."""
-    tokens = owner.logits_processor.get_top_tokens(owner.lm_head, hidden_states)
+    processor = cast("LogitsProcessor", owner.logits_processor)
+    head = cast("VocabParallelEmbedding", owner.lm_head)
+    tokens = processor.get_top_tokens(head, hidden_states)
     return tokens.to(torch.int64).view(-1, 1)
 
 
