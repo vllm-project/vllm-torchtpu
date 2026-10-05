@@ -12,7 +12,7 @@ import pytest
 from . import conftest as omni_conftest
 from .conftest import OmniRunner, _OmniRunnerManager, omni_fixture_lock
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = pytest.mark.omni
 _EVENTS: list[tuple[str, str]] = []
 
 
