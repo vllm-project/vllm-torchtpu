@@ -30,6 +30,7 @@ packed token rows and the source rank's value-head columns.
 
 import dataclasses
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -86,8 +87,8 @@ def _qkv_receive_group_stride(
 def _mesh_device_id(
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    pcp_rank: jax.Array,
-) -> tuple[jax.Array, ...]:
+    pcp_rank: int | jax.Array,
+) -> tuple[int | jax.Array, ...]:
     """Build the destination's full logical mesh coordinate.
 
     Keep remote-copy addressing identical to the PCP streaming attention
@@ -101,7 +102,7 @@ def _mesh_device_id(
 
 
 def _all_rank_barrier(
-    barrier_sem: jax.Array,
+    barrier_sem: jax.Ref,
     rank: jax.Array,
     pcp_size: int,
     *,
@@ -125,18 +126,18 @@ def _all_rank_barrier(
 
 
 def _compute_gdn_tile(
-    b_slot_ref: jax.Array,
-    a_slot_ref: jax.Array,
-    conv_state_slot_ref: jax.Array,
-    recurrent_slot_ref: jax.Array,
-    out_slot_ref: jax.Array,
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_slot_ref: jax.Ref,
+    recurrent_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
     metadata_ref: memory_ref.MetadataRef,
     stage_metadata_ref: pcp_metadata.PcpStageMetadata,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
     received_qkv_ref: jax.Array,
-    compute_qkv_ref: jax.Array,
+    compute_qkv_ref: jax.Ref,
     *,
     cfg: config.GDNConfig,
     comm_chunk_size: int,
@@ -235,7 +236,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     qkv_recv_sems: jax.Array,
     output_send_sems: jax.Array,
     output_recv_sems: jax.Array,
-    barrier_sems: jax.Array,
+    barrier_sems: jax.Ref,
     received_qkv_ref: jax.Array,
     compute_qkv_ref: jax.Array,
     output_stage_ref: jax.Array,
@@ -555,6 +556,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 sem=projection_weight_sem,
             ).start()
             if is_fp8_projection:
+                assert projection_weight_scale_ref is not None
+                assert projection_weight_scale_vmem_ref is not None
                 source = (pl.ds(source_row, width),)
                 target = (pl.ds(destination_row, width),)
                 if projection_weight_scale_ref.ndim == 2:
@@ -636,6 +639,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     float(dtype_info.min),
                     float(dtype_info.max),
                 ).astype(projection_weight_ref.dtype)
+                assert projection_x_scale_ref is not None
                 projection_x_scale_ref[...] = x_scale
             else:
                 # Keep the operand reused across the interleaved GDN pipeline
@@ -655,8 +659,12 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 dst_ref=weight_ref,
                 sem=projection_weight_sem,
             ).wait()
-            blocked = is_fp8_projection and projection_weight_scale_vmem_ref.ndim == 2
+            blocked = (
+                is_fp8_projection
+                and cast(jax.Array, projection_weight_scale_vmem_ref).ndim == 2
+            )
             if is_fp8_projection:
+                assert projection_weight_scale_vmem_ref is not None
                 scale_slice = (pl.ds(0, width),)
                 if blocked:
                     scale_slice = (slice(None),) + scale_slice
@@ -667,6 +675,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     sem=projection_scale_sem,
                 ).wait()
             if blocked:
+                assert projection_weight_scale_vmem_ref is not None
+                assert projection_x_scale_ref is not None
                 num_blocks = projection_weight_scale_vmem_ref.shape[0]
                 block_k = projection_weight_vmem_ref.shape[1] // num_blocks
                 acc = jnp.zeros((projection_token_block_size, width), jnp.float32)
@@ -693,6 +703,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     preferred_element_type=jnp.float32,
                 )
                 if is_fp8_projection:
+                    assert projection_weight_scale_vmem_ref is not None
+                    assert projection_x_scale_ref is not None
                     acc *= projection_x_scale_ref[...][:, None]
                     acc *= projection_weight_scale_vmem_ref[pl.ds(0, width)][None, :]
             return acc.astype(hidden_ref.dtype)

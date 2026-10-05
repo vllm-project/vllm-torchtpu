@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -661,6 +662,7 @@ def _attention_kernel(
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
     def _send_blse_batch(seq_idx_start, bo_sem_idx, *, wait=False):
+        assert blse_x2_ref is not None and lse_hbm_ref is not None
         sem = sems.at[4, bo_sem_idx]
         vmem_ref = blse_x2_ref.at[bo_sem_idx, :]
 
@@ -703,6 +705,7 @@ def _attention_kernel(
 
     def store_blse(bo_sem_idx, batch_idx, lse_col):
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
+        assert blse_x2_ref is not None
         if not lse_lane_dense:
             blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
             return
@@ -1366,8 +1369,8 @@ def sparse_ragged_paged_attention(
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     if return_lse:
         if lse_lane_dense:
-            return out, lse[:, :actual_num_q_heads]
-        return out, lse[:, :actual_num_q_heads, 0]
+            return out, cast(jax.Array, lse)[:, :actual_num_q_heads]
+        return out, cast(jax.Array, lse)[:, :actual_num_q_heads, 0]
     return out
 
 
@@ -1509,7 +1512,7 @@ def sparse_attention_chunk(
         cache_kv_nope: jax.Array,
         cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
         kv_lens: jax.Array,  # i32[max_num_tokens]
-        start_seq_idx: jax.Array,  # i32
+        start_seq_idx: int,
         end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
@@ -1634,7 +1637,10 @@ def sparse_attention_chunk(
                 out_shape=(
                     [
                         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                        jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
+                        jax.ShapeDtypeStruct(
+                            shape=cast(jax.Array, lse).shape,
+                            dtype=cast(jax.Array, lse).dtype,
+                        ),
                     ]
                     if return_lse
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -1658,7 +1664,7 @@ def sparse_attention_chunk(
         if split_q:
             operands.append(q_pe)
         if return_lse:
-            operands.append(lse)
+            operands.append(cast(jax.Array, lse))
         return kernel(*scalar_prefetches, *operands)
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]

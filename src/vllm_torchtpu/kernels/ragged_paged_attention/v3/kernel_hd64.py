@@ -1378,7 +1378,7 @@ def ragged_paged_attention_hd64(
     sliding_window: int | None = None,
     strict_sliding_window: bool = True,
     soft_cap: float | None = None,
-    mask_value: float | None = DEFAULT_MASK_VALUE,
+    mask_value: float = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
