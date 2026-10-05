@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Shared helpers for the Kimi-K3 sweep drivers (eval_conc_sweep.sh,
-# agentx_sweep.sh). Source it after setting:
+# Shared helpers for the three Kimi-K3 InferenceX scripts in this directory:
+#   agentx_sweep.sh    boots a server, then calls agentx_client.sh (boot,
+#                      config.json, cleanup, log dump, GCS)
+#   agentx_client.sh   benchmarks a server it did not boot (server URL,
+#                      liveness, drain, engine counters, GCS)
+#   eval_conc_sweep.sh boots a server, then runs lm_eval against it (all of it)
+# Source it after setting:
 #   K3_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
-#   RESULTS_DIR    where the harness and the sweep write results
-#   PORT           the vLLM server port
+#   RESULTS_DIR    where the harness and these scripts write results
+#   PORT           the vLLM server port - only needed when K3_SERVER_URL is
+#                  unset, since that is the fallback k3_server_url resolves to
 # Everything here talks to the server named by k3_server_url: the one the
 # caller booted with run_benchmarks.sh --keep-alive, or one on another host.
 
