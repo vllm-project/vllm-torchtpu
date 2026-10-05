@@ -104,7 +104,9 @@ def patch_disable_eagle_block_drop() -> None:
         finally:
             self.use_eagle = True
 
+    # pyrefly: ignore[missing-attribute]
     __init__._tpu_disable_eagle_block_drop_patch = True
+    # pyrefly: ignore[missing-attribute]
     split._tpu_disable_eagle_block_drop_patch = True
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = split
