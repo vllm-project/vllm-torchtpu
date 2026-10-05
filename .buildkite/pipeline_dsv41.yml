@@ -34,16 +34,18 @@ steps:
           # The checkpoint does not fit a tpu7x-8 agent's disk, so it is not
           # staged with stage_model_snapshot.sh. A gs:// MODEL_URI makes
           # run_benchmarks.sh serve with --load-format runai_streamer, which
-          # needs a bucket the agent SA can get_bucket on (see the
-          # glm52-fp4-offload step on main). The prefix is a flat copy of the
-          # HF repo at revision 2cba9e4.
+          # needs storage.buckets.get on the bucket as well as object reads
+          # (see the glm52-fp4-offload step on main). The CI agent SAs hold
+          # roles/storage.bucketViewer and roles/storage.objectViewer on
+          # gs://wdhongtw-hf-flat, a flat copy of the HF repo at revision
+          # 2cba9e4.
           #
           # The config's benchmark (2 prompts, 128 in / 16 out) is the smoke
           # test; GSM8K (first 100 examples) is gated against
           # baselines/eval/deepseek-v41-flash-tp8-ep.gsm8k.baseline.json.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env MODEL_URI=gs://tpu-commons-ci/deepseek-ai/DeepSeek-V4.1-Flash
+            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             EXTRA_SERVE_ARGS=--language-model-only
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
             --config deepseek-v41-flash-tp8-ep
