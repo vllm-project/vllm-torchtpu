@@ -48,6 +48,7 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import copy
 import functools
 import gc
 import json
@@ -70,6 +71,32 @@ logger = init_logger(__name__)
 # every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
 # (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+
+
+# Checkpoint tensor name -> (first row, row count) of the rows this rank keeps.
+# Filled at model construction by layers that shard a tensor by rows and load
+# only their part. See register_row_slice.
+_ROW_SLICES: dict[str, tuple[int, int]] = {}
+
+
+def register_row_slice(name: str, start: int, rows: int) -> None:
+    """Stream only rows ``[start, start + rows)`` of checkpoint tensor ``name``.
+
+    For tensors too large to stream whole: the Run:AI streamer refuses any
+    single tensor above its memory limit (40 GB by default), and every rank
+    would buffer its own full copy. ``name`` matches the checkpoint name
+    exactly or as a dot-separated suffix. The layer's weight loader then
+    receives a ``[rows, ...]`` tensor and must accept it in place of the full
+    one. Applies only to the EP-sharded Run:AI iterator below.
+    """
+    _ROW_SLICES[name] = (start, rows)
+
+
+def _row_slice_for(name: str) -> tuple[int, int] | None:
+    for key, row_slice in _ROW_SLICES.items():
+        if name == key or name.endswith("." + key):
+            return row_slice
+    return None
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
@@ -171,7 +198,8 @@ def _sharded_runai_weights_iterator(
     Reads each file's safetensors header (via the Run:AI streamer, so
     ``gs://`` and local paths both work), drops non-local expert tensors
     from the request plan, and streams the surviving byte ranges as
-    contiguous runs. The skipped bytes are never requested from storage.
+    contiguous runs. Tensors with a registered row slice are fetched as
+    just those rows. The skipped bytes are never requested from storage.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -195,8 +223,8 @@ def _sharded_runai_weights_iterator(
         # (and a zero-byte group at the head of its queue aborts the whole
         # remaining stream). They are yielded directly as empty tensors.
         zero_size_tensors: list = []
-        kept = skipped = 0
-        kept_bytes = skipped_bytes = 0
+        kept = skipped = sliced = 0
+        kept_bytes = skipped_bytes = sliced_bytes = 0
 
         run_start: int | None = None
         run_sizes: list[int] = []
@@ -224,6 +252,32 @@ def _sharded_runai_weights_iterator(
                 elif size == 0:
                     kept += 1
                     zero_size_tensors.append(tensor_meta)
+                elif (row_slice := _row_slice_for(tensor_meta.name)) is not None:
+                    start, rows = row_slice
+                    total_rows = tensor_meta.shape[0]
+                    assert start >= 0 and rows > 0 and start + rows <= total_rows, (
+                        f"row slice {row_slice} does not fit {tensor_meta.name} "
+                        f"with {total_rows} rows"
+                    )
+                    row_bytes = size // total_rows
+                    part = copy.copy(tensor_meta)
+                    part.shape = [rows, *tensor_meta.shape[1:]]
+                    # The part is not contiguous with its neighbours' bytes,
+                    # so it is a request of its own.
+                    _flush(path)
+                    requests.append(
+                        FileChunks(
+                            len(requests),
+                            path,
+                            pos + start * row_bytes,
+                            [rows * row_bytes],
+                        )
+                    )
+                    tensors_by_request.append([part])
+                    kept += 1
+                    kept_bytes += rows * row_bytes
+                    sliced += 1
+                    sliced_bytes += size - rows * row_bytes
                 else:
                     kept += 1
                     kept_bytes += size
@@ -236,12 +290,15 @@ def _sharded_runai_weights_iterator(
 
         logger.info(
             "[sharded-ep-load] fetching %d tensors (%.1f GB) in %d ranges; "
-            "skipping %d non-local expert tensors (%.1f GB) before fetch",
+            "skipping %d non-local expert tensors (%.1f GB) and other ranks' "
+            "rows of %d row-sliced tensors (%.1f GB) before fetch",
             kept,
             kept_bytes / 1e9,
             len(requests),
             skipped,
             skipped_bytes / 1e9,
+            sliced,
+            sliced_bytes / 1e9,
         )
 
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)

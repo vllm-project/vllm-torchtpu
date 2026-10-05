@@ -278,6 +278,93 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
     assert "m.layers.0.empty.weight" in yielded
 
 
+def test_row_sliced_tensor_fetches_only_its_rows():
+    """A tensor with a registered row slice becomes its own request over just
+    those rows' bytes, breaks the surrounding run, and is yielded with the
+    sliced row count."""
+    # The Run:AI streamer ships with PR #331; skip until it is in the image.
+    pytest.importorskip("runai_model_streamer")
+    import torch
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    file_meta = _fake_file_meta(
+        offset=100,
+        names_and_sizes=[
+            ("layers.1.engram.q_weight", 8),  # kept @100
+            ("layers.1.engram.embed.weight", 40),  # 10 rows x 4 B @108
+            ("layers.1.engram.k_weight", 8),  # kept @148
+        ],
+    )
+    file_meta.tensors_metadata[1].shape = [10, 4]
+
+    captured = {}
+
+    class FakeStreamer:
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, requests, credentials, device, is_distributed):
+            captured["requests"] = requests
+
+        def get_chunks(self):
+            for request in captured["requests"]:
+                for index, size in enumerate(request.chunks):
+                    yield request.id, index, torch.empty(size, dtype=torch.uint8)
+
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    fake_metadata = MagicMock()
+    fake_metadata.from_files.return_value = [file_meta]
+
+    def fake_create(buffer, tensor_meta):
+        shape = getattr(tensor_meta, "shape", [buffer.numel()])
+        return buffer.view(shape)
+
+    with (
+        patch.dict(mlp._ROW_SLICES, clear=True),
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp, "SafetensorsMetadata", fake_metadata),
+        patch.object(sp, "create_torch_tensor", fake_create),
+    ):
+        mlp.register_row_slice("layers.1.engram.embed.weight", 3, 5)
+        yielded = {
+            name: tuple(tensor.shape)
+            for name, tensor in _sharded_runai_weights_iterator(
+                ["gs://bucket/file0.safetensors"],
+                local_expert_ids=set(),
+                use_tqdm_on_load=False,
+            )
+        }
+
+    assert [(r.offset, r.chunks) for r in captured["requests"]] == [
+        (100, [8]),
+        (108 + 3 * 4, [5 * 4]),  # rows 3..7 only
+        (148, [8]),
+    ]
+    assert yielded["layers.1.engram.embed.weight"] == (5, 4)
+    # The file's metadata keeps the full shape for any other consumer.
+    assert file_meta.tensors_metadata[1].shape == [10, 4]
+
+
+def test_row_slice_matches_dotted_suffix_only():
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    with patch.dict(mlp._ROW_SLICES, clear=True):
+        mlp.register_row_slice("layers.1.engram.embed.weight", 0, 2)
+        assert mlp._row_slice_for("layers.1.engram.embed.weight") == (0, 2)
+        assert mlp._row_slice_for("model.layers.1.engram.embed.weight") == (0, 2)
+        assert mlp._row_slice_for("layers.11.engram.embed.weight") is None
+        assert mlp._row_slice_for("layers.1.engram.embed.scale") is None
+
+
 def test_streamer_split_preserves_chunk_index_mapping():
     """Pin the library contract this loader depends on: when
     RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
