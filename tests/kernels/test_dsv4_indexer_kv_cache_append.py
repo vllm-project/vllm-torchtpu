@@ -33,6 +33,7 @@ import types
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
@@ -40,6 +41,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     kv_cache_append,
     kv_cache_utils,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 _KV_PACKING = 4
 _HAS = "head_along_sublane"
