@@ -141,9 +141,16 @@ fi
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
 # kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
-# scheduled kube pipeline names its own lane - and defaults to all of them.
+# scheduled pipeline names its own lane. Without it a build runs every lane but
+# perf, which has scheduled builds of its own; nightly builds still run perf,
+# and so does the integration pipeline, whose LKG promotion waits on two perf
+# steps.
 ALL_LANES="verify perf integration tests"
-lanes="${CI_LANES:-${ALL_LANES}}"
+default_lanes="verify integration tests"
+if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+  default_lanes="${ALL_LANES}"
+fi
+lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
     echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2

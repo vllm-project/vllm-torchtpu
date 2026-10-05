@@ -9,6 +9,14 @@ mounts and select the JAX CPU backend. Host model caches and test results
 use `$HOME/.cache/vllm-torchtpu-ci` on CPU agents and `/mnt/disks/persist`
 on TPU agents.
 
+`pipeline_perf.yml` (`pipeline_perf_kube.yml` on kube) holds the perf/eval
+steps, and PR and post-merge builds do not run them. The 02:00 PT nightly runs
+all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
+`CI_LANES=perf` run the perf lane alone; without `NIGHTLY` that is only the
+steps not gated on it. The schedules keep clear of the hours the nightly's
+perf steps take. The integration pipeline also runs the lane, because its LKG
+promotion waits on two of its steps.
+
 The `vllm-torchtpu-nightly-image` pipeline runs `pipeline_nightly_image.yml`,
 which builds the ci, dev and prod images with
 `scripts/publish_nightly_images.sh`. It has no git triggers; its schedules pick
