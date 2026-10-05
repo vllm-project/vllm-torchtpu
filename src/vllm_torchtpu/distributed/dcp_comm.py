@@ -15,9 +15,27 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, overload
 
 import torch
+
+
+@overload
+def cp_lse_ag_out_rs(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def cp_lse_ag_out_rs(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def cp_lse_ag_out_rs(
