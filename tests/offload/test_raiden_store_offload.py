@@ -2490,8 +2490,9 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
 
 
 def _isolate_storage_env(test: unittest.TestCase) -> None:
-    """Run `test` with no RAIDEN_STORAGE_* variables and a seeded hash."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("RAIDEN_STORAGE_")}
+    """Run `test` with no storage-tier variables and a seeded hash."""
+    prefixes = ("RAIDEN_STORAGE_", "EXPERIMENTAL_RAIDEN_STORAGE_")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes)}
     env["PYTHONHASHSEED"] = "0"
     patcher = patch.dict(os.environ, env, clear=True)
     patcher.start()
@@ -2610,14 +2611,11 @@ class TestStorageConfig(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = tmp.name
 
-    def _resolve(self, extra_config=None, *, pp_size=1, pcp_size=1):
+    def _resolve(self, extra_config=None, *, pp_size=1):
         from vllm_torchtpu.offload.raiden_store import resolve_storage_config
 
         return resolve_storage_config(
-            extra_config or {},
-            model_name="org/model",
-            pp_size=pp_size,
-            pcp_size=pcp_size,
+            extra_config or {}, model_name="org/model", pp_size=pp_size
         )
 
     def test_off_without_a_path(self):
@@ -2628,9 +2626,10 @@ class TestStorageConfig(unittest.TestCase):
             RAIDEN_STORAGE_CAPACITY_GB="x",
             RAIDEN_STORAGE_METADATA_CACHE_TTL="0",
             RAIDEN_STORAGE_PROPERTIES="tp_size=2",
+            EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK="maybe",
         )
         del os.environ["PYTHONHASHSEED"]
-        self.assertIsNone(self._resolve(pp_size=2, pcp_size=2))
+        self.assertIsNone(self._resolve(pp_size=2))
 
     def test_env_turns_it_on(self):
         os.environ["RAIDEN_STORAGE_PATH"] = self.root
@@ -2763,7 +2762,11 @@ class TestStorageConfig(unittest.TestCase):
             "unsupported type": ({"raiden_storage_type": "s3"}, {}, "not supported"),
             "relative path": ({"raiden_storage_path": "kv"}, {}, "absolute"),
             "pipeline parallel": ({}, {"pp_size": 2}, "pp_size=2"),
-            "prefill context parallel": ({}, {"pcp_size": 2}, "pcp_size=2"),
+            "skip flag not a boolean": (
+                {"experimental_raiden_storage_skip_parallelism_check": "maybe"},
+                {},
+                "must be true or false",
+            ),
             "capacity not a number": (
                 {"raiden_storage_capacity_gb": "x"},
                 {},
@@ -2823,6 +2826,47 @@ class TestStorageConfig(unittest.TestCase):
         for name, (extra, kwargs, message) in cases.items():
             with self.subTest(name), self.assertRaisesRegex(ValueError, message):
                 self._resolve({"raiden_storage_path": self.root, **extra}, **kwargs)
+
+    def test_pipeline_parallel_needs_the_experimental_flag(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        flag = "experimental_raiden_storage_skip_parallelism_check"
+        env_flag = flag.upper()
+        on = {"raiden_storage_path": self.root}
+        # The refusal names the way out.
+        with self.assertRaisesRegex(ValueError, f"pp_size=2.*{env_flag}"):
+            self._resolve(on, pp_size=2)
+        # Either source turns it into a warning; a set extra-config value wins.
+        cases = {
+            "extra config": ({flag: True}, {}),
+            "extra config string": ({flag: "yes"}, {}),
+            "env": ({}, {env_flag: "1"}),
+            "empty extra config value": ({flag: ""}, {env_flag: "on"}),
+        }
+        for name, (extra, env) in cases.items():
+            with (
+                self.subTest(name),
+                patch.dict(os.environ, env),
+                patch.object(rs.logger, "warning") as warning,
+            ):
+                self.assertIsNotNone(self._resolve({**on, **extra}, pp_size=2))
+                warning.assert_called_once()
+                self.assertIn("pp_size=2", warning.call_args.args[1])
+        with (
+            patch.dict(os.environ, {env_flag: "true"}),
+            self.assertRaisesRegex(ValueError, "pp_size=2"),
+        ):
+            self._resolve({**on, flag: False}, pp_size=2)
+        # Without pipeline parallelism the flag changes nothing.
+        with patch.object(rs.logger, "warning") as warning:
+            self.assertEqual(self._resolve({**on, flag: True}), self._resolve(on))
+            warning.assert_not_called()
+        # A misspelled variable stops startup, as for every env_bool flag.
+        with (
+            patch.dict(os.environ, {env_flag: "maybe"}),
+            self.assertRaisesRegex(ValueError, env_flag),
+        ):
+            self._resolve(on)
 
     def test_requires_pythonhashseed(self):
         del os.environ["PYTHONHASHSEED"]
@@ -2932,14 +2976,51 @@ class TestStorageBackendConfigs(unittest.TestCase):
     def test_rank_coords_are_checked(self):
         from vllm_torchtpu.offload.raiden_store import StorageRankCoords
 
-        for tp_rank, tp_size in ((-1, 4), (4, 4), (0, 0)):
-            with (
-                self.subTest(tp_rank=tp_rank, tp_size=tp_size),
-                self.assertRaises(ValueError),
-            ):
-                StorageRankCoords(tp_rank=tp_rank, tp_size=tp_size)
+        cases = (
+            {"tp_rank": -1, "tp_size": 4},
+            {"tp_rank": 4, "tp_size": 4},
+            {"tp_rank": 0, "tp_size": 0},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": 2, "pcp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": -1, "pcp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pcp_rank": 0, "pcp_size": 0},
+        )
+        for kwargs in cases:
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                StorageRankCoords(**kwargs)
 
-    def test_worker_coords_come_from_tp_group(self):
+    def test_pcp_ranks_get_their_own_shard_files(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # PCP-major, as in raiden P/D registration.
+        coords = rs.StorageRankCoords(tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4)
+        self.assertEqual((coords.storage_rank, coords.storage_size), (7, 8))
+        # Every (PCP, TP) pair gets a file of its own, and none is skipped.
+        ranks = sorted(
+            rs.StorageRankCoords(tp, 2, pcp_rank=pcp, pcp_size=4).storage_rank
+            for pcp in range(4)
+            for tp in range(2)
+        )
+        self.assertEqual(ranks, list(range(8)))
+        # PCP=8, TP=1: PCP rank 5 writes tp8_r5, and the store looks for all
+        # eight files of a block.
+        worker = rs.build_worker_storage_backend_config(
+            FAKE_STORAGE_IMPL,
+            _storage_config(),
+            rs.StorageRankCoords(0, 1, pcp_rank=5, pcp_size=8),
+        )
+        self.assertEqual(
+            (worker.parallelism.tp_rank, worker.parallelism.tp_size), (5, 8)
+        )
+        store = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL,
+            _storage_config(),
+            rs.StorageRankCoords(0, 1, pcp_size=8),
+        )
+        self.assertEqual(
+            (store.parallelism.tp_size, store.properties["tp_size"]), (8, "8")
+        )
+
+    def test_worker_coords_come_from_tp_and_pcp_groups(self):
         from vllm_torchtpu.offload import raiden_store as rs
 
         with (
@@ -2951,9 +3032,13 @@ class TestStorageBackendConfigs(unittest.TestCase):
                 "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
                 return_value=4,
             ),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_world_size", return_value=2),
         ):
             coords = rs.worker_storage_rank_coords()
-        self.assertEqual(coords, rs.StorageRankCoords(tp_rank=3, tp_size=4))
+        self.assertEqual(
+            coords, rs.StorageRankCoords(tp_rank=3, tp_size=4, pcp_rank=1, pcp_size=2)
+        )
 
 
 class TestStorageSpec(unittest.TestCase):
@@ -2966,7 +3051,9 @@ class TestStorageSpec(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = tmp.name
 
-    def _get_manager_and_worker(self, spec, *, tp_rank=2, tp_world_size=4):
+    def _get_manager_and_worker(
+        self, spec, *, tp_rank=2, tp_world_size=4, pcp_rank=0, pcp_world_size=1
+    ):
         with (
             _fake_tpu_sync(FAKE_STORAGE_IMPL),
             patch(
@@ -2987,6 +3074,11 @@ class TestStorageSpec(unittest.TestCase):
             patch(
                 "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
                 return_value=tp_world_size,
+            ),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
+            patch(
+                "vllm_torchtpu.distributed.pcp.get_pcp_world_size",
+                return_value=pcp_world_size,
             ),
         ):
             spec.get_manager()
@@ -3029,14 +3121,48 @@ class TestStorageSpec(unittest.TestCase):
         )
         self.assertEqual(worker_cfg.properties["direct_io"], "true")
 
-    def test_worker_tp_group_must_match_config(self):
+    def test_pcp_without_tp_writes_one_file_per_pcp_rank(self):
+        # PCP=8, TP=1, the interleaved layout: each PCP rank holds a different
+        # token chunk of every block, so each writes a file of its own.
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=1, pcp_size=8)
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(
+            spec, tp_rank=0, tp_world_size=1, pcp_rank=5, pcp_world_size=8
+        )
+        (store_cfg,) = manager_kwargs["secondary_backend_configs"]
+        self.assertEqual(store_cfg.parallelism.tp_size, 8)
+        self.assertEqual(store_cfg.properties["tp_size"], "8")
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(
+            (worker_cfg.parallelism.tp_rank, worker_cfg.parallelism.tp_size), (5, 8)
+        )
+
+    def test_worker_groups_must_match_config(self):
         spec = _build_spec({"raiden_storage_path": self.root})
-        with self.assertRaisesRegex(AssertionError, "TP group size"):
+        with self.assertRaisesRegex(AssertionError, "worker group sizes TP=2"):
             self._get_manager_and_worker(spec, tp_rank=0, tp_world_size=2)
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=1, pcp_size=8)
+        with self.assertRaisesRegex(AssertionError, "PCP=4 != configured"):
+            self._get_manager_and_worker(
+                spec, tp_rank=0, tp_world_size=1, pcp_rank=0, pcp_world_size=4
+            )
 
     def test_bad_setting_stops_construction(self):
         with self.assertRaisesRegex(ValueError, "pp_size=2"):
             _build_spec({"raiden_storage_path": self.root}, pp_size=2)
+
+    def test_experimental_flag_lets_pipeline_parallel_start(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with patch.object(rs.logger, "warning") as warning:
+            spec = _build_spec(
+                {
+                    "raiden_storage_path": self.root,
+                    "experimental_raiden_storage_skip_parallelism_check": True,
+                },
+                pp_size=2,
+            )
+        self.assertEqual(spec.storage_config.root_dir, self.root)
+        warning.assert_called_once()
 
 
 class TestStoragePlumbing(unittest.TestCase):

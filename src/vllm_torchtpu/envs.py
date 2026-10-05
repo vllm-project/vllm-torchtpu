@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     RAIDEN_STORAGE_METADATA_CACHE_ENTRIES: str = "0"
     RAIDEN_STORAGE_METADATA_CACHE_TTL: str = "60"
     RAIDEN_STORAGE_PROPERTIES: str = ""
+    EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TORCHTPU_IPC_KEY: str = ""
@@ -838,6 +839,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # raiden_storage_properties key in kv_connector_extra_config wins key by
     # key.
     "RAIDEN_STORAGE_PROPERTIES": env_str("RAIDEN_STORAGE_PROPERTIES", ""),
+    # Experimental, for testing only: lets the storage tier start under
+    # pipeline parallelism, which it otherwise refuses. Storage files are
+    # keyed by TP and PCP rank, so pipeline stages overwrite each other's
+    # files and a block read back from storage can carry another stage's KV.
+    # The experimental_raiden_storage_skip_parallelism_check key in
+    # kv_connector_extra_config wins over it.
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK": env_bool(
+        "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK", default=False
+    ),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
     # jobs whose blocks are about to be reused.
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S": env_float(

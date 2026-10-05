@@ -138,6 +138,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # local-rank offsets, which move a worker to a different chip without
     # changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",
     "RAIDEN_STORAGE_CAPACITY_GB",
