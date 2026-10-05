@@ -20,6 +20,8 @@ ISL_OSL_CONFIGS="100000:2048"
 CONCURRENCY_OPTIONS="4 8 16"
 RANDOM_RANGE_RATIO="0.0"
 BENCHMARK_TEMPERATURE=0
+# Required by run_benchmarks.sh for every config; no eval runs here.
+EVAL_TOLERANCE="0.03"
 # MXFP4 expert processing alone takes ~40 min on v7x-8.
 SERVER_READY_WAIT_MIN=120
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
