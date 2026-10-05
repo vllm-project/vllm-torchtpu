@@ -55,10 +55,6 @@ x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
 x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
-  # Keyed so the v7x-16 step below can depend on the whole group. A `wait`
-  # barrier cannot order it: Buildkite exempts any step with its own depends_on
-  # from wait, and that step needs one for the image.
-  #
   # Not in a K3=1 build, which runs the Kimi-K3 step at the bottom and nothing
   # else.
   - group: ":kubernetes: Perf and Eval on TPU"
@@ -218,24 +214,18 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --run-lm-eval
 
-  # A two-host slice, so it goes through run_multihost.sh and the JobSet in
-  # manifests/. Not in the tpu/v7x concurrency group: a group counts steps, not
-  # chips, so no slot can say "the whole fleet" - the dependency below is what
-  # reserves the hardware instead.
+  # The three v7x-16 steps below are two-host slices, so they go through
+  # run_multihost.sh and the JobSets in manifests/. They are not in the tpu/v7x
+  # concurrency group and depend on nothing but the image: the fleet has five
+  # 2x2x2 slices and places each JobSet in a slice of its own, and the group
+  # above is capped at 24 of the 40 v7x chips, so two of these run alongside it
+  # from the start and the third takes the first slice to come free.
   - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
     key: "perf_nightly_glm_5_2_fp8_dp16_ep"
     # Without build_docker this submits a sixteen-chip workload against a tag
     # that was never pushed and holds the fleet in ImagePullBackOff.
-    #
-    # TODO: drop the perf_tpu edge once the reservation has room for this
-    # alongside the group. Chips come free only when the group drains,
-    # and it backfills the moment a slot opens, so a step wanting the
-    # whole fleet never sees it. allow_failure because what this needs from
-    # those steps is their chips, not their results.
     depends_on:
       - "build_docker"
-      - step: "perf_tpu"
-        allow_failure: true
     if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
@@ -249,16 +239,10 @@ steps:
     commands:
       - .buildkite/kubernetes/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
 
-  # Chained after glm rather than sharing its dependency: each of these wants
-  # all sixteen chips, and three steps released together would start their
-  # budgets at once and spend them waiting. allow_failure for the same reason
-  # the glm edge has it - what this needs from the step before is its chips.
   - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
     key: "perf_nightly_deepseek_v4_pro_dp16_ep"
     depends_on:
       - "build_docker"
-      - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
-        allow_failure: true
     if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
@@ -289,8 +273,6 @@ steps:
     key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
     depends_on:
       - "build_docker"
-      - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
-        allow_failure: true
     if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:

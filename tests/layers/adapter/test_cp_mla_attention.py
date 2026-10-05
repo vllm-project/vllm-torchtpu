@@ -235,7 +235,6 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
 _OWNERSHIP = [(d, c) for d in (2, 4, 8, 16) for c in (1, 4, 64)]
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     """Every position has exactly one owner, and every rank is an owner."""
@@ -247,7 +246,6 @@ def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     assert set(owners.tolist()) == set(range(dcp_size))
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     """Over a whole interleave cycle the shards are exactly equal.
@@ -264,7 +262,6 @@ def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     assert (counts == 3 * interleave_c).all()
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_c", _OWNERSHIP)
 def test_local_indices_stay_inside_the_shard(dcp_size, interleave_c):
     """A rank is only ever handed an index into its own cache shard."""
@@ -372,6 +369,7 @@ def _merge_partials(
     return (weights[..., None] * outs).sum(0)
 
 
+@pytest.mark.tpu_test
 class SparseMlaLseTest(parameterized.TestCase):
     """`return_lse` and the KV-sharded merge it exists to enable. Tolerances
     are set by the kernel's bf16 output, not the merge, which is exact in f32."""

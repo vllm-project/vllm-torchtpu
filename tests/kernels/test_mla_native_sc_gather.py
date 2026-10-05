@@ -16,9 +16,12 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest
 
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
+
+pytestmark = pytest.mark.tpu_test
 
 
 class NativeScGatherTest(absltest.TestCase):

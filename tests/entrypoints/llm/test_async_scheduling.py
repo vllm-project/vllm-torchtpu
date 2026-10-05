@@ -13,6 +13,8 @@ from vllm import LLM, SamplingParams
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # Capture the original __init__ to allow safe monkeypatching and clean restoration.

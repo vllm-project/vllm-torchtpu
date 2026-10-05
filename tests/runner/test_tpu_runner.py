@@ -35,7 +35,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -79,6 +83,137 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
         "request-0": [0] * 8,
         "request-1": [0] * 13,
     }
+
+
+def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
+    spec = FullAttentionSpec(
+        block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
+    )
+    split = 384 // kernel_page_size
+    pages = spec.max_num_blocks_per_req(config, 1048576) * split
+    table = SimpleNamespace(
+        max_num_blocks_per_req=pages,
+        blocks_per_kv_block=split,
+        get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
+    )
+    runner = SimpleNamespace(
+        max_model_len=1048576,
+        max_num_reqs=64,
+        max_num_tokens=256,
+        block_size=384,
+        max_num_blocks_per_req=pages,
+        most_model_len=most_model_len,
+        input_batch=SimpleNamespace(block_table=[table]),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+        _attention_kernel_block_size=kernel_page_size,
+        _attention_kv_cache_group_id=0,
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    return runner
+
+
+@pytest.mark.parametrize(
+    "dcp_size,kernel_page_size,expected_cap,expected_pages,most_pages",
+    [(1, 384, 47, 2731, 171), (8, 384, 64, 342, 22), (8, 16, 15, 8208, 528)],
+)
+@pytest.mark.parametrize("uniform_group", [False, True])
+def test_smem_caps_match_metadata_and_schedule_geometry(
+    dcp_size, kernel_page_size, expected_cap, expected_pages, most_pages, uniform_group
+):
+    runner = _smem_runner(dcp_size, kernel_page_size)
+    if uniform_group:
+        group = runner.kv_cache_config.kv_cache_groups[0]
+        group.kv_cache_spec = UniformTypeKVCacheSpecs(
+            block_size=384, kv_cache_specs={"attn.0": group.kv_cache_spec}
+        )
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == expected_cap
+    assert runner.num_reqs_most_model_len == 64
+    assert runner.num_blocks_per_most_len_req == most_pages
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+    builder = AttentionMetadataBuilder(
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+        ["attn.0"],
+        runner.vllm_config,
+        torch.device("cpu"),
+        runner,
+        0,
+    )
+    for use_max, pages in [(True, expected_pages), (False, most_pages)]:
+        _, metadata_pages = builder._block_table_geometry(
+            SimpleNamespace(use_max_model_len=use_max)
+        )
+        assert metadata_pages == pages
+        seqs, schedule_pages, page_size = TPUModelRunner._attention_kernel_shapes(
+            runner, use_max
+        )
+        assert schedule_pages == metadata_pages
+        assert page_size == kernel_page_size
+        assert seqs == (expected_cap if use_max else 64)
+
+
+def test_smem_caps_follow_widest_attention_group():
+    runner = _smem_runner()
+    runner.input_batch.block_table.extend(
+        [
+            SimpleNamespace(max_num_blocks_per_req=4096),
+            SimpleNamespace(max_num_blocks_per_req=100000),
+        ]
+    )
+    runner.kv_cache_config.kv_cache_groups.extend(
+        [
+            SimpleNamespace(
+                kv_cache_spec=runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            ),
+            SimpleNamespace(
+                kv_cache_spec=MambaSpec(
+                    block_size=384, shapes=((1, 128),), dtypes=(torch.float32,)
+                )
+            ),
+        ]
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == 32
+
+
+def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
+    runner = _smem_runner(most_model_len=None)
+    final_table = runner.input_batch.block_table[0]
+    runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
+    runner.max_num_blocks_per_req = 2731
+    runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == 47
+
+    def rebuild(_self, _config, _sizes):
+        runner.input_batch.block_table[0] = final_table
+
+    monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
+    # super() requires a TPUModelRunner instance, but no device initialization.
+    real_runner = object.__new__(TPUModelRunner)
+    real_runner.__dict__.update(runner.__dict__)
+    real_runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(real_runner)
+    )
+    TPUModelRunner.may_reinitialize_input_batch(
+        real_runner, runner.kv_cache_config, [384]
+    )
+    assert real_runner.num_reqs_max_model_len == 64
+    assert real_runner.max_num_blocks_per_req == 342
+    assert real_runner.block_table_cpu.shape == (64, 342)
+    assert real_runner.num_reqs_most_model_len is None
 
 
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
@@ -635,6 +770,7 @@ class TestStartStopPhasedProfiling:
         assert runner.phase_based_profiler is None
 
 
+@pytest.mark.tpu_test
 class TestTPURunner:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
@@ -790,6 +926,7 @@ class TestAttentionMetadataBuilder:
         for gid in range(num_groups):
             bt = MagicMock()
             bt.max_num_blocks_per_req = max_num_blocks_per_req
+            bt.blocks_per_kv_block = 1
             bt.get_cpu_tensor.return_value = (
                 torch.arange(
                     max_num_reqs * max_num_blocks_per_req, dtype=torch.int32
@@ -809,10 +946,12 @@ class TestAttentionMetadataBuilder:
                 dtype=torch.bfloat16,
                 page_size_padded=16384,
             )
+        config = MagicMock()
+        config.parallel_config.decode_context_parallel_size = 1
         return AttentionMetadataBuilder(
             kv_cache_spec=spec,
             layer_names=["attn.0"],
-            vllm_config=MagicMock(),
+            vllm_config=config,
             device=runner.device,
             runner=runner,
             kv_cache_group_id=kv_cache_group_id,
@@ -1815,6 +1954,7 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
     assert vllm_config.cache_config.block_size in (128, 256)
 
 
+@pytest.mark.tpu_test
 def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
@@ -2299,3 +2439,64 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+@pytest.mark.tpu_test
+def test_upload_unless_unchanged_reuses_only_identical_values(device):
+    """Spec steps reuse the previous upload of a small tensor while its values
+    repeat. New values, dtype or shape upload again, and slots never share an
+    entry."""
+    runner = SimpleNamespace(device=device, _h2d_reuse={})
+
+    def upload(slot, host):
+        return TPUModelRunner._upload_unless_unchanged(runner, slot, host)
+
+    a = upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32))
+    assert upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32)) is a
+    b = upload("qsl", torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert b is not a
+    assert torch.equal(b.cpu(), torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert upload("idx", torch.tensor([0, 4, 8, 12], dtype=torch.int32)) is not b
+
+    # Same bytes, different dtype or shape: not a match.
+    z = upload("z", torch.zeros(4, dtype=torch.int32))
+    zf = upload("z", torch.zeros(4, dtype=torch.float32))
+    assert zf is not z and zf.dtype == torch.float32
+    z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
+    assert z22 is not zf and tuple(z22.shape) == (2, 2)
+
+
+def test_relayout_tables_reaches_the_draft_model(monkeypatch):
+    """The draft shares the target's cached Pallas ops, which are traced
+    against the target's relayouted tables; the draft's own tables must get
+    the same layout (a column-major draft rope cache fails the shared op
+    with RuntimeProgramInputMismatch while precompiling the draft buckets).
+    """
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
+    seen = []
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_rope_caches",
+        lambda model: seen.append(("rope", model)),
+    )
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_hash_tables",
+        lambda model: seen.append(("hash", model)),
+    )
+    runner = MagicMock(spec=TPUModelRunner)
+    draft_model = object()
+
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == [("rope", draft_model), ("hash", draft_model)]
+
+    # No draft (ngram) or flags off: nothing to relayout.
+    seen.clear()
+    TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == []

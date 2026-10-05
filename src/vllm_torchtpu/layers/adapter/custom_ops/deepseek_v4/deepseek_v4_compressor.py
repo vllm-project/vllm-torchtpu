@@ -14,6 +14,7 @@
 """TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
+from typing import TYPE_CHECKING, cast
 
 import jax
 import torch
@@ -37,6 +38,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.utils import align_to
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -141,6 +145,8 @@ def _compressor_jax_csa(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The CSA kernel always returns a rope cache.
+    assert new_rope_cache is not None
     return new_cache, new_rope_cache
 
 
@@ -189,6 +195,8 @@ def _compressor_jax_hca(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The HCA kernel always returns a state cache.
+    assert new_state_cache is not None
     return new_cache, new_state_cache
 
 
@@ -364,7 +372,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if self._wkv_wgate_transposed:
             return
-        weight = self.fused_wkv_wgate.weight.data.t().contiguous()
+        weight = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
 
@@ -538,8 +546,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                     "attention metadata; using another layer's would corrupt "
                     f"its pages. Known: {sorted(attn_ctx)}"
                 )
-        state_metadata = attn_ctx[state_prefix]
-        k_cache_metadata = attn_ctx[k_cache_prefix]
+        assert k_cache_prefix is not None
+        state_metadata = cast("AttentionMetadata | None", attn_ctx[state_prefix])
+        k_cache_metadata = cast("AttentionMetadata | None", attn_ctx[k_cache_prefix])
         if state_metadata is None or k_cache_metadata is None:
             return
 

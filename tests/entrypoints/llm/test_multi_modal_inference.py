@@ -36,6 +36,8 @@ from vllm.multimodal.image import convert_image_mode
 
 from vllm_torchtpu import tpu_info
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 # Known-good partial text outputs for the cherry-blossom image.

@@ -16,11 +16,14 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 # Import the kernels
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla_swa
+
+pytestmark = pytest.mark.tpu_test
 
 
 def get_kv_cache_shape(
