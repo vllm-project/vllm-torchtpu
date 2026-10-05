@@ -1,5 +1,7 @@
 """Single-pass delayed mHC with compact TPU Sinkhorn and upstream residual flow."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -152,15 +154,13 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
 
     def kernel(x_ref, w_ref, pre_ref, mix_ref, square_ref, value_ref):
         pre = pre_ref[...]
-        value = square = None
+        terms, sums = [], []
         for m in range(mult):
             x = x_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
-            term = pre[:, m : m + 1] * x
-            sums = jnp.sum(x * x, axis=1, keepdims=True)
-            value = term if value is None else value + term
-            square = sums if square is None else square + sums
-        value_ref[...] = value.astype(value_ref.dtype)
-        square_ref[...] = square
+            terms.append(pre[:, m : m + 1] * x)
+            sums.append(jnp.sum(x * x, axis=1, keepdims=True))
+        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
+        square_ref[...] = functools.reduce(jnp.add, sums)
         parts = jnp.dot(x_ref[...], w_ref[...], preferred_element_type=jnp.float32)
         mix_ref[...] = (
             parts[:, :mixes]
