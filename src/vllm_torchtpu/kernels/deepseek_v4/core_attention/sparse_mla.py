@@ -698,7 +698,7 @@ def sparse_ragged_paged_attention(
         swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
         swa_l: jax.Array,  # float32[max_num_tokens, num_l_heads]
         swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
-        start_seq_idx: jax.Array,  # i32
+        start_seq_idx: int,  # i32
         end_seq_idx: jax.Array,  # i32
         num_valid_tokens: jax.Array,  # i32
         kernel_batch_size: int,

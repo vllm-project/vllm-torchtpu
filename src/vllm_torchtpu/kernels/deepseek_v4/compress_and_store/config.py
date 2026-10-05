@@ -38,6 +38,7 @@ Modes:
 
 import dataclasses
 import enum
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +58,7 @@ class Mode(enum.Enum):
     CSA_INDEXER = "csa_indexer"
 
 
-_MODE_DEFAULTS = {
+_MODE_DEFAULTS: dict[Mode, dict[str, Any]] = {
     Mode.HCA: dict(
         head_dim=512,
         rope_head_dim=64,

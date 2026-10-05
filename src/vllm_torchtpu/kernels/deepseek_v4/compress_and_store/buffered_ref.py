@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +33,7 @@ class _BufferedRef(pltpu.BufferedRef):
     def create(
         cls,
         spec: pl.BlockSpec,
-        dtype_or_type: jax.Array,
+        dtype_or_type: jax.typing.DTypeLike,
         buffer_type: pltpu.BufferType,
         buffer_count: int,
         use_lookahead: bool,
@@ -60,12 +60,14 @@ class _BufferedRef(pltpu.BufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CosSinRef(_BufferedRef):
     def copy_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        dest_ref = self.window_ref.at[slot]  # (tile_n, rope_head_dim)
+        dest_ref = cast(jax.Ref, self.window_ref.at[slot])  # (tile_n, rope_head_dim)
 
         tile_n = self.cfgs.tile_sizes.tile_n
         compress_ratio = self.cfgs.dims.compress_ratio
@@ -83,6 +85,8 @@ class CosSinRef(_BufferedRef):
             pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
@@ -96,6 +100,8 @@ class PageBufferRef(_BufferedRef):
     #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
 
     def copy_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
@@ -112,7 +118,7 @@ class PageBufferRef(_BufferedRef):
         pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
         block_size = self.cfgs.state_block_size
 
-        page_buffer_ref = self.window_ref.at[slot]
+        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
         global_idx = pid * tile_n
 
         @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
@@ -133,6 +139,8 @@ class PageBufferRef(_BufferedRef):
             pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
@@ -146,10 +154,12 @@ class OutputRef(_BufferedRef):
 
     def copy_in(self, src_ref, grid_indices):
         # Only called in CSA_INDEXER mode (INPUT_OUTPUT)
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         cache_ref, kv_slot_mapping_ref, _ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        dest_ref = self.window_ref.at[slot]
+        dest_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n
@@ -175,9 +185,11 @@ class OutputRef(_BufferedRef):
                 pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n
@@ -199,9 +211,11 @@ class OutputRef(_BufferedRef):
                 ).wait()
 
     def copy_out(self, dest_ref, grid_indices):
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        src_ref = self.window_ref.at[slot]
+        src_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
@@ -247,9 +261,11 @@ class OutputRef(_BufferedRef):
                         pltpu.make_async_copy(src_nope, dest_nope, sem).start()
 
     def wait_out(self, dest_ref, grid_indices):
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
@@ -300,10 +316,12 @@ class RoPEOutputRef(_BufferedRef):
     # Only used for CSA (has_rope_cache=True).
 
     def copy_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        dest_ref = self.window_ref.at[slot]
+        dest_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n
@@ -328,9 +346,11 @@ class RoPEOutputRef(_BufferedRef):
                 pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n
@@ -353,11 +373,13 @@ class RoPEOutputRef(_BufferedRef):
                 ).wait()
 
     def copy_out(self, dest_ref, grid_indices):
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
 
-        src_ref = self.window_ref.at[slot]
+        src_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n
@@ -380,9 +402,11 @@ class RoPEOutputRef(_BufferedRef):
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
 
     def wait_out(self, dest_ref, grid_indices):
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
 
         tile_n = self.cfgs.tile_sizes.tile_n

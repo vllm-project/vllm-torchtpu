@@ -128,82 +128,7 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `loop`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `make_async_copy`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `loop`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `make_async_copy`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `run_scoped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `SemaphoreType`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `pallas_call`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `PrefetchScalarGridSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `custom_jax_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
@@ -602,78 +527,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
       "name": "bad-override-param-name",
       "concise_description": "Class member `OutputRef.copy_out` overrides parent class `_BufferedRef` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
@@ -682,48 +537,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
       "name": "bad-override-param-name",
       "concise_description": "Class member `RoPEOutputRef.copy_out` overrides parent class `_BufferedRef` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
@@ -731,59 +546,9 @@
       "concise_description": "Class member `RoPEOutputRef.wait_out` overrides parent class `_BufferedRef` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/buffered_ref.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `SupportsDType | dtype | str | type[Any]` is not assignable to parameter `dtype_or_type` with type `Array` in function `_BufferedRef.create`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `bool | int` is not assignable to parameter `overlap` with type `bool` in function `state_rows_per_token`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `bool | int | Unknown` is not assignable to parameter `overlap` with type `bool` in function `Dimensions.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `bool | int | Unknown` is not assignable to parameter `has_rope_cache` with type `bool` in function `Dimensions.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `bool | int | Unknown` is not assignable to parameter `cos_sin_dtype` with type `SupportsDType | dtype | str | type[Any]` in function `Dimensions.__init__`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Array` is not assignable to parameter `global_idx` with type `int` in function `vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compute.gather_from_page_buffer`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/csa_gather.py",
@@ -796,79 +561,9 @@
       "concise_description": "Expected 1 positional argument, got 4"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla_swa.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_sliding_window_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/sparse_mla.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `start_seq_idx` with type `Array` in function `run_mla_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/mhc/fused_post_pre_kernel.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Array, ...]` is not assignable to declared return type `tuple[Array, Array, Array, Array]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/mhc/pre_kernel.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Array, ...]` is not assignable to declared return type `tuple[Array, Array]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/mhc/pre_kernel.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Array, ...]` is not assignable to declared return type `tuple[Array, Array, Array]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/mhc/utils.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Array, ...]` is not assignable to declared return type `tuple[Array, Array, Array]`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
       "name": "bad-override",
       "concise_description": "Class member `CosSinRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `Array | tuple[Array, Array]` is not assignable to declared return type `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/rope.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `Array | tuple[Array, Array]` is not assignable to declared return type `tuple[Array, Array]`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
@@ -1004,11 +699,6 @@
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/streamindex_topk.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
