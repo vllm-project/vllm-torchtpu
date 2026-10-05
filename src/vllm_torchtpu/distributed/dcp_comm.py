@@ -21,24 +21,28 @@ import torch
 
 
 def cp_lse_ag_out_rs(
-    output: torch.Tensor, lse: torch.Tensor, group: Any | None
-) -> tuple[torch.Tensor, torch.Tensor]:
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Mirror vllm.v1.attention.ops.dcp.cp_lse_ag_out_rs.
 
     Args:
       output: [T, H * group, D]
       lse: [T, H * group]
+      return_lse: also return the merged LSE.
 
     Returns:
-      (merged_output [T, H, D] in output.dtype, merged_lse [T, H] in f32).
-      Computed in f32.
+      merged_output [T, H, D] in output.dtype, plus merged_lse [T, H] in f32
+      if return_lse. Computed in f32.
 
     Note: we do not implement Helix-style `dcp_a2a_lse_reduce` merge (one
       a2a of output + LSE, then a local combine), as we observe no benefit
       over AG-RS on TPU topologies.
     """
     if group is None or int(group.world_size) == 1:
-        return output, lse
+        return (output, lse) if return_lse else output
 
     # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
     lse = lse.to(torch.float32)
@@ -50,7 +54,10 @@ def cp_lse_ag_out_rs(
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
 
-    merged = group.reduce_scatter(weighted.contiguous(), dim=1)
+    merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+    if not return_lse:
+        return merged
+
     heads = merged.shape[1]
     start = int(group.rank_in_group) * heads
-    return merged.to(output.dtype), merged_lse[:, start : start + heads]
+    return merged, merged_lse[:, start : start + heads]

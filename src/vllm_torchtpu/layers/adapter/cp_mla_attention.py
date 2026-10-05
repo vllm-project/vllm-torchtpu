@@ -117,7 +117,7 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    return cp_lse_ag_out_rs(output, lse, group)[0]
+    return cp_lse_ag_out_rs(output, lse, group)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

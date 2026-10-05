@@ -335,7 +335,9 @@ def forward_with_dcp(
 
     ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
 
-    ctx_output, ctx_lse = cp_lse_ag_out_rs(ctx_output, ctx_lse, dcp_group)
+    ctx_output, ctx_lse = cp_lse_ag_out_rs(
+        ctx_output, ctx_lse, dcp_group, return_lse=True
+    )
 
     new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
 
