@@ -433,13 +433,12 @@ def _validate_libtpu_version() -> None:
 
 @contextlib.contextmanager
 def _torch_tpu_wrapper():
-    """Alias torch.cuda.* to torch.tpu.* during inherited GPUModelRunner init.
+    """Alias torch.cuda.* to torch.accelerator.* during inherited GPUModelRunner
+    init.
 
     Mirrors vllm/v1/worker/xpu_model_runner.py:_torch_cuda_wrapper. The parent
     GPUModelRunner constructs torch.cuda.Stream/Event for comm and async copy;
-    this wrapper makes those resolve to the TPU equivalents (verified present
-    on torch.tpu: Stream, Event, current_stream, default_stream, stream,
-    set_stream, synchronize, set_device, current_device, device_count).
+    this wrapper makes those resolve to the accelerator equivalents.
 
     The 5 APIs not on torch.tpu are stubbed:
       - mem_get_info -> torch.accelerator.get_memory_info (works on TPU)
@@ -448,22 +447,24 @@ def _torch_tpu_wrapper():
         disable cudagraphs in __init__ via compilation_config overrides.
     """
     saved = {}
-    aliased = (
-        "Stream",
-        "Event",
-        "current_stream",
-        "default_stream",
-        "stream",
-        "set_stream",
-        "synchronize",
-        "set_device",
-        "current_device",
-        "device_count",
-        "is_available",
-    )
-    for name in aliased:
+    accelerator_aliases = {
+        "current_device": torch.accelerator.current_device_index,
+        "set_device": torch.accelerator.set_device_index,
+        "is_available": torch.accelerator.is_available,
+        "device_count": torch.accelerator.device_count,
+        "synchronize": torch.accelerator.synchronize,
+        "current_stream": torch.accelerator.current_stream,
+        "set_stream": torch.accelerator.set_stream,
+    }
+    tpu = getattr(torch, "tpu", None)
+    tpu_aliases = ("Stream", "Event", "default_stream", "stream")
+    for name, func in accelerator_aliases.items():
         saved[name] = getattr(torch.cuda, name, None)
-        setattr(torch.cuda, name, getattr(torch.tpu, name))
+        setattr(torch.cuda, name, func)
+    for name in tpu_aliases:
+        saved[name] = getattr(torch.cuda, name, None)
+        if tpu is not None and hasattr(tpu, name):
+            setattr(torch.cuda, name, getattr(tpu, name))
     saved["mem_get_info"] = getattr(torch.cuda, "mem_get_info", None)
     torch.cuda.mem_get_info = lambda *a, **kw: torch.accelerator.get_memory_info()
     saved["empty_cache"] = getattr(torch.cuda, "empty_cache", None)
