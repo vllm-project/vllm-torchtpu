@@ -10,6 +10,8 @@ import pytest
 
 from .tpu_test_utils import run_in_isolated_process
 
+pytestmark = pytest.mark.tpu_test
+
 
 def _run_state_seam():
     os.environ["VLLM_KV_CACHE_LAYOUT"] = "HND"

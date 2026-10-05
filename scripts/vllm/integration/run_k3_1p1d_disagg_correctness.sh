@@ -52,7 +52,10 @@
 #     * neither engine preempted a request (num_preemptions == 0)
 #
 # Stages 4 and 5 compare tokens, which needs a prefill chunk to be one KV block
-# (configs/kimi-k3-tp32-ep-1p1d.sh); this refuses to start otherwise.
+# (configs/kimi-k3-tp8-dp4-ep-1p1d.sh); this refuses to start otherwise. They
+# also hold their requests to one DP rank of each engine (K3_PD_DP_RANK): the
+# replicas differ slightly in greedy output. The other stages and the eval
+# spread over the replicas as the proxy sends them.
 #
 # Exit status: 0 every stage passed, 1 a stage failed, anything else no stage
 # was run.
@@ -62,6 +65,7 @@
 #   PREFILL_URL, DECODE_URL  the engines, for /metrics
 #   PREFILL_CHUNK_TOKENS     the pair's --max-num-batched-tokens
 #   LOG_DIR                  where each stage's output is kept
+#   K3_PD_DP_RANK            the DP rank stages 4 and 5 hold to, if any
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -190,6 +194,10 @@ run_stages() {
   # --min-max-tokens: room for the six tokens K3 closes its channels with.
   # --skip-short-qa: that suite asserts trivia in Qwen3.5's phrasing.
   local fixtures=("${chat[@]}" --min-max-tokens 32 --skip-short-qa)
+  local pinned=()
+  if [[ -n "${K3_PD_DP_RANK:-}" ]]; then
+    pinned=(--data-parallel-rank "${K3_PD_DP_RANK}")
+  fi
 
   stage quick_probe python3 "${smoke}" "${chat[@]}" --quick-probe-only
   stage correctness python3 "${smoke}" "${fixtures[@]}"
@@ -197,10 +205,11 @@ run_stages() {
     --concurrent-requests "${K3_PD_CONCURRENCY}"
   # 120 lines is ~4.2k tokens.
   stage divergence python3 "${script_dir}/smoke_prefix_cache_e2e_divergence.py" \
-    "${chat[@]}" --attempts 3 --line-count 120 \
+    "${chat[@]}" "${pinned[@]}" --attempts 3 --line-count 120 \
     --logprob-atol "${DIVERGENCE_LOGPROB_ATOL}"
   stage state_contamination python3 \
-    "${script_dir}/smoke_mamba_state_contamination.py" "${target[@]}" --rounds 3
+    "${script_dir}/smoke_mamba_state_contamination.py" "${target[@]}" \
+    "${pinned[@]}" --rounds 3
 
   stage counters check_counters
 

@@ -163,6 +163,7 @@ class TestNvfp4Helpers:
             _requant_moe_w4a8(w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
 
 
+@pytest.mark.tpu_test
 class TestNvfp4Config:
     """Tests for VllmNvfp4Config get_name and get_quant_method dispatch."""
 

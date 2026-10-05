@@ -51,12 +51,12 @@ def test_fp8_config_rejects_store_dtype():
         )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "block_size,shard_size,deepseek_v4",
     [
         ([128, 128], 256, False),
         ([128, 128], 192, False),
+        ([128, 128], 64, False),
         (None, 256, False),
         ([128, 128], 256, True),
     ],
@@ -65,6 +65,7 @@ def test_fp8_routed_experts_checkpoint_allocation(
     monkeypatch, block_size, shard_size, deepseek_v4
 ):
     """Exercise upstream construction and loading with TPU checkpoint geometry."""
+    from math import gcd
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
@@ -151,25 +152,575 @@ def test_fp8_routed_experts_checkpoint_allocation(
         )
 
     assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
-    padded = (shard_size + 127) // 128 * 128 if block_size else shard_size
-    assert layer.w13_weight.shape == (2, 2 * padded, 256)
-    assert layer.w2_weight.shape == (2, 256, padded)
+    eff_block = gcd(128, shard_size) if block_size else None
+    assert layer.w13_weight.shape == (2, 2 * shard_size, 256)
+    assert layer.w2_weight.shape == (2, 256, shard_size)
     assert layer.w13_weight.dtype == layer.w2_weight.dtype == torch.float8_e4m3fn
     suffix = "weight_scale_inv" if block_size else "weight_scale"
     w13_scale = getattr(layer, f"w13_{suffix}")
     w2_scale = getattr(layer, f"w2_{suffix}")
-    assert w13_scale.shape == ((2, 2 * padded // 128, 2) if block_size else (2, 2))
-    assert w2_scale.shape == ((2, 2, padded // 128) if block_size else (2,))
+    assert w13_scale.shape == (
+        (2, 2 * shard_size // eff_block, 256 // eff_block) if block_size else (2, 2)
+    )
+    assert w2_scale.shape == (
+        (2, 256 // eff_block, shard_size // eff_block) if block_size else (2,)
+    )
     assert w13_scale.dtype == w2_scale.dtype == torch.float32
     assert layer.w13_weight.weight_loader == layer.weight_loader
     assert w13_scale.weight_loader == layer.weight_loader
     assert layer.w13_input_scale is None and layer.w2_input_scale is None
-    if block_size and shard_size == padded:
-        # The second TP rank loads the original checkpoint block grid without
-        # native GPU scale refinement. Distinct columns expose wrong slicing.
+    if block_size and shard_size == 256:
         scales = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         layer.weight_loader(w2_scale, scales, "w2_weight_scale_inv", "w2", 0)
         torch.testing.assert_close(w2_scale[0], scales[:, 2:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tp_size,full_inter",
+    [(1, 64), (1, 192), (4, 768), (8, 768), (16, 1024)],
+)
+def test_fp8_routed_experts_tp_shard_loading(monkeypatch, tp_size, full_inter):
+    """Sub-block TP shards load without overflow and dequantize to the checkpoint."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import _process_fp8_moe_weights
+
+    hidden = 128
+    shard = full_inter // tp_size
+    padded = (shard + 127) // 128 * 128
+    n_blocks = (full_inter + 127) // 128
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    gen = torch.Generator().manual_seed(0)
+    w1 = torch.ones(full_inter, hidden, dtype=torch.float8_e4m3fn)
+    w3 = torch.full((full_inter, hidden), 2.0, dtype=torch.float8_e4m3fn)
+    w2 = torch.ones(hidden, full_inter, dtype=torch.float8_e4m3fn)
+    s1 = torch.rand(n_blocks, hidden // 128, generator=gen) + 0.5
+    s3 = torch.rand(n_blocks, hidden // 128, generator=gen) + 0.5
+    s2 = torch.rand(hidden // 128, n_blocks, generator=gen) + 0.5
+    ref_w1 = (
+        w1.float()
+        * s1.repeat_interleave(128, dim=0)[:full_inter].repeat_interleave(128, dim=1)[
+            :, :hidden
+        ]
+    )
+    ref_w3 = (
+        w3.float()
+        * s3.repeat_interleave(128, dim=0)[:full_inter].repeat_interleave(128, dim=1)[
+            :, :hidden
+        ]
+    )
+    ref_w2 = (
+        w2.float()
+        * s2.repeat_interleave(128, dim=0)[:hidden].repeat_interleave(128, dim=1)[
+            :, :full_inter
+        ]
+    )
+
+    for tp_rank in range(tp_size):
+        parallel = FusedMoEParallelConfig(
+            tp_size=tp_size,
+            pcp_size=1,
+            dp_size=1,
+            ep_size=1,
+            tp_rank=tp_rank,
+            pcp_rank=0,
+            dp_rank=0,
+            ep_rank=0,
+            sp_size=1,
+            use_ep=False,
+            all2all_backend="allgather_reducescatter",
+            enable_eplb=False,
+        )
+        config = FusedMoEConfig(
+            num_experts=1,
+            experts_per_token=1,
+            hidden_dim=hidden,
+            intermediate_size=full_inter,
+            num_local_experts=1,
+            num_logical_experts=1,
+            activation=MoEActivation.SILU,
+            device=torch.device("cpu"),
+            routing_method=RoutingMethodType.Renormalize,
+            moe_parallel_config=parallel,
+            in_dtype=torch.bfloat16,
+        )
+        expert_map = ExpertMapManager(
+            max_num_batched_tokens=16,
+            top_k=1,
+            global_num_experts=1,
+            num_redundant_experts=0,
+            num_expert_group=None,
+            moe_parallel_config=parallel,
+            placement_strategy="linear",
+            enable_eplb=False,
+        )
+        quant = VllmFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        quant.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_expert_parallel=False),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+        )
+        with set_current_vllm_config(quant.vllm_config):
+            layer = RoutedExperts(
+                layer_name="model.layers.0.mlp.experts",
+                params_dtype=torch.bfloat16,
+                moe_config=config,
+                quant_config=quant,
+                expert_map_manager=expert_map,
+            )
+
+        # Dirty the uninitialized weight buffers so tp_size=1 padding tests
+        # verify that _process_fp8_moe_weights zeroes the padded tail.
+        layer.w13_weight.data.fill_(7.0)
+        layer.w2_weight.data.fill_(7.0)
+        for sid, w, s in (("w1", w1, s1), ("w3", w3, s3), ("w2", w2, s2)):
+            attr = "w2" if sid == "w2" else "w13"
+            layer.weight_loader(
+                getattr(layer, f"{attr}_weight"), w, f"{sid}.weight", sid, 0
+            )
+            layer.weight_loader(
+                getattr(layer, f"{attr}_weight_scale_inv"),
+                s,
+                f"{sid}.weight_scale_inv",
+                sid,
+                0,
+            )
+
+        w13_q, w13_s, w2_q, w2_s, _, _ = _process_fp8_moe_weights(
+            layer,
+            weight_block_size=tuple(layer.quant_method.moe_block_shape),
+            activation="silu",
+        )
+        sl = slice(tp_rank * shard, (tp_rank + 1) * shard)
+        got_w13 = (w13_q[0].float() * w13_s[0, 0, 0]).T
+        got_w2 = (w2_q[0].float() * w2_s[0, 0, 0]).T
+        torch.testing.assert_close(got_w13[:shard], ref_w1[sl], rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(
+            got_w13[padded : padded + shard], ref_w3[sl], rtol=1e-2, atol=1e-2
+        )
+        assert not got_w13[shard:padded].any()
+        assert not got_w13[padded + shard :].any()
+        torch.testing.assert_close(
+            got_w2[:, :shard], ref_w2[:, sl], rtol=1e-2, atol=1e-2
+        )
+        assert not got_w2[:, shard:].any()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tp_size,full_inter,expected_block",
+    [
+        (1, 192, [128, 128]),  # tp_size=1 non-aligned: padded to 256, not refined.
+        (16, 1024, [64, 64]),  # Qwen3.5-397B shared geometry: shard 64.
+        (8, 768, [32, 32]),  # Shard 96: the smallest block still allowed.
+        (2, 512, [128, 128]),  # Shard 256: whole blocks, nothing to refine.
+        (16, 640, None),  # Shard 40: gcd 8 < 32, refused.
+    ],
+)
+def test_fp8_routed_experts_block_refine(
+    monkeypatch, tp_size, full_inter, expected_block
+):
+    """Sub-block shards use upstream's refine: blocks under 32 are refused."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    parallel = FusedMoEParallelConfig(
+        tp_size=tp_size,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=0,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    config = FusedMoEConfig(
+        num_experts=1,
+        experts_per_token=1,
+        hidden_dim=128,
+        intermediate_size=full_inter,
+        num_local_experts=1,
+        num_logical_experts=1,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    expert_map = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=1,
+        global_num_experts=1,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    quant = VllmFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+    quant.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+    )
+
+    def build():
+        with set_current_vllm_config(quant.vllm_config):
+            return RoutedExperts(
+                layer_name="model.layers.0.mlp.experts",
+                params_dtype=torch.bfloat16,
+                moe_config=config,
+                quant_config=quant,
+                expert_map_manager=expert_map,
+            )
+
+    if expected_block is None:
+        with pytest.raises(ValueError, match="no common block >= 32"):
+            build()
+        return
+
+    layer = build()
+    method = layer.quant_method
+    assert list(method.moe_block_shape) == expected_block
+    if tp_size == 1:
+        assert (
+            layer.moe_config.intermediate_size_per_partition
+            == (full_inter + 127) // 128 * 128
+        )
+    if expected_block == [128, 128]:
+        assert method.weight_scale_refine is None
+    else:
+        assert method.weight_scale_refine == (
+            128 // expected_block[0],
+            128 // expected_block[1],
+        )
+
+
+class TestFp8LinearSubBlockTP:
+    """Tests for sub-block TP partitioning on FP8 block-quantized linear layers
+    (e.g. Qwen3.5-397B-A17B-FP8 shared_expert with intermediate_size=1024 at TP=16).
+    """
+
+    @staticmethod
+    def _mock_tp(monkeypatch, tp_size: int, tp_rank: int):
+        for target in (
+            "vllm.distributed",
+            "vllm.distributed.parallel_state",
+            "vllm.model_executor.layers.linear",
+            "vllm.model_executor.parameter",
+            "vllm.model_executor.layers.quantization.utils.fp8_utils",
+        ):
+            monkeypatch.setattr(
+                f"{target}.get_tensor_model_parallel_world_size",
+                lambda: tp_size,
+                raising=False,
+            )
+            monkeypatch.setattr(
+                f"{target}.get_tensor_model_parallel_rank",
+                lambda: tp_rank,
+                raising=False,
+            )
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("fused_checkpoint", [False, True])
+    def test_merged_column_parallel_tp16_shared_expert_gate_up(
+        self, monkeypatch, fused_checkpoint
+    ):
+        """MergedColumnParallelLinear with output_sizes=[1024, 1024] at TP=16
+        (64 rows per gate/up shard, smaller than block_size=128) must allocate
+        separate scale blocks for gate and up and load the exact block scale for
+        each of the 16 TP ranks without out-of-bounds slicing or overwriting.
+        """
+        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            BlockQuantScaleParameterTPU,
+        )
+        from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+        tp_size = 16
+        hidden = 256
+        inter = 1024
+        shard = inter // tp_size  # 64 < 128
+
+        gen = torch.Generator().manual_seed(42)
+        gate_w = torch.ones(inter, hidden, dtype=torch.float8_e4m3fn)
+        up_w = torch.full((inter, hidden), 2.0, dtype=torch.float8_e4m3fn)
+        gate_s = torch.arange(
+            1, 1 + (inter // 128) * (hidden // 128), dtype=torch.float32
+        ).reshape(inter // 128, hidden // 128)
+        up_s = (
+            torch.arange(
+                100, 100 + (inter // 128) * (hidden // 128), dtype=torch.float32
+            ).reshape(inter // 128, hidden // 128)
+            + torch.rand(inter // 128, hidden // 128, generator=gen) * 0.1
+        )
+
+        ref_gate = dequantize_tensor(
+            gate_w, gate_s, axis=(0, 1), out_dtype=torch.float32
+        )
+        ref_up = dequantize_tensor(up_w, up_s, axis=(0, 1), out_dtype=torch.float32)
+
+        quant = VllmFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+
+        for tp_rank in range(tp_size):
+            self._mock_tp(monkeypatch, tp_size, tp_rank)
+            layer = MergedColumnParallelLinear(
+                input_size=hidden,
+                output_sizes=[inter, inter],
+                bias=False,
+                quant_config=quant,
+                params_dtype=torch.bfloat16,
+            )
+            assert layer.weight.shape == (2 * shard, hidden)
+            assert layer.weight_block_size == [64, 128]
+            assert isinstance(layer.weight_scale_inv, BlockQuantScaleParameterTPU)
+            assert layer.weight_scale_inv.shape == (2, hidden // 128)
+
+            if fused_checkpoint:
+                fused_w = torch.cat([gate_w, up_w], dim=0)
+                fused_s = torch.cat([gate_s, up_s], dim=0)
+                layer.weight.weight_loader(layer.weight, fused_w)
+                layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, fused_s)
+            else:
+                layer.weight.weight_loader(layer.weight, gate_w, 0)
+                layer.weight.weight_loader(layer.weight, up_w, 1)
+                layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, gate_s, 0)
+                layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, up_s, 1)
+
+            expected_block_idx = tp_rank // 2
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[0], gate_s[expected_block_idx]
+            )
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[1], up_s[expected_block_idx]
+            )
+
+            layer.quant_method.process_weights_after_loading(layer)
+            assert layer.weight.shape == (hidden, 2 * shard)
+            assert layer.weight_scale.shape == (2 * shard,)
+
+            sl = slice(tp_rank * shard, (tp_rank + 1) * shard)
+            got = (layer.weight.float() * layer.weight_scale[None, :]).T
+            torch.testing.assert_close(got[:shard], ref_gate[sl], rtol=5e-2, atol=2e-1)
+            torch.testing.assert_close(got[shard:], ref_up[sl], rtol=5e-2, atol=2e-1)
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("enable_blockwise_kernel", [False, True])
+    def test_row_parallel_tp16_shared_expert_down(
+        self, monkeypatch, enable_blockwise_kernel
+    ):
+        """RowParallelLinear with input_size=1024 at TP=16 (input_size_per_partition=64,
+        smaller than block_k=128) must pass block validation, refine the scale grid
+        along input_dim, and fall back cleanly to per-channel quantization when
+        input_size_per_partition < REQUANTIZE_BLOCK_SIZE.
+        """
+        from vllm.model_executor.layers.linear import RowParallelLinear
+
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            BlockQuantScaleParameterTPU,
+        )
+        from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+        if enable_blockwise_kernel:
+            monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+            monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "128")
+
+        tp_size = 16
+        inter = 1024
+        hidden = 256
+        shard = inter // tp_size  # 64 < 128
+
+        down_w = torch.ones(hidden, inter, dtype=torch.float8_e4m3fn)
+        down_s = torch.arange(
+            1, 1 + (hidden // 128) * (inter // 128), dtype=torch.float32
+        ).reshape(hidden // 128, inter // 128)
+        ref_down = dequantize_tensor(
+            down_w, down_s, axis=(0, 1), out_dtype=torch.float32
+        )
+
+        quant = VllmFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+
+        for tp_rank in range(tp_size):
+            self._mock_tp(monkeypatch, tp_size, tp_rank)
+            layer = RowParallelLinear(
+                input_size=inter,
+                output_size=hidden,
+                bias=False,
+                quant_config=quant,
+                params_dtype=torch.bfloat16,
+                reduce_results=False,
+            )
+            assert layer.weight.shape == (hidden, shard)
+            assert layer.weight_block_size == [128, 64]
+            assert isinstance(layer.weight_scale_inv, BlockQuantScaleParameterTPU)
+            assert layer.weight_scale_inv.shape == (hidden // 128, 1)
+
+            layer.weight.weight_loader(layer.weight, down_w)
+            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, down_s)
+
+            expected_block_idx = tp_rank // 2
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[:, 0], down_s[:, expected_block_idx]
+            )
+
+            layer.quant_method.process_weights_after_loading(layer)
+            assert layer.weight.shape == (shard, hidden)
+            assert layer.weight_scale.shape == (hidden,)
+
+            sl = slice(tp_rank * shard, (tp_rank + 1) * shard)
+            got = (layer.weight.float() * layer.weight_scale[None, :]).T
+            torch.testing.assert_close(got, ref_down[:, sl], rtol=5e-2, atol=2e-1)
+
+    @pytest.mark.cpu_test
+    def test_column_parallel_tp16_sub_block(self, monkeypatch):
+        """ColumnParallelLinear with output_size=1024 at TP=16 (64 rows per shard)."""
+        from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+        from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+        tp_size = 16
+        out_size = 1024
+        in_size = 256
+        shard = out_size // tp_size  # 64
+
+        w = torch.ones(out_size, in_size, dtype=torch.float8_e4m3fn)
+        s = torch.arange(
+            1, 1 + (out_size // 128) * (in_size // 128), dtype=torch.float32
+        ).reshape(out_size // 128, in_size // 128)
+        ref = dequantize_tensor(w, s, axis=(0, 1), out_dtype=torch.float32)
+
+        quant = VllmFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+
+        for tp_rank in range(tp_size):
+            self._mock_tp(monkeypatch, tp_size, tp_rank)
+            layer = ColumnParallelLinear(
+                input_size=in_size,
+                output_size=out_size,
+                bias=False,
+                quant_config=quant,
+                params_dtype=torch.bfloat16,
+                gather_output=False,
+            )
+            assert layer.weight.shape == (shard, in_size)
+            assert layer.weight_scale_inv.shape == (1, in_size // 128)
+
+            layer.weight.weight_loader(layer.weight, w)
+            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, s)
+            torch.testing.assert_close(layer.weight_scale_inv.data[0], s[tp_rank // 2])
+
+            layer.quant_method.process_weights_after_loading(layer)
+            sl = slice(tp_rank * shard, (tp_rank + 1) * shard)
+            got = (layer.weight.float() * layer.weight_scale[None, :]).T
+            torch.testing.assert_close(got, ref[sl], rtol=5e-2, atol=2e-1)
+
+    @pytest.mark.cpu_test
+    def test_qkv_parallel_tp16_sub_block_with_kv_replication(self, monkeypatch):
+        """QKVParallelLinear with KV head replication and sub-block shards at TP=16."""
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+
+        tp_size = 16
+        head_size = 64
+        total_num_heads = 16  # 1024 total Q rows -> 64 per TP rank
+        total_num_kv_heads = 4  # 256 total K/V rows -> 64 per TP rank (4x replicated)
+        hidden = 256
+
+        q_w = torch.ones(total_num_heads * head_size, hidden, dtype=torch.float8_e4m3fn)
+        k_w = torch.full(
+            (total_num_kv_heads * head_size, hidden), 2.0, dtype=torch.float8_e4m3fn
+        )
+        v_w = torch.full(
+            (total_num_kv_heads * head_size, hidden), 3.0, dtype=torch.float8_e4m3fn
+        )
+        q_s = torch.arange(1, 1 + 8 * 2, dtype=torch.float32).reshape(8, 2)
+        k_s = torch.arange(50, 50 + 2 * 2, dtype=torch.float32).reshape(2, 2)
+        v_s = torch.arange(90, 90 + 2 * 2, dtype=torch.float32).reshape(2, 2)
+
+        quant = VllmFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+
+        for tp_rank in range(tp_size):
+            self._mock_tp(monkeypatch, tp_size, tp_rank)
+            layer = QKVParallelLinear(
+                hidden_size=hidden,
+                head_size=head_size,
+                total_num_heads=total_num_heads,
+                total_num_kv_heads=total_num_kv_heads,
+                bias=False,
+                quant_config=quant,
+                params_dtype=torch.bfloat16,
+            )
+            assert layer.weight.shape == (192, hidden)
+            assert layer.weight_scale_inv.shape == (3, hidden // 128)
+
+            for sid, w, s in (("q", q_w, q_s), ("k", k_w, k_s), ("v", v_w, v_s)):
+                layer.weight.weight_loader(layer.weight, w, sid)
+                layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, s, sid)
+
+            kv_group = tp_rank // (tp_size // total_num_kv_heads)
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[0], q_s[tp_rank // 2]
+            )
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[1], k_s[kv_group // 2]
+            )
+            torch.testing.assert_close(
+                layer.weight_scale_inv.data[2], v_s[kv_group // 2]
+            )
 
 
 class FakeQuant:
@@ -229,6 +780,7 @@ class FakeFusedMoELayer(torch.nn.Module):
         return cls
 
 
+@pytest.mark.tpu_test
 class TestFp8MoEScaleReshape:
     """Tests for block-quantized FP8 MoE scale reshaping."""
 
@@ -307,6 +859,7 @@ class TestFp8MoEScaleReshape:
                     )
 
 
+@pytest.mark.tpu_test
 class TestFp8LinearRuntimeQuant:
     """Tests for ullm-style runtime FP8 dense linear weights."""
 
@@ -543,6 +1096,7 @@ class TestFp8LinearRuntimeQuant:
             _quantized_matmul_jax(x, w_q, w_scale)
 
 
+@pytest.mark.tpu_test
 class TestFp8WeightTranspose:
     """Tests for weight transpose in MoE processing."""
 
@@ -598,6 +1152,7 @@ class TestFp8WeightTranspose:
         assert torch.all(w13_scale_deinterleaved[:, inter:, :] == 2.0)
 
 
+@pytest.mark.tpu_test
 class TestOnlineFp8Quantization:
     """Tests for _quantize_bf16_moe_weights."""
 
@@ -756,6 +1311,7 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+@pytest.mark.tpu_test
 class TestMoERequantizationChunks:
     """Requantizing a few experts at a time must give the whole-tensor
     result."""

@@ -14,6 +14,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 
 from .test_pcp_tp_dcp_connector import _manifest
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.mark.parametrize("pcp,heads", [(4, 1), (16, 4)])
 def test_native_registry_accepts_pcp_tp_dcp_spans_and_cancellation(pcp, heads):

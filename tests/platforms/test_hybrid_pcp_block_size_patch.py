@@ -12,8 +12,6 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _config(
     *, pcp: int, enable_prefix_caching: bool = False, connector_enabled: bool = False

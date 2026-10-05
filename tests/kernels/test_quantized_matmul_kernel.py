@@ -32,6 +32,8 @@ from vllm_torchtpu.kernels.quantized_matmul import (
     util,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 jax.config.update("jax_numpy_dtype_promotion", "standard")
 
 xla_quantized_matmul = util.xla_quantized_matmul

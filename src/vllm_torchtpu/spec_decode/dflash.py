@@ -39,6 +39,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
+    """Whether a draft carries MoE layers, i.e. emits EP collectives.
+
+    Missing a MoE draft here is a hang, not an error: under EP-DP lockstep
+    the busy rank's draft forward waits on all-to-alls that the idle ranks never issue.
+    """
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+    if is_mixture_of_experts(draft_model):
+        return True
+    return any(isinstance(m, MoERunner) for m in draft_model.modules())
+
+
 class DFlashProposer:
     """DFlash draft proposer for TPU.
 
@@ -821,9 +835,7 @@ class DFlashProposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            self._draft_has_moe_cache = _draft_has_moe_layers(self.draft_model)
         return self._draft_has_moe_cache
 
     @torch.no_grad()

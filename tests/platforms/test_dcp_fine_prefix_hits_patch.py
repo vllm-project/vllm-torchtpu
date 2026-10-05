@@ -38,8 +38,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu import _patch_vllm_dcp_fine_prefix_hits
 
-pytestmark = pytest.mark.cpu_test
-
 BLOCK_SIZE = 256
 DCP = 16
 LOGICAL_BLOCK = BLOCK_SIZE * DCP  # 4096

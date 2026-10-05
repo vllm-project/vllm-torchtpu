@@ -65,7 +65,10 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
 
 # =====================================================================
 
-pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+pytestmark = [
+    pytest.mark.tpu_test,
+    pytest.mark.filterwarnings("ignore::DeprecationWarning"),
+]
 
 
 def streamindex_topk_ref(

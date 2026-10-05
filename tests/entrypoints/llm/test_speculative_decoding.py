@@ -21,6 +21,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import string
 import subprocess
@@ -39,6 +40,8 @@ from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
+
+pytestmark = pytest.mark.tpu_test
 
 
 @pytest.fixture(autouse=True)
@@ -1705,6 +1708,20 @@ DP_CONCURRENCY = 8
 DP_SERVE_LOG_DIR = "/perf_eval_results"
 _SERVE_ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL)\b|Traceback|Timed out")
 
+# vLLM logs this when a worker's constructor raises. The engine cannot come up
+# after that, but the server does not exit either, so without a check the
+# health poll waits out the whole startup deadline.
+_WORKER_START_FAILED = "WorkerProc failed to start"
+
+# A worker group whose TPU slice never forms: libtpu times out at its
+# PRE_START_SESSION_BARRIER and init_process_group then fails with this. It
+# hits a fresh server now and then on CI whatever the change under test (build
+# 3390, a typing-only commit whose next run passed), and a new launch on fresh
+# ports comes up, so it gets one more attempt. Any other startup failure is
+# reported as is.
+_TPU_INIT_RACE = "PjRtClient is not initialized"
+DP_SERVER_START_ATTEMPTS = 2
+
 # Prometheus renders the same counters the in-process reader exposes, with a
 # `_total` suffix.
 _DRAFT_METRIC = SPEC_DRAFT_METRIC + "_total"
@@ -1874,9 +1891,58 @@ class _ServedEngine:
         return totals[_DRAFT_METRIC], totals[_ACCEPTED_METRIC], per_engine
 
 
-@contextlib.contextmanager
-def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
-    """Run `vllm serve` with these engine kwargs; yield a _ServedEngine."""
+class _ServeStartupError(RuntimeError):
+    """`vllm serve` never became healthy; `retryable` marks the TPU init race."""
+
+    def __init__(self, message: str, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _read_log(path: str) -> str:
+    with open(path, errors="replace") as fh:
+        return fh.read()
+
+
+def _startup_error(log_path: str, message: str) -> _ServeStartupError:
+    text = _read_log(log_path)
+    lines = text.splitlines()
+    kept = log_path
+    if os.path.isdir(DP_SERVE_LOG_DIR):
+        kept = shutil.copy(log_path, DP_SERVE_LOG_DIR)
+    # Every DP worker logs each warmup step, so the end of the log is warmup
+    # chatter and the line saying why startup failed scrolls out of any short
+    # tail. Report the error lines from the whole log too.
+    errors = [line for line in lines if _SERVE_ERROR_LINE.search(line)]
+    return _ServeStartupError(
+        f"{message}\n--- full log: {kept} ---\n"
+        "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
+        "--- tail ---\n" + "\n".join(lines[-40:]),
+        retryable=_TPU_INIT_RACE in text,
+    )
+
+
+def _stop_server(server: subprocess.Popen) -> None:
+    """Stop the server and every engine and worker process it started."""
+    server.terminate()
+    try:
+        server.wait(timeout=180)
+    except subprocess.TimeoutExpired:
+        # The server leads its own process group, which holds every engine and
+        # worker it spawned. Killing only the server would orphan them, and a
+        # worker stuck in TPU init would keep its chip from the next launch.
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait(timeout=60)
+    wait_for_tpu_release()
+
+
+def _start_server(
+    model_name: str, speculative_config: dict | None, kwargs: dict
+) -> tuple[subprocess.Popen, str]:
+    """Launch `vllm serve` and wait for /health; return the server and its URL.
+
+    A server that fails to come up is stopped before the error is raised.
+    """
     port = _pick_free_port()
     cmd = [
         sys.executable,
@@ -1893,77 +1959,82 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
 
     base = f"http://localhost:{port}"
 
+    # The first request against a fresh engine pair compiles the runtime
+    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+    # worker-RPC deadline -- the engine is torn down mid-compile and every
+    # request 500s. Raise the deadline past the compile.
+    #
+    # vLLM also gives its engine processes only 600s by default to report
+    # ready, a third of the startup this test allows. A DP engine pair
+    # compiles every graph at startup, which is CPU-bound: the DFlash pair
+    # takes about 630s on a host with a slower CPU. Wait as long as the
+    # health poll does.
+    env = dict(
+        os.environ,
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
+        VLLM_ENGINE_READY_TIMEOUT_S=str(DP_SERVER_STARTUP_TIMEOUT_S),
+    )
+
     # Log to a file rather than a pipe. vLLM startup writes far more than a
     # pipe buffer holds, and nothing here drains it, so PIPE would block the
     # server mid-startup and the health poll would never succeed.
     with tempfile.NamedTemporaryFile(
-        mode="w+", suffix=".log", prefix="vllm_serve_dp_", delete=False
+        mode="w", suffix=".log", prefix="vllm_serve_dp_", delete=False
     ) as log:
-
-        def _fail(message: str) -> RuntimeError:
-            log.flush()
-            with open(log.name) as fh:
-                lines = fh.read().splitlines()
-            kept = log.name
-            if os.path.isdir(DP_SERVE_LOG_DIR):
-                kept = shutil.copy(log.name, DP_SERVE_LOG_DIR)
-            # Every DP worker logs each warmup step, so the end of the log is
-            # warmup chatter and the line saying why startup failed scrolls out
-            # of any short tail. Report the error lines from the whole log too.
-            errors = [line for line in lines if _SERVE_ERROR_LINE.search(line)]
-            return RuntimeError(
-                f"{message}\n--- full log: {kept} ---\n"
-                "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
-                "--- tail ---\n" + "\n".join(lines[-40:])
-            )
-
-        # The first request against a fresh engine pair compiles the runtime
-        # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
-        # worker-RPC deadline -- the engine is torn down mid-compile and every
-        # request 500s. Raise the deadline past the compile.
-        #
-        # vLLM also gives its engine processes only 600s by default to report
-        # ready, a third of the startup this test allows. A DP engine pair
-        # compiles every graph at startup, which is CPU-bound: the DFlash pair
-        # takes about 630s on a host with a slower CPU. Wait as long as the
-        # health poll does.
-        env = dict(
-            os.environ,
-            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S),
-            VLLM_ENGINE_READY_TIMEOUT_S=str(DP_SERVER_STARTUP_TIMEOUT_S),
-        )
-
         server = subprocess.Popen(
-            cmd, stdout=log, stderr=subprocess.STDOUT, env=env, text=True
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            start_new_session=True,
         )
-        try:
-            deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
-            while True:
-                if server.poll() is not None:
-                    raise _fail(
-                        f"vllm serve exited with {server.returncode} during startup"
-                    )
-                try:
-                    urllib.request.urlopen(f"{base}/health", timeout=10).close()
-                    break
-                except (urllib.error.URLError, OSError):
-                    pass
-                if time.time() > deadline:
-                    raise _fail(
-                        "vllm serve did not become healthy within "
-                        f"{DP_SERVER_STARTUP_TIMEOUT_S}s"
-                    )
-                time.sleep(10)
-            print(f"vllm serve ready at {base}; log: {log.name}")
-            yield _ServedEngine(base, model_name)
-        finally:
-            server.terminate()
+    try:
+        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+        while True:
+            if server.poll() is not None:
+                raise _startup_error(
+                    log.name,
+                    f"vllm serve exited with {server.returncode} during startup",
+                )
             try:
-                server.wait(timeout=180)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=60)
-            wait_for_tpu_release()
+                urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                break
+            except (urllib.error.URLError, OSError):
+                pass
+            if _WORKER_START_FAILED in _read_log(log.name):
+                raise _startup_error(log.name, "a vllm serve worker failed to start")
+            if time.time() > deadline:
+                raise _startup_error(
+                    log.name,
+                    "vllm serve did not become healthy within "
+                    f"{DP_SERVER_STARTUP_TIMEOUT_S}s",
+                )
+            time.sleep(10)
+    except BaseException:
+        _stop_server(server)
+        raise
+    print(f"vllm serve ready at {base}; log: {log.name}")
+    return server, base
+
+
+@contextlib.contextmanager
+def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
+    """Run `vllm serve` with these engine kwargs; yield a _ServedEngine."""
+    attempt = 1
+    while True:
+        try:
+            server, base = _start_server(model_name, speculative_config, kwargs)
+            break
+        except _ServeStartupError as e:
+            if not e.retryable or attempt == DP_SERVER_START_ATTEMPTS:
+                raise
+            print(f"vllm serve attempt {attempt} hit the TPU init race:\n{e}")
+            attempt += 1
+    try:
+        yield _ServedEngine(base, model_name)
+    finally:
+        _stop_server(server)
 
 
 def _qwen35_dp_kwargs() -> dict:

@@ -92,6 +92,7 @@ def test_rank_order_ignores_device_ids(monkeypatch, group):
     assert ep.ep_rank_order() == (0, 1, 2, 3)
 
 
+@pytest.mark.tpu_test
 def test_mesh_comes_from_pallas_and_caches_by_axis_and_ids(monkeypatch):
     """The mesh is Torchtpu's, and jax.devices() is never consulted.
 
@@ -123,6 +124,7 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_ids(monkeypatch):
     assert made.call_count == 2
 
 
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_group_smaller_than_the_world(monkeypatch):
     """get_pallas_mesh spans the whole torch.distributed world and cannot
     describe a sub-group, so a smaller EP group has to fail rather than build

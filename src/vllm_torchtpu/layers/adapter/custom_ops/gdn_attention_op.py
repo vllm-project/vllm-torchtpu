@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import itertools
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -74,6 +74,21 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
 _GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
+
+if TYPE_CHECKING:
+
+    class _GdnAttentionMetadata(Protocol):
+        """The per-layer AttentionMetadata fields that GDN reads.
+
+        The runner fills them with torch tensors, while AttentionMetadata
+        annotates them as jax.Array.
+        """
+
+        block_tables: torch.Tensor
+        seq_lens: torch.Tensor
+        query_start_loc: torch.Tensor
+        request_distribution: torch.Tensor
+        mamba_state_indices: torch.Tensor | None
 
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -353,6 +368,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
+    # Narrowed to the layer that _create_conv1d installs.
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    conv1d: GdnColumnParallelLinear
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
@@ -362,6 +381,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
+        # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
+        # pyrefly: ignore[bad-assignment]
         self.kv_cache = None
         vllm_config = get_vllm_model_wrapper_context().vllm_config
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
@@ -390,6 +411,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
         if not self._bm_kernel:
             return ids
+        assert self._bm_region is not None
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
 
@@ -1109,7 +1131,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
-            attn_metadata = get_forward_context().attn_metadata[self.prefix]
+            assert kv_cache is not None
+            attn_metadata = cast(
+                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
+            )[self.prefix]
             return self._forward_fused_pooled_pcp(
                 hidden_states,
                 kv_cache[0],
@@ -1156,7 +1181,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             recurrent_state = None
         else:
-            attn_metadata = get_forward_context().attn_metadata[self.prefix]
+            attn_metadata = cast(
+                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
+            )[self.prefix]
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the

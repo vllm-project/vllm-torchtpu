@@ -29,6 +29,8 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture(autouse=True)
 def _raise_dynamo_recompile_limit():

@@ -440,6 +440,7 @@ def test_block_must_divide_local_shard():
         layer.quant_method.process_weights_after_loading(layer)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("block", [[1, 128], [128, 128], [128, 512]])
 def test_online_block_matmul_tpu(block):
     import jax

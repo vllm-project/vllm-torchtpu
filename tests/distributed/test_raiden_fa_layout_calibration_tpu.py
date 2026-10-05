@@ -27,6 +27,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
 from .tpu_test_utils import run_in_isolated_process
 
+pytestmark = pytest.mark.tpu_test
+
 _TOKEN_BYTES = 1024
 _NUM_BLOCKS = 16
 _EXPECTED_TOKEN_PERMUTATION_SHA256 = (
