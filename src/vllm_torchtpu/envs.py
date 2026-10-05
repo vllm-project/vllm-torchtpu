@@ -366,7 +366,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is
-    # faster. The spec-decode draft ignores the cap.
+    # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
+    # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
