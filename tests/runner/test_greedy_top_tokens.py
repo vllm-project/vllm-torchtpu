@@ -223,14 +223,16 @@ K = 3
 def _verify_chunk(monkeypatch, synthetic):
     """Three requests at k=3: all drafts accepted, rejected at the second
     draft, rejected at the first of two drafts. Rows are the vocab-parallel
-    logits of a 4-rank head; one target row is an exact tie."""
+    logits of a 4-rank head; one target row is an exact tie. Entries are
+    quarters, so every logit is exact in fp32 whatever order a CPU's matmul
+    sums in, and the tie holds on every host."""
     gen = torch.Generator().manual_seed(7)
-    weight = torch.randn(96, 16, generator=gen)
+    weight = torch.randint(-8, 9, (96, 16), generator=gen).float() / 4
     weight[20] *= 3
     weight[50] = weight[20]
     draft_lengths = [3, 3, 2]
     rows = sum(d + 1 for d in draft_lengths)
-    hidden_states = torch.randn(rows, 16, generator=gen)
+    hidden_states = torch.randint(-8, 9, (rows, 16), generator=gen).float() / 4
     hidden_states[4] = weight[20]
     logits = hidden_states @ weight.T
     assert torch.topk(logits[4], 2).indices.sort().values.tolist() == [20, 50]
