@@ -1368,10 +1368,24 @@ class KVCacheManager:
         kv_caches: dict[str, torch.Tensor] = {}
         native_raw_cache = None
         native_cache_layouts = None
+        native_rope_pools = None
         if use_upstream_allocator:
-            materialized = self.ds_v4.initialize_v41(
-                kv_cache_config, layer_name_to_spec.__getitem__
-            )
+            if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
+                from vllm_torchtpu.models.vllm.deepseek_v41_csa2.cache import (
+                    materialize_upstream_kv_cache,
+                )
+
+                materialized = materialize_upstream_kv_cache(
+                    kv_cache_config,
+                    self.runner.device,
+                    self.runner.cache_config.get_resolved_kv_cache_layout(),
+                    word_rows=True,
+                )
+                native_rope_pools = materialized.rope_pools
+            else:
+                materialized = self.ds_v4.initialize_v41(
+                    kv_cache_config, layer_name_to_spec.__getitem__
+                )
             kv_caches = materialized.kv_caches
             # Match the shared pool path: donation must start only after
             # allocation/view initialization has finished on the device.
@@ -1736,6 +1750,7 @@ class KVCacheManager:
             self.runner.kv_caches,
             native_raw_cache=native_raw_cache,
             native_cache_layouts=native_cache_layouts,
+            native_rope_pools=native_rope_pools,
         )
 
         # Pre-build and cache bundled RPA kernels across all attention layers before

@@ -17,12 +17,17 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu import envs
+
+    v41_package = (
+        "deepseek_v41_csa2" if envs.TPU_DEEPSEEK_V41_IMPL == "v2" else "deepseek_v41"
+    )
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     ModelRegistry.register_model(
         "DeepseekV41ForCausalLM",
-        "vllm_torchtpu.models.vllm.deepseek_v41.model:DeepseekV41ForCausalLM",
+        f"vllm_torchtpu.models.vllm.{v41_package}.model:DeepseekV41ForCausalLM",
     )
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
