@@ -1136,6 +1136,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                     hashes_per_chunk=1,
                     kv_event_group_spec=MagicMock(),
                     sliding_window_size_in_chunks=None,
+                    kv_cache_spec=MagicMock(),
+                    manager_cls=MagicMock(),
                 ),
             ),
             blocks_per_chunk=1,

@@ -28,7 +28,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
@@ -767,7 +767,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
