@@ -36,6 +36,52 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+def narrow_page_indices(
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    *,
+    sliding_window: int,
+    logical_page_size: int,
+    max_q_len: int,
+    max_kv_pages_per_block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Keep only the pages each sequence's sliding window can touch.
+
+    The kernels copy `page_indices` into SMEM, and at long max model lengths
+    the full table is large: 8,192 int32 entries per sequence at 1M tokens and
+    128-token pages. The kernels compute every position from `kv_lens`, so
+    dropping whole pages before the window and reducing `kv_lens` by the same
+    number of tokens keeps every read and write on the same page.
+
+    Each sequence keeps `window_pages` entries, starting at the page of the
+    first key any of its queries can see. They cover the keys and new tokens,
+    which can start partway into a page, the pages a kv block can read past
+    them, and one page of margin.
+
+    Returns the shifted `kv_lens` and a `[max_num_seqs * window_pages]` table,
+    or the inputs unchanged when the table is already that narrow.
+    """
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+
+    span_pages = cdiv(max_q_len + sliding_window, logical_page_size) + 1
+    window_pages = span_pages + max_kv_pages_per_block + 1
+    if window_pages >= pages_per_seq:
+        return kv_lens, page_indices
+
+    # Same bound as the kernels' `_start_offset` for the first query block.
+    q_lens = jnp.maximum(cu_q_lens[1:] - cu_q_lens[:-1], 0)
+    first_key = jnp.maximum(kv_lens - q_lens - sliding_window + 1, 0)
+    first_page = first_key // logical_page_size
+
+    window = jnp.arange(window_pages, dtype=first_page.dtype)
+    cols = jnp.minimum(first_page[:, None] + window[None, :], pages_per_seq - 1)
+    table = page_indices.reshape(max_num_seqs, pages_per_seq)
+    narrowed = jnp.take_along_axis(table, cols, axis=1).reshape(-1)
+    return kv_lens - first_page * logical_page_size, narrowed
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -1535,6 +1581,15 @@ def mla_sliding_window_ragged_paged_attention(
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
+    kv_lens, page_indices = narrow_page_indices(
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        max_q_len=q.shape[0],
+        max_kv_pages_per_block=max(num_kv_pages_per_blocks),
+    )
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
