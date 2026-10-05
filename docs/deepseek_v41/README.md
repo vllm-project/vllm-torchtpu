@@ -1,7 +1,7 @@
 # DeepSeek V4.1 on TorchTPU
 
 The runtime entry is
-`vllm_torchtpu.models.vllm.deepseek_v41.model:DeepseekV41ForCausalLM`.
+`vllm_torchtpu.models.vllm.deepseek_v41.v1.model:DeepseekV41ForCausalLM`.
 Model construction, decoder order, checkpoint names and cache ownership are
 inherited from pinned vLLM v0.30.0.
 
@@ -14,12 +14,12 @@ formats are outside this implementation.
 
 | File | Responsibility |
 | --- | --- |
-| `models/vllm/deepseek_v41/model.py` | Model assembly and compiled encoder/decoder stages |
-| `models/vllm/deepseek_v41/replay_plan.py` | Prompt-tail replay planning across scheduler chunks |
-| `models/vllm/deepseek_v41/attention.py` | MLA adapter, cache binding and output projection |
-| `models/vllm/deepseek_v41/engram.py` | Upstream hashing, request lookbacks and TPU lookup |
-| `models/vllm/deepseek_v41/mhc.py` | Delayed mHC, compact Sinkhorn and residual flow |
-| `models/vllm/deepseek_v41/ops.py` | RoPE tables and tensor rotation |
+| `models/vllm/deepseek_v41/v1/model.py` | Model assembly and compiled encoder/decoder stages |
+| `models/vllm/deepseek_v41/v1/replay_plan.py` | Prompt-tail replay planning across scheduler chunks |
+| `models/vllm/deepseek_v41/v1/attention.py` | MLA adapter, cache binding and output projection |
+| `models/vllm/deepseek_v41/v1/engram.py` | Upstream hashing, request lookbacks and TPU lookup |
+| `models/vllm/deepseek_v41/v1/mhc.py` | Delayed mHC, compact Sinkhorn and residual flow |
+| `models/vllm/deepseek_v41/v1/ops.py` | RoPE tables and tensor rotation |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_cache.py` | Native binding, byte/record and index-page geometry, public slot helpers and cache operations |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_backend.py` | Shared vLLM backend contract, separate from cache layout arithmetic |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_ced_attention_op.py` | Read-only CED attention over the selected SWA window and compressed KV |

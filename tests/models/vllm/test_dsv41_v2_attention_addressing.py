@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.models.vllm.deepseek_v41_csa2.attention import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _request_row_slots,
     _row_slots,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41_csa2.attention_kernels import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _attend_window,
     _attention_state,
     _visible_top_k,
@@ -18,7 +18,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41_csa2.attention_kernels import (
     paged_index_scores_jax,
     paged_indexer_jax,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41_csa2.cache import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     gather_cache_pieces,
     gather_cache_values,
     merge_halves,

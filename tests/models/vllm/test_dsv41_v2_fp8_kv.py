@@ -6,8 +6,8 @@ import numpy as np
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-from vllm_torchtpu.models.vllm.deepseek_v41_csa2.attention_kernels import compact_records
-from vllm_torchtpu.models.vllm.deepseek_v41_csa2.cache import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import compact_records
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     NOPE_DIM,
     PagedCacheRows,
     encode_fp8_kv,

@@ -475,7 +475,7 @@ class TPUWorker(WorkerBase):
     def _reserve_deepseek_v41_rope_companion(self, available: int) -> int:
         if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
             return available
-        from vllm_torchtpu.models.vllm.deepseek_v41_csa2.cache import (
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
             reserve_rope_companion,
         )
 

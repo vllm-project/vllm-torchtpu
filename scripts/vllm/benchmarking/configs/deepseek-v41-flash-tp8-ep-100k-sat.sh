@@ -30,7 +30,7 @@ export NEW_MODEL_DESIGN=1
 export MODEL_IMPL_TYPE=vllm
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
-# V4.1 impl v2 (models/vllm/deepseek_v41_csa2); use with KV_CACHE_DTYPE=fp8.
+# V4.1 impl v2 (models/vllm/deepseek_v41/v2); use with KV_CACHE_DTYPE=fp8.
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 # 4 x the 1280 MiB single-request budget (100k config).
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=5368709120 --compilation-config={\"compile_sizes\":[4,$V41_CHUNK]}"

@@ -29,7 +29,7 @@ export NEW_MODEL_DESIGN=1
 export MODEL_IMPL_TYPE=vllm
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
-# V4.1 impl v2 (models/vllm/deepseek_v41_csa2); use with KV_CACHE_DTYPE=fp8.
+# V4.1 impl v2 (models/vllm/deepseek_v41/v2); use with KV_CACHE_DTYPE=fp8.
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 # 256 MiB held ~44k tokens in the 4096-len smoke run; 1280 MiB leaves margin for
 # 103,424 tokens.

@@ -353,8 +353,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
-    # V4.1 implementation: "v1" (models/vllm/deepseek_v41) or "v2"
-    # (models/vllm/deepseek_v41_csa2: FP8 main KV + RoPE companion pool).
+    # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
+    # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
     ),
