@@ -10,6 +10,9 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 ASYNC_SCHEDULING=false
+# run_benchmarks.sh defaults to fp8, which the TPU V4.1 attention rejects: its
+# SWA cache is BF16 and the compressed KV is packed FP8 on its own.
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 NUM_PROMPTS="${NUM_PROMPTS:-2}"
 ISL_OSL_CONFIGS="${ISL_OSL_CONFIGS:-128:16}"

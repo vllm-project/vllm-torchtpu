@@ -43,10 +43,19 @@ steps:
           # The config's benchmark (2 prompts, 128 in / 16 out) is the smoke
           # test; GSM8K (first 100 examples) is gated against
           # baselines/eval/deepseek-v41-flash-tp8-ep.gsm8k.baseline.json.
+          #
+          # The sizes below replace the config's 1M-context defaults with the
+          # launch verified on CDK (GSM8K 196/200), which also keeps compile
+          # to two graph sizes. GSM8K prompts fit well within 4096 tokens.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             EXTRA_SERVE_ARGS=--language-model-only
+            MAX_MODEL_LEN=4096
+            MAX_NUM_BATCHED_TOKENS=128
+            DEEPSEEK_V41_COMPILE_SIZES='[8,128]'
+            GPU_MEMORY_UTILIZATION=0.75
+            TPU_DEEPSEEK_V41_CED=0
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
             --config deepseek-v41-flash-tp8-ep
             --run-lm-eval
