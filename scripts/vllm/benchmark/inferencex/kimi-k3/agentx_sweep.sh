@@ -2,7 +2,7 @@
 # Kimi-K3 InferenceX AgentX sweep: start one server from --config, run
 # agentx_client.sh against it, stop it again.
 #
-#   agentx_sweep.sh [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
+#   agentx_sweep.sh --chips 16 [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
 #       [--duration 1800] [--fast 1|0] [--ix-ref main]
 #       [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
@@ -41,6 +41,9 @@ FAST=1
 IX_REF="main"
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"
+# Physical TPU chips serving this benchmark. No default: see the note at the
+# point of use.
+CHIPS=""
 PORT=8000
 GCS_ARG=""
 
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --ix-ref)        IX_REF="$2"; shift 2 ;;
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
+        --chips)         CHIPS="$2"; shift 2 ;;
         --gcs-root)      GCS_ARG="$2"; shift 2 ;;
         --port)          PORT="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -90,6 +94,19 @@ if [ -z "$CONC_LIST" ]; then
 fi
 k3_check_conc_list "$CONC_LIST" || exit 1
 k3_check_conc_list "$GSM8K_CONC" || exit 1
+# PHYSICAL CHIPS, not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x
+# google.com/tpu 4, which is what GKE allocates and what Google bills per
+# chip-hour) and vLLM runs 32 ranks on it, two per chip. So TP x DP is twice the
+# divisor and the parallelism cannot give it; the caller states it, with no
+# default, because a wrong divisor silently scales the one number this benchmark
+# exists to report.
+case "${CHIPS:-}" in
+    ''|*[!0-9]*|0)
+        log "FATAL: --chips N is required: the number of physical TPU chips serving" \
+            "this benchmark (16 for one v7x-32 / 2x2x4 slice). It is what InferenceX" \
+            "divides total throughput by for the per-chip figure."
+        exit 2 ;;
+esac
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"
 MAX_CONC=1
 for c in "${CONCS[@]}"; do [ "$c" -gt "$MAX_CONC" ] && MAX_CONC=$c; done
@@ -149,15 +166,18 @@ if [ -n "$MODEL_URI" ]; then
     TOK_DIR=$(python3 -c "import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)" "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
-# The chip count InferenceX divides throughput by. For one server it is the
-# parallelism the harness actually booted, which it recorded in config.json, so
-# it follows the config instead of being asserted here.
-CHIPS=$(( $(k3_config_json_get tensor_parallelism) * $(k3_config_json_get data_parallelism) ))
-if [ "$CHIPS" -le 0 ]; then
-    log "FATAL: could not read the chip count from $RESULTS_DIR/config.json"
-    exit 1
+# The chip count InferenceX divides throughput by, which is PHYSICAL CHIPS and
+# not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x google.com/tpu 4, which is
+# what GKE allocates and what Google bills per chip-hour), and vLLM runs 32 ranks
+# on it - two per chip. So TP x DP is twice the divisor, and the parallelism
+# cannot give it. The deployment states it, and there is no default, because a
+# wrong divisor silently scales the one number this benchmark exists to report.
+RANKS=$(( $(k3_config_json_get tensor_parallelism) * $(k3_config_json_get data_parallelism) ))
+log "serving on $CHIPS chips with $RANKS ranks (TP x DP, from config.json)"
+if [ "$RANKS" -gt 0 ] && [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
+    log "WARNING: $RANKS ranks on $CHIPS chips is not the two-per-chip v7x shape;" \
+        "check K3_AGENTX_CHIPS is the chip count and not the rank count"
 fi
-log "serving on $CHIPS chips (tensor_parallelism x data_parallelism, from config.json)"
 
 # The config name is the label: it is the one file that defines this server, so
 # it identifies the row better than a string of knobs reassembled here.
