@@ -3849,17 +3849,18 @@ class TestTPURaidenConnectorWorker:
                 _flush_stage3_submits(worker)
             assert not step.is_alive()
             assert not errors
-            assert fast_done.is_set()
-            failed = {"dst-slow"} if prearm_failure else set()
+            assert fast_done.is_set() is not prearm_failure
+            failed = {"dst-slow", "dst-fast"} if prearm_failure else set()
             accepted = {"dst-slow", "dst-fast"} - failed
             assert worker.get_finished() == (set(), failed)
             assert worker._stage3_controller_accepted == accepted
             assert worker.get_block_ids_with_load_errors() == (
-                {7, 8} if prearm_failure else set()
+                {7, 8, 9, 10} if prearm_failure else set()
             )
-            sources = ["src-fast"] if prearm_failure else ["src-slow", "src-fast"]
-            engine.poll_results = [([], sources, [])]
-            assert worker.get_finished() == (set(), accepted)
+            assert facade.start_transfer.call_count == (1 if prearm_failure else 2)
+            if not prearm_failure:
+                engine.poll_results = [([], ["src-slow", "src-fast"], [])]
+                assert worker.get_finished() == (set(), accepted)
 
     def test_stage3_async_submit_defers_native_terminal_until_outcome(self):
         worker = _make_raiden_worker(
@@ -3995,6 +3996,89 @@ class TestTPURaidenConnectorWorker:
             worker._submit_stage3_loads(meta, MagicMock())
             _flush_stage3_submits(worker)
         return engine, facade
+
+    def test_stage3_unreachable_source_skips_rpcs_only_for_that_source(self):
+        worker = _make_raiden_worker(
+            is_producer=False, tp_rank=0, tp_size=1, block_size=1024
+        )
+        engine, facade = self._park_missing_registration_load(
+            worker,
+            [
+                RuntimeError(
+                    "Control RPC connection failed before sending request to "
+                    "prefill-controller.test:27000"
+                )
+            ],
+            registration_wait_s=30.0,
+        )
+        healthy = MagicMock()
+        healthy.start_transfer.return_value = True
+        worker._stage3_source_facades["healthy-prefill.test:27000"] = healthy
+        dead_meta = self._make_stage3_load_meta("dst-2", "src-2", 1005, [21, 22])
+        healthy_meta = self._make_stage3_load_meta("dst-3", "src-3", 1006, [31])
+        healthy_meta.reqs_to_load[
+            "dst-3"
+        ].src_controller_address = "healthy-prefill.test:27000"
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+        ):
+            assert worker.get_finished() == (set(), {"dst-late"})
+            worker._submit_stage3_loads(dead_meta, engine)
+            worker._submit_stage3_loads(healthy_meta, engine)
+            _flush_stage3_submits(worker)
+            assert worker.get_finished() == (set(), {"dst-2"})
+            assert worker.get_block_ids_with_load_errors() == {11, 12, 21, 22}
+            assert "dst-3" in worker._stage3_controller_accepted
+        assert facade.start_transfer.call_count == 1
+        assert healthy.start_transfer.call_count == 1
+
+    def test_stage3_stock_connect_timeout_skips_later_rpcs_but_holds_its_load(
+        self,
+    ):
+        worker = _make_raiden_worker(
+            is_producer=False, tp_rank=0, tp_size=1, block_size=1024
+        )
+        engine, facade = self._park_missing_registration_load(
+            worker,
+            [
+                RuntimeError(
+                    "Timeout (300s) failed to connect to robust endpoint "
+                    "prefill-controller.test:27000: connect failed to "
+                    "prefill-controller.test:27000: Connection refused"
+                )
+            ],
+            registration_wait_s=30.0,
+        )
+        dead_meta = self._make_stage3_load_meta("dst-2", "src-2", 1005, [21, 22])
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+        ):
+            assert worker.get_finished() == (set(), set())
+            assert "dst-late" in worker._stage3_pending_controller_failures
+            assert worker._load_block_ids["dst-late"] == [11, 12]
+            worker._submit_stage3_loads(dead_meta, engine)
+            _flush_stage3_submits(worker)
+            assert worker.get_finished() == (set(), {"dst-2"})
+            assert worker.get_block_ids_with_load_errors() == {21, 22}
+        assert facade.start_transfer.call_count == 1
 
     def test_stage3_async_submit_parks_missing_registration_then_retries(self):
         worker = _make_raiden_worker(

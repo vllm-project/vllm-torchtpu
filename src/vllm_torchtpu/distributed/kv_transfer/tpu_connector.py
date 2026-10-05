@@ -141,6 +141,7 @@ _STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
 # handles concurrent coordinations (plan claims are per request), so a small
 # pool keeps an admission burst from queueing behind one slow peer.
 _STAGE3_SUBMIT_WORKERS = 4
+_STAGE3_UNREACHABLE_SOURCE_BACKOFF_S = 30.0
 
 _KV_PARAMS_ADMITTED = "_tpu_kv_params_admitted"
 _KV_PARAMS_REJECTED = "_tpu_kv_params_rejected"
@@ -2429,6 +2430,7 @@ class TPURaidenConnectorWorker:
         self._stage3_submit_queue: queue.Queue = queue.Queue()
         self._stage3_submit_lock = threading.Lock()
         self._stage3_submit_outcomes: list[_Stage3SubmitOutcome] = []
+        self._stage3_unreachable_sources: dict[str, float] = {}
         self._stage3_submit_threads: list[threading.Thread] = []
         # A queued/running RPC retains its destination blocks until its actual
         # outcome is drained. Enqueue age cannot prove that it will not arm a
@@ -4909,6 +4911,8 @@ class TPURaidenConnectorWorker:
         uuid = int(req_meta.uuid)
 
         def _release() -> None:
+            if self._stage3_source_unreachable(address):
+                return
             cancelled = False
             try:
                 cancelled = bool(
@@ -4924,6 +4928,8 @@ class TPURaidenConnectorWorker:
                     uuid,
                     exc,
                 )
+                if self._stage3_source_down(address, exc):
+                    self._mark_stage3_source_unreachable(address)
             logger.info(
                 "%s",
                 json.dumps(
@@ -5387,6 +5393,32 @@ class TPURaidenConnectorWorker:
             finally:
                 self._stage3_submit_queue.task_done()
 
+    def _stage3_source_unreachable(self, address: str) -> bool:
+        with self._stage3_submit_lock:
+            until = self._stage3_unreachable_sources.get(address, 0)
+        return time.perf_counter() < until
+
+    @staticmethod
+    def _stage3_source_down(address: str, exc: BaseException) -> bool:
+        text = str(exc)
+        return text == (
+            f"Control RPC connection failed before sending request to {address}"
+        ) or (
+            text.startswith("Timeout (")
+            and f"failed to connect to robust endpoint {address}: " in text
+        )
+
+    def _mark_stage3_source_unreachable(self, address: str) -> None:
+        logger.error(
+            "Stage-3 source controller %s is unreachable; skipping its loads for %.0fs",
+            address,
+            _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S,
+        )
+        with self._stage3_submit_lock:
+            self._stage3_unreachable_sources[address] = (
+                time.perf_counter() + _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S
+            )
+
     def _execute_stage3_submit(self, task: _Stage3SubmitTask) -> _Stage3SubmitOutcome:
         """Runs one coordination RPC; safe on any thread.
 
@@ -5408,6 +5440,15 @@ class TPURaidenConnectorWorker:
                 submit_ms=0.0,
                 attempted_at=start_submit,
             )
+        address = str(task.call_kwargs["src_controller_address"])
+        not_sent = f"Control RPC connection failed before sending request to {address}"
+        if self._stage3_source_unreachable(address):
+            return _Stage3SubmitOutcome(
+                task=task,
+                error=RuntimeError(not_sent),
+                submit_ms=0.0,
+                attempted_at=start_submit,
+            )
         error: BaseException | None = None
         try:
             if task.retry_inline:
@@ -5423,6 +5464,8 @@ class TPURaidenConnectorWorker:
                 raise RuntimeError("source controller rejected Stage-3 transfer")
         except Exception as exc:  # pylint: disable=broad-except
             error = exc
+            if self._stage3_source_down(address, exc):
+                self._mark_stage3_source_unreachable(address)
         return _Stage3SubmitOutcome(
             task=task,
             error=error,
@@ -5812,7 +5855,7 @@ class TPURaidenConnectorWorker:
                     or str(exc)
                     == (
                         "Control RPC connection failed before sending request to "
-                        f"{src_controller_address}"
+                        f"{str(req_meta.src_controller_address).strip()}"
                     )
                 )
             ):
