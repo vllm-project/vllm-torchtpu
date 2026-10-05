@@ -222,14 +222,14 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed):
+def _dcp_case(dcp_size, seed, q_len=Q_LEN):
     """Records plus the positional args and kwargs of one sharded DCP call."""
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+    q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    weights = jax.random.normal(kw, (q_len, H_IDX), jnp.float32).astype(jnp.bfloat16)
 
     # interleave_size=1: global position g lives on rank g % dcp_size at local
     # index g // dcp_size, so the shards are a strided de-interleave.
@@ -250,7 +250,7 @@ def _dcp_case(dcp_size, seed):
         shards,
         jnp.array([KV_LEN], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
-        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
     )
     kwargs = dict(
@@ -328,3 +328,30 @@ def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
         streamindex_topk_dcp(*args, **kwargs, chunk_tokens=chunk_tokens)
     )
     np.testing.assert_array_equal(chunked, unchunked)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+def test_dcp_fused_payload_is_bit_identical(q_len, dcp_size):
+    """`fused_payload` drops the gathers and changes no output element.
+
+    q_len=16 is the decode bucket, where both top-ks take the two-stage path
+    and every gather the flag removes is live.
+    """
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 5, q_len=q_len)
+
+    def gathers(**kw):
+        return streamindex_topk_dcp.lower(*args, **kwargs, **kw).as_text().count(
+            "stablehlo.gather"
+        )
+
+    assert gathers(fused_payload=True) < gathers(), (
+        "the fused program has as many gathers as the reference, so this"
+        " comparison would pass trivially"
+    )
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, fused_payload=True))
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()

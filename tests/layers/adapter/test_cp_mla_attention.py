@@ -15,7 +15,9 @@
 position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
+import concurrent.futures
 import math
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -226,6 +228,164 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
         torch.from_numpy(outs).float(), torch.from_numpy(lses).float(), monkeypatch
     ).numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+
+
+# ===================================================================== #
+# The all-to-all merge (`TPU_DCP_LSE_MERGE_A2A`).
+# ===================================================================== #
+
+
+class _ExchangeHub:
+    """A lockstep all-to-all between threads, one thread per DCP rank."""
+
+    def __init__(self, world, wrong_destination=False):
+        self.world = world
+        self.slots = [None] * world
+        self.barrier = threading.Barrier(world)
+        # Fault injection: rank `r` is handed the block meant for rank `r+1`.
+        self.wrong_destination = wrong_destination
+
+
+class _A2AGroup:
+    def __init__(self, hub, rank):
+        self.world_size = hub.world
+        self.rank_in_group = rank
+        self.device_group = None
+        self._hub = hub
+
+    def all_to_all(self, x):
+        hub = self._hub
+        hub.slots[self.rank_in_group] = x
+        hub.barrier.wait()
+        dest = (self.rank_in_group + int(hub.wrong_destination)) % hub.world
+        recv = torch.stack([hub.slots[src][dest] for src in range(hub.world)])
+        hub.barrier.wait()
+        return recv
+
+
+def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
+    """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
+    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    world = outputs.shape[0]
+    hub = _ExchangeHub(world, wrong_destination)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        blocks = list(pool.map(run, range(world)))
+    return torch.cat(blocks, dim=1)
+
+
+def _hard_partials(rng, dcp_size, tokens=12, local_heads=4, vdim=64):
+    """bf16 partials (the kernel's output dtype) with f32 lse that exercise
+    every merge rule: large lse (a merge without the max shift overflows exp),
+    tokens one rank owns alone, a token no rank owns, a rank owning nothing."""
+    heads = dcp_size * local_heads
+    outputs = torch.from_numpy(
+        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
+    ).to(torch.bfloat16)
+    lses = torch.from_numpy(
+        (rng.standard_normal((dcp_size, tokens, heads)) * 4).astype(np.float32)
+    )
+    lses[:, 0] += 200.0  # exp(200) overflows f32: only the shift saves it
+    lses[:, 1] -= 200.0  # exp(-200) underflows f32 to 0: only the shift saves it
+    lses[1:, 2] = float("-inf")  # rank 0 owns token 2 alone
+    lses[:, 3] = float("-inf")  # nobody owns token 3 (a padding row)
+    lses[dcp_size - 1] = float("-inf")  # the last rank owns nothing at all
+    lses[0, 4, :local_heads] = float("-inf")  # a mixed row, per head
+    return outputs, lses
+
+
+def _bf16_close(got, reference):
+    """Within bf16 rounding of the f64 answer: one bf16 ulp (2^-8 relative,
+    since the bf16 mantissa has 8 bits with the implicit one) plus a floor."""
+    got = got.to(torch.float32).numpy().astype(np.float64)
+    return bool(
+        np.isfinite(got).all()
+        and (np.abs(got - reference) <= 2.0**-8 * np.abs(reference) + 1e-6).all()
+    )
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_all_to_all_merge_matches_the_f64_reference(dcp_size, monkeypatch):
+    outputs, lses = _hard_partials(np.random.default_rng(20261002), dcp_size)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert got.dtype == torch.bfloat16
+    assert got.shape == outputs.shape[1:]
+    reference = _reference_merge(outputs.float(), lses)
+    assert _bf16_close(got, reference)
+    # The `-inf` rules, stated exactly: a lone owner comes back verbatim and a
+    # token nobody owns is zero, not NaN.
+    torch.testing.assert_close(got[2], outputs[0, 2], rtol=0, atol=0)
+    assert (got[3] == 0).all()
+
+
+def test_all_to_all_merge_agrees_with_the_reduce_scatter_merge(monkeypatch):
+    """Same answer as today's path, up to the final bf16 rounding."""
+    outputs, lses = _hard_partials(np.random.default_rng(7), 8)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    today = _merge_whole(outputs.float(), lses, monkeypatch).to(torch.bfloat16)
+    diff = (got.float() - today.float()).abs()
+    assert (diff <= 2.0**-8 * today.float().abs() + 1e-6).all()
+
+
+def test_positive_control_wrong_head_slice_is_caught(monkeypatch):
+    """The reference check must fail when a rank merges another rank's heads."""
+    outputs, lses = _hard_partials(np.random.default_rng(13), 4)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=True)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
+    """The reference check must fail when the merge skips the max shift."""
+
+    def unshifted(o_recv, l_recv):
+        weights = torch.where(
+            torch.isfinite(l_recv), torch.exp(l_recv), torch.zeros_like(l_recv)
+        )
+        denom = weights.sum(dim=0)
+        weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
+        return (o_recv.to(torch.float32) * weights.unsqueeze(-1)).sum(dim=0)
+
+    outputs, lses = _hard_partials(np.random.default_rng(17), 4)
+    monkeypatch.setattr(cp_mla, "_merge_received", unshifted)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize(
+    "enabled,tokens,per_bucket,expect_a2a",
+    [
+        (False, 8, True, False),
+        (True, 8, True, True),
+        (True, 256, True, True),
+        (True, 257, True, False),
+        # A single-trace caller (the spec-decode draft) ignores the cap.
+        (True, 257, False, True),
+        (False, 257, False, False),
+    ],
+)
+def test_merge_picks_the_all_to_all_per_bucket(
+    enabled, tokens, per_bucket, expect_a2a, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", enabled, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 256, raising=False
+    )
+    monkeypatch.setattr(
+        cp_mla,
+        "merge_lse_partials_all_to_all",
+        lambda o, lse, g: calls.append(o.shape[0]) or o[:, :2],
+    )
+    outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
+    group = _FakeGroup(outputs, lses, 0)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], per_bucket=per_bucket)
+    assert calls == ([tokens] if expect_a2a else [])
 
 
 # ===================================================================== #

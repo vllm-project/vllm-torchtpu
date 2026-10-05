@@ -181,6 +181,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        onehot_sortfree=envs.TPU_MOE_ONEHOT_SORTFREE,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)

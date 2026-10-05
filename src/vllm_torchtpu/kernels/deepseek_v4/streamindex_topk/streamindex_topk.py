@@ -622,6 +622,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "fused_payload",
     ),
 )
 def streamindex_topk(
@@ -650,6 +651,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    fused_payload: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -709,6 +711,8 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      fused_payload: forwarded to `sparsecore_topk`; folds the two-stage
+        candidate-to-column gather into the SparseCore kernel. Same result.
 
     Returns:
       Top-K indices in this rank's local compressed space, or
@@ -1128,6 +1132,7 @@ def streamindex_topk(
                 scheduling_group_id=sc_group,
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
+                fused_payload=fused_payload,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
@@ -1193,6 +1198,7 @@ def streamindex_topk(
         "decode_req_batch_size",
         "chunk_tokens",
         "dcp_axis_name",
+        "fused_payload",
     ),
 )
 def streamindex_topk_dcp(
@@ -1216,6 +1222,7 @@ def streamindex_topk_dcp(
     decode_req_batch_size: int = 4,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    fused_payload: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1273,6 +1280,11 @@ def streamindex_topk_dcp(
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
         two compose.
       dcp_axis_name: name of the DCP mesh axis.
+      fused_payload: resolve the merged winners to this rank's own indices
+        inside the SparseCore merge (a payload of `idxs` windowed at
+        `dcp_rank * k`) instead of a separate `take_along_axis`, and fold the
+        two-stage candidate maps of both top-ks in the same way. Bit-identical
+        output; removes three SparseCore gathers per call at decode shapes.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1335,6 +1347,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            fused_payload=fused_payload,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
@@ -1342,10 +1355,29 @@ def streamindex_topk_dcp(
 
         # Stage 2. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
+        full_rows = jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32)
+        if fused_payload:
+            # Flat column `c` of the rank-major gather is this rank's slot
+            # `c - dcp_rank * k` exactly when it lies in `[dcp_rank * k, +k)`,
+            # so a payload of `idxs` windowed there is `resolve_owned_winners`
+            # without its gather: owned winners come back as local indices,
+            # everyone else's as -1, slot for slot.
+            owned = sparsecore_topk(
+                scores,
+                k,
+                row_lengths=full_rows,
+                write_empty_rows=True,
+                payload=idxs,
+                payload_offset=jnp.full(
+                    (scores.shape[0],), dcp_rank * k, dtype=jnp.int32
+                ),
+                fused_payload=True,
+            )
+            return dcp_sc_compact.pack_nonnegative(owned)
         slots = sparsecore_topk(
             scores,
             k,
-            row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
+            row_lengths=full_rows,
             write_empty_rows=True,
         )
         return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)

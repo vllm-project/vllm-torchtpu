@@ -912,7 +912,7 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "merge_lse_partials_scatter_heads",
-        lambda out, _lse: out[:, :local_heads, :],
+        lambda out, _lse, **_kw: out[:, :local_heads, :],
     )
 
     q_nope_rep = torch.randn(num_tokens, group_heads, 128)
@@ -959,7 +959,7 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     monkeypatch.setattr(
         attention_adapter,
         "merge_lse_partials_scatter_heads",
-        lambda out, _lse: out[:, :local_heads, :],
+        lambda out, _lse, **_kw: out[:, :local_heads, :],
     )
 
     impl.forward(

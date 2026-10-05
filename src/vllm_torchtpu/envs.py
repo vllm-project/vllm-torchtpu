@@ -8,6 +8,14 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
+    TPU_DCP_MLA_PACKED_GATHER: bool = False
+    TPU_DCP_MLA_TOPK_CAP: int = 512
+    TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_DCP_MLA_CAPPED_PREP: bool = False
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
+    TPU_DCP_LSE_MERGE_A2A: bool = False
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_LSE_MERGE_RS_BF16: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -65,6 +73,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -82,6 +91,10 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
+    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
+    TPU_INDEXER_TOPK_NOCOPY: bool = False
+    TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -349,6 +362,61 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # DCP sparse MLA (SparseCore cache layout): gather only each token's live
+    # top-k rows as packed 64-row atoms and attend 256-row tiles of them
+    # (`sparse_ragged_paged_attention(packed_gather=True)`), instead of all
+    # `topk` slots per token when a rank owns ~topk/dcp of them. Takes the
+    # decode buckets ahead of TPU_DCP_MLA_TOPK_CAP when both are on; off by
+    # default (the capped path is as fast or faster at 1-2 decode requests).
+    "TPU_DCP_MLA_PACKED_GATHER": env_bool("TPU_DCP_MLA_PACKED_GATHER", default=False),
+    # DCP sparse MLA (SparseCore cache layout): gather and attend this many
+    # top-k slots per token instead of all `topk`; tokens owning more are
+    # recomputed exactly in-kernel over all their windows
+    # (`sparse_ragged_paged_attention(topk_cap=...)`). 0 = off. Chunks the
+    # packed gather takes stay packed. A rank owns ~topk/dcp = 128 of 2048 on
+    # average, so 512 covers every row but a rare skewed one.
+    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 512),
+    # Gather/attention chunk (query tokens) of the capped path: fewer, larger
+    # chunks amortise the per-chunk calls; each chunk's static gather buffer
+    # is chunk * topk rows (~335 MB at 256), of which only the live windows
+    # are written.
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # Capped path index prep (`sparse_ragged_paged_attention(
+    # capped_window_prep=True)`): translate the top-k to physical rows once
+    # per call, straight into the window-major layout the capped gather reads,
+    # and only for the windows some gridded row needs (window 0 unless a row
+    # overflows `TPU_DCP_MLA_TOPK_CAP`), instead of a full-width page
+    # translation plus a per-chunk window-major copy. Same gathered rows.
+    "TPU_DCP_MLA_CAPPED_PREP": env_bool("TPU_DCP_MLA_CAPPED_PREP", default=False),
+    # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
+    # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
+    # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
+    # instead of materialising a padded [T, H, 640] concat, and export the
+    # log-sum-exp as a lane-dense f32[T, H] instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=False),
+    # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
+    # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
+    # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial
+    # and an f32 reduce-scatter over heads, all-to-all each destination's head
+    # slice of the native-dtype partial and of the f32 lse, and merge this
+    # rank's heads locally in f32. Half the bytes and no serial lse round
+    # trip, so it pays where the merge is latency-bound (decode); same result
+    # up to f32 summation order. The reduce-scatter sums in the network and
+    # wins past ~64 tokens (dcp=8, compiled: a2a 26 vs 29 us at 16 tokens,
+    # 34 vs 48 at 32, 63 vs 65 at 64, 113 vs 108 at 128), hence the cap.
+    # The cap applies to the backbone only; the spec-decode draft, traced once
+    # for every bucket, takes the exchange at every size.
+    "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int(
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64
+    ),
+    # Experimental, not recommended: cast the weighted partial to bf16 before
+    # the merge's reduce-scatter. Halves its bytes but rounds the cross-rank
+    # sum in bf16 at every stage; a quarter to a third of outputs move by more
+    # than one bf16 ulp (dcp=8/16), which fails the merge's accuracy bar.
+    "TPU_DCP_LSE_MERGE_RS_BF16": env_bool("TPU_DCP_LSE_MERGE_RS_BF16", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -594,6 +662,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
+    # at most 1024), derive the stable-sort positions, permuted token ids and
+    # group sizes by int32 compare-and-count instead of three comparison
+    # sorts. Outputs are bit-identical to the sorted form.
+    "TPU_MOE_ONEHOT_SORTFREE": env_bool("TPU_MOE_ONEHOT_SORTFREE"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -674,6 +747,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Fold the SparseCore top-k's index gathers (the two-stage candidate map
+    # and, under DCP, `resolve_owned_winners`' take_along_axis) into the top-k
+    # kernel's emit instead of separate offloaded gathers. Same indices.
+    "TPU_SC_TOPK_FUSED_PAYLOAD": env_bool("TPU_SC_TOPK_FUSED_PAYLOAD", default=False),
+    # Indexer writes its top-k into the shared `topk_indices_buffer` with one
+    # full-width row update and hands the fresh rows to attention, instead of
+    # a -1 fill plus a partial-width write whose result attention re-reads.
+    "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
+    ),
+    # As TPU_INDEXER_TOPK_SINGLE_WRITE (implies it), with the row update done
+    # by a donating op so XLA updates the table in place instead of copying the
+    # whole `[max_num_batched_tokens, width]` table in every indexed layer.
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
+    # With TPU_INDEXER_TOPK_SINGLE_WRITE / _NOCOPY: the indexed layer's own
+    # attention reads its rows back from the updated shared table, the same
+    # `table[:num_tokens]` expression the following skip_topk layers read,
+    # instead of the fresh rows. One expression lets XLA CSE the attention's
+    # top-k-only index prep (physical rows, live counts, window metadata)
+    # across the indexed layer and its skip_topk layers; with the fresh rows
+    # the first skip_topk layer recomputes it whenever num_tokens is short of
+    # the table height (decode). Same values either way.
+    "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
+        "TPU_INDEXER_TOPK_SHARED_READ", default=False
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
