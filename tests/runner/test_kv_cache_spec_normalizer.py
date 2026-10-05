@@ -422,7 +422,12 @@ def test_deepseek_v32_indexer_backend_and_normalizer_modes(monkeypatch, caplog) 
         page_size_padded=None,
     )
 
-    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    # Drop a value a previous test's monkeypatch.setattr undo may have left in the
+    # module dict, so `envs.__getattr__` resolves the variable afresh. A bare
+    # `delattr(raising=False)` is not enough: `hasattr` is True through
+    # `__getattr__`, so it raises on a module dict without the name.
+    if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in vars(envs):
+        monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE")
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
 
@@ -565,13 +570,17 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
     )
     caplog.set_level(logging.WARNING)
     monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
-    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    # Pin the flags as module attributes rather than through os.environ: the
+    # helpers read `envs.<NAME>`, so this stays correct after enable_envs_cache()
+    # and regardless of attributes other tests' monkeypatch undo left behind.
+    # The mode is pinned both ways, since explicitness is read from os.environ.
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
-    monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
-    monkeypatch.delenv("TPU_RAIDEN_GLM_ADMISSION", raising=False)
-    monkeypatch.delenv("TPU_RAIDEN_DSV4_ADMISSION", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", False)
 
-    nb, block_size, head_size = 8, 256, 132
+    nb, block_size, head_size = 8, 256, 129
     indexer_spec = MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
@@ -582,8 +591,8 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
 
     # 1. Default 'sal' + Raiden GLM admission -> HAS shape (nb, 64, 4, 256)
     #    and 256 B/token.
-    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
-    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", True)
     caplog.clear()
     shape_fallback = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
         nb, block_size, 1, head_size, torch.uint8
@@ -609,6 +618,7 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
 
     # 2. Explicit 'sal' + Raiden GLM admission -> ValueError.
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
             nb, block_size, 1, head_size, torch.uint8
@@ -622,8 +632,9 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
 
     # 3. DSv4 admission alone (with GLM admission off) -> keeps SAL (132 B/token).
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
-    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "0")
-    monkeypatch.setenv("TPU_RAIDEN_DSV4_ADMISSION", "1")
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", True)
     shape_dsv4 = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
         nb, block_size, 1, head_size, torch.uint8
     )

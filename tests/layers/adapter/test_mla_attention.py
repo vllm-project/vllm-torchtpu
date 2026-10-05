@@ -1212,7 +1212,12 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
     cu_q_lens = jnp.array([0, 2, 6], dtype=jnp.int32)
     distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
 
-    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    # Drop a value a previous test's monkeypatch.setattr undo may have left in the
+    # module dict, so `envs.__getattr__` resolves the variable afresh. A bare
+    # `delattr(raising=False)` is not enough: `hasattr` is True through
+    # `__getattr__`, so it raises on a module dict without the name.
+    if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in vars(envs):
+        monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE")
     results = {}
     for mode, init_cache in [
         ("xla", init_has),
@@ -1379,30 +1384,34 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
     monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
 
-    monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    # Pin the flags as module attributes rather than through os.environ: the
+    # helpers read `envs.<NAME>`, so this stays correct after enable_envs_cache()
+    # and regardless of attributes other tests' monkeypatch undo left behind.
+    # The mode is pinned both ways, since explicitness is read from os.environ.
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
-    monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
-    monkeypatch.delenv("TPU_RAIDEN_GLM_ADMISSION", raising=False)
-    monkeypatch.delenv("TPU_RAIDEN_DSV4_ADMISSION", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", False)
 
     # 1. No Raiden flags -> default 'sal' selects SEQ_ALONG_LANE.
     assert not envs.use_raiden_glm_admission()
     assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
 
     # 2. Only one of the two flags or DSv4 admission alone -> still SEQ_ALONG_LANE.
-    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
-    monkeypatch.setenv("TPU_RAIDEN_DSV4_ADMISSION", "1")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", True)
     assert not envs.use_raiden_glm_admission()
     assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
 
-    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "0")
-    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", True)
     assert not envs.use_raiden_glm_admission()
     assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
 
     # 3. Default 'sal' + Raiden GLM admission -> HEAD_ALONG_SUBLANE + one warning.
-    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
-    monkeypatch.setenv("TPU_RAIDEN_GLM_ADMISSION", "1")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", True)
     assert envs.use_raiden_glm_admission()
     assert not envs.is_indexer_kv_cache_mode_explicit()
     caplog.clear()
@@ -1420,6 +1429,7 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     for explicit_mode in ("has", "xla"):
         caplog.clear()
         monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
         assert envs.is_indexer_kv_cache_mode_explicit()
         assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
         assert not [
@@ -1430,10 +1440,12 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
 
     # 5. Explicit 'sal' (env or mode arg) + Raiden GLM admission -> ValueError.
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     assert envs.is_indexer_kv_cache_mode_explicit()
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         st_mod.indexer_kv_layout(256)
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         st_mod.indexer_kv_layout(256, mode="sal")
 
