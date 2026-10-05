@@ -35,7 +35,7 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
 from vllm_torchtpu.utils import align_to
 
@@ -402,8 +402,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
