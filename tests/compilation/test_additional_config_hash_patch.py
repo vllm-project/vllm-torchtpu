@@ -157,7 +157,7 @@ def test_additional_config_is_restored_after_hashing(patched_compute_hash):
 
 
 def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-    def exploding_compute_hash(self):
+    def exploding_compute_hash(self, *args, **kwargs):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)

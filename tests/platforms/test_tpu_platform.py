@@ -80,8 +80,12 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         cache_config=SimpleNamespace(block_size=16),
         block_size=16,
         use_eagle=False,
+        use_eagle_block_drop=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=16,
     )
     request = SimpleNamespace(

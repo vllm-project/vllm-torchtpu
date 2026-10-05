@@ -174,17 +174,17 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     original = VllmConfig.compute_hash
 
-    def compute_hash(self, include_version: bool = True) -> str:
+    def compute_hash(self, *args, **kwargs) -> str:
         additional_config = self.additional_config
         if not isinstance(additional_config, dict):
-            return original(self, include_version=include_version)
+            return original(self, *args, **kwargs)
         filtered = {
             key: value
             for key, value in additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
         if filtered == additional_config:
-            return original(self, include_version=include_version)
+            return original(self, *args, **kwargs)
         # Hash a shallow copy with the filtered dict rather than mutating the
         # live config: compute_hash() may run while other code holds the same
         # VllmConfig, and a shallow copy shares every sub-config by reference
@@ -192,7 +192,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         # compute_hash its own additional_config to read.
         proxy = copy.copy(self)
         proxy.additional_config = filtered
-        return original(proxy, include_version=include_version)
+        return original(proxy, *args, **kwargs)
 
     VllmConfig._tpu_upstream_compute_hash = original
     VllmConfig.compute_hash = compute_hash

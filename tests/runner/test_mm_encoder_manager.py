@@ -285,8 +285,18 @@ def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
         assert (output == count).all()
     assert manager._run_budget_graph.call_args_list == (
         [
-            call({"tokens": [1, 3]}, 8, allow_eager_fallback=False),
-            call({"tokens": [4]}, 8, allow_eager_fallback=False),
+            call(
+                {"tokens": [1, 3]},
+                8,
+                axis_keys=(),
+                allow_eager_fallback=False,
+            ),
+            call(
+                {"tokens": [4]},
+                8,
+                axis_keys=(),
+                allow_eager_fallback=False,
+            ),
         ]
         if active
         else []
