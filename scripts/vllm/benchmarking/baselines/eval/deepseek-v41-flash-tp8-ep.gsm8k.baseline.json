@@ -1,0 +1,5 @@
+{
+  "gsm8k": {
+    "exact_match,flexible-extract": 0.97
+  }
+}

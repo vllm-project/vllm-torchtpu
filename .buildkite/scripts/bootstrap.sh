@@ -142,7 +142,10 @@ fi
 # .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
 # kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
 # scheduled kube pipeline names its own lane - and defaults to all of them.
-ALL_LANES="verify perf integration tests"
+#
+# epic/dsv41 only targets DeepSeek-V4.1-Flash, so it runs that model's lane
+# alone instead of "verify perf integration tests".
+ALL_LANES="dsv41"
 lanes="${CI_LANES:-${ALL_LANES}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
