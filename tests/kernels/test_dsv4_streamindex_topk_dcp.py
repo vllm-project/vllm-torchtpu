@@ -135,10 +135,12 @@ def test_sparsecore_fused_pack_matches_reference(dcp_size):
     num_rows, k = 16, 128
     rng = np.random.default_rng(20261003)
     # Slots can come from any rank [0, dcp_size * k)
-    slots = np.stack([
-        rng.choice(dcp_size * k, size=k, replace=False).astype(np.int32)
-        for _ in range(num_rows)
-    ])
+    slots = np.stack(
+        [
+            rng.choice(dcp_size * k, size=k, replace=False).astype(np.int32)
+            for _ in range(num_rows)
+        ]
+    )
     slots[0, -5:] = -1
     idxs = rng.integers(0, 100000, size=(num_rows, k), dtype=np.int32)
     idxs[1, -3:] = -1
