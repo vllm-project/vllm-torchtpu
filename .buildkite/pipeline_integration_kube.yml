@@ -3,9 +3,9 @@
 #
 # qwen35-pcp8-dp8-disagg-correctness and qwen35-gpc-correctness reach their
 # second host by ssh on bare metal, starting a container there with ROLE=decode
-# or GPC_ROLE=worker. They cannot go through run_multihost.sh, which brings up a
-# Ray cluster and runs one command on the head, so each has a JobSet naming its
-# two roles instead, and run_jobset.sh submits it.
+# or GPC_ROLE=worker. That is not one command on a Ray head, which is what
+# run_multihost.sh runs by default, so each has a JobSet naming its two roles
+# instead, and run_multihost.sh --manifest submits it.
 
 # Every step here writes its results under this directory and the pod uploads
 # whatever it finds there. Declared once for the pipeline rather than per step:
@@ -214,7 +214,7 @@ steps:
       - *kube_plugin
     commands:
       - >-
-        .buildkite/kubernetes/run_multihost.sh
+        .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
         python3 examples/offline_inference.py
         --model Qwen/Qwen3-0.6B
         --tensor-parallel-size 16
@@ -248,7 +248,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh qwen3.5-p8d8-disagg.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-p8d8-disagg.yaml
 
   - label: ":kubernetes: Integration: qwen35-gpc-correctness"
     key: "integration_qwen35_gpc_correctness"
@@ -262,7 +262,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh qwen3.5-gpc-two-replica.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-gpc-two-replica.yaml
 
   # Nightly only, as on bare metal: a DSv4 boot is ~27 min of weight streaming
   # and compile before the probes start.
@@ -279,4 +279,4 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh dsv4-pd-disagg.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest dsv4-pd-disagg.yaml

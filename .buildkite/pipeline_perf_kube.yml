@@ -234,7 +234,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
+      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
 
   - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
     key: "perf_nightly_deepseek_v4_pro_dp16_ep"
@@ -255,7 +255,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_multihost.sh bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
+      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
 
   # GLM-5.2 again, and deliberately the same config: what is under test is the
   # bootstrap, not the model. This path is vLLM's own multi-node data
@@ -281,7 +281,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep
+      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 --backend mp glm-5.2-fp8-dp16-ep
 
   # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
   # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
@@ -301,7 +301,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh qwen3.5-397b-1p1d.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
 
   # The two Kimi-K3 steps run last. They take the 2x2x4 queue's own chips,
   # which the v7x-8 and v7x-16 steps above borrow while it is idle; started
@@ -332,7 +332,7 @@ steps:
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh kimi-k3-1p1d-4dp8tp.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-1p1d-4dp8tp.yaml
 
   # Kimi-K3 aggregated on one 2x2x4 slice, four hosts of four chips: the only
   # nightly of it, as pipeline_perf.yml has no bare-metal counterpart.
