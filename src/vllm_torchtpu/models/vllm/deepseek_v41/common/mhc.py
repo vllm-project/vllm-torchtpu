@@ -1,4 +1,7 @@
-"""Single-pass delayed mHC with compact TPU Sinkhorn and upstream residual flow."""
+"""Single-pass delayed mHC with compact TPU Sinkhorn and upstream residual flow.
+
+Shared by the v1 and v2 DeepSeek V4.1 implementations.
+"""
 
 import functools
 
@@ -8,7 +11,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
-from .ops import rms_norm
+from vllm_torchtpu.layers.adapter.normalization import rms_norm
 
 
 def _pre_gates(
@@ -135,6 +138,21 @@ def pack_mix_weight(fn: torch.Tensor) -> torch.Tensor:
     return packed.contiguous().to(fn.device)
 
 
+def pack_mix_weights(layers) -> None:
+    """Pack each decoder layer's FP32 mix weights after weight loading.
+
+    Call after upstream ``finalize_mhc_broadcast_weights``: its first-layer
+    broadcast weight reads the FP32 ``hc_attn_fn``. Packed weights are BF16,
+    so a second call is a no-op.
+    """
+    for layer in layers:
+        for name in ("hc_attn_fn", "hc_ffn_fn"):
+            fn = getattr(layer, name)
+            if fn.device.type == "tpu" and fn.dtype == torch.float32:
+                packed = torch.nn.Parameter(pack_mix_weight(fn), requires_grad=False)
+                setattr(layer, name, packed)
+
+
 def _packed_mixes(x: jax.Array, weight: jax.Array, mixes: int) -> jax.Array:
     """Mix logits from a packed weight, summed in `_flat_pre_sums` order."""
     parts = jnp.dot(x, weight, preferred_element_type=jnp.float32)
@@ -247,7 +265,7 @@ def initialize_delayed_mhc():
     )
 
     _pre_op = pallas.jax_op(
-        "pallas::dsv41v2_delayed_mhc_pre",
+        "pallas::deepseek_v41_delayed_mhc_pre",
         delayed_pre_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
         input_partition_specs=(
@@ -278,7 +296,7 @@ def initialize_delayed_mhc():
 
     global _pre_flat_op
     _pre_flat_op = pallas.jax_op(
-        "pallas::dsv41v2_delayed_mhc_pre_flat",
+        "pallas::deepseek_v41_delayed_mhc_pre_flat",
         delayed_pre_flat_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
         input_partition_specs=(P(),) * 5 + (None,) * 5,

@@ -15,20 +15,20 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 
+from ..common.mhc import (
+    collapse,
+    initialize_delayed_mhc,
+    initialize_mhc_post,
+    pack_mix_weights,
+    post,
+    pre,
+    shifted_post_pre,
+)
 from .attention import DeepseekV41Attention, _block_table, _cache_slots
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import plan_decoder_replay
 from .engram import Engram, NgramHashState
-from .mhc import (
-    collapse,
-    initialize_delayed_mhc,
-    initialize_mhc_post,
-    pack_mix_weight,
-    post,
-    pre,
-    shifted_post_pre,
-)
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
@@ -417,16 +417,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if layers and layers[0].hc_attn_fn.dtype != torch.float32:
             return  # Already packed.
         super().finalize_mhc_broadcast_weights()
-        # The upstream broadcast weight above reads FP32 hc_attn_fn; pack the
-        # per-layer mix weights afterwards so mHC pre skips per-step packing.
-        for layer in layers:
-            for name in ("hc_attn_fn", "hc_ffn_fn"):
-                fn = getattr(layer, name)
-                if fn.device.type == "tpu":
-                    packed = torch.nn.Parameter(
-                        pack_mix_weight(fn), requires_grad=False
-                    )
-                    setattr(layer, name, packed)
+        pack_mix_weights(layers)
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix

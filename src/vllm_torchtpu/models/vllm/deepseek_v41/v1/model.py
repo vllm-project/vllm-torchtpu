@@ -31,16 +31,17 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 )
 from vllm_torchtpu.logger import init_logger
 
-from .attention import DeepseekV41Attention
-from .engram import Engram, NgramHashState
-from .mhc import (
+from ..common.mhc import (
     collapse,
     initialize_delayed_mhc,
     initialize_mhc_post,
+    pack_mix_weights,
     post,
     pre,
     shifted_post_pre,
 )
+from .attention import DeepseekV41Attention
+from .engram import Engram, NgramHashState
 from .ops import compact_rope_caches
 from .replay_plan import plan_decoder_replay
 
@@ -424,6 +425,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        if layers and layers[0].hc_attn_fn.dtype != torch.float32:
+            return  # Already packed.
+        super().finalize_mhc_broadcast_weights()
+        pack_mix_weights(layers)
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix

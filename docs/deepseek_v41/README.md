@@ -18,7 +18,7 @@ formats are outside this implementation.
 | `models/vllm/deepseek_v41/v1/replay_plan.py` | Prompt-tail replay planning across scheduler chunks |
 | `models/vllm/deepseek_v41/v1/attention.py` | MLA adapter, cache binding and output projection |
 | `models/vllm/deepseek_v41/v1/engram.py` | Upstream hashing, request lookbacks and TPU lookup |
-| `models/vllm/deepseek_v41/v1/mhc.py` | Delayed mHC, compact Sinkhorn and residual flow |
+| `models/vllm/deepseek_v41/common/mhc.py` | Delayed mHC (shared by v1 and v2): load-time packed mix weights, Pallas prefill pass, compact Sinkhorn and residual flow |
 | `models/vllm/deepseek_v41/v1/ops.py` | RoPE tables and tensor rotation |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_cache.py` | Native binding, byte/record and index-page geometry, public slot helpers and cache operations |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_backend.py` | Shared vLLM backend contract, separate from cache layout arithmetic |
