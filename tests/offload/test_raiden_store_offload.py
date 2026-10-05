@@ -2623,7 +2623,12 @@ class TestStorageConfig(unittest.TestCase):
     def test_off_without_a_path(self):
         # Nothing else is read or checked while the tier is off, so DRAM-only
         # deployments, pipeline parallel ones included, are unaffected.
-        os.environ.update(RAIDEN_STORAGE_TYPE="s3", RAIDEN_STORAGE_CAPACITY_GB="x")
+        os.environ.update(
+            RAIDEN_STORAGE_TYPE="s3",
+            RAIDEN_STORAGE_CAPACITY_GB="x",
+            RAIDEN_STORAGE_METADATA_CACHE_TTL="0",
+            RAIDEN_STORAGE_PROPERTIES="tp_size=2",
+        )
         del os.environ["PYTHONHASHSEED"]
         self.assertIsNone(self._resolve(pp_size=2, pcp_size=2))
 
@@ -2665,7 +2670,95 @@ class TestStorageConfig(unittest.TestCase):
         self.assertEqual(cfg.root_dir, nested)
         self.assertTrue(os.path.isdir(nested))
 
+    def test_metadata_cache_settings(self):
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_METADATA_CACHE_ENTRIES="-1",
+            RAIDEN_STORAGE_METADATA_CACHE_TTL="300",
+        )
+        cfg = self._resolve()
+        self.assertEqual(
+            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (-1, 300)
+        )
+        cfg = self._resolve(
+            {
+                "raiden_storage_metadata_cache_entries": 4096,
+                "raiden_storage_metadata_cache_ttl": -1,
+            }
+        )
+        self.assertEqual(
+            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (4096, -1)
+        )
+        # An empty variable means the default, as an unset one does.
+        os.environ.update(
+            RAIDEN_STORAGE_METADATA_CACHE_ENTRIES="",
+            RAIDEN_STORAGE_METADATA_CACHE_TTL="",
+        )
+        cfg = self._resolve()
+        self.assertEqual(
+            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (0, 60)
+        )
+
+    def test_properties_merge_key_by_key(self):
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_PROPERTIES=(
+                " direct_io=true, storage_io_thread_pool_size=32,"
+            ),
+        )
+        cfg = self._resolve(
+            {
+                "raiden_storage_properties": {
+                    "storage_io_thread_pool_size": 64,
+                    "lookup_batch_size": 16,
+                    # Empty, so the env value stays.
+                    "direct_io": None,
+                    # Unknown keys pass through: raiden reads what it knows.
+                    "future_knob": "x",
+                }
+            }
+        )
+        self.assertEqual(
+            cfg.properties,
+            (
+                ("direct_io", "true"),
+                ("future_knob", "x"),
+                ("lookup_batch_size", "16"),
+                ("storage_io_thread_pool_size", "64"),
+            ),
+        )
+
+    def test_property_values_become_raiden_strings(self):
+        cfg = self._resolve(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": {
+                    "direct_io": False,
+                    "ratio": 0.5,
+                    "blank": " ",
+                },
+            }
+        )
+        self.assertEqual(cfg.properties, (("direct_io", "false"), ("ratio", "0.5")))
+        # Extra config takes the env var's string form too.
+        cfg = self._resolve(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": "direct_io=true",
+            }
+        )
+        self.assertEqual(cfg.properties, (("direct_io", "true"),))
+
+    def test_env_property_the_connector_sets_is_refused(self):
+        os.environ.update(
+            RAIDEN_STORAGE_PATH=self.root,
+            RAIDEN_STORAGE_PROPERTIES="metadata_cache_ttl_secs=5",
+        )
+        with self.assertRaisesRegex(ValueError, "RAIDEN_STORAGE_METADATA_CACHE_TTL"):
+            self._resolve()
+
     def test_rejects_bad_settings(self):
+        properties = "raiden_storage_properties"
         cases = {
             "unsupported type": ({"raiden_storage_type": "s3"}, {}, "not supported"),
             "relative path": ({"raiden_storage_path": "kv"}, {}, "absolute"),
@@ -2682,6 +2775,49 @@ class TestStorageConfig(unittest.TestCase):
                 {"raiden_storage_capacity_gb": "inf"},
                 {},
                 "positive",
+            ),
+            "fractional cache size": (
+                {"raiden_storage_metadata_cache_entries": "1.5"},
+                {},
+                "cache size",
+            ),
+            "cache size below -1": (
+                {"raiden_storage_metadata_cache_entries": -2},
+                {},
+                "cache size",
+            ),
+            "zero cache TTL": ({"raiden_storage_metadata_cache_ttl": 0}, {}, "TTL"),
+            "cache TTL with a unit": (
+                {"raiden_storage_metadata_cache_ttl": "60s"},
+                {},
+                "TTL",
+            ),
+            "property without a value": (
+                {properties: "direct_io"},
+                {},
+                "not key=value",
+            ),
+            "repeated property": ({properties: "a=1,a=2"}, {}, "repeated key 'a'"),
+            "empty property key": ({properties: "=1"}, {}, "empty or repeated key"),
+            "property the connector sets": (
+                {properties: {"root_dir": "/x"}},
+                {},
+                "'root_dir' is set by the connector, from raiden_storage_path",
+            ),
+            "TP size property": (
+                {properties: {"tp_size": 2}},
+                {},
+                "parallel config",
+            ),
+            "nested property value": (
+                {properties: {"a": {"b": 1}}},
+                {},
+                "string, number or boolean",
+            ),
+            "properties not a mapping": (
+                {properties: ["direct_io=true"]},
+                {},
+                "mapping or a string",
             ),
         }
         for name, (extra, kwargs, message) in cases.items():
@@ -2719,8 +2855,10 @@ class TestStorageBackendConfigs(unittest.TestCase):
             FAKE_STORAGE_IMPL, _storage_config(), rs.StorageRankCoords(0, 4)
         )
         self.assertEqual(cfg.type, "posix")
-        # The store finds a block by rank 0's file, whose path needs the TP
-        # size; raiden would otherwise use the store's shard count.
+        # The store finds a block by its shard files, whose paths need the TP
+        # size. Raiden reads it from parallelism; the pinned build reads the
+        # tp_size property. The store holds no shard, so it has no TP rank.
+        self.assertEqual((cfg.parallelism.tp_size, cfg.parallelism.tp_rank), (4, -1))
         self.assertEqual(
             cfg.properties,
             {
@@ -2728,8 +2866,33 @@ class TestStorageBackendConfigs(unittest.TestCase):
                 "model_name": "org/model",
                 "capacity_bytes": str(1 << 30),
                 "tp_size": "4",
+                "metadata_cache_max_entries": "0",
+                "metadata_cache_ttl_secs": "60",
             },
         )
+
+    def test_pass_through_properties_reach_store_and_workers(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        storage = _storage_config(
+            metadata_cache_entries=1024,
+            metadata_cache_ttl_secs=-1,
+            properties=(("direct_io", "true"), ("lookup_batch_size", "64")),
+        )
+        store = rs.build_store_storage_backend_config(
+            FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(0, 4)
+        )
+        worker = rs.build_worker_storage_backend_config(
+            FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(1, 4)
+        )
+        for cfg in (store, worker):
+            self.assertEqual(cfg.properties["direct_io"], "true")
+            self.assertEqual(cfg.properties["lookup_batch_size"], "64")
+        # The metadata cache sits in front of the store's lookups only.
+        self.assertEqual(store.properties["metadata_cache_max_entries"], "1024")
+        self.assertEqual(store.properties["metadata_cache_ttl_secs"], "-1")
+        self.assertNotIn("metadata_cache_max_entries", worker.properties)
+        self.assertNotIn("metadata_cache_ttl_secs", worker.properties)
 
     def test_worker_config(self):
         from vllm_torchtpu.offload import raiden_store as rs
@@ -2838,20 +3001,33 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(worker_kwargs["backend_configs"], [])
 
     def test_on_configures_store_and_worker(self):
-        spec = _build_spec({"raiden_storage_path": self.root})
+        spec = _build_spec(
+            {
+                "raiden_storage_path": self.root,
+                "raiden_storage_properties": {"direct_io": True},
+            }
+        )
         self.assertEqual(
-            spec.storage_config, _storage_config(root_dir=self.root, capacity_bytes=0)
+            spec.storage_config,
+            _storage_config(
+                root_dir=self.root,
+                capacity_bytes=0,
+                properties=(("direct_io", "true"),),
+            ),
         )
         manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
         (store_cfg,) = manager_kwargs["secondary_backend_configs"]
         self.assertEqual(store_cfg.properties["root_dir"], self.root)
+        self.assertEqual(store_cfg.parallelism.tp_size, 4)
         self.assertEqual(store_cfg.properties["tp_size"], "4")
+        self.assertEqual(store_cfg.properties["direct_io"], "true")
         # The worker registers under its world rank but writes as its TP rank.
         self.assertEqual(worker_kwargs["rank"], 6)
         (worker_cfg,) = worker_kwargs["backend_configs"]
         self.assertEqual(
             (worker_cfg.parallelism.tp_rank, worker_cfg.parallelism.tp_size), (2, 4)
         )
+        self.assertEqual(worker_cfg.properties["direct_io"], "true")
 
     def test_worker_tp_group_must_match_config(self):
         spec = _build_spec({"raiden_storage_path": self.root})

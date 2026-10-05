@@ -130,6 +130,9 @@ if TYPE_CHECKING:
     RAIDEN_STORAGE_PATH: str = ""
     RAIDEN_STORAGE_TYPE: str = ""
     RAIDEN_STORAGE_CAPACITY_GB: str = ""
+    RAIDEN_STORAGE_METADATA_CACHE_ENTRIES: str = "0"
+    RAIDEN_STORAGE_METADATA_CACHE_TTL: str = "60"
+    RAIDEN_STORAGE_PROPERTIES: str = ""
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TORCHTPU_IPC_KEY: str = ""
@@ -817,6 +820,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Storage capacity in GiB, reported to the raiden store; "" leaves it
     # unset. Kept as a string here; raiden_store.py parses and validates it.
     "RAIDEN_STORAGE_CAPACITY_GB": env_str("RAIDEN_STORAGE_CAPACITY_GB", ""),
+    # How many storage files the raiden store remembers having found, so
+    # repeated lookups of a hot prefix skip the filesystem. "0" (the default)
+    # turns that cache off; "-1" removes the limit. Like the TTL below, kept
+    # as a string here and parsed and validated in raiden_store.py.
+    "RAIDEN_STORAGE_METADATA_CACHE_ENTRIES": env_str(
+        "RAIDEN_STORAGE_METADATA_CACHE_ENTRIES", "0"
+    ),
+    # Seconds a cache entry lasts without being used; "60" by default, "-1"
+    # for no expiry.
+    "RAIDEN_STORAGE_METADATA_CACHE_TTL": env_str(
+        "RAIDEN_STORAGE_METADATA_CACHE_TTL", "60"
+    ),
+    # Further storage backend properties, passed to raiden unread as
+    # comma-separated key=value pairs, e.g.
+    # "direct_io=true,storage_io_thread_pool_size=32". The
+    # raiden_storage_properties key in kv_connector_extra_config wins key by
+    # key.
+    "RAIDEN_STORAGE_PROPERTIES": env_str("RAIDEN_STORAGE_PROPERTIES", ""),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
     # jobs whose blocks are about to be reused.
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S": env_float(

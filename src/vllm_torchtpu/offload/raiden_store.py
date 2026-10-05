@@ -1756,14 +1756,38 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
 # -- storage tier ---------------------------------------------------------------
 
 # kv_connector_extra_config keys for the storage tier. A non-empty value wins
-# over the RAIDEN_STORAGE_* environment variable with the same meaning.
+# over the RAIDEN_STORAGE_* environment variable with the same meaning;
+# raiden_storage_properties and RAIDEN_STORAGE_PROPERTIES merge key by key.
 _STORAGE_PATH_KEY = "raiden_storage_path"
 _STORAGE_TYPE_KEY = "raiden_storage_type"
 _STORAGE_CAPACITY_GB_KEY = "raiden_storage_capacity_gb"
 _STORAGE_MODEL_NAME_KEY = "raiden_storage_model_name"
+_STORAGE_METADATA_CACHE_ENTRIES_KEY = "raiden_storage_metadata_cache_entries"
+_STORAGE_METADATA_CACHE_TTL_KEY = "raiden_storage_metadata_cache_ttl"
+_STORAGE_PROPERTIES_KEY = "raiden_storage_properties"
 
 # The only storage backend type raiden accepts today.
 _POSIX_STORAGE_TYPE = "posix"
+
+# Raiden's own defaults for the store's metadata cache: off, and 60 seconds.
+_DEFAULT_METADATA_CACHE_ENTRIES = 0
+_DEFAULT_METADATA_CACHE_TTL_SECS = 60
+
+# Backend properties the connector sets itself, mapped to where each comes
+# from. The pass-through properties may not set them, so each has one source.
+_MANAGED_STORAGE_PROPERTIES = {
+    "root_dir": f"{_STORAGE_PATH_KEY} / RAIDEN_STORAGE_PATH",
+    "model_name": _STORAGE_MODEL_NAME_KEY,
+    "capacity_bytes": f"{_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB",
+    "metadata_cache_max_entries": (
+        f"{_STORAGE_METADATA_CACHE_ENTRIES_KEY} / RAIDEN_STORAGE_METADATA_CACHE_ENTRIES"
+    ),
+    "metadata_cache_ttl_secs": (
+        f"{_STORAGE_METADATA_CACHE_TTL_KEY} / RAIDEN_STORAGE_METADATA_CACHE_TTL"
+    ),
+    "tp_size": "the parallel config",
+    "tp_rank": "the parallel config",
+}
 
 
 @dataclass(frozen=True)
@@ -1781,6 +1805,15 @@ class RaidenStorageConfig:
     # Reported to raiden as the tier's capacity; 0 leaves it unset. Raiden
     # does not enforce it, and nothing deletes files from root_dir.
     capacity_bytes: int = 0
+    # The store's cache of storage files it has found: its size in files
+    # (0 turns it off, -1 removes the limit) and how long, in seconds, an
+    # unused entry lasts (-1: no expiry).
+    metadata_cache_entries: int = _DEFAULT_METADATA_CACHE_ENTRIES
+    metadata_cache_ttl_secs: int = _DEFAULT_METADATA_CACHE_TTL_SECS
+    # Further backend properties as (key, value) pairs sorted by key, passed
+    # to raiden unread, so a new backend tunable needs no change here.
+    # Raiden checks them when it builds the backend.
+    properties: tuple[tuple[str, str], ...] = ()
 
 
 def _storage_setting(extra_config: Mapping[str, Any], key: str, env_value: str) -> str:
@@ -1805,6 +1838,72 @@ def _parse_storage_capacity(value: str) -> int:
             f"a positive number of GiB, got {value!r}"
         )
     return int(gib * (1 << 30))
+
+
+def _parse_metadata_cache_setting(
+    value: str, *, default: int, minimum: int, what: str
+) -> int:
+    """An integer of at least `minimum`, or -1 for no limit, the rule raiden
+    applies too. "" reads as `default`; `what` names the setting."""
+    if not value:
+        return default
+    try:
+        number = int(value)
+    except ValueError:
+        number = None
+    if number is None or (number < minimum and number != -1):
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: {what} must be an integer >= "
+            f"{minimum}, or -1 for no limit; got {value!r}"
+        )
+    return number
+
+
+def _parse_storage_properties(value: Any, source: str) -> dict[str, str]:
+    """Pass-through backend properties from one source: a mapping, or a
+    string of comma-separated key=value pairs.
+
+    Only their shape is checked; raiden checks the values. Each becomes the
+    string raiden takes, a boolean "true" or "false". An empty value leaves
+    its key out, so the other source or raiden's default applies.
+    """
+    where = f"TPURaidenOffloadingConnector: storage properties ({source})"
+    if value is None or isinstance(value, Mapping):
+        items = list((value or {}).items())
+    elif isinstance(value, str):
+        items = []
+        for item in filter(str.strip, value.split(",")):
+            key, sep, item_value = item.partition("=")
+            if not sep:
+                raise ValueError(f"{where}: {item.strip()!r} is not key=value")
+            items.append((key, item_value))
+    else:
+        raise ValueError(
+            f"{where} must be a mapping or a string of key=value pairs, got "
+            f"{type(value).__name__}"
+        )
+    properties: dict[str, str] = {}
+    for key, item_value in items:
+        key = str(key).strip()
+        if key in _MANAGED_STORAGE_PROPERTIES:
+            raise ValueError(
+                f"{where}: {key!r} is set by the connector, from "
+                f"{_MANAGED_STORAGE_PROPERTIES[key]}"
+            )
+        if not key or key in properties:
+            raise ValueError(f"{where}: empty or repeated key {key!r}")
+        if isinstance(item_value, bool):
+            item_value = "true" if item_value else "false"
+        elif item_value is None or isinstance(item_value, int | float):
+            item_value = "" if item_value is None else str(item_value)
+        elif not isinstance(item_value, str):
+            raise ValueError(
+                f"{where}: {key!r} must be a string, number or boolean, got "
+                f"{type(item_value).__name__}"
+            )
+        if item_value.strip():
+            properties[key] = item_value.strip()
+    return properties
 
 
 def _ensure_writable_dir(path: str) -> None:
@@ -1879,6 +1978,41 @@ def resolve_storage_config(
             extra_config, _STORAGE_CAPACITY_GB_KEY, envs.RAIDEN_STORAGE_CAPACITY_GB
         )
     )
+    metadata_cache_entries = _parse_metadata_cache_setting(
+        _storage_setting(
+            extra_config,
+            _STORAGE_METADATA_CACHE_ENTRIES_KEY,
+            envs.RAIDEN_STORAGE_METADATA_CACHE_ENTRIES,
+        ),
+        default=_DEFAULT_METADATA_CACHE_ENTRIES,
+        minimum=0,
+        what=(
+            "storage metadata cache size "
+            f"({_STORAGE_METADATA_CACHE_ENTRIES_KEY} / "
+            "RAIDEN_STORAGE_METADATA_CACHE_ENTRIES)"
+        ),
+    )
+    metadata_cache_ttl_secs = _parse_metadata_cache_setting(
+        _storage_setting(
+            extra_config,
+            _STORAGE_METADATA_CACHE_TTL_KEY,
+            envs.RAIDEN_STORAGE_METADATA_CACHE_TTL,
+        ),
+        default=_DEFAULT_METADATA_CACHE_TTL_SECS,
+        minimum=1,
+        what=(
+            "storage metadata cache TTL in seconds "
+            f"({_STORAGE_METADATA_CACHE_TTL_KEY} / RAIDEN_STORAGE_METADATA_CACHE_TTL)"
+        ),
+    )
+    properties = _parse_storage_properties(
+        envs.RAIDEN_STORAGE_PROPERTIES, "RAIDEN_STORAGE_PROPERTIES"
+    )
+    properties.update(
+        _parse_storage_properties(
+            extra_config.get(_STORAGE_PROPERTIES_KEY), _STORAGE_PROPERTIES_KEY
+        )
+    )
     root_dir = os.path.normpath(root_dir)
     _ensure_writable_dir(root_dir)
     return RaidenStorageConfig(
@@ -1888,6 +2022,9 @@ def resolve_storage_config(
             _storage_setting(extra_config, _STORAGE_MODEL_NAME_KEY, "") or model_name
         ),
         capacity_bytes=capacity_bytes,
+        metadata_cache_entries=metadata_cache_entries,
+        metadata_cache_ttl_secs=metadata_cache_ttl_secs,
+        properties=tuple(sorted(properties.items())),
     )
 
 
@@ -1935,6 +2072,8 @@ def _new_storage_backend_config(impl: Any, storage: RaidenStorageConfig) -> Any:
         )
     cfg = backend_config_cls()
     cfg.type = storage.storage_type
+    for key, value in storage.properties:
+        cfg.set_property(key, value)
     cfg.set_property("root_dir", storage.root_dir)
     cfg.set_property("model_name", storage.model_name)
     if storage.capacity_bytes:
@@ -1947,13 +2086,23 @@ def build_store_storage_backend_config(
 ) -> Any:
     """The scheduler-side store's config for the storage tier.
 
-    The store decides whether storage has a block by looking for rank 0's
-    file, so it needs the TP size to build that path. It must be set here:
-    raiden would otherwise take the store's shard count, which this connector
-    sets to 1.
+    The store decides whether storage has a block by looking for the block's
+    shard files, so it needs the TP size to build their paths; left unset,
+    raiden would assume 1. It goes in `parallelism`, as for the workers.
+    tpu-sync-torch up to 0.0.1.dev20261002213151 reads the store's TP size
+    from the `tp_size` property instead, so that carries it too; later
+    builds overwrite the property from `parallelism`.
+
+    Only the store gets the metadata cache settings: the cache sits in front
+    of its lookups.
     """
     cfg = _new_storage_backend_config(impl, storage)
+    parallelism = impl.ParallelismConfig()
+    parallelism.tp_size = coords.tp_size
+    cfg.parallelism = parallelism
     cfg.set_property("tp_size", str(coords.tp_size))
+    cfg.set_property("metadata_cache_max_entries", str(storage.metadata_cache_entries))
+    cfg.set_property("metadata_cache_ttl_secs", str(storage.metadata_cache_ttl_secs))
     return cfg
 
 
@@ -2166,7 +2315,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
                 logger.info(
                     "TPURaidenOffloadingConnector: storage tier on: %s under %s "
-                    "(model dir %r, %d TP ranks, capacity %s)",
+                    "(model dir %r, %d TP ranks, capacity %s, metadata cache "
+                    "%d entries / %ds TTL, properties %s)",
                     storage.storage_type,
                     storage.root_dir,
                     storage.model_name,
@@ -2176,6 +2326,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                         if storage.capacity_bytes
                         else "unset"
                     ),
+                    storage.metadata_cache_entries,
+                    storage.metadata_cache_ttl_secs,
+                    dict(storage.properties) or "none",
                 )
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
@@ -2207,9 +2360,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
                 coords = worker_storage_rank_coords()
-                # The store looks for rank 0's file under the TP size from the
-                # config; a worker that disagreed would write where it never
-                # looks.
+                # The store looks for a block's files under the TP size from
+                # the config; a worker that disagreed would write where the
+                # store never looks.
                 assert coords.tp_size == self.tp_size, (
                     "TPURaidenOffloadingConnector: worker TP group size "
                     f"{coords.tp_size} != configured tp_size {self.tp_size}"
