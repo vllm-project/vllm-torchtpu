@@ -56,9 +56,53 @@ def clear_eagle_block_drop(kv_cache_manager) -> None:
         coordinator.attention_groups = [g._replace(use_eagle=False) for g in groups]
 
 
+def patch_offload_without_eagle_groups() -> None:
+    """Build the KV offloading scheduler config without EAGLE groups.
+
+    The offloading connector applies its own copy of the drop: each EAGLE
+    group's trailing chunk is skipped on store while decoding and popped from
+    every host lookup. With no annotated group it flags *every* group, the
+    Mamba groups included, so a host hit must end one chunk before the
+    retained Mamba boundary. Under sparse retention
+    (``--prefix-cache-retention-interval 0``) no state exists there and the
+    host cache almost never hits. Like the device-side drop this only
+    protects draft-model KV, so it goes with it. ``supports_partial_tail``
+    keeps the value computed with the EAGLE groups.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        scheduler as offload_scheduler,
+    )
+
+    config_cls = offload_scheduler.SchedulerOffloadConfig
+    original_from_spec = config_cls.from_spec
+    if getattr(original_from_spec, "_tpu_disable_eagle_block_drop_patch", False):
+        return
+
+    @wraps(original_from_spec)
+    def from_spec(spec, vllm_config, kv_cache_config):
+        config = original_from_spec(spec, vllm_config, kv_cache_config)
+        if not any(group.is_eagle_group for group in config.kv_group_configs):
+            return config
+        logger.info(
+            "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: KV offloading keeps the "
+            "trailing chunk of every group."
+        )
+        return config._replace(
+            kv_group_configs=tuple(
+                group._replace(is_eagle_group=False)
+                for group in config.kv_group_configs
+            )
+        )
+
+    # pyrefly: ignore[missing-attribute]
+    from_spec._tpu_disable_eagle_block_drop_patch = True
+    config_cls.from_spec = staticmethod(from_spec)
+
+
 def patch_disable_eagle_block_drop() -> None:
     if not envs.VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP:
         return
+    patch_offload_without_eagle_groups()
     import vllm.v1.core.sched.scheduler as scheduler_module
     from vllm.v1.core.sched.scheduler import Scheduler
 

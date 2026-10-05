@@ -42,6 +42,58 @@ def _install(monkeypatch, fake_init=None):
     eagle_block_drop.patch_disable_eagle_block_drop()
 
 
+def _offload_config(eagle_groups):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        GroupOffloadConfig,
+        SchedulerOffloadConfig,
+    )
+
+    groups = tuple(
+        GroupOffloadConfig(
+            group_idx=i,
+            tokens_per_block=BLOCK,
+            tokens_per_chunk=BLOCK,
+            hashes_per_chunk=1,
+            sliding_window_size_in_chunks=1 if i < 3 else None,
+            kv_event_group_spec=None,
+            is_eagle_group=i in eagle_groups,
+        )
+        for i in range(4)
+    )
+    return SchedulerOffloadConfig(
+        kv_group_configs=groups,
+        blocks_per_chunk=1,
+        tokens_per_hash=BLOCK,
+        num_workers=8,
+        offload_prompt_only=False,
+        supports_partial_tail=False,
+    )
+
+
+def test_patched_offload_config_has_no_eagle_groups(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        SchedulerOffloadConfig,
+    )
+
+    monkeypatch.setattr(
+        SchedulerOffloadConfig,
+        "from_spec",
+        staticmethod(
+            lambda spec, vllm_config, kv_cache_config: _offload_config({0, 1, 2, 3})
+        ),
+    )
+    eagle_block_drop.patch_offload_without_eagle_groups()
+    config = SchedulerOffloadConfig.from_spec(None, None, None)
+    assert [g.is_eagle_group for g in config.kv_group_configs] == [False] * 4
+    assert [g.sliding_window_size_in_chunks for g in config.kv_group_configs] == [
+        1,
+        1,
+        1,
+        None,
+    ]
+    assert config.supports_partial_tail is False
+
+
 def test_split_back_off_matches_upstream_without_patch():
     split = Scheduler._mamba_block_aligned_split
     # Upstream: with EAGLE the chunk stops one block before the last boundary.
