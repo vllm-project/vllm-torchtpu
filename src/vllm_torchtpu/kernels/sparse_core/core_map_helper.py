@@ -19,6 +19,8 @@ and calls ``core_map`` directly on the given mesh. Near drop-in for
 (list) becomes ``scratch_types`` (dict).
 """
 
+from typing import cast
+
 from jax._src import api, lax, tree_util
 from jax._src import core as jax_core
 from jax._src.pallas import core as pl_core
@@ -26,7 +28,7 @@ from jax._src.pallas import core as pl_core
 
 def _empty_out_ref(out_type):
     # Mirrors internal `pl.kernel` logic; may need updating on JAX bumps.
-    aval = pl_core._convert_out_shape_to_aval(out_type)
+    aval = cast(jax_core.ShapedArray, pl_core._convert_out_shape_to_aval(out_type))
     memory_space = (
         None
         if isinstance(aval.memory_space, jax_core.MemorySpace)
