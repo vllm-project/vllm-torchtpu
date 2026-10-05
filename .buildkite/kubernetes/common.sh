@@ -83,6 +83,8 @@ FORWARD=(
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT
   # Set by bootstrap.sh; benchmark configs branch on it.
   NIGHTLY CREATED_BY
+  # The P/D benchmark loads its results into BigQuery when this is set.
+  BQ_UPLOAD
   # Carries the -m filter into bktec's collection step; see the sharded steps
   # in pipeline_tests_kube.yml.
   PYTEST_ADDOPTS

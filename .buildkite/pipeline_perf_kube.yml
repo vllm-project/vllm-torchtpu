@@ -55,11 +55,8 @@ x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
 x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
-  # Not in a K3=1 build, which runs the Kimi-K3 step at the bottom and nothing
-  # else.
   - group: ":kubernetes: Perf and Eval on TPU"
     key: "perf_tpu"
-    if: build.env("K3") != "1"
     steps:
       - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
         <<: *perf_step
@@ -226,7 +223,7 @@ steps:
     # that was never pushed and holds the fleet in ImagePullBackOff.
     depends_on:
       - "build_docker"
-    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
+    if: 'build.env("NIGHTLY") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -243,7 +240,7 @@ steps:
     key: "perf_nightly_deepseek_v4_pro_dp16_ep"
     depends_on:
       - "build_docker"
-    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
+    if: 'build.env("NIGHTLY") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -273,7 +270,7 @@ steps:
     key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
     depends_on:
       - "build_docker"
-    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
+    if: 'build.env("NIGHTLY") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -286,18 +283,66 @@ steps:
     commands:
       - .buildkite/kubernetes/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep
 
-  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips. This is the only
-  # nightly of it: pipeline_perf.yml has no bare-metal counterpart. That shape
-  # has a queue and chips of its own, so this waits only for the image, not for
-  # the v7x-8 and v7x-16 steps above.
+  # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
+  # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
+  # table and through the same parse_gke_results.py as before, tagged
+  # runner=kube by CI_RUNNER. It holds eight chips on 2x2x1, so it queues with
+  # the v7x-8 steps rather than taking chips from them.
+  - label: ":kubernetes: Perf: Nightly Qwen3.5-397B 1P1D P/D benchmark"
+    key: "perf_nightly_qwen35_397b_1p1d"
+    depends_on: "build_docker"
+    if: 'build.env("NIGHTLY") == "1"'
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    env:
+      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+      BQ_UPLOAD: "1"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_jobset.sh qwen3.5-397b-1p1d.yaml
+
+  # The two Kimi-K3 steps run last. They take the 2x2x4 queue's own chips,
+  # which the v7x-8 and v7x-16 steps above borrow while it is idle; started
+  # alongside those steps, Kueue would evict them to give the chips back. So
+  # each waits for everything before it, failed or not, and the 1P1D, which
+  # needs both slices, goes first.
   #
-  # Only in a K3=1 build, scheduled nightly at 03:00 PT behind the 02:00
-  # Kimi-K3 1P1D in pipeline_disagg_kube.yml: the 2x2x4 slices also serve
-  # Kimi-K3 development, and this keeps CI on them to that window.
+  # Prefill TP8 x DP4 x EP32 to decode TP8 x DP4 x EP32, each on its own 2x2x4
+  # slice.
+  - label: ":kubernetes: Perf/Eval: Nightly Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
+    key: "perf_nightly_kimi_k3_1p1d"
+    depends_on:
+      - "build_docker"
+      - step: "perf_tpu"
+        allow_failure: true
+      - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
+        allow_failure: true
+      - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
+        allow_failure: true
+      - step: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
+        allow_failure: true
+      - step: "perf_nightly_qwen35_397b_1p1d"
+        allow_failure: true
+    if: 'build.env("NIGHTLY") == "1"'
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_jobset.sh kimi-k3-1p1d-4dp8tp.yaml
+
+  # Kimi-K3 aggregated on one 2x2x4 slice, four hosts of four chips: the only
+  # nightly of it, as pipeline_perf.yml has no bare-metal counterpart.
   - label: ":kubernetes: Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
     key: "perf_nightly_kimi_k3_tp32_ep"
-    depends_on: "build_docker"
-    if: 'build.env("K3") == "1"'
+    depends_on:
+      - "build_docker"
+      - step: "perf_nightly_kimi_k3_1p1d"
+        allow_failure: true
+    if: 'build.env("NIGHTLY") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
