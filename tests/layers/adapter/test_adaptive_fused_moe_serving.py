@@ -58,6 +58,7 @@ def setup(monkeypatch):
         bridge, "build_ep_mesh", lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
     )
     monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(bridge, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(bridge, "ep_rank_order", lambda: None)
     monkeypatch.setattr(
         bridge, "ep_token_replica_groups", lambda **kw: tuple((r,) for r in range(8))
@@ -212,6 +213,78 @@ def test_admission_failure_never_falls_back(setup, monkeypatch, fp4, failure):
         conversion.assert_not_called()
         assert layer.w13_weight.dtype == torch.uint8
     setup[1].assert_not_called()
+
+
+@pytest.mark.parametrize("tp,sp", [(1, False), (8, True), (8, False)])
+def test_tp_replicated_layer_declines_to_grouped(setup, monkeypatch, tp, sp):
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+    import vllm_torchtpu
+
+    op, forbidden = setup
+    declined = tp > 1 and not sp
+    layer, method = make_layer(fp4=False), make_method(fp4=False)
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = sp
+    mock_conversion(monkeypatch, fp4=False)
+    monkeypatch.setattr(bridge, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(fp8, "prebuild_fused_moe_kernel", Mock())
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    log = Mock()
+    monkeypatch.setattr(bridge.logger, "info_once", log)
+    method.process_weights_after_loading(layer)
+    assert method._use_adaptive_fused_moe is not declined
+    assert method.supports_internal_mk is not declined
+    assert bridge._build_op.called is not declined
+    if declined:
+        fp8.prebuild_fused_moe_kernel.assert_called_once()
+    assert not legacy.fused_moe_ep_supported(method)
+    reasons = [c.args[0] for c in log.call_args_list if "not engaged" in c.args[0]]
+    assert len(reasons) == declined
+
+    # With the layer declined, the runner keeps vLLM's single all-reduce.
+    class Runner:
+        _fused_output_is_reduced = property(lambda self: False)
+
+    monkeypatch.setattr(mr, "MoERunner", Runner)
+    vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
+    runner = Runner()
+    runner.moe_config = SimpleNamespace(skip_final_all_reduce=False)
+    runner._quant_method = method
+    assert runner._fused_output_is_reduced is not declined
+
+    x = torch.ones(2, 512, dtype=torch.bfloat16)
+    if sp:
+        return
+    if not declined:
+        assert method.apply_monolithic(layer, x, torch.ones(2, 8)) is x
+        return
+    layer._experts_start = torch.zeros(1, dtype=torch.int32)
+    routed = (torch.ones(2, 2), torch.zeros(2, 2, dtype=torch.int32))
+    monkeypatch.setattr(fp8.moe_routing, "route", Mock(return_value=routed))
+    grouped = torch.zeros_like(x)
+    monkeypatch.setattr(fp8, "fused_moe_gmm", Mock(return_value=grouped))
+    assert method.apply_monolithic(layer, x, torch.ones(2, 8)) is grouped
+    op.assert_not_called()
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy_flag", [None, "0"])
+def test_reduced_patch_installed_whenever_adaptive_can_arm(monkeypatch, legacy_flag):
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+    import vllm_torchtpu
+
+    class Runner:
+        _fused_output_is_reduced = property(lambda self: False)
+
+    monkeypatch.setattr(mr, "MoERunner", Runner)
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "adaptive")
+    if legacy_flag is None:
+        monkeypatch.delenv("USE_MOE_FUSED_EP_KERNEL", raising=False)
+    else:
+        monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", legacy_flag)
+    vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
+    assert getattr(Runner, "_tpu_fused_output_reduced_patch", False)
 
 
 @pytest.mark.parametrize("armed", [False, True])

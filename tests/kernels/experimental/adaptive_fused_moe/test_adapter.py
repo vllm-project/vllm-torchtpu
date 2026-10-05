@@ -237,3 +237,86 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
     gate = SimpleNamespace(astype=lambda _: "gate")
     functions[-1](1, 2, 3, 4, 5, gate, 6)
     assert kernel.call_args.kwargs["token_replica_groups"] == groups
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_prebuild_fixes_padded_row_skip_at_weight_load(context, monkeypatch, skip):
+    from vllm.compilation import backends
+
+    monkeypatch.setattr(bridge.envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip)
+    _, op = context
+    prebuild(layer())
+    assert op.call_args.kwargs["skip_padded_tokens"] is skip
+    # A draft layer reads a mask its own forward never wrote.
+    with backends.set_model_tag("eagle_head"):
+        prebuild(layer())
+    assert op.call_args.kwargs["skip_padded_tokens"] is False
+
+
+def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_padding_mask(
+    monkeypatch,
+):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    specs = []
+
+    def create(name, fn, **kwargs):
+        specs.append(len(kwargs["input_partition_specs"]))
+        return Mock(side_effect=lambda *args: args)
+
+    monkeypatch.setattr(bridge, "jax_op", create)
+    mesh = object()
+    plain = bridge._build_op(mesh, 2, True, "silu", None)
+    run = bridge._build_op(mesh, 2, True, "silu", None, skip_padded_tokens=True)
+    assert run is not plain
+    assert run is bridge._build_op(mesh, 2, True, "silu", None, skip_padded_tokens=True)
+    assert specs == [7, 8]
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: run})
+    value = layer()
+    args = (
+        torch.ones(8, 512, dtype=torch.bfloat16),
+        value.w13_weight,
+        value.w2_weight,
+        value.w13_weight_scale_inv,
+        value.w2_weight_scale_inv,
+        torch.ones(8, 8),
+    )
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    with pytest.raises(RuntimeError, match="padding state"):
+        bridge.run_adaptive_fused_moe(owner, *args)
+    state = token_padding.TokenPaddingState.create(16, device="cpu")
+    state.update(5, 8)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    # The forward follows the build, not the environment.
+    monkeypatch.setattr(bridge.envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    call = bridge.run_adaptive_fused_moe(owner, *args)
+    assert len(call) == 8
+    assert call[7].dtype == torch.int32
+    assert call[7].tolist() == [0] * 5 + [1] * 3
+
+
+def test_built_padded_op_passes_the_mask_to_the_kernel(monkeypatch):
+    import importlib
+
+    package = importlib.import_module(
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
+    kernel = Mock(return_value="output")
+    monkeypatch.setattr(package, "adaptive_fused_moe", kernel)
+    monkeypatch.setattr(bridge, "_OPS", {})
+    functions = []
+
+    def create(name, fn, **kwargs):
+        functions.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", create)
+    mesh = object()
+    bridge._build_op(mesh, 2, True, "silu", None)
+    bridge._build_op(mesh, 2, True, "silu", None, skip_padded_tokens=True)
+    gate = SimpleNamespace(astype=lambda _: "gate")
+    functions[0](1, 2, 3, 4, 5, gate, 6)
+    assert kernel.call_args.kwargs["padded"] is None
+    functions[1](1, 2, 3, 4, 5, gate, 6, "mask")
+    assert kernel.call_args.kwargs["padded"] == "mask"
