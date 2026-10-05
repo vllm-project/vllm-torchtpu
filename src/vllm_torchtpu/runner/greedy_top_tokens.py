@@ -50,6 +50,7 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
             "an lm_head and a logits_processor.get_top_tokens; unset "
             "TPU_GREEDY_TOP_TOKENS for this model."
         )
+    assert processor is not None and head is not None
     if processor.scale <= 0.0:
         raise NotImplementedError(
             "TPU_GREEDY_TOP_TOKENS: the argmax reduction needs a positive "

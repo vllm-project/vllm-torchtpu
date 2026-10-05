@@ -4123,6 +4123,8 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
         if top_tokens:
+            assert self.rejection_sampler is not None
+            assert self.speculative_config is not None
             bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
@@ -5928,6 +5930,8 @@ class TPUModelRunner(GPUModelRunner):
         warm_accept_u: torch.Tensor,
     ) -> None:
         """The greedy verify path on greedy tokens (TPU_GREEDY_TOP_TOKENS)."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
         tokens = torch.zeros((num_tokens, 1), dtype=torch.int64).to(self.device)
         bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
             tokens, bonus_logits_indices, target_logits_indices
