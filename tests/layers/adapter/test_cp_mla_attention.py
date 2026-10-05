@@ -357,13 +357,13 @@ def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "enabled,tokens,allow_a2a,expect_a2a",
+    "enabled,tokens,is_backbone,expect_a2a",
     [
         (False, 8, True, False),
         (True, 8, True, True),
         (True, 256, True, True),
         (True, 257, True, False),
-        # A single-trace caller (the spec-decode draft) keeps the
+        # The MTP drafter, traced once for every bucket, keeps the
         # reduce-scatter at every size.
         (True, 8, False, False),
         (True, 257, False, False),
@@ -371,7 +371,7 @@ def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
     ],
 )
 def test_merge_picks_the_all_to_all(
-    enabled, tokens, allow_a2a, expect_a2a, monkeypatch
+    enabled, tokens, is_backbone, expect_a2a, monkeypatch
 ):
     calls = []
     monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", enabled, raising=False)
@@ -386,7 +386,9 @@ def test_merge_picks_the_all_to_all(
     outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
     group = _FakeGroup(outputs, lses, 0)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
-    cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], allow_a2a=allow_a2a)
+    cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone
+    )
     assert calls == ([tokens] if expect_a2a else [])
 
 
