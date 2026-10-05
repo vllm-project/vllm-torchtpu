@@ -1762,8 +1762,6 @@ _STORAGE_PATH_KEY = "raiden_storage_path"
 _STORAGE_TYPE_KEY = "raiden_storage_type"
 _STORAGE_CAPACITY_GB_KEY = "raiden_storage_capacity_gb"
 _STORAGE_MODEL_NAME_KEY = "raiden_storage_model_name"
-_STORAGE_METADATA_CACHE_ENTRIES_KEY = "raiden_storage_metadata_cache_entries"
-_STORAGE_METADATA_CACHE_TTL_KEY = "raiden_storage_metadata_cache_ttl"
 _STORAGE_PROPERTIES_KEY = "raiden_storage_properties"
 # Experimental, for testing only: see resolve_storage_config.
 _STORAGE_SKIP_PARALLELISM_CHECK_KEY = (
@@ -1773,22 +1771,12 @@ _STORAGE_SKIP_PARALLELISM_CHECK_KEY = (
 # The only storage backend type raiden accepts today.
 _POSIX_STORAGE_TYPE = "posix"
 
-# Raiden's own defaults for the store's metadata cache: off, and 60 seconds.
-_DEFAULT_METADATA_CACHE_ENTRIES = 0
-_DEFAULT_METADATA_CACHE_TTL_SECS = 60
-
 # Backend properties the connector sets itself, mapped to where each comes
 # from. The pass-through properties may not set them, so each has one source.
 _MANAGED_STORAGE_PROPERTIES = {
     "root_dir": f"{_STORAGE_PATH_KEY} / RAIDEN_STORAGE_PATH",
     "model_name": _STORAGE_MODEL_NAME_KEY,
     "capacity_bytes": f"{_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB",
-    "metadata_cache_max_entries": (
-        f"{_STORAGE_METADATA_CACHE_ENTRIES_KEY} / RAIDEN_STORAGE_METADATA_CACHE_ENTRIES"
-    ),
-    "metadata_cache_ttl_secs": (
-        f"{_STORAGE_METADATA_CACHE_TTL_KEY} / RAIDEN_STORAGE_METADATA_CACHE_TTL"
-    ),
     "tp_size": "the parallel config",
     "tp_rank": "the parallel config",
 }
@@ -1811,14 +1799,11 @@ class RaidenStorageConfig:
     # Reported to raiden as the tier's capacity; 0 leaves it unset. Raiden
     # does not enforce it, and nothing deletes files from root_dir.
     capacity_bytes: int = 0
-    # The store's cache of storage files it has found: its size in files
-    # (0 turns it off, -1 removes the limit) and how long, in seconds, an
-    # unused entry lasts (-1: no expiry).
-    metadata_cache_entries: int = _DEFAULT_METADATA_CACHE_ENTRIES
-    metadata_cache_ttl_secs: int = _DEFAULT_METADATA_CACHE_TTL_SECS
     # Further backend properties as (key, value) pairs sorted by key, passed
-    # to raiden unread, so a new backend tunable needs no change here.
-    # Raiden checks them when it builds the backend.
+    # to the store and every worker unread, so a new backend tunable needs no
+    # change here. The store's metadata cache (metadata_cache_max_entries,
+    # metadata_cache_ttl_secs) is set this way too; workers check those but
+    # do not use them. Raiden checks every value when it builds the backend.
     properties: tuple[tuple[str, str], ...] = ()
 
 
@@ -1844,25 +1829,6 @@ def _parse_storage_capacity(value: str) -> int:
             f"a positive number of GiB, got {value!r}"
         )
     return int(gib * (1 << 30))
-
-
-def _parse_metadata_cache_setting(
-    value: str, *, default: int, minimum: int, what: str
-) -> int:
-    """An integer of at least `minimum`, or -1 for no limit, the rule raiden
-    applies too. "" reads as `default`; `what` names the setting."""
-    if not value:
-        return default
-    try:
-        number = int(value)
-    except ValueError:
-        number = None
-    if number is None or (number < minimum and number != -1):
-        raise ValueError(
-            f"TPURaidenOffloadingConnector: {what} must be an integer >= "
-            f"{minimum}, or -1 for no limit; got {value!r}"
-        )
-    return number
 
 
 def _parse_storage_flag(value: Any, *, default: bool, what: str) -> bool:
@@ -2025,33 +1991,6 @@ def resolve_storage_config(
             extra_config, _STORAGE_CAPACITY_GB_KEY, envs.RAIDEN_STORAGE_CAPACITY_GB
         )
     )
-    metadata_cache_entries = _parse_metadata_cache_setting(
-        _storage_setting(
-            extra_config,
-            _STORAGE_METADATA_CACHE_ENTRIES_KEY,
-            envs.RAIDEN_STORAGE_METADATA_CACHE_ENTRIES,
-        ),
-        default=_DEFAULT_METADATA_CACHE_ENTRIES,
-        minimum=0,
-        what=(
-            "storage metadata cache size "
-            f"({_STORAGE_METADATA_CACHE_ENTRIES_KEY} / "
-            "RAIDEN_STORAGE_METADATA_CACHE_ENTRIES)"
-        ),
-    )
-    metadata_cache_ttl_secs = _parse_metadata_cache_setting(
-        _storage_setting(
-            extra_config,
-            _STORAGE_METADATA_CACHE_TTL_KEY,
-            envs.RAIDEN_STORAGE_METADATA_CACHE_TTL,
-        ),
-        default=_DEFAULT_METADATA_CACHE_TTL_SECS,
-        minimum=1,
-        what=(
-            "storage metadata cache TTL in seconds "
-            f"({_STORAGE_METADATA_CACHE_TTL_KEY} / RAIDEN_STORAGE_METADATA_CACHE_TTL)"
-        ),
-    )
     properties = _parse_storage_properties(
         envs.RAIDEN_STORAGE_PROPERTIES, "RAIDEN_STORAGE_PROPERTIES"
     )
@@ -2069,8 +2008,6 @@ def resolve_storage_config(
             _storage_setting(extra_config, _STORAGE_MODEL_NAME_KEY, "") or model_name
         ),
         capacity_bytes=capacity_bytes,
-        metadata_cache_entries=metadata_cache_entries,
-        metadata_cache_ttl_secs=metadata_cache_ttl_secs,
         properties=tuple(sorted(properties.items())),
     )
 
@@ -2162,24 +2099,19 @@ def build_store_storage_backend_config(
 ) -> Any:
     """The scheduler-side store's config for the storage tier.
 
-    The store decides whether storage has a block by looking for all of the
-    block's shard files, so it needs their count, the storage size, to build
-    their paths; left unset, raiden would assume 1. Raiden calls it the TP
-    size, and it goes in `parallelism`, as for the workers.
-    tpu-sync-torch up to 0.0.1.dev20261002213151 reads the store's TP size
-    from the `tp_size` property instead, so that carries it too; later
-    builds overwrite the property from `parallelism`.
-
-    Only the store gets the metadata cache settings: the cache sits in front
-    of its lookups.
+    The store decides whether storage has a block by looking for the block's
+    shard files, and their paths include the shard count, the storage size;
+    left unset, raiden would assume 1. Raiden calls it the TP size, and it
+    goes in `parallelism`, as for the workers. tpu-sync-torch up to
+    0.0.1.dev20261002213151 reads the store's TP size from the `tp_size`
+    property instead, so that carries it too; later builds overwrite the
+    property from `parallelism`.
     """
     cfg = _new_storage_backend_config(impl, storage)
     parallelism = impl.ParallelismConfig()
     parallelism.tp_size = coords.storage_size
     cfg.parallelism = parallelism
     cfg.set_property("tp_size", str(coords.storage_size))
-    cfg.set_property("metadata_cache_max_entries", str(storage.metadata_cache_entries))
-    cfg.set_property("metadata_cache_ttl_secs", str(storage.metadata_cache_ttl_secs))
     return cfg
 
 
@@ -2396,8 +2328,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 logger.info(
                     "TPURaidenOffloadingConnector: storage tier on: %s under %s "
                     "(model dir %r, %d shards per block (TP %d x PCP %d), "
-                    "capacity %s, metadata cache %d entries / %ds TTL, "
-                    "properties %s)",
+                    "capacity %s, properties %s)",
                     storage.storage_type,
                     storage.root_dir,
                     storage.model_name,
@@ -2409,8 +2340,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                         if storage.capacity_bytes
                         else "unset"
                     ),
-                    storage.metadata_cache_entries,
-                    storage.metadata_cache_ttl_secs,
                     dict(storage.properties) or "none",
                 )
             self._manager = RaidenOffloadingManager(

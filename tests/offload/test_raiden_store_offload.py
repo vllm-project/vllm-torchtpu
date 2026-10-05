@@ -2624,7 +2624,6 @@ class TestStorageConfig(unittest.TestCase):
         os.environ.update(
             RAIDEN_STORAGE_TYPE="s3",
             RAIDEN_STORAGE_CAPACITY_GB="x",
-            RAIDEN_STORAGE_METADATA_CACHE_TTL="0",
             RAIDEN_STORAGE_PROPERTIES="tp_size=2",
             EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK="maybe",
         )
@@ -2669,33 +2668,19 @@ class TestStorageConfig(unittest.TestCase):
         self.assertEqual(cfg.root_dir, nested)
         self.assertTrue(os.path.isdir(nested))
 
-    def test_metadata_cache_settings(self):
+    def test_metadata_cache_is_set_through_properties(self):
+        # The store's metadata cache is tuned with ordinary properties, passed
+        # on unread like the rest; raiden checks the values.
         os.environ.update(
             RAIDEN_STORAGE_PATH=self.root,
-            RAIDEN_STORAGE_METADATA_CACHE_ENTRIES="-1",
-            RAIDEN_STORAGE_METADATA_CACHE_TTL="300",
-        )
-        cfg = self._resolve()
-        self.assertEqual(
-            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (-1, 300)
+            RAIDEN_STORAGE_PROPERTIES="metadata_cache_max_entries=-1",
         )
         cfg = self._resolve(
-            {
-                "raiden_storage_metadata_cache_entries": 4096,
-                "raiden_storage_metadata_cache_ttl": -1,
-            }
+            {"raiden_storage_properties": {"metadata_cache_ttl_secs": 300}}
         )
         self.assertEqual(
-            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (4096, -1)
-        )
-        # An empty variable means the default, as an unset one does.
-        os.environ.update(
-            RAIDEN_STORAGE_METADATA_CACHE_ENTRIES="",
-            RAIDEN_STORAGE_METADATA_CACHE_TTL="",
-        )
-        cfg = self._resolve()
-        self.assertEqual(
-            (cfg.metadata_cache_entries, cfg.metadata_cache_ttl_secs), (0, 60)
+            cfg.properties,
+            (("metadata_cache_max_entries", "-1"), ("metadata_cache_ttl_secs", "300")),
         )
 
     def test_properties_merge_key_by_key(self):
@@ -2751,9 +2736,11 @@ class TestStorageConfig(unittest.TestCase):
     def test_env_property_the_connector_sets_is_refused(self):
         os.environ.update(
             RAIDEN_STORAGE_PATH=self.root,
-            RAIDEN_STORAGE_PROPERTIES="metadata_cache_ttl_secs=5",
+            RAIDEN_STORAGE_PROPERTIES="capacity_bytes=5",
         )
-        with self.assertRaisesRegex(ValueError, "RAIDEN_STORAGE_METADATA_CACHE_TTL"):
+        with self.assertRaisesRegex(
+            ValueError, "capacity_bytes.*RAIDEN_STORAGE_CAPACITY_GB"
+        ):
             self._resolve()
 
     def test_rejects_bad_settings(self):
@@ -2778,22 +2765,6 @@ class TestStorageConfig(unittest.TestCase):
                 {"raiden_storage_capacity_gb": "inf"},
                 {},
                 "positive",
-            ),
-            "fractional cache size": (
-                {"raiden_storage_metadata_cache_entries": "1.5"},
-                {},
-                "cache size",
-            ),
-            "cache size below -1": (
-                {"raiden_storage_metadata_cache_entries": -2},
-                {},
-                "cache size",
-            ),
-            "zero cache TTL": ({"raiden_storage_metadata_cache_ttl": 0}, {}, "TTL"),
-            "cache TTL with a unit": (
-                {"raiden_storage_metadata_cache_ttl": "60s"},
-                {},
-                "TTL",
             ),
             "property without a value": (
                 {properties: "direct_io"},
@@ -2910,19 +2881,20 @@ class TestStorageBackendConfigs(unittest.TestCase):
                 "model_name": "org/model",
                 "capacity_bytes": str(1 << 30),
                 "tp_size": "4",
-                "metadata_cache_max_entries": "0",
-                "metadata_cache_ttl_secs": "60",
             },
         )
 
     def test_pass_through_properties_reach_store_and_workers(self):
         from vllm_torchtpu.offload import raiden_store as rs
 
-        storage = _storage_config(
-            metadata_cache_entries=1024,
-            metadata_cache_ttl_secs=-1,
-            properties=(("direct_io", "true"), ("lookup_batch_size", "64")),
-        )
+        properties = {
+            "direct_io": "true",
+            # Only the store builds the metadata cache; workers check these
+            # values when they build their backend, then ignore them.
+            "metadata_cache_max_entries": "1024",
+            "metadata_cache_ttl_secs": "-1",
+        }
+        storage = _storage_config(properties=tuple(sorted(properties.items())))
         store = rs.build_store_storage_backend_config(
             FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(0, 4)
         )
@@ -2930,13 +2902,8 @@ class TestStorageBackendConfigs(unittest.TestCase):
             FAKE_STORAGE_IMPL, storage, rs.StorageRankCoords(1, 4)
         )
         for cfg in (store, worker):
-            self.assertEqual(cfg.properties["direct_io"], "true")
-            self.assertEqual(cfg.properties["lookup_batch_size"], "64")
-        # The metadata cache sits in front of the store's lookups only.
-        self.assertEqual(store.properties["metadata_cache_max_entries"], "1024")
-        self.assertEqual(store.properties["metadata_cache_ttl_secs"], "-1")
-        self.assertNotIn("metadata_cache_max_entries", worker.properties)
-        self.assertNotIn("metadata_cache_ttl_secs", worker.properties)
+            for key, value in properties.items():
+                self.assertEqual(cfg.properties[key], value)
 
     def test_worker_config(self):
         from vllm_torchtpu.offload import raiden_store as rs
@@ -3001,8 +2968,8 @@ class TestStorageBackendConfigs(unittest.TestCase):
             for tp in range(2)
         )
         self.assertEqual(ranks, list(range(8)))
-        # PCP=8, TP=1: PCP rank 5 writes tp8_r5, and the store looks for all
-        # eight files of a block.
+        # PCP=8, TP=1: PCP rank 5 writes tp8_r5, and the store looks for a
+        # block's files under tp8.
         worker = rs.build_worker_storage_backend_config(
             FAKE_STORAGE_IMPL,
             _storage_config(),
