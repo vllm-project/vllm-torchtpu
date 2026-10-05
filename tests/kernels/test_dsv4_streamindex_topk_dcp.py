@@ -128,6 +128,34 @@ def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
     np.testing.assert_array_equal(got, want)
 
 
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_sparsecore_fused_pack_matches_reference(dcp_size):
+    """Fused SparseCore gather + pack matches take_along_axis + reference pack."""
+    _require_sparsecore()
+    num_rows, k = 16, 128
+    rng = np.random.default_rng(20261003)
+    # Slots can come from any rank [0, dcp_size * k)
+    slots = np.stack([
+        rng.choice(dcp_size * k, size=k, replace=False).astype(np.int32)
+        for _ in range(num_rows)
+    ])
+    slots[0, -5:] = -1
+    idxs = rng.integers(0, 100000, size=(num_rows, k), dtype=np.int32)
+    idxs[1, -3:] = -1
+
+    for r in range(dcp_size):
+        lo = r * k
+        hi = lo + k
+        ours = (slots >= lo) & (slots < hi)
+        safe = np.maximum(slots, 0)
+        merged = np.where(ours, np.take_along_axis(idxs, safe % k, axis=1), -1)
+        want = _xla_pack_reference(jnp.asarray(merged))
+        got = dcp_sc_compact.pack_owned_winners(
+            jnp.asarray(slots), jnp.asarray(idxs), r
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
     """Stages 1-3 of `streamindex_topk_dcp` in numpy, as `resolve` receives them.
 

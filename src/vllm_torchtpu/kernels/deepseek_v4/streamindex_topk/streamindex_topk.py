@@ -1234,13 +1234,14 @@ def streamindex_topk_dcp(
       3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
          `[T, dcp_size * k]` scores to select the exact top-k global winners:
          `[T, dcp_size * k] -> [T, k]`.
-      4. Rank-Local Filtering: `dcp_sc_compact.resolve_owned_winners` keeps the
+      4. Rank-Local Filtering: `dcp_sc_compact.pack_owned_winners` keeps the
          slots whose chunk came from `dcp_rank`, resolves them against this
          rank's own pre-gather indices at `slot % k`, and left-packs them into a
-         `-1` padded prefix. Those indices are rank-local already -- they never
-         crossed the gather -- so no coordinate conversion is needed and
-         ownership is decided in exactly one place. The ranks' outputs form an
-         exact partition of the global top-k.
+         `-1` padded prefix via fused SparseCore gather and compaction.
+         Those indices are rank-local already -- they never crossed the gather
+         -- so no coordinate conversion is needed and ownership is decided in
+         exactly one place. The ranks' outputs form an exact partition of the
+         global top-k.
 
     By gathering candidates along axis 1 upfront rather than partitioning tokens
     over an `all_to_all`, all communication is consolidated into a single upfront
@@ -1348,7 +1349,7 @@ def streamindex_topk_dcp(
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
             write_empty_rows=True,
         )
-        return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
+        return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
 
     replicated = P()
     return jax.shard_map(
