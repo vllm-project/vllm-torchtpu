@@ -116,6 +116,9 @@ N_PREFETCH = (
 # weight format and the model carry them, and each absent one has to drop
 # out of the MIDDLE of the tuple, leaving the operands after it in place.
 N_STAGING_INPUTS = 2  # token-gather table and ungathered token buffer
+# A sparse-dispatch build (sparse_waves > 0) takes one more HBM operand, the
+# dispatch table, right after the token buffer, and the start kernel's
+# receive semaphores as a trailing semaphore operand.
 N_WEIGHT_SLABS = 2  # the gate/up and down weight slabs
 N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 #                     them
@@ -536,12 +539,63 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    sparse_waves=0,
+    sparse_stream_groups=(),
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    sparse_waves=0 is the production kernel: its rows come from the
+    all-gathered token buffer. sparse_waves=W > 0 is the experimental
+    sparse-dispatch form (fused_ep_moe_v2's sparse_waves, sparse_dispatch.py):
+    the rows arrive by a pairwise exchange that
+    async_dispatch.ragged_a2a_start_waves starts BEFORE this kernel, split
+    into W waves of g_local / W experts laid out in visit order. The token
+    buffer operand is then the start kernel's receive buffer, and before an
+    expert's first tile the kernel waits only for the waves up to that
+    expert's, so the first experts compute while later waves are in flight.
+
+    sparse_stream_groups (sparse_dispatch.stream_groups; () is off) spreads
+    the last visited expert, each shard's busiest, over the waves: its
+    source runs are laid out from this shard on
+    (host.owner_first_run_starts) and group w of them arrives in wave w,
+    while the other experts fill the waves before the last
+    (host.sparse_experts_per_wave). Each of its tiles waits only for the
+    waves its rows are in; a tile whose wave has not been waited yet issues
+    its fetch after the previous tile's compute rather than before it, so
+    the wait overlaps that compute.
+    """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
         )
+    sparse = sparse_waves > 0
+    if sparse_waves < 0 or (sparse and g_local % sparse_waves):
+        raise ValueError(
+            f"sparse_waves must be 0 (off) or divide g_local={g_local}; "
+            f"got {sparse_waves}"
+        )
+    if sparse_stream_groups and (
+        not sparse
+        or len(sparse_stream_groups) != sparse_waves
+        or sum(sparse_stream_groups) != ep
+    ):
+        raise ValueError(
+            "sparse_stream_groups must be sparse_waves source-group sizes "
+            f"summing to ep={ep}; got {sparse_stream_groups} with "
+            f"sparse_waves={sparse_waves}"
+        )
+    experts_per_wave = (
+        host.sparse_experts_per_wave(
+            g_local, sparse_waves, stream=bool(sparse_stream_groups)
+        )
+        if sparse
+        else 0
+    )
+    # The first source, counted from this shard, of each streamed group
+    # after group 0.
+    stream_bounds = tuple(
+        sum(sparse_stream_groups[: w + 1]) for w in range(len(sparse_stream_groups) - 1)
+    )
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
@@ -812,7 +866,12 @@ def _build_fused_ep_moe_kernel(
         token_gather_hbm = next(it)
         # lhs_hbm is the ungathered token buffer [tokens, lane blocks, 128].
         # The wire never ships the topk weight, so it is not an operand.
+        # Under sparse dispatch it is the start kernel's receive buffer, which
+        # fills wave by wave while this kernel runs.
         lhs_hbm = next(it)
+        # Sparse dispatch: the [4 * ep, waves] i32 dispatch table. Row 3 * ep
+        # holds the rows this shard receives in each wave.
+        disp_tab_hbm = next(it) if sparse else None
         # The activation row scale exists only where the rows were quantized.
         ls_hbm = next(it) if has_act_scale else None
         w1_hbm, w2_hbm = (next(it) for _ in range(2))
@@ -823,6 +882,9 @@ def _build_fused_ep_moe_kernel(
         # same [G, N] layout as the per-channel weight scales beside them.
         w1b_hbm = next(it) if has_w1_bias else None
         w2b_hbm = next(it) if has_w2_bias else None
+        # Sparse dispatch: the start kernel's receive semaphores; wave w's
+        # rows count on slot w.
+        wave_sems = next(it) if sparse else None
         if rhs_packed4:
             # Packed-u32 weight stream: the four-bit [G, K, N] refs viewed as
             # [G, K//8, N] uint32, so the DMA moves half the bytes. This is
@@ -890,6 +952,9 @@ def _build_fused_ep_moe_kernel(
             # Never cp_sem: its start+wait users must not consume these.
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
+        # Sparse dispatch scratch: the dispatch table in scalar memory, and the
+        # number of waves already waited for.
+        disp_tab_sm, waves_done_sm = (next(it), next(it)) if sparse else (None, None)
 
         me = rank_sm[0, 0]
 
@@ -959,7 +1024,48 @@ def _build_fused_ep_moe_kernel(
                 def _(b=b):
                     weight_starts(visit_sm[b], b)
 
+        def wait_wave(w):
+            """Sparse dispatch: wait for all of wave ``w``'s rows."""
+            assert disp_tab_sm is not None
+            rows = disp_tab_sm[3 * ep, w]
+
+            @pl.when(rows > 0)
+            def _():
+                assert wave_sems is not None
+                _rows_wait(wave_sems.at[w], lhs_hbm, rows)
+
+        def wait_waves_through(last):
+            """Sparse dispatch: wait every wave up to ``last`` not yet waited.
+
+            Each wave is waited exactly once, so its semaphore returns to zero.
+            """
+            assert waves_done_sm is not None
+            first = waves_done_sm[0]
+
+            def body(w, c):
+                wait_wave(w)
+                return c
+
+            lax.fori_loop(first, last + 1, body, jnp.int32(0))
+            waves_done_sm[0] = jnp.maximum(first, last + 1)
+
+        def stream_need(e, end_block):
+            """Streaming: the last wave expert e's rows below ``end_block``
+            (expert-local blocks) arrive in. Its runs are owner-first, so
+            group w starts at the run of source me + bounds[w - 1], and the
+            rows below end_block reach group w iff that run starts below it.
+            """
+            need = jnp.int32(0)
+            for b in stream_bounds:
+                group_start = commit_start_sm[e, lax.rem(me + b, ep)]
+                need = need + (group_start < end_block).astype(jnp.int32)
+            return need
+
         prologue()
+        if sparse:
+            assert waves_done_sm is not None
+            sync(disp_tab_hbm, disp_tab_sm)
+            waves_done_sm[0] = jnp.int32(0)
         _all_pairs_barrier(ep)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
@@ -1214,7 +1320,7 @@ def _build_fused_ep_moe_kernel(
             def _():
                 _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
 
-        def prime_expert(e, lhs_slot, wslot, window_started):
+        def prime_expert(e, lhs_slot, wslot, window_started, visit_i=None):
             """Prime expert ``e``'s metadata and first activation tile.
 
             ``wslot`` is the scalar-memory slot this expert's group-zero index
@@ -1223,7 +1329,20 @@ def _build_fused_ep_moe_kernel(
             start is what ``window_started`` reports, and then only the wait
             is owed. The window is a bare HBM round trip, and issued here it
             is the one arrival at an expert's head with nothing behind it.
+            ``visit_i`` is e's position in the visit list; sparse dispatch
+            lays its waves out by that position.
             """
+            if sparse:
+                assert visit_i is not None
+                last = lax.div(visit_i, jnp.int32(experts_per_wave))
+                if stream_bounds:
+                    # The streamed expert is the last visit: its first tile
+                    # waits only for the waves its rows are in.
+                    first_blocks = jnp.minimum(expert_rows_sm[e], tile_m) // ROWBLK
+                    last = jnp.where(
+                        visit_i == n_visit - 1, stream_need(e, first_blocks), last
+                    )
+                wait_waves_through(last)
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
 
@@ -1481,6 +1600,48 @@ def _build_fused_ep_moe_kernel(
                 lhs_ready_tile(live_rows, parity)
                 other_parity = jnp.int32(1) - parity
 
+                def issue_next_tile():
+                    """Issue tile t+1's activations into the other slot."""
+                    next_t = t + 1
+                    next_group = next_t // gather_tiles
+                    next_within = lax.rem(next_t, jnp.int32(gather_tiles))
+                    next_group_slot = lax.rem(wslot + next_group, jnp.int32(2))
+                    next_group_base = slab_base + next_group * gather_payload_rows
+                    _, next_shift = gather_dma_coords(next_group_base)
+                    next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
+                    lhs_issue_tile(
+                        slab_base + next_t * tile_m,
+                        next_rows // ROWBLK,
+                        other_parity,
+                        next_group_slot,
+                        next_shift + next_within * tile_m,
+                    )
+
+                if stream_bounds:
+                    # Streaming: tile t+1 of the streamed expert may need a
+                    # wave not waited yet. Its fetch then goes out after this
+                    # tile's compute (deferred_fetch), so the wait overlaps it.
+                    next_end = (t + 1) * tile_blocks + (
+                        jnp.minimum(rows - (t + 1) * tile_m, tile_m) // ROWBLK
+                    )
+                    next_need = jnp.where(
+                        visit_i == n_visit - 1,
+                        stream_need(e, next_end),
+                        jnp.int32(0),
+                    )
+                    fetch_now = next_need < waves_done_sm[0]
+
+                def deferred_fetch():
+                    """Streaming: the fetch the wave check held back."""
+                    if stream_bounds:
+
+                        @pl.when(
+                            jnp.logical_and(t + 1 < n_tiles, jnp.logical_not(fetch_now))
+                        )
+                        def _():
+                            wait_waves_through(next_need)
+                            issue_next_tile()
+
                 @pl.when(t + 1 < n_tiles)
                 def _():
                     next_t = t + 1
@@ -1505,15 +1666,14 @@ def _build_fused_ep_moe_kernel(
                                 jnp.int32(1) - next_group_slot,
                             )
 
-                    _, next_shift = gather_dma_coords(next_group_base)
-                    next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
-                    lhs_issue_tile(
-                        slab_base + next_t * tile_m,
-                        next_rows // ROWBLK,
-                        other_parity,
-                        next_group_slot,
-                        next_shift + next_within * tile_m,
-                    )
+                    if stream_bounds:
+
+                        @pl.when(fetch_now)
+                        def _():
+                            issue_next_tile()
+
+                    else:
+                        issue_next_tile()
 
                 # The next expert's index window, a tile early. This is the
                 # only arrival the kernel waits for with nothing issued
@@ -1666,6 +1826,7 @@ def _build_fused_ep_moe_kernel(
                     rows_out, subs_out = ship_tile(
                         parity, t, tile_block_base, live_blocks
                     )
+                    deferred_fetch()
                     return (
                         tile_count + 1,
                         jnp.where(parity == 0, rows_out, carried[1]),
@@ -1676,6 +1837,7 @@ def _build_fused_ep_moe_kernel(
                     )
 
                 commit_tile(parity, t, tile_block_base, live_blocks)
+                deferred_fetch()
 
                 return (
                     tile_count + 1,
@@ -1716,6 +1878,7 @@ def _build_fused_ep_moe_kernel(
                     lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
                     next_wslot,
                     jnp.bool_(True),
+                    visit_i=visit_i + 1 if sparse else None,
                 )
 
             return carry[:-1] + (next_wslot,)
@@ -1747,7 +1910,13 @@ def _build_fused_ep_moe_kernel(
 
         @pl.when(n_visit > 0)
         def _():
-            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+            prime_expert(
+                visit_sm[0],
+                jnp.int32(0),
+                jnp.int32(0),
+                jnp.bool_(False),
+                visit_i=jnp.int32(0) if sparse else None,
+            )
 
         def run_last_tile(e, d):
             """The expert-local tile holding run (e, d)'s last block."""
@@ -1883,6 +2052,10 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
+        if sparse:
+            # Every wave, including any no visited expert reached, is waited
+            # before exit, so no receive semaphore is left with a count.
+            wait_waves_through(jnp.int32(sparse_waves - 1))
         drain_transport()
         _all_pairs_barrier(ep)
 
@@ -1954,6 +2127,14 @@ def _build_fused_ep_moe_kernel(
                 pltpu.SemaphoreType.DMA,  # mehop_scl_sem
             ]
         )
+        + (
+            [
+                pltpu.SMEM((4 * ep, sparse_waves), jnp.int32),  # disp_tab_sm
+                pltpu.SMEM((1,), jnp.int32),  # waves_done_sm
+            ]
+            if sparse
+            else []
+        )
     )
     # The staging buffer and the two weight slabs are always operands; the
     # activation row scale, the two weight scale tables and the two bias
@@ -1965,6 +2146,7 @@ def _build_fused_ep_moe_kernel(
         + N_SCALE_TABLES * int(has_scales)
         + int(has_w1_bias)
         + int(has_w2_bias)
+        + int(sparse)  # the dispatch table
     )
 
     def make_call(recv_rows):
@@ -2009,6 +2191,8 @@ def _build_fused_ep_moe_kernel(
         )
         name = (
             f"fused_ep_moe_v2"
+            f"{f'_sparse_w{sparse_waves}' if sparse else ''}"
+            f"{'_st' if stream_bounds else ''}"
             f"{'_pp' if progressive_push else ''}"
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
@@ -2019,7 +2203,8 @@ def _build_fused_ep_moe_kernel(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=N_PREFETCH,
-                in_specs=[hbm] * n_inputs,
+                in_specs=[hbm] * n_inputs
+                + ([pl.BlockSpec(memory_space=pltpu.SEMAPHORE)] if sparse else []),
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
                 grid=(),
@@ -2052,8 +2237,18 @@ def _build_fused_ep_moe_kernel(
         visit,
         counts,
         rank,
+        disp_tab=None,
+        wave_sems=None,
     ):
         """The served ragged transport form; returns arrivals and scales."""
+        # A sparse-dispatch build takes the dispatch table and the start
+        # kernel's receive semaphores, and act_q_gathered is the start
+        # kernel's receive buffer; any other build takes neither.
+        if (disp_tab is not None) != sparse or (wave_sems is not None) != sparse:
+            raise ValueError(
+                f"the kernel was built with sparse_waves={sparse_waves}, which "
+                f"{'needs' if sparse else 'takes no'} disp_tab and wave_sems"
+            )
         # tables = the block-unit transport tuple and the row-unit push
         # tuple, (rows, base) from shard_expert_slabs, act_scales the
         # activation scale slab in the dense lane-block view
@@ -2113,11 +2308,13 @@ def _build_fused_ep_moe_kernel(
             rank.astype(jnp.int32),
             token_gather.astype(jnp.int32),
             act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
+            *((disp_tab.astype(jnp.int32),) if disp_tab is not None else ()),
             *act_scale_arg,
             w1,
             w2,
             *scale_args,
             *biases,
+            *((wave_sems,) if sparse else ()),
         )
         recv, rscl, _contrib, _contrib_scl = res
         return recv, rscl

@@ -192,6 +192,35 @@ def token_gather_smem_bytes(tile_m):
     return 2 * token_gather_window_rows(tile_m) * jnp.dtype(jnp.int32).itemsize
 
 
+def owner_first_run_starts(run_rows_aligned, g_local):
+    """Run starts [E, ep] with each expert's source runs from its owner on.
+
+    Source s's run of expert e sits at position (s - e // g_local) mod ep in
+    the expert's slab instead of at position s: the owner shard's own rows
+    first, then the shards after it in mesh order, which is the order sparse
+    dispatch's streaming lands them in. A compare-reduce over [E, ep, ep]
+    rather than a gather.
+    """
+    e_total, ep = run_rows_aligned.shape
+    owner = jnp.arange(e_total, dtype=jnp.int32) // g_local
+    rel = lax.rem(jnp.arange(ep, dtype=jnp.int32)[None, :] - owner[:, None] + ep, ep)
+    ahead = rel[:, None, :] < rel[:, :, None]  # [e, s, s']: s' precedes s
+    return jnp.sum(jnp.where(ahead, run_rows_aligned[:, None, :], 0), axis=2)
+
+
+def sparse_experts_per_wave(g_local, waves, *, stream=False):
+    """Visit positions per wave in sparse dispatch's expert-wave layout.
+
+    Whole-expert waves split the g_local positions evenly. Streaming spreads
+    the last visited expert over every wave, so the other g_local - 1 fill
+    the first waves - 1 and the last wave carries only the streamed
+    expert's last source group.
+    """
+    if not stream:
+        return g_local // waves
+    return max(1, -(-(g_local - 1) // (waves - 1)))
+
+
 def mirror_run_tiles(run_start, run_rows, tile_m):
     """Mirror sublanes a run owns: the source tiles its rows fall in."""
     shift = pow2_shift(tile_m, "tile_m")
@@ -829,6 +858,7 @@ def build_routing_tables_sharded(
     shard_stride,
     all_gather_rows=None,
     gathered=None,
+    rotate_runs=False,
 ):
     """Build only the routing-plan slices consumed by shard ``me``.
 
@@ -843,6 +873,11 @@ def build_routing_tables_sharded(
     ``gathered`` supplies it instead, from a caller that folded the count row
     into the routing all-gather it was already paying for; ``topk_idx`` is
     then unused. Every table below is identical either way.
+
+    rotate_runs lays each expert's source runs out from its owner shard on
+    (owner_first_run_starts) rather than from shard 0. Every table that
+    places a row in a slab derives from the run starts, so they all follow;
+    arrival positions do not depend on the order and are unchanged.
     """
     if (gathered is None) == (all_gather_rows is None):
         raise ValueError("pass exactly one of all_gather_rows and gathered")
@@ -883,7 +918,10 @@ def build_routing_tables_sharded(
 
     run_rows = rows_by_dest.T
     run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
-    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
+    if rotate_runs:
+        run_start_aligned = owner_first_run_starts(run_rows_aligned, e_total // ep)
+    else:
+        run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
     expert_rows_aligned = run_rows_aligned.sum(axis=1)
     rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
     local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard

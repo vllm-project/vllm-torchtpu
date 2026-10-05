@@ -209,6 +209,105 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         assert "score_bias" not in forwarded
 
 
+@pytest.mark.parametrize("min_rows", [32, 128])
+@pytest.mark.parametrize("armed", [False, True])
+def test_sparse_dispatch_is_opt_in_and_gated_on_rows_per_shard(
+    monkeypatch, armed, min_rows
+):
+    """Off by default the kernel call is exactly what it was. Armed, only steps
+    with enough rows a shard take it, on the sharded plan it dispatches from;
+    a threshold under the tested floor acts as the floor."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_DISPATCH", armed)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_WAVES", 4)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS", min_rows)
+    gate = max(min_rows, bridge._SPARSE_MIN_LOCAL_TOKENS)
+    closures = []
+    monkeypatch.setattr(
+        bridge, "jax_op", lambda name, fn, **kwargs: closures.append(fn) or Mock()
+    )
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    mesh = SimpleNamespace(axis_names=("ep",), shape={"ep": _STUB_EP})
+    args = (mesh, 2, True, "silu", None, False)
+    op = bridge._build_op(*args)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_DISPATCH", not armed)
+    assert bridge._build_op(*args) is not op
+    gating, rank = jnp.zeros((1, 4)), jnp.zeros((1, 1), dtype=jnp.int32)
+    for rows in (gate // 2, gate - 1, gate):
+        x = jnp.ones((rows * _STUB_EP, 8), dtype=jnp.bfloat16)
+        assert closures[0](x, None, None, None, None, gating, rank) is x
+        forwarded = kernel.call_args.kwargs
+        if armed and rows >= gate:
+            assert forwarded["sparse_waves"] == 4
+            assert forwarded["sharded_plan"] is True
+        else:
+            assert "sparse_waves" not in forwarded
+            assert forwarded["sharded_plan"] is False
+
+
+@pytest.mark.parametrize(
+    ("spec", "name", "selected"),
+    [
+        ("", "model.layers.7.mlp.experts", True),
+        ("3,7-9", "model.layers.7.mlp.experts", True),
+        ("3,7-9", "model.layers.9.mlp.experts", True),
+        ("3,7-9", "model.layers.10.mlp.experts", False),
+        ("3,7-9", "model.layers.17.mlp.experts", False),
+        ("3,7-9", "", False),
+    ],
+)
+def test_sparse_layers_select_by_layer_index(monkeypatch, spec, name, selected):
+    """MOE_FUSED_EP_V2_SPARSE_LAYERS picks the layers sparse dispatch may
+    serve; empty picks every layer."""
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_DISPATCH", True)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_LAYERS", spec)
+    seen = []
+    assert (
+        _prebuild(
+            _layer(layer_name=name),
+            build_op=lambda *args, **kwargs: seen.append(kwargs) or "op",
+        )
+        == "op"
+    )
+    assert seen[0]["sparse_layer"] is selected
+
+
+def test_unselected_layer_keeps_the_all_gather(monkeypatch):
+    """A layer left out of the list builds the all-gather op even when
+    sparse dispatch is armed."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_DISPATCH", True)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_SPARSE_WAVES", 4)
+    monkeypatch.setattr(
+        envs, "MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS", bridge._SPARSE_MIN_LOCAL_TOKENS
+    )
+    closures = []
+    monkeypatch.setattr(
+        bridge, "jax_op", lambda name, fn, **kwargs: closures.append(fn) or Mock()
+    )
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    mesh = SimpleNamespace(axis_names=("ep",), shape={"ep": _STUB_EP})
+    args = (mesh, 2, True, "silu", None, False)
+    sparse = bridge._build_op(*args)
+    assert bridge._build_op(*args, sparse_layer=False) is not sparse
+    gating, rank = jnp.zeros((1, 4)), jnp.zeros((1, 1), dtype=jnp.int32)
+    x = jnp.ones((bridge._SPARSE_MIN_LOCAL_TOKENS * _STUB_EP, 8), dtype=jnp.bfloat16)
+    closures[1](x, None, None, None, None, gating, rank)
+    assert "sparse_waves" not in kernel.call_args.kwargs
+    closures[0](x, None, None, None, None, gating, rank)
+    assert kernel.call_args.kwargs["sparse_waves"] == 4
+
+
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):

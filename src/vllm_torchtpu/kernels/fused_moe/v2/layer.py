@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.fused_moe.v2 import sparse_dispatch
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -259,6 +260,8 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    sparse_waves=0,
+    sparse_stream=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -315,6 +318,23 @@ def fused_ep_moe_v2(
     which is what the reference hash router does. Everything downstream of
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
+
+    sparse_waves (experimental; 0, the default, is off and builds exactly the
+    program above) replaces the activation all-gather with a sparse exchange
+    (sparse_dispatch.py): each shard sends every (token, destination shard)
+    pair once, in sparse_waves groups of experts ordered fewest rows first,
+    and the kernel starts each expert as soon as its group has landed. It
+    must divide the experts per shard and needs sharded_plan. The exchange
+    takes as long as the hottest shard's ingress, so it is faster than the
+    all-gather when routing is balanced and slower under strong skew; it
+    never switches back on its own. Every routing is dropless either way.
+
+    sparse_stream (experimental; needs sparse_waves >= 2) spreads each
+    shard's busiest expert, which it visits last, over the waves: its rows
+    go out in groups of source shards, the shard's own first, while the
+    other experts fill the waves before the last, and the kernel waits for
+    it tile by tile, so only its last group is left when the exchange ends
+    (sparse_dispatch.stream_groups). Same bits.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -429,6 +449,20 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    if sparse_waves and not sharded_plan:
+        raise ValueError(
+            "sparse_waves dispatches from the sharded routing plan; pass "
+            "sharded_plan=True"
+        )
+    stream_groups = (
+        sparse_dispatch.stream_groups(ep, sparse_waves) if sparse_stream else ()
+    )
+    if sparse_stream and not stream_groups:
+        raise ValueError(
+            "sparse_stream spreads an expert over the waves of sparse dispatch: "
+            "it needs sparse_waves >= 2 and ep divisible by "
+            f"2 ** (sparse_waves - 1); got sparse_waves={sparse_waves}, ep={ep}"
+        )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -441,6 +475,9 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        sparse_waves=sparse_waves,
+        # Passed only when on, so the off build's cache key is unchanged.
+        **({"sparse_stream_groups": stream_groups} if stream_groups else {}),
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -474,12 +511,9 @@ def fused_ep_moe_v2(
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
-            ax,
-            axis=0,
-            tiled=True,
-        )
+        q_v = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
+        # Sparse dispatch sends the rows itself once the routing is known.
+        q_g = None if sparse_waves else lax.all_gather(q_v, ax, axis=0, tiled=True)
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
@@ -567,6 +601,39 @@ def fused_ep_moe_v2(
             n_tokens=T,
             topk=topk,
         )
+        sparse = None
+        if sparse_waves:
+            sparse = sparse_dispatch.start(
+                q_v,
+                pairs_g.reshape(T, topk),
+                rows_by_dest,
+                me,
+                ep=ep,
+                g_local=g_local,
+                waves=sparse_waves,
+                stream=stream_groups,
+            )
+            # The barrier makes every table op below consume a value the
+            # start kernel produced, so none can be hoisted in front of it.
+            # The weight-scale relayouts ride it too, so they also land under
+            # the exchange.
+            # pairs_g rides it rather than its expert_blocks view: pinned at
+            # the barrier, the view was relaid out for its consumers after
+            # it (three copies per layer); formed after it, XLA lays it out
+            # for them directly, as on the all-gather path.
+            g = gathered
+            g_arrays = (pairs_g, g.local_blocks, g.block_hist, g.rows_by_dest)
+            (g_arrays, w1s_l, w2s_l), fut = lax.optimization_barrier(
+                ((g_arrays, w1s_l, w2s_l), sparse.fut)
+            )
+            gathered = g._replace(
+                expert_blocks=g_arrays[0].reshape(T * topk // block, block),
+                local_blocks=g_arrays[1],
+                block_hist=g_arrays[2],
+                rows_by_dest=g_arrays[3],
+            )
+            sparse = sparse._replace(fut=fut)
+            q_g = fut[3]  # the receive buffer, filled wave by wave
 
         plan_kw = dict(
             e_total=e_total,
@@ -577,8 +644,14 @@ def fused_ep_moe_v2(
             shard_stride=ragged_stride,
         )
         if sharded_plan:
+            # Streaming lays each expert's source runs out from its owner
+            # on, the order its groups arrive in.
             routing = build_routing_tables_sharded(
-                None, me, gathered=gathered, **plan_kw
+                None,
+                me,
+                gathered=gathered,
+                rotate_runs=bool(stream_groups),
+                **plan_kw,
             )
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
@@ -597,11 +670,16 @@ def fused_ep_moe_v2(
         # smaller shape, so it is taken only where the routing plan in front
         # of the collective is longer than the scatters behind it. Same bits
         # either way; only the queue moves.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        if t_local >= AGQ_MIN_LOCAL_TOKENS and sparse is None:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
+        if sparse is None:
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
+        else:
+            token_gather = sparse_dispatch.token_gather(
+                slab_row, sparse.posmap, topk=topk, ragged_stride=ragged_stride
+            )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
@@ -645,7 +723,14 @@ def fused_ep_moe_v2(
         # row of the count table rather than its own reduction, so this
         # builder's second value is not read; it leaves the program with
         # the rest of the dead code, and its own test still sees it.
-        visit, _ = expert_visit_list(expert_rows, g_local)
+        if sparse is None:
+            visit, _ = expert_visit_list(expert_rows, g_local)
+        else:
+            # Fewest rows first, the order the waves were laid out in, which
+            # the kernel's per-wave wait keys on; empties also come last.
+            visit = lax.dynamic_index_in_dim(
+                sparse.visit_order, me, axis=0, keepdims=False
+            )
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
         counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
@@ -659,6 +744,13 @@ def fused_ep_moe_v2(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+        # Under sparse dispatch q_g is the exchange's receive buffer, and the
+        # kernel waits for each wave on the semaphores the start kernel gave.
+        sparse_kw = (
+            {}
+            if sparse is None
+            else dict(disp_tab=sparse.disp_tab, wave_sems=sparse.fut[1])
+        )
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,
@@ -676,7 +768,10 @@ def fused_ep_moe_v2(
             visit=visit,
             counts=counts,
             rank=rank_l,
+            **sparse_kw,
         )
+        if sparse is not None:
+            arrivals = sparse_dispatch.finish(sparse, arrivals, ep=ep)
 
         # The destination's own table: one arrival row per selection slot.
         pos = (
@@ -764,6 +859,8 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
+        int(sparse_waves),
+        bool(sparse_stream),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
@@ -777,5 +874,12 @@ def fused_ep_moe_v2(
                     out_specs=P(ax),
                     check_vma=False,
                 )
+                if sparse_waves:
+                    # The exchange's start kernel hands its DMA semaphores to
+                    # the fused kernel and to the drain, which is only valid
+                    # inside one XLA program. Under a caller's trace this jit
+                    # is inlined; an eager call would otherwise run the
+                    # shard_map one primitive at a time, a program each.
+                    sm = jax.jit(sm)
                 _LAYER_SM_CACHE[key] = sm
     return sm(*args)

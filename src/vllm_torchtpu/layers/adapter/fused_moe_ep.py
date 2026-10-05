@@ -42,6 +42,8 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
+import functools
+import re
 from typing import Any
 
 import jax
@@ -76,6 +78,40 @@ _TILE_M = 128
 # excluding the two fixed token-gather windows. Measured by subtracting the
 # former full token-gather scalar-prefetch table at the allocation boundary.
 _SMEM_OVERHEAD_BYTES = 236 * 1024
+
+# Experimental sparse dispatch (MOE_FUSED_EP_V2_SPARSE_DISPATCH) is taken only
+# by steps with at least MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS rows per shard
+# and never below this floor, the smallest shape its tests cover; smaller
+# steps keep the all-gather, which moves few rows there anyway.
+_SPARSE_MIN_LOCAL_TOKENS = 64
+
+_SPARSE_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+@functools.cache
+def _sparse_layer_set(spec: str) -> frozenset[int]:
+    """Parse MOE_FUSED_EP_V2_SPARSE_LAYERS: comma-separated indices or a-b ranges."""
+    layers: set[int] = set()
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        first, _, last = part.partition("-")
+        layers.update(range(int(first), int(last or first) + 1))
+    return frozenset(layers)
+
+
+def _sparse_layer_selected(layer) -> bool:
+    """Whether experimental sparse dispatch may serve this layer.
+
+    MOE_FUSED_EP_V2_SPARSE_LAYERS restricts it to the listed MoE layer indices,
+    a static per-layer choice from a routing profile: the exchange wins where a
+    layer's hottest rank receives little more than its share of tokens and
+    loses under strong skew. Empty selects every layer.
+    """
+    spec = envs.MOE_FUSED_EP_V2_SPARSE_LAYERS.strip()
+    if not spec:
+        return True
+    match = _SPARSE_LAYER_RE.search(getattr(layer, "layer_name", "") or "")
+    return match is not None and int(match.group(1)) in _sparse_layer_set(spec)
+
 
 # One op for every shape: `fused_ep_moe_v2` derives its routing block and ragged
 # stride from the operands when they are not given, so nothing here has to vary
@@ -176,10 +212,23 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    sparse_layer=True,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    # Experimental and off by default: fused_ep_moe_v2's sparse_waves.
+    sparse_waves = (
+        envs.MOE_FUSED_EP_V2_SPARSE_WAVES
+        if envs.MOE_FUSED_EP_V2_SPARSE_DISPATCH and sparse_layer
+        else 0
+    )
+    sparse_stream = bool(sparse_waves) and envs.MOE_FUSED_EP_V2_SPARSE_STREAM
+    sparse_min_rows = (
+        max(envs.MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS, _SPARSE_MIN_LOCAL_TOKENS)
+        if sparse_waves
+        else 0
+    )
     key = (
         topk,
         renormalize,
@@ -193,10 +242,21 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        sparse_waves,
+        sparse_stream,
+        sparse_min_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
         return cached
+    if sparse_waves:
+        logger.info(
+            "Fused EP MoE v2: experimental sparse dispatch armed (%d waves, "
+            "stream=%s) for steps of >= %d rows per shard",
+            sparse_waves,
+            sparse_stream,
+            sparse_min_rows,
+        )
 
     # Each distinct closure gets its own torch op name: two `CustomOpDef`s
     # registered under one qualname do not raise, they silently share a
@@ -208,6 +268,17 @@ def _build_op(
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
+        # Sparse dispatch is static per traced shape and dispatches from the
+        # sharded routing plan. Only an armed closure reads the mesh, so with
+        # it off this forwards exactly what it did before.
+        plan_kw = dict(sharded_plan=sharded_plan)
+        if (
+            sparse_waves
+            and x.shape[0] // mesh.shape[mesh.axis_names[0]] >= sparse_min_rows
+        ):
+            plan_kw = dict(sharded_plan=True, sparse_waves=sparse_waves)
+            if sparse_stream:
+                plan_kw["sparse_stream"] = True
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -230,8 +301,8 @@ def _build_op(
             rhs_qb=rhs_qb,
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
-            sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            **plan_kw,
             **bias_kw,
             **routing_kw,
         )
@@ -640,6 +711,13 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
+    sparse_layer = _sparse_layer_selected(layer)
+    if envs.MOE_FUSED_EP_V2_SPARSE_DISPATCH and envs.MOE_FUSED_EP_V2_SPARSE_LAYERS:
+        logger.info(
+            "Fused EP MoE v2 sparse dispatch: %s %s",
+            getattr(layer, "layer_name", "?"),
+            "on" if sparse_layer else "off (all-gather)",
+        )
     op = _build_op(
         mesh,
         topk,
@@ -654,6 +732,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        sparse_layer=sparse_layer,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

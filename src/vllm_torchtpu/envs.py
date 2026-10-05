@@ -73,6 +73,11 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_SPARSE_DISPATCH: bool = False
+    MOE_FUSED_EP_V2_SPARSE_WAVES: int = 4
+    MOE_FUSED_EP_V2_SPARSE_STREAM: bool = False
+    MOE_FUSED_EP_V2_SPARSE_LAYERS: str = ""
+    MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS: int = 128
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -640,6 +645,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # EXPERIMENTAL, off by default. Sparse, expert-wave dispatch for fused EP
+    # MoE v2: instead of all-gathering every token to every rank, each rank
+    # sends each (token, destination rank) pair once through a split-phase
+    # Pallas ragged all-to-all, in MOE_FUSED_EP_V2_SPARSE_WAVES groups of
+    # experts ordered fewest rows first, and the fused kernel starts each
+    # expert as soon as its group has landed. The exchange takes as long as
+    # the hottest rank's ingress, so it is faster than the all-gather when
+    # expert load is balanced and slower under strong skew; nothing switches
+    # between the two at run time. Calls that take it build the sharded
+    # routing plan whatever MOE_FUSED_EP_V2_SHARDED_PLAN says; shapes under
+    # MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS tokens per rank keep the
+    # all-gather.
+    "MOE_FUSED_EP_V2_SPARSE_DISPATCH": env_bool("MOE_FUSED_EP_V2_SPARSE_DISPATCH"),
+    # Expert groups the sparse exchange is pipelined in; must divide the
+    # experts per rank.
+    "MOE_FUSED_EP_V2_SPARSE_WAVES": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_SPARSE_WAVES", "4") or 4
+    ),
+    # Experimental, with MOE_FUSED_EP_V2_SPARSE_DISPATCH: spread each rank's
+    # busiest expert over the waves instead of landing it whole in the last
+    # one, so the kernel is on it before the exchange ends
+    # (sparse_dispatch.stream_groups).
+    "MOE_FUSED_EP_V2_SPARSE_STREAM": env_bool("MOE_FUSED_EP_V2_SPARSE_STREAM"),
+    # EXPERIMENTAL. Restricts MOE_FUSED_EP_V2_SPARSE_DISPATCH to these MoE
+    # layer indices (comma-separated; "a-b" ranges allowed); the other layers
+    # keep the all-gather. Empty applies it to every layer. Meant for a static
+    # per-layer choice from a routing profile.
+    "MOE_FUSED_EP_V2_SPARSE_LAYERS": env_str("MOE_FUSED_EP_V2_SPARSE_LAYERS", ""),
+    # Experimental, with MOE_FUSED_EP_V2_SPARSE_DISPATCH: traced shapes with
+    # fewer tokens per rank than this keep the all-gather. The exchange has a
+    # fixed cost the all-gather does not, so it only pays off on large steps;
+    # on DeepSeek-V4-Pro at EP=16 it measured about 7% slower than the
+    # all-gather at 64 tokens per rank and level with it at 128. Values under
+    # 64, the smallest shape its tests cover, act as 64.
+    "MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_SPARSE_MIN_LOCAL_TOKENS", "128") or 128
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
