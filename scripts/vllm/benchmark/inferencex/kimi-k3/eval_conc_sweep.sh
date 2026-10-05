@@ -55,12 +55,12 @@ done
 [ -n "$RESULTS_DIR" ] || { echo "[k3-eval-sweep] ERROR: --results-dir is required"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-K3_SWEEP_TAG="k3-eval-sweep"
-# shellcheck source=scripts/vllm/benchmark/inferencex/kimi-k3/sweep_lib.sh
-source "$SCRIPT_DIR/sweep_lib.sh"
-SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
+IX_SWEEP_TAG="k3-eval-sweep"
+# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
+source "$SCRIPT_DIR/../sweep_lib.sh"
+SUMMARY_PY="$SCRIPT_DIR/../sweep_summary.py"
 
-k3_check_conc_list "$CONC_LIST" || exit 1
+ix_check_conc_list "$CONC_LIST" || exit 1
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"
 IFS=',' read -r -a TASK_LIST <<< "$TASKS"
 for task in "${TASK_LIST[@]}"; do
@@ -69,14 +69,14 @@ for task in "${TASK_LIST[@]}"; do
 done
 mkdir -p "$RESULTS_DIR"
 SUMMARY="$RESULTS_DIR/summary.md"
-k3_set_gcs_root "$GCS_ARG"
+ix_set_gcs_root "$GCS_ARG"
 
 SUMMARY_PRINTED=0
 # shellcheck disable=SC2317  # run by the EXIT trap
 cleanup() {
     log "cleanup"
-    bash "$K3_BENCHMARKING_DIR/cleanup_server.sh"
-    k3_dump_server_log_context
+    bash "$IX_BENCHMARKING_DIR/cleanup_server.sh"
+    ix_dump_server_log_context
     if [ -f "$SUMMARY" ] && [ "$SUMMARY_PRINTED" = "0" ]; then log "===== summary (partial) ====="; cat "$SUMMARY"; fi
     if [ -n "$GCS_ROOT" ] && command -v gsutil >/dev/null 2>&1; then
         log "uploading $RESULTS_DIR to $GCS_ROOT"
@@ -87,8 +87,8 @@ trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- boot
 log "===== boot: config=$CONFIG_NAME concs=${CONCS[*]} tasks=${TASK_LIST[*]} gsm8k_limit>=$GSM8K_LIMIT mmlu_limit>=$MMLU_LIMIT ctx=$K3_SWEEP_CTX max_num_seqs=$K3_SWEEP_MAX_NUM_SEQS ====="
-k3_boot_server "$CONFIG_NAME" || exit 1
-MODEL=$(k3_config_json_get model)
+ix_boot_server "$CONFIG_NAME" || exit 1
+MODEL=$(ix_config_json_get model)
 save_now "$RESULTS_DIR/config.json"
 
 {
@@ -113,7 +113,7 @@ for c in "${CONCS[@]}"; do
         log "===== conc=$c task=$task limit=$limit ($n_q questions) ====="
         if ! server_alive; then log "FATAL: server died before conc=$c $task"; FAIL=1; break 2; fi
         T0=$(date +%s)
-        pre0=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+        pre0=$(ix_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
         lm_eval --tasks "$task" --seed "0,1234,None,1234" --output_path "$out" --log_samples --limit "$limit" \
             --model local-chat-completions \
             --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,num_concurrent=$c,max_retries=3,timeout=3600" \
@@ -122,7 +122,7 @@ for c in "${CONCS[@]}"; do
         wall=$(( $(date +%s) - T0 ))
         errs=$(grep -c -iE 'error|exception|timed out' "$out/lm_eval.log" || true)
         read -r metric score stderr <<< "$(python3 "$SUMMARY_PY" lm-eval-score --output-dir "$out" --task "$task")"
-        pre1=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+        pre1=$(ix_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
         preempt=$(( ${pre1:-0} - ${pre0:-0} ))
         log "conc=$c task=$task rc=$rc $metric=$score ±$stderr wall=${wall}s log-errors=$errs engine-preemptions=$preempt"
         if [ "$rc" -ne 0 ]; then

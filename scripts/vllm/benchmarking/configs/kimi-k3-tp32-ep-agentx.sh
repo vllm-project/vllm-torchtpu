@@ -36,6 +36,15 @@ QUANTIZATION=""
 # deployment and so has its own config and its own list.
 AGENTX_CONC_LIST="1 2 4 8"
 
+# What InferenceX files the row under. The client is model-agnostic, so the model
+# name and the precision label come from here. "fp4" because the checkpoint's
+# experts are MXFP4 with FP8 attention, which is the label the published B300
+# vLLM row uses.
+AGENTX_MODEL_PREFIX=kimik3
+AGENTX_PRECISION=fp4
+# Printed under the summary, for reading our numbers against a published row.
+AGENTX_REFERENCE_ROW="InferenceX dashboard, 8x B300 vLLM, taken 2026-09-07; out tok/s per GPU @ P90 interactivity: c1 15.1@203, c2 18.6@133, c4 23.4@121, c8 40.6@64, c16 58.4@32, c24 66.3@22, c48 75.7@12.5, c70 87.6@7.9"
+
 # Not the AgentX cases. run_benchmarks.sh insists on a fixed-sequence cell
 # before it will hand back a live server, and these are the smallest one that
 # boots; the replay that follows ignores them.

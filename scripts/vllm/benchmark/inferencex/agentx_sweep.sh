@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kimi-K3 InferenceX AgentX sweep: start one server from --config, run
+# InferenceX AgentX sweep: start one server from --config, run
 # agentx_client.sh against it, stop it again.
 #
 #   agentx_sweep.sh --chips 16 [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
@@ -35,7 +35,7 @@
 set -uo pipefail
 
 CONFIG_NAME="kimi-k3-tp32-ep-agentx"
-RESULTS_DIR="/perf_eval_results/k3-agentx-sweep"
+RESULTS_DIR="/perf_eval_results/agentx-sweep"
 DURATION=1800
 FAST=1
 IX_REF="main"
@@ -64,13 +64,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-K3_SWEEP_TAG="k3-agentx-sweep"
-# shellcheck source=scripts/vllm/benchmark/inferencex/kimi-k3/sweep_lib.sh
+IX_SWEEP_TAG="agentx-sweep"
+# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
 source "$SCRIPT_DIR/sweep_lib.sh"
-CONFIG_FILE="$K3_BENCHMARKING_DIR/configs/${CONFIG_NAME}.sh"
+CONFIG_FILE="$IX_BENCHMARKING_DIR/configs/${CONFIG_NAME}.sh"
 [ -f "$CONFIG_FILE" ] || { log "FATAL: no such config: $CONFIG_FILE"; exit 2; }
 mkdir -p "$RESULTS_DIR"
-k3_set_gcs_root "$GCS_ARG"
+ix_set_gcs_root "$GCS_ARG"
 export PORT
 
 # What the config says the run covers. Read in a subshell so the config's other
@@ -80,20 +80,31 @@ export PORT
 # would be read here as an unset variable.
 # The list is read last: read's final variable takes the rest of the line, and
 # AGENTX_CONC_LIST is space separated.
+AGENTX_REFERENCE_ROW=$(
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE" >/dev/null 2>&1
+    echo "${AGENTX_REFERENCE_ROW:-}"
+)
 _cfg_values=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
-    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG_NAME failed to load; the boot would fail the same way"; exit 2; }
-read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD CONFIG_CONC_LIST <<< "$_cfg_values"
+read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD MODEL_PREFIX PRECISION CONFIG_CONC_LIST <<< "$_cfg_values"
+for _req in MODEL_PREFIX PRECISION; do
+    if [ -z "${!_req}" ]; then
+        log "FATAL: $CONFIG_NAME declares no AGENTX_${_req}; it is what InferenceX files the row under"
+        exit 2
+    fi
+done
 
 CONC_LIST=$(printf '%s' "${CONFIG_CONC_LIST:-}" | tr ' ' ',')
 if [ -z "$CONC_LIST" ]; then
     log "FATAL: $CONFIG_NAME declares no AGENTX_CONC_LIST"
     exit 2
 fi
-k3_check_conc_list "$CONC_LIST" || exit 1
-k3_check_conc_list "$GSM8K_CONC" || exit 1
+ix_check_conc_list "$CONC_LIST" || exit 1
+ix_check_conc_list "$GSM8K_CONC" || exit 1
 # PHYSICAL CHIPS, not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x
 # google.com/tpu 4, which is what GKE allocates and what Google bills per
 # chip-hour) and vLLM runs 32 ranks on it, two per chip. So TP x DP is twice the
@@ -143,8 +154,8 @@ log "config=$CONFIG_NAME concs=${CONCS[*]} max_num_seqs=$CONFIG_MAX_NUM_SEQS" \
 # shellcheck disable=SC2317  # run by the trap
 cleanup() {
     log "cleanup"
-    bash "$K3_BENCHMARKING_DIR/cleanup_server.sh"
-    k3_dump_server_log_context
+    bash "$IX_BENCHMARKING_DIR/cleanup_server.sh"
+    ix_dump_server_log_context
     # A failed boot is the most common failure, and the client - which does the
     # uploading - never ran, so without this the logs that explain it exist only
     # in a container that is about to go away.
@@ -156,12 +167,12 @@ cleanup() {
 # server holding every chip on the pod.
 trap cleanup EXIT INT TERM
 
-k3_boot_server "$CONFIG_NAME" || exit 1
+ix_boot_server "$CONFIG_NAME" || exit 1
 
 # The weights run_benchmarks.sh pulled, so the client can tokenize locally
 # instead of resolving the model on the hub.
 TOK_DIR=""
-MODEL_URI=$(k3_config_json_get model_uri)
+MODEL_URI=$(ix_config_json_get model_uri)
 if [ -n "$MODEL_URI" ]; then
     TOK_DIR=$(python3 -c "import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)" "$MODEL_URI" 2>/dev/null | tail -1)
 fi
@@ -172,7 +183,7 @@ fi
 # on it - two per chip. So TP x DP is twice the divisor, and the parallelism
 # cannot give it. The deployment states it, and there is no default, because a
 # wrong divisor silently scales the one number this benchmark exists to report.
-RANKS=$(( $(k3_config_json_get tensor_parallelism) * $(k3_config_json_get data_parallelism) ))
+RANKS=$(( $(ix_config_json_get tensor_parallelism) * $(ix_config_json_get data_parallelism) ))
 log "serving on $CHIPS chips with $RANKS ranks (TP x DP, from config.json)"
 if [ "$RANKS" -gt 0 ] && [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: $RANKS ranks on $CHIPS chips is not the two-per-chip v7x shape;" \
@@ -181,7 +192,7 @@ fi
 
 # The config name is the label: it is the one file that defines this server, so
 # it identifies the row better than a string of knobs reassembled here.
-LABEL="agentx_k3_${CONFIG_NAME}"
+LABEL="agentx_${CONFIG_NAME}"
 
 bash "$SCRIPT_DIR/agentx_client.sh" \
     --server-url "http://127.0.0.1:$PORT" \
@@ -193,8 +204,11 @@ bash "$SCRIPT_DIR/agentx_client.sh" \
     --ix-ref "$IX_REF" \
     --gsm8k-limit "$GSM8K_LIMIT" \
     --gsm8k-conc "$GSM8K_CONC" \
-    --model "$(k3_config_json_get model)" \
+    --model "$(ix_config_json_get model)" \
     --label "$LABEL" \
     --spec-method "$SPEC_METHOD" \
+    --model-prefix "$MODEL_PREFIX" \
+    --precision "$PRECISION" \
+    ${AGENTX_REFERENCE_ROW:+--reference-row "$AGENTX_REFERENCE_ROW"} \
     ${TOK_DIR:+--tokenizer-dir "$TOK_DIR"} \
     ${GCS_ARG:+--gcs-root "$GCS_ARG"}

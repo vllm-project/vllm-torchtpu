@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Result parsing for the Kimi-K3 InferenceX scripts in this directory.
+"""Result parsing for the InferenceX benchmark scripts.
 
 Pure functions plus a small CLI, so the summary logic of agentx_client.sh (the
 AgentX replay) and eval_conc_sweep.sh (the lm_eval ladder) can be unit tested

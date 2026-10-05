@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for scripts/vllm/benchmark/inferencex/kimi-k3/sweep_summary.py.
+"""Unit tests for scripts/vllm/benchmark/inferencex/sweep_summary.py.
 
 The parsers are pure functions over JSON files, so they are pinned down here
 without a TPU. The AgentX fixture mirrors the layout InferenceX's
@@ -33,10 +33,9 @@ _SCRIPT = (
     / "vllm"
     / "benchmark"
     / "inferencex"
-    / "kimi-k3"
     / "sweep_summary.py"
 )
-_spec = importlib.util.spec_from_file_location("k3_sweep_summary", _SCRIPT)
+_spec = importlib.util.spec_from_file_location("ix_sweep_summary", _SCRIPT)
 summary = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(summary)
 

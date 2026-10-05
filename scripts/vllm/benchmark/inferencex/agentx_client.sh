@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# The InferenceX AgentX client for Kimi-K3, run against a vLLM server that is
-# already serving. It clones InferenceX, installs aiperf and the trace corpus,
+# The InferenceX AgentX client, run against a vLLM server that is already
+# serving. Not specific to a model: what it is told are the server's URL, the
+# chip count to divide by, and the labels InferenceX files the row under. It clones InferenceX, installs aiperf and the trace corpus,
 # runs a GSM8K accuracy probe, then replays the AgentX trace corpus once per
 # concurrency in --conc-list, ascending, waiting for the server to drain between
 # points. The summary table is the output.
 #
-#   agentx_client.sh --conc-list 1,2,4,8|none --chips N [--server-url URL]
+#   agentx_client.sh --conc-list 1,2,4,8|none --chips N --model-prefix NAME
+#       --precision LABEL [--reference-row "..."] [--server-url URL]
 #       [--runner-type tpu7x-32] [--results-dir DIR]
 #       [--duration 1800] [--fast 1|0] [--ix-ref main] [--tokenizer-dir DIR]
 #       [--model NAME] [--max-model-len N] [--gsm8k-limit 100]
@@ -39,8 +41,8 @@ PORT=8000               # only used when --server-url is absent
 # which is what agentx_sweep.sh starts. --server-url, or AIPERF_SERVER_URL in
 # the environment, names one somewhere else; AIPERF_SERVER_URL is the variable
 # InferenceX's own srt_agentic.sh reads in the same situation.
-K3_SERVER_URL="${AIPERF_SERVER_URL:-}"
-RESULTS_DIR="/perf_eval_results/k3-agentx-client"
+IX_SERVER_URL="${AIPERF_SERVER_URL:-}"
+RESULTS_DIR="/perf_eval_results/agentx-client"
 CONC_LIST=""
 DURATION=1800
 FAST=1
@@ -57,18 +59,27 @@ MAX_MODEL_LEN_ARG=""   # context window; read from the server when empty
 # from one engine's TP, so the caller states it and there is no default.
 CHIPS=""
 RUNNER_TYPE_ARG=""     # InferenceX runner id; "tpu7x-$CHIPS" when empty
+# What InferenceX files the result row under. Both describe the model being
+# served, which this script does not choose, so the caller states them: the
+# aggregate lane reads them out of the serve config, and so does the kube one.
+MODEL_PREFIX_ARG=""
+PRECISION_ARG=""
+# An optional line printed under the summary, for reading our numbers against a
+# published row. The caller supplies it because which row is comparable is a
+# property of the model and the scenario, not of this client.
+REFERENCE_ROW=""
 # The result filename prefix, and the spec-decoding method to record with the
 # row. Both describe the server, which this script did not configure, so the
 # caller states them: agentx_sweep.sh composes them from the serve knobs it
 # passed, and a kube lane from its own config. Defaulted so an ad-hoc run
 # still writes somewhere sensible.
-LABEL="agentx_k3"
+LABEL="agentx"
 SPEC_METHOD="none"
 GCS_ARG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --server-url)    K3_SERVER_URL="$2"; shift 2 ;;
+        --server-url)    IX_SERVER_URL="$2"; shift 2 ;;
         --conc-list)     CONC_LIST="$2"; shift 2 ;;
         --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
@@ -84,6 +95,9 @@ while [[ $# -gt 0 ]]; do
         --gcs-root)      GCS_ARG="$2"; shift 2 ;;
         --chips)         CHIPS="$2"; shift 2 ;;
         --runner-type)   RUNNER_TYPE_ARG="$2"; shift 2 ;;
+        --model-prefix)  MODEL_PREFIX_ARG="$2"; shift 2 ;;
+        --precision)     PRECISION_ARG="$2"; shift 2 ;;
+        --reference-row) REFERENCE_ROW="$2"; shift 2 ;;
         --port)          PORT="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -97,32 +111,42 @@ case "${CHIPS:-}" in
     ''|*[!0-9]*|0) echo "agentx_client.sh: --chips N is required (the serving deployment's chip count; it is what per-chip throughput is divided by)" >&2; exit 2 ;;
 esac
 RUNNER_TYPE="${RUNNER_TYPE_ARG:-tpu7x-$CHIPS}"
+# Both are labels InferenceX files the row under, and neither has a sensible
+# default here, so they are required rather than guessed.
+if [ -z "$MODEL_PREFIX_ARG" ]; then
+    echo "agentx_client.sh: --model-prefix NAME is required (InferenceX files the row under it)" >&2
+    exit 2
+fi
+if [ -z "$PRECISION_ARG" ]; then
+    echo "agentx_client.sh: --precision LABEL is required (InferenceX files the row under it)" >&2
+    exit 2
+fi
 
 if [ "$CONC_LIST" = "none" ]; then CONCS=(); else IFS=',' read -r -a CONCS <<< "$CONC_LIST"; fi
 IFS=',' read -r -a GSM8K_CONCS <<< "$GSM8K_CONC"
 
-K3_SERVER_URL="${K3_SERVER_URL%/}"
-export K3_SERVER_URL
-if [ -n "$K3_SERVER_URL" ]; then
+IX_SERVER_URL="${IX_SERVER_URL%/}"
+export IX_SERVER_URL
+if [ -n "$IX_SERVER_URL" ]; then
     # benchmark_lib.sh works out its own URL when this is unset, which is what a
     # server on this host has always relied on, so it is set only when the
     # server is elsewhere.
-    export AIPERF_SERVER_URL="$K3_SERVER_URL"
+    export AIPERF_SERVER_URL="$IX_SERVER_URL"
 fi
 export PORT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-K3_SWEEP_TAG="k3-agentx-client"
-# shellcheck source=scripts/vllm/benchmark/inferencex/kimi-k3/sweep_lib.sh
+IX_SWEEP_TAG="agentx-client"
+# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
 source "$SCRIPT_DIR/sweep_lib.sh"
 
 # One validator for both lists, shared with eval_conc_sweep.sh, so a 0 or an
 # 007 cannot reach aiperf's --concurrency or lm_eval's num_concurrent.
-[ "$CONC_LIST" = "none" ] || k3_check_conc_list "$CONC_LIST" || exit 1
-k3_check_conc_list "$GSM8K_CONC" || exit 1
+[ "$CONC_LIST" = "none" ] || ix_check_conc_list "$CONC_LIST" || exit 1
+ix_check_conc_list "$GSM8K_CONC" || exit 1
 SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
 mkdir -p "$RESULTS_DIR"
-k3_set_gcs_root "$GCS_ARG"
+ix_set_gcs_root "$GCS_ARG"
 
 # shellcheck disable=SC2317  # run by the EXIT trap
 cleanup() {
@@ -135,12 +159,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-log "server=$(k3_server_url) concs=${CONCS[*]} gsm8k_limit=$GSM8K_LIMIT gsm8k_conc=$GSM8K_CONC duration=$DURATION fast=$FAST ix_ref=$IX_REF"
+log "server=$(ix_server_url) concs=${CONCS[*]} gsm8k_limit=$GSM8K_LIMIT gsm8k_conc=$GSM8K_CONC duration=$DURATION fast=$FAST ix_ref=$IX_REF"
 log "host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
 log "disk (container view):"; df -h / /tmp /root/.cache /perf_eval_results /dev/shm 2>/dev/null
 
 if ! server_alive; then
-    log "FATAL: no server answering /v1/models at $(k3_server_url)"
+    log "FATAL: no server answering /v1/models at $(ix_server_url)"
     exit 1
 fi
 # The served name and the context window come from the server. vLLM puts
@@ -150,13 +174,13 @@ fi
 # server rather than preferred, because a model id that disagrees 404s every
 # request after a 30-minute boot, and a clamped context silently changes which
 # traces are eligible.
-_models_json=$(curl -sf --max-time 30 "$(k3_server_url)/v1/models") \
-    || { log "FATAL: cannot read /v1/models from $(k3_server_url)"; exit 1; }
+_models_json=$(curl -sf --max-time 30 "$(ix_server_url)/v1/models") \
+    || { log "FATAL: cannot read /v1/models from $(ix_server_url)"; exit 1; }
 read -r _served_model _served_ctx <<< "$(printf '%s' "$_models_json" | python3 -c '
 import json, sys
 card = json.load(sys.stdin)["data"][0]
 print(card["id"], card.get("max_model_len") or 0)
-')" || { log "FATAL: cannot parse /v1/models from $(k3_server_url)"; exit 1; }
+')" || { log "FATAL: cannot parse /v1/models from $(ix_server_url)"; exit 1; }
 if [ -n "$MODEL_ARG" ] && [ "$MODEL_ARG" != "$_served_model" ]; then
     log "FATAL: --model '$MODEL_ARG' is not what the server serves ('$_served_model')"
     exit 1
@@ -179,11 +203,11 @@ fi
 log "served model: $MODEL, context $MAX_MODEL_LEN"
 
 # ---- Client scratch (venv on root disk: /dev/shm is noexec) -----------------
-SCRATCH=/tmp/.k3_agentx_scratch
+SCRATCH=/tmp/.agentx_scratch
 DATA_SCRATCH="$SCRATCH"
 shm_avail=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
 if [ -n "${shm_avail:-}" ] && [ "$shm_avail" -gt $((20 * 1024 * 1024)) ]; then
-    DATA_SCRATCH=/dev/shm/.k3_agentx_scratch
+    DATA_SCRATCH=/dev/shm/.agentx_scratch
 fi
 mkdir -p "$SCRATCH" "$DATA_SCRATCH"
 export TMPDIR="$DATA_SCRATCH/tmp"; mkdir -p "$TMPDIR"
@@ -241,7 +265,7 @@ fi
 
 sanity_probe() {
     log "--- probe: /v1/chat/completions ---"
-    curl -s --max-time 300 "$(k3_server_url)/v1/chat/completions" -H 'Content-Type: application/json' \
+    curl -s --max-time 300 "$(ix_server_url)/v1/chat/completions" -H 'Content-Type: application/json' \
         -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+3? Answer with just the number.\"}],\"max_tokens\":64,\"temperature\":0}" \
         | python3 -c "
 import sys, json
@@ -251,7 +275,7 @@ print('[k3-agentx-client] chat content:', repr(m.get('content')), '| reasoning:'
 print('[k3-agentx-client] error:', r.get('error')) if 'error' in r else None
 " || log "chat probe FAILED"
     log "--- probe: chat with tools + tool result ---"
-    curl -s --max-time 300 "$(k3_server_url)/v1/chat/completions" -H 'Content-Type: application/json' -d @- << JSON | python3 -c "
+    curl -s --max-time 300 "$(ix_server_url)/v1/chat/completions" -H 'Content-Type: application/json' -d @- << JSON | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
 if 'error' in r:
@@ -283,22 +307,23 @@ for gc in "${GSM8K_CONCS[@]}"; do
     log "===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$gc ====="
     EVAL_DIR="$RESULTS_DIR/gsm8k_c$gc"; mkdir -p "$EVAL_DIR"
     T0=$(date +%s)
-    # The server runs --reasoning-parser kimi_k3 (as the B300 recipe does), so
+    # A server with a reasoning parser puts the answer in reasoning_content, so
     # the answer arrives in reasoning_content, which stock lm_eval never reads.
     # InferenceX's gsm8k.yaml + its lm_eval sitecustomize patch score it; the
     # patch targets lm-eval 0.4.9.x and overrides TemplateAPI.apply_chat_template,
     # so re-check it whenever the image's lm-eval pin moves.
     if [ ! -f "$IX_EVALS/patches/lm_eval_sitecustomize.py" ]; then
         log "FATAL: no lm_eval patch at $IX_EVALS/patches/lm_eval_sitecustomize.py;" \
-            "unpatched lm_eval reads only 'content' and K3 answers in reasoning_content," \
-            "which scores 0.0 and looks like a model failure"
+            "unpatched lm_eval reads only 'content', so a model that answers in" \
+            "reasoning_content scores 0.0 and looks like a model failure, not a" \
+            "missing patch"
         exit 1
     fi
     PATCH_DIR=$(mktemp -d); cp "$IX_EVALS/patches/lm_eval_sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
     PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}" OPENAI_API_KEY=EMPTY \
     lm_eval --tasks "$IX_EVALS/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
         --model local-chat-completions --apply_chat_template --log_samples \
-        --model_args "model=$MODEL,base_url=$(k3_server_url)/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$gc,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
+        --model_args "model=$MODEL,base_url=$(ix_server_url)/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$gc,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
         --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
         --output_path "$EVAL_DIR" > "$EVAL_DIR/lm_eval.log" 2>&1
     rc=$?
@@ -339,15 +364,16 @@ export AIPERF_PYTHON_VERSION="${AIPERF_PYTHON_VERSION:-3.12}"
 export KV_OFFLOADING=none
 unset KV_OFFLOAD_BACKEND
 export DURATION MODEL
-export MODEL_PREFIX=kimik3
+export MODEL_PREFIX="$MODEL_PREFIX_ARG"
 # TP and EP_SIZE here are not our parallelism: they are what InferenceX divides
 # total throughput by, so both carry the chip count (the same thing the CDK
 # AgentX recipe calls TPU_CHIPS).
 export TP="$CHIPS" EP_SIZE="$CHIPS" PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
-# PRECISION is a label in the aggregate: the checkpoint's experts are MXFP4
-# (compressed-tensors weight_packed) with FP8 attention, which InferenceX
-# files under "fp4", the same label as the published B300 vLLM run.
-export FRAMEWORK=vllm PRECISION=fp4
+# PRECISION is a label in the aggregate, not something the client measures: it
+# is how InferenceX files the row, so it has to match what the published rows
+# for this model use.
+export FRAMEWORK=vllm
+export PRECISION="$PRECISION_ARG"
 export RUNNER_TYPE
 SPEC_DECODING="$SPEC_METHOD"
 export SPEC_DECODING
@@ -391,7 +417,7 @@ for idx in "${!CONCS[@]}"; do
     fi
     log "replay cmd: $REPLAY_CMD"
     T0=$(date +%s)
-    pre0=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+    pre0=$(ix_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
     # aiperf can hang in its own shutdown after a warmup-drain timeout, so each
     # point runs under POINT_CAP. On expiry every aiperf process is killed and
     # the point is marked HARD_TIMEOUT.
@@ -399,7 +425,7 @@ for idx in "${!CONCS[@]}"; do
     ( run_agentic_replay_and_write_outputs "$RESULT_DIR" ) &
     replay_pid=$!
     ( sleep "$REPLAY_CAP"
-      echo "[$K3_SWEEP_TAG] conc $c: HARD TIMEOUT after ${REPLAY_CAP}s, killing the client"
+      echo "[$IX_SWEEP_TAG] conc $c: HARD TIMEOUT after ${REPLAY_CAP}s, killing the client"
       touch "$RESULT_DIR/HARD_TIMEOUT"
       pkill -TERM -f "aiperf" 2>/dev/null; sleep 20
       pkill -KILL -f "aiperf" 2>/dev/null; kill -KILL "$replay_pid" 2>/dev/null ) &
@@ -408,8 +434,8 @@ for idx in "${!CONCS[@]}"; do
     pkill -P "$watchdog_pid" 2>/dev/null   # the watchdog's sleep
     kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null
     pkill -KILL -f "aiperf" 2>/dev/null   # never leave a client behind between points
-    pre1=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
-    log "conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s engine-preemptions=$(( ${pre1:-0} - ${pre0:-0} )) (a preempted request resumes from its saved state; K3 keeps a KDA recurrent state per sequence, so a non-zero count is worth checking against output quality)"
+    pre1=$(ix_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+    log "conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s engine-preemptions=$(( ${pre1:-0} - ${pre0:-0} )) (a preempted request resumes from its saved state; a model with recurrent per-sequence state makes a non-zero count worth checking against output quality)"
     if [ ! -f "$AGENTIC_OUTPUT_DIR/$RESULT_FILENAME.json" ]; then
         FAIL=1
         log "ERROR: conc $c produced no aggregate ($RESULT_FILENAME.json); $([ -f "$RESULT_DIR/HARD_TIMEOUT" ] && echo 'hard timeout' || echo 'client or aggregation failed, see the replay log above')"
@@ -435,7 +461,7 @@ if ! python3 "$SUMMARY_PY" agentx-table --results-dir "$RESULTS_DIR" \
     log "ERROR: the AgentX table could not be rendered; the per-point JSON is in $RESULTS_DIR"
 fi
 save_now "$RESULTS_DIR/summary.md"
-log "reference snapshot (InferenceX dashboard, 8x B300 vLLM, taken 2026-09-07; out tok/s per GPU @ P90 interactivity): c1 15.1@203, c2 18.6@133, c4 23.4@121, c8 40.6@64, c16 58.4@32, c24 66.3@22, c48 75.7@12.5, c70 87.6@7.9"
+[ -z "$REFERENCE_ROW" ] || log "reference: $REFERENCE_ROW"
 server_alive || { log "ERROR: server is dead at the end of the sweep"; FAIL=1; }
 [ "$FAIL" = "0" ] || log "sweep finished with failures; exiting 1"
 exit $FAIL

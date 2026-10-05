@@ -44,7 +44,7 @@
 #     K3_SWEEP_GCS_ROOT      default empty (no GCS copy; artifacts only)
 #   Runtime at the defaults: ~30 min boot + ~90 min sweep.
 #
-# K3_SWEEP=perf  — driver scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh
+# K3_SWEEP=perf  — driver scripts/vllm/benchmark/inferencex/agentx_sweep.sh
 #   One K3 server from K3_CONFIG (TP32/EP, long context, tool-call + reasoning
 #   parsers, block size 256), a GSM8K probe on
 #   the fresh server, then the InferenceX AgentX trace replay (aiperf, Claude
@@ -125,6 +125,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/agentx_sweep.sh --chips 16 --config ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} --results-dir /perf_eval_results/k3-agentx-sweep --duration ${K3_DURATION:-1800} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --ix-ref ${K3_IX_REF:-main} --gcs-root \"${K3_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/agentx_sweep.sh --chips 16 --config ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} --results-dir /perf_eval_results/k3-agentx-sweep --duration ${K3_DURATION:-1800} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --ix-ref ${K3_IX_REF:-main} --gcs-root \"${K3_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"
