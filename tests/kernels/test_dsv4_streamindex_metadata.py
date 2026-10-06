@@ -489,6 +489,57 @@ class ChunkedMetadataTest(parameterized.TestCase):
         self.assertGreaterEqual(int(num_steps.sum()), 1)
         self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
 
+    def test_long_context_schedule_fits_in_smem(self):
+        """The DCP=2 / 1M cell that filled smem to the byte at 81920 steps.
+
+        Eight sequences of 512K local kv over 256-byte pages is
+        pages_per_seq=2048, so max_bkv is 1024 and the old per-chunk bound
+        asked for 8 * 10 * 1024 steps. Three int32 arrays of that length plus
+        the page table come to exactly 1 MiB, which is all of smem.
+        """
+        num_seqs = 8
+        pages_per_seq = 2048
+        meta_ = metadata.compute_metadata(
+            seq_lens=jnp.full((num_seqs,), 512 * 1024, dtype=jnp.int32),
+            cu_q_lens=jnp.arange(num_seqs + 1, dtype=jnp.int32) * 256,
+            start_seq_idx=0,
+            end_seq_idx=num_seqs,
+            bq_sz=128,
+            bkv_sz=512,
+            pages_per_seq=pages_per_seq,
+            page_size=256,
+            max_num_tokens=2048,
+            static_q_len=None,
+            seq_batch_size=1,
+            chunk_token_start=tuple(range(0, 2048, 256)),
+            chunk_tokens=256,
+        )
+        max_steps = meta_.bq_idx.shape[0]
+        self.assertGreaterEqual(max_steps, int(np.array(meta_.num_steps).sum()))
+        self.assertLess(max_steps, 81920)
+        smem_bytes = 3 * max_steps * 4 + num_seqs * pages_per_seq * 4
+        self.assertLess(smem_bytes, 1024 * 1024)
+
+    @parameterized.named_parameters(
+        ("one_chunk", (0,), 1024),
+        ("even_cuts", (0, 256, 512, 768), 256),
+        ("uneven_cuts", (0, 100, 600), 512),
+        ("more_chunks_than_tiles", tuple(range(0, 1024, 128)), 128),
+    )
+    def test_schedule_never_outruns_its_arrays(self, starts, chunk_tokens):
+        """The bound is load-bearing: num_steps is not clamped to max_steps."""
+        ragged = jnp.array((0, 100, 512, 1000, 1024), dtype=jnp.int32)
+        for seq_batch_size in (1, 2):
+            meta_ = self._chunk_meta(
+                starts,
+                chunk_tokens=chunk_tokens,
+                cu_q_lens=ragged,
+                seq_batch_size=seq_batch_size,
+            )
+            self.assertLessEqual(
+                int(np.array(meta_.num_steps).sum()), meta_.bq_idx.shape[0]
+            )
+
     def test_empty_pass_returns_a_zero_per_chunk(self):
         """The empty branch has to agree with the schedule branch on shape."""
         meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
