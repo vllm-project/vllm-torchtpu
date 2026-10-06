@@ -356,16 +356,17 @@ if [ "$RUN_MM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 7. Upload results to Spanner and BigQuery (dual write during migration)
+# 7. Upload results to BigQuery (and Spanner, if asked)
 # ========================================================
-echo "=== Uploading results to Spanner and BigQuery ==="
+echo "=== Uploading results ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
 if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
     UPLOAD_ARGS+=("--skip-db-upload")
 fi
-# Spanner only. A fleet that reports into the shared BigQuery table but keeps
-# no Spanner record of its own sets this; the guard above still wins.
-if [ "${SKIP_SPANNER_UPLOAD:-0}" = "1" ] || [ "${SKIP_SPANNER_UPLOAD:-}" = "true" ]; then
+# Spanner is opt-in: its rows duplicate the BigQuery ones, keyed by the same
+# RecordId. SKIP_SPANNER_UPLOAD=0 writes it as well; the guard above still
+# skips both.
+if [ "${SKIP_SPANNER_UPLOAD:-1}" != "0" ] && [ "${SKIP_SPANNER_UPLOAD:-}" != "false" ]; then
     UPLOAD_ARGS+=("--skip-spanner")
 fi
 
