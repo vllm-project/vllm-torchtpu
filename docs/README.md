@@ -20,23 +20,33 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-rocket-launch:{ .lg .middle } __I'm New__
 
-    Install the plugin, start a server, and send your first request.
+    Provision a Cloud TPU, install `vllm-torchtpu`, and send your first request.
 
-    [:octicons-arrow-right-24: Installation and Quickstart](https://github.com/vllm-project/vllm-torchtpu#readme)
+    [:octicons-arrow-right-24: Cloud TPU Setup](getting_started/tpu_setup.md)
 
-- :material-speedometer:{ .lg .middle } __I Want to Tune__
+    [:octicons-arrow-right-24: Installation](getting_started/installation.md)
 
-    Cut compile times and capture TPU traces to find where time goes.
+    [:octicons-arrow-right-24: Quickstart](getting_started/quickstart.md)
 
-    [:octicons-arrow-right-24: TorchTPU Compilation Cache](torch_tpu_compilation.md)
+- :material-speedometer:{ .lg .middle } __I Want to Serve & Tune__
 
-    [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
+    Check supported models, scale across multi-host TPU slices, and cut compile times.
 
-- :material-code-tags:{ .lg .middle } __I Want to Build__
+    [:octicons-arrow-right-24: Supported Models & Features](user_guide/supported_models.md)
 
-    Contribute code and follow the submission flow.
+    [:octicons-arrow-right-24: Multi-Host Serving](user_guide/multihost.md)
+
+    [:octicons-arrow-right-24: Compilation & Warmup Cache](user_guide/compilation_cache.md)
+
+- :material-code-tags:{ .lg .middle } __I Want to Contribute__
+
+    Learn the architecture, run tests & benchmarks, and profile TPU kernels.
 
     [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
+
+    [:octicons-arrow-right-24: Coding Guidance](developers_guide/coding_guidance.md)
+
+    [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
 
 </div>
 

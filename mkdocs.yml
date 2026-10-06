@@ -47,13 +47,25 @@ theme:
 
 nav:
   - 'Home': README.md
-  - 'Features & Usage':
-    - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
-    - 'Docker': docker.md
-  - 'Developers Guides':
-    - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md
+  - 'Getting Started':
+    - 'Cloud TPU Setup': getting_started/tpu_setup.md
+    - 'Installation': getting_started/installation.md
+    - 'Quickstart': getting_started/quickstart.md
+    - 'Docker Guide': getting_started/docker.md
+  - 'User Guide':
+    - 'Supported Models & Features': user_guide/supported_models.md
+    - 'Multi-Host Serving': user_guide/multihost.md
+    - 'Compilation & Warmup Cache': user_guide/compilation_cache.md
+  - 'Deployment':
+    - 'Kubernetes & GKE': deployment/kubernetes.md
+  - 'Developer Guide':
+    - 'Contributing': developers_guide/contributing.md
+    - 'Coding Guidance': developers_guide/coding_guidance.md
+    - 'Optimization Best Practices': developers_guide/optimization_best_practices.md
+    - 'TPU Patch Mechanism': developers_guide/tpu_patch_mechanism.md
     - 'Type Checking': developers_guide/type_checking.md
-    - 'TPU Patch Mechanism': tpu_patch_mechanism.md
+    - 'Testing & CI': developers_guide/testing_and_ci.md
+    - 'Benchmarking': developers_guide/benchmarking.md
     - 'Profiling': developers_guide/profiling.md
 
 validation:
@@ -61,9 +73,9 @@ validation:
     omitted_files: info
     not_found: warn
   links:
-    not_found: ignore
+    not_found: warn
     absolute_links: ignore
-    unrecognized_links: ignore
+    unrecognized_links: warn
 
 plugins:
   - search

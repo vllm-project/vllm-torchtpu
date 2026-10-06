@@ -82,8 +82,8 @@ export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 uv tool install keyring --with keyrings.google-artifactregistry-auth
 export UV_TORCH_BACKEND=cpu
 
-# Install vllm-torchtpu and dependencies in editable mode
-VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
+# Install vllm-torchtpu and dependencies in editable mode (--group vllm pulls vLLM from source)
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e . --group vllm
 ```
 
 #### Option B: Using `pip`
@@ -98,8 +98,9 @@ pip install keyring keyrings.google-artifactregistry-auth
 # TODO: Replace with the public index once torch_tpu is open-sourced
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-# Install vllm-torchtpu and dependencies in editable mode
-VLLM_TARGET_DEVICE="empty" pip install --pre -e .
+# Install vllm-torchtpu and dependencies in editable mode (--group vllm pulls vLLM from source;
+# needs pip >= 25.1)
+VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 ```
 
 ### 4. [Optional] Developing with vLLM Source
@@ -167,7 +168,7 @@ The project source is organized under `src/vllm_torchtpu/`:
 ## 5. Development & Testing Guidelines
 
 ### Local Testing via Docker
-For running development and unit tests inside containerized environments using Docker, refer to the [Docker Developer Guide](docs/docker.md).
+For running development and unit tests inside containerized environments using Docker, refer to the [Docker Developer Guide](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/getting_started/docker.md).
 
 ### Physical TPU Tests & Buildkite CI (The `ready` Label Gate)
 Tests requiring physical TPU hardware run in Buildkite CI.

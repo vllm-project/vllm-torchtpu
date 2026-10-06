@@ -129,7 +129,7 @@ PATCHES = (
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
-    # See docs/tpu_patch_mechanism.md for details.
+    # See docs/developers_guide/tpu_patch_mechanism.md for details.
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
         ("platform_activation", "model_load"),

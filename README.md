@@ -124,7 +124,7 @@ VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 The local installation of `vllm` is optional. Follow these steps when
 one need to develop with `vllm` directly.
 
-> **Note:** Currently, `vllm==0.27.0` is supported.
+> **Note:** Currently, `vllm==0.29.0` is supported.
 
 #### Option A: Using `uv` (Recommended)
 
@@ -133,7 +133,7 @@ one need to develop with `vllm` directly.
 source ~/uv_venv/bin/activate
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install vLLM in editable mode
 VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
@@ -146,7 +146,7 @@ VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
 source ~/pip_venv/bin/activate
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install vLLM in editable mode
 VLLM_TARGET_DEVICE="empty" pip install --no-deps -e ../vllm

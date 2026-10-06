@@ -14,8 +14,8 @@ which builds the ci, dev and prod images with
 `scripts/publish_nightly_images.sh`. It has no git triggers; its schedules pick
 the branch. A build of `main` pushes `nightly-YYYYMMDD` and `latest`, and a
 build of `release/X.Y.Z` pushes `YYYYMMDD-X.Y.Z` and `X.Y.Z` (see
-`docs/docker.md`). To start nightly images for a new release branch, add a
-schedule on that pipeline with the branch set to `release/X.Y.Z`.
+`docs/getting_started/docker.md`). To start nightly images for a new release
+branch, add a schedule on that pipeline with the branch set to `release/X.Y.Z`.
 
 Unit tests run on CPU by default. For a test file that requires a single-host
 TPU, add `pytestmark = pytest.mark.tpu_test` after its imports (or
