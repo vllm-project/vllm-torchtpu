@@ -53,7 +53,7 @@ UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
 UPSTREAM_MTP_FORWARD = qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward
-
+UPSTREAM_MLP_INIT = qwen3_next.Qwen3NextMLP.__init__
 _QWEN3_NEXT_MOE_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
 )
@@ -79,6 +79,10 @@ def _should_use_sp(
 ) -> bool:
     """Whether this step should shard activations [T/TP, H] across TP ranks."""
     min_sp_tokens = envs.VLLM_TPU_SP_MIN_TOKENS
+    if not min_sp_tokens and envs.USE_MOE_FUSED_TP_AR:
+        from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import MAX_DECODE_TOKENS
+
+        min_sp_tokens = MAX_DECODE_TOKENS + 1
     if min_sp_tokens <= 2:
         return True
     from vllm_torchtpu.compilation import shape_variants
@@ -88,6 +92,28 @@ def _should_use_sp(
     if is_mtp or (torch.compiler.is_compiling() and shape_variants._session is None):
         return False
     return bool(full_num_tokens >= min_sp_tokens)
+
+
+def patched_mlp_init(
+    self,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    is_sequence_parallel = kwargs.get("is_sequence_parallel", False)
+    prefix = kwargs.get("prefix", "")
+    if (
+        is_sequence_parallel
+        and envs.USE_MOE_FUSED_TP_AR
+        and prefix.endswith(".shared_expert")
+    ):
+        from vllm.config import get_current_vllm_config
+
+        vllm_cfg = get_current_vllm_config()
+        if not vllm_cfg.parallel_config.enable_expert_parallel:
+            # Keep the shared expert TP-sharded so arm_fused_tp_ar can fuse its
+            # [H, 2I/TP] and [I/TP, H] slices into the routed MoE kernel.
+            kwargs["is_sequence_parallel"] = False
+    UPSTREAM_MLP_INIT(self, *args, **kwargs)
 
 
 def patched_attention_forward(
@@ -187,11 +213,26 @@ def patched_decoder_layer_forward(
 
     # Fully Connected
     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    if use_sp:
-        hidden_states = self.mlp(
-            hidden_states,
-            already_sequence_parallel=True,
-        )
+    if self.use_attn_reduce_scatter_for_moe:
+        if envs.USE_MOE_FUSED_TP_AR:
+            from vllm_torchtpu.layers.adapter import fused_moe_tp_ar
+
+            prev_use_sp = fused_moe_tp_ar._CURRENT_LAYER_USE_SP
+            fused_moe_tp_ar._CURRENT_LAYER_USE_SP = use_sp
+            try:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    already_sequence_parallel=True,
+                )
+            finally:
+                fused_moe_tp_ar._CURRENT_LAYER_USE_SP = prev_use_sp
+        elif use_sp:
+            hidden_states = self.mlp(
+                hidden_states,
+                already_sequence_parallel=True,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
     else:
         hidden_states = self.mlp(hidden_states)
 
@@ -362,15 +403,18 @@ def maybe_patch_qwen3_next(
         lc._get_quantize_rows_op()
         lc._get_prequant_matmul_op()
         qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
+    if envs.USE_MOE_FUSED_TP_AR:
+        qwen3_next.Qwen3NextMLP.__init__ = patched_mlp_init
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
     qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
     qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
     logger.info(
         "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward "
-        "(fp8_gather=%s, fp8_min_tokens=%d, sp_min_tokens=%d).",
+        "(fp8_gather=%s, fp8_min_tokens=%d, sp_min_tokens=%d, fused_tp_ar=%s).",
         envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER,
         envs.VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS,
         envs.VLLM_TPU_SP_MIN_TOKENS,
+        envs.USE_MOE_FUSED_TP_AR,
     )
     return None

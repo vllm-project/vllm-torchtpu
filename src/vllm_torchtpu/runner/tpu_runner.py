@@ -4792,6 +4792,12 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
+        # After the drafter, so its MTP layer is armed too.
+        if envs.USE_MOE_FUSED_TP_AR:
+            from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import arm_runner_models
+
+            arm_runner_models(self)
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 

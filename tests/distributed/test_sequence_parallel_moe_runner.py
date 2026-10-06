@@ -353,3 +353,116 @@ def test_project_prequant_uses_prequant_matmul_for_per_channel_fp8(monkeypatch):
         (torch.Size([6, 4]), torch.Size([6, 1]), torch.Size([4, 5]), torch.Size([5]))
     ]
     torch.testing.assert_close(out, torch.full((6, 5), 3.0, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expect_sp"),
+    [
+        (32, False),
+        (128, False),
+        (256, True),
+        (1024, True),
+    ],
+)
+def test_patched_decoder_layer_bucket_gated_sp_with_fused_tp_ar(
+    monkeypatch, num_tokens, expect_sp
+):
+    from vllm_torchtpu.layers.adapter import fused_moe_tp_ar
+
+    tp_size = 8
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_TP_AR", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_SP_MIN_TOKENS", 0)
+    monkeypatch.setattr(envs, "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER", False)
+    monkeypatch.setattr(
+        qwen3_next_patch, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    calls: list[str] = []
+
+    def fake_all_gather(x, dim):
+        calls.append("all_gather")
+        return x.repeat(tp_size, *([1] * (x.ndim - 1)))
+
+    def fake_reduce_scatter(x, dim):
+        calls.append("reduce_scatter")
+        return x[: x.shape[0] // tp_size]
+
+    def fake_all_reduce(x):
+        calls.append("all_reduce")
+        return x
+
+    monkeypatch.setattr(
+        qwen3_next_patch, "tensor_model_parallel_all_gather", fake_all_gather
+    )
+    monkeypatch.setattr(
+        qwen3_next_patch, "tensor_model_parallel_reduce_scatter", fake_reduce_scatter
+    )
+    monkeypatch.setattr(
+        qwen3_next_patch, "tensor_model_parallel_all_reduce", fake_all_reduce
+    )
+
+    seen_sp: list[bool] = []
+
+    def mlp(x, already_sequence_parallel=False):
+        seen_sp.append(fused_moe_tp_ar._CURRENT_LAYER_USE_SP)
+        return x
+
+    layer = SimpleNamespace(
+        input_layernorm=lambda h, r=None: (h, r) if r is not None else h,
+        post_attention_layernorm=lambda h, r: (h + r, r),
+        use_attn_reduce_scatter_for_moe=True,
+        layer_type="linear_attention",
+        linear_attn=lambda hidden_states, **kwargs: hidden_states,
+        layer_scale=False,
+        mlp=mlp,
+    )
+    in_rows = num_tokens // tp_size if expect_sp else num_tokens
+    hidden = torch.ones(in_rows, 4, dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens)
+
+    out, _ = qwen3_next_patch.patched_decoder_layer_forward(
+        layer, hidden, None, positions
+    )
+
+    assert seen_sp == [expect_sp]
+    assert out.shape == (in_rows, 4)
+    if expect_sp:
+        assert calls == ["all_gather", "reduce_scatter"]
+    else:
+        assert calls == ["all_reduce"]
+
+
+def test_patched_mlp_init_keeps_shared_expert_tp_sharded(monkeypatch):
+    import vllm.config as vllm_config_mod
+
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_TP_AR", True)
+    monkeypatch.setattr(
+        vllm_config_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_expert_parallel=False)
+        ),
+    )
+    recorded_kwargs: list[dict[str, object]] = []
+
+    def fake_upstream_mlp_init(self, *args, **kwargs):
+        recorded_kwargs.append(kwargs)
+
+    monkeypatch.setattr(qwen3_next_patch, "UPSTREAM_MLP_INIT", fake_upstream_mlp_init)
+
+    qwen3_next_patch.patched_mlp_init(
+        SimpleNamespace(),
+        hidden_size=4096,
+        intermediate_size=1024,
+        hidden_act="silu",
+        quant_config=None,
+        reduce_results=False,
+        expert_gate=None,
+        is_sequence_parallel=True,
+        disable_tp=False,
+        prefix="model.layers.0.mlp.shared_expert",
+    )
+
+    assert len(recorded_kwargs) == 1
+    assert recorded_kwargs[0]["hidden_size"] == 4096
+    assert recorded_kwargs[0]["is_sequence_parallel"] is False
+    assert recorded_kwargs[0]["disable_tp"] is False

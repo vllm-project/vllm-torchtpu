@@ -1186,6 +1186,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
+        from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import (
+            fused_moe_tp_ar,
+            fused_moe_tp_ar_supported,
+        )
+
+        if fused_moe_tp_ar_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return fused_moe_tp_ar(self, layer, x, topk_weights, topk_ids)
+
         return fused_moe_gmm(**kwargs)
 
 

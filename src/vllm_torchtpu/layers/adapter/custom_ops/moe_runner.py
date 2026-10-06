@@ -85,6 +85,8 @@ class VllmMoERunner(MoERunner):
 
     @property
     def do_naive_dispatch_combine(self) -> bool:
+        if getattr(self, "_fused_moe_tp_ar_armed", False):
+            return False
         return (
             self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
         ) and not self._quant_method.supports_internal_mk
