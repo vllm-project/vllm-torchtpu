@@ -55,11 +55,27 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
 
-      # pipeline_integration.yml gates this on build.pull_request.id, which no
-      # scheduled build has. Kept ungated rather than migrated as a step that
-      # could never run: this lane exists to put work on the fleet.
+      # pipeline_integration.yml also sets the prefill and decode layout
+      # (ROLE, PREFILL_*, DECODE_*, TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT).
+      # Those names do not reach the pod, and the values there are the script's
+      # own defaults, so the script supplies them.
+      - label: ":kubernetes: Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
+        key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
+
+      # PR builds only, as on bare metal; a nightly does not run it there.
       - label: ":kubernetes: Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
+        if: "build.pull_request.id != null"
         env:
           SHAPE: *shape_8_core
         <<: *integration_step
