@@ -3,7 +3,7 @@
 # agentx_client.sh against it, stop it again.
 #
 #   agentx_sweep.sh --chips 16 [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
-#       [--duration 1800] [--fast 1|0] [--ix-ref main]
+#       [--duration 1800] [--fast 1|0] [--ix-ref SHA]
 #       [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
 #
@@ -38,7 +38,7 @@ CONFIG_NAME="kimi-k3-tp32-ep-agentx"
 RESULTS_DIR="/perf_eval_results/agentx-sweep"
 DURATION=1800
 FAST=1
-IX_REF="main"
+IX_REF=""            # empty: agentx_client.sh owns the pin
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"
 # Physical TPU chips serving this benchmark. No default: see the note at the
@@ -201,7 +201,7 @@ bash "$SCRIPT_DIR/agentx_client.sh" \
     --results-dir "$RESULTS_DIR" \
     --duration "$DURATION" \
     --fast "$FAST" \
-    --ix-ref "$IX_REF" \
+    ${IX_REF:+--ix-ref "$IX_REF"} \
     --gsm8k-limit "$GSM8K_LIMIT" \
     --gsm8k-conc "$GSM8K_CONC" \
     --model "$(ix_config_json_get model)" \

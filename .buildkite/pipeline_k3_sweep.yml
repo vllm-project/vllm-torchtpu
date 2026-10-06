@@ -64,8 +64,9 @@
 #     K3_DURATION          default 1800      (measurement window per point, seconds)
 #     K3_GSM8K_LIMIT       default 100       (0 = skip the probe)
 #     K3_GSM8K_CONC        default 8         (comma list = one GSM8K run per value)
-#     K3_IX_REF            default main      (InferenceX git ref to clone; set a commit SHA to
-#                                              pin a run for reproducibility, e.g. K3_IX_REF=9acf24c)
+#     K3_IX_REF            default empty     (the pin in agentx_client.sh, which is a full
+#                                              40-character SHA: an abbreviated one cannot be
+#                                              fetched. Set it to override that pin.)
 #     K3_GCS_ROOT          default empty     (no GCS copy; artifacts only)
 #   Runtime at the defaults: ~25 min boot + ~30 min per concurrency (fast mode).
 #
@@ -125,6 +126,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/agentx_sweep.sh --chips 16 --config ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} --results-dir /perf_eval_results/k3-agentx-sweep --duration ${K3_DURATION:-1800} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --ix-ref ${K3_IX_REF:-main} --gcs-root \"${K3_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/agentx_sweep.sh --chips 16 --config ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} --results-dir /perf_eval_results/k3-agentx-sweep --duration ${K3_DURATION:-1800} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --ix-ref \"${K3_IX_REF:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"

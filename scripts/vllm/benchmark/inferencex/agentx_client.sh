@@ -46,7 +46,14 @@ RESULTS_DIR="/perf_eval_results/agentx-client"
 CONC_LIST=""
 DURATION=1800
 FAST=1
-IX_REF="main"          # InferenceX git ref; pass --ix-ref <commit> to pin a run (e.g. 9acf24c = 2026-09-07, aiperf 754356e)
+# Pinned, not main. InferenceX refactors its benchmark harness under us: in one
+# week it moved its tree into inferencex-e2e/, added ten env vars that
+# build_replay_cmd validates, and then replaced benchmark_lib.sh - which this
+# script sources - with the infx.bench package (#3610). A nightly that tracks
+# main races those. 8ba71d0 is the last ref this lane ran clean on (build 65:
+# both ladder points, ok=19 err=0, isl p50 337k). Bump it deliberately, with a
+# run to show the new ref works; --ix-ref overrides for a one-off.
+IX_REF="8ba71d0"
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"         # comma list allowed: one GSM8K run per value
 TOK_DIR_ARG=""         # a local tokenizer directory, when the caller pulled the weights
