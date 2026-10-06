@@ -1253,16 +1253,19 @@ def _visible_top_k(
     selections then run on SparseCore over the full width, bounded by
     ``lengths`` instead of buckets (no SparseCore op inside `lax.switch`).
     """
-    width = scores.shape[1]
+    rows, width = scores.shape
     if (
         unordered
         and lengths is not None
-        and scores.shape[0] >= 16
         and width >= 2048
         and width % 16 == 0
         and k % 16 == 0
     ):
-        return _sparsecore_top_k(scores, k, jnp.minimum(lengths, width))
+        # SparseCore top-k selects 16-row tiles; padding rows select nothing.
+        padding = -rows % 16
+        scores = jnp.pad(scores, ((0, padding), (0, 0)), constant_values=-jnp.inf)
+        lengths = jnp.pad(jnp.minimum(lengths, width), (0, padding))
+        return _sparsecore_top_k(scores, k, lengths)[:rows]
 
     def select(columns, scores):
         scores = scores[:, :columns]
