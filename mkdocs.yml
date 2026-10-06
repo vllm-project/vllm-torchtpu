@@ -54,9 +54,15 @@ nav:
     - 'Docker Guide': getting_started/docker.md
   - 'User Guide':
     - 'Supported Models & Features': user_guide/supported_models.md
+    - 'Parallelism & Scaling': user_guide/parallelism.md
     - 'Multi-Host Serving': user_guide/multihost.md
+    - 'Disaggregated Serving (P/D)': user_guide/disaggregated_serving.md
+    - 'Quantization': user_guide/quantization.md
+    - 'Speculative Decoding': user_guide/speculative_decoding.md
     - 'Compilation & Warmup Cache': user_guide/compilation_cache.md
-  - 'Deployment':
+  - 'Deployment & Recipes':
+    - 'TPU v7x (Ironwood) Recipes': deployment/v7x_recipes.md
+    - 'TPU v6e (Trillium) Recipes': deployment/v6e_recipes.md
     - 'Kubernetes & GKE': deployment/kubernetes.md
   - 'Developer Guide':
     - 'Contributing': developers_guide/contributing.md
@@ -67,6 +73,8 @@ nav:
     - 'Testing & CI': developers_guide/testing_and_ci.md
     - 'Benchmarking': developers_guide/benchmarking.md
     - 'Profiling': developers_guide/profiling.md
+  - 'Reference':
+    - 'Environment Variables': reference/env_vars.md
 
 validation:
   nav:

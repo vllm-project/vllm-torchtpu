@@ -28,15 +28,17 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
     [:octicons-arrow-right-24: Quickstart](getting_started/quickstart.md)
 
-- :material-speedometer:{ .lg .middle } __I Want to Serve & Tune__
+- :material-speedometer:{ .lg .middle } __I Want to Serve & Scale__
 
-    Check supported models, scale across multi-host TPU slices, and cut compile times.
+    Explore supported models, 6D parallelism, P/D disaggregation, and TPU recipes.
 
     [:octicons-arrow-right-24: Supported Models & Features](user_guide/supported_models.md)
 
-    [:octicons-arrow-right-24: Multi-Host Serving](user_guide/multihost.md)
+    [:octicons-arrow-right-24: Parallelism & Scaling](user_guide/parallelism.md)
 
-    [:octicons-arrow-right-24: Compilation & Warmup Cache](user_guide/compilation_cache.md)
+    [:octicons-arrow-right-24: Disaggregated Serving (P/D)](user_guide/disaggregated_serving.md)
+
+    [:octicons-arrow-right-24: TPU v7x Serving Recipes](deployment/v7x_recipes.md)
 
 - :material-code-tags:{ .lg .middle } __I Want to Contribute__
 
@@ -47,6 +49,8 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
     [:octicons-arrow-right-24: Coding Guidance](developers_guide/coding_guidance.md)
 
     [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
+
+    [:octicons-arrow-right-24: Environment Variables](reference/env_vars.md)
 
 </div>
 
