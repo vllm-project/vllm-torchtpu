@@ -164,7 +164,7 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 # HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
-# fp8 page is genuinely half a bf16 one (b/510425663).
+# fp8 page is genuinely half a bf16 one.
 KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] = {
     VllmKVCacheLayout.LBNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     VllmKVCacheLayout.BLNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
