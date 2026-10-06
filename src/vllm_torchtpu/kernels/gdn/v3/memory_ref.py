@@ -771,19 +771,31 @@ def create_allocs(
         )
     else:
         # (input, output) pairs; the input only ever holds window position 0.
-        conv_alloc = tuple(
-            make(t, w, conv_tail, conv_state_ref, conv_fields)
-            for t, w in (
-                (pltpu.BufferType.INPUT, 1),
-                (pltpu.BufferType.OUTPUT, cfg.window_size),
-            )
+        conv_alloc = (
+            make(pltpu.BufferType.INPUT, 1, conv_tail, conv_state_ref, conv_fields),
+            make(
+                pltpu.BufferType.OUTPUT,
+                cfg.window_size,
+                conv_tail,
+                conv_state_ref,
+                conv_fields,
+            ),
         )
-        recurrent_alloc = tuple(
-            make(t, w, recurrent_tail, recurrent_state_ref, recurrent_fields)
-            for t, w in (
-                (pltpu.BufferType.INPUT, 1),
-                (pltpu.BufferType.OUTPUT, cfg.window_size),
-            )
+        recurrent_alloc = (
+            make(
+                pltpu.BufferType.INPUT,
+                1,
+                recurrent_tail,
+                recurrent_state_ref,
+                recurrent_fields,
+            ),
+            make(
+                pltpu.BufferType.OUTPUT,
+                cfg.window_size,
+                recurrent_tail,
+                recurrent_state_ref,
+                recurrent_fields,
+            ),
         )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
