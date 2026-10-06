@@ -297,6 +297,7 @@ def outer_kernel(
     in_refs = (qkv_ref, b_ref, a_ref)
     if cfg.split_state:
         # The write-back buffers ride after the activation output.
+        assert isinstance(conv_alloc, tuple) and isinstance(recurrent_alloc, tuple)
         (conv_in, conv_out), (recurrent_in, recurrent_out) = conv_alloc, recurrent_alloc
         in_allocs += (conv_in, recurrent_in)
         out_allocs = (out_alloc, conv_out, recurrent_out)
@@ -318,6 +319,8 @@ def outer_kernel(
             )
 
     else:
+        assert isinstance(conv_alloc, memory_ref.StateBufferedRef)
+        assert isinstance(recurrent_alloc, memory_ref.StateBufferedRef)
         in_allocs += (conv_alloc, recurrent_alloc)
         out_allocs = (out_alloc,)
         state_refs = (conv_state_ref, recurrent_state_ref)
