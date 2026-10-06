@@ -95,6 +95,16 @@ repos:
     additional_dependencies: [ruff==0.14.0]
     always_run: true
     pass_filenames: false
+  - id: check-license-header
+    name: Python files carry the Apache 2.0 license header
+    # Either form counts: the full Apache text or the one-line SPDX tag.
+    # `\A\Z` matches an empty file, so a bare __init__.py passes.
+    entry: '\A\Z|Licensed under the Apache License|SPDX-License-Identifier: Apache-2\.0'
+    language: pygrep
+    args: [--negate, --multiline]
+    types: [python]
+    # protoc writes this file; see scripts/update_xplane_proto.sh.
+    exclude: ^src/vllm_torchtpu/tools/xplane_pb2\.py$
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash
