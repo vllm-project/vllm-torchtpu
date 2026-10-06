@@ -6,6 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -352,3 +353,211 @@ def test_mixed_q_split_matches_unsplit_mixed_mode() -> None:
         np.asarray(split_cache),
         np.asarray(unsplit_cache),
     )
+
+
+def _build_ragged_case(
+    q_lens: list[int],
+    previous_tokens: list[int],
+    num_q_heads: int,
+    seed: int,
+):
+    """Inputs for a ragged batch plus a numpy log-sum-exp reference.
+
+    Sequence s has `previous_tokens[s]` keys in the cache and `q_lens[s]` new
+    tokens this step; query i of it sits at position `previous_tokens[s] + i`
+    and, under the causal mask, attends the keys at positions 0..that one.
+    The reference rounds every input to bf16 first, as the kernel reads them,
+    and does the rest in f32.
+    """
+    lkv_dim, r_dim, padded_r_dim = 512, 64, 128
+    page_size, packing = 16, 2
+    num_seqs = len(q_lens)
+    max_num_tokens = sum(q_lens)
+    kv_lens = [p + q for p, q in zip(previous_tokens, q_lens)]
+    pages_per_seq = max((kv + page_size - 1) // page_size for kv in kv_lens)
+    rng = np.random.default_rng(seed)
+
+    def bf16(x):
+        return jnp.asarray(x, jnp.bfloat16)
+
+    ql_nope = bf16(rng.normal(size=(num_q_heads, max_num_tokens, lkv_dim)) * 0.05)
+    q_pe = bf16(rng.normal(size=(max_num_tokens, num_q_heads, r_dim)) * 0.05)
+    new_kv_c = bf16(rng.normal(size=(max_num_tokens, lkv_dim)))
+    new_k_pe = bf16(rng.normal(size=(max_num_tokens, r_dim)))
+    old_kv_c = bf16(rng.normal(size=(num_seqs, pages_per_seq * page_size, lkv_dim)))
+    old_k_pe = bf16(rng.normal(size=(num_seqs, pages_per_seq * page_size, r_dim)))
+    cache = jnp.concatenate(
+        [old_kv_c, jnp.pad(old_k_pe, ((0, 0), (0, 0), (0, padded_r_dim - r_dim)))],
+        axis=2,
+    ).reshape(
+        num_seqs * pages_per_seq, page_size // packing, packing, lkv_dim + padded_r_dim
+    )
+
+    cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    reference = np.zeros((max_num_tokens, num_q_heads), np.float32)
+    f32 = lambda x: np.asarray(x.astype(jnp.float32))  # noqa: E731
+    for s in range(num_seqs):
+        q_start = int(cu_q_lens[s])
+        q = np.concatenate(
+            [
+                f32(ql_nope)[:, q_start : q_start + q_lens[s]],
+                f32(q_pe)[q_start : q_start + q_lens[s]].transpose(1, 0, 2),
+            ],
+            axis=2,
+        )  # [heads, q_len, 576]
+        old = np.concatenate(
+            [
+                f32(old_kv_c)[s, : previous_tokens[s]],
+                f32(old_k_pe)[s, : previous_tokens[s]],
+            ],
+            axis=1,
+        )
+        new = np.concatenate(
+            [
+                f32(new_kv_c)[q_start : q_start + q_lens[s]],
+                f32(new_k_pe)[q_start : q_start + q_lens[s]],
+            ],
+            axis=1,
+        )
+        keys = np.concatenate([old, new], axis=0)  # [kv_len, 576]
+        scores = np.einsum("hqd,kd->hqk", q, keys)
+        for i in range(q_lens[s]):
+            visible = scores[:, i, : previous_tokens[s] + i + 1]
+            m = visible.max(axis=1)
+            reference[q_start + i] = m + np.log(
+                np.exp(visible - m[:, None]).sum(axis=1)
+            )
+
+    args = (
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        jnp.asarray(kv_lens, jnp.int32),
+        jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32),
+        jnp.asarray(cu_q_lens),
+    )
+    return args, cache, reference
+
+
+@pytest.mark.parametrize(
+    ("s_dtype", "atol"),
+    [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)],
+    ids=["f32_scores", "bf16_scores"],
+)
+def test_return_lse_matches_reference_and_leaves_output_unchanged(
+    s_dtype, atol
+) -> None:
+    """`return_lse` adds the log-sum-exp and changes nothing else.
+
+    Covers the batched-decode, decode and mixed programs in one call, a
+    head count that needs VMEM padding (12, as Kimi-K3 at TP=8), query
+    blocks larger than one, the causal mask inside a ragged prefill, and
+    the sequence tail beyond the last query block.
+    """
+    q_lens = [1, 1, 1, 1, 1, 5, 16, 33]
+    previous_tokens = [114, 7, 0, 40, 200, 30, 9, 100]
+    distribution = jnp.asarray([5, 5, len(q_lens)], jnp.int32)
+    args, cache, reference = _build_ragged_case(q_lens, previous_tokens, 12, seed=7)
+    kwargs = dict(
+        num_kv_pages_per_block=(3, 1, 2),
+        num_queries_per_block=(1, 16, 16),
+        decode_batch_size=4,
+        s_dtype=s_dtype,
+    )
+    out, updated = mla_ragged_paged_attention(
+        *args[:4], cache.copy(), *args[4:], distribution, **kwargs
+    )
+    out_lse, updated_lse, lse = mla_ragged_paged_attention(
+        *args[:4], cache.copy(), *args[4:], distribution, **kwargs, return_lse=True
+    )
+    jax.block_until_ready((out, updated, out_lse, updated_lse, lse))
+
+    np.testing.assert_array_equal(np.asarray(out_lse), np.asarray(out))
+    np.testing.assert_array_equal(np.asarray(updated_lse), np.asarray(updated))
+    assert lse.shape == (sum(q_lens), 12)
+    assert lse.dtype == jnp.float32
+    np.testing.assert_allclose(np.asarray(lse), reference, atol=atol, rtol=0)
+
+
+def test_return_lse_with_three_heads_and_padded_tokens() -> None:
+    """Three heads (Kimi-K3 at TP=32) pad to four in the kernel; the padding
+    heads and the tokens past the last sequence must not leak into the
+    result, which reads 0 there."""
+    q_lens = [1, 1, 2]
+    previous_tokens = [50, 3, 20]
+    args, cache, reference = _build_ragged_case(q_lens, previous_tokens, 3, seed=11)
+    pad_tokens = 4
+    ql_nope, q_pe, new_kv_c, new_k_pe, kv_lens, page_indices, cu_q_lens = args
+    ql_nope = jnp.pad(ql_nope, ((0, 0), (0, pad_tokens), (0, 0)))
+    q_pe = jnp.pad(q_pe, ((0, pad_tokens), (0, 0), (0, 0)))
+    new_kv_c = jnp.pad(new_kv_c, ((0, pad_tokens), (0, 0)))
+    new_k_pe = jnp.pad(new_k_pe, ((0, pad_tokens), (0, 0)))
+    distribution = jnp.asarray([2, 2, 3], jnp.int32)
+    _, _, lse = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=8,
+        s_dtype=jnp.float32,
+        return_lse=True,
+    )
+    lse.block_until_ready()
+    assert lse.shape == (sum(q_lens) + pad_tokens, 3)
+    np.testing.assert_allclose(
+        np.asarray(lse)[: sum(q_lens)], reference, atol=1e-4, rtol=0
+    )
+    np.testing.assert_array_equal(np.asarray(lse)[sum(q_lens) :], 0.0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "distribution"),
+    [
+        ({"mixed_q_split": 2}, [2, 2, 5]),
+        ({"two_step_flash_attention": False}, [2, 2, 5]),
+        # The prefill program only runs with chunk_prefill_size; without it
+        # a sequence in the [i, j) range is not attended by any program.
+        ({"chunk_prefill_size": 16}, [2, 4, 5]),
+    ],
+    ids=["q_split_2", "one_step", "chunk_prefill_16"],
+)
+def test_return_lse_on_other_kernel_paths(kwargs, distribution) -> None:
+    """The lse is read from the same scratch on every kernel variant; the
+    split-query mixed path, the one-step attention and the fixed-length
+    prefill program must agree with the reference as well."""
+    q_lens = [1, 1, 16, 16, 7]
+    previous_tokens = [40, 3, 20, 100, 9]
+    distribution = jnp.asarray(distribution, jnp.int32)
+    args, cache, reference = _build_ragged_case(q_lens, previous_tokens, 12, seed=3)
+    out, updated = mla_ragged_paged_attention(
+        *args[:4],
+        cache.copy(),
+        *args[4:],
+        distribution,
+        num_kv_pages_per_block=(3, 1, 2),
+        num_queries_per_block=(1, 16, 16),
+        s_dtype=jnp.float32,
+        **kwargs,
+    )
+    out_lse, updated_lse, lse = mla_ragged_paged_attention(
+        *args[:4],
+        cache.copy(),
+        *args[4:],
+        distribution,
+        num_kv_pages_per_block=(3, 1, 2),
+        num_queries_per_block=(1, 16, 16),
+        s_dtype=jnp.float32,
+        return_lse=True,
+        **kwargs,
+    )
+    jax.block_until_ready((out, updated, out_lse, updated_lse, lse))
+    np.testing.assert_array_equal(np.asarray(out_lse), np.asarray(out))
+    np.testing.assert_array_equal(np.asarray(updated_lse), np.asarray(updated))
+    np.testing.assert_allclose(np.asarray(lse), reference, atol=1e-4, rtol=0)
