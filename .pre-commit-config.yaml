@@ -99,6 +99,13 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: no-internal-refs
+    name: No go/ links or b/ bug numbers
+    # The repo is public, so internal links and bug IDs mean nothing to most
+    # readers. Put the reasoning in the comment or cite a public source.
+    entry: '\b(b/[0-9]+|go/[A-Za-z])'
+    language: pygrep
+    types: [text]
   - id: pyrefly
     name: Pyrefly type check
     # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather
