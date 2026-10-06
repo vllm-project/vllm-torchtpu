@@ -113,9 +113,10 @@ steps:
           # isl100000_osl1_c1.json is the prefill tok/s and TTFT the 100k
           # prefill time. The perf baseline holds only the request count, so
           # the step fails when a request fails, not on throughput; the
-          # numbers are published as artifacts and not yet gated. PR #1575
-          # measured 21246 tok/s (TTFT 4.71 s) on a CDK tpu7x node with sync
-          # scheduling; compare runs from the same environment only.
+          # numbers are published as artifacts and not yet gated. Build 3775
+          # measured 19372 tok/s (TTFT P50 5.18 s); PR #1575 measured 21246
+          # tok/s (TTFT 4.71 s) on its author's host with sync scheduling.
+          # Compare runs from the same environment only.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
