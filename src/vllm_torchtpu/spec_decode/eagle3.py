@@ -1139,7 +1139,9 @@ class Eagle3Proposer:
                     num_rejected_tokens_np,
                     scheduler_output,
                     next_tokens_device=(
-                        None if not is_async else next_tokens_per_chunk[ci]
+                        None
+                        if next_tokens_per_chunk is None
+                        else next_tokens_per_chunk[ci]
                     ),
                     device_seed=device_seed,
                 )

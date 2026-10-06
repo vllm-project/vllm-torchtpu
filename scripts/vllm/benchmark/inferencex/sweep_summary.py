@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Result parsing for the Kimi-K3 sweep drivers.
+"""Result parsing for the InferenceX benchmark scripts.
 
-Pure functions plus a small CLI, so the drivers' summary logic can be unit
-tested (tests/scripts/test_k3_sweep_summary.py) without a TPU:
+Pure functions plus a small CLI, so the summary logic of agentx_client.sh (the
+AgentX replay) and eval_conc_sweep.sh (the lm_eval ladder) can be unit tested
+(tests/scripts/test_k3_sweep_summary.py) without a TPU:
 
   lm-eval-score  --output-dir DIR --task TASK
       -> "<metric> <score> <stderr>" from the newest lm_eval results_*.json
@@ -27,7 +28,10 @@ tested (tests/scripts/test_k3_sweep_summary.py) without a TPU:
       -> "| N | <strict-match> | <flexible-extract> |"
   agentx-table   --results-dir DIR --base NAME --concs N...
       -> markdown table over DIR/NAME_c<N>.json, the aggregate JSON that
-         InferenceX's process_agentic_result.py writes per point.
+         InferenceX's process_agentic_result.py writes per point. A point whose
+         conc_<N>/HARD_TIMEOUT marker exists is labelled as such whether or not
+         it produced an aggregate, and one unreadable aggregate costs its own
+         row rather than the table.
 """
 
 from __future__ import annotations
@@ -144,13 +148,20 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
                 f"| {c} | (no aggregate: {why}{os.path.basename(path)} missing) |"
             )
             continue
-        with open(path) as f:
-            d = json.load(f)
+        label = f"{c} (HARD_TIMEOUT)" if timed_out else str(c)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            # One truncated aggregate must not cost the whole table: the other
+            # points' numbers are still the run's result.
+            lines.append(f"| {label} | (unreadable: {type(e).__name__}) |")
+            continue
         cells = []
         for _, key in AGENTX_COLUMNS:
             v = dotted_get(d, key)
             cells.append("-" if v is None else f"{v:.4g}")
-        lines.append(f"| {c} | " + " | ".join(cells) + " |")
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 

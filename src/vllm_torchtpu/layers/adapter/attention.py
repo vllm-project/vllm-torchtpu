@@ -12,6 +12,7 @@ import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -2399,7 +2400,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.request_distribution,
                 )
                 # The scatter undoes the head all-gather above.
-                outputs = merge_lse_partials_scatter_heads(partial, lse)
+                #
+                # Only the backbone may use the all-to-all merge. The merge
+                # picks it by comparing the token count to
+                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                # the backbone is traced multiple times, once per bucket
+                # group (`_precompile_backbone`). The MTP drafter (model_tag
+                # "eagle_head") is traced once for every bucket: the
+                # comparison would pin its graph to the first size, and the
+                # large buckets fail with ShapeSpecializationError. So the
+                # drafter keeps the reduce-scatter, as with the flag off.
+                outputs = merge_lse_partials_scatter_heads(
+                    partial,
+                    lse,
+                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)

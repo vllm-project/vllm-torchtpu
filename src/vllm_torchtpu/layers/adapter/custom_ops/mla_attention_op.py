@@ -920,46 +920,45 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 prefill_group is not None,
             )
             q = self.q_b_proj(q_c)[0]
-        elif self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None, (
-                "fused_qkv_a_proj is required when q_lora_rank is not None"
-            )
-            assert self.q_a_layernorm is not None, (
-                "q_a_layernorm is required when q_lora_rank is not None"
-            )
-            assert self.q_b_proj is not None, (
-                "q_b_proj is required when q_lora_rank is not None"
-            )
-
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            if self.gate_is_fused:
-                q_c, kv_lora, output_gate = qkv_lora.split(
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        self.num_heads * self.v_head_dim,
-                    ],
-                    dim=-1,
-                )
-            else:
-                q_c, kv_lora = qkv_lora.split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
         else:
-            assert self.kv_a_proj_with_mqa is not None, (
-                "kv_a_proj_with_mqa is required when q_lora_rank is None"
-            )
-            assert self.q_proj is not None, (
-                "q_proj is required when q_lora_rank is None"
-            )
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_proj(hidden_states)[0]
+            if self.q_lora_rank is not None:
+                assert self.fused_qkv_a_proj is not None, (
+                    "fused_qkv_a_proj is required when q_lora_rank is not None"
+                )
+                assert self.q_a_layernorm is not None, (
+                    "q_a_layernorm is required when q_lora_rank is not None"
+                )
+                assert self.q_b_proj is not None, (
+                    "q_b_proj is required when q_lora_rank is not None"
+                )
 
-        if self.kimi_preprocess is None:
-            # Set by the earlier `kimi_preprocess is None` branch.
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if self.gate_is_fused:
+                    q_c, kv_lora, output_gate = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            self.num_heads * self.v_head_dim,
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    q_c, kv_lora = qkv_lora.split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
+            else:
+                assert self.kv_a_proj_with_mqa is not None, (
+                    "kv_a_proj_with_mqa is required when q_lora_rank is None"
+                )
+                assert self.q_proj is not None, (
+                    "q_proj is required when q_lora_rank is None"
+                )
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                q = self.q_proj(hidden_states)[0]
+
             assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -1048,9 +1047,6 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         assert key is not None
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
 
         pos = torch.add(positions, offsets) if offsets is not None else positions
         cos_sin = self.cos_sin_cache.index_select(0, pos)
@@ -1067,8 +1063,8 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
         if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
+            query = torch.cat((query_rot, query[..., self.rotary_dim :]), dim=-1)
+            key = torch.cat((key_rot, key[..., self.rotary_dim :]), dim=-1)
         else:
             query = query_rot
             key = key_rot

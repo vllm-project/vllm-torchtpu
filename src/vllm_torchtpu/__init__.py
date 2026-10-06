@@ -595,6 +595,8 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
     """
+    from typing import Literal
+
     from vllm.config.model import ModelConfig
 
     if getattr(ModelConfig, "_tpu_kimi_kda_layer_counts_patched", False):
@@ -603,7 +605,9 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     original_get_num_layers = ModelConfig.get_num_layers_by_block_type
 
     def patched_get_num_layers_by_block_type(
-        self, parallel_config, block_type="attention"
+        self,
+        parallel_config,
+        block_type: Literal["attention", "linear_attention", "mamba"] = "attention",
     ) -> int:
         try:
             return original_get_num_layers(self, parallel_config, block_type)
@@ -1439,6 +1443,9 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
     list. The other native checks and TPU's combination checks still apply.
     An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
+    from collections.abc import Callable
+    from typing import Any, cast
+
     from vllm.config.vllm import VllmConfig
 
     if getattr(VllmConfig, "_tpu_force_v1_runner_patch", False):
@@ -1453,15 +1460,17 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         )
         return
 
+    original_fget = cast(Callable[[Any], bool], original_prop.fget)
+
     def patched_use_v2(self):
         import vllm.envs as envs
 
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
-            return original_prop.fget(self)
+            return original_fget(self)
         device_config = getattr(self, "device_config", None)
         if device_config is not None and device_config.device_type == "tpu":
             return False
-        return original_prop.fget(self)
+        return original_fget(self)
 
     original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
 
@@ -1682,6 +1691,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
@@ -1713,6 +1723,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             masked_input = input_
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.tp_size > 1:
+            assert input_mask is not None
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
 

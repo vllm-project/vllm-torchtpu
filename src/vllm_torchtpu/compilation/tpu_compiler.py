@@ -133,12 +133,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, offload retry and drain limits, a weight-load sync cadence, a
-    # debug log switch, and the local-rank offsets, which move a worker to a
-    # different chip without changing the executable it runs.
+    # checks, the raiden offload storage tier, offload retry and drain
+    # limits, a weight-load sync cadence, a debug log switch, and the
+    # local-rank offsets, which move a worker to a different chip without
+    # changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",
+    "RAIDEN_STORAGE_CAPACITY_GB",
+    "RAIDEN_STORAGE_PATH",
+    "RAIDEN_STORAGE_PROPERTIES",
+    "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
     "TORCH_TPU_BASE_PORT",
@@ -178,10 +184,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
-    # And the mesh they export with. Since google-pytorch/torch_tpu#3522 the
-    # order is the process group's rank order rather than something
-    # `build_ep_mesh` chooses, but the file still decides the axis and the
-    # shape the kernel exports against.
+    # And the mesh they export with: `build_ep_mesh` decides the axis, the
+    # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",

@@ -29,7 +29,7 @@
 # then "New Build" with K3_SWEEP (and any knobs below) in the build's
 # environment. Or select this file on vllm-torchtpu-dev with DEV_PIPELINE_FILE.
 #
-# K3_SWEEP=eval  — driver scripts/vllm/benchmarking/k3_eval_conc_sweep.sh
+# K3_SWEEP=eval  — driver scripts/vllm/benchmark/inferencex/kimi-k3/eval_conc_sweep.sh
 #   Nightly kimi-k3-tp32-ep serve flags with a 16k context, max-num-seqs 256
 #   and matching compile buckets (config kimi-k3-tp32-ep-concsweep), then
 #   lm_eval for each task at each client concurrency in ascending order,
@@ -44,24 +44,26 @@
 #     K3_SWEEP_GCS_ROOT      default empty (no GCS copy; artifacts only)
 #   Runtime at the defaults: ~30 min boot + ~90 min sweep.
 #
-# K3_SWEEP=perf  — driver scripts/vllm/benchmarking/k3_agentx_sweep.sh
-#   K3 AgentX server geometry (config kimi-k3-tp32-ep-agentx: TP32/EP, long
-#   context, tool-call + reasoning parsers, block size 256), a GSM8K probe on
+# K3_SWEEP=perf  — driver scripts/vllm/benchmark/inferencex/agentx_sweep.sh
+#   One K3 server from K3_CONFIG (TP32/EP, long context, tool-call + reasoning
+#   parsers, block size 256), a GSM8K probe on
 #   the fresh server, then the InferenceX AgentX trace replay (aiperf, Claude
 #   Code sessions) at each concurrency ascending. Summary table: output tok/s
-#   per chip, TTFT, TPOT, P90 interactivity, cache hit. A run below the
+#   per chip, TTFT, TPOT, P90 interactivity, cache hit (a trace statistic aiperf
+#   computes from token overlap, not a server measurement). A run below the
 #   model's native context replays only the traces that fit (the client logs
 #   how many), so it is a bring-up number, not a submission.
-#     K3_CONC_LIST         default 1,2,4,8   (none = GSM8K probe only)
-#     K3_CTX               default 131072    (max-model-len)
-#     K3_KV                default fp8       (fp8 | auto = bf16)
-#     K3_APC               default 0         (1 = prefix caching + unified KV pool)
-#     K3_SPEC              default none      (dspark = DSpark draft, synthetic acceptance)
+#   The server is entirely the config's: context, KV dtype, prefix caching, MoE
+#   requantisation, spec decode, parallelism, and the concurrency ladder with the
+#   MAX_NUM_SEQS that covers it. K3_CONFIG picks which one.
+#     K3_CONFIG            default kimi-k3-tp32-ep-agentx  (any config in
+#                                              scripts/vllm/benchmarking/configs/ that
+#                                              declares AGENTX_CONC_LIST; another arm is
+#                                              that file with the line changed)
 #     K3_FAST              default 1         (1 = 20 min windows; 0 = canonical 30 min)
+#     K3_DURATION          default 1800      (measurement window per point, seconds)
 #     K3_GSM8K_LIMIT       default 100       (0 = skip the probe)
 #     K3_GSM8K_CONC        default 8         (comma list = one GSM8K run per value)
-#     K3_MOE_REQUANT       default 0         (512 = W4A8 MoE via MOE_REQUANTIZE_BLOCK_SIZE)
-#     K3_EXTRA_SERVE_ARGS  default empty     (prepended to the serve command)
 #     K3_IX_REF            default main      (InferenceX git ref to clone; set a commit SHA to
 #                                              pin a run for reproducibility, e.g. K3_IX_REF=9acf24c)
 #     K3_GCS_ROOT          default empty     (no GCS copy; artifacts only)
@@ -71,9 +73,9 @@
 # forwards only an allowlist of env vars into the containers. Knob values are
 # spliced into this file as text before it is parsed, so they must not contain
 # double quotes or `$` (a value that does breaks the upload, loudly).
-# K3_EXTRA_SERVE_ARGS is appended after the config's own flags, so it can
-# override any of them (vLLM takes the last occurrence of a flag); JSON-valued
-# flags cannot be passed through it because of the quoting rule above.
+# That quoting rule is one more reason the serve flags are not build variables:
+# the AgentX config's --compilation-config and --speculative-config are JSON and
+# could never have been passed as one.
 
 steps:
   - label: "K3_SWEEP must be eval, perf or both"
@@ -103,15 +105,19 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_eval_conc_sweep.sh --results-dir /perf_eval_results/k3-eval-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} --gcs-root \"${K3_SWEEP_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/kimi-k3/eval_conc_sweep.sh --results-dir /perf_eval_results/k3-eval-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} --gcs-root \"${K3_SWEEP_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"
 
-  - label: "K3 perf sweep: AgentX conc ${K3_CONC_LIST:-1,2,4,8} ctx ${K3_CTX:-131072} kv ${K3_KV:-fp8} apc ${K3_APC:-0} spec ${K3_SPEC:-none} fast ${K3_FAST:-1} rq ${K3_MOE_REQUANT:-0} (TPU v7x-32)"
+  - label: "K3 perf sweep: AgentX ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} fast ${K3_FAST:-1} (TPU v7x-32)"
     key: k3_agentx_sweep
     if: 'build.env("K3_SWEEP") == "perf" || build.env("K3_SWEEP") == "both"'
     depends_on: build_docker
-    timeout_in_minutes: 600
+    # Boot (up to 4 h, SERVER_READY_WAIT_MIN) plus the ladder: four points under
+    # the client's per-point cap of (warmup grace 3600 + window + 900) s. The cap
+    # only means something if the step outlasts it, or Buildkite kills the step
+    # first and the summary cannot say which point hung.
+    timeout_in_minutes: 780
     agents:
       queue: "tpu_v7x_32_queue"
     env:
@@ -119,6 +125,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --moe-requant ${K3_MOE_REQUANT:-0} --ix-ref ${K3_IX_REF:-main} --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_GCS_ROOT:-}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmark/inferencex/agentx_sweep.sh --chips 16 --config ${K3_CONFIG:-kimi-k3-tp32-ep-agentx} --results-dir /perf_eval_results/k3-agentx-sweep --duration ${K3_DURATION:-1800} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --gsm8k-conc ${K3_GSM8K_CONC:-8} --ix-ref ${K3_IX_REF:-main} --gcs-root \"${K3_GCS_ROOT:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"

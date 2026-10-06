@@ -335,13 +335,15 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
+            vllm_config.cache_config.block_size, self.window_size
         )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self.mla_attn, "scale", None)
             or getattr(self.mla_attn, "softmax_scale", None)

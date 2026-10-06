@@ -687,6 +687,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         del positions
         group = self.prefill_group if sequence_parallel else get_tp_group()
         assert group is not None
+        # Set and read only on the low-rank gate path.
+        gate_input: torch.Tensor | None = None
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.

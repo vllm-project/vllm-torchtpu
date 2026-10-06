@@ -13,6 +13,8 @@
 # limitations under the License.
 """DeepSeek-V4 mixture-of-experts layer."""
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -105,8 +107,10 @@ class DeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
+            e_score_correction_bias=cast(
+                torch.Tensor | None, self.gate.e_score_correction_bias
+            ),
+            hash_indices_table=cast(torch.Tensor | None, self.gate.tid2eid),
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,

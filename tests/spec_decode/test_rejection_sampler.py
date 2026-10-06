@@ -803,3 +803,33 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
 
     expected = torch.tensor([[1, 9], [8, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.tpu_test
+def test_random_rejection_sample_with_candidate_blocks_matches_full_vocab(device):
+    num_reqs, k, vocab_size = 4, 3, 128 * 200
+    tokens = num_reqs * k
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(tokens, vocab_size, generator=gen) * 3
+    random_drafts = torch.randint(0, vocab_size, (tokens,), generator=gen)
+    even = torch.arange(tokens) % 2 == 0
+    drafts = torch.where(even, logits.argmax(dim=-1), random_drafts)
+    kwargs = dict(
+        draft_token_ids=drafts.to(torch.int32).to(device),
+        num_draft_tokens=torch.full((num_reqs,), k, dtype=torch.int32, device=device),
+        target_logits=logits.to(device),
+        bonus_token_ids=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        segment_ids=torch.arange(num_reqs, device=device).repeat_interleave(k),
+        group_indices=torch.arange(k, device=device).repeat(num_reqs),
+        max_draft_tokens=k,
+        temperatures=torch.full((tokens, 1), 0.6, device=device),
+        top_k=torch.full((tokens, 1), 20, dtype=torch.int32, device=device),
+        top_p=torch.full((tokens, 1), 0.95, device=device),
+        accept_u=torch.rand(tokens, generator=gen).to(device),
+        recover_u=torch.rand(tokens, vocab_size, generator=gen).to(device),
+        do_sampling=True,
+    )
+    sampler = RejectionSampler()
+    expected = sampler(**kwargs)
+    result = sampler(**kwargs, topk_candidates=64)
+    torch.testing.assert_close(result, expected)
