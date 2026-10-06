@@ -245,6 +245,8 @@ def _patch_wan_ffn_gelu_fence() -> None:
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
 
 
+# TODO: Remove once vLLM-Omni synchronizes the device at the end of its
+# startup warmup (e.g. current_omni_platform.synchronize() in _dummy_run).
 def _patch_diffusion_startup_warmup_sync() -> None:
     """Synchronize the device after vLLM-Omni's diffusion startup warmup.
 
@@ -261,8 +263,6 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     Applied from ``apply_omni_model_specific_patches``, i.e. in the process that
     builds the model and runs the warmup forward.
     """
-    # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
-    # startup warmup (e.g. current_omni_platform.synchronize() in _dummy_run).
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
     orig_run_startup_warmup = DiffusionEngine.run_startup_warmup
