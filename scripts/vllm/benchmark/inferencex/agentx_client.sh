@@ -8,7 +8,7 @@
 #
 #   agentx_client.sh --conc-list 1,2,4,8|none --chips N --model-prefix NAME
 #       --precision LABEL [--reference-row "..."] [--server-url URL]
-#       [--runner-type tpu7x-32] [--results-dir DIR]
+#       [--engine-url URL] [--runner-type tpu7x-32] [--results-dir DIR]
 #       [--duration 1800] [--fast 1|0] [--ix-ref main] [--tokenizer-dir DIR]
 #       [--model NAME] [--max-model-len N] [--gsm8k-limit 100]
 #       [--gsm8k-conc 8[,16,...]]
@@ -80,6 +80,7 @@ GCS_ARG=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --server-url)    IX_SERVER_URL="$2"; shift 2 ;;
+        --engine-url)    IX_ENGINE_URL="$2"; shift 2 ;;
         --conc-list)     CONC_LIST="$2"; shift 2 ;;
         --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
@@ -127,6 +128,12 @@ IFS=',' read -r -a GSM8K_CONCS <<< "$GSM8K_CONC"
 
 IX_SERVER_URL="${IX_SERVER_URL%/}"
 export IX_SERVER_URL
+# Where /metrics is read from, when that is not the server requests go to: a P/D
+# pair is driven through a proxy that has none, and the queue depth and the
+# preemption counters are one engine's anyway.
+IX_ENGINE_URL="${IX_ENGINE_URL:-}"
+IX_ENGINE_URL="${IX_ENGINE_URL%/}"
+export IX_ENGINE_URL
 if [ -n "$IX_SERVER_URL" ]; then
     # benchmark_lib.sh works out its own URL when this is unset, which is what a
     # server on this host has always relied on, so it is set only when the
@@ -146,6 +153,13 @@ source "$SCRIPT_DIR/sweep_lib.sh"
 ix_check_conc_list "$GSM8K_CONC" || exit 1
 SUMMARY_PY="$SCRIPT_DIR/sweep_summary.py"
 mkdir -p "$RESULTS_DIR"
+# Absolute from here on. aiperf resolves --output-artifact-dir against its own
+# cwd while InferenceX's aggregation runs under cd "$INFMAX_CONTAINER_WORKSPACE"
+# (the InferenceX tree), so a relative results dir has the replay writing one
+# path and the aggregation reading another - which is how build 65 replayed
+# successfully and then reported profile_export.jsonl not found. Upstream does
+# not hit it because its results live inside that workspace; ours do not.
+RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
 ix_set_gcs_root "$GCS_ARG"
 
 # shellcheck disable=SC2317  # run by the EXIT trap
@@ -355,12 +369,32 @@ if [ "${#CONCS[@]}" -eq 0 ]; then
 fi
 
 # ---- (2) AgentX replay, one concurrency at a time, ascending ----------------
+# InferenceX's own defaults. build_replay_cmd validates ten variables and
+# defaults none of them, and nothing inside InferenceX sources this file - the
+# workflow driving it is meant to. Taking theirs keeps us at parity on the
+# thresholds the submission is judged by. Our departures come after it.
+if [ ! -f "$IX_ROOT/benchmarks/runtime_settings.sh" ]; then
+    log "FATAL: no benchmarks/runtime_settings.sh in the InferenceX checkout at $IX_ROOT"
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$IX_ROOT/benchmarks/runtime_settings.sh"
+
+# A proxy in front of a P/D pair does not re-export engine metrics, and neither
+# does a plain server's /metrics reach aiperf through one. benchmark_lib.sh turns
+# this list into one --server-metrics flag with a URL per engine, keeping
+# endpoint_url per series, and srt_agentic.sh builds it the same way for anything
+# but a dynamo frontend. One server here; a caller fronting several engines sets
+# it to all of them.
+export AIPERF_SERVER_METRICS_URLS="${AIPERF_SERVER_METRICS_URLS:-$(ix_engine_url)/metrics}"
+
 export INFMAX_CONTAINER_WORKSPACE="$IX_ROOT"
 export AIPERF_RUNTIME_DIR="$SCRATCH/inferencex-agentic"
 # The trace corpus goes into the HF cache; the pod mounts a persistent one at
 # /root/.cache/huggingface, so use it when writable and fall back to scratch.
 if [ -w /root/.cache/huggingface ] 2>/dev/null; then export HF_HOME=/root/.cache/huggingface; else export HF_HOME="$DATA_SCRATCH/hf_home"; fi
-export AIPERF_PYTHON_VERSION="${AIPERF_PYTHON_VERSION:-3.12}"
+# 3.12 over their 3.11: the image's own interpreter, so uv fetches no second.
+export AIPERF_PYTHON_VERSION="${AGENTX_PYTHON_VERSION:-3.12}"
 export KV_OFFLOADING=none
 unset KV_OFFLOAD_BACKEND
 export DURATION MODEL
@@ -379,7 +413,21 @@ SPEC_DECODING="$SPEC_METHOD"
 export SPEC_DECODING
 export IMAGE="${BUILDKITE_COMMIT:-local}"
 export AGENTIC_OUTPUT_DIR="$RESULTS_DIR"
+# No power measurement here; REQUIRE_POWER follows, and both are validated
+# beside IS_MULTINODE (benchmark_lib.sh:3402).
 export ENABLE_AGENTX_POWER=0
+export REQUIRE_POWER="${REQUIRE_POWER:-false}"
+# Recipe-owned, so runtime_settings.sh omits it. True: each role spans four
+# hosts. The string, not 0/1.
+export IS_MULTINODE="${IS_MULTINODE:-true}"
+export AIPERF_EXPERIMENTAL_FAST="$FAST"
+# Over their 1800: one ~70k-token turn can take >30 min on a prefill-bound
+# engine. Unconditional, since runtime_settings.sh has just set it, and before
+# POINT_CAP, which is arithmetic over it ($(( )) over an unset name is fatal
+# under set -u).
+export AGENTIC_WARMUP_GRACE_PERIOD="${AGENTX_WARMUP_GRACE:-3600}"
+export AIPERF_DRAIN_TIMEOUT_SECONDS="${AIPERF_DRAIN_TIMEOUT_SECONDS:-3600}"
+
 # Per-point hard cap, and the ladder's whole budget. The cap has to be large
 # enough for warmup plus the window and small enough that it fires before the
 # build's own timeout kills the step - otherwise the point is killed with no
@@ -388,12 +436,6 @@ POINT_CAP=$(( AGENTIC_WARMUP_GRACE_PERIOD + DURATION + 900 ))
 log "per-point cap ${POINT_CAP}s (warmup grace $AGENTIC_WARMUP_GRACE_PERIOD + window $DURATION + 900);" \
     "${#CONCS[@]} points, so the ladder needs up to $(( POINT_CAP * ${#CONCS[@]} / 60 )) min" \
     "on top of the boot - the step's timeout must exceed that"
-export AIPERF_EXPERIMENTAL_FAST="$FAST"
-export AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
-# One ~70k-token turn can take >30 min on a prefill-bound engine, so the
-# warmup drain needs more than the client's default 1800 s grace.
-export AGENTIC_WARMUP_GRACE_PERIOD="${AGENTIC_WARMUP_GRACE_PERIOD:-3600}"
-export AIPERF_DRAIN_TIMEOUT_SECONDS="${AIPERF_DRAIN_TIMEOUT_SECONDS:-3600}"
 
 # shellcheck source=/dev/null  # lives in the InferenceX checkout
 source "$IX_ROOT/benchmarks/benchmark_lib.sh"
@@ -409,6 +451,9 @@ for idx in "${!CONCS[@]}"; do
     export RESULT_FILENAME="${BASE_RESULT_FILENAME}_c${c}"
     export RESULT_DIR="$RESULTS_DIR/conc_${c}"
     mkdir -p "$RESULT_DIR"
+    # Outside RESULT_DIR, which is uploaded as the step's artifacts.
+    POINT_DONE="$SCRATCH/point_done_c${c}"
+    rm -f "$POINT_DONE"
     log "===== AgentX conc $c ($((idx+1))/${#CONCS[@]}) ====="
     if ! server_alive; then log "FATAL: server down before conc $c"; FAIL=1; break; fi
     build_replay_cmd "$RESULT_DIR"
@@ -425,12 +470,16 @@ for idx in "${!CONCS[@]}"; do
     ( run_agentic_replay_and_write_outputs "$RESULT_DIR" ) &
     replay_pid=$!
     ( sleep "$REPLAY_CAP"
+      # Killing the sleep is not enough: the subshell would carry on and both
+      # announce a timeout and mark the row with one.
+      [ -e "$POINT_DONE" ] && exit 0
       echo "[$IX_SWEEP_TAG] conc $c: HARD TIMEOUT after ${REPLAY_CAP}s, killing the client"
       touch "$RESULT_DIR/HARD_TIMEOUT"
       pkill -TERM -f "aiperf" 2>/dev/null; sleep 20
       pkill -KILL -f "aiperf" 2>/dev/null; kill -KILL "$replay_pid" 2>/dev/null ) &
     watchdog_pid=$!
     wait "$replay_pid"; rc=$?
+    touch "$POINT_DONE"
     pkill -P "$watchdog_pid" 2>/dev/null   # the watchdog's sleep
     kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null
     pkill -KILL -f "aiperf" 2>/dev/null   # never leave a client behind between points

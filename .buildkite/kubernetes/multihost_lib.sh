@@ -120,6 +120,10 @@ mp_serve_args() {
   [ -n "$QUANTIZATION" ] && extra_args="$extra_args --quantization $QUANTIZATION"
   extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
   [ -n "$EXTRA_SERVE_ARGS" ] && extra_args="$extra_args $EXTRA_SERVE_ARGS"
+  # Empty leaves the flag off, so vLLM serves the checkpoint's own window - what
+  # a full-context benchmark wants, rather than a number copied into a config.
+  # Every config that sets it behaves exactly as before.
+  [ -n "${MAX_MODEL_LEN:-}" ] && extra_args="$extra_args --max-model-len=$MAX_MODEL_LEN"
   local prefix_caching_flag="--no-enable-prefix-caching"
   [ "$ENABLE_PREFIX_CACHING" = "true" ] && prefix_caching_flag="--enable-prefix-caching"
   local async_flag="--async-scheduling"
@@ -140,7 +144,6 @@ mp_serve_args() {
     --data-parallel-size-local="$DP_LOCAL"
     --data-parallel-address="$DP_ADDRESS"
     --data-parallel-rpc-port="$DP_RPC_PORT"
-    --max-model-len="$MAX_MODEL_LEN"
     --max-num-batched-tokens="$MAX_NUM_BATCHED_TOKENS"
     --max-num-seqs="$MAX_NUM_SEQS"
     "$async_flag"
