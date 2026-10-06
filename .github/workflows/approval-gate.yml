@@ -63,8 +63,12 @@ jobs:
     # Plumbing only: green whenever the gate ran at all. The verdict lives in
     # the CODEOWNERS Approval check run.
     name: Run Approval Gate
+    # Only PRs into the default branch. Epic branches (e.g. epic/dsv41) are
+    # reviewed within the epic team; the owners review the epic as a whole
+    # when it merges into the default branch, where this gate runs as usual.
     if: >-
       github.repository == 'vllm-project/vllm-torchtpu' &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
       github.event.pull_request.draft == false
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
