@@ -2748,7 +2748,7 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_compressor.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, partial[Array | tuple[Array, Array]], mesh=Mesh, donate_argnums=tuple[int] | tuple[int, int], input_partition_specs=tuple[P, P, P, P, P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, partial[Array | tuple[Array, Array]], mesh=Mesh | None, donate_argnums=tuple[int] | tuple[int, int], input_partition_specs=tuple[P, P, P, P, P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_compressor.py",
@@ -2758,7 +2758,7 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_indexer.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (q: Array, positions: Array, cos_sin_cache: Array, indexer_weights: Array, cache_kv: Array, seq_lens: Array, page_indices: Array, cu_q_lens: Array, distribution: Array, *, k: int = ..., compression_ratio: int = ..., softmax_scale: float = ..., n_head: int = ...) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P, P, P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (q: Array, positions: Array, cos_sin_cache: Array, indexer_weights: Array, cache_kv: Array, seq_lens: Array, page_indices: Array, cu_q_lens: Array, distribution: Array, *, k: int = ..., compression_ratio: int = ..., softmax_scale: float = ..., n_head: int = ...) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P, P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_indexer.py",
@@ -2768,17 +2768,17 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_mhc_op.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (residual: Array, fn: Array, hc_scale: Array, hc_base: Array, *, rms_eps: float = ..., hc_pre_eps: float = ..., hc_sinkhorn_eps: float = ..., hc_post_mult_value: float = ..., sinkhorn_repeat: int = ...) -> tuple[Array, Array, Array], mesh=Mesh, input_partition_specs=tuple[P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (residual: Array, fn: Array, hc_scale: Array, hc_base: Array, *, rms_eps: float = ..., hc_pre_eps: float = ..., hc_sinkhorn_eps: float = ..., hc_post_mult_value: float = ..., sinkhorn_repeat: int = ...) -> tuple[Array, Array, Array], mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_mhc_op.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (Literal['pallas::deepseek_v4_mhc_post_v1'], (x: Array, residual: Array, post_layer_mix: Array, comb_res_mix: Array) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (Literal['pallas::deepseek_v4_mhc_post_v1'], (x: Array, residual: Array, post_layer_mix: Array, comb_res_mix: Array) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_mhc_op.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, residual: Array, post_layer_mix: Array, comb_res_mix: Array, fn: Array, hc_scale: Array, hc_base: Array, *, rms_eps: float = ..., hc_pre_eps: float = ..., hc_sinkhorn_eps: float = ..., hc_post_mult_value: float = ..., sinkhorn_repeat: int = ...) -> tuple[Array, Array, Array, Array], mesh=Mesh, input_partition_specs=tuple[P, P, P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, residual: Array, post_layer_mix: Array, comb_res_mix: Array, fn: Array, hc_scale: Array, hc_base: Array, *, rms_eps: float = ..., hc_pre_eps: float = ..., hc_sinkhorn_eps: float = ..., hc_post_mult_value: float = ..., sinkhorn_repeat: int = ...) -> tuple[Array, Array, Array, Array], mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
@@ -3098,17 +3098,17 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, partial[tuple[Array, Array]], mesh=Mesh, donate_argnums=tuple[Literal[2]], input_partition_specs=tuple[P, P, P, P, P, P, P, P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P, P, P, P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, partial[tuple[Array, Array]], mesh=Mesh | None, donate_argnums=tuple[Literal[2]], input_partition_specs=tuple[P, P, P, P, P, P, P, P, P, P, P, P, P, P] | tuple[P, P, P, P, P, P, P, P, P, P, P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, positions: Array, cos_sin_cache: Array, *, eps: float = ...) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, positions: Array, cos_sin_cache: Array, *, eps: float = ...) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (Literal['pallas::deepseek_v4_kv_rope'], (x: Array, positions: Array, cos_sin_cache: Array) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (Literal['pallas::deepseek_v4_kv_rope'], (x: Array, positions: Array, cos_sin_cache: Array) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
@@ -3118,7 +3118,7 @@
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, positions: Array, cos_sin_cache: Array, wo_a: Array, wo_a_scale: Array, *, head_dim: int = ...) -> Array, mesh=Mesh, input_partition_specs=tuple[P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (x: Array, positions: Array, cos_sin_cache: Array, wo_a: Array, wo_a_scale: Array, *, head_dim: int = ...) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
