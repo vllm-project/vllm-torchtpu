@@ -23,6 +23,12 @@
 # the proxy, read the cases out of the serve config, run agentx_client.sh against
 # the proxy, upload the results.
 #
+# The AGENTX_* knobs are passed only when set, so agentx_client.sh keeps one
+# default per value. A second default here is how build 245 ran against
+# InferenceX main while the client had pinned a ref. Only --gsm8k-conc carries a
+# value, because 4 is a departure from the client's 8: the pair's ladder tops
+# out at 4.
+#
 # Env (the manifest sets all of these):
 #   WORKLOAD_NAME   the JobSet's name; each head is <name>-<role>-0-0.<name>
 #   K3_PD_CONFIG    the serve config both engines booted, read here for the cases
@@ -166,11 +172,11 @@ bash "$IX_DIR/agentx_client.sh" \
     --spec-method none \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
-    --duration "${AGENTX_DURATION:-1800}" \
-    --fast "${AGENTX_FAST:-1}" \
-    --ix-ref "${AGENTX_IX_REF:-main}" \
-    --gsm8k-limit "${AGENTX_GSM8K_LIMIT:-100}" \
     --gsm8k-conc "${AGENTX_GSM8K_CONC:-4}" \
+    ${AGENTX_DURATION:+--duration "$AGENTX_DURATION"} \
+    ${AGENTX_FAST:+--fast "$AGENTX_FAST"} \
+    ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
+    ${AGENTX_GSM8K_LIMIT:+--gsm8k-limit "$AGENTX_GSM8K_LIMIT"} \
     ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
 rc=$?
 log "the AgentX client finished with rc=$rc"

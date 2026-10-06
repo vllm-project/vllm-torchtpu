@@ -338,24 +338,14 @@ steps:
   # the correctness stages. This is the workload the submission is scored on.
   #
   # Last, and after the correctness pair rather than beside it: each pair takes
-  # two 2x2x4 slices, so two of them at once is four, and Kueue would evict one
-  # to serve the other. Every dependency allows failure - this lane does not
-  # care whether anything before it passed, only that it is no longer holding
-  # the chips.
+  # two 2x2x4 slices, so two at once is four and Kueue would evict one to serve
+  # the other. One dependency is enough - that step already waits for everything
+  # the chips are borrowed by - and failure is allowed, since this lane needs the
+  # chips free rather than the steps before it green.
   - label: ":kubernetes: :tpu: Perf: Nightly Kimi-K3 AgentX 1P1D (TPU v7x 2x2x4 x2)"
     key: "perf_nightly_kimi_k3_agentx_1p1d"
     depends_on:
       - "build_docker"
-      - step: "perf_tpu"
-        allow_failure: true
-      - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_qwen35_397b_1p1d"
-        allow_failure: true
       - step: "perf_nightly_kimi_k3_1p1d"
         allow_failure: true
     if: 'build.env("NIGHTLY") == "1"'

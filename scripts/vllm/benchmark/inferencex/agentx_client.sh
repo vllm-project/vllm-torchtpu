@@ -50,10 +50,10 @@ FAST=1
 # week it moved its tree into inferencex-e2e/, added ten env vars that
 # build_replay_cmd validates, and then replaced benchmark_lib.sh - which this
 # script sources - with the infx.bench package (#3610). A nightly that tracks
-# main races those. 8ba71d0 is the last ref this lane ran clean on (build 65:
+# main races those. This is the last ref the lane ran clean on (build 65:
 # both ladder points, ok=19 err=0, isl p50 337k). Bump it deliberately, with a
 # run to show the new ref works; --ix-ref overrides for a one-off.
-IX_REF="8ba71d0"
+IX_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"         # comma list allowed: one GSM8K run per value
 TOK_DIR_ARG=""         # a local tokenizer directory, when the caller pulled the weights
@@ -250,7 +250,13 @@ ix_layout_root() {
 
 if ! ix_layout_root "$IX_DIR" >/dev/null; then
     rm -rf "$IX_DIR"
-    if [[ "$IX_REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+    if [[ "$IX_REF" =~ ^[0-9a-f]{7,39}$ ]]; then
+        log "FATAL: --ix-ref '$IX_REF' looks like an abbreviated commit, which cannot" \
+            "be fetched - git answers \"couldn't find remote ref\". Use the full 40" \
+            "characters."
+        exit 2
+    fi
+    if [[ "$IX_REF" =~ ^[0-9a-f]{40}$ ]]; then
         # A commit cannot be cloned with --branch: fetch just that commit.
         if ! { git init -q "$IX_DIR" \
                 && git -C "$IX_DIR" fetch -q --depth 1 "$IX_URL" "$IX_REF" \
