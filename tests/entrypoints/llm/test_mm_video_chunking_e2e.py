@@ -43,13 +43,13 @@ import os
 import queue as queue_lib
 import traceback
 from dataclasses import asdict, dataclass
+from typing import Any
 
 import numpy as np
 import pytest
 from PIL import Image
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.video import VideoAsset
-from vllm.multimodal.inputs import VideoMetadata
 
 from vllm_torchtpu import tpu_info
 
@@ -89,7 +89,7 @@ def _build_qwen2_5_vl_video_prompt(question: str) -> str:
     )
 
 
-def _load_video(num_frames: int) -> tuple[np.ndarray, VideoMetadata]:
+def _load_video(num_frames: int) -> tuple[np.ndarray, dict[str, Any]]:
     """Loads RGB video frames resized to a fixed square resolution and its metadata.
 
     Args:
@@ -111,13 +111,20 @@ def _load_video(num_frames: int) -> tuple[np.ndarray, VideoMetadata]:
             for frame in frames
         ]
     )
-    metadata = getattr(asset, "video_metadata", None)
-    if metadata is None:
-        metadata = VideoMetadata(
-            fps=1.0,
-            duration=float(num_frames),
-            total_num_frames=num_frames,
-        )
+    raw_metadata = getattr(asset, "video_metadata", None)
+    if isinstance(raw_metadata, dict):
+        metadata = dict(raw_metadata)
+    elif hasattr(raw_metadata, "__dict__"):
+        metadata = dict(vars(raw_metadata))
+    else:
+        metadata = {
+            "fps": 1.0,
+            "duration": float(num_frames),
+            "total_num_frames": num_frames,
+            "video_backend": "opencv",
+            "frames_indices": list(range(num_frames)),
+            "do_sample_frames": True,
+        }
     return video, metadata
 
 
@@ -136,7 +143,7 @@ class GenerationResult:
 
 def _run_video_generation_worker(
     prompts: list[str],
-    videos: list[np.ndarray | tuple[np.ndarray, VideoMetadata]],
+    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
     chunk_patch_size: int,
     max_num_seqs: int,
     queue: multiprocessing.Queue,
@@ -196,11 +203,14 @@ def _run_video_generation_worker(
                         else (
                             video,
                             getattr(video, "video_metadata", None)
-                            or VideoMetadata(
-                                fps=1.0,
-                                duration=float(len(video)),
-                                total_num_frames=len(video),
-                            ),
+                            or {
+                                "fps": 1.0,
+                                "duration": float(len(video)),
+                                "total_num_frames": len(video),
+                                "video_backend": "opencv",
+                                "frames_indices": list(range(len(video))),
+                                "do_sample_frames": True,
+                            },
                         )
                     )
                 },
@@ -230,7 +240,7 @@ def _run_video_generation_worker(
 
 def run_video_generation_in_isolated_process(
     prompts: list[str],
-    videos: list[np.ndarray | tuple[np.ndarray, VideoMetadata]],
+    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
     chunk_patch_size: int,
     max_num_seqs: int = 1,
 ) -> list[GenerationResult]:
@@ -335,7 +345,7 @@ def _assert_bit_exact(
 
 
 @pytest.fixture(scope="module")
-def single_video() -> tuple[np.ndarray, VideoMetadata]:
+def single_video() -> tuple[np.ndarray, dict[str, Any]]:
     """Loads a 16-frame test video."""
     return _load_video(num_frames=16)
 
@@ -348,7 +358,7 @@ def single_video_prompt() -> str:
 
 @pytest.fixture(scope="module")
 def reference_result(
-    single_video: tuple[np.ndarray, VideoMetadata], single_video_prompt: str
+    single_video: tuple[np.ndarray, dict[str, Any]], single_video_prompt: str
 ) -> GenerationResult:
     """Runs unchunked greedy video generation shared across tests in this module.
 
@@ -382,7 +392,7 @@ def test_video_inference_reference(reference_result: GenerationResult):
 
 @pytest.mark.timeout(1800)
 def test_video_baseline_is_deterministic(
-    single_video: tuple[np.ndarray, VideoMetadata],
+    single_video: tuple[np.ndarray, dict[str, Any]],
     single_video_prompt: str,
     reference_result: GenerationResult,
 ):
@@ -417,7 +427,7 @@ _BUDGETS = {
 @pytest.mark.parametrize("budget_name", list(_BUDGETS))
 def test_video_chunking_is_bit_exact(
     budget_name: str,
-    single_video: tuple[np.ndarray, VideoMetadata],
+    single_video: tuple[np.ndarray, dict[str, Any]],
     single_video_prompt: str,
     reference_result: GenerationResult,
 ):

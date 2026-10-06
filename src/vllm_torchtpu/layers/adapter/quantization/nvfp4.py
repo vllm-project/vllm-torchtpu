@@ -41,9 +41,11 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import vllm.model_executor.kernels.linear as linear_kernels
+import vllm.model_executor.layers.quantization.modelopt as modelopt_module
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
@@ -585,7 +587,20 @@ class _NullInputQuantKernel:
     layer advertises no input_quant_key."""
 
     @staticmethod
-    def input_quant_key():
+    def input_quant_key() -> str | None:
+        return None
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        return True, None
+
+    @classmethod
+    def can_implement(cls, *args: Any, **kwargs: Any) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
         return None
 
 
@@ -618,6 +633,12 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         self.marlin_input_dtype = None
         self.spec = QuantSpec(weight=kNvfp4Static, activation=None)
 
+    def select_kernel(self, *args: Any, **kwargs: Any) -> Any:
+        return _NullInputQuantKernel()
+
+    def init_kernel(self, *args: Any, **kwargs: Any) -> Any:
+        return _NullInputQuantKernel()
+
     def create_weights(
         self,
         layer,
@@ -628,16 +649,37 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         params_dtype,
         **extra_weight_attrs,
     ):
-        ModelOptLinearMethod.create_weights(
-            self,
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
+        orig_init_nvfp4_modelopt = getattr(
+            modelopt_module, "init_nvfp4_linear_kernel", None
         )
+        orig_init_nvfp4_linear = getattr(
+            linear_kernels, "init_nvfp4_linear_kernel", None
+        )
+
+        def null_factory(*args, **kwargs):
+            return _NullInputQuantKernel()
+
+        try:
+            if orig_init_nvfp4_modelopt is not None:
+                modelopt_module.init_nvfp4_linear_kernel = null_factory
+            if orig_init_nvfp4_linear is not None:
+                linear_kernels.init_nvfp4_linear_kernel = null_factory
+            ModelOptLinearMethod.create_weights(
+                self,
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+        finally:
+            if orig_init_nvfp4_modelopt is not None:
+                modelopt_module.init_nvfp4_linear_kernel = orig_init_nvfp4_modelopt
+            if orig_init_nvfp4_linear is not None:
+                linear_kernels.init_nvfp4_linear_kernel = orig_init_nvfp4_linear
+
         self.kernel = _NullInputQuantKernel()
 
         # input_scale / weight_scale_2 are per-tensor (no output_dim); vLLM's
