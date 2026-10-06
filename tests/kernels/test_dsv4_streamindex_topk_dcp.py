@@ -84,7 +84,7 @@ def _require_sparsecore():
     try:
         if pltpu.get_tpu_info().sparse_core is not None:
             return
-    except Exception:  # no TPU at all
+    except Exception:  # no TPU at all  # noqa: S110
         pass
     pytest.skip("needs SparseCore")
 

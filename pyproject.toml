@@ -156,11 +156,11 @@ exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 [tool.ruff.lint]
 # E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
 # bugs, SIM needless complexity, G logging calls, ISC string concatenation,
-# T20 print calls.
+# T20 print calls, S110 `except: pass`.
 # E501 fails a line longer than 88 characters, the width `ruff format` wraps
 # code at. The formatter does not split comments or strings, so wrap those by
 # hand.
-select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20"]
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.

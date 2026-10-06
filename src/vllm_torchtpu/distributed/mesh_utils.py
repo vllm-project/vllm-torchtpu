@@ -81,7 +81,7 @@ def _get_tpu_global_device_id() -> int:
             local_devices = jax.local_devices()
             if local_devices:
                 return int(getattr(local_devices[0], "id", 0))
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         return 0
 
