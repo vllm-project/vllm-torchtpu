@@ -14,7 +14,10 @@ MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS=1
 ASYNC_SCHEDULING=true
 GPU_MEMORY_UTILIZATION=0.85
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+# fp8 selects v2's FP8 main KV record and the SparseMLA kernel. TPU V4.1 does
+# not use the fp8_ds_mla layout, so auto would mean BF16 KV and the slower
+# generic paged attention.
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 NUM_PROMPTS=4
 ISL_OSL_CONFIGS="100000:1"
 CONCURRENCY_OPTIONS="1"

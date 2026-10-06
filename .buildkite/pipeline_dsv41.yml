@@ -82,10 +82,9 @@ steps:
           # The step fails only on a failed request or a round without a valid
           # measurement window; the numbers are published as artifacts
           # (decode/sweep.md and decode/*/summary.md) and not yet gated.
-          # Build 3647 measured 89 / 170 / 352 tok/s at C4 / C8 / C16 (TPOT P50
-          # ~46 ms). The same code and launch flags ran at 162 / 328 / 595
-          # tok/s (TPOT P50 ~25 ms) on a CDK tpu7x node, so compare runs from
-          # the same environment only.
+          # Before #1608 the config ran with BF16 KV (kv-cache-dtype auto);
+          # it runs with FP8 KV since, so compare only runs after that change.
+          # Throughput also depends on the CI agent pool.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
