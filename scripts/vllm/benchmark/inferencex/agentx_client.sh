@@ -426,6 +426,19 @@ SPEC_DECODING="$SPEC_METHOD"
 export SPEC_DECODING
 export IMAGE="${BUILDKITE_COMMIT:-local}"
 export AGENTIC_OUTPUT_DIR="$RESULTS_DIR"
+# A short run, for shaking the lane out rather than measuring it. Their
+# runtime_settings.sh has just set both of these, so the overrides are
+# unconditional. One warmup request per lane instead of ten saves a
+# long-context prefill per lane, and a window under 900 s needs the override,
+# which aiperf records by flagging the row submission_valid=false
+# (benchmark_lib.sh:3349). Both unset is a real run.
+[ -z "${AGENTX_WARMUP_REQUESTS:-}" ] || export AIPERF_WARMUP_REQUESTS_PER_LANE="$AGENTX_WARMUP_REQUESTS"
+[ -z "${AGENTX_UNSAFE_OVERRIDE:-}" ] || export AIPERF_UNSAFE_OVERRIDE="$AGENTX_UNSAFE_OVERRIDE"
+if [ "$DURATION" -lt 900 ] && [ "${AIPERF_UNSAFE_OVERRIDE:-false}" != "true" ]; then
+    log "WARNING: --duration $DURATION is under the scenario's 900 s minimum, so aiperf" \
+        "adds --unsafe-override itself and flags the row submission_valid=false"
+fi
+
 # No power measurement here; REQUIRE_POWER follows, and both are validated
 # beside IS_MULTINODE (benchmark_lib.sh:3402).
 export ENABLE_AGENTX_POWER=0
