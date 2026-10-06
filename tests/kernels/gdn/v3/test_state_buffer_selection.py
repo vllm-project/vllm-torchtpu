@@ -106,4 +106,5 @@ GDN, KDA = config.AttentionMode.GDN, config.AttentionMode.KDA
 def test_state_buffer_selection(n_kq, n_v, num_seqs, num_spec_tokens, mode, batched):
     got = _traced_configs(n_kq, n_v, num_seqs, num_spec_tokens, mode)
     assert got["batched"] == batched
-    assert got["per_seq"][1]
+    # The per-sequence pass always keeps the shared buffer.
+    assert not got["per_seq"][1]

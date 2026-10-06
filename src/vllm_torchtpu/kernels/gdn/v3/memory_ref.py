@@ -608,7 +608,8 @@ SPLIT_STATE_VMEM_FRACTION = 0.8
 def split_state_fits(
     cfg: config.GDNConfig, conv_state: jax.Array, recurrent_state: jax.Array | None
 ) -> bool:
-    """Whether the pipeline buffers fit in VMEM with `cfg.split_state`."""
+    """Whether the batched pass's pipeline buffers fit in VMEM with
+    `cfg.split_state`."""
     conv_tail, recurrent_tail = state_block_tails(cfg, conv_state.shape)
     recurrent_dtype = (conv_state if recurrent_state is None else recurrent_state).dtype
     ckpt_bytes = (
@@ -625,18 +626,8 @@ def split_state_fits(
             + cfg.v_dim_size * cfg.dtypes.act_out.itemsize
         )
     )
-    carry_bytes = 0
-    if cfg.mode == config.GDNMode.PER_SEQ:
-        carry_bytes = (
-            cfg.seq_tile_size
-            * 4
-            * (
-                cfg.prev_kernel_size * cfg.dim_size
-                + cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim
-            )
-        )
     weight_bytes = 4 * cfg.dim_size * cfg.kernel_size
-    total = cfg.num_buffers * (state_bytes + act_bytes) + carry_bytes + weight_bytes
+    total = cfg.num_buffers * (state_bytes + act_bytes) + weight_bytes
     return total <= SPLIT_STATE_VMEM_FRACTION * cfg.get_vmem_limit_bytes()
 
 

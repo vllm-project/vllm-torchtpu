@@ -367,9 +367,15 @@ def _select_state_buffers(
     time than tile 4 with the shared buffer at 8 / 64 / 256 padded rows.
     KDA keeps its tile; it is unmeasured. With no fitting tile, the
     requested tile runs on the shared buffer.
+
+    The per-sequence pass keeps the shared buffer: its in-kernel temporaries
+    are not in `split_state_fits`, and at 64 v-heads with a 64-token tile
+    split buffers exceed scoped VMEM.
     """
+    if cfg.mode == config.GDNMode.PER_SEQ:
+        return cfg
     candidates = [cfg]
-    if cfg.mode != config.GDNMode.PER_SEQ and not cfg.is_kda:
+    if not cfg.is_kda:
         tile = cfg.tile_size
         while tile > 1:
             tile //= 2
