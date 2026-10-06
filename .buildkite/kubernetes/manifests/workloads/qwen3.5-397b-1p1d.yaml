@@ -60,7 +60,7 @@ spec:
               containers:
               - name: workload
                 image: ${IMAGE}
-                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_engine.sh", "prefill"]
+                command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/disagg_engine.sh", "prefill"]
                 env:
                 # The downward API, so these cannot come from the script.
                 - name: POD_IP
@@ -127,7 +127,7 @@ spec:
               containers:
               - name: workload
                 image: ${IMAGE}
-                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_engine.sh", "decode"]
+                command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/disagg_engine.sh", "decode"]
                 env:
                 # The downward API, so these cannot come from the script.
                 - name: POD_IP
@@ -223,7 +223,7 @@ spec:
                   value: "0"
                 - name: PYTHONUNBUFFERED
                   value: "1"
-                command: ["/bin/bash", "/root/torchtpu-vllm/.buildkite/kubernetes/disagg_benchmark.sh"]
+                command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/disagg_benchmark.sh"]
                 # Request equals limit, so this is Guaranteed: it holds no
                 # chips and shares a worker-cpu node, so the bound is real.
                 resources:

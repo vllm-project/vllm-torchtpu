@@ -195,7 +195,7 @@ run_mp_multihost() {
   # Run the benchmark/eval flow inside the head container
   set +e
   echo "--- Running eval flow in head container for config=${CONFIG_NAME}"
-  docker exec -w /root/torchtpu-vllm node bash -c '
+  docker exec -w /workspace/vllm-torchtpu node bash -c '
     umask 000
     rm -rf /perf_eval_results/*
     bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config "$1" --host localhost --port "$2" --results-dir /perf_eval_results/"$1" "${@:3}"
