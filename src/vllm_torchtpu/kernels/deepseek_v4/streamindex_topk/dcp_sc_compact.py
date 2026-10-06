@@ -268,5 +268,6 @@ def pack_owned_winners(
         scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
         name=f"sc_gather_pack_owned_b{b}_w{width}",
+        # pyrefly: ignore[bad-argument-count]
     )(slots.reshape(-1), idxs.reshape(-1), rank_2d.reshape(-1))
     return out.reshape(padded_b, width)[:b]

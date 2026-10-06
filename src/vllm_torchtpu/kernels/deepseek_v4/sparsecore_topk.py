@@ -370,6 +370,7 @@ def _topk_body(
                 jnp.where((~whole_bucket) & active, score_chunk_base, 0),
                 unroll=4,
                 carry=jnp.int32(0),
+                # pyrefly: ignore[bad-argument-type]
             )(count_prior_ties)
         else:
             score_chunk_base = 0
@@ -439,6 +440,7 @@ def _topk_body(
 
             plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
         else:
+            # pyrefly: ignore[bad-argument-type]
             m_s = jnp.where(whole_bucket, m_whole, m_ranked)
             w_slot = jnp.bitwise_and(w, jnp.int32(1))
             glob_vmem[pl.ds(0, LANES)] = jnp.broadcast_to(m_s, (LANES,))

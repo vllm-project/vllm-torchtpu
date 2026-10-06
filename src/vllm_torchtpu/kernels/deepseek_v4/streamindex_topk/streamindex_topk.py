@@ -394,8 +394,15 @@ def kernel(
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
         row = kv_head_dim_groups * num_lane_tiles_bkv + lane_tile_idx
         words = rows[batch_idx, pl.ds(row, 1), :]
-        # The scale is byte 0 of each word, which the bitcast puts in row 0.
-        return pltpu.bitcast(words, jnp.float8_e8m0fnu)[0:1].astype(jnp.float32)
+        # UE8M0 holds a bare biased exponent, which is where f32 keeps its own:
+        # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly.
+        e = words & 0xFF
+        f = pltpu.bitcast(e << 23, jnp.float32)
+        return jnp.where(
+            e == 0xFF,
+            jnp.float32(jnp.nan),
+            jnp.where(e == 0, jnp.float32(2.0**-127), f),
+        )
 
     def transpose_to_head_major(bq_rows, n_tok):
         """[n_tok*H, D] head-minor rows -> [H*n_tok, D] head-major rows."""
@@ -695,6 +702,7 @@ def kernel(
                     else:
                         term = jnp.maximum(st_h, 0.0) * w_h
                     acc = term if acc is None else acc + term
+            assert acc is not None
             return acc
 
         # Row `t * score_pitch + j` holds lane tile j of token t.
