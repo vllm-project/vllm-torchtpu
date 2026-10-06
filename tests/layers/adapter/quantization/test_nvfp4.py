@@ -226,6 +226,9 @@ class TestNvfp4LinearMethod:
         quant_config = MagicMock(group_size=16)
         linear_config = MagicMock()
         method = VllmNvfp4LinearMethod(quant_config, linear_config)
+        assert method.ctx.group_size == 16
+        assert method.akey is None
+        assert method.spec is not None
         layer = make_linear_layer(64, 32)
 
         def mock_base_create_weights(self, lyr, *args, **kwargs):

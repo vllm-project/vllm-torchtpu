@@ -44,6 +44,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -53,11 +54,14 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    CkptCtx,
+    FormatScheme,
     KNvfp4Static,
     ModelOptLinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
@@ -606,6 +610,13 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         # pyrefly: ignore[bad-assignment]
         self.kernel = _NullInputQuantKernel()
         self.wkey = KNvfp4Static()
+        self.ctx = CkptCtx(group_size=self.group_size)
+        self.akey = None
+        self.fmt = FormatScheme()
+        self.input_dtype = torch.get_default_dtype()
+        self.out_dtype = torch.get_default_dtype()
+        self.marlin_input_dtype = None
+        self.spec = QuantSpec(weight=kNvfp4Static, activation=None)
 
     def create_weights(
         self,
@@ -627,6 +638,7 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
             params_dtype,
             **extra_weight_attrs,
         )
+        self.kernel = _NullInputQuantKernel()
 
         # input_scale / weight_scale_2 are per-tensor (no output_dim); vLLM's
         # fused QKV/MergedColumn stacked loader cannot place the per-projection
