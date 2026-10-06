@@ -656,13 +656,15 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
             linear_kernels, "init_nvfp4_linear_kernel", None
         )
 
-        def null_factory(*args, **kwargs):
+        def null_factory(*args: Any, **kwargs: Any) -> Any:
             return _NullInputQuantKernel()
 
         try:
             if orig_init_nvfp4_modelopt is not None:
+                # pyrefly: ignore[bad-assignment]
                 modelopt_module.init_nvfp4_linear_kernel = null_factory
             if orig_init_nvfp4_linear is not None:
+                # pyrefly: ignore[bad-assignment]
                 linear_kernels.init_nvfp4_linear_kernel = null_factory
             ModelOptLinearMethod.create_weights(
                 self,
@@ -676,8 +678,10 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
             )
         finally:
             if orig_init_nvfp4_modelopt is not None:
+                # pyrefly: ignore[bad-assignment]
                 modelopt_module.init_nvfp4_linear_kernel = orig_init_nvfp4_modelopt
             if orig_init_nvfp4_linear is not None:
+                # pyrefly: ignore[bad-assignment]
                 linear_kernels.init_nvfp4_linear_kernel = orig_init_nvfp4_linear
 
         self.kernel = _NullInputQuantKernel()
