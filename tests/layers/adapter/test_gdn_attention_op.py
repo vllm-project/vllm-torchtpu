@@ -532,6 +532,31 @@ class TestVllmGatedDeltaNetAttention:
             expected_dtype
         )
 
+    @pytest.mark.parametrize("form", ["two_calls", "tables"])
+    def test_pooled_op_binds_the_gdn_form_at_build(self, form, cpu_vllm_config_context):
+        """The kernel form is resolved outside jit and keys the shared op."""
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+        captured = {}
+
+        def fake_jax_op(_name, wrapped_fn, **_kwargs):
+            captured["wrapped_fn"] = wrapped_fn
+            return MagicMock()
+
+        module = "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch.dict(gdn_attention_op._shared_gdn_ops, clear=True),
+            patch(module + "pallas.jax_op", side_effect=fake_jax_op),
+            patch(module + "gdn_pooled_form", return_value=form),
+        ):
+            attn._build_pooled_gdn_op()
+            [(_kind, key)] = gdn_attention_op._shared_gdn_ops
+        with patch(module + "gdn_attention_pooled_core_tpu") as mock_core:
+            captured["wrapped_fn"](*([MagicMock()] * 12))
+
+        assert mock_core.call_args.kwargs["gdn_form"] == form
+        assert form in key
+
     def test_pooled_impl_forwards_every_operand_the_forward_passes(
         self, cpu_vllm_config_context
     ):
@@ -1626,3 +1651,71 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize(("env", "form"), [(None, "two_calls"), ("1", "tables")])
+def test_gdn_pooled_form_follows_the_tables_in_kernel_flag(monkeypatch, env, form):
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    if env is None:
+        monkeypatch.delenv("TPU_GDN_TABLES_IN_KERNEL", raising=False)
+    else:
+        monkeypatch.setenv("TPU_GDN_TABLES_IN_KERNEL", env)
+    gdn_attention.gdn_pooled_form.cache_clear()
+    try:
+        assert gdn_attention.gdn_pooled_form() == form
+    finally:
+        gdn_attention.gdn_pooled_form.cache_clear()
+
+
+# Local value heads of Qwen3.5-397B's GDN layer: 64 split eight ways under TP8,
+# whole under DP8.
+@pytest.mark.parametrize(
+    ("rows", "n_v", "form"),
+    [
+        (8, 8, "tables"),
+        (16, 8, "tables"),
+        (32, 8, "tables"),
+        (48, 8, "tables"),
+        (64, 8, "two_calls"),
+        (256, 8, "two_calls"),
+        (8, 64, "two_calls"),
+        (32, 64, "two_calls"),
+        (64, 64, "two_calls"),
+        (256, 64, "two_calls"),
+    ],
+)
+def test_tables_form_only_on_steps_where_it_measured_faster(rows, n_v, form):
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    assert gdn_attention.gdn_pooled_form_for_step("tables", rows, n_v) == form
+    assert gdn_attention.gdn_pooled_form_for_step("two_calls", rows, n_v) == (
+        "two_calls"
+    )
+
+
+@pytest.mark.parametrize(("rows", "form"), [(48, "tables"), (64, "two_calls")])
+def test_pooled_local_passes_the_step_form_to_the_kernel(rows, form):
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    n_kq, n_v, d_k, d_v = 2, 8, 128, 128
+    dim = 2 * n_kq * d_k + n_v * d_v
+    module = "vllm_torchtpu.layers.core.gdn_attention."
+    with (
+        patch(module + "_build_v3_pool_state_plan"),
+        patch(
+            module + "gdn_v3_wrapper.fused_conv1d_gdn", return_value=(None, None)
+        ) as kernel,
+    ):
+        gdn_attention.run_jax_gdn_attention_pooled_local(
+            jnp.zeros((rows, dim)),
+            *([MagicMock()] * 11),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=4,
+            pool_block_tokens=256,
+            gdn_form="tables",
+        )
+    assert kernel.call_args.kwargs["gdn_form"] == form

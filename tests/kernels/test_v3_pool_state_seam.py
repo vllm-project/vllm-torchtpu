@@ -5,6 +5,7 @@ The remaining classes execute Pallas kernels and run on TPU (same gating
 as test_pool_adapters.py).
 """
 
+import functools
 import pathlib
 
 import jax
@@ -620,6 +621,299 @@ class TestPooledSpecWindows:
         first = np.asarray(runs[0].view(jnp.int16))
         for again in runs[1:]:
             np.testing.assert_array_equal(np.asarray(again.view(jnp.int16)), first)
+
+
+class TestTablesFormMatchesTwoCalls:
+    """`gdn_form="tables"` runs both passes in one call over in-kernel tables.
+
+    It runs the same per-tile code over the same tables as the two-call form,
+    so outputs and every pool byte, checkpoint blocks included, must match
+    exactly, with and without speculative decoding.
+    """
+
+    def _compare(self, pool, idx, kwargs):
+        def run(form):
+            return wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=idx,
+                state_source=jnp.copy(pool),
+                state_plan=_plan(pool),
+                gdn_form=form,
+                **kwargs,
+            )
+
+        pool_two, out_two = run("two_calls")
+        pool_tables, out_tables = run("tables")
+        np.testing.assert_array_equal(np.asarray(out_tables), np.asarray(out_two))
+        before = np.asarray(pool.view(jnp.int16))
+        after_two = np.asarray(pool_two.view(jnp.int16))
+        assert not np.array_equal(after_two, before), "no state was written"
+        np.testing.assert_array_equal(
+            np.asarray(pool_tables.view(jnp.int16)), after_two
+        )
+
+    def _pool_with_states(self, seed, idx, num_mgr=NUM_MGR):
+        keys = iter(jax.random.split(jax.random.key(seed), 2))
+        n = idx.shape[0]
+        return _write_states(
+            _garbage_pool(seed, num_mgr),
+            jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx,
+        )
+
+    def test_decode(self):
+        # Five decodes, the fifth fresh: the last batched tile is partial.
+        idx = jnp.array([1, 2, 3, 4, 5, 0, 0, 0], dtype=jnp.int32)
+        pool = self._pool_with_states(50, idx[:4], num_mgr=7)
+        kwargs = _rand_inputs(51, 8) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 3, 4, 5, 5, 5, 5]),
+            distribution=jnp.array([5, 5, 5], dtype=jnp.int32),
+            seq_lens=jnp.array([9, 3, 17, 5, 1, 0, 0, 0], dtype=jnp.int32),
+        )
+        self._compare(pool, idx, kwargs)
+
+    def test_mixed_decode_and_prefill(self):
+        idx = jnp.array([1, 2, 3, 4, 0, 0], dtype=jnp.int32)
+        pool = self._pool_with_states(52, idx[:4])
+        # Two decodes, a fresh 70-token prefill, a 41-token continuation,
+        # padded to 128 rows (row buckets are multiples of 16).
+        kwargs = _rand_inputs(53, 128) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 72, 113, 113, 113]),
+            distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([7, 9, 70, 60, 0, 0], dtype=jnp.int32),
+        )
+        self._compare(pool, idx, kwargs)
+
+    def test_padded_rows_and_null_block(self):
+        idx = jnp.array([2, 4, 0, 0], dtype=jnp.int32)
+        pool = self._pool_with_states(54, idx[:2])
+        kwargs = _rand_inputs(55, 16) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 2, 2]),
+            distribution=jnp.array([2, 2, 2], dtype=jnp.int32),
+            seq_lens=jnp.array([5, 5, 0, 0], dtype=jnp.int32),
+        )
+        self._compare(pool, idx, kwargs)
+
+    @pytest.mark.parametrize("rows", [256, 257], ids=["max_rows", "fallback"])
+    def test_rows_at_the_in_kernel_limit(self, rows):
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        pool = self._pool_with_states(56, idx)
+        kwargs = _rand_inputs(57, rows) | dict(
+            query_start_loc=jnp.array([0, 1, 2, 3, rows]),
+            distribution=jnp.array([3, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([4, 8, 6, rows], dtype=jnp.int32),
+        )
+        self._compare(pool, idx, kwargs)
+
+    def _spec_pool(self, seed, ckpt_indices, num_mgr):
+        """Distinct states at every named checkpoint block, garbage elsewhere."""
+        n, window = ckpt_indices.shape
+        pool = _garbage_pool(seed, num_mgr)
+        keys = iter(jax.random.split(jax.random.key(seed), 2 * window))
+        for t in range(window):
+            pool = _write_states(
+                pool,
+                jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+                jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                    jnp.bfloat16
+                ),
+                ckpt_indices[:, t],
+            )
+        return pool
+
+    @pytest.mark.parametrize("num_spec", [1, 3])
+    def test_spec_windows_with_partial_acceptance(self, num_spec):
+        window = num_spec + 1
+        # Three verify windows of varying length resuming from the last
+        # accepted checkpoint, then a prefill resuming from a non-zero one.
+        lens = [window, max(1, window - 2), window - 1, 20]
+        reads = [num_spec, 1, 0, num_spec]
+        n = len(lens)
+        rng = np.random.default_rng(60 + num_spec)
+        ckpt_indices = jnp.asarray(
+            rng.permutation(np.arange(1, n * window + 1)).reshape(n, window),
+            dtype=jnp.int32,
+        )
+        pool = self._spec_pool(61, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(62, 48) | dict(
+            query_start_loc=jnp.asarray(np.cumsum([0] + lens), dtype=jnp.int32),
+            distribution=jnp.array([3, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([9, 12, 7, 40], dtype=jnp.int32),
+            read_offsets=jnp.asarray(reads, dtype=jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        self._compare(pool, ckpt_indices[:, 0], kwargs)
+
+    @pytest.mark.parametrize("rows", [256, 257], ids=["max_rows", "fallback"])
+    def test_spec_rows_at_the_in_kernel_limit(self, rows):
+        num_spec, window = 3, 4
+        # 64 full verify windows; the fallback adds a one-token prefill.
+        lens = [window] * 64 + [1] * (rows - 256)
+        n = len(lens)
+        ckpt_indices = (
+            jnp.arange(1, n * window + 1, dtype=jnp.int32).reshape(window, n).T
+        )
+        pool = self._spec_pool(63, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(64, rows) | dict(
+            query_start_loc=jnp.asarray(np.cumsum([0] + lens), dtype=jnp.int32),
+            distribution=jnp.array([64, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+            read_offsets=jnp.asarray([i % window for i in range(n)], jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        self._compare(pool, ckpt_indices[:, 0], kwargs)
+
+    def test_spec_checkpoints_repeat_exactly(self):
+        # The tables form of TestPooledSpecWindows' repeat test: several tiles
+        # of verify windows with non-zero read offsets, where four sequences
+        # per tile wrote nondeterministic checkpoint-0 states.
+        num_spec, window, n = 3, 4, 16
+        ckpt_indices = (
+            jnp.arange(1, n * window + 1, dtype=jnp.int32).reshape(window, n).T
+        )
+        pool = self._spec_pool(65, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(66, n * window) | dict(
+            query_start_loc=jnp.arange(0, n * window + 1, window, dtype=jnp.int32),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+            read_offsets=jnp.asarray([i % window for i in range(n)], jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        runs = [
+            wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=ckpt_indices[:, 0],
+                state_source=jnp.copy(pool),
+                state_plan=_plan(pool),
+                gdn_form="tables",
+                **kwargs,
+            )[0]
+            for _ in range(3)
+        ]
+        first = np.asarray(runs[0].view(jnp.int16))
+        for again in runs[1:]:
+            np.testing.assert_array_equal(np.asarray(again.view(jnp.int16)), first)
+
+
+def _pallas_call_names(jaxpr):
+    names = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            names.append(eqn.params["name"])
+        for param in eqn.params.values():
+            inner = getattr(param, "jaxpr", None)
+            if inner is not None:
+                names += _pallas_call_names(getattr(inner, "jaxpr", inner))
+    return names
+
+
+class TestTablesFormAtDP8:
+    """The tables form at Qwen3.5-397B's DP8 layer: 64 local value heads over
+    the HND fp8 attention pool. The one call holds the per-sequence carry
+    scratch through the batched pass, which its limit must budget for; it
+    compiles here and matches the two calls exactly."""
+
+    N_KQ, N_V = 16, 64
+    DIM = N_KQ * D_K * 2 + N_V * D_V  # 12288
+    PAYLOAD, PAGE = (4, 64, 4), 128  # 1024 B per token
+    SSM_NTOK = N_V * D_K * D_V * 4 // 1024  # 4096
+    CONV_NTOK = 128  # smallest power of two holding 3 * DIM bf16
+    SPLIT = -(-(SSM_NTOK + CONV_NTOK) // PAGE)  # 33
+    MAX_SEQS = 40
+
+    def _plan(self, pool):
+        return pool_adapters.v3_state_source(
+            pool,
+            split=self.SPLIT,
+            ssm_ntok=self.SSM_NTOK,
+            conv_tok0=self.SSM_NTOK,
+            conv_ntok=self.CONV_NTOK,
+            conv_dim=self.DIM,
+            n_v=self.N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+        )
+
+    def _compare(self, monkeypatch, seed, lens, ctx, rows, num_decodes):
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        n = len(lens)
+        rng = np.random.default_rng(seed)
+        num_mgr = 2 * self.MAX_SEQS + 1
+        # Bytes in [0x30, 0x3c]: every fp8 / bf16 / f32 view is small and
+        # finite, so the states read before any write are valid.
+        pool = jnp.asarray(
+            rng.integers(
+                0x30, 0x3D, (num_mgr * self.SPLIT, *self.PAYLOAD, self.PAGE), np.uint8
+            )
+        ).view(jnp.float8_e4m3fn)
+        idx = np.zeros((self.MAX_SEQS,), np.int32)
+        idx[:n] = rng.permutation(np.arange(1, num_mgr))[:n]
+        qsl = np.zeros((self.MAX_SEQS + 1,), np.int32)
+        qsl[1 : n + 1] = np.cumsum(lens)
+        qsl[n + 1 :] = qsl[n]
+        seq_lens = np.zeros((self.MAX_SEQS,), np.int32)
+        seq_lens[:n] = np.asarray(lens) + np.asarray(ctx)
+        keys = iter(jax.random.split(jax.random.key(seed), 5))
+        kwargs = dict(
+            qkv=jax.random.normal(next(keys), (rows, self.DIM)).astype(jnp.bfloat16),
+            b=jax.random.normal(next(keys), (rows, self.N_V)).astype(jnp.bfloat16),
+            a=jax.random.normal(next(keys), (rows, self.N_V)).astype(jnp.bfloat16),
+            conv_weight=jax.random.normal(next(keys), (self.DIM, 1, KERNEL_SIZE)),
+            conv_bias=None,
+            a_log=jnp.log(jnp.linspace(1.0, 16.0, self.N_V)),
+            dt_bias=jax.random.normal(next(keys), (self.N_V,)),
+            query_start_loc=jnp.asarray(qsl),
+            state_indices=jnp.asarray(idx),
+            distribution=jnp.array([num_decodes, n, n], dtype=jnp.int32),
+            seq_lens=jnp.asarray(seq_lens),
+            n_kq=self.N_KQ,
+            n_v=self.N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            conv_state=None,
+            recurrent_state=None,
+            state_plan=self._plan(pool),
+        )
+
+        def run(form, source):
+            return wrapper.fused_conv1d_gdn(
+                state_source=source, gdn_form=form, **kwargs
+            )
+
+        # The fused call itself, not the two-call fallback, is under test.
+        jaxpr = jax.make_jaxpr(functools.partial(run, "tables"))(pool)
+        assert _pallas_call_names(jaxpr.jaxpr) == [
+            "fused_conv1d_gdn_batched_tables_in_kernel"
+        ]
+        pool_two, out_two = run("two_calls", jnp.copy(pool))
+        pool_tables, out_tables = run("tables", jnp.copy(pool))
+        np.testing.assert_array_equal(
+            np.asarray(out_tables.view(jnp.int16)), np.asarray(out_two.view(jnp.int16))
+        )
+        before = np.asarray(pool.view(jnp.uint8))
+        after_two = np.asarray(pool_two.view(jnp.uint8))
+        assert not np.array_equal(after_two, before), "no state was written"
+        np.testing.assert_array_equal(
+            np.asarray(pool_tables.view(jnp.uint8)), after_two
+        )
+
+    def test_decode(self, monkeypatch):
+        # 40 decodes padded to 64 rows (DP8 c256: 40 sequences per engine).
+        self._compare(monkeypatch, 70, [1] * 40, [100] * 40, 64, 40)
+
+    def test_mixed_decode_and_prefill(self, monkeypatch):
+        # Eight decodes and a 100-token chunk resuming at 300, in 128 rows.
+        self._compare(monkeypatch, 71, [1] * 8 + [100], [100] * 8 + [300], 128, 8)
 
 
 class TestPooledCallerV3:

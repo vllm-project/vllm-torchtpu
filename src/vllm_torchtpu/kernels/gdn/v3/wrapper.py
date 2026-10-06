@@ -27,8 +27,23 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     config,
     memory_ref,
     metadata,
+    tables_in_kernel,
     vmem_ldst,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+# The chunked pass inverts its triangular matrix in blocks of this many rows
+# (compute_gdn.invert_triangular_matrix), so a longer tile must be a multiple.
+_CHUNK_BLOCK_SIZE = 16
+
+
+def _default_mixed_tile_size(batch_size: int, n_v: int, num_spec_tokens: int) -> int:
+    tile = min(128 if num_spec_tokens == 0 and n_v <= 8 else 64, batch_size)
+    if tile > _CHUNK_BLOCK_SIZE:
+        tile -= tile % _CHUNK_BLOCK_SIZE
+    return tile
 
 
 def inner_kernel(
@@ -376,6 +391,84 @@ def _select_state_buffers(
     return cfg
 
 
+def outer_kernel_tables_in_kernel(
+    # Inputs.
+    query_start_loc_ref: jax.Array,
+    seq_lens_ref: jax.Array,
+    state_indices_ref: jax.Array,
+    read_offsets_ref: jax.Array,
+    distribution_ref: jax.Array,
+    ckpt_indices_ref: jax.Array | None,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    _: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    # Outputs.
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    # Scratches.
+    *scratch_refs: jax.Array,
+    cfg_b: config.GDNConfig,
+    cfg_p: config.GDNConfig,
+    max_seqs: int,
+    scratch_names: tuple[str, ...],
+):
+    """Both pooled passes in one call, routing tables built at entry."""
+    del source_out_ref
+    sc = dict(zip(scratch_names, scratch_refs))
+    carry_conv = sc.pop("carry_conv_scratch_ref")
+    carry_recurrent = sc.pop("carry_recurrent_scratch_ref")
+    meta_b, meta_p = tables_in_kernel.fill_and_wrap(
+        query_start_loc_ref,
+        seq_lens_ref,
+        state_indices_ref,
+        read_offsets_ref,
+        distribution_ref,
+        ckpt_indices_ref,
+        sc,
+        cfg_b,
+        cfg_p,
+        max_seqs,
+    )
+    outer_kernel(
+        meta_b,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        source_ref,
+        None,
+        None,
+        weights_ref,
+        out_ref,
+        None,
+        None,
+        None,
+        None,
+        cfg=cfg_b,
+    )
+
+    @pl.when(meta_p.num_tiles[...] > 0)
+    def _():
+        outer_kernel(
+            meta_p,
+            qkv_ref,
+            b_ref,
+            a_ref,
+            source_ref,
+            None,
+            None,
+            weights_ref,
+            out_ref,
+            None,
+            None,
+            carry_conv,
+            carry_recurrent,
+            cfg=cfg_p,
+        )
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -394,6 +487,7 @@ def _select_state_buffers(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "gdn_form",
     ),
 )
 def fused_conv1d_gdn(
@@ -429,7 +523,8 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    mixed_tile_size: int | None = None,
+    gdn_form: str = "two_calls",
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -500,7 +595,15 @@ def fused_conv1d_gdn(
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences.
+            sequences. None selects 128 for at most 8 value heads without
+            speculative decoding, else 64, capped at the step's rows and
+            rounded down to a tile the chunked pass accepts.
+        gdn_form: Pooled path only. "two_calls" runs the batched and the
+            per-sequence pass as two calls over XLA-built routing tables;
+            "tables" runs both in one call that builds the tables in SMEM
+            (`tables_in_kernel`), falling back to "two_calls" above
+            `tables_in_kernel.MAX_ROWS` rows or when the call's VMEM need
+            (`tables_in_kernel.vmem_limit_bytes`) exceeds the chip's VMEM.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -580,6 +683,8 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    if mixed_tile_size is None:
+        mixed_tile_size = _default_mixed_tile_size(batch_size, n_v, num_spec_tokens)
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
@@ -656,14 +761,11 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
+    def make_cfg(
+        mode: config.GDNMode,
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
-        in_act: jax.Array | None,
-        mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-        # With a state source, it rides the conv-state slot and the dense
-        # recurrent-state input is absent.
+    ) -> config.GDNConfig:
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
@@ -696,7 +798,17 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
-        cfg = _select_state_buffers(cfg, in_conv_state, in_recurrent_state)
+        return _select_state_buffers(cfg, in_conv_state, in_recurrent_state)
+
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # With a state source, it rides the conv-state slot and the dense
+        # recurrent-state input is absent.
+        cfg = make_cfg(mode, in_conv_state, in_recurrent_state)
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
@@ -774,8 +886,87 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    def call_kernel_tables_in_kernel(
+        in_source: jax.Array,
+        cfg_b: config.GDNConfig,
+        cfg_p: config.GDNConfig,
+        vmem_limit_bytes: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        in_act = jnp.zeros_like(cfg_b.get_out_shape())
+        num_ckpts = 0 if ckpt_indices is None else ckpt_indices.shape[1]
+        scratch = tables_in_kernel.scratch_shapes(
+            num_seqs, padded_batch_size, cfg_b.tile_size, num_ckpts
+        )
+        scratch.update(cfg_p.get_scratch_shape_dict())
+        scratch_names = tuple(scratch)
+        raw = (
+            query_start_loc.astype(jnp.int32),
+            seq_lens.astype(jnp.int32),
+            state_indices.astype(jnp.int32),
+            read_offsets,
+            distribution.astype(jnp.int32),
+            ckpt_indices,
+        )
+        num_raw = sum(x is not None for x in raw)
+        return pl.pallas_call(
+            functools.partial(
+                outer_kernel_tables_in_kernel,
+                cfg_b=cfg_b,
+                cfg_p=cfg_p,
+                max_seqs=num_seqs,
+                scratch_names=scratch_names,
+            ),
+            out_shape=(in_act, in_source),
+            in_specs=(
+                *(None if x is None else smem_spec for x in raw),
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, hbm_spec),
+            scratch_shapes=[scratch[name] for name in scratch_names],
+            input_output_aliases={num_raw + 3: 1, num_raw + 4: 0},
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            name=cfg_b.get_kernel_name() + "_tables_in_kernel",
+            metadata=cfg_b.get_metadata(),
+        )(*raw, qkv, b, a, in_source, in_act, weights)
+
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
+    if gdn_form not in ("two_calls", "tables"):
+        raise ValueError(f"gdn_form must be 'two_calls' or 'tables', got {gdn_form!r}")
+
+    use_tables = (
+        pooled
+        and gdn_form == "tables"
+        and not (batched_only or prefill_only)
+        and padded_batch_size <= tables_in_kernel.MAX_ROWS
+    )
+    if use_tables:
+        cfg_b = make_cfg(config.GDNMode.BATCHED, state_source, None)
+        cfg_p = make_cfg(config.GDNMode.PER_SEQ, state_source, None)
+        tables_vmem_bytes = tables_in_kernel.vmem_limit_bytes(cfg_b, cfg_p)
+        vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        use_tables = tables_vmem_bytes <= vmem_capacity_bytes
+        if not use_tables:
+            logger.warning_once(
+                "GDN tables form needs %d B of VMEM for both passes, above the "
+                "%d B the chip has; using two calls.",
+                tables_vmem_bytes,
+                vmem_capacity_bytes,
+            )
+    if use_tables:
+        out_act, out_source = call_kernel_tables_in_kernel(
+            state_source, cfg_b, cfg_p, tables_vmem_bytes
+        )
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
 
     if pooled:
         out_act, out_source = None, state_source
