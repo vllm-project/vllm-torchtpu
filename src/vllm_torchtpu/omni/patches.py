@@ -151,6 +151,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_qwen_image_rope_txt_freqs_clone()
     _patch_wan_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
+    _patch_diffusion_startup_warmup_sync()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
@@ -242,3 +243,33 @@ def _patch_wan_ffn_gelu_fence() -> None:
 
     ColumnParallelGELU.forward = _fenced_gelu_forward
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
+
+
+def _patch_diffusion_startup_warmup_sync() -> None:
+    """Synchronize the device after vLLM-Omni's diffusion startup warmup.
+
+    Root cause: ``DiffusionEngine._dummy_run`` (startup warmup) drops its output
+    without a host sync. Under torch_tpu DEFER_AND_FUSE the warmup's tail ops
+    (VAE decode) stay pending in torch_tpu's process-global deferred-op queue and
+    are materialized together with the first real request, which then gets cut
+    into different fused programs than later identical requests (those start
+    from an empty queue because the previous output's ``.cpu()`` flushed it).
+    The first request after startup therefore differs numerically from later
+    same-seed requests (tests_omni/models/wan/test_wan_pr.py::
+    test_wan_deterministic_seed_parity_tpu).
+
+    Applied from ``apply_omni_model_specific_patches``, i.e. in the process that
+    builds the model and runs the warmup forward.
+    """
+    # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
+    # startup warmup (e.g. current_omni_platform.synchronize() in _dummy_run).
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    orig_run_startup_warmup = DiffusionEngine.run_startup_warmup
+
+    def _synced_run_startup_warmup(self: Any) -> None:
+        orig_run_startup_warmup(self)
+        torch.accelerator.synchronize()  # flushes pending deferred ops + waits
+
+    DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
+    logger.info("Applied TPU patch: device sync after diffusion startup warmup.")

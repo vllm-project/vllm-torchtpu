@@ -379,3 +379,34 @@ def test_omni_tpu_patches_configuration(monkeypatch):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+
+
+def test_startup_warmup_device_sync(monkeypatch):
+    # The startup warmup must be followed by a device sync so that its pending
+    # deferred TPU ops are not fused into the first request.
+    from vllm_omni.diffusion import ipc
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    calls = []
+
+    class MockAccelerator:
+        @staticmethod
+        def synchronize(device=None):
+            calls.append("sync")
+
+    monkeypatch.setattr(torch, "accelerator", MockAccelerator(), raising=False)
+    monkeypatch.setattr(
+        DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
+    )
+    # Call the undecorated body so the run-once cache is left alone, and
+    # restore the other attributes it patches.
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_decode_output",
+        ltx2_runtime.LTXRuntime._decode_output,
+    )
+    apply_omni_model_specific_patches.__wrapped__()
+
+    DiffusionEngine.run_startup_warmup(object())
+    assert calls == ["warmup", "sync"]
