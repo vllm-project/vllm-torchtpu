@@ -21,6 +21,7 @@ def _split_scheduler(use_eagle: bool):
         hash_block_size=BLOCK,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
     )
 
 
