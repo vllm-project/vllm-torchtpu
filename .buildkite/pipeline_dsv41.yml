@@ -95,3 +95,34 @@ steps:
             --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-decode
         artifact_paths:
           - "perf_eval_results/**/*"
+
+      - label: "DeepSeek-V4.1-Flash: 100k prefill benchmark (TPU v7x-8)"
+        key: "dsv41_flash_tp8_ep_100k_prefill"
+        # Same weight streaming and startup as the GSM8K step, then a warmup
+        # and 4 measured requests of ~5 s each.
+        timeout_in_minutes: 180
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+        commands:
+          # Weights stream from gs://wdhongtw-hf-flat as in the GSM8K step.
+          #
+          # Requests have a 100k-token prompt and output one token, sent one
+          # at a time, so total_token_throughput in
+          # isl100000_osl1_c1.json is the prefill tok/s and TTFT the 100k
+          # prefill time. The perf baseline holds only the request count, so
+          # the step fails when a request fails, not on throughput; the
+          # numbers are published as artifacts and not yet gated. PR #1575
+          # measured 21246 tok/s (TTFT 4.71 s) on a CDK tpu7x node with sync
+          # scheduling; compare runs from the same environment only.
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+            EXTRA_SERVE_ARGS=--language-model-only
+            bash ./scripts/vllm/benchmarking/run_eval_flow.sh
+            --config deepseek-v41-flash-tp8-ep-100k-prefill
+            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-prefill
+        artifact_paths:
+          - "perf_eval_results/**/*"
