@@ -1272,10 +1272,15 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:
         return
-    if vllm_config.speculative_config is not None:
+    # The Qwen3.5 MoE drafter forward (Qwen3_5MultiTokenPredictor) already
+    # chunks to the local token shard and all-gathers after the final norm.
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method != "mtp"
+    ):
         raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 does not yet cover the speculative "
-            "drafter; disable speculative decoding or wait for #1562."
+            "TPU_MOE_SEQUENCE_PARALLEL=1 covers only the MTP drafter; "
+            f"got speculative method {vllm_config.speculative_config.method!r}."
         )
     archs = vllm_config.model_config.architectures or []
     if not any(a.startswith("Qwen3_5Moe") for a in archs):

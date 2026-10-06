@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 
 import jax
@@ -47,6 +48,8 @@ def inner_kernel(
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
+    conv_state_out_ref: jax.Array | None = None,
+    recurrent_out_ref: jax.Array | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -74,10 +77,17 @@ def inner_kernel(
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
             pipeline owns the Pallas program id.
+        conv_state_out_ref: With `cfg.split_state`, the convolution state
+            write-back VMEM ref; otherwise new states overwrite the input ref.
+        recurrent_out_ref: As `conv_state_out_ref`, for the recurrent state.
     """
 
     if p_id is None:
         p_id = pl.program_id(0)
+    if conv_state_out_ref is None:
+        conv_state_out_ref = conv_state_slot_ref
+    if recurrent_out_ref is None:
+        recurrent_out_ref = recurrent_slot_ref
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -116,7 +126,7 @@ def inner_kernel(
     if cfg.state_plan is None:
         # Only the checkpoint positions; the extra incoming-state position
         # (`cfg.state_in_pos`) is never copied out.
-        conv_state_slot_ref[:, : cfg.window_size] = new_conv_state
+        conv_state_out_ref[:, : cfg.window_size] = new_conv_state
     else:
         # External source tiles: encode each window position's checkpoint
         # through the region's typed view; copy_out pushes the raw bytes
@@ -124,7 +134,7 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
                 args = (
-                    conv_state_slot_ref.at[idx, t],
+                    conv_state_out_ref.at[idx, t],
                     cfg.state_plan.conv,
                     new_conv_state[idx, t],
                 )
@@ -221,14 +231,14 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[:, : cfg.window_size] = new_recurrent_state.astype(
-            recurrent_slot_ref.dtype
+        recurrent_out_ref[:, : cfg.window_size] = new_recurrent_state.astype(
+            recurrent_out_ref.dtype
         )
     else:
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
                 args = (
-                    recurrent_slot_ref.at[idx, t],
+                    recurrent_out_ref.at[idx, t],
                     cfg.state_plan.recurrent,
                     new_recurrent_state[idx, t],
                 )
@@ -286,40 +296,53 @@ def outer_kernel(
 
     num_tiles = metadata_ref.num_tiles[...]
 
+    body = functools.partial(inner_kernel, cfg=cfg)
+    in_allocs = (qkv_alloc, b_alloc, a_alloc)
+    in_refs = (qkv_ref, b_ref, a_ref)
+    if cfg.split_state:
+        # The write-back buffers ride after the activation output.
+        assert isinstance(conv_alloc, tuple) and isinstance(recurrent_alloc, tuple)
+        (conv_in, conv_out), (recurrent_in, recurrent_out) = conv_alloc, recurrent_alloc
+        in_allocs += (conv_in, recurrent_in)
+        out_allocs = (out_alloc, conv_out, recurrent_out)
+        state_refs = (conv_state_ref, recurrent_state_ref)
+        out_refs = (out_ref, *state_refs)
+
+        def body(qkv, b, a, conv, recurrent, out, conv_new, recurrent_new, *scratch):
+            inner_kernel(
+                qkv,
+                b,
+                a,
+                conv,
+                recurrent,
+                out,
+                *scratch,
+                cfg=cfg,
+                conv_state_out_ref=conv_new,
+                recurrent_out_ref=recurrent_new,
+            )
+
+    else:
+        assert isinstance(conv_alloc, memory_ref.StateBufferedRef)
+        assert isinstance(recurrent_alloc, memory_ref.StateBufferedRef)
+        in_allocs += (conv_alloc, recurrent_alloc)
+        out_allocs = (out_alloc,)
+        state_refs = (conv_state_ref, recurrent_state_ref)
+        out_refs = (out_ref,)
+    in_refs += state_refs
+
     pipeline_func = pltpu.emit_pipeline(
-        body=functools.partial(
-            inner_kernel,
-            cfg=cfg,
-        ),
+        body=body,
         grid=(num_tiles,),
-        in_specs=(
-            qkv_alloc.spec,
-            b_alloc.spec,
-            a_alloc.spec,
-            conv_alloc.spec,
-            recurrent_alloc.spec,
-        ),
-        out_specs=(out_alloc.spec,),
+        in_specs=tuple(alloc.spec for alloc in in_allocs),
+        out_specs=tuple(alloc.spec for alloc in out_allocs),
     )
 
-    @pl.with_scoped(
-        allocations=(
-            qkv_alloc,
-            b_alloc,
-            a_alloc,
-            conv_alloc,
-            recurrent_alloc,
-            out_alloc,
-        ),
-    )
+    @pl.with_scoped(allocations=in_allocs + out_allocs)
     def _run(allocations):
         pipeline_func(
-            qkv_ref,
-            b_ref,
-            a_ref,
-            conv_state_ref,
-            recurrent_state_ref,
-            out_ref,
+            *in_refs,
+            *out_refs,
             scratches=(
                 metadata_ref,
                 weights_ref,
@@ -330,6 +353,37 @@ def outer_kernel(
         )
 
     _run()
+
+
+def _select_state_buffers(
+    cfg: config.GDNConfig,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array | None,
+) -> config.GDNConfig:
+    """Uses split state buffers where they fit, else the shared buffer.
+
+    GDN halves the decode tile until split buffers fit: at 64 v-heads (DP8)
+    the batched pass at tile 2 with split buffers took 11% / 3% / 1% less
+    time than tile 4 with the shared buffer at 8 / 64 / 256 padded rows.
+    KDA keeps its tile; it is unmeasured. With no fitting tile, the
+    requested tile runs on the shared buffer.
+
+    The per-sequence pass keeps the shared buffer: its in-kernel temporaries
+    are not in `split_state_fits`, and at 64 v-heads with a 64-token tile
+    split buffers exceed scoped VMEM.
+    """
+    if cfg.mode == config.GDNMode.PER_SEQ:
+        return cfg
+    candidates = [cfg]
+    if not cfg.is_kda:
+        tile = cfg.tile_size
+        while tile > 1:
+            tile //= 2
+            candidates.append(dataclasses.replace(cfg, tile_size=tile))
+    for candidate in candidates:
+        if memory_ref.split_state_fits(candidate, conv_state, recurrent_state):
+            return dataclasses.replace(candidate, split_state=True)
+    return cfg
 
 
 @jax.jit(
@@ -655,6 +709,7 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
+        cfg = _select_state_buffers(cfg, in_conv_state, in_recurrent_state)
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
