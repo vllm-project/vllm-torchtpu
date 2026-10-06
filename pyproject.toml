@@ -156,11 +156,11 @@ exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 [tool.ruff.lint]
 # E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
 # bugs, SIM needless complexity, G logging calls, ISC string concatenation,
-# T20 print calls, S110 `except: pass`.
+# T20 print calls, S110 `except: pass`, TID251 banned imports.
 # E501 fails a line longer than 88 characters, the width `ruff format` wraps
 # code at. The formatter does not split comments or strings, so wrap those by
 # hand.
-select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110"]
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110", "TID251"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.
@@ -169,7 +169,21 @@ ignore = [
     "UP032",  # .format() that could be an f-string
 ]
 
+# Banned in src/vllm_torchtpu/kernels/ only; see per-file-ignores below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
+"vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+
 [tool.ruff.lint.per-file-ignores]
+# Kernels stay free of torch and vLLM, so they run and test as plain JAX.
+# Adapter files bridge a kernel to torch. The three files listed after them
+# import torch or vLLM and have not been split yet.
+"!src/vllm_torchtpu/kernels/**" = ["TID251"]
+"src/vllm_torchtpu/kernels/**/vllm_adapter.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
+
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
 # that built it. B023 warns that a closure outliving its loop sees the last
