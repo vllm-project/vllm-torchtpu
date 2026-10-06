@@ -77,6 +77,7 @@ class KVLayout(enum.Enum):
 # Determined from microbenchmarks for 8k/1k and 256k/1k.
 DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 
+
 # Source of `_scheduling_group_id`s for the chunked TensorCore/SparseCore
 # pipeline. One counter for the process, because the ids are global to a
 # compiled program and a model traces this kernel once per layer: two layers

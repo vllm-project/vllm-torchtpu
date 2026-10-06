@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Left-pack the merged DCP top-k winners that one rank owns, on SparseCore.
-
-The winners are rank-local already: only scores cross the all-gather, so the
-indices never leave the rank that produced them.
-"""
+"""Left-pack the merged DCP top-k winners that one rank owns, on SparseCore."""
 
 import functools
 
@@ -30,7 +26,7 @@ SCAN_UNROLL = 8
 
 
 def _pack_body(
-    vals_hbm,  # i32[padded_b * width]
+    merged_hbm,  # i32[padded_b * width]
     out_hbm,  # i32[padded_b * width]
     rowbuf_vmem,  # i32[width + lanes]
     *,
@@ -44,24 +40,29 @@ def _pack_body(
     flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
     chunks = width // lanes
 
-    def pipeline_step(vals_vmem, out_vmem):
+    def pipeline_step(merged_vmem, out_vmem):
         row = pl.program_id(0) * (num_cores * num_subcores) + flat
 
         def fill(i):
             rowbuf_vmem[pl.ds(i * lanes, lanes)] = jnp.full((lanes,), -1, jnp.int32)
 
-        # Pad up front; the scan below only overwrites the kept prefix.
+        # Pad up front; the scan below only overwrites the owned prefix.
         plsc.parallel_loop(0, chunks, unroll=4)(fill)
 
         def emit(i, woff):
-            v = vals_vmem[pl.ds(i * lanes, lanes)]
-            keep = v >= 0
-            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, lanes)], v, mask=keep)
-            return woff + plsc.all_reduce_population_count(keep)[0]
+            g = merged_vmem[pl.ds(i * lanes, lanes)]
+            owned = g >= 0
+            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, lanes)], g, mask=owned)
+            return woff + plsc.all_reduce_population_count(owned)[0]
 
-        # Carried `woff` makes this sequential: ascending order, and `woff <= width`.
+        # `woff` is carried, so this is a sequential scan: winners land in
+        # ascending column order and `woff <= width` because at most every
+        # entry is owned. That bound is what makes truncation impossible.
         plsc.parallel_loop(
-            0, jnp.where(row < b, chunks, 0), unroll=SCAN_UNROLL, carry=jnp.int32(0)
+            0,
+            jnp.where(row < b, chunks, 0),
+            unroll=SCAN_UNROLL,
+            carry=jnp.int32(0),
         )(emit)
 
         def copy_out(i):
@@ -85,7 +86,7 @@ def _pack_body(
     )
     pltpu.emit_pipeline(
         pipeline_step, grid=(num_waves,), in_specs=in_specs, out_specs=out_specs
-    )(vals_hbm, out_hbm)
+    )(merged_hbm, out_hbm)
 
 
 def _gather_and_pack_body(
@@ -174,18 +175,21 @@ def pack_owned_winners(
     idxs: jax.Array | None = None,  # i32[num_rows, width]
     dcp_rank: int | jax.Array | None = None,
 ) -> jax.Array:
-    """Left-packs each row's non-negative entries into a `-1` padded prefix.
+    """Compacts non-negative rank-local winners into a `-1`-padded prefix.
 
     When `idxs` and `dcp_rank` are provided, performs fused SparseCore gather
     and compaction directly from `slots` and `idxs`, avoiding an intermediate
     XLA gather offload.
 
     Args:
-        slots: i32[num_rows, width] global top-k slots (if idxs provided) or
-            rank-local cache indices with `-1` in unowned slots (legacy 1-arg mode).
-            `width` must be a multiple of `sc.num_lanes`.
-        idxs: optional i32[num_rows, width] local candidate indices.
-        dcp_rank: optional rank index along the DCP axis.
+      slots: i32[num_rows, width] global top-k slots (if idxs provided) or
+        rank-local cache indices with `-1` in unowned slots (legacy 1-arg mode).
+        `width` must be a multiple of `sc.num_lanes`.
+      idxs: optional i32[num_rows, width] local candidate indices.
+      dcp_rank: optional rank index along the DCP axis.
+
+    Returns:
+      i32[num_rows, width] of rank-local cache indices, prefix-packed.
     """
     b, width = slots.shape
     if slots.dtype != jnp.int32:
@@ -204,7 +208,6 @@ def pack_owned_winners(
 
     num_waves = (b + rows_per_wave - 1) // rows_per_wave
     padded_b = num_waves * rows_per_wave
-
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
         num_subcores=sc.num_subcores,
@@ -265,30 +268,5 @@ def pack_owned_winners(
         scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
         name=f"sc_gather_pack_owned_b{b}_w{width}",
-        # pyrefly: ignore[bad-argument-count]
     )(slots.reshape(-1), idxs.reshape(-1), rank_2d.reshape(-1))
     return out.reshape(padded_b, width)[:b]
-
-
-def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
-    """Left-packs each row's non-negative entries into a `-1` padded prefix.
-
-    Relative order is preserved, and a row of all non-negatives fills exactly
-    `width`, so this never truncates.
-    """
-    return pack_owned_winners(vals)
-
-
-def resolve_owned_winners(
-    local_idxs: jax.Array,  # i32[num_rows, k], this rank's rank-local candidates
-    slots: jax.Array,  # i32[num_rows, k], flat columns of the merged score list
-    k: int,
-    dcp_rank: jax.Array | int,
-) -> jax.Array:
-    """Picks the merged winners this rank produced out of its own list, packed.
-
-    Fuses ownership filtering, VMEM register gather (`plsc.load_gather`), and
-    left-compaction (`plsc.store_compressed`) into a single SparseCore kernel
-    with zero separate XLA gather offload ops.
-    """
-    return pack_owned_winners(slots, local_idxs, dcp_rank)
