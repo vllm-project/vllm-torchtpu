@@ -26,6 +26,7 @@ import pytest
 import torch
 from absl.testing import parameterized
 
+from vllm_torchtpu.distributed import dcp_comm
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
     cp_owner_rank,
@@ -57,7 +58,10 @@ class _FakeGroup:
         total = None
         for rank in range(self.world_size):
             peer = _FakeGroup(self._outputs, self._lses, rank)
-            term = cp_mla._weight_by_lse(self._outputs[rank], self._lses[rank], peer)
+            peer.reduce_scatter = lambda tensor, dim: tensor
+            term = dcp_comm.cp_lse_ag_out_rs(
+                self._outputs[rank], self._lses[rank], peer
+            )
             total = term if total is None else total + term
         return total.to(dtype)
 
@@ -324,12 +328,13 @@ def test_all_to_all_merge_matches_the_f64_reference(dcp_size, monkeypatch):
 
 
 def test_all_to_all_merge_agrees_with_the_reduce_scatter_merge(monkeypatch):
-    """Same answer as today's path, up to the final bf16 rounding."""
+    """Compare both paths to the reference."""
     outputs, lses = _hard_partials(np.random.default_rng(7), 8)
-    got = _a2a_merge_whole(outputs, lses, monkeypatch)
-    today = _merge_whole(outputs.float(), lses, monkeypatch).to(torch.bfloat16)
-    diff = (got.float() - today.float()).abs()
-    assert (diff <= 2.0**-8 * today.float().abs() + 1e-6).all()
+    reference = _reference_merge(outputs.float(), lses)
+    a2a_result = _a2a_merge_whole(outputs, lses, monkeypatch)
+    ag_rs_result = _merge_whole(outputs.float(), lses, monkeypatch).to(torch.bfloat16)
+    assert _bf16_close(a2a_result, reference)
+    assert _bf16_close(ag_rs_result, reference)
 
 
 def test_positive_control_wrong_head_slice_is_caught(monkeypatch):
