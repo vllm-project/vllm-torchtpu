@@ -1,7 +1,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -486,7 +486,7 @@ def materialize_kv_cache_tensors(
                     )
                     if region in region_caches:
                         cache = region_caches[region]
-                        expected_shape = group.backend.get_kv_cache_shape(
+                        expected_shape = cast(Any, group.backend).get_kv_cache_shape(
                             num_blocks * spec.block_size // kernel_block_size,
                             kernel_block_size,
                             spec.num_kv_heads,

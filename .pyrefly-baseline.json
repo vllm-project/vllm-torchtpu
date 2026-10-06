@@ -1026,29 +1026,9 @@
       "concise_description": "Object of class `NoneType` has no attribute `e_score_correction_bias`"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal[1], Literal[2]]` is not assignable to parameter `axis` with type `int` in function `vllm_torchtpu.layers.core.quantization.dequantize_tensor`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/vision_attention.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "unsupported-operation",
-      "concise_description": "`**` is not supported between `None` and `float`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "unsupported-operation",
-      "concise_description": "`**` is not supported between `None` and `float`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `sharded_ragged_paged_attention`"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
@@ -1064,36 +1044,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
@@ -1254,11 +1204,6 @@
       "path": "src/vllm_torchtpu/tpu_info.py",
       "name": "bad-return",
       "concise_description": "Returned type `None` is not assignable to declared return type `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/utils.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `(obj: object, /) -> int` is not assignable to declared return type `(Any) -> bytes`"
     }
   ]
 }

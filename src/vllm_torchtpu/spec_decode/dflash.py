@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -715,7 +715,7 @@ class DFlashProposer:
         dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
             num_tokens, num_reqs, num_blocks
         )
-        dummy_positions = dummy_attn_metadata.input_positions
+        dummy_positions = cast(torch.Tensor, dummy_attn_metadata.input_positions)
         assert self.draft_model is not None
 
         with set_vllm_model_wrapper_context(

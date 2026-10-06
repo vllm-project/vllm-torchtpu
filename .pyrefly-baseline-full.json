@@ -2561,21 +2561,6 @@
       "concise_description": "Object of class `AbstractValue` has no attribute `memory_space`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `AbstractValue` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `AbstractValue` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `AbstractValue` has no attribute `sharding`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
@@ -2594,26 +2579,6 @@
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `object` with type `int` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<` is not supported between `complex` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `complex` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `number` and `int`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py",
@@ -2661,21 +2626,6 @@
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
     },
     {
-      "path": "src/vllm_torchtpu/kv_cache_materializer.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `input_positions` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `input_positions` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `model_config`"
@@ -2714,11 +2664,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `input_positions` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -2799,11 +2744,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/kda_attention_op.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mamba_state_copy_op.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `Any | None` is not assignable to declared return type `Tensor`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
@@ -2888,17 +2828,7 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal[1], Literal[2]]` is not assignable to parameter `axis` with type `int` in function `vllm_torchtpu.layers.core.quantization.dequantize_tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Self@VllmFp8MoEMethodTPU` is not assignable to parameter `self` with type `VllmUnquantizedFusedMoEMethod` in function `vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method.UnquantizedFusedMoEMethod.create_weights`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "bad-override",
-      "concise_description": "Class member `VllmFp8MoEMethodTPU.get_fused_moe_quant_config` overrides parent class `Fp8MoEMethod` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
@@ -2926,56 +2856,6 @@
       "concise_description": "Class member `TpuMMEncoderAttention.forward_tpu` overrides parent class `MMEncoderAttention` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `Array | tuple[Array, tuple[Array]]` is not assignable to declared return type `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `sharded_ragged_paged_attention`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `Tensor` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown` is not assignable to parameter `block_tables` with type `Array` in function `AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `mamba_state_indices` with type `Array | None` in function `AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_metadata.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `mamba_ckpt_indices` with type `Array | None` in function `AttentionMetadata.__init__`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
@@ -2994,51 +2874,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `size`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
@@ -3179,56 +3014,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "unbound-name",
       "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `query_start_loc` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `state_indices` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `seq_lens` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `distribution` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `window_distribution` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `slot_read_offsets` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.dispatched_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `query_start_loc` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `state_indices` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `seq_lens` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `distribution` with type `Tensor` in function `vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op.pooled_impl`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/dspark.py",
@@ -3607,31 +3392,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `input_positions` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `block_tables` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `seq_lens` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `query_start_loc` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `request_distribution` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
     },
@@ -3684,36 +3444,6 @@
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
       "name": "unexpected-keyword",
       "concise_description": "Unexpected keyword argument `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `input_positions` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `block_tables` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `seq_lens` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `query_start_loc` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `request_distribution` with type `Array` in function `vllm_torchtpu.layers.core.attention_metadata.AttentionMetadata.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `positions` with type `Tensor` in function `DFlashProposer._tpu_precompute_and_update_kv_cache`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
@@ -3839,16 +3569,6 @@
       "path": "src/vllm_torchtpu/tpu_info.py",
       "name": "bad-return",
       "concise_description": "Returned type `None` is not assignable to declared return type `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/utils.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `(obj: object, /) -> int` is not assignable to declared return type `(Any) -> bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[Tensor] | Tensor` is not assignable to parameter `object` with type `Tensor` in function `list.append`"
     },
     {
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
