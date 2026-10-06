@@ -67,12 +67,26 @@ for TARGET in "${TARGETS[@]}"; do
   echo "--- :docker: Tagging as ${LATEST_IMAGE}"
   docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
 
+  # Step 1: Tag and push extra vllm-torchtpu images alongside torchtpu-vllm
+  # so that nightly builds populate the new image namespace in Artifact Registry.
+  EXTRA_IMAGE_NAME="${REGISTRY}/vllm-torchtpu-${TARGET}"
+  EXTRA_DATE_IMAGE="${EXTRA_IMAGE_NAME}:${DATE_TAG}"
+  EXTRA_LATEST_IMAGE="${EXTRA_IMAGE_NAME}:${LATEST_TAG}"
+
+  echo "--- :docker: Tagging extra images for vllm-torchtpu transition (${EXTRA_DATE_IMAGE}, ${EXTRA_LATEST_IMAGE})"
+  docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
+  docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
+
   echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Artifact Registry"
   docker push "${DATE_IMAGE}"
   docker push "${LATEST_IMAGE}"
 
+  echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
+  docker push "${EXTRA_DATE_IMAGE}"
+  docker push "${EXTRA_LATEST_IMAGE}"
+
   echo "--- Cleaning up locally built image tags for ${TARGET}"
-  docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" || true
+  docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" "${EXTRA_DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}" || true
 done
 
 echo "--- Successfully built and published all nightly images!"
