@@ -15,14 +15,19 @@
 
 # Priority constants for pipeline jobs.
 # On-call fix > Post-merge > Pre-merge > Integration pipeline > Benchmark > Other/Default > Nightly
+# The same numbers as tpu-inference's pipeline_config.sh. The kube launcher maps
+# a build's JOB_PRIORITY to a Kueue priority class by number (ci-infra's
+# launch.py, JOB_PRIORITY_CLASSES), so both repos have to agree on them. On the
+# shared bare-metal TPU queues it also means the two repos' builds of the same
+# kind rank equally.
 export PRIORITY_ONCALL_FIX=12
-export PRIORITY_POST_MERGE=11
-export PRIORITY_PRE_MERGE=6
-export PRIORITY_INTEGRATION=4
-export PRIORITY_BENCHMARK=3
-export PRIORITY_DEFAULT=2
-export PRIORITY_NIGHTLY=1
-export PRIORITY_KERNEL_TUNING=-9
+export PRIORITY_POST_MERGE=10
+export PRIORITY_PRE_MERGE=5
+export PRIORITY_INTEGRATION=3
+export PRIORITY_BENCHMARK=2
+export PRIORITY_DEFAULT=1
+export PRIORITY_NIGHTLY=0
+export PRIORITY_KERNEL_TUNING=-10
 
 # Implemented dynamic job prioritization by injecting integers during upload
 upload_with_priority() {
