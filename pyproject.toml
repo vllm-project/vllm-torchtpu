@@ -155,11 +155,12 @@ exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 
 [tool.ruff.lint]
 # E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
-# bugs, SIM needless complexity, G logging calls, ISC string concatenation.
+# bugs, SIM needless complexity, G logging calls, ISC string concatenation,
+# T20 print calls.
 # E501 fails a line longer than 88 characters, the width `ruff format` wraps
 # code at. The formatter does not split comments or strings, so wrap those by
 # hand.
-select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.
@@ -179,6 +180,11 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+
+# Library code logs through vllm_torchtpu.logger. Tests, scripts and
+# command-line tools print to the terminal on purpose.
+"!src/**" = ["T20"]
+"src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
 
 [tool.ruff.format]
 docstring-code-format = true
