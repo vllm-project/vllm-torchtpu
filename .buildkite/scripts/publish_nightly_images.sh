@@ -57,7 +57,7 @@ cd "${REPO_ROOT}"
 TARGETS=("ci" "dev" "prod")
 
 for TARGET in "${TARGETS[@]}"; do
-  IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
+  IMAGE_NAME="${REGISTRY}/vllm-torchtpu-${TARGET}"
   DATE_IMAGE="${IMAGE_NAME}:${DATE_TAG}"
   LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 
@@ -67,13 +67,13 @@ for TARGET in "${TARGETS[@]}"; do
   echo "--- :docker: Tagging as ${LATEST_IMAGE}"
   docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
 
-  # Step 1: Tag and push extra vllm-torchtpu images alongside torchtpu-vllm
-  # so that nightly builds populate the new image namespace in Artifact Registry.
-  EXTRA_IMAGE_NAME="${REGISTRY}/vllm-torchtpu-${TARGET}"
+  # Step 1: Tag and push extra legacy torchtpu-vllm images for backward compatibility
+  # so existing consumers continue working smoothly until migration is finalized.
+  EXTRA_IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
   EXTRA_DATE_IMAGE="${EXTRA_IMAGE_NAME}:${DATE_TAG}"
   EXTRA_LATEST_IMAGE="${EXTRA_IMAGE_NAME}:${LATEST_TAG}"
 
-  echo "--- :docker: Tagging extra images for vllm-torchtpu transition (${EXTRA_DATE_IMAGE}, ${EXTRA_LATEST_IMAGE})"
+  echo "--- :docker: Tagging extra legacy images for backward compatibility (${EXTRA_DATE_IMAGE}, ${EXTRA_LATEST_IMAGE})"
   docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
   docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
 
