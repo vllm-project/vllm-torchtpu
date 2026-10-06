@@ -303,11 +303,10 @@ steps:
     commands:
       - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
 
-  # The two Kimi-K3 steps run last. They take the 2x2x4 queue's own chips,
-  # which the v7x-8 and v7x-16 steps above borrow while it is idle; started
-  # alongside those steps, Kueue would evict them to give the chips back. So
-  # each waits for everything before it, failed or not, and the 1P1D, which
-  # needs both slices, goes first.
+  # The Kimi-K3 step runs last. It takes the 2x2x4 queue's own chips, which the
+  # v7x-8 and v7x-16 steps above borrow while it is idle; started alongside
+  # those steps, Kueue would evict them to give the chips back. So it waits for
+  # everything before it, failed or not.
   #
   # Prefill TP8 x DP4 x EP32 to decode TP8 x DP4 x EP32, each on its own 2x2x4
   # slice.
@@ -333,24 +332,3 @@ steps:
       - *kube_plugin
     commands:
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-1p1d-4dp8tp.yaml
-
-  # Kimi-K3 aggregated on one 2x2x4 slice, four hosts of four chips: the only
-  # nightly of it, as pipeline_perf.yml has no bare-metal counterpart.
-  - label: ":kubernetes: Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
-    key: "perf_nightly_kimi_k3_tp32_ep"
-    depends_on:
-      - "build_docker"
-      - step: "perf_nightly_kimi_k3_1p1d"
-        allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    env:
-      TPU_ACCELERATOR_TYPE: "tpu7x"
-      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-      BENCHMARK_WARMUP_RUNS: "1"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x4 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval
