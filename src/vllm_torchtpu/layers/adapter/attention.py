@@ -12,6 +12,7 @@ import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -41,7 +42,13 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    indexer_kv_layout,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    get_kv_cache_shape as _get_indexer_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
@@ -163,7 +170,7 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 # HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
-# fp8 page is genuinely half a bf16 one (b/510425663).
+# fp8 page is genuinely half a bf16 one.
 KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] = {
     VllmKVCacheLayout.LBNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     VllmKVCacheLayout.BLNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
@@ -1825,9 +1832,10 @@ class PallasMLAttentionBackend(AttentionBackend):
 class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     """Indexer backend for TPU.
 
-    The TPU materializer retains the native 3-D indexer K cache shape
-    `(num_blocks, block_size, head_size)` consumed by streamindex. vLLM 0.29
-    no longer owns this backend shape hook.
+    Sizes and allocates the 4-D packed `uint8` indexer K cache in either
+    `HEAD_ALONG_SUBLANE` (`(num_blocks, block_size // 4, 4, 256)`, 256 B/token)
+    or `SEQ_ALONG_LANE` (`(num_blocks, 33, 4, block_size)`, 132 B/token) layout,
+    decided once via `indexer_kv_layout(block_size)`.
 
     The page size hooks below delegate to `PallasMLAttentionBackend`. They are
     not the indexer's own page size: `cache_config.block_size` is global across
@@ -1847,7 +1855,47 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
+        del num_kv_heads, cache_dtype_str
+        kv_layout = indexer_kv_layout(block_size)
+        return _get_indexer_kv_cache_shape(
+            total_num_pages=num_blocks,
+            page_size=block_size,
+            actual_head_dim=head_size,
+            kv_layout=kv_layout,
+        )
+
+    @classmethod
+    def get_kv_cache_page_size_bytes(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        dtype = (
+            torch.uint8
+            if isinstance(cache_dtype_str, str)
+            and cache_dtype_str.lower().strip() == "auto"
+            else _resolve_kv_cache_dtype(cache_dtype_str)
+        )
+        shape = cls.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        page_bytes = cls.get_kv_cache_page_size_bytes(
+            spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+        )
+        return dataclasses.replace(
+            spec, num_head_slots=1, state_content_bytes=page_bytes // spec.block_size
+        )
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
@@ -2401,7 +2449,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.request_distribution,
                 )
                 # The scatter undoes the head all-gather above.
-                outputs = merge_lse_partials_scatter_heads(partial, lse)
+                #
+                # Only the backbone may use the all-to-all merge. The merge
+                # picks it by comparing the token count to
+                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                # the backbone is traced multiple times, once per bucket
+                # group (`_precompile_backbone`). The MTP drafter (model_tag
+                # "eagle_head") is traced once for every bucket: the
+                # comparison would pin its graph to the first size, and the
+                # large buckets fail with ShapeSpecializationError. So the
+                # drafter keeps the reduce-scatter, as with the flag off.
+                outputs = merge_lse_partials_scatter_heads(
+                    partial,
+                    lse,
+                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)

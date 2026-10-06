@@ -539,6 +539,64 @@ class TestTpuPlatform:
         )
 
     @pytest.mark.parametrize(
+        ("linear", "max_model_len", "added"),
+        [
+            (False, 32768, []),
+            # budget/32 = 64 rows would be 23 buckets above budget/4; the
+            # step widens to 4 * 64 to stay within seven.
+            (True, 32768, [768, 1280, 1536, 1792]),
+            # Up to the longest prompt pass, 1000 + 8 rounded up to 1024:
+            # eight 64-row buckets, so 128 rows.
+            (True, 1000, [640, 768, 896]),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_linear_token_buckets(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        linear,
+        max_model_len,
+        added,
+    ):
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_seqs = 8
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
+    def test_linear_token_step_at_the_served_budget(self):
+        paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
+
+        assert paddings == list(range(6144, 16385, 2048))
+
+    def test_linear_token_buckets_for_tp8_qwen35_mtp(self):
+        # The TP8 Qwen3.5 recipe: 16384-token budget, max_model_len 10240,
+        # 64 seqs. 512-row buckets were 13 (4608..10752) and OOMed the
+        # 512 GiB pod precompiling under MTP; 1024 rows keep it to seven,
+        # six of them new beside the power-of-two 8192.
+        paddings = tpu_platform._get_linear_token_paddings(16384, 10240 + 64)
+
+        assert paddings == list(range(5120, 11265, 1024))
+
+    @pytest.mark.parametrize("budget", [256, 2048, 8192, 16384, 65536])
+    def test_linear_token_buckets_are_capped(self, budget):
+        for longest_pass in range(16, 4 * budget, max(1, budget // 61)):
+            paddings = tpu_platform._get_linear_token_paddings(budget, longest_pass)
+
+            assert len(paddings) <= tpu_platform._MAX_LINEAR_BUCKETS
+            assert all(budget // 4 < p <= budget for p in paddings)
+
+    @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
         [
             # Hybrid CPU offloading transfers whole pool rows; without the

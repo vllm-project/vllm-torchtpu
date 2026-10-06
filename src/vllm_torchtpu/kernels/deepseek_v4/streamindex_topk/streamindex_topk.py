@@ -14,6 +14,7 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +34,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+
+try:
+    from vllm_torchtpu.logger import init_logger
+
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
@@ -503,6 +511,85 @@ def prepare_outputs(out):
 # 8-bit KV data packs 4 values into every 32-bit sublane word.
 KV_PACKING = 4
 
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+_INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int | str]] = set()
+
+
+def indexer_kv_layout(
+    block_size: int,
+    mode: str | None = None,
+) -> KVLayout:
+    """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
+
+    `sal` requires `block_size` to be a positive multiple of 128 and is not
+    supported by Raiden GLM Stage-3 admission (`build_glm_mla_pool_manifest` /
+    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry).
+    When `sal` is selected by default and Raiden GLM admission is enabled, or
+    when `block_size < 128` or `block_size % 128 != 0`, this helper selects
+    `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
+    allocation and op execution always agree on the layout. Explicitly
+    requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
+    """
+    try:
+        from vllm_torchtpu import envs
+
+        raiden_glm_admission = envs.use_raiden_glm_admission()
+        explicit_env = envs.is_indexer_kv_cache_mode_explicit()
+        env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+    except ImportError:
+        raiden_glm_admission = False
+        explicit_env = False
+        env_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+
+    if mode is None:
+        raw_mode = env_mode
+        explicit_mode = explicit_env
+    else:
+        raw_mode = mode
+        explicit_mode = True
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if resolved == "sal":
+        if raiden_glm_admission:
+            if explicit_mode:
+                raise ValueError(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible with "
+                    "Raiden GLM admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and "
+                    "TPU_RAIDEN_GLM_ADMISSION=1), which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or unset it to allow "
+                    "automatic fallback)."
+                )
+            key: tuple[str, int | str] = (resolved, "raiden_glm_admission")
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible "
+                    "with Raiden GLM admission (which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        if block_size < 128 or block_size % 128 != 0:
+            key = (resolved, int(block_size))
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r requires block_size to be a "
+                    "positive multiple of 128 (got block_size=%d); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer.",
+                    resolved,
+                    block_size,
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        return KVLayout.SEQ_ALONG_LANE
+    return KVLayout.HEAD_ALONG_SUBLANE
+
 
 def get_kv_cache_shape(
     total_num_pages: int,
@@ -512,6 +599,10 @@ def get_kv_cache_shape(
 ) -> tuple[int, ...]:
     """Returns the packed uint8 index KV cache shape for a given layout."""
     kv_layout = KVLayout.parse(kv_layout)
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
     head_dim = align_to(actual_head_dim, 128)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         if page_size % 128 != 0:
@@ -1191,6 +1282,7 @@ def streamindex_topk(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
     ),
@@ -1214,6 +1306,7 @@ def streamindex_topk_dcp(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
@@ -1268,6 +1361,8 @@ def streamindex_topk_dcp(
       buffer_count: buffer count for pallas kernel.
       vmem_limit_bytes: vmem limit for pallas kernel.
       decode_req_batch_size: maximum decode batch size per iteration.
+      kv_layout: memory layout of `cache_kv` (`HEAD_ALONG_SUBLANE` or
+        `SEQ_ALONG_LANE`).
       chunk_tokens: forwarded to `streamindex_topk` for the per-rank local
         scoring pass; see there for the semantics. Chunking cuts the replicated
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
@@ -1329,6 +1424,7 @@ def streamindex_topk_dcp(
             buffer_count=buffer_count,
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
+            kv_layout=kv_layout,
             enable_early_exit=False,
             chunk_tokens=chunk_tokens,
             cp_size=dcp_size,

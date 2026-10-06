@@ -72,6 +72,18 @@ x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
 steps:
+  # pyrefly in the CI image against .pyrefly-baseline-full.json, as on bare
+  # metal. The pod already runs that image, but typecheck_full.sh decides it is
+  # outside a container by looking for /.dockerenv, which a pod does not have,
+  # and would try to start Docker.
+  - label: ":kubernetes: Type Check - Full Environment"
+    key: "typecheck_full"
+    <<: *cpu_unit_test_defaults
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run.sh env TYPECHECK_IN_PLACE=1 bash tools/typecheck_full.sh
+
   - label: ":kubernetes: Unit Tests - CPU (PR)"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'

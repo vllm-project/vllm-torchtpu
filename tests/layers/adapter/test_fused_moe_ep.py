@@ -235,12 +235,9 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
-def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
-    """The permutation exists only to undo a mesh ordered by device id.
-
-    Since google-pytorch/torch_tpu#3522 `build_ep_mesh` orders by rank, so mesh
-    index i holds EP rank i's experts and the op must be handed nothing.
-    """
+def test_mesh_expert_order_is_none_when_ranks_follow_device_ids():
+    """The permutation exists only to undo a mesh ordered by device id; where
+    EP rank order already is device order the op must be handed nothing."""
     seen = []
     assert (
         _prebuild(
@@ -251,15 +248,6 @@ def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
         == "op"
     )
     assert seen and seen[0][_MESH_ORDER_ARG] is None
-
-
-def test_ep_rank_order_is_the_identity():
-    """It no longer depends on how the group's ranks are arranged."""
-    from vllm_torchtpu.distributed import ep_mesh
-
-    group = SimpleNamespace(ranks=[3, 1, 2, 0])
-    with patch.object(ep_mesh, "get_ep_group", return_value=group):
-        assert ep_mesh.ep_rank_order() == (0, 1, 2, 3)
 
 
 def test_ep_rank_order_is_none_without_a_group():
@@ -470,25 +458,23 @@ def test_mesh_expert_order(order, expected):
         assert bridge._mesh_expert_order(len(order)) == expected
 
 
-def test_ep_rank_order_does_not_depend_on_where_the_devices_sit():
-    """It used to undo a mesh ordered by device id.
-
-    google-pytorch/torch_tpu#3522 binds partition p to rank p and
-    `build_ep_mesh` orders by rank to match, so mesh index i holds EP rank i's
-    experts whatever the chips underneath are doing.
-    """
+def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
+    """The mesh is in ascending device-id order (the rank-ordered one makes the
+    fused MoE's all-gathers slow), so this is what says which rank sits where."""
     from vllm_torchtpu.distributed import ep_mesh
 
+    # EP ranks 0..7 on a tpu7x host's device ids. Sorted ascending, rank r ends
+    # up at the position of its device id.
+    device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
-    orders = []
-    for device_ids in ((0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 2, 3, 4, 5, 6, 7)):
-        with (
-            patch.object(ep_mesh, "get_ep_group", return_value=group),
-            patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
-        ):
-            orders.append(ep_mesh.ep_rank_order())
+    with (
+        patch.object(ep_mesh, "get_ep_group", return_value=group),
+        patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
+    ):
+        order = ep_mesh.ep_rank_order()
 
-    assert orders[0] == orders[1] == tuple(range(8))
+    assert order == tuple(rank for _, rank in sorted(zip(device_ids, range(8))))
+    assert order == (0, 1, 6, 7, 2, 3, 4, 5)
 
 
 def test_supports_internal_mk_tracks_both_owners():

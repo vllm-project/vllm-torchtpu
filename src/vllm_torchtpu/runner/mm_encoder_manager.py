@@ -3,7 +3,10 @@ from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+from vllm.model_executor.models.interfaces import (
+    SupportsEncoderCudaGraph,
+    supports_encoder_cudagraph,
+)
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from vllm_torchtpu.logger import init_logger
@@ -79,7 +82,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
             vllm_config=vllm_config,
             device=device,
             dtype=cast(torch.dtype, vllm_config.model_config.dtype),
-            model=vllm_model,
+            # maybe_create_mm_encoder_manager checks supports_encoder_cudagraph.
+            model=cast(SupportsEncoderCudaGraph, vllm_model),
         )
 
         encoder_use_dp = getattr(vllm_model, "use_data_parallel", None)

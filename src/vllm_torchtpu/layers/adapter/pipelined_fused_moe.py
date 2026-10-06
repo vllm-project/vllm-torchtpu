@@ -18,12 +18,15 @@ This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
+from typing import cast
+
 import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -41,6 +44,22 @@ def enable_pipelined_collective_and_compute() -> bool:
 
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
+
+
+def _quantized_all_gather(
+    collective_group, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """All-gather activations in fp8, restored on arrival."""
+    out_dtype = hidden_states.dtype
+    quantized, scale = quantize_tensor(
+        hidden_states, quant_dtype=torch.float8_e4m3fn, axis=-1
+    )
+    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
+    ag_scale = collective_group.all_gather(scale, dim=0)
+    ag_hidden_states = dequantize_tensor(
+        ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
+    )
+    return ag_hidden_states
 
 
 def calculate_moe_chunks(
@@ -173,11 +192,20 @@ def pipelined_fused_moe_gmm(
         seq_len, parallel_size, chunk_size
     )
 
+    # There is no gather to make cheaper on a single rank, so quantizing there
+    # would only round the activations for nothing.
+    quantize_ag = parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER
+
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
-            ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+            if quantize_ag:
+                ag_hidden_states = _quantized_all_gather(
+                    collective_group, hidden_states
+                )
+            else:
+                ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
                 collective_group.all_gather(topk_weights, dim=0)
                 if topk_weights is not None
@@ -201,8 +229,9 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=ag_topk_weights,
-            topk_ids=ag_topk_ids,
+            # Declared Tensor like the parameters; a None input stays None.
+            topk_weights=cast(torch.Tensor, ag_topk_weights),
+            topk_ids=cast(torch.Tensor, ag_topk_ids),
             experts_start=experts_start,
             topk=topk,
             activation=activation,
@@ -240,8 +269,13 @@ def pipelined_fused_moe_gmm(
         else [None] * num_chunks
     )
 
+    def _all_gather_hs(hs_slice):
+        if quantize_ag:
+            return _quantized_all_gather(collective_group, hs_slice)
+        return collective_group.all_gather(hs_slice, dim=0)
+
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_hs_curr = _all_gather_hs(hs_slices[0])
     ag_tw_curr = (
         collective_group.all_gather(weights_slices[0], dim=0)
         if weights_slices[0] is not None
@@ -259,7 +293,7 @@ def pipelined_fused_moe_gmm(
         ag_hs_next = ag_tw_next = ag_ti_next = None
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_hs_next = _all_gather_hs(hs_slices[i + 1])
             # Locals let the None checks below narrow; subscripts do not.
             weights_next = weights_slices[i + 1]
             ag_tw_next = (
@@ -283,8 +317,8 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=ag_tw_curr,
-            topk_ids=ag_ti_curr,
+            topk_weights=cast(torch.Tensor, ag_tw_curr),
+            topk_ids=cast(torch.Tensor, ag_ti_curr),
             experts_start=experts_start,
             topk=topk,
             activation=activation,

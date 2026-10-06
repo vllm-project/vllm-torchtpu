@@ -208,7 +208,7 @@ spec:
                 # bytes that were measured rather than a tag that has moved.
                 - name: DOCKER_IMAGE
                   value: ${IMAGE}
-                # Off unless the step says otherwise; see pipeline_disagg_kube.yml.
+                # Off unless the step says otherwise; see pipeline_perf_kube.yml.
                 - name: BQ_UPLOAD
                   value: "0"
                 # Loading the torchtpu platform plugin on this CPU client makes
