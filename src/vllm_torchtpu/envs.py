@@ -387,15 +387,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
-    # QK pair-blocked pooled GDN conv layout: full-width states interleave
-    # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
-    # to one whole destination pool token (2 contiguous transfer spans per
-    # rank per state group).  Identity for head-shard states.  Must match
-    # across a disagg pair; the value rides the raiden layout fingerprint.
-    # Resolution is layered (see env_override.py): an explicitly set
-    # value always wins; otherwise raiden runs derive it from
-    # TPU_RAIDEN_TRANSFER_PARALLELISM (enabled iff >= 8, and 8 is that
-    # variable's default — so it is on by default under raiden).
+    # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
+    # with the unified GDN state pool: its kernel reads segment-major
+    # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
+    # match across a disagg pair; the value rides the raiden layout
+    # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),

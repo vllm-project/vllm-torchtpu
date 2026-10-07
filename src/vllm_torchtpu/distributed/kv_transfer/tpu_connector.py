@@ -4602,10 +4602,9 @@ class TPURaidenConnectorWorker:
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
             # Raw transfers move physical bytes; admit only the fingerprinted
-            # tiled layout.  The whole-token QK pair-blocked conv layout is
-            # enforced downstream: the span lowering rejects any other conv
-            # region vocabulary, and the layout version rides the compared
-            # fingerprint payload.
+            # tiled layout.  The conv layout is enforced downstream: the
+            # span lowering requires whole-token conv segments, and the
+            # layout version rides the compared fingerprint payload.
             payload = self._raiden_layout_fingerprint_payload
             if not payload:
                 raise RuntimeError(

@@ -175,11 +175,11 @@ def measured_fa_layout_fingerprint(
         "element_size_in_bits": element_bits,
         "kv_layout": kv_layout,
         # GDN conv state layout version.  Both sides of a disagg pair must
-        # agree: the byte-span convention (pair-blocked whole-token QK
-        # spans vs the legacy split Q/K) is baked into the transfer plan,
-        # and the geometries are size-identical, so a mixed pair would not
-        # otherwise fail closed.  The controller compares fingerprints
-        # before emitting a plan.
+        # agree: the byte-span convention (segment-major Q/K, or the QK
+        # pair-blocked spans an older build may still emit) is baked into
+        # the transfer plan, and the geometries are size-identical, so a
+        # mixed pair would not otherwise fail closed.  The controller
+        # compares fingerprints before emitting a plan.
         "gdn_conv_layout": (
             "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
         ),

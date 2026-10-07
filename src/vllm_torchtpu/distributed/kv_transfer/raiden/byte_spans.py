@@ -163,22 +163,26 @@ def lower_gdn_state_shard_spans(
 ) -> PoolSpanRegistration:
     """Lower one rank's GDN head shard into a full destination state.
 
-    Under the QK pair-blocked conv layout the rank-local conv row is
-    ``[QK | V]`` where the QK block shares whole pool tokens (Q and K
-    row-pairs interleaved) and V is whole-token aligned.  The full-width
-    destination stores the rank QK blocks in rank order followed by the
-    rank V blocks in rank order, which is exactly the stored order the
-    pooled kernel's ``rows_perm`` maps back to logical ``[Q | K | V]``.
-    Each rank therefore contributes two contiguous spans per tap; every
-    span offset and size is a whole multiple of the physical pool token,
-    so the raw (physical-byte) transport moves them placement-exactly.
+    The rank-local conv row is segment-major, ``[Q_r | K_r | V_r]``.  Rank
+    r's Q lands at ``Q_base + r * size`` in the full-width destination row,
+    and likewise its K and V, so the destination holds the logical
+    ``[Q | K | V]`` the pooled kernel reads, with no permutation after the
+    transfer.  Each rank contributes one span per segment per tap; every
+    span offset and size must be a whole multiple of the physical pool
+    token so the raw (physical-byte) transport moves them
+    placement-exactly.  With the unified pool's fp32 conv state this holds
+    up to an 8-way head split (Qwen3.5: 2 key heads x 128 x 4 B = 1024 B).
+
+    The QK pair-blocked vocabulary (``gdn_conv_qk``/``gdn_conv_v``) is still
+    lowered, but the pool manifest no longer emits it: with fan-in > 1 it
+    leaves the QK block rank-grouped, which the pooled kernel cannot read.
 
     SSM state is head-major and whole-token aligned: one contiguous span
     at a rank-dependent destination offset.
 
-    ``regions`` comes from the admitted source pool manifest.  The legacy
-    ``gdn_conv_q``/``gdn_conv_k`` vocabulary is rejected: its half-token
-    Q/K extents are not placement-exact under the raw tiled layout.
+    ``regions`` comes from the admitted source pool manifest.  Sub-token
+    segments (for example bf16 conv at an 8-way split) fail closed in the
+    whole-token guard below.
 
     ``physical_granule_bytes`` describes the common source/destination
     carrier layout. It must be derived from that layout, not from conv or
@@ -256,9 +260,10 @@ def lower_gdn_state_shard_spans(
 
     names = set(normalized)
     if names == {"gdn_conv_qk", "gdn_conv_v"}:
-        # QK pair-blocked layout (source transfer degree >= 8): the rank's
-        # QK block shares whole pool tokens, so one QK span and one V span
-        # per tap are placement-exact.
+        # QK pair-blocked layout: the rank's QK block shares whole pool
+        # tokens, so one QK span and one V span per tap are placement-exact.
+        # The pool manifest rejects it for the unified pool; kept for
+        # manifests built elsewhere.
         qk = normalized["gdn_conv_qk"]
         v = normalized["gdn_conv_v"]
         taps = qk[3]
@@ -266,11 +271,10 @@ def lower_gdn_state_shard_spans(
             raise ValueError("GDN conv qk/v regions disagree on tap count")
         segments = (("qk", qk, qk[2] * qk[4]), ("v", v, v[2] * v[4]))
     elif names == {"gdn_conv_q", "gdn_conv_k", "gdn_conv_v"}:
-        # Segment-major layout (source transfer degree < 8): each per-rank
-        # segment is a whole-token multiple on its own, so the classic one
-        # span per segment per tap is placement-exact.  At degree >= 8 the
-        # Q/K segments are sub-token and the alignment guard below fails
-        # this path closed.
+        # Segment-major layout: each per-rank segment is a whole-token
+        # multiple on its own, so one span per segment per tap is
+        # placement-exact.  Sub-token Q/K segments fail closed in the
+        # alignment guard below.
         q = normalized["gdn_conv_q"]
         k = normalized["gdn_conv_k"]
         v = normalized["gdn_conv_v"]
@@ -308,7 +312,7 @@ def lower_gdn_state_shard_spans(
         if value % physical_granule_bytes:
             raise ValueError(
                 "raw TPU GDN conv extents must be whole physical tokens "
-                "(sub-token Q/K segments need the QK pair-blocked layout): "
+                "(sub-token Q/K segments are not supported by the unified pool): "
                 f"{name}={value}"
             )
 
