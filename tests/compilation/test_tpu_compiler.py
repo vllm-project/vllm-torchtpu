@@ -553,3 +553,92 @@ class TestTpuCompilerCache:
         c2.initialize_cache(str(rank2_dir))
         c2.compile(g_diff, [x], {}, Range(16, 16), key="sub0_16")
         assert len(calls) == 2
+
+    @pytest.mark.parametrize(
+        ("across_dp", "alone", "replays"),
+        [(False, True, False), (True, True, True), (True, False, False)],
+    )
+    def test_peer_artifact_replay_across_dp(
+        self, tmp_path, monkeypatch, across_dp, alone, replays
+    ):
+        """A rank of DP rank 1 replays DP rank 0's artifact only with
+        TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP and a single rank per DP rank."""
+        import torch
+        from torch import fx, nn
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        class _Add(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("delta", torch.tensor([1.0]))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.delta
+
+        calls = []
+
+        def _compile(graph, inputs):
+            calls.append("compile")
+            fn = lambda x: (x,)  # noqa: E731
+            fn.serialize = lambda: f"entry_{len(calls)}"
+            return fn
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", _compile)
+        monkeypatch.setattr(
+            tpu_compiler, "_deserialize_entry", lambda e: lambda x: (f"replayed:{e}",)
+        )
+        monkeypatch.setattr(tpu_compiler, "_alone_in_dp_rank", lambda: alone)
+        monkeypatch.setattr(envs, "TPU_PARALLEL_PRECOMPILE", True)
+        monkeypatch.setattr(envs, "TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP", across_dp)
+
+        x = torch.zeros(16, 4)
+        outs = []
+        for dp in (0, 1):
+            g = fx.symbolic_trace(_Add())
+            for node in g.graph.nodes:
+                if node.op == "placeholder":
+                    node.meta["val"] = x
+            c = tpu_compiler.TpuCompilerAdaptor()
+            c.initialize_cache(str(tmp_path / "hash" / f"rank_0_{dp}" / "backbone"))
+            outs.append(c.compile(g, [x], {}, Range(16, 16), key="sub0_16")[0])
+        if replays:
+            assert calls == ["compile"]
+            assert outs[1](x) == "replayed:entry_1"
+        else:
+            assert calls == ["compile", "compile"]
+
+    def test_replay_across_dp_flag_not_in_compile_hash(self, monkeypatch):
+        """Like TPU_PARALLEL_PRECOMPILE, the flag only changes where a peer
+        artifact is looked for, so toggling it must not recompile."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP", "1")
+        assert (
+            "TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP"
+            not in tpu_compiler._tpu_compile_env_factors()
+        )
+
+    @pytest.mark.parametrize(
+        ("tp", "pp", "pcp", "alone"),
+        [(1, 1, 1, True), (2, 1, 1, False), (1, 2, 1, False), (1, 1, 2, False)],
+    )
+    def test_alone_in_dp_rank(self, monkeypatch, tp, pp, pcp, alone):
+        from vllm.distributed import parallel_state
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setattr(
+            parallel_state, "model_parallel_is_initialized", lambda: True
+        )
+        for name, size in (
+            ("get_tp_group", tp),
+            ("get_pp_group", pp),
+            ("get_pcp_group", pcp),
+        ):
+            monkeypatch.setattr(
+                parallel_state, name, lambda size=size: SimpleNamespace(world_size=size)
+            )
+        assert tpu_compiler._alone_in_dp_rank() is alone

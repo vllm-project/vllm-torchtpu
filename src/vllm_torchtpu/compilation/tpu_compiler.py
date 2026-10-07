@@ -124,6 +124,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    # Only widens where TPU_PARALLEL_PRECOMPILE looks for a peer artifact to
+    # replay; each replay is checked against the graph fingerprint.
+    "TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -429,6 +432,27 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
         return None
 
 
+def _alone_in_dp_rank() -> bool:
+    """Whether this rank is the only rank of its DP rank (TP = PP = PCP = 1).
+
+    Only then does every DP rank trace and run the same programs on one
+    device each; with more ranks per DP rank, the DP groups' collectives run
+    on different devices, which the graph fingerprint does not see.
+    """
+    from vllm.distributed import parallel_state
+
+    if not parallel_state.model_parallel_is_initialized():
+        return False
+    return all(
+        group().world_size == 1
+        for group in (
+            parallel_state.get_tp_group,
+            parallel_state.get_pp_group,
+            parallel_state.get_pcp_group,
+        )
+    )
+
+
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
@@ -624,7 +648,10 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         vLLM keys the cache dir by config hash, then `rank_<rank>_<dp_rank>`,
         then the compiled module's prefix. Only ranks of the same DP rank are
-        looked at.
+        looked at, unless TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP lets every DP
+        rank in: when each DP rank has a single rank (TP = PP = PCP = 1), it
+        would otherwise never find a peer. With more ranks per DP rank the flag
+        is ignored.
         """
         if self.cache_dir is None:
             return []
@@ -632,8 +659,17 @@ class TpuCompilerAdaptor(CompilerInterface):
         match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
         if match is None:
             return []
+        across_dp = envs.TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP
+        if across_dp and not _alone_in_dp_rank():
+            logger.warning_once(
+                "Ignoring TPU_PRECOMPILE_PEER_REPLAY_ACROSS_DP: it applies only "
+                "when each DP rank is known to have a single rank "
+                "(TP = PP = PCP = 1)."
+            )
+            across_dp = False
+        pattern = "rank_*_*" if across_dp else f"rank_*_{match[2]}"
         paths = []
-        for rank_dir in sorted(own.parent.parent.glob(f"rank_*_{match[2]}")):
+        for rank_dir in sorted(own.parent.parent.glob(pattern)):
             path = rank_dir / own.name / key
             if rank_dir != own.parent and path.is_file():
                 paths.append(str(path))
