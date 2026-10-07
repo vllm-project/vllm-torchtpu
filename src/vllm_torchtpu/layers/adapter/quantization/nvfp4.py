@@ -49,7 +49,10 @@ import vllm.model_executor.layers.quantization.modelopt as modelopt_module
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    register_weight_loader_v2_supported_method,
+)
 from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
     register_quantization_config,
@@ -64,6 +67,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4FusedMoE,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
+from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
@@ -604,6 +608,7 @@ class _NullInputQuantKernel:
         return None
 
 
+@register_weight_loader_v2_supported_method
 class VllmNvfp4LinearMethod(ModelOptLinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
@@ -627,7 +632,7 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         self.wkey = KNvfp4Static()
         self.ctx = CkptCtx(group_size=self.group_size)
         self.akey = None
-        self.fmt = FormatScheme()
+        self.fmt = getattr(modelopt_module, "_DROP_INPUT_SCALE", FormatScheme())
         self.input_dtype = torch.get_default_dtype()
         self.out_dtype = torch.get_default_dtype()
         self.marlin_input_dtype = None
@@ -693,6 +698,15 @@ class VllmNvfp4LinearMethod(ModelOptLinearMethod):
         def scalar_weight_loader(param, loaded_weight, *args, **kwargs):
             assert loaded_weight.numel() == 1
             param.data.fill_(loaded_weight.item())
+
+        if not hasattr(layer, "input_scale"):
+            layer.register_parameter(
+                "input_scale",
+                PerTensorScaleParameter(
+                    data=torch.full((len(output_partition_sizes),), torch.nan),
+                    weight_loader=scalar_weight_loader,
+                ),
+            )
 
         for name in ("input_scale", "weight_scale_2"):
             if hasattr(layer, name):
