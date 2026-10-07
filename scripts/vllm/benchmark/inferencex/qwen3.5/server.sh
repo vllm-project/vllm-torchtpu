@@ -15,99 +15,95 @@
 
 set -euo pipefail
 
-# Optionally activate a venv.
 if [ -n "${VENV:-}" ] && [ -f "$VENV/bin/activate" ]; then
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
 fi
 
 PORT="${PORT:-8000}"
-SHARDING="${SHARDING:-DP8_EP}"
 ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-64}"
+SHARDING="${SHARDING:-DP8_EP}"
+
 MODEL="${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
 SERVED_NAME="${SERVED_NAME:-Qwen/Qwen3.5-397B-A17B-FP8}"
 case "$MODEL" in
   gs://*) LOAD_FORMAT="${LOAD_FORMAT:-runai_streamer}" ;;
 esac
-# Headroom over ISL+OSL (matches InferenceX qwen3.5: ISL+OSL+20)
-MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-20}"
+MAX_MODEL_LEN=$((ISL + OSL + 1024))
 
 case "$SHARDING" in
   DP8_EP)
-    # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # New prefills are admitted every this many steps. Larger value trades
-    # TTFT for throughput. Default 8 keeps TTFT low.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-8}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
-      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    export DP_SCHED_ENABLED=1
+    export DP_SCHED_ENABLED=0
+    export USE_MOE_FUSED_EP_KERNEL=1
     ;;
   TP8_EP)
-    # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
     DP_SIZE=1
     SHARDING_ARGS=(
       --tensor-parallel-size=8
       --data-parallel-size=1
       --enable-expert-parallel
-    ) ;;
-  DP4TP2_EP)
-    # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
-    # on the same chip + expert-parallel MoE.
-    DP_SIZE=4
-    # New prefills are admitted every this many steps. Larger value trades
-    # TTFT for throughput. Default 8 keeps TTFT low.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-8}"
-    SHARDING_ARGS=(
-      --tensor-parallel-size=2
-      --data-parallel-size=4
-      --enable-expert-parallel
-      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    export DP_SCHED_ENABLED=1
+    export USE_MOE_FUSED_EP_KERNEL=0
+    export TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS="${TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS:-1024}"
+    case "$TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS" in
+      ''|*[!0-9]*) echo "ERROR: invalid hierarchical all-reduce threshold" >&2; exit 1 ;;
+    esac
     ;;
-  *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
+  *) echo "ERROR: unknown SHARDING=$SHARDING" >&2; exit 1 ;;
 esac
 
-MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
+if [ "$USE_MOE_FUSED_EP_KERNEL" = "1" ]; then
+  export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-33}"
+  export TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER="${TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER:-1}"
+  export MOE_FUSED_EP_V2_ROWBLK="${MOE_FUSED_EP_V2_ROWBLK:-1}"
+  export MOE_FUSED_EP_V2_SKIP_PADDED_ROWS="${MOE_FUSED_EP_V2_SKIP_PADDED_ROWS:-1}"
+fi
 
-# Global num of batched tokens == max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
-GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
-GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
-
-MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
-
-MAX_NUM_SEQS=$((CONC / DP_SIZE))
+GLOBAL_MAX_NUM_BATCHED_TOKENS="${GLOBAL_MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$(( (GLOBAL_MAX_NUM_BATCHED_TOKENS + DP_SIZE - 1) / DP_SIZE ))}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-$(( (CONC + DP_SIZE - 1) / DP_SIZE ))}"
+PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-1}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
+SHARDING_ARGS+=(--prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL")
 
-# Increase API-server frontend wait time since cold init may take long.
+# Apply tuned runtime defaults.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 export TPU_ACCELERATOR_TYPE=tpu7x
+# Use tuned compiler and kernel settings.
 export USE_MOE_SPARSE_CORE=1
-export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-32768}"
+export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-2048}"
 
-# Default to v3 which is a bit faster than v2.
-export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
+DEFAULT_LIBTPU_INIT_ARGS=" --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false"
 
-# Add extra padding
-# 4, 8 for low concurrency 4 and 8
-# 48 for concurrency 256 when DP8+EP is enabled to reduce padding from 32->64.
-# Set it to empty to opt out of the extra buckets.
-export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48}"
+# Use hierarchical all-reduce for large TP activations.
+if [ "$SHARDING" = "TP8_EP" ] && [ "$TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS" -gt 0 ]; then
+  TP_HIERARCHICAL_AR_MIN_BYTES=$((TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS * 4096 * 2))
+  DEFAULT_LIBTPU_INIT_ARGS+=" --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=$TP_HIERARCHICAL_AR_MIN_BYTES"
+fi
 
-# Shrink the rotary cos_sin caches to max_model_len, text-only, to minimize
-# xla layout data copy overhead.
+# Allow the fused row gather to overlap routing.
+if [ "${TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER:-0}" = "1" ]; then
+  DEFAULT_LIBTPU_INIT_ARGS+=" --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
+fi
+
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS-$DEFAULT_LIBTPU_INIT_ARGS}"
+
+export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48,3072}"
+
 export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 
-# Skip padded tokens in the fused MoE so they activate no experts.
 export TPU_MOE_SKIP_PADDED_TOKENS=1
+
+export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
 
 args=(
   "$MODEL"
@@ -125,10 +121,11 @@ args=(
   --quantization=fp8
   --kv-cache-dtype=fp8
   --attention-backend CUSTOM
+  --api-server-count=1
   "${SHARDING_ARGS[@]}"
 )
-# Pass --load-format when streaming from GCS.
 [ -n "${LOAD_FORMAT:-}" ] && args+=(--load-format="$LOAD_FORMAT")
+
 
 set -x
 vllm serve "${args[@]}"

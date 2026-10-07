@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -259,6 +260,7 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    valid_tokens=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -293,6 +295,10 @@ def fused_ep_moe_v2(
     reach the no-drop bound respectively. act_fn selects the fused FFN
     activation from the kernel's ACT_FNS and is a build-time constant.
 
+    valid_tokens, when present, is an int32 [ep] vector sharded over the mesh:
+    each rank contributes the length of its valid token prefix. Rows beyond it
+    are excluded from routing, transport, and expert work, and return zero.
+
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
     It changes routing-plan construction only, never the core kernel.
@@ -317,6 +323,7 @@ def fused_ep_moe_v2(
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
     """
     form = weight_form(weight_format)
+    async_row_gather = envs.TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
     # The weights themselves, against the format they were named as. This
     # validated only that the SCALES matched, which was largely
@@ -411,6 +418,12 @@ def fused_ep_moe_v2(
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
+    has_valid_tokens = valid_tokens is not None
+    if has_valid_tokens and valid_tokens.shape != (ep,):
+        raise ValueError(
+            f"valid_tokens must have one value per EP rank ({ep},), got "
+            f"{tuple(valid_tokens.shape)}"
+        )
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -455,10 +468,20 @@ def fused_ep_moe_v2(
         gate_l = next(operands)
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
+        valid_l = next(operands) if has_valid_tokens else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
         me = rank_l[0, 0]
+        # Rows past this rank's valid prefix are padding: they are zeroed on
+        # the wire, route nowhere and come back as zero.
+        if valid_l is None:
+            valid_rows = jnp.ones((t_local,), dtype=jnp.bool_)
+        else:
+            valid_in = jnp.arange(token_layout.input_rows, dtype=jnp.int32) < valid_l[0]
+            valid_rows = token_layout.split(valid_in[:, None], me, fill_value=False)[
+                :, 0
+            ]
         x_l = token_layout.split(x_l, me)
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
         if hash_l is not None:
@@ -468,18 +491,21 @@ def fused_ep_moe_v2(
             # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
+        if valid_l is not None:
+            rows_bf16 = jnp.where(valid_rows[:, None], rows_bf16, 0)
         if form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
-            ax,
-            axis=0,
-            tiled=True,
-        )
+        q_wire = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
+        if async_row_gather:
+            # Preserve sharding while allowing routing overlap.
+            with jax.named_scope("fused_ep_row_all_gather_overlap"):
+                q_g = lax.all_gather(q_wire, ax, axis=0, tiled=True)
+        else:
+            q_g = lax.all_gather(q_wire, ax, axis=0, tiled=True)
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
@@ -517,7 +543,9 @@ def fused_ep_moe_v2(
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        row_routes = (
+            jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & valid_rows[:, None]
+        )
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -531,6 +559,10 @@ def fused_ep_moe_v2(
         # host, which is how this repository verifies that a change served
         # the same program. A counter belongs in a metrics channel outside
         # the trace.
+        if valid_l is not None:
+            # An out-of-range expert id keeps a padded row out of every
+            # routing count, so it costs no transport or expert work.
+            topk_idx = jnp.where(valid_rows[:, None], topk_idx, jnp.int32(e_total))
         # One all-gather carries the indices, the row scales where the rows
         # were quantized, and the per-expert pair counts the routing plan
         # would otherwise exchange in a collective of its own.
@@ -696,6 +728,8 @@ def fused_ep_moe_v2(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        if valid_l is not None:
+            combined = jnp.where(valid_rows[:, None], combined, 0)
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -719,10 +753,11 @@ def fused_ep_moe_v2(
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
+    valid_args = (valid_tokens,) if has_valid_tokens else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),) * len(score_bias_args)
-        + (P(ax),) * len(bias_args)
+        + (P(ax),) * (len(valid_args) + len(bias_args))
     )
     args = (
         (x, rank, w1, w2)
@@ -730,6 +765,7 @@ def fused_ep_moe_v2(
         + (gating,)
         + hash_args
         + score_bias_args
+        + valid_args
         + bias_args
     )
     NS = jax.sharding.NamedSharding
@@ -764,6 +800,8 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
+        async_row_gather,
+        has_valid_tokens and valid_tokens.dtype,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

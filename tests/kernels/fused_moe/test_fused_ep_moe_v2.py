@@ -547,6 +547,53 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+def test_padded_suffix_routes_nowhere_and_valid_rows_match_reference():
+    """Uneven per-rank padding does no transport or expert work."""
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        31,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.BF16,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        32,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    valid_tokens = jnp.asarray([32, 31, 29, 24, 17, 8, 1, 0], dtype=jnp.int32)
+    out = fused_ep_moe_v2(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.BF16,
+        valid_tokens=valid_tokens,
+    )
+    want = _dense_reference(
+        mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=SMALL["topk"]
+    )
+    local_tokens = SMALL["tokens"] // EP
+    valid = np.concatenate(
+        [np.arange(local_tokens) < n for n in np.asarray(valid_tokens)]
+    )
+    actual = np.asarray(out)
+    reference = np.asarray(want)
+    assert not np.count_nonzero(actual[~valid])
+    error = _relative_l2(actual[valid], reference[valid])
+    assert error < BF16_RELATIVE_BOUND, error
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

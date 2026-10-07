@@ -33,7 +33,9 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator
+import operator
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -55,6 +57,15 @@ class ShapeSpecializationError(RuntimeError):
 # ---------------------------------------------------------------------------
 # What a trace assumed about the token count
 # ---------------------------------------------------------------------------
+
+
+def _placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+    nodes = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        nodes.append(node)
+    return nodes
 
 
 def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
@@ -133,23 +144,63 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
     return None
 
 
+def _meta_entry(value: Any) -> Any:
+    """Return a comparable placeholder type and shape."""
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
+    return (str(value.dtype), dims)
+
+
 def _signature(graph: fx.GraphModule) -> tuple:
-    """The submodule input list a handed-over runnable has to match.
+    """The submodule input list a handed-over runnable has to match."""
+    return tuple(_meta_entry(value) for value in _placeholder_values(graph))
 
-    Symbolic dims compare as "?", so the token dimension matches across traces
-    but a structural difference -- a split graph whose subgraph takes one chunk
-    in one variant and two in another -- does not.
-    """
 
-    def shape(value: Any) -> Any:
-        if not isinstance(value, torch.Tensor):
-            return type(value).__name__
-        dims = tuple(
-            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
-        )
-        return (str(value.dtype), dims)
+def _handover_inputs(graph: fx.GraphModule) -> list[tuple[str, Any]]:
+    """Return placeholders in runnable argument order."""
+    return [
+        (node.name, _meta_entry(node.meta.get("example_value", node.meta.get("val"))))
+        for node in _placeholder_nodes(graph)
+    ]
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+
+def _input_permutation(
+    old: list[tuple[str, Any]], new: list[tuple[str, Any]]
+) -> list[int] | None:
+    """Map reordered trace inputs to stored runnable slots."""
+    if len(old) != len(new):
+        return None
+    new_index = {name: i for i, (name, _) in enumerate(new)}
+    if len(new_index) != len(new):
+        return None
+    perm = []
+    for name, entry in old:
+        i = new_index.get(name)
+        if i is None or new[i][1] != entry:
+            return None
+        perm.append(i)
+    if len(set(perm)) != len(perm):
+        return None
+    return perm
+
+
+def _signature_delta(cached: Sequence[Any], current: Sequence[Any]) -> str:
+    """Summarize structural differences between trace inputs."""
+
+    def render(counts: Counter) -> str:
+        if not counts:
+            return "nothing"
+        by_frequency = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        return ", ".join(f"{count}x {item}" for item, count in by_frequency)
+
+    return (
+        f"{len(cached)} inputs vs {len(current)}. "
+        f"Only in the earlier trace: "
+        f"{render(Counter(cached) - Counter(current))}. "
+        f"Only in this one: "
+        f"{render(Counter(current) - Counter(cached))}"
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -179,7 +230,8 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str],
+            tuple[Callable[..., Any], tuple, list[tuple[str, Any]]],
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -190,16 +242,42 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
+        runnable, _signature, inputs = found
+        new_inputs = _handover_inputs(graph)
+        if inputs == new_inputs:
+            return runnable
+        # Reorder equivalent inputs to match the stored executable.
+        perm = _input_permutation(inputs, new_inputs)
+        if perm is None:
             raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+                f"{key} cannot be handed over: the trace that compiled it "
+                f"takes different inputs than this one, beyond a reordering "
+                f"({_signature_delta(inputs, new_inputs)}). Each trace's "
+                "executable receives its lifted buffers positionally, so "
+                "neither can stand in for the other, and the graph that "
+                "stays live needs one executable per bucket. Either give the "
+                "two sides of the branch that forked the trace the same "
+                "lifted inputs, or stop forking on the token count "
+                "(TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, "
+                "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS, "
+                "TPU_KERNEL_ITER_MODE)."
             )
-        return runnable
+        if perm == list(range(len(perm))):
+            return runnable
+        moved = sum(1 for j, i in enumerate(perm) if j != i)
+        logger.info(
+            "[shape-variants] %s handed over with %d of %d inputs reordered",
+            key,
+            moved,
+            len(perm),
+        )
+        # Return arguments in stored slot order.
+        getter = operator.itemgetter(*perm)
+
+        def reordered(*args: Any) -> Any:
+            return runnable(*getter(args))
+
+        return reordered
 
     def put(
         self,
@@ -208,7 +286,11 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _handover_inputs(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.

@@ -75,12 +75,18 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS: int = 0
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
+    TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_ROWBLK: int = 2
+    MOE_FUSED_EP_V2_SKIP_PADDED_ROWS: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
@@ -654,6 +660,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # Enable native hierarchical all-reduce above this token count.
+    "TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS", "0")
+    ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
@@ -672,11 +682,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8": env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
+    # Optional per-compiled-shape selector. A value greater than zero keeps
+    # smaller static token buckets on the grouped-matmul dispatch path while
+    # retaining fused EP for larger buckets. Zero preserves the deployment-
+    # wide fused-EP behavior.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")
+    ),
+    # Let the fused-EP activation-row all-gather overlap routing. Pair it with
+    # the async all-gather XLA flags; without them this only names the scope.
+    "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER": env_bool("TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER"),
+    # For small DP token buckets, gather hidden states first and recompute the
+    # router logits on the gathered rows. This removes the separate router-
+    # logits all-gather. Zero disables the optimization and preserves the
+    # compute-then-gather path for every bucket.
+    "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS", "0")
+    ),
     # Largest node-wide token count, out of the scheduler's cap, at or above
-    # which the fused kernel is armed for the whole deployment. Decided once at
-    # weight load, not per step: a per-step choice would need the token count
-    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
-    # arming everything. Below the threshold the grouped-matmul path serves.
+    # which the fused kernel is built at weight load. This is independent of
+    # TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, which selects the execution path for
+    # each compiled static token shape after the kernel has been armed.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
     ),
@@ -690,6 +716,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Rows per fused EP MoE v2 transport block, which is also the padding each
+    # (expert, destination) run rounds up to. A power of two. Read once, when
+    # the kernel module is imported.
+    "MOE_FUSED_EP_V2_ROWBLK": lambda: int(os.getenv("MOE_FUSED_EP_V2_ROWBLK", "2")),
+    # With TPU_MOE_SKIP_PADDED_TOKENS, also hand fused EP MoE v2 each rank's
+    # valid-prefix length so padded rows skip routing, transport and expert
+    # work. Off keeps the kernel's operands unchanged.
+    "MOE_FUSED_EP_V2_SKIP_PADDED_ROWS": env_bool("MOE_FUSED_EP_V2_SKIP_PADDED_ROWS"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

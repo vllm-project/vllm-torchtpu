@@ -25,6 +25,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 FP8_MAX = 448.0
 FP8 = jnp.float8_e4m3fn
 # Storage only: there is no four-bit MXU, so each block is widened to e4m3.
@@ -85,8 +87,10 @@ MAX_NBUF = nbuf_for(MAX_WEIGHT_PREFETCH_DISTANCE)
 # transport moves that no token asked for -- half the arrival buffer at the
 # decode bucket is this padding. It has to stay a power of two (ROWBLK_SHIFT)
 # and small enough for the routing tables' alignment slot field (the check in
-# refuse_bad_plan_args, which is an upper bound only).
-ROWBLK = 2
+# refuse_bad_plan_args, which is an upper bound only). Set by
+# MOE_FUSED_EP_V2_ROWBLK; single-row blocks avoid per-expert padding on small
+# batches.
+ROWBLK = envs.MOE_FUSED_EP_V2_ROWBLK
 # A token row is a whole number of 128-lane blocks: the lane count of the
 # vector unit this kernel is built for.
 HIDDEN_LANE_BLOCK = 128
@@ -522,7 +526,12 @@ def _refuse_bad_plan_args(T, K, *, e_total, ep, t_local, block, tile_m):
 def build_routing_tables(
     topk_idx, *, e_total, ep, t_local, block, tile_m, shard_stride
 ):
-    """Assign every routed (token, expert) pair the slab row it computes on."""
+    """Assign every routed (token, expert) pair the slab row it computes on.
+
+    A pair whose expert id is outside [0, e_total) -- a padded token row --
+    routes nowhere: it counts toward no expert, reads arrival row 0 and has
+    its slab writes dropped.
+    """
     # topk_idx [T, K] i32 expert ids, all-gathered. Rows order by expert then
     # by owning shard, each run padded to ROWBLK.
     T, K = topk_idx.shape
@@ -532,6 +541,7 @@ def build_routing_tables(
         T, K, e_total=e_total, ep=ep, t_local=t_local, block=block, tile_m=tile_m
     )
     expert_of_pair = topk_idx.reshape(-1).astype(jnp.int32)
+    valid_pair = (expert_of_pair >= 0) & (expert_of_pair < e_total)
     n_blocks = n // block
     expert_blocks = expert_of_pair.reshape(n_blocks, block)
     bins = jnp.arange(e_total, dtype=jnp.int32)
@@ -615,7 +625,14 @@ def build_routing_tables(
         mirror_blocks, expert_blocks, bins
     ).reshape(-1)
 
-    slab_row = base_of_pair + slot  # always < total
+    # The one-hot lookups give an invalid pair no expert, so it shares no
+    # count with a valid one. Point its reads at row 0 and its slab writes
+    # past both slab destinations so they are dropped.
+    pos = jnp.where(valid_pair, pos, jnp.int32(0))
+    mirror_row = jnp.where(valid_pair, mirror_row, jnp.int32(0))
+    slab_row = jnp.where(
+        valid_pair, base_of_pair + slot, jnp.int32(off_shard_slab_row(shard_stride, ep))
+    )
 
     return RoutingTables(
         arrival_row=pos.reshape(T, K),
@@ -907,7 +924,9 @@ def build_routing_tables_sharded(
     # The rank pass this consumer needs is the block-wide one restricted to
     # this rank's own blocks, which is that pass over those blocks alone.
     my_rank = _rank_within_block(my_blocks, block)
+    my_valid = ((my_blocks >= 0) & (my_blocks < e_total)).reshape(t_local, K)
     pos = (_lookup_per_pair(pos_table, my_blocks, bins) + my_rank).reshape(t_local, K)
+    pos = jnp.where(my_valid, pos, jnp.int32(0))
 
     # The mirror position of the same pair: its offset within the run, past
     # the lane its source tile's sublane starts on. Same shape of lookup as
@@ -931,6 +950,7 @@ def build_routing_tables_sharded(
     mirror_pos = (_lookup_per_pair(mirror_table, my_blocks, bins) + my_rank).reshape(
         t_local, K
     )
+    mirror_pos = jnp.where(my_valid, mirror_pos, jnp.int32(0))
 
     # Across all tokens, compute offsets only for this rank's local experts.
     first = me * g_local

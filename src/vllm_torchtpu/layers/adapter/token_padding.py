@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_torchtpu import envs
+
 _padding_state: "TokenPaddingState | None" = None
 
 
@@ -24,13 +26,24 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # Track the valid prefix once for all MoE layers.
+    local_valid_tokens: torch.Tensor | None = None
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        # Only fused EP's padded-row skip reads the valid-prefix length.
+        local_valid_tokens = (
+            torch.zeros(1, dtype=torch.int32, device=device)
+            if envs.MOE_FUSED_EP_V2_SKIP_PADDED_ROWS
+            else None
+        )
+        return cls(
+            local_padding_mask=local_padding_mask,
+            local_valid_tokens=local_valid_tokens,
+        )
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
@@ -38,14 +51,35 @@ class TokenPaddingState:
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        if self.local_valid_tokens is not None:
+            valid_host = torch.tensor([local_valid_tokens], dtype=torch.int32)
+            self.local_valid_tokens.copy_(valid_host)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
+
+    def get_local_valid_tokens(self) -> torch.Tensor | None:
+        return self.local_valid_tokens
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
+
+
+def get_local_valid_tokens() -> torch.Tensor | None:
+    """Return this rank's persistent valid-prefix length, when configured."""
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_valid_tokens()
+
+
+def retain_padding_graph_input(output: torch.Tensor) -> torch.Tensor:
+    """Keep the padding-state buffer in every shape-specialized MoE graph."""
+    if _padding_state is None:
+        return output
+    value = _padding_state.local_padding_mask.reshape(-1)[0].to(output.dtype)
+    return output + (value - value)
 
 
 def zero_routing_weights_for_padding(

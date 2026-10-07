@@ -404,12 +404,10 @@ def test_three_tiers_each_keep_their_own_structure(tmp_path):
 def _split_graph_is_refused(cache_root):
     config, _ = prepare(cache_root, splitting_ops=["tpu_shape_variants_test::wave"])
     model = build(WaveModel, config)
-    try:
+    with pytest.raises(
+        shape_variants.ShapeSpecializationError, match="cannot be handed over"
+    ):
         warm(model, config)
-    except Exception as exc:
-        assert "TPU_KERNEL_ITER_MODE" in str(exc)
-    else:
-        raise AssertionError("a split graph handed a bucket over anyway")
 
 
 def test_split_graph_cannot_hand_buckets_between_traces(tmp_path):
@@ -491,6 +489,32 @@ def test_a_guard_the_range_cannot_express_still_refuses():
     assert unsupported_reason(env, 2048) is not None  # provably violated
 
 
+def test_signature_delta_names_the_few_inputs_that_differ():
+    """Report only inputs that differ between traces."""
+    shared = [("torch.bfloat16", (4096,))] * 1245
+    cached = tuple(shared + [("torch.int32", ())] * 60 + [("torch.bool", (256,))])
+    current = tuple(shared + [("torch.int32", (8,)), ("torch.int32", (1, 1))])
+
+    delta = shape_variants._signature_delta(cached, current)
+
+    assert "1306 inputs vs 1247" in delta
+    assert "60x ('torch.int32', ())" in delta
+    assert "1x ('torch.bool', (256,))" in delta
+    assert "1x ('torch.int32', (8,))" in delta
+    assert "('torch.bfloat16', (4096,))" not in delta  # the agreed 1245
+
+
+def test_signature_delta_when_only_the_order_differs():
+    """Ignore ordering when reporting signature differences."""
+    a = (("torch.int32", ()), ("torch.bool", (4,)))
+    b = (("torch.bool", (4,)), ("torch.int32", ()))
+
+    assert a != b
+    assert shape_variants._signature_delta(a, b) == (
+        "2 inputs vs 2. Only in the earlier trace: nothing. Only in this one: nothing"
+    )
+
+
 def test_env_override_keeps_the_mega_artifact_off():
     """It is inductor-only on the load side; see the commit for why."""
     with patch.dict(os.environ, clear=False) as env:
@@ -511,3 +535,119 @@ def test_missing_guard_field_cannot_accept_a_bucket(field):
     delattr(env if field == "guards" else guard, field)
     with pytest.raises(AttributeError, match=field):
         unsupported_reason(env, 2048)
+
+
+def _stub_graph(order, metas=None):
+    """A GraphModule whose placeholders carry the given names and metas."""
+    if metas is None:
+        metas = {
+            "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+            "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+            "dp_metadata": torch.empty(3, dtype=torch.int32),
+        }
+    graph = fx.Graph()
+    outs = []
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        outs.append(node)
+    graph.output(tuple(outs))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+def test_handover_reorders_a_permuted_input_list():
+    """Reorder equivalent inputs during executable handoff."""
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: received.append(args),
+    )
+
+    runnable = session.get(
+        "dir", "key", _stub_graph(["hidden_states", "dp_metadata", "gate_weight"])
+    )
+
+    hidden = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
+    gate = torch.zeros(HIDDEN, 2, dtype=torch.bfloat16)
+    meta = torch.zeros(3, dtype=torch.int32)
+    runnable(hidden, meta, gate)  # the new trace's order
+    assert received == [(hidden, gate, meta)]  # the executable's order
+
+
+def test_handover_without_permutation_returns_the_runnable_itself():
+    """An identical input list must not pay the reordering shim."""
+    session = shape_variants.BucketExecutables()
+    compiled = lambda *args: args  # noqa: E731
+    order = ["hidden_states", "gate_weight", "dp_metadata"]
+    session.put("dir", "key", _stub_graph(order), compiled)
+    assert session.get("dir", "key", _stub_graph(order)) is compiled
+
+
+def test_handover_still_refuses_a_changed_input():
+    """A name whose dtype/shape moved is a real difference, not a shuffle."""
+    session = shape_variants.BucketExecutables()
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: args,
+    )
+    changed = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 4, dtype=torch.bfloat16),  # wider
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="gate_weight"):
+        session.get(
+            "dir",
+            "key",
+            _stub_graph(["hidden_states", "dp_metadata", "gate_weight"], changed),
+        )
+
+
+def test_handover_still_refuses_a_different_input_set():
+    """An input only one trace has cannot be matched by any reordering."""
+    session = shape_variants.BucketExecutables()
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["hidden_states", "gate_weight", "dp_metadata"]),
+        lambda *args: args,
+    )
+    other = {
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "router_bias": torch.empty(2, dtype=torch.bfloat16),
+        "dp_metadata": torch.empty(3, dtype=torch.int32),
+    }
+    with pytest.raises(
+        shape_variants.ShapeSpecializationError, match="TPU_KERNEL_ITER_MODE"
+    ):
+        session.get(
+            "dir",
+            "key",
+            _stub_graph(["hidden_states", "router_bias", "dp_metadata"], other),
+        )
+
+
+def test_handover_reorders_equal_type_inputs_by_name():
+    """Equal dtype/shape inputs still need their name-derived permutation."""
+    metas = {
+        "gate_weight": torch.empty(1, dtype=torch.int32),
+        "dp_metadata": torch.empty(1, dtype=torch.int32),
+    }
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(list(metas), metas),
+        lambda *args: received.append(args),
+    )
+    runnable = session.get(
+        "dir", "key", _stub_graph(["dp_metadata", "gate_weight"], metas)
+    )
+    runnable("metadata", "weight")
+    assert received == [("weight", "metadata")]

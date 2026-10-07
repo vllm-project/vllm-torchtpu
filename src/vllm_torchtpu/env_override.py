@@ -171,6 +171,22 @@ def _user_has_flag(flag_name: str) -> bool:
 
 _libtpu_extra_args: list[str] = []
 
+# Enable native hierarchical all-reduce before libtpu loads.
+_tp_hierarchical_ar_flag = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
+try:
+    _tp_hierarchical_ar_min_tokens = envs.TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS
+except ValueError:
+    import sys
+
+    sys.stderr.write(
+        "vllm_torchtpu.env_override: invalid "
+        "TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS; disabling native "
+        "hierarchical all-reduce.\n"
+    )
+    _tp_hierarchical_ar_min_tokens = 0
+if _tp_hierarchical_ar_min_tokens > 0 and not _user_has_flag(_tp_hierarchical_ar_flag):
+    _libtpu_extra_args.append(f"{_tp_hierarchical_ar_flag}=true")
+
 # --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
 # batched RPA attention kernel's scheduling metadata (default budget is too
 # small on --attention-backend CUSTOM).

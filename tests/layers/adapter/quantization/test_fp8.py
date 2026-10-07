@@ -1236,6 +1236,64 @@ class TestOnlineFp8Quantization:
 
         mock_routing.assert_called_once()
 
+    def test_fused_ep_step_threshold_selects_static_token_shape(self, monkeypatch):
+        """Large buckets use fused EP while small buckets use GMM dispatch."""
+        from unittest.mock import MagicMock, patch
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 256)
+        layer = MagicMock()
+        layer._experts_start = None
+        method = object.__new__(VllmFp8MoEMethodTPU)
+        method._tpu_activation_str = "silu"
+
+        small_x = torch.randn(16, 64, dtype=torch.bfloat16)
+        small_logits = torch.randn(16, 8, dtype=torch.bfloat16)
+        large_x = torch.randn(256, 64, dtype=torch.bfloat16)
+        large_logits = torch.randn(256, 8, dtype=torch.bfloat16)
+
+        fused_ep = "vllm_torchtpu.layers.adapter.fused_moe_ep"
+        with (
+            patch(f"{fused_ep}.fused_moe_ep_supported", return_value=True),
+            patch(f"{fused_ep}.score_bias_operand", return_value=None),
+            patch(f"{fused_ep}.fused_moe_ep", return_value=large_x) as mock_fused,
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.fp8."
+                "enable_pipelined_collective_and_compute",
+                return_value=False,
+            ),
+            patch.object(
+                method, "_apply_owning_dispatch", return_value=small_x
+            ) as mock_dispatch,
+        ):
+            small_actual = method.apply_monolithic(layer, small_x, small_logits)
+            large_actual = method.apply_monolithic(layer, large_x, large_logits)
+
+        torch.testing.assert_close(small_actual, small_x)
+        torch.testing.assert_close(large_actual, large_x)
+        mock_dispatch.assert_called_once()
+        assert mock_dispatch.call_args.args[1] is small_x
+        mock_fused.assert_called_once()
+        assert mock_fused.call_args.args[1] is large_x
+
+    def test_fused_ep_step_threshold_rejects_negative_value(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", -1)
+        layer = MagicMock()
+        method = object.__new__(VllmFp8MoEMethodTPU)
+        method._tpu_activation_str = "silu"
+
+        with pytest.raises(
+            ValueError, match="TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0"
+        ):
+            method.apply_monolithic(layer, torch.randn(16, 64), torch.randn(16, 8))
+
 
 class FakeInt8MoEConfig:
     """The `moe_config` attributes `_process_fp8_moe_weights` actually reads."""

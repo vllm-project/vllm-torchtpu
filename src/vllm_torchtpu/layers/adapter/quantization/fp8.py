@@ -1114,6 +1114,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        fused_ep_step_min_tokens = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+        if fused_ep_step_min_tokens < 0:
+            raise ValueError("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0")
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
@@ -1147,16 +1150,32 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
 
         if fused_moe_ep_supported(self):
-            return fused_moe_ep(
-                self,
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                router_logits,
-                score_bias_operand(layer),
-            )
+            if x.shape[0] >= fused_ep_step_min_tokens:
+                out = fused_moe_ep(
+                    self,
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                    router_logits,
+                    score_bias_operand(layer),
+                )
+                if not _moe_shape_selection_enabled():
+                    return out
+                # Shape selection splits buckets between this graph and the
+                # GMM one; keep their lifted inputs identical for handover.
+                experts_start = layer._experts_start
+                if experts_start is not None:
+                    value = experts_start.to(out.dtype)
+                    out = out + (value - value)
+                return token_padding.retain_padding_graph_input(out)
+            if not enable_pipelined_collective_and_compute():
+                # This method owns the EP exchange, so shapes below the
+                # per-step threshold do the dispatch and combine here.
+                return self._apply_owning_dispatch(
+                    layer, x, router_logits, activation_str
+                )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1197,6 +1216,94 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run GMM after external dispatch for small token shapes."""
+        del input_ids
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            retain_fused_ep_graph_inputs,
+        )
+
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        out = fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+        )
+        return retain_fused_ep_graph_inputs(out)
+
+    def _apply_owning_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation_str: str,
+    ) -> torch.Tensor:
+        """Run a fused-EP-armed layer on the gather/GMM/combine path.
+
+        `x` and `router_logits` are this rank's own tokens. This reproduces
+        exactly what vLLM's naive dispatch/combine would have done, so the two
+        paths differ only in who issues the collectives.
+        """
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            retain_fused_ep_graph_inputs,
+        )
+
+        ep = get_ep_group()
+        gathered_x, gathered_logits = ep.dispatch_router_logits(x, router_logits, False)
+        topk_weights, topk_ids = moe_routing.route(layer, gathered_x, gathered_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        out = fused_moe_gmm(
+            hidden_states=gathered_x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+        )
+        return retain_fused_ep_graph_inputs(ep.combine(out, False))
+
+
+def _moe_shape_selection_enabled() -> bool:
+    """Whether some compiled token buckets leave the fused EP graph."""
+    return (
+        envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS > 0
+        or envs.TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS > 0
+    )
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
