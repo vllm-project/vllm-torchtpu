@@ -47,18 +47,15 @@ def _inputs(rows, width, topk, num_tokens, out_rows, n=1):
 
 
 @pytest.mark.parametrize(
-    "rows,width,topk,num_tokens,out_rows",
+    "rows,width,topk,num_tokens",
     [
-        (64, 32, 32, 16, 16),  # decode bucket, full-width top-k
-        (64, 48, 32, 16, 16),  # buffer wider than top-k
-        (64, 32, 32, 64, 64),  # the whole buffer
-        (64, 32, 32, 16, 8),  # kernel returned fewer rows than tokens
+        (64, 32, 32, 16),  # decode bucket, full-width top-k
+        (64, 48, 32, 16),  # buffer wider than top-k
+        (64, 32, 32, 64),  # the whole buffer
     ],
 )
-def test_topk_rows_update_matches_fill_then_write(
-    rows, width, topk, num_tokens, out_rows
-):
-    stale, topk_indices = _inputs(rows, width, topk, num_tokens, out_rows)
+def test_topk_rows_update_matches_fill_then_write(rows, width, topk, num_tokens):
+    stale, topk_indices = _inputs(rows, width, topk, num_tokens, num_tokens)
     want = _reference(stale.clone(), topk, num_tokens, topk_indices)
 
     got_rows = _topk_rows(stale, topk, num_tokens, topk_indices)

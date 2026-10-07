@@ -244,13 +244,17 @@ def _topk_rows(
     buf: torch.Tensor, topk_tokens: int, num_tokens: int, topk_indices: torch.Tensor
 ) -> torch.Tensor:
     """The `[num_tokens, buf.shape[1]]` rows the -1 fill plus partial write
-    would leave at the top of `buf`: the top-k, then -1, clamped to `buf`."""
+    would leave at the top of `buf`: the top-k, then -1, clamped to `buf`.
+
+    The top-k kernels return one row per query token, so only the columns
+    ever need -1 padding.
+    """
     num_tokens = min(num_tokens, buf.shape[0])
     rows = topk_indices[:num_tokens, :topk_tokens].to(buf.dtype)
-    pad_rows = num_tokens - rows.shape[0]
+    assert rows.shape[0] == num_tokens, (rows.shape, num_tokens)
     pad_cols = buf.shape[1] - rows.shape[1]
-    if pad_rows or pad_cols:
-        rows = torch.nn.functional.pad(rows, (0, pad_cols, 0, pad_rows), value=-1)
+    if pad_cols:
+        rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
     return rows
 
 
