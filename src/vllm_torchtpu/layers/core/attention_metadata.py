@@ -323,6 +323,33 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
         return block_table_obj, target_num_blocks
 
+    def _active_block_table_columns(
+        self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
+    ) -> int:
+        """Power-of-2 bucketed active column bound for CPU staging copies.
+
+        Keeps the device tensor's static shape ``target_num_reqs * target_num_blocks``
+        intact (avoiding XLA recompilation) while bounding the CPU slice copy to
+        the power-of-2 bucket covering the active sequences' maximum block index.
+        """
+        seq_lens_cpu = ctx.seq_lens_cpu
+        if (
+            seq_lens_cpu is None
+            and ctx.seq_lens is not None
+            and ctx.seq_lens.device.type == "cpu"
+        ):
+            seq_lens_cpu = ctx.seq_lens
+        if seq_lens_cpu is None or ctx.num_reqs <= 0 or target_num_blocks <= 16:
+            return target_num_blocks
+        max_seq_len = int(max(seq_lens_cpu[: ctx.num_reqs]))
+        if max_seq_len <= 0:
+            return min(16, target_num_blocks)
+        needed_blocks = cdiv(max_seq_len, self.target_block_size)
+        if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+            needed_blocks += ctx.mamba_ckpt_window - 1
+        bucket_cols = 1 << max(4, (needed_blocks - 1).bit_length())
+        return min(target_num_blocks, bucket_cols)
+
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
@@ -352,11 +379,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            active_cols = self._active_block_table_columns(ctx, target_num_blocks)
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
             source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+            block_tables[: ctx.num_reqs, :active_cols] = source_block_tables[
+                ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
@@ -500,13 +528,16 @@ def stage_block_table_uploads(
 
     if ctx.position_ids_override is None:
         offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
+        for builder, (_, block_table_obj, target_num_blocks) in zip(
+            entry_builders, entries
+        ):
+            active_cols = builder._active_block_table_columns(ctx, target_num_blocks)
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
                 num_reqs_padded, target_num_blocks
             )
             source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+            rows[: ctx.num_reqs, :active_cols] = source[
+                ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
             ]
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.

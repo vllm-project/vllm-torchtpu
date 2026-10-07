@@ -175,8 +175,25 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
 
     def get_output(self) -> ModelRunnerOutput:
+        num_reqs = len(self._model_runner_output.req_ids)
         if self.copy_state is None:
-            self._model_runner_output.sampled_token_ids = []
+            if (
+                num_reqs > 0
+                and len(self.discard_sampled_tokens_req_indices) == num_reqs
+            ):
+                self._model_runner_output.sampled_token_ids = [
+                    [] for _ in range(num_reqs)
+                ]
+            else:
+                self._model_runner_output.sampled_token_ids = []
+            return self._model_runner_output
+
+        if (
+            not self.copy_state.spec_logprobs
+            and num_reqs > 0
+            and len(self.discard_sampled_tokens_req_indices) == num_reqs
+        ):
+            self._model_runner_output.sampled_token_ids = [[] for _ in range(num_reqs)]
             return self._model_runner_output
 
         self.copy_state.wait()

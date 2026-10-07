@@ -2434,6 +2434,10 @@ class TPUModelRunner(GPUModelRunner):
 
         pre_req_ids = self._pre_async_results.req_ids
         pre_request_seq_lens = self._pre_async_results.request_seq_lens
+        if not pre_request_seq_lens:
+            if getattr(self._pre_async_results, "copy_state", None) is not None:
+                self._pre_async_results.wait_for_copy()
+            return
         pre_discard_sampled_tokens_req_indices = (
             self._pre_async_results.discard_sampled_tokens_req_indices
         )
@@ -2780,6 +2784,23 @@ class TPUModelRunner(GPUModelRunner):
                 0,
                 torch.from_numpy(token_indices),
                 out=self.input_ids_cpu[:num_reqs],
+            )
+        elif num_reqs == 1:
+            # Fast path for single-request prefill chunk: copy contiguous slice
+            # directly without np.repeat / np.concatenate / torch.index_select.
+            start_pos = int(self.input_batch.num_computed_tokens_cpu[start_index])
+            positions_np = self.positions_np[:total_num_scheduled_tokens]
+            np.add(
+                start_pos,
+                self.arange_np[:total_num_scheduled_tokens],
+                out=positions_np,
+                casting="unsafe",
+            )
+            self.input_ids_cpu[:total_num_scheduled_tokens].copy_(
+                self.input_batch.token_ids_cpu_tensor[
+                    start_index,
+                    start_pos : start_pos + total_num_scheduled_tokens,
+                ]
             )
         else:
             # General path: mixed prefill + decode.
@@ -4404,29 +4425,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
-                ),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]
-                ),
-                sampled_token_ranks=np.concatenate(
-                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
-                ),
-            )
-            logprobs = logprobs_lists
-
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
@@ -4452,9 +4450,32 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        logprobs = []
+        if needs_logprobs and len(combined_logprobs) and request_seq_lens:
+            # TODO: concatenate the LogprobsTensors (torch) first, then
+            # call .tolists() once to match the GPU path and avoid the
+            # per-chunk numpy round-trip.
+            combined_logprobs_lists = []
+            for i in range(len(combined_logprobs)):
+                logprobs = combined_logprobs[i].tolists()
+                combined_logprobs_lists.append(logprobs)
+
+            logprobs_lists = LogprobsLists(
+                logprob_token_ids=np.concatenate(
+                    [lp.logprob_token_ids for lp in combined_logprobs_lists]
+                ),
+                logprobs=np.concatenate(
+                    [lp.logprobs for lp in combined_logprobs_lists]
+                ),
+                sampled_token_ranks=np.concatenate(
+                    [lp.sampled_token_ranks for lp in combined_logprobs_lists]
+                ),
+            )
+            logprobs = logprobs_lists
+
         next_tokens_tpu = None
         copy_state = None
-        if combined_selected_tokens:
+        if combined_selected_tokens and (request_seq_lens or spec_logprobs_chunks):
             with self._stage_timing.stage("sampled_token_d2h"):
                 copy_state = AsyncTPUCopyState.from_device_chunks(
                     combined_selected_tokens,
@@ -4605,7 +4626,9 @@ class TPUModelRunner(GPUModelRunner):
                     next_token_indices,
                     num_draft_per_req,
                 )
-            if next_tokens_tpu_chunks:
+            if next_tokens_tpu_chunks and (
+                request_seq_lens or spec_num_rejected is not None
+            ):
                 if len(next_tokens_tpu_chunks) == 1:
                     next_tokens_tpu = next_tokens_tpu_chunks[0]
                 else:
