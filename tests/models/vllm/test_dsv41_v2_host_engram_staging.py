@@ -557,16 +557,12 @@ class TestEngramModuleStagingAndEmbed:
             assert engram_offload._staged_raw is not None
             assert engram_offload._host_raw.shape == (16, 2, 32)
             assert engram_offload._host_scale.shape == (16, 2, 2)
-            if hasattr(v2_engram, "_unpack_bytes"):
-                assert engram_offload._staged_raw.shape == (16 * 2 * 32 // 4,)
-                assert engram_offload._staged_raw.dtype == torch.int32
-                assert engram_offload._staged_scale.shape == (
-                    engram_offload._host_scale_buf.numel() // 4,
-                )
-                assert engram_offload._staged_scale.dtype == torch.int32
-            else:
-                assert engram_offload._staged_raw.shape == (16, 2, 32)
-                assert engram_offload._staged_scale.shape == (16, 2, 2)
+            raw_words = 16 * 2 * 32 // 4
+            scale_words = engram_offload._host_scale_buf.numel() // 4
+            assert engram_offload._staged_raw.shape == (raw_words + scale_words,)
+            assert engram_offload._staged_raw.dtype == torch.int32
+            assert torch.all(engram_offload._staged_raw[:raw_words] == 0)
+            assert torch.all(engram_offload._staged_raw[raw_words:] == -1)
 
     def test_prepare_embeddings_staging_fast_path_and_fallback(self):
         engram = self._create_mock_engram(cpu_offload=True)
@@ -612,6 +608,7 @@ class TestEngramModuleStagingAndEmbed:
         engram = self._create_mock_engram(cpu_offload=True)
         with patch.object(v2_engram.upstream.Engram, "_init_staging"):
             engram._init_staging(max_tokens=16, head_dim=32)
+        engram.prepare_embeddings(torch.zeros((4, 2), dtype=torch.int32))
         ready = engram._ready_rows(4)
         assert ready.shape == (4, 2, 32)
         assert ready.dtype == torch.bfloat16
@@ -626,6 +623,7 @@ class TestEngramModuleStagingAndEmbed:
 
             # tp_size = 2 with padding (num_tokens=3, tp=2 -> chunk=2, pad=1)
             engram.embed_tokens.tp_size = 2
+            engram.prepare_embeddings(torch.zeros((3, 2), dtype=torch.int32))
             with patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.common.engram._gather_engram_rows",
                 side_effect=lambda x, dim: torch.cat([x, x], dim=dim),
@@ -634,6 +632,7 @@ class TestEngramModuleStagingAndEmbed:
                 assert rows_tp2.shape == (2, 2, 32)
 
                 # tp_size = 2 without padding (num_tokens=4, tp=2 -> chunk=2, pad=0)
+                engram.prepare_embeddings(torch.zeros((4, 2), dtype=torch.int32))
                 rows_tp2_exact = engram._sp_embed(
                     torch.zeros((4, 2), dtype=torch.int32)
                 )

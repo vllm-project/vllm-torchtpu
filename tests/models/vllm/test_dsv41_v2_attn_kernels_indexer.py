@@ -767,7 +767,8 @@ class TestPagedIndexerJax:
         )
         assert sel_short.shape == (16, topk)
 
-        # 2) Prefill shared tile: row_lengths.sum() <= cand_keys
+        # 2) Prefill shared tile: q.shape[0] > records.shape[0] and
+        # row_lengths.sum() <= cand_keys
         # Many tokens (16) sharing only 2 requests, cand_keys = 16 * 4 * 16 = 1024
         # row_lengths sum is ~2 * 300 = 600 <= 1024 -> triggers full_context
         lengths_prefill = jnp.full((16,), 300, dtype=jnp.int32)
@@ -785,6 +786,28 @@ class TestPagedIndexerJax:
             candidate_filter=True,
         )
         assert sel_prefill.shape == (16, topk)
+
+        # 3) Decode / verify (q.shape[0] <= records.shape[0]): routes to
+        # candidate_context whenever longest > topk even if
+        # row_lengths.sum() <= cand_keys
+        _, records_dec, _, _, q_dec, weights_dec = _request_inputs(rng, 8, 6, width)
+        requests_dec = jnp.zeros((6,), dtype=jnp.int32)
+        lengths_dec = jnp.full((6,), 300, dtype=jnp.int32)
+        candidates_dec = jnp.zeros((6, 4), dtype=jnp.int32)
+        sel_dec, _ = paged_indexer_jax(
+            q_dec,
+            pool,
+            jnp.asarray(records_dec),
+            weights_dec,
+            lengths_dec,
+            candidates_dec,
+            requests_dec,
+            topk=topk,
+            block_size=block_size,
+            candidate_write=False,
+            candidate_filter=True,
+        )
+        assert sel_dec.shape == (6, topk)
 
     def test_candidate_context_branch_ordered_and_unordered(self):
         rng = np.random.default_rng(707)
@@ -830,6 +853,32 @@ class TestPagedIndexerJax:
         assert len(val0) + len(pad0) == topk
         # Zero-length rows are completely -1
         assert np.all(np.asarray(sel_unord[1:]) == -1)
+
+        # 1b) unordered=True with scores.shape[1] >= 2048 (_sparsecore_top_k path)
+        candidates_large = jnp.zeros((tokens, 128), dtype=jnp.int32)
+        records_large = jnp.zeros((16, 4096), dtype=jnp.int32)
+        lengths_large = jnp.full((tokens,), 3000, dtype=jnp.int32)
+        with mock.patch.object(
+            attention_kernels,
+            "_sparsecore_top_k",
+            return_value=jnp.zeros((tokens, topk), dtype=jnp.int32),
+        ) as mock_sc_topk:
+            sel_sc, _ = paged_indexer_jax(
+                q,
+                pool,
+                records_large,
+                weights,
+                lengths_large,
+                candidates_large,
+                jnp.asarray(requests),
+                topk=topk,
+                block_size=block_size,
+                candidate_write=False,
+                candidate_filter=True,
+                unordered=True,
+            )
+            assert sel_sc.shape == (tokens, topk)
+            assert mock_sc_topk.call_count == 2
 
         # 2) unordered=False: exercises underfull topk, occupied, fillers, and sort
         sel_ord, pub_ord = paged_indexer_jax(

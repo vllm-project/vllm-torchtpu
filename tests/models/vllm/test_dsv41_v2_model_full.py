@@ -859,6 +859,44 @@ class TestModelEngramMethods:
             assert h_dum is not None
             assert m_dum is not None
 
+        # 9. stage == "encoder" scopes layer iteration to _ced_boundary
+        model_enc = self._create_mock_model(cpu_offload=True)
+        dec_engram = SimpleNamespace(
+            embed_tokens=SimpleNamespace(cpu_offload=True),
+            layer_hash_index=0,
+            prepare_embeddings=MagicMock(),
+        )
+        model_enc.layers.append(SimpleNamespace(engram=dec_engram))
+        model_enc.end_layer = 2
+        model_enc._ced_boundary = 1
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
+                return_value=torch.zeros((2, 4, 1)),
+            ),
+        ):
+            model_enc._prepare_engram(
+                input_ids, pos, torch.tensor([[10, 11]]), stage="encoder"
+            )
+            model_enc.layers[0].engram.prepare_embeddings.assert_called_once()
+            dec_engram.prepare_embeddings.assert_not_called()
+
 
 # ==============================================================================
 # 7. Tests for DeepseekV41Model Forward and Replay Logic

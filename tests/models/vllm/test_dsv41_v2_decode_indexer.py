@@ -208,34 +208,34 @@ class TestAttentionKernelsDecodeIndexer:
     """Coverage for v2/attention_kernels.py / changes."""
 
     def test_constants_and_tile_budget_spectrum(self):
-        """Test _INDEX_KEYS_PER_ITER = 65536 and _INDEX_MAX_TILE = 8192 budget."""
-        assert _INDEX_KEYS_PER_ITER == 65536
-        assert _INDEX_MAX_TILE == 8192
+        """Test _INDEX_KEYS_PER_ITER = 262144 and _INDEX_MAX_TILE = 16384 budget."""
+        assert _INDEX_KEYS_PER_ITER == 262144
+        assert _INDEX_MAX_TILE == 16384
 
-        # 1. tokens <= 8: budget capped at _INDEX_MAX_TILE (8192)
+        # 1. tokens <= 16: budget capped at _INDEX_MAX_TILE (16384)
         pool = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
         q = jnp.zeros((1, 2, 128), dtype=jnp.bfloat16)
         records = jnp.full((1, 16384), -1, dtype=jnp.int32)
         weights = jnp.zeros((1, 2), dtype=jnp.float32)
         lengths = jnp.array([10], dtype=jnp.int32)
 
-        # tokens = 1 -> budget = min(max(512, min(8192, 65536 // 1)), 16384) = 8192
+        # tokens = 1 -> budget = min(max(512, min(16384, 262144 // 1)), 16384) = 16384
         scores = paged_index_scores_jax(q, pool, records, weights, lengths)
         assert scores.shape == (1, 16384)
 
-        # 2. tokens = 16 -> budget = min(max(512, min(8192, 65536 // 16)), 16384) = 4096
+        # 2. tokens = 16 -> min(max(512, min(16384, 262144 // 16)), 16384) = 16384
         q16 = jnp.zeros((16, 2, 128), dtype=jnp.bfloat16)
         weights16 = jnp.zeros((16, 2), dtype=jnp.float32)
         lengths16 = jnp.full((16,), 10, dtype=jnp.int32)
         scores16 = paged_index_scores_jax(q16, pool, records, weights16, lengths16)
         assert scores16.shape == (16, 16384)
 
-        # 3. tokens = 128 -> budget hits 512 floor
-        q128 = jnp.zeros((128, 2, 128), dtype=jnp.bfloat16)
-        weights128 = jnp.zeros((128, 2), dtype=jnp.float32)
-        lengths128 = jnp.full((128,), 10, dtype=jnp.int32)
-        scores128 = paged_index_scores_jax(q128, pool, records, weights128, lengths128)
-        assert scores128.shape == (128, 16384)
+        # 3. tokens = 512 -> budget hits 512 floor
+        q512 = jnp.zeros((512, 2, 128), dtype=jnp.bfloat16)
+        weights512 = jnp.zeros((512, 2), dtype=jnp.float32)
+        lengths512 = jnp.full((512,), 10, dtype=jnp.int32)
+        scores512 = paged_index_scores_jax(q512, pool, records, weights512, lengths512)
+        assert scores512.shape == (512, 16384)
 
         # 4. Small width clamps budget via -(-width // 128) * 128
         records_short = jnp.full((1, 256), -1, dtype=jnp.int32)
@@ -297,12 +297,13 @@ class TestAttentionKernelsDecodeIndexer:
         heads, dim = 2, 128
         pool = jnp.zeros((64, ROW_WORDS), dtype=jnp.int32)
 
-        # Branch 1: requests is not None and tokens <= records.shape[0] (decode take)
-        q_dec = jnp.zeros((2, heads, dim), dtype=jnp.bfloat16)
-        records_dec = jnp.full((4, 256), -1, dtype=jnp.int32)
-        weights_dec = jnp.zeros((2, heads), dtype=jnp.float32)
-        lengths_dec = jnp.array([10, 20], dtype=jnp.int32)
-        requests_dec = jnp.array([1, 3], dtype=jnp.int32)
+        # Branch 1a: requests is not None, tokens <= records.shape[0],
+        # tokens >= 6 and tokens % 6 == 0 (grouped branch)
+        q_dec = jnp.zeros((6, heads, dim), dtype=jnp.bfloat16)
+        records_dec = jnp.full((8, 256), -1, dtype=jnp.int32)
+        weights_dec = jnp.zeros((6, heads), dtype=jnp.float32)
+        lengths_dec = jnp.full((6,), 10, dtype=jnp.int32)
+        requests_dec = jnp.zeros((6,), dtype=jnp.int32)
 
         res_dec = paged_index_scores_jax(
             q_dec,
@@ -313,7 +314,20 @@ class TestAttentionKernelsDecodeIndexer:
             requests=requests_dec,
             page_records=16,
         )
-        assert res_dec.shape == (2, 256)
+        assert res_dec.shape == (6, 256)
+
+        # Branch 1b: requests is not None, tokens <= records.shape[0],
+        # tokens not divisible by 6 (tokens = 2)
+        res_dec_2 = paged_index_scores_jax(
+            q_dec[:2],
+            pool,
+            records_dec,
+            weights_dec[:2],
+            lengths_dec[:2],
+            requests=requests_dec[:2],
+            page_records=16,
+        )
+        assert res_dec_2.shape == (2, 256)
 
         # Branch 2: requests is not None and tokens > records.shape[0]
         # (prefill row_step loop)

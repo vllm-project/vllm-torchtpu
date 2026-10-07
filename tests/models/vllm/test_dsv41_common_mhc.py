@@ -154,3 +154,28 @@ def test_pallas_path_matches_torch_reference(tokens, dim, packed):
         pytest.skip("Pallas TPU kernel needs TPU hardware")
     _check(tokens, dim, packed)
     _check_post_pre(tokens, dim, packed)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("mult", [2, 4])
+def test_collapse_flat_matches_view_sum(mult):
+    """Slice collapse equals the ``[T, M, D]`` view sum.
+
+    Bitwise on TPU, where ``(s0 + s2) + (s1 + s3)`` is XLA's reduce order for
+    the view; CPU XLA may sum in another order, so it only checks closeness.
+    """
+    rng = np.random.default_rng(2)
+    tokens, dim = 16, 256
+    flat = jnp.asarray(rng.standard_normal((tokens, mult * dim)) * 4, jnp.bfloat16)
+    pre = jnp.asarray(rng.uniform(0.01, 1.5, (tokens, mult)), jnp.float32)
+
+    def view_sum(f, p):
+        view = f.reshape(tokens, mult, dim).astype(jnp.float32)
+        return (p[..., None] * view).sum(1)
+
+    want = jax.jit(view_sum)(flat, pre)
+    got = jax.jit(mhc._collapse_flat)(flat, pre)
+    if jax.default_backend() == "tpu":
+        np.testing.assert_array_equal(_np(got), _np(want))
+    else:
+        np.testing.assert_allclose(_np(got), _np(want), rtol=1e-6, atol=1e-5)

@@ -91,8 +91,8 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc,
     ):
-        # min(16 * 4 * 2 - 1, 512) = min(127, 512) = 127
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 127
+        # min(2 * (16 * 4 * 2) - 1, 768) = min(255, 768) = 255
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 255
 
 
 def test_unpack_fp4_to_e2m1():

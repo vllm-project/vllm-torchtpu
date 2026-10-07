@@ -611,7 +611,6 @@ class TestEngramModule:
         )
         common_engram.Engram._init_staging(engram, 16, 32)
         assert engram._staged_raw is not None
-        assert engram._staged_scale is not None
         assert engram._host_raw.shape == (16, 2, 32)
 
     def test_engram_prepare_embeddings_branches(self, monkeypatch: pytest.MonkeyPatch):
@@ -644,25 +643,19 @@ class TestEngramModule:
         engram.prepare_embeddings(hash_ids_partial)
         assert torch.all(engram._host_scale[:3] == 129)
         assert engram._host_scale_buf[3].item() == common_engram._INVALID_SCALE
-        staged_raw_3, staged_scale_3 = engram._staged_tensors(3)
-        assert staged_raw_3.shape == (3 * cols * dim // 4,)
-        assert staged_scale_3.shape == (3,)
-        assert engram._active_raw.shape == (3, cols * dim // 4)
-        assert engram._active_scale.shape == (3, 1)
+        staged_raw_3 = engram._staged_tensors(3)
+        assert staged_raw_3.shape == (3 * (cols * dim // 4 + 1),)
+        assert engram._active_raw.shape == (3, cols * dim // 4 + 1)
 
-        # Calling again with num_tokens=3 reuses the cached staging pair and views
+        # Calling again with num_tokens=3 reuses the cached staging tensor and view
         engram.prepare_embeddings(hash_ids_partial)
-        assert engram._staged_tensors(3) == (staged_raw_3, staged_scale_3)
-        assert engram._staged_views(3) == (engram._active_raw, engram._active_scale)
-        assert engram._staged_tensors(max_tokens) == (
-            engram._staged_raw,
-            engram._staged_scale,
-        )
+        assert engram._staged_tensors(3) is staged_raw_3
+        assert engram._staged_views(3) is engram._active_raw
+        assert engram._staged_tensors(max_tokens) is engram._staged_raw
 
         # 1b. Single token (num_tokens=1 < 2 skips mark_dynamic)
         engram.prepare_embeddings(torch.zeros(1, cols, dtype=torch.int32))
-        assert engram._active_raw.shape == (1, cols * dim // 4)
-        assert engram._active_scale.shape == (1, 1)
+        assert engram._active_raw.shape == (1, cols * dim // 4 + 1)
 
         # 2. Exact tokens: scale_bytes % 4 == 0 (skips tail word byte pad)
         hash_ids_full = torch.zeros(max_tokens, cols, dtype=torch.int32)

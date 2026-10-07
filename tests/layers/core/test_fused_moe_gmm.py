@@ -931,13 +931,12 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
 @pytest.mark.parametrize("explicit", [None, -1])
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
-    # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) and a
-    # 256-row block (v6e) both sit at or below the cap, so block - 1 wins:
-    # a full block stays on the SparseCore path. None and -1 both select
-    # auto.
+    # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) resolves
+    # to min(2 * 512 - 1, 768) = 768, and a 256-row block (v6e) resolves to
+    # min(2 * 256 - 1, 768) = 511. None and -1 both select auto.
     for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 511),
-        (_fake_sc_info(8, 2, 16), 255),
+        (_fake_sc_info(16, 2, 16), 768),
+        (_fake_sc_info(8, 2, 16), 511),
     ):
         monkeypatch.setattr(
             fused_moe_gmm.pltpu,
@@ -955,7 +954,7 @@ def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
         "get_tpu_info",
         lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
     )
-    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 768
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):

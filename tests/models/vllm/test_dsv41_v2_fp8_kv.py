@@ -225,16 +225,16 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     engram_stub.embed_tokens = emb_cpu
     Engram._init_staging(engram_stub, max_tokens=5, head_dim=dim)
     assert engram_stub._staged_raw is not None
-    engram_stub._host_raw.fill_(0x7F)
+    engram_stub._host_packed_buf.fill_(0x7F)
     engram_stub._host_scale.fill_(200)
     engram_stub.prepare_embeddings(indices)
     got = engram_stub._ready_rows(indices.shape[0])
     assert torch.equal(got.view(torch.int16), out_cpu.view(torch.int16))
     assert engram_stub._active_raw.shape[0] == indices.shape[0]
-    assert engram_stub._active_scale.shape[0] == indices.shape[0]
     assert torch.all(engram_stub._host_scale[2, 1] == _INVALID_SCALE)
     assert torch.all(engram_stub._host_scale[indices.shape[0] :] == 200)
-    assert torch.all(engram_stub._host_raw[indices.shape[0] :] == 0x7F)
+    packed_bytes = engram_stub._staged_tensors(indices.shape[0]).numel() * 4
+    assert torch.all(engram_stub._host_packed_buf[packed_bytes:] == 0x7F)
 
 
 def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():

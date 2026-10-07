@@ -637,17 +637,20 @@ class TestTokenParallelAttentionDispatchAndHelpers:
             return (
                 token_parallel
                 and cur_tp_size > 1
-                and tokens >= 16 * cur_tp_size
-                and tokens % (16 * cur_tp_size) == 0
+                and tokens >= 6 * cur_tp_size
+                and tokens % cur_tp_size == 0
             )
 
         # Falsy branches
         assert not check(False, 8, 2048)  # token_parallel is False
         assert not check(True, 1, 2048)  # tp_size <= 1
-        assert not check(True, 8, 64)  # tokens < 128
-        assert not check(True, 8, 150)  # tokens % 128 != 0
+        assert not check(True, 8, 32)  # tokens < 48
+        assert not check(True, 8, 50)  # tokens % 8 != 0
 
         # Truthy branch
+        assert check(True, 8, 48)
+        assert check(True, 8, 64)
+        assert check(True, 8, 96)
         assert check(True, 8, 128)
         assert check(True, 8, 256)
         assert check(True, 8, 1024)
@@ -759,7 +762,7 @@ class TestTokenParallelAttentionDispatchAndHelpers:
                     side_effect=lambda q, *args, **kwargs: q,
                 ),
             ):
-                # 1. Test token-parallel body execution
+                # 1a. Test token-parallel body execution (pad_rows == 0, tokens=1024)
                 res_tp = fp8_attn(
                     jnp.zeros((1024, 64, 512)),
                     jnp.zeros((1024, 512)),
@@ -781,6 +784,30 @@ class TestTokenParallelAttentionDispatchAndHelpers:
                     4096,
                 )
                 assert res_tp.shape == (1024, 64, 512)
+
+                # 1b. Test token-parallel body execution with 8-sublane padding
+                # (tokens=48, pad_rows=2)
+                res_tp_48 = fp8_attn(
+                    jnp.zeros((48, 64, 512)),
+                    jnp.zeros((48, 512)),
+                    jnp.zeros((48, 128)),
+                    jnp.zeros((12, 32)),
+                    jnp.zeros((48, 64), dtype=jnp.int32),
+                    jnp.zeros((48, 128), dtype=jnp.int32),
+                    jnp.zeros((1, 1), dtype=jnp.int32),
+                    jnp.zeros((2,), dtype=jnp.int32),
+                    jnp.zeros((64,)),
+                    jnp.zeros((64,)),
+                    jnp.zeros((1,), dtype=jnp.int32),
+                    0.125,
+                    16,
+                    None,
+                    False,
+                    True,
+                    False,
+                    4096,
+                )
+                assert res_tp_48.shape == (48, 64, 512)
 
                 # 2. Test non-token-parallel body execution
                 res_non_tp = fp8_attn(

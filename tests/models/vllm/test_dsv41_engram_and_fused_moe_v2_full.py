@@ -398,9 +398,7 @@ class TestCommonNgramHashStateFull:
             mock_stager.flush.assert_called_once_with(mock_tpu_param)
 
         # __init__ with cpu_offload None vs bool
-        monkeypatch.setattr(
-            common_engram.envs, "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", True
-        )
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "1")
         emb = object.__new__(common_engram.ParallelEngramEmbedding)
         with (
             patch(
@@ -541,21 +539,15 @@ class TestCommonNgramHashStateFull:
             engram._init_staging(max_tokens=4, head_dim=16)
             assert engram._staged_raw is None
 
-        # prepare_embeddings and _ready_rows
-        engram._staged_raw = torch.zeros(4 * 2 * 16 // 4, dtype=torch.int32)
-        engram._staged_scale = torch.zeros(4, dtype=torch.int32)
-        engram._host_raw = torch.zeros(4, 2, 16, dtype=torch.uint8)
-        engram._host_scale_buf = torch.full(
-            (16,), common_engram._INVALID_SCALE, dtype=torch.uint8
-        )
-        engram._host_scale = engram._host_scale_buf[: 4 * 2 * 2].view(4, 2, 2)
-        engram.embed_tokens = SimpleNamespace(
-            gather_raw=lambda h, r, s: None,
-            block_size=8,
-            cpu_offload=True,
-            n_hash_cols=2,
-            tp_size=1,
-        )
+            engram.embed_tokens = SimpleNamespace(
+                gather_raw=lambda h, r, s: None,
+                part_n_hash_cols=2,
+                block_size=8,
+                cpu_offload=True,
+                n_hash_cols=2,
+                tp_size=1,
+            )
+            engram._init_staging(max_tokens=4, head_dim=16)
 
         hash_ids = torch.tensor([[0, 1], [2, 3]])
         engram.prepare_embeddings(hash_ids)

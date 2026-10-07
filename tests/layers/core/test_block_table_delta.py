@@ -329,3 +329,5 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     dev = torch.empty_like(flat, device="meta")
     stager.record_full(key, _ctx(1, [4]), entries, builders, 1, flat, dev)
     assert stager._layouts[key].dev is dev
+    assert btd.DELTA_CAPACITY == 8192
+    assert btd.DELTA_CAPACITY >= 128 * 51
