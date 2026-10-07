@@ -152,7 +152,8 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     )
     req_ids = getattr(batch, "req_ids", None)
     if req_id_to_index and req_ids is not None:
-        matched: list[tuple[int, int, int]] = []
+        dst_idx: list[int] = []
+        src_idx: list[int] = []
         qsl = runner.query_start_loc_cpu[: chunk_num_reqs + 1].tolist()
         for i in range(chunk_num_reqs):
             req_id = req_ids[start_index + i]
@@ -160,8 +161,11 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 q_start = int(qsl[i])
                 q_end = int(qsl[i + 1])
                 if q_end > q_start:
-                    matched.append((q_start, q_end, int(req_id_to_index[req_id])))
-        if matched:
+                    n_sched = q_end - q_start
+                    src_start = int(req_id_to_index[req_id])
+                    dst_idx.extend(range(q_start, q_end))
+                    src_idx.extend(range(src_start, src_start + n_sched))
+        if dst_idx:
             ids = runner.input_ids_cpu.clone()
             flat_src = _async_source_tokens_cpu(pre_async)
             if flat_src is None:
@@ -173,11 +177,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                     all_prompt=all_prompt,
                     host_ready=False,
                 )
-            for q_start, q_end, src_start in matched:
-                n_sched = q_end - q_start
-                ids[q_start:q_end] = flat_src[src_start : src_start + n_sched].to(
-                    dtype=ids.dtype
-                )
+            ids[dst_idx] = flat_src[src_idx].to(dtype=ids.dtype)
 
     return HostEngramInputs(
         input_ids=ids,

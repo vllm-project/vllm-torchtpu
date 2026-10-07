@@ -323,7 +323,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 )
                 if self._has_cpu_offloaded_engram():
                     gathered_hashes = gathered_hashes.to("cpu")
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                end_layer = (
+                    getattr(self, "_ced_boundary", self.end_layer)
+                    if stage == "encoder"
+                    else self.end_layer
+                )
+                for layer in islice(self.layers, self.start_layer, end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
                         engram.prepare_embeddings(
