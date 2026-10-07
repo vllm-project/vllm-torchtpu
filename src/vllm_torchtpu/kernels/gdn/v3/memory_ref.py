@@ -253,11 +253,13 @@ class StateBufferedRef(BaseBufferedRef):
     """Input/output buffered ref for per-sequence state (conv / recurrent).
 
     The VMEM window holds one state per window position,
-    [seq_tile_size, window_size, *state_shape]. The initial state is read
-    from `state_indices[s] + read_offset[s]` into position 0 of the
-    sequence's window row, and after compute the first
-    `min(r_size, window_size)` checkpoints are written back to
-    `state_indices[s] .. + that many slots`.
+    [seq_tile_size, state_window_alloc, *state_shape]. The initial state is
+    read from the checkpoint selected by the sequence's read offset into
+    `cfg.state_in_pos`: position 0 without speculative decoding, and an
+    extra position past the `window_size` checkpoints with it, so it never
+    aliases a checkpoint that an in-flight copy_out of the same slot is
+    still reading. After compute the first `min(r_size, window_size)`
+    checkpoints are written back from positions `0..`.
 
     Without speculative decoding `window_size` is 1 and `read_offset` is 0,
     so this reduces to reading and writing the single state at
@@ -303,11 +305,14 @@ class StateBufferedRef(BaseBufferedRef):
             read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
             state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
 
+            # Into the dedicated incoming-state position (see
+            # `GDNConfig.state_in_pos`), never a checkpoint position that an
+            # in-flight copy_out of this slot may still be reading.
             pltpu.make_async_copy(
                 src_ref.at[
                     pl.ds(state_idx, dma_size), pl.ds(self.offset, num_granules)
                 ],
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
+                vmem_ref.at[idx, pl.ds(self.cfg.state_in_pos, dma_size)],
                 sem,
             ).start()
 
@@ -454,10 +459,11 @@ def create_allocs(
 
     if cfg.state_plan is None:
         # One state checkpoint per window position per sequence (a single one
-        # without speculative decoding, where window_size is 1).
+        # without speculative decoding, where window_size is 1), plus the
+        # dedicated incoming-state position with it (`cfg.state_in_pos`).
         conv_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
@@ -467,7 +473,7 @@ def create_allocs(
         packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
         recurrent_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.num_v_heads,
             cfg.kq_head_dim // packing,
             cfg.v_head_dim,

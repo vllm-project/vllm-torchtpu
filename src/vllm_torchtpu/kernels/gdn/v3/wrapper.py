@@ -115,7 +115,9 @@ def inner_kernel(
     )
 
     if cfg.state_plan is None:
-        conv_state_slot_ref[...] = new_conv_state
+        # Only the checkpoint positions; the extra incoming-state position
+        # (`cfg.state_in_pos`) is never copied out.
+        conv_state_slot_ref[:, : cfg.window_size] = new_conv_state
     else:
         # TODO: Delete this after completing unified pool redesign.
         legacy_unified.store_external_state(
@@ -207,8 +209,9 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        # Round to the state dtype, then pack into the uint32 window.
-        recurrent_slot_ref[...] = pltpu.bitcast(
+        # Round to the state dtype, then pack into the uint32 window. Only
+        # the checkpoint positions; see `cfg.state_in_pos`.
+        recurrent_slot_ref[:, : cfg.window_size] = pltpu.bitcast(
             new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
         )
     else:
@@ -526,14 +529,17 @@ def fused_conv1d_gdn(
         # weights, activations scratch and compiler temporaries).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+        # State tiles hold `window` checkpoints plus one dedicated
+        # incoming-state position (`GDNConfig.state_in_pos`) when window > 1.
+        state_positions = window + (1 if window > 1 else 0)
         recurrent_bytes_per_seq = (
-            window * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
         )
         bytes_per_seq = (
             # Recurrent checkpoints — the dominant term.
             recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
-            + window * (kernel_size - 1) * dim * 4
+            + state_positions * (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
             + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
         )

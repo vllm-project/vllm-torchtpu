@@ -115,9 +115,11 @@ def load_and_select_states(
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
         conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
+            [seq_tile_size, state_window_alloc, prev_kernel_size, 1, dim_size];
+            the incoming state is at window position `cfg.state_in_pos`.
         recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
+            state_window_alloc, num_v_heads, kq_head_dim // packing, v_head_dim]
+            (uint32 words); the incoming state is at `cfg.state_in_pos`.
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -156,7 +158,9 @@ def load_and_select_states(
             )
         else:
             # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-            hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
+            hbm_conv_state = conv_state_slot_ref[idx, cfg.state_in_pos].astype(
+                jnp.float32
+            )
             prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
             if carry_conv_scratch_ref is not None:
@@ -168,7 +172,7 @@ def load_and_select_states(
             # Unpack the uint32 words to the state dtype, then upcast because
             # compute runs in fp32.
             hbm_recurrent_state = pltpu.bitcast(
-                recurrent_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+                recurrent_slot_ref[idx, cfg.state_in_pos], cfg.dtypes.recurrent_state
             ).astype(jnp.float32)
             prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
