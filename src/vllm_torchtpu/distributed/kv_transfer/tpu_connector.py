@@ -2486,6 +2486,12 @@ class TPURaidenConnectorWorker:
         self._load_block_ids: dict[str, list[int]] = {}
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
+        kv_transfer_config = vllm_config.kv_transfer_config
+        self._stage3_fail_uncertain_loads_early = (
+            kv_transfer_config is not None
+            and getattr(kv_transfer_config, "kv_load_failure_policy", None) == "fail"
+            and not dist_utils.get_raiden_inline_load()
+        )
         self.transfer_stats = TpuKVConnectorStats()
         dist_utils.configure_raiden_telemetry()
         logger.info(
@@ -5673,6 +5679,8 @@ class TPURaidenConnectorWorker:
                 dist_utils.get_p2p_wait_pull_timeout()
             )
             self._stage3_pending_controller_failures[destination_req_id] = deadline
+            if self._stage3_fail_uncertain_loads_early:
+                self._failed_block_ids.update(pending.local_blocks)
             logger.error(
                 "Stage-3 controller transfer outcome uncertain; "
                 "waiting for native terminal state req_id=%s "
