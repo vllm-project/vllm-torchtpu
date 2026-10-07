@@ -1,0 +1,104 @@
+plan kimi-k3-agentx (kimi-k3/agentx), format 1, tool <version>
+point: c4
+image: ci
+model: moonshotai/Kimi-K3, loaded from gs://tpu-commons-ci/moonshootai/kimi/k3
+
+role server: tpu7x/2x2x4, 4 hosts x 4 chips (8 devices each), ray
+  ready: GET :8000/health within 4h10m of the server's start  [P-09]
+  host 0 (head)
+    pre: ray start --head --port=6379
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --data-parallel-size 1 --async-scheduling \
+               --no-enable-prefix-caching --kv-cache-dtype fp8 --attention-backend CUSTOM \
+               --api-server-count 1 --load-format runai_streamer --tensor-parallel-size 32 \
+               --enable-expert-parallel --max-num-batched-tokens 8192 \
+               --gpu-memory-utilization 0.82 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,8192]}' --max-model-len 131072 \
+               --max-num-seqs 16 --port 8000
+    scenario env: none
+    tool env:
+      JAX_PLATFORMS=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=ray  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 1
+    pre: ray start --address=<head_ip>:6379
+    serve: none; a Ray worker serves through the head
+    scenario env: none
+    tool env:
+      JAX_PLATFORMS=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=ray  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 2
+    pre: ray start --address=<head_ip>:6379
+    serve: none; a Ray worker serves through the head
+    scenario env: none
+    tool env:
+      JAX_PLATFORMS=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=ray  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 3
+    pre: ray start --address=<head_ip>:6379
+    serve: none; a Ray worker serves through the head
+    scenario env: none
+    tool env:
+      JAX_PLATFORMS=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=ray  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+driver: server host 0; tasks connect to 127.0.0.1:8000  [P-14]
+  task env:
+    PYTHONUNBUFFERED=1  [P-06]
+    TPU_MULTIHOST_BACKEND=ray  [P-06]
+  agentx: no gate
+    run: /opt/infx/runtime/venv/bin/python -m infx.bench agentic  (timeout 3h)
+      env:
+        AGENTIC_OUTPUT_DIR=<results_dir>  [P-21]
+        AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS=3600  [P-21]
+        AIPERF_EXPERIMENTAL_FAST=0  [P-21]
+        AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=false  [P-21]
+        AIPERF_MAX_CONTEXT_LENGTH=131072
+        AIPERF_RUNTIME_DIR=/opt/infx/runtime  [P-21]
+        AIPERF_SERVER_URL=http://127.0.0.1:8000  [P-21]
+        AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING=0  [P-21]
+        CONC=4  [P-21]
+        DCP_SIZE=1  [P-21]
+        DURATION=3600  [P-21]
+        EVAL_ONLY=false  [P-21]
+        FRAMEWORK=vllm  [P-21]
+        IS_AGENTIC=1  [P-21]
+        IS_MULTINODE=false  [P-21]
+        KV_OFFLOADING=none  [P-21]
+        MODEL=moonshotai/Kimi-K3  [P-21]
+        MODEL_PREFIX=kimik3  [P-21]
+        PCP_SIZE=1  [P-21]
+        PP_SIZE=1  [P-21]
+        PRECISION=fp4  [P-21]
+        PYTHONPATH=/opt/infx/InferenceX/inferencex-e2e  [P-21]
+        PYTHONSAFEPATH=1  [P-21]
+        RESULT_DIR=<results_dir>  [P-21]
+        RESULT_FILENAME=agentx_c4  [P-21]
+        RUNNER_TYPE=tpu7x  [P-21]
+        SERVED_MODEL_NAME=moonshotai/Kimi-K3  [P-21]
+        SPEC_DECODING=none  [P-21]
+        TP=16  [P-21]

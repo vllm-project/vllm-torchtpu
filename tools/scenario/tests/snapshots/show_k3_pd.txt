@@ -1,0 +1,58 @@
+kimi-k3-tp8-dp4-ep-1p1d (kimi-k3/tp8-dp4-ep-1p1d)
+layers: tool < defaults < extends:kimi-k3/tp32-ep < scenario
+
+schema                                         1                                         scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:3  (over scenarios/kimi-k3/tp32-ep.yaml:2, scenarios/defaults.yaml:2)
+name                                           kimi-k3-tp8-dp4-ep-1p1d                   scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:4
+extends                                        kimi-k3/tp32-ep                           scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:5
+server.image                                   ci                                        scenarios/defaults.yaml:4
+server.args.async-scheduling                   true                                      scenarios/defaults.yaml:12
+server.args.kv-cache-dtype                     fp8                                       scenarios/defaults.yaml:15
+server.args.attention-backend                  CUSTOM                                    scenarios/defaults.yaml:16
+server.args.api-server-count                   1                                         scenarios/defaults.yaml:18
+server.args.load-format                        runai_streamer                            scenarios/kimi-k3/tp32-ep.yaml:12
+server.args.enable-expert-parallel             true                                      scenarios/kimi-k3/tp32-ep.yaml:14
+server.args.max-model-len                      10240                                     scenarios/kimi-k3/tp32-ep.yaml:15  (over scenarios/defaults.yaml:9)
+server.args.max-num-seqs                       8                                         scenarios/kimi-k3/tp32-ep.yaml:17  (over scenarios/defaults.yaml:11)
+server.args.trust-remote-code                  true                                      scenarios/kimi-k3/tp32-ep.yaml:19
+server.args.limit-mm-per-prompt.image          0                                         scenarios/kimi-k3/tp32-ep.yaml:20
+server.args.limit-mm-per-prompt.video          0                                         scenarios/kimi-k3/tp32-ep.yaml:20
+server.args.block-size                         256                                       scenarios/kimi-k3/tp32-ep.yaml:21
+server.args.compilation-config.compile_sizes   [1, 8, 1296]                              scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:16  (over scenarios/kimi-k3/tp32-ep.yaml:22)
+server.args.tensor-parallel-size               8                                         scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:11  (over scenarios/kimi-k3/tp32-ep.yaml:13, scenarios/defaults.yaml:7)
+server.args.data-parallel-size                 4                                         scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:12  (over scenarios/defaults.yaml:8)
+server.args.gpu-memory-utilization             0.8                                       scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:13  (over scenarios/kimi-k3/tp32-ep.yaml:18, scenarios/defaults.yaml:14)
+server.args.enable-prefix-caching              true                                      scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:14  (over scenarios/defaults.yaml:13)
+server.args.max-num-batched-tokens             1296                                      scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:15  (over scenarios/kimi-k3/tp32-ep.yaml:16, scenarios/defaults.yaml:10)
+server.args.distributed-executor-backend       mp                                        scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:17
+server.model.name                              moonshotai/Kimi-K3                        scenarios/kimi-k3/tp32-ep.yaml:6
+server.model.path                              gs://tpu-commons-ci/moonshootai/kimi/k3   scenarios/kimi-k3/tp32-ep.yaml:7
+server.startup_timeout                         4h                                        scenarios/kimi-k3/tp32-ep.yaml:10  (over scenarios/defaults.yaml:5)
+server.multihost                               mp                                        scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:8  (over scenarios/kimi-k3/tp32-ep.yaml:9)
+server.scratch                                 64Gi                                      scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:9
+server.env.TPU_KV_RESHARD_TRANSPORT            raiden                                    scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:19
+server.env.TPU_RAIDEN_DST_SHARDS               8                                         scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:20
+server.env.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS  10800                                     scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:21
+server.roles.prefill.slice                     tpu7x/2x2x4                               scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:24
+server.roles.prefill.kv.connector              TPURaidenConnector                        scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:25
+server.roles.prefill.kv.role                   producer                                  scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:25
+server.roles.decode.slice                      tpu7x/2x2x4                               scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:27
+server.roles.decode.kv.connector               TPURaidenConnector                        scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:28
+server.roles.decode.kv.role                    consumer                                  scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:28
+server.router.type                             toy-proxy                                 scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:30
+server.router.command                          ["python3", "examples/disagg/toy_proxy_server.py"]  scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:31
+tasks.eval.lm_eval.model                       local-chat-completions                    scenarios/defaults.yaml:40
+tasks.eval.lm_eval.model_args.num_concurrent   16                                        scenarios/kimi-k3/tp32-ep.yaml:40  (over scenarios/defaults.yaml:41)
+tasks.eval.lm_eval.seed                        0,1234,None,1234                          scenarios/defaults.yaml:42
+tasks.eval.lm_eval.limit                       100                                       scenarios/defaults.yaml:43
+tasks.eval.lm_eval.apply_chat_template         true                                      scenarios/defaults.yaml:44
+tasks.eval.lm_eval.tasks                       ["mmlu_pro"]                              scenarios/kimi-k3/tp32-ep.yaml:39
+tasks.eval.lm_eval.fewshot_as_multiturn        false                                     scenarios/kimi-k3/tp32-ep.yaml:41  (over scenarios/defaults.yaml:45)
+tasks.eval.lm_eval.gen_kwargs                  {"chat_template_kwargs": {"thinking": false}}  scenarios/kimi-k3/tp32-ep.yaml:42  (over scenarios/defaults.yaml:46)
+tasks.eval.tolerance                           0.025                                     scenarios/kimi-k3/tp32-ep.yaml:43
+tasks.eval.baseline.from                       kimi-k3/tp32-ep                           scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:45
+tasks.driver                                   prefill                                   scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:33
+tasks.custom                                   [{"name": "correctness", "command": ["bash", "scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh"], "env": {"PREFILL_CHUNK_TOKENS": "1296", "K3_PD_DP_RANK": "3", "LOG_DIR": "${SCENARIO_RESULTS_DIR}/k3_1p1d_correctness"}, "timeout": "4h", "skip_rest_if_exit_ge": 2}]  scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:35
+
+deleted:
+  server.slice    scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:7
+  tasks.perf      scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml:34

@@ -92,6 +92,9 @@ class Resolved:
     overrides: tuple[str, ...]
     ref_baselines: Mapping[str, RefBaseline]
     warnings: tuple[Diagnostic, ...] = ()
+    # Layer names, lowest first: tool, defaults, extends:<ref>..., scenario,
+    # sweep:<point>, set:<i>...
+    layers: tuple[str, ...] = ()
 
     @property
     def experiment(self) -> bool:
@@ -339,6 +342,19 @@ class Resolver:
 
     # Files and reference ids ---------------------------------------------
 
+    def scenario_files(self) -> list[pathlib.Path]:
+        """Every scenario under scenarios/, by reference id."""
+        return [self.file_of(ref) for ref in self.all_refs()]
+
+    def declared_name(self, file: pathlib.Path) -> tuple[str, int] | None:
+        """The file's own `name` and its line, or None when it has none."""
+        try:
+            loaded = self._load(file)
+        except DiagnosticError:
+            return None
+        name = loaded.data.get("name") if isinstance(loaded.data, dict) else None
+        return (name, loaded.line(("name",))) if isinstance(name, str) else None
+
     def ref_of(self, file: pathlib.Path) -> str:
         """The path under scenarios/ without .yaml; `@<path>` outside it."""
         if file.is_relative_to(self.scenarios):
@@ -549,7 +565,15 @@ class Resolver:
                 scenario, current.name, data, prov, overrides, follow_refs, report
             )
             if resolved is not None:
-                results.append(resolved)
+                layers = (
+                    "tool",
+                    "defaults",
+                    *(f"extends:{layer.ref}" for layer in reversed(parents)),
+                    "scenario",
+                    *([f"sweep:{current.name}"] if current.name is not None else []),
+                    *(f"set:{o.index}" for o in overrides),
+                )
+                results.append(dataclasses.replace(resolved, layers=layers))
         return results
 
     def _overrides(self, sets: tuple[str, ...], report: _Report) -> list[Override]:
