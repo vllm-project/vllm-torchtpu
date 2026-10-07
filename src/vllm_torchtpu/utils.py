@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -239,7 +239,7 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
+def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes | int]:
     """
     A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
     """
@@ -290,7 +290,7 @@ def tpu_bind_kv_cache(
             if isinstance(cache, (list, tuple)):
                 runner_kv_caches.extend(cache)
             else:
-                runner_kv_caches.append(cache)
+                runner_kv_caches.append(cast(torch.Tensor, cache))
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache

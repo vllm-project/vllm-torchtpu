@@ -13,11 +13,9 @@ logger = init_logger(__name__)
 
 PcpGroupLayout = CpGroupLayout
 
-# PCP builds its own mesh rather than going through
-# ``mesh_utils.get_or_create_cp_mesh``, so it needs its own cache: the two
-# builders produce different objects for the same key -- abstract
-# ``_PallasDevice`` positions here, real TPU devices there -- and sharing one
-# dict between them would hand a caller whichever ran first.
+# Each CP axis builds its own Pallas mesh and keys the cache on its own
+# factorization of the world, so each keeps its own dict rather than sharing
+# one that would hand a caller whichever axis ran first.
 _MESH_CACHE: dict[tuple, Any] = {}
 
 

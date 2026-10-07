@@ -405,6 +405,10 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_KV_RESHARD_TRANSPORT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -1268,10 +1272,15 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:
         return
-    if vllm_config.speculative_config is not None:
+    # The Qwen3.5 MoE drafter forward (Qwen3_5MultiTokenPredictor) already
+    # chunks to the local token shard and all-gathers after the final norm.
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method != "mtp"
+    ):
         raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 does not yet cover the speculative "
-            "drafter; disable speculative decoding or wait for #1562."
+            "TPU_MOE_SEQUENCE_PARALLEL=1 covers only the MTP drafter; "
+            f"got speculative method {vllm_config.speculative_config.method!r}."
         )
     archs = vllm_config.model_config.architectures or []
     if not any(a.startswith("Qwen3_5Moe") for a in archs):

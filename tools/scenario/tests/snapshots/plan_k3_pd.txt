@@ -1,0 +1,360 @@
+plan kimi-k3-tp8-dp4-ep-1p1d (kimi-k3/tp8-dp4-ep-1p1d), format 1, tool <version>
+image: ci
+model: moonshotai/Kimi-K3, loaded from gs://tpu-commons-ci/moonshootai/kimi/k3
+
+role prefill: tpu7x/2x2x4, 4 hosts x 4 chips (8 devices each), mp
+  ready: GET :8000/health within 4h10m of the server's start  [P-09]
+  kv: TPURaidenConnector kv_producer  [P-11]
+  scratch: 64Gi per host
+  host 0 (head)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --api-server-count 1 --load-format runai_streamer \
+               --enable-expert-parallel --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --port 8000
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=prefill  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:prefill>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=prefill-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=prefill  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=27000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 1
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 1
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=prefill  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:prefill>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=prefill-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=prefill  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=27000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 2
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 2
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=prefill  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:prefill>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=prefill-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=prefill  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=27000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 3
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 3
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=prefill  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:prefill>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=prefill-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=prefill  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=27000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+role decode: tpu7x/2x2x4, 4 hosts x 4 chips (8 devices each), mp
+  ready: GET :8000/health within 4h10m of the server's start  [P-09]
+  kv: TPURaidenConnector kv_consumer  [P-11]
+  scratch: 64Gi per host
+  host 0 (head)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --api-server-count 1 --load-format runai_streamer \
+               --enable-expert-parallel --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --port 8000
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=decode  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:decode>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=decode-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=decode  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=28000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 1
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 1
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=decode  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:decode>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=decode-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=decode  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=28000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 2
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 2
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=decode  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:decode>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=decode-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=decode  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=28000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 3
+    pre: python3 -m scenario.runtime.warm gs://tpu-commons-ci/moonshootai/kimi/k3  (timeout 10m, best effort)
+    serve: vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+               --served-model-name moonshotai/Kimi-K3 --async-scheduling --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --load-format runai_streamer --enable-expert-parallel \
+               --max-model-len 10240 --max-num-seqs 8 --trust-remote-code \
+               --limit-mm-per-prompt '{"image":0,"video":0}' --block-size 256 \
+               --compilation-config '{"compile_sizes":[1,8,1296]}' --tensor-parallel-size 8 \
+               --data-parallel-size 4 --gpu-memory-utilization 0.8 --enable-prefix-caching \
+               --max-num-batched-tokens 1296 --distributed-executor-backend mp \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}' \
+               --data-parallel-size-local 1 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 3
+    left off: --api-server-count --port  [P-05]
+    scenario env:
+      TPU_KV_RESHARD_TRANSPORT=raiden
+      TPU_RAIDEN_DST_SHARDS=8
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_KV_TRANSFER_NAMESPACE=decode  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:decode>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=decode-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=decode  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=28000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=14400  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+driver: prefill host 0; tasks connect to 127.0.0.1:8100  [P-14]
+  router: python3 examples/disagg/toy_proxy_server.py --host 0.0.0.0 --port 8100 \
+              --prefiller-hosts <role_head:prefill> --prefiller-ports 8000 \
+              --decoder-hosts <role_head:decode> --decoder-ports 8000
+    ready: GET :8100/healthcheck  [P-13]
+  task env:
+    PYTHONUNBUFFERED=1  [P-06]
+    TPU_MULTIHOST_BACKEND=mp  [P-06]
+  custom correctness, skips the rest on exit >= 2
+    run: bash scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh  (timeout 4h)
+      env:
+        DECODE_URL=http://<role_head:decode>:8000  [P-17]
+        K3_PD_DP_RANK=3
+        LOG_DIR=<results_dir>/k3_1p1d_correctness
+        PREFILL_CHUNK_TOKENS=1296
+        PREFILL_URL=http://<role_head:prefill>:8000  [P-17]
+        PROXY_URL=http://127.0.0.1:8100  [P-17]
+        SCENARIO_API_PORT=8000  [P-17]
+        SCENARIO_HOST_DECODE=<role_head:decode>  [P-17]
+        SCENARIO_HOST_PREFILL=<role_head:prefill>  [P-17]
+        SCENARIO_RESULTS_DIR=<results_dir>  [P-17]
+        SCENARIO_ROUTER_PORT=8100  [P-17]
+        SCENARIO_SERVED_MODEL=moonshotai/Kimi-K3  [P-17]
+        SCENARIO_SERVER_LOG=<server_log>  [P-17]
+  eval
+    mmlu_pro: lm_eval, gate tolerance 0.025 (from:kimi-k3/tp32-ep)
+      run: lm_eval --tasks mmlu_pro --seed 0,1234,None,1234 --output_path <results_dir> \
+               --limit 100 --model local-chat-completions \
+               --model_args model=moonshotai/Kimi-K3,base_url=http://127.0.0.1:8100/v1/chat/completions,num_concurrent=16 \
+               --apply_chat_template --gen_kwargs '{"chat_template_kwargs":{"thinking":false}}'

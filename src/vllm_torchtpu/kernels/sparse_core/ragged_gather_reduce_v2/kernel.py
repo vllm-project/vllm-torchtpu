@@ -223,7 +223,7 @@ def _row_kernel(
     # reduced value -- the last row of the group within this block. Scanning
     # backwards, a row inherits its successor's merge target when they share
     # a destination, otherwise it is its own target.
-    rev_src_row_idx_in_vmem = []
+    rev_src_row_idx_in_vmem: list[int | jax.Array] = []
     rev_is_row_valid = []
     for row_vmem_idx in reversed(range(cfg.row_chunk_size)):
         if row_vmem_idx == cfg.row_chunk_size - 1:

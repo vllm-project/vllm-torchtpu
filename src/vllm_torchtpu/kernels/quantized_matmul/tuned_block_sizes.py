@@ -28,7 +28,7 @@ class TunedValue(NamedTuple):
 
 
 TUNED_BLOCK_SIZES_RAW = {
-    # go/keep-sorted start
+    # keep-sorted start
     (6, 1024, 1024, 4096, "int8", "int8"): (1024, 256, 4096),
     (6, 1024, 1024, 8192, "int8", "int8"): (1024, 512, 8192),
     (6, 1024, 128, 8192, "int8", "int8"): (512, 128, 8192),
@@ -517,7 +517,7 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8192, 5120, 8192, "float8_e4m3fn", "float8_e4m3fn"): (512, 5120, 2048),
     (7, 8192, 8192, 14336, "float8_e4m3fn", "float8_e4m3fn"): (1024, 4096, 1024),
     (7, 8192, 8192, 4096, "float8_e4m3fn", "float8_e4m3fn"): (1024, 2048, 4096),
-    # go/keep-sorted end
+    # keep-sorted end
 }
 
 TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {

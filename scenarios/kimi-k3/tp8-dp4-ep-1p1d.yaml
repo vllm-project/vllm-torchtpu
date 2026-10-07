@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=../../tools/scenario/schema/scenario.schema.json
+# Kimi-K3 1P1D: prefill and decode each TP8 x DP4 x EP32 on their own 2x2x4 slice,
+# one DP replica per host, KV over Raiden Stage 3, the proxy and tasks on the
+# prefill head. The serve flags are kimi-k3/tp32-ep's, with what Raiden and the
+# correctness stages need on top.
+schema: 1
+name: kimi-k3-tp8-dp4-ep-1p1d
+extends: kimi-k3/tp32-ep
+server:
+  slice: null
+  multihost: mp
+  # The boot's temporary files are tens of GB, more than the container disk.
+  scratch: 64Gi
+  args:
+    tensor-parallel-size: 8
+    data-parallel-size: 4
+    # What the connector's DP support was validated with.
+    gpu-memory-utilization: 0.80
+    # The Kimi pool needs KDA state blocks to match attention blocks.
+    enable-prefix-caching: true
+    # One prefill chunk is one KV block (1296 tokens for fp8 at TP8), so a request
+    # resumed from a prefix hit runs the cold run's chunk shapes and the stages
+    # can compare tokens.
+    max-num-batched-tokens: 1296
+    compilation-config: {compile_sizes: [1, 8, 1296]}
+    mamba-cache-mode: align
+    # The stages read usage.cached_tokens.
+    enable-prompt-tokens-details: true
+    # Without it a chat response carries K3's channel-closing markers as text.
+    reasoning-parser: kimi_k3
+    distributed-executor-backend: mp
+  env:
+    TPU_KV_RESHARD_TRANSPORT: raiden
+    TPU_RAIDEN_RESHARD_IMPL: store
+    TPU_USE_RAIDEN_KV_CACHE_MANAGER: "1"
+    TPU_RAIDEN_KIMIK3_ADMISSION: "1"
+    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+    # Kimi admission: the producer's and the consumer's TP, on both engines.
+    TPU_RAIDEN_TRANSFER_PARALLELISM: "8"
+    TPU_RAIDEN_DST_SHARDS: "8"
+    # Decode keeps a local prefix hit and pulls the suffix alone.
+    TPU_RAIDEN_PREFIX_AWARE_LOAD: "1"
+    TPU_KV_SHM_POOL_GB: "8"
+    TPU_PREMAPPED_BUFFER_SIZE: "17179869184"
+    TPU_MOE_HIERARCHICAL_EP: "1"
+    TPU_LATENT_PROJ_INTRA_CHIP_TP: "1"
+    TPU_RAIDEN_TRANSFER_NUM_SLOTS: "1"
+    TPU_PARALLEL_PRECOMPILE: "1"
+    TPU_P2P_WAIT_PULL_TIMEOUT: "900"
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "10800"
+  roles:
+    prefill:
+      slice: tpu7x/2x2x4
+      kv: {connector: TPURaidenConnector, role: producer}
+    decode:
+      slice: tpu7x/2x2x4
+      kv: {connector: TPURaidenConnector, role: consumer}
+  router:
+    type: toy-proxy
+    command: [python3, examples/disagg/toy_proxy_server.py]
+tasks:
+  driver: prefill
+  perf: null
+  custom:
+    - name: correctness
+      command: [bash, scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh]
+      env:
+        # The pair's max-num-batched-tokens, which the stages check against the
+        # block the engine chose.
+        PREFILL_CHUNK_TOKENS: "1296"
+        # The last DP rank, whose store is on the role's last host: a cross-host
+        # handoff, which is what DP adds to the pair.
+        K3_PD_DP_RANK: "3"
+        LOG_DIR: "${SCENARIO_RESULTS_DIR}/k3_1p1d_correctness"
+      timeout: 4h
+      # Exit 2 or more means the stages could not start, so the eval is skipped.
+      skip_rest_if_exit_ge: 2
+  eval:
+    baseline: {from: kimi-k3/tp32-ep}

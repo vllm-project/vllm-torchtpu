@@ -1,0 +1,79 @@
+plan glm-5.2-fp8-mp-dp16-ep (glm-5.2/fp8-dp16-ep-mp), format 1, tool <version>
+image: ci
+model: zai-org/GLM-5.2-FP8, loaded from gs://tpu-commons-ci/glm/GLM-5.2-FP8
+
+role server: tpu7x/2x2x2, 2 hosts x 4 chips (8 devices each), mp
+  ready: GET :8000/health within 2h10m of the server's start  [P-09]
+  host 0 (head)
+    serve: vllm serve gs://tpu-commons-ci/glm/GLM-5.2-FP8 --served-model-name zai-org/GLM-5.2-FP8 \
+               --async-scheduling --no-enable-prefix-caching --attention-backend CUSTOM \
+               --api-server-count 1 --load-format runai_streamer --tensor-parallel-size 1 \
+               --data-parallel-size 16 --enable-expert-parallel --max-model-len 9216 \
+               --max-num-batched-tokens 1024 --max-num-seqs 64 --gpu-memory-utilization 0.9 \
+               --kv-cache-dtype fp8 --enable-ep-weight-filter --safetensors-load-strategy prefetch \
+               --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45 \
+               --data-parallel-size-local 8 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --port 8000
+    scenario env: none
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=7200  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+  host 1
+    serve: vllm serve gs://tpu-commons-ci/glm/GLM-5.2-FP8 --served-model-name zai-org/GLM-5.2-FP8 \
+               --async-scheduling --no-enable-prefix-caching --attention-backend CUSTOM \
+               --load-format runai_streamer --tensor-parallel-size 1 --data-parallel-size 16 \
+               --enable-expert-parallel --max-model-len 9216 --max-num-batched-tokens 1024 \
+               --max-num-seqs 64 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 \
+               --enable-ep-weight-filter --safetensors-load-strategy prefetch \
+               --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45 \
+               --data-parallel-size-local 8 --data-parallel-address <head_ip> \
+               --data-parallel-rpc-port 29500 --headless --data-parallel-start-rank 8
+    left off: --api-server-count --port  [P-05]
+    scenario env: none
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_MULTIHOST_BACKEND=mp  [P-06]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_SKIP_MDS_QUERY=1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=7200  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+driver: server host 0; tasks connect to 127.0.0.1:8000  [P-14]
+  task env:
+    PYTHONUNBUFFERED=1  [P-06]
+    TPU_MULTIHOST_BACKEND=mp  [P-06]
+  perf (vllm-bench, product): 1 cell, gate tolerance 0.05 (from:glm-5.2/fp8-dp16-ep)
+    isl8192_osl1024_c1024
+      warmup 1: vllm bench serve --backend vllm --trust-remote-code --request-rate inf \
+                    --ignore-eos --seed 42 --model zai-org/GLM-5.2-FP8 \
+                    --tokenizer <pulled_model_dir|zai-org/GLM-5.2-FP8> --host 127.0.0.1 \
+                    --port 8000 --dataset-name random --random-input-len 8192 \
+                    --random-output-len 1024 --random-range-ratio 0.0 --num-prompts 2048 \
+                    --max-concurrency 1024 --percentile-metrics ttft,tpot,itl,e2el \
+                    --temperature 0.0 --save-result \
+                    --result-filename <results_dir>/isl8192_osl1024_c1024.warmup1.json
+      run: vllm bench serve --backend vllm --trust-remote-code --request-rate inf --ignore-eos \
+               --seed 42 --model zai-org/GLM-5.2-FP8 \
+               --tokenizer <pulled_model_dir|zai-org/GLM-5.2-FP8> --host 127.0.0.1 --port 8000 \
+               --dataset-name random --random-input-len 8192 --random-output-len 1024 \
+               --random-range-ratio 0.0 --num-prompts 2048 --max-concurrency 1024 \
+               --percentile-metrics ttft,tpot,itl,e2el --temperature 0.0 --save-result \
+               --result-filename <results_dir>/isl8192_osl1024_c1024.json

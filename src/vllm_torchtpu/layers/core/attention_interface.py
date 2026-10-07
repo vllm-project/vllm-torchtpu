@@ -1,7 +1,7 @@
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -287,7 +287,7 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap, is_mqa) -> jax.Arra
     attn = jax.vmap(attn)
     outputs = attn(q, k, v, None)
 
-    return outputs
+    return cast(jax.Array, outputs)
 
 
 def sharded_splash_attention(
@@ -493,7 +493,7 @@ def attention_bundled(
     )
 
     if head_dim_original is None:
-        head_dim_original = q.shape[-1]
+        head_dim_original = cast(int, q.shape[-1])
     md = attention_metadata
     if sm_scale is None:
         sm_scale = head_dim_original**-0.5
@@ -607,10 +607,10 @@ def attention(
     # k,v: (T, K, H)
 
     if head_dim_original is None:
-        head_dim_original = q.shape[-1]
+        head_dim_original = cast(int, q.shape[-1])
 
     if sm_scale is None:
-        sm_scale = head_dim_original**-0.5
+        sm_scale = cast(float, head_dim_original**-0.5)
 
     md = attention_metadata
 
@@ -621,10 +621,10 @@ def attention(
         k,
         v,
         kv_cache,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
-        md.request_distribution,
+        cast(jax.Array, md.seq_lens),
+        cast(jax.Array, md.block_tables),
+        cast(jax.Array, md.query_start_loc),
+        cast(jax.Array, md.request_distribution),
         sinks,
         sm_scale=sm_scale,
         attention_chunk_size=attention_chunk_size,

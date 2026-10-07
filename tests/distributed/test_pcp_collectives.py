@@ -15,9 +15,7 @@ from vllm_torchtpu.distributed import mesh_utils, pcp
 @pytest.fixture(autouse=True)
 def isolated_caches(monkeypatch):
     monkeypatch.setattr(mesh_utils, "_LAYOUT_CACHE", {})
-    monkeypatch.setattr(mesh_utils, "_MESH_CACHE", {})
-    # PCP keeps its own mesh cache: it builds a Torchtpu PallasMesh, not the
-    # device mesh mesh_utils builds, so the two cannot share one dict.
+    # Each axis keeps its own mesh cache; mesh_utils holds only the layout.
     monkeypatch.setattr(pcp, "_MESH_CACHE", {})
 
 
@@ -225,9 +223,8 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     """Everything ``get_or_create_pcp_mesh`` reads, except Torchtpu itself.
 
     ``get_cp_group_layout`` is patched on ``pcp`` rather than on
-    ``mesh_utils``: PCP now builds its own mesh instead of going through
-    ``mesh_utils.get_or_create_cp_mesh``, so the name that gets called is the
-    one bound in ``pcp``'s namespace by its ``from ... import``.
+    ``mesh_utils``: PCP builds its own mesh, so the name that gets called is
+    the one bound in ``pcp``'s namespace by its ``from ... import``.
     """
     monkeypatch.setattr(pcp, "get_cp_group_layout", lambda group: layout_holder[0])
     monkeypatch.setattr(

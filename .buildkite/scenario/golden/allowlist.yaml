@@ -1,0 +1,321 @@
+# Intended differences between today's kube scripts and the scenarios' plans.
+#
+# Each entry accepts the differences it matches: scenario (one or a list),
+# point (optional; any point when absent), where and name (shell globs), kind,
+# and the today and plan values ("*" is any value, null is absent). Every entry
+# needs a reason and has to match at least one difference, so a fixed script
+# removes its entry too. A failing case prints the entry that would accept
+# each new difference.
+
+# Serve flags -------------------------------------------------------------------
+
+- scenario: qwen3-0.6b/tp1
+  where: serve server/0
+  kind: flag
+  name: --served-model-name
+  today: null
+  plan: Qwen/Qwen3-0.6B
+  reason: >-
+    model.name is always --served-model-name (R-SCH-7). It equals the model
+    here, which is vLLM's default name.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve */0
+  kind: flag
+  name: --served-model-name
+  today: null
+  plan: Qwen/Qwen3.5-397B-A17B-FP8
+  reason: >-
+    model.name is always --served-model-name (R-SCH-7). It equals the model
+    here, which is vLLM's default name.
+
+- scenario: [qwen3-0.6b/tp1, kimi-k3/tp32-ep, kimi-k3/agentx, kimi-k3/eval-conc-sweep]
+  where: serve server/0
+  kind: flag
+  name: --api-server-count
+  today: null
+  plan: "1"
+  reason: >-
+    defaults.yaml sets one API frontend on every server, a choice and not
+    derived plumbing. Today run_benchmarks.sh passes it only with DP > 1
+    (run_benchmarks.sh:288-290); with DP 1 it is vLLM's own value.
+
+- scenario: [glm-5.2/fp8-dp16-ep-mp, kimi-k3/tp8-dp4-ep-1p1d]
+  where: serve */0
+  kind: flag
+  name: --host
+  today: 0.0.0.0
+  plan: null
+  reason: >-
+    The tool owns host. vLLM's default already binds every interface: P14's
+    engines and run_benchmarks.sh serve other pods without it.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve */0
+  kind: flag
+  name: --port
+  today: null
+  plan: "8000"
+  reason: >-
+    P-03 passes --port 8000 on every API host. disagg_engine.sh relies on
+    vLLM's default port, which is the same 8000.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve prefill/0
+  kind: flag
+  name: --data-parallel-size
+  today: null
+  plan: "1"
+  reason: defaults.yaml sets DP 1, which is vLLM's default.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve decode/0
+  kind: flag
+  name: --data-parallel-size-local
+  today: "8"
+  plan: null
+  reason: >-
+    P-04 passes it only to mp roles over several hosts. On one host vLLM sets
+    the local DP to the DP size, as the single-host DP configs rely on
+    (run_benchmarks.sh never passes it).
+
+# Ray workers -------------------------------------------------------------------
+
+- scenario: [glm-5.2/fp8-dp16-ep, kimi-k3/tp32-ep, kimi-k3/agentx, kimi-k3/eval-conc-sweep]
+  where: pre server/*
+  kind: flag
+  name: --address
+  today: wl-slice-0-0.wl:6379
+  plan: 10.1.0.1:6379
+  reason: >-
+    P-07 joins the head at head_ip, the head's name resolved to IPv4 with
+    bounded retry (R-RUN-8). Today multihost_entry.sh hands the name to ray
+    start.
+
+# Env ---------------------------------------------------------------------------
+
+- scenario: qwen3-0.6b/tp1
+  where: serve server/0
+  kind: env
+  name: TPU_ACCELERATOR_TYPE
+  today: null
+  plan: tpu7x
+  reason: >-
+    P-10 sets the accelerator on every TPU host. This is the one v7x step that
+    leaves it unset (pipeline_perf_kube.yml:81-89); without TPU_SKIP_MDS_QUERY
+    libtpu reads the same value from the metadata server.
+
+- scenario: kimi-k3/tp32-ep
+  where: serve server/0
+  kind: env
+  name: VLLM_ENGINE_READY_TIMEOUT_S
+  today: "7200"
+  plan: "14400"
+  reason: >-
+    startup_timeout is 4h, the config's own startup budget
+    (SERVER_READY_WAIT_MIN=240). No step runs this config, so today the engine
+    timeout is run_benchmarks.sh's 7200 default on the head.
+
+- scenario: kimi-k3/tp32-ep
+  where: pre server/*
+  kind: env
+  name: VLLM_ENGINE_READY_TIMEOUT_S
+  today: null
+  plan: "14400"
+  reason: >-
+    The plan sets the engine timeout on every host. Today only the head's
+    run_benchmarks.sh exports it, and no step sets it for the Ray workers.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve prefill/0
+  kind: env
+  name: TPU_KV_TRANSFER_NAMESPACE
+  today: gke_prefill
+  plan: prefill
+  reason: &raiden-ids >-
+    P-12 names Raiden identities after the role. They only have to differ
+    between the roles, and a fleet prefix would be a leak (02 8.7 #9). Port
+    bases are unchanged.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve prefill/0
+  kind: env
+  name: TPU_RAIDEN_ENGINE_ID
+  today: gke-prefill-engine
+  plan: prefill-engine
+  reason: *raiden-ids
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve decode/0
+  kind: env
+  name: TPU_KV_TRANSFER_NAMESPACE
+  today: gke_decode
+  plan: decode
+  reason: *raiden-ids
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: serve decode/0
+  kind: env
+  name: TPU_RAIDEN_ENGINE_ID
+  today: gke-decode-engine
+  plan: decode-engine
+  reason: *raiden-ids
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: serve prefill/*
+  kind: env
+  name: TPU_KV_TRANSFER_NAMESPACE
+  today: k3_prefill
+  plan: prefill
+  reason: *raiden-ids
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: serve prefill/*
+  kind: env
+  name: TPU_RAIDEN_ENGINE_ID
+  today: k3-prefill-engine
+  plan: prefill-engine
+  reason: *raiden-ids
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: serve decode/*
+  kind: env
+  name: TPU_KV_TRANSFER_NAMESPACE
+  today: k3_decode
+  plan: decode
+  reason: *raiden-ids
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: serve decode/*
+  kind: env
+  name: TPU_RAIDEN_ENGINE_ID
+  today: k3-decode-engine
+  plan: decode-engine
+  reason: *raiden-ids
+
+# Remote-code warm --------------------------------------------------------------
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: pre *
+  kind: command
+  name: program
+  today: python3 .buildkite/kubernetes/warm_remote_code.py
+  plan: python3 -m scenario.runtime.warm
+  reason: >-
+    P-19 runs the tool's copy of warm_remote_code.py (runtime/warm.py, M2)
+    with the same model path, on the same hosts, with the same 600 s bound.
+
+# Router and client -------------------------------------------------------------
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: router
+  kind: flag
+  name: --port
+  today: "10000"
+  plan: "8100"
+  reason: &router-port >-
+    The router port is plumbing (P-13). Nothing outside the client host uses
+    it (02 8.7 #10).
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: perf *
+  kind: flag
+  name: --port
+  today: "10000"
+  plan: "8100"
+  reason: *router-port
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: perf *
+  kind: flag
+  name: --append-result
+  today: "true"
+  plan: null
+  reason: &save-result >-
+    Same content for a fresh file: --append-result opens it with "a+" and
+    --save-result with "w" (vLLM benchmarks/serve.py). Each cell writes its
+    own file.
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: perf *
+  kind: flag
+  name: --save-result
+  today: null
+  plan: "true"
+  reason: *save-result
+
+- scenario: qwen3.5-397b/fp8-pcp8-dp8-1p1d
+  where: other client/0
+  kind: command
+  name: pip uninstall
+  today: -y libtpu libtpu-nightly
+  plan: null
+  reason: >-
+    The chipless driver gets P-18's env (VLLM_PLUGINS empty,
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0), which the manifest also sets, instead of
+    uninstalling libtpu in the pod.
+
+# Custom tasks ------------------------------------------------------------------
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: custom correctness
+  kind: env
+  name: PROXY_PORT
+  today: "8100"
+  plan: null
+  reason: >-
+    The script's PROXY_PORT default is 8100, the router port (P-13). Per-role
+    and router port variables are G10, in M3.
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: custom correctness
+  kind: env
+  name: PROXY_URL
+  today: null
+  plan: http://127.0.0.1:8100
+  reason: &custom-env >-
+    The custom-task env contract (P-17) gives every custom task these names;
+    the script reads none of them.
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: custom correctness
+  kind: env
+  name: SCENARIO_*
+  today: null
+  plan: "*"
+  reason: *custom-env
+
+- scenario: kimi-k3/tp8-dp4-ep-1p1d
+  where: other prefill/0
+  kind: command
+  name: python3 .buildkite/kubernetes/check_completions.py
+  today: http://127.0.0.1:8100/v1/completions moonshotai/Kimi-K3
+  plan: null
+  reason: >-
+    It lives under .buildkite/, which a scenario may not name (R-TEST-5). M3
+    moves it next to the integration scripts and adds a custom task.
+
+# Server-side cases -------------------------------------------------------------
+
+- scenario: kimi-k3/agentx
+  where: perf isl8192_osl1024_c1
+  kind: command
+  name: vllm bench serve
+  today: isl8192_osl1024_c1
+  plan: null
+  reason: >-
+    run_benchmarks.sh runs a fixed-length cell before it hands back the
+    server, and the config sets the smallest one that boots
+    (kimi-k3-tp32-ep-agentx.sh). The scenario runs AgentX alone on a fresh
+    server.
+
+- scenario: kimi-k3/eval-conc-sweep
+  where: perf isl8192_osl1024_c1
+  kind: command
+  name: vllm bench serve
+  today: isl8192_osl1024_c1
+  plan: null
+  reason: >-
+    run_benchmarks.sh's smoke cell before it hands back the server
+    (kimi-k3-tp32-ep-concsweep.sh, NUM_PROMPTS=2). The scenario's lm_eval
+    runs go straight to the server.

@@ -35,6 +35,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -534,7 +535,50 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
+
+        cap = self._pooling_kv_cache_cap_bytes()
+        if cap is not None and cap < available:
+            logger.info(
+                "Pooling KV cache cap: %.2f GiB of %.2f GiB available; "
+                "%.2f GiB reclaimed (consider raising --max-num-batched-tokens; "
+                "set VLLM_TPU_POOLING_KV_CACHE_TOKENS=0 to disable).",
+                cap / utils.GBYTES,
+                available / utils.GBYTES,
+                (available - cap) / utils.GBYTES,
+            )
+            available = cap
         return available
+
+    def _pooling_kv_cache_cap_bytes(self) -> int | None:
+        """Deterministic KV budget for pure pooling models, or None.
+
+        Pooling requests are prefill-only, so KV only has to hold the in-flight
+        steps plus the earlier chunks of requests still in chunked prefill.
+        The cap is derived from the config alone, so num_gpu_blocks (and thus
+        the backbone compile hash) is identical across restarts and ranks.
+        """
+        runner = getattr(self, "model_runner", None)
+        setting = envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS
+        if (
+            runner is None
+            or not getattr(runner, "is_pooling_model", False)
+            or setting == 0
+            or self.cache_config.num_gpu_blocks_override is not None
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.vllm_config.kv_transfer_config is not None
+            or getattr(self.model_config, "is_hybrid", False)
+        ):
+            return None
+        sc = self.scheduler_config
+        return compute_pooling_kv_cache_cap_bytes(
+            runner.get_kv_cache_spec(),
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=sc.max_num_batched_tokens,
+            max_num_seqs=sc.max_num_seqs,
+            async_scheduling=bool(sc.async_scheduling),
+            long_prefill_token_threshold=sc.long_prefill_token_threshold,
+            override_tokens=setting if setting > 0 else None,
+        )
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)

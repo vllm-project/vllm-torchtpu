@@ -14,14 +14,14 @@ import jax
 #    - bn
 #    - bk
 TUNED_BLOCK_SIZES = {
-    # go/keep-sorted start
+    # keep-sorted start
     (6, 1024, 51200, 5120, "bfloat16", 8): (6400, 2560),
     (6, 1024, 57344, 8192, "bfloat16", 8): (7168, 8192),
     (6, 2048, 51200, 5120, "bfloat16", 8): (1280, 5120),
     (6, 2048, 57344, 8192, "bfloat16", 8): (1024, 8192),
     (6, 4096, 51200, 5120, "bfloat16", 8): (3200, 5120),
     (6, 8192, 51200, 5120, "bfloat16", 8): (1280, 5120),
-    # go/keep-sorted end
+    # keep-sorted end
 }
 
 

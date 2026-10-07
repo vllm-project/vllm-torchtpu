@@ -1,0 +1,39 @@
+[build-system]
+# Pinned exactly: uv.lock does not lock build requirements, so a floating
+# backend could change what `uv pip install ./tools/scenario` builds.
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-torchtpu-scenario"
+dynamic = ["version"]
+description = "Validate, show, render and run vLLM server scenarios."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.12,<3",
+    "click>=8.1,<9",
+    "ruamel.yaml>=0.18.10,<0.20",
+]
+
+[project.scripts]
+scenario = "scenario.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10"]
+
+[tool.hatch.version]
+path = "src/scenario/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scenario"]
+
+# Run with `-c tools/scenario/pyproject.toml` from the repo root, so the root
+# project's pytest settings never apply here and root `pytest` (testpaths =
+# ["tests"]) never collects these tests.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib mode: test module names may repeat across the directories one
+# presubmit session collects.
+addopts = ["--import-mode=importlib"]
+# Shared test helpers (plan_fixtures.py) import by name.
+pythonpath = ["tests"]

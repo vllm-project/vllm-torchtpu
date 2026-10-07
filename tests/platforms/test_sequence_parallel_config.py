@@ -126,7 +126,7 @@ def test_sequence_parallel_rejects_unvalidated_arch(configure_sp_moe, arch):
         configure_sp_moe(vllm_config)
 
 
-def test_sequence_parallel_rejects_speculative_decoding(configure_sp_moe):
+def test_sequence_parallel_admits_mtp(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
         tensor_parallel_size=8,
@@ -137,12 +137,27 @@ def test_sequence_parallel_rejects_speculative_decoding(configure_sp_moe):
         parallel_config=parallel_config,
         model_config=model_config,
         compilation_config=SimpleNamespace(compile_sizes=[16, 32, 64]),
-        speculative_config=SimpleNamespace(),
+        speculative_config=SimpleNamespace(method="mtp"),
     )
-    with pytest.raises(
-        ValueError,
-        match="does not yet cover the speculative drafter",
-    ):
+    configure_sp_moe(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [16, 32, 64]
+
+
+@pytest.mark.parametrize("method", ["eagle", "ngram"])
+def test_sequence_parallel_rejects_non_mtp_speculative(configure_sp_moe, method):
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=SimpleNamespace(compile_sizes=[16, 32, 64]),
+        speculative_config=SimpleNamespace(method=method),
+    )
+    with pytest.raises(ValueError, match="covers only the MTP drafter"):
         configure_sp_moe(vllm_config)
 
 

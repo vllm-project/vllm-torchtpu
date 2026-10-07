@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Group layout and JAX mesh construction shared by the context-parallel axes.
+"""Group layout shared by the context-parallel axes.
 
-`pcp.py` and `dcp.py` each need the same two things: the order of the ranks in
-their process group paired with the TPU device each one sits on, and a
-one-axis JAX mesh laid out in that order. Neither is specific to which axis
-asked -- a layout is just "this group's ranks, in order, and where they live"
+`pcp.py` and `dcp.py` each need the same thing: the order of the ranks in
+their process group paired with the TPU device each one sits on. Neither is
+specific to which axis asked -- a layout is just "this group's ranks, in
+order, and where they live"
 
-`ep_mesh.py` builds its own mesh but takes the rank/device helpers from here
-too, which is why this module is named for the job rather than for an axis.
+Every axis builds its own Pallas mesh, because torch_tpu requires one that
+spans the whole world and the axes factor the world differently. `ep_mesh.py`
+takes the rank/device helpers from here too, which is why this module is
+named for the job rather than for an axis.
 """
 
 from __future__ import annotations
@@ -28,10 +30,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -57,7 +55,6 @@ class CpGroupLayout:
 
 
 _LAYOUT_CACHE: dict[tuple[int, tuple[int, ...], int, int], CpGroupLayout] = {}
-_MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 
 
 def _get_current_global_rank() -> int:
@@ -81,7 +78,7 @@ def _get_tpu_global_device_id() -> int:
             local_devices = jax.local_devices()
             if local_devices:
                 return int(getattr(local_devices[0], "id", 0))
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         return 0
 
@@ -147,70 +144,3 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     )
     _LAYOUT_CACHE[cache_key] = layout
     return layout
-
-
-def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
-    """Build a one-axis JAX mesh ordered by `group`.
-
-    This helper is intentionally op-local: it does not replace the runner's
-    normal single-device model mesh.
-
-    The cache is keyed on `(axis_name, device_ids)`, so two axes coexist even
-    when they cover the same devices -- which they do under `tp=N, dcp=N`.
-    """
-
-    layout = get_cp_group_layout(group)
-    cache_key = (axis_name, layout.device_ids)
-    cached = _MESH_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    import jax
-    import numpy as np
-    from jax.sharding import Mesh
-
-    devices_by_id = {
-        int(getattr(device, "id", idx)): device
-        for idx, device in enumerate(jax.devices())
-    }
-    missing = [
-        device_id for device_id in layout.device_ids if device_id not in devices_by_id
-    ]
-    if missing:
-        raise RuntimeError(
-            f"Cannot build the '{axis_name}' mesh because JAX does not "
-            f"expose all of the group's TPU device ids: missing={missing}, "
-            f"layout={layout}, "
-            f"jax_device_ids={sorted(devices_by_id)}"
-        )
-
-    mesh_devices = np.asarray(
-        [devices_by_id[device_id] for device_id in layout.device_ids]
-    )
-    mesh = Mesh(mesh_devices, axis_names=(axis_name,))
-
-    # This is the mesh the CP kernel runs on, so it is the only place that
-    # sees the rank -> device correspondence the ring actually uses.
-    # ``lax.axis_index(axis_name)`` inside the kernel returns a *position* in
-    # this array, not a rank; it coincides with rank_in_group only because
-    # device_ids above is built by walking layout.ranks in order. Logging the
-    # two side by side makes a divergence visible instead of silent.
-    # Cached per layout, so this logs once per worker rather than per step.
-    positions = ", ".join(
-        f"pos{position}=rank{rank}/dev{device_id}"
-        f"@{tuple(getattr(device, 'coords', ()))}"
-        f"c{getattr(device, 'core_on_chip', '?')}"
-        for position, (rank, device_id, device) in enumerate(
-            zip(layout.ranks, layout.device_ids, mesh_devices)
-        )
-    )
-    logger.info(
-        "CP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
-        axis_name,
-        layout.world_size,
-        layout.rank_in_group,
-        positions,
-    )
-
-    _MESH_CACHE[cache_key] = mesh
-    return mesh

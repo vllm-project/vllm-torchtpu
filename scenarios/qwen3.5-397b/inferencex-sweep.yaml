@@ -1,0 +1,92 @@
+# yaml-language-server: $schema=../../tools/scenario/schema/scenario.schema.json
+# Qwen3.5-397B against InferenceX's benchmark client on one 2x2x1 host, one fresh
+# server per concurrency. Each point is sharded as InferenceX's table for this
+# model says (TP8 at low concurrency, DP4 x TP2 above), with max-num-seqs =
+# concurrency / DP and max-num-batched-tokens = 16384 / DP.
+schema: 1
+name: qwen3.5-397b-inferencex-sweep
+server:
+  model: {name: Qwen/Qwen3.5-397B-A17B-FP8}
+  slice: tpu7x/2x2x1
+  args:
+    # vLLM's default of one frontend per DP rank, as InferenceX runs it.
+    api-server-count: null
+    enable-expert-parallel: true
+    # ISL + OSL + 20, as InferenceX's Qwen3.5 servers.
+    max-model-len: 9236
+    gpu-memory-utilization: 0.92
+    block-size: 256
+    language-model-only: true
+    limit-mm-per-prompt: {image: 0, video: 0}
+    quantization: fp8
+  env:
+    USE_MOE_SPARSE_CORE: "1"
+    ONEHOT_MOE_PERMUTE_THRESHOLD: "32768"
+    RAGGED_GATHER_REDUCE_VERSION: v3
+    # Extra token buckets: 4 and 8 for low concurrency, 48 for DP points at 256.
+    TPU_TOKEN_BUCKET_EXTRA: "4,8,48"
+    # Rotary caches truncated to max-model-len, text only.
+    TPU_ROPE_CACHE_TRUNCATE: "1"
+    # Padded tokens activate no experts in the fused MoE.
+    TPU_MOE_SKIP_PADDED_TOKENS: "1"
+tasks:
+  perf:
+    client: inferencex
+    isl_osl: [[8192, 1024]]
+    concurrency: [4]
+    random_range_ratio: 0.8
+    num_prompts: {per_concurrency: 10}
+    num_warmups: {per_concurrency: 2}
+    client_args: {backend: vllm, request-rate: inf, ignore-eos: true, use-chat-template: true}
+sweep:
+  points:
+    - name: tp8-c4
+      server: {args: {tensor-parallel-size: 8, max-num-batched-tokens: 16384, max-num-seqs: 4}}
+      tasks: {perf: {concurrency: [4]}}
+    - name: tp8-c8
+      server: {args: {tensor-parallel-size: 8, max-num-batched-tokens: 16384, max-num-seqs: 8}}
+      tasks: {perf: {concurrency: [8]}}
+    - name: tp8-c16
+      server: {args: {tensor-parallel-size: 8, max-num-batched-tokens: 16384, max-num-seqs: 16}}
+      tasks: {perf: {concurrency: [16]}}
+    - name: dp4tp2-c32
+      server:
+        args:
+          tensor-parallel-size: 2
+          data-parallel-size: 4
+          # New prefills are admitted every this many steps: TTFT for throughput.
+          prefill-schedule-interval: 8
+          max-num-batched-tokens: 4096
+          max-num-seqs: 8
+        env: {DP_SCHED_ENABLED: "1"}
+      tasks: {perf: {concurrency: [32]}}
+    - name: dp4tp2-c64
+      server:
+        args:
+          tensor-parallel-size: 2
+          data-parallel-size: 4
+          prefill-schedule-interval: 8
+          max-num-batched-tokens: 4096
+          max-num-seqs: 16
+        env: {DP_SCHED_ENABLED: "1"}
+      tasks: {perf: {concurrency: [64]}}
+    - name: dp4tp2-c128
+      server:
+        args:
+          tensor-parallel-size: 2
+          data-parallel-size: 4
+          prefill-schedule-interval: 8
+          max-num-batched-tokens: 4096
+          max-num-seqs: 32
+        env: {DP_SCHED_ENABLED: "1"}
+      tasks: {perf: {concurrency: [128]}}
+    - name: dp4tp2-c256
+      server:
+        args:
+          tensor-parallel-size: 2
+          data-parallel-size: 4
+          prefill-schedule-interval: 8
+          max-num-batched-tokens: 4096
+          max-num-seqs: 64
+        env: {DP_SCHED_ENABLED: "1"}
+      tasks: {perf: {concurrency: [256]}}

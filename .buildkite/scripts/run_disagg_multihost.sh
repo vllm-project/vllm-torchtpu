@@ -254,7 +254,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}'"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /workspace/vllm-torchtpu -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}'"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -264,7 +264,7 @@ docker pull "${IMAGE_TAG}" || true
 
 set +e
 docker run --name disagg-head --privileged --net=host --shm-size=128g --device /dev/fuse \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   -v "${HOST_HF_HOME}:/root/.cache/huggingface" \
   -v "${PERSIST_ROOT}/perf_eval_results:/perf_eval_results" \
   -e ROLE=head \

@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../tools/scenario/schema/scenario.schema.json
+# InferenceX AgentX trace replay against the aggregate TP32 server, one fresh
+# server per concurrency. The server is the TP32 one with a long context, the
+# tool-call and reasoning parsers and decode buckets up to max-num-seqs.
+schema: 1
+name: kimi-k3-agentx
+extends: kimi-k3/tp32-ep
+server:
+  args:
+    # The aiperf client drops whole traces above the context, so this decides
+    # which traces are replayed: a bring-up number, not a submission.
+    max-model-len: 131072
+    # Twice the ladder's top concurrency, so the scheduler is never the limit.
+    max-num-seqs: 16
+    # Leaves enough KV for concurrent 128k contexts.
+    gpu-memory-utilization: 0.85
+    enable-auto-tool-choice: true
+    tool-call-parser: kimi_k3
+    reasoning-parser: kimi_k3
+    # Decode buckets bracket the ladder (1 to max-num-seqs); prefill chunks are
+    # 8192 with remainders padded to 1024, 2048 or 4096.
+    compilation-config: {compile_sizes: [1, 2, 4, 8, 16, 1024, 2048, 4096, 8192]}
+tasks:
+  perf: null
+  eval: null
+  agentx:
+    concurrency: 1
+    fast: true
+    duration: 20m
+    # Warmup grace, the window and drain, as the client's per-point cap.
+    timeout: 1h45m
+    labels:
+      model_prefix: kimik3
+      # The experts are MXFP4 with FP8 attention, the label the published B300
+      # vLLM row uses.
+      precision: fp4
+    env:
+      # Replays traces that fit max-model-len; the kimik3 corpus is uncapped.
+      AIPERF_MAX_CONTEXT_LENGTH: "131072"
+      # One ~70k-token turn can take over 30 minutes on a prefill-bound engine.
+      AGENTIC_WARMUP_GRACE_PERIOD: "3600"
+      AIPERF_DRAIN_TIMEOUT_SECONDS: "3600"
+      AIPERF_TRACE_IDLE_GAP_CAP_SECONDS: "300"
+sweep:
+  name: c{tasks.agentx.concurrency}
+  zip:
+    tasks.agentx.concurrency: [1, 2, 4, 8]

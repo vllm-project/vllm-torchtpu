@@ -663,9 +663,7 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
-    return bool(
-        tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER and tpu_envs.TPU_RAIDEN_GLM_ADMISSION
-    )
+    return tpu_envs.use_raiden_glm_admission()
 
 
 def _use_raiden_dsv4_admission() -> bool:

@@ -1,0 +1,20 @@
+# AgentX on the TP32 server: one fresh server per concurrency.
+schema: 1
+name: kimi-k3-agentx
+extends: kimi-k3/tp32-ep
+server:
+  args:
+    max-model-len: 131072
+    max-num-seqs: 16
+tasks:
+  perf: null
+  eval: null
+  agentx:
+    concurrency: 1
+    labels: {model_prefix: kimik3, precision: fp4}
+    env: {AIPERF_MAX_CONTEXT_LENGTH: "131072"}
+sweep:
+  name: c{tasks.agentx.concurrency}
+  zip:
+    tasks.agentx.concurrency: [1, 2, 4, 8]
+    server.args.max-num-seqs: [16, 16, 16, 32]

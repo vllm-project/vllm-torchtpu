@@ -1,0 +1,43 @@
+# Presubmit for the scenario tool (tools/scenario) and scenarios/: the tool's
+# tests on both supported Pythons, the golden drift check against today's kube
+# scripts, the generated-files check and a validate of every scenario. No path
+# filter: an edit to a script the golden check runs has to reach it.
+name: scenario
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    if: github.repository == 'vllm-project/vllm-torchtpu'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          # The version that wrote tools/scenario/uv.lock, so the lock check
+          # does not depend on when uv last released.
+          version: "0.12.15"
+      - name: Lock file is current
+        run: uv lock --check --project tools/scenario
+      # -c keeps the root project's pytest settings out. .buildkite/scenario
+      # holds the golden check, which runs today's bash with stub programs.
+      - name: Tests and golden drift check (Python 3.12)
+        run: >-
+          uv run --project tools/scenario --frozen --python 3.12
+          pytest -c tools/scenario/pyproject.toml tools/scenario/tests .buildkite/scenario
+      - name: Tests (Python 3.13)
+        run: >-
+          uv run --project tools/scenario --frozen --python 3.13
+          pytest -c tools/scenario/pyproject.toml tools/scenario/tests
+      - name: Generated schemas and REFERENCE.md are current
+        run: uv run --project tools/scenario --frozen --no-dev scenario dev regen --check
+      - name: Every scenario validates
+        run: uv run --project tools/scenario --frozen --no-dev scenario validate

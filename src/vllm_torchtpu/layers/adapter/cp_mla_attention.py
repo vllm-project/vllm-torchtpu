@@ -39,6 +39,7 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
+from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -59,6 +60,22 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     if group is None or int(group.world_size) == 1:
         return q
     return group.all_gather(q.contiguous(), dim=1)
+
+
+def all_gather_q_nope_pe_heads(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call."""
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return ql_nope, q_pe
+    q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
+    return (
+        q_dcp[..., :kv_lora_rank].contiguous(),
+        q_dcp[..., kv_lora_rank:].contiguous(),
+    )
 
 
 def merge_lse_partials_scatter_heads(
@@ -116,46 +133,7 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    weighted = _weight_by_lse(output, lse, group)
-    return group.reduce_scatter(weighted, dim=1).to(output.dtype)
-
-
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """This rank's `softmax_r(lse) * o_r` term, in f32."""
-    lse_f32 = lse.to(torch.float32).contiguous()
-    # [world_size, num_tokens, num_heads]: small, and it removes the need for
-    # any further reduction over the denominator.
-    gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
-    if not isinstance(gathered, torch.Tensor):
-        gathered = torch.cat(list(gathered), dim=0)
-
-    finite = torch.isfinite(gathered)
-    shift = torch.where(
-        finite, gathered, torch.full_like(gathered, float("-inf"))
-    ).amax(dim=0)
-    # A token with no contributor on any rank would give inf - inf; pin the
-    # shift to 0 there and let the zero denominator carry the result to zero.
-    empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, torch.zeros_like(shift), shift)
-
-    weights = torch.where(
-        finite, torch.exp(gathered - shift.unsqueeze(0)), torch.zeros_like(gathered)
-    )
-    denom = weights.sum(dim=0)
-    safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-
-    # This rank's row of `gathered` is `lse_f32` itself. Weighting from the
-    # local copy instead of indexing by rank keeps the rank out of the traced
-    # program, so every DCP rank compiles the same executable.
-    mine = (
-        torch.where(
-            torch.isfinite(lse_f32),
-            torch.exp(lse_f32 - shift),
-            torch.zeros_like(lse_f32),
-        )
-        / safe_denom
-    )
-    return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
+    return cp_lse_ag_out_rs(output, lse, group)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
