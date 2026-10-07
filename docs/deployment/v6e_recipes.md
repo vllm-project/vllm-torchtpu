@@ -2,6 +2,9 @@
 
 **TPU v6e (Trillium)** provides 1 TensorCore per physical chip with `32 GB` of high-bandwidth memory (HBM) per chip. Single-host TPU v6e VMs are available in `1-chip` (`v6e-1`, `32 GB` HBM), `4-chip` (`v6e-4`, `128 GB` HBM), and `8-chip` (`v6e-8`, `256 GB` HBM) topologies, with multi-host pod slices scaling to `v6e-16` (`512 GB` HBM) and beyond.
 
+> [!NOTE]
+> **Reference Configuration Examples**: Unlike the [TPU v7x Serving Recipes](v7x_recipes.md) (which mirror dedicated CI benchmark scripts in `scripts/vllm/benchmarking/configs/`), the `v6e` commands below are **reference configuration examples** sized for `v6e` HBM capacity (`32 GB` per chip). Check [Supported Models](../user_guide/supported_models.md) (`support_matrices/nightly/v6e/model_support_matrix.csv`) for the latest nightly `v6e` CI validation status of each checkpoint.
+
 ---
 
 ## Recommended Topologies by Model Size
