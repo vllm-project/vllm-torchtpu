@@ -37,6 +37,8 @@ except ImportError:
         write_states,
     )
 
+pytestmark = pytest.mark.tpu_test
+
 TOL = dict(rtol=1e-3, atol=1e-3)
 
 
