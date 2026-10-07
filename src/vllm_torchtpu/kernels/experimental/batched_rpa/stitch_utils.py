@@ -100,6 +100,7 @@ def _stitch_prefill_lane(
     bkv_sz_cache: jax.Array,
     cache_pages: jax.Array,
     new_tok_offset: jax.Array,
+    bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
@@ -120,10 +121,16 @@ def _stitch_prefill_lane(
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
-    merged_cache_u32 = jax.lax.select(
-        lane_idx >= bkv_sz_cache,
-        rolled_u32[..., : cfgs.bkv_sz],
+    # The new-KV fetch is page-granular, so lanes past the last new token hold
+    # whatever followed it in HBM (the next request, or NaN step padding). Zero
+    # them, as the decode path does: 0 * NaN in p @ V is NaN even where p == 0,
+    # and the whole-page writeback would carry them into the HBM page tail.
+    merged_cache_u32 = jnp.where(
+        lane_idx < bkv_sz_cache,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
+        jnp.where(
+            lane_idx < bkv_sz_cache + bkv_sz_new, rolled_u32[..., : cfgs.bkv_sz], 0
+        ),
     )
 
     return merged_cache_u32
@@ -211,6 +218,7 @@ def stitch_new_kv_lane(
             bkv_sz_cache,
             cache_pages,
             new_tok_offset,
+            bkv_sz_frm_new.astype(jnp.int32),
             v_len,
             cfgs=cfgs,
         )
