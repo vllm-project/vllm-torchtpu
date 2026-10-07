@@ -85,11 +85,24 @@ rows to the runner's original layout.
 Bounded replay deliberately approximates decoder SWA state; it is not
 numerically equivalent to a full decoder pass for long prompts. The default
 remains the full-forward reference until matched quality and performance
-validation is complete. Prefix caching uses the full-forward path even when
-the option is set: rebuilding the missing decoder window from cached encoder
-outputs is not implemented. Bounded replay requires unsharded token rows
+validation is complete. Bounded replay requires unsharded token rows
 (PCP1, no sequence parallelism); existing PP1/DP1 and speculation restrictions
 also apply.
+
+With prefix caching, the v2 implementation follows upstream's SWA bounded
+replay contract (`cache_config.swa_bounded_replay`, on by default). The SWA
+group leaves prefix caching, and the scheduler resumes each hit one window
+(128 tokens) early. Those replayed tokens rebuild SWA state:
+
+- SWA attention reads no row below the replay start, in both the encoder and
+  the decoder;
+- compressed KV and indexer rows of replayed tokens stay as cached;
+- the decoder window starts at the later of the prompt tail and the replay
+  start.
+
+A preempted request resuming past its prompt reads its Engram lookback from
+committed tokens on that step. v1, or v2 with `swa_bounded_replay` off, still
+falls back to the full-forward path with prefix caching.
 
 The shared runner changes provide only registration, native-cache binding,
 metadata, Engram lookbacks and compilation-cache invalidation. The vLLM version

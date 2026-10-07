@@ -22,6 +22,8 @@ def _runner_with_raw_tensors(raw_tensors):
     runner.requests = {}
     runner._mamba_state_pos = {}
     runner._mamba_offset_seeded = set()
+    runner._replay_starts = {}
+    runner.kv_cache_config = None
     runner._pre_async_results = None
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
@@ -299,7 +301,7 @@ def _dense_runner(
     """A non-pooled runner; ``fine_unit`` fakes the DCP fine-prefix gate."""
     runner = _runner_with_raw_tensors([])
     runner.kv_cache_config = SimpleNamespace(
-        num_blocks=num_blocks, has_mamba_layers=has_mamba_layers
+        num_blocks=num_blocks, has_mamba_layers=has_mamba_layers, kv_cache_groups=[]
     )
     runner.vllm_config = None
     runner.kv_caches = kv_caches

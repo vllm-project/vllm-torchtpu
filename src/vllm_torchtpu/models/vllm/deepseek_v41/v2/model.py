@@ -33,7 +33,7 @@ from .attention import (
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
-from .ced import plan_decoder_replay
+from .ced import plan_decoder_replay, prefix_replay_enabled
 from .engram import Engram, NgramHashState
 from .host_engram import (
     HOST_ENGRAM_KEY,
@@ -51,11 +51,12 @@ def _ced_config(
     cache_config = getattr(vllm_config, "cache_config", None)
     enable_prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
     ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
-    if ced_enabled and enable_prefix_caching:
+    if ced_enabled and enable_prefix_caching and not prefix_replay_enabled(vllm_config):
         if warn_prefix_caching:
             logger.warning(
-                "CED bounded replay requires prefix caching disabled; "
-                "using full forward to retain cached SWA state semantics"
+                "CED with prefix caching needs SWA bounded replay "
+                "(cache_config.swa_bounded_replay, no PCP); using full forward "
+                "to retain cached SWA state semantics"
             )
         ced_enabled = False
     hf_config = getattr(
@@ -384,13 +385,32 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else None
             )
-            encoded = self.encoder_stage(
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                lookback_token_ids,
+            # SWA bounded replay: the encoder reads no SWA row below a prefix
+            # hit's replay start and leaves cached KV of replayed tokens. The
+            # input exists in every CED step so the compiled graph does not
+            # depend on whether prefix caching is on.
+            requests = first.seq_lens.shape[0] if first is not None else 1
+            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+            window_starts = torch.tensor(
+                hits + (0,) * (requests - len(hits)),
+                dtype=positions.dtype,
+                device=positions.device,
             )
+            encoder_context = replace(
+                context,
+                additional_kwargs={
+                    **context.additional_kwargs,
+                    "deepseek_v41_window_starts": window_starts,
+                },
+            )
+            with override_forward_context(encoder_context):
+                encoded = self.encoder_stage(
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    lookback_token_ids,
+                )
         finally:
             self._engram_prepared_outside_stage = False
         # Match the runner's convention for compiled backends that wrap the

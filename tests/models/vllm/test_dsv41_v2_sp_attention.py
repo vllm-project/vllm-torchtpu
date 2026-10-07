@@ -55,7 +55,17 @@ def test_ced_config_combinations(monkeypatch, caplog):
         enabled2, boundary2 = v2_model._ced_config(cfg2, warn_prefix_caching=True)
     assert enabled2 is False
     assert boundary2 == 15
-    assert "CED bounded replay requires prefix caching disabled" in caplog.text
+    assert "CED with prefix caching needs SWA bounded replay" in caplog.text
+
+    # 2b. With SWA bounded replay, CED keeps running alongside prefix caching.
+    cfg2b = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, swa_bounded_replay=True
+        ),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        model_config=cfg2.model_config,
+    )
+    assert v2_model._ced_config(cfg2b, warn_prefix_caching=True) == (True, 15)
 
     # 3. CED=1 and prefix caching enabled with warn_prefix_caching=False
     caplog.clear()

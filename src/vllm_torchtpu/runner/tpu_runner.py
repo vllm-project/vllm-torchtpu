@@ -843,6 +843,9 @@ class TPUModelRunner(GPUModelRunner):
         # mapping (built in initialize_kv_cache), and the block-seed copies
         # staged by _prepare_inputs and flushed before the forward.
         self._mamba_state_pos: dict[str, int] = {}
+        # SWA bounded replay (DeepSeek-V4.1): the first position each request
+        # holds sliding-window KV for, fixed when the scheduler admits it.
+        self._replay_starts: dict[str, int] = {}
         self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
         # Manager-block -> pool-block split: >1 when the pool is born at a
         # smaller attention-kernel granularity (batched RPA).
@@ -2419,6 +2422,61 @@ class TPUModelRunner(GPUModelRunner):
         input_batch.update_req_spec_token_ids = guarded
         input_batch._tpu_spec_room_guard = True
 
+    def _prefix_replay_tokens(self) -> int:
+        config = self.kv_cache_config
+        if config is None:
+            return 0
+        return max(
+            (
+                group.kv_cache_spec.prefix_replay_tokens
+                for group in config.kv_cache_groups
+            ),
+            default=0,
+        )
+
+    def _record_replay_starts(self, scheduler_output: "SchedulerOutput") -> None:
+        """Keep each admitted request's SWA bounded replay start.
+
+        The scheduler rewinds a prefix hit by the replay window and resumes the
+        request at the replay start, so a resumed request (sent without the
+        field under the V1 runner) starts at its computed-token count.
+        """
+        if not self._prefix_replay_tokens():
+            return
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.replay_start:
+                assert new_req.replay_start == new_req.num_computed_tokens
+                self._replay_starts[new_req.req_id] = new_req.replay_start
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            if req_id in cached.resumed_req_ids and num_computed:
+                self._replay_starts[req_id] = num_computed
+
+    def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
+        """Upstream's lookback gather, widened on a replayed admission step.
+
+        Upstream reads prompt ids only, since generated slots may hold async
+        placeholders. A request resumed at its SWA bounded replay start past
+        its prompt has all of its tokens committed on that step, and the SWA
+        group holding the older history is not prefix-cached.
+        """
+        buf = self.lookback_token_ids
+        assert buf is not None
+        buf.np.fill(-1)
+        if num_reqs > 0:
+            depth = buf.np.shape[1]
+            starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
+            pos = starts - np.arange(1, depth + 1)
+            limit = self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if self._replay_starts.get(req_id) == starts[row, 0]:
+                    limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
+            valid = (pos >= 0) & (pos < limit)
+            rows = np.arange(num_reqs)[:, None]
+            ids = self.input_batch.token_ids_cpu[rows, np.clip(pos, 0, None)]
+            buf.np[:num_reqs] = np.where(valid, ids, -1)
+        return buf.copy_to_gpu()
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         invalidated_req_ids = (
             scheduler_output.finished_req_ids
@@ -2427,6 +2485,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
+            self._replay_starts.pop(req_id, None)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
@@ -2460,6 +2519,7 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        self._record_replay_starts(scheduler_output)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -3173,6 +3233,19 @@ class TPUModelRunner(GPUModelRunner):
                     tuple(
                         int(v)
                         for v in self.input_batch.num_prompt_tokens[
+                            start_index : start_index + num_reqs
+                        ]
+                    )
+                    + (0,) * (target_num_reqs - num_reqs)
+                )
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            replay_starts_cpu=(
+                (
+                    tuple(
+                        self._replay_starts.get(req_id, 0)
+                        for req_id in self.input_batch.req_ids[
                             start_index : start_index + num_reqs
                         ]
                     )

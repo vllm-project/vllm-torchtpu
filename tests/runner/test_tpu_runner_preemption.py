@@ -53,6 +53,8 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._install_spec_token_room_guard = lambda: None
     runner._mamba_state_pos = {"resumed": 9, "continuing": 12}
     runner._mamba_offset_seeded = {"resumed", "continuing"}
+    runner._replay_starts = {}
+    runner.kv_cache_config = None
     output = SchedulerOutput.make_empty()
     output.finished_req_ids = {"resumed"} if transition == "finish" else set()
     output.preempted_req_ids = {"resumed"} if transition == "preempt" else None

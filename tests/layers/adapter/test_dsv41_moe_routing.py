@@ -428,6 +428,7 @@ def test_route_unpartitioned_path(monkeypatch):
 class _FakeForwardContext:
     def __init__(self, attn_metadata=None):
         self.attn_metadata = attn_metadata
+        self.additional_kwargs = {}
 
 
 def test_prepare_tpu_metadata_not_dict_early_return(monkeypatch):

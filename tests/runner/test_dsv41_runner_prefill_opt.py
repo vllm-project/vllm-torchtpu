@@ -47,6 +47,7 @@ def _make_ctx(**kwargs):
         "query_start_loc": None,
         "query_start_loc_cpu": None,
         "prompt_lens_cpu": None,
+        "replay_starts_cpu": None,
         "request_distribution": None,
         "position_ids_override": None,
         "staged_block_tables": None,
@@ -471,6 +472,7 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path():
 
         return SimpleNamespace(
             reorder_batch_threshold=1,
+            _replay_starts={},
             sequence_layout_planner=AllSequenceLayoutPlanner(),
             _dp_target_bucket=None,
             input_batch=SimpleNamespace(

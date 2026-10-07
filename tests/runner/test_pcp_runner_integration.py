@@ -147,6 +147,7 @@ def _make_runner(
     runner.mamba_slot_read_offsets = None
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
+    runner._replay_starts = {}
     runner._unified_kv_layout = False
     # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
     runner._kv_cache_bundle = None
