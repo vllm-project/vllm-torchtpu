@@ -278,29 +278,28 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
 
 
 def test_hybrid_specs_mamba_page_uses_pooled_physical_dtypes() -> None:
-    # K3 TP32 regression: the KDA layer declares its conv state fp32 (the
-    # fused kernel wants fp32 dense caches), but the unified pool stores the
-    # conv region in bf16. Sizing the mamba page from the declared dtypes
-    # (196608 + 13824 = 210432 B) outgrows the pool's attention-shaped page
-    # (207360 B) and fails the materializer's page invariant; the pool
-    # physical dtypes keep it at 203520 B so the platform-padded 207360 B
-    # holds.
+    # K3 TP32: the KDA layer declares its conv state fp32 and the unified pool
+    # stores it in fp32 too, so the mamba page is 196608 + 13824 = 210432 B.
+    # That outgrows the 162-token MLA page (207360 B); the block size that
+    # fits it is 170 tokens (217600 B), and the normalized mamba spec must
+    # take the attention page and keep the pool's physical dtypes.
     attention_spec = MLAAttentionSpec(
-        block_size=162,
+        block_size=170,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
         page_size_padded=PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            162, 1, 576, torch.bfloat16
+            170, 1, 576, torch.bfloat16
         ),
     )
-    assert attention_spec.page_size_bytes == 207360
+    assert attention_spec.page_size_bytes == 217600
     mamba_spec = MambaSpec(
         block_size=32768,
         shapes=[(3, 3, 3, 128), (3, 128, 128)],
         dtypes=[torch.float32, torch.float32],
-        page_size_padded=207360,
+        page_size_padded=217600,
     )
+    assert mamba_spec.page_size_bytes == 217600
 
     normalized = normalize_kv_cache_specs_for_tpu(
         {
@@ -312,11 +311,11 @@ def test_hybrid_specs_mamba_page_uses_pooled_physical_dtypes() -> None:
         attention_backend=PallasAttentionBackend,
     )
 
-    assert normalized["mamba"].page_size_bytes == 207360
+    assert normalized["mamba"].page_size_bytes == 217600
     assert normalized["mamba"].page_size_bytes == normalized["attn"].page_size_bytes
-    # The retyped spec describes the pool's physical layout: bf16 conv, fp32
+    # The retyped spec describes the pool's physical layout: fp32 conv, fp32
     # ssm.
-    assert tuple(normalized["mamba"].dtypes) == (torch.bfloat16, torch.float32)
+    assert tuple(normalized["mamba"].dtypes) == (torch.float32, torch.float32)
 
 
 def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:

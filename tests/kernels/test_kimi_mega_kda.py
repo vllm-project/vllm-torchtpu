@@ -42,10 +42,8 @@ def test_fused_kda_segment_dispatch(
         )
         calls.append(mode)
         increment = 1 if mode == "verify" else 10
-        states = (
-            kwargs["conv_state"] + increment,
-            kwargs["recurrent_state"] + increment,
-        )
+        conv_state, recurrent_state = kwargs["states"]
+        states = (conv_state + increment, recurrent_state + increment)
         return states, jnp.full((8, 2), increment, jnp.float32)
 
     monkeypatch.setattr(kda_attention_op.gdn_wrapper, "fused_conv1d_gdn", fake_kernel)
