@@ -48,8 +48,8 @@
 #   One K3 server from K3_CONFIG (TP32/EP, long context, tool-call + reasoning
 #   parsers, block size 256), a GSM8K probe on
 #   the fresh server, then the InferenceX AgentX trace replay (aiperf, Claude
-#   Code sessions) at each concurrency ascending. Summary table: output tok/s
-#   per chip, TTFT, TPOT, P90 interactivity, cache hit (a trace statistic aiperf
+#   Code sessions) at each concurrency ascending. Summary table: output tokens
+#   per dollar, tok/s, TTFT, TPOT, P90 interactivity, cache hit (a statistic aiperf
 #   computes from token overlap, not a server measurement). A run below the
 #   model's native context replays only the traces that fit (the client logs
 #   how many), so it is a bring-up number, not a submission.

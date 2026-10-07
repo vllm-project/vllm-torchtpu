@@ -9,7 +9,7 @@
 #   agentx_client.sh --conc-list 1,2,4,8|none --chips N --model-prefix NAME
 #       --precision LABEL [--reference-row "..."] [--server-url URL]
 #       [--engine-url URL] [--runner-type tpu7x-32] [--results-dir DIR]
-#       [--duration 1800] [--fast 1|0] [--ix-ref main] [--tokenizer-dir DIR]
+#       [--duration 1800] [--fast 1|0] [--ix-ref SHA] [--tokenizer-dir DIR]
 #       [--model NAME] [--max-model-len N] [--gsm8k-limit 100]
 #       [--gsm8k-conc 8[,16,...]]
 #       [--gcs-root gs://...] [--port 8000]
@@ -18,9 +18,10 @@
 # starts one from a config and then calls this; a lane whose servers are already
 # running calls this directly - a kube P/D JobSet does so from its CPU pod, with
 # --server-url pointing at the proxy in front of however many prefill and decode
-# engines it has. --chips is the one thing the deployment has to state, because
-# per-chip throughput is a division and nothing in a single /v1/models response
-# can tell this script what to divide by.
+# engines it has. --chips is the one thing the deployment has to state: the
+# headline metric is tokens per dollar, which is what the chips cost for the hour
+# they ran, and nothing in a /v1/models response can tell this script how many
+# there are.
 #
 # One live server serves the whole ladder: aiperf's per-invocation cache-bust
 # marker keeps the points' KV keyspaces disjoint, the same shape as InferenceX's
@@ -59,11 +60,11 @@ GSM8K_CONC="8"         # comma list allowed: one GSM8K run per value
 TOK_DIR_ARG=""         # a local tokenizer directory, when the caller pulled the weights
 MODEL_ARG=""           # served model name; read from the server when empty
 MAX_MODEL_LEN_ARG=""   # context window; read from the server when empty
-# The number of TPU chips serving this benchmark. InferenceX divides total
-# throughput by it to get the per-chip number that is the scenario's headline
-# metric, so it is the serving deployment's whole chip count: TP x DP for one
-# server, and prefill chips + decode chips for a P/D set. It cannot be derived
-# from one engine's TP, so the caller states it and there is no default.
+# The number of TPU chips serving this benchmark: the serving deployment's whole
+# chip count, TP x DP for one server and prefill chips + decode chips for a P/D
+# set. Times the rate in sweep_summary.py it is the cost the headline tokens per
+# dollar divides by. It cannot be derived from one engine's TP, so the caller
+# states it and there is no default.
 CHIPS=""
 RUNNER_TYPE_ARG=""     # InferenceX runner id; "tpu7x-$CHIPS" when empty
 # What InferenceX files the result row under. Both describe the model being
@@ -116,7 +117,7 @@ if [ -z "$CONC_LIST" ]; then
     exit 2
 fi
 case "${CHIPS:-}" in
-    ''|*[!0-9]*|0) echo "agentx_client.sh: --chips N is required (the serving deployment's chip count; it is what per-chip throughput is divided by)" >&2; exit 2 ;;
+    ''|*[!0-9]*|0) echo "agentx_client.sh: --chips N is required (the serving deployment's chip count; with the rate in sweep_summary.py it is the cost tokens per dollar divides by)" >&2; exit 2 ;;
 esac
 RUNNER_TYPE="${RUNNER_TYPE_ARG:-tpu7x-$CHIPS}"
 # Both are labels InferenceX files the row under, and neither has a sensible
@@ -412,9 +413,12 @@ export KV_OFFLOADING=none
 unset KV_OFFLOAD_BACKEND
 export DURATION MODEL
 export MODEL_PREFIX="$MODEL_PREFIX_ARG"
-# TP and EP_SIZE here are not our parallelism: they are what InferenceX divides
-# total throughput by, so both carry the chip count (the same thing the CDK
-# AgentX recipe calls TPU_CHIPS).
+# Not our parallelism: these feed InferenceX's own num_gpus, which it divides
+# total throughput by, so they carry the chip count. They only take effect when
+# IS_MULTINODE=false; we set it true (below), and that branch reads PREFILL_TP
+# and DECODE_TP instead, leaving its num_gpus 0 and its per_gpu empty. Our
+# tokens-per-dollar column does not use any of it: sweep_summary.py divides by
+# what --chips cost.
 export TP="$CHIPS" EP_SIZE="$CHIPS" PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
 # PRECISION is a label in the aggregate, not something the client measures: it
 # is how InferenceX files the row, so it has to match what the published rows
@@ -530,7 +534,7 @@ log "===== summary ($LABEL fast=$FAST) ====="
 : > "$RESULTS_DIR/summary.md"
 print_gsm8k_table
 if ! python3 "$SUMMARY_PY" agentx-table --results-dir "$RESULTS_DIR" \
-        --base "$BASE_RESULT_FILENAME" --concs "${DONE_CONCS[@]}" \
+        --base "$BASE_RESULT_FILENAME" --chips "$CHIPS" --concs "${DONE_CONCS[@]}" \
         | tee -a "$RESULTS_DIR/summary.md"; then
     FAIL=1
     log "ERROR: the AgentX table could not be rendered; the per-point JSON is in $RESULTS_DIR"

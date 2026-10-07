@@ -108,14 +108,14 @@ ix_check_conc_list "$GSM8K_CONC" || exit 1
 # PHYSICAL CHIPS, not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x
 # google.com/tpu 4, which is what GKE allocates and what Google bills per
 # chip-hour) and vLLM runs 32 ranks on it, two per chip. So TP x DP is twice the
-# divisor and the parallelism cannot give it; the caller states it, with no
-# default, because a wrong divisor silently scales the one number this benchmark
-# exists to report.
+# count and the parallelism cannot give it; the caller states it, with no
+# default, because the chips are what tokens per dollar is divided by and a wrong
+# count silently scales the one number this benchmark exists to report.
 case "${CHIPS:-}" in
     ''|*[!0-9]*|0)
         log "FATAL: --chips N is required: the number of physical TPU chips serving" \
-            "this benchmark (16 for one v7x-32 / 2x2x4 slice). It is what InferenceX" \
-            "divides total throughput by for the per-chip figure."
+            "this benchmark (16 for one v7x-32 / 2x2x4 slice). Times the rate in" \
+            "sweep_summary.py it is the cost tokens per dollar divides by."
         exit 2 ;;
 esac
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"
@@ -177,12 +177,12 @@ if [ -n "$MODEL_URI" ]; then
     TOK_DIR=$(python3 -c "import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)" "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
-# The chip count InferenceX divides throughput by, which is PHYSICAL CHIPS and
-# not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x google.com/tpu 4, which is
-# what GKE allocates and what Google bills per chip-hour), and vLLM runs 32 ranks
-# on it - two per chip. So TP x DP is twice the divisor, and the parallelism
-# cannot give it. The deployment states it, and there is no default, because a
-# wrong divisor silently scales the one number this benchmark exists to report.
+# The chips tokens per dollar is costed over, which is PHYSICAL CHIPS and not
+# ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x google.com/tpu 4, which is what
+# GKE allocates and what Google bills per chip-hour), and vLLM runs 32 ranks on
+# it - two per chip. So TP x DP is twice the count, and the parallelism cannot
+# give it. The deployment states it, and there is no default, because a wrong
+# count silently scales the one number this benchmark exists to report.
 RANKS=$(( $(ix_config_json_get tensor_parallelism) * $(ix_config_json_get data_parallelism) ))
 log "serving on $CHIPS chips with $RANKS ranks (TP x DP, from config.json)"
 if [ "$RANKS" -gt 0 ] && [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then

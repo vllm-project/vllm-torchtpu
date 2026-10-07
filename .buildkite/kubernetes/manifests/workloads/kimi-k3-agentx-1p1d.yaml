@@ -215,8 +215,8 @@ spec:
                     - name: K3_PD_CONFIG
                       value: kimi-k3-tp8-dp4-ep-agentx
                     # Physical chips the pair holds: 4 hosts x google.com/tpu 4
-                    # per slice, twice. The divisor for the per-chip figure, and
-                    # what is billed per chip-hour - not the 64 ranks on them.
+                    # per slice, twice. What is billed per chip-hour, and so what
+                    # tokens per dollar is costed over - not the 64 ranks on them.
                     - name: AGENTX_CHIPS
                       value: "32"
                     # This pod's results are the step's only output.

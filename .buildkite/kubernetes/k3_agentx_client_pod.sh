@@ -88,9 +88,9 @@ if [ "${CFG_MAX_NUM_SEQS:-0}" -lt "$NEED_SEQS" ]; then
     exit 2
 fi
 
-# The per-chip divisor: PHYSICAL chips, both engines, stated by the manifest
-# because only it knows what was allocated. TP x DP is ranks, and on v7x that is
-# twice the chips, so deriving it here would halve the reported figure.
+# What tokens per dollar is costed over: PHYSICAL chips, both engines, stated by
+# the manifest because only it knows what was allocated. TP x DP is ranks, and on
+# v7x that is twice the chips, so deriving it here would halve the figure.
 : "${AGENTX_CHIPS:?the manifest must state the physical chip count (32 for two 2x2x4 slices)}"
 case "$AGENTX_CHIPS" in ''|*[!0-9]*|0) log "FATAL: bad AGENTX_CHIPS '$AGENTX_CHIPS'"; exit 2 ;; esac
 CHIPS="$AGENTX_CHIPS"
@@ -108,6 +108,11 @@ proxy_pid=""
 cleanup() {
     [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null
     if [ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ] && command -v buildkite-agent >/dev/null 2>&1; then
+        # aiperf writes server_metrics_export.json per point, and at this context
+        # it was 357 MB in build 247 - one sample per metric per scrape for the
+        # whole window. The CSV beside it carries the same series, so drop the
+        # JSON rather than upload it every night.
+        find "$ARTIFACTS_DIR" -name server_metrics_export.json -delete 2>/dev/null
         buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*" \
             || log "ERROR: results were produced but could not be uploaded"
     fi

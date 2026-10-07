@@ -583,12 +583,12 @@ async def _handle_completions(api: str, request: Request):
                     first = False
                 yield chunk
 
-        # text/event-stream when the caller asked for a stream, which is what the
-        # decode instance is actually sending back. Declared as application/json
-        # a client parses each SSE frame - "data: {...}" prefix and all - as a
-        # JSON document and every request fails; aiperf's agentic replay does
-        # exactly that, while the non-streaming callers this proxy had until now
-        # (check_completions.py, lm_eval) never noticed.
+        # text/event-stream when the caller asked for a stream, which is what
+        # the decode instance is actually sending back. Declared as
+        # application/json, a client parses each SSE frame - "data: {...}" prefix
+        # and all - as one JSON document, and every request fails; aiperf's
+        # agentic replay does exactly that, while the non-streaming callers this
+        # proxy had until now (check_completions.py, lm_eval) never noticed.
         media_type = (
             "text/event-stream" if req_data.get("stream") else "application/json"
         )
