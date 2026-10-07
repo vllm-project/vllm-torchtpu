@@ -232,6 +232,11 @@ _TOPK_ROWS_UPDATE_OP = pallas.jax_op(
 )
 
 
+# torch.compile traces the forward with fake tensors (shape and dtype, no data),
+# so it can't run the JAX function to learn what this op returns. This fake
+# tells it: a tensor shaped like `buf`, i.e. the whole updated table, which the
+# caller copies back into `buf`. The real `_topk_rows_update_jax` runs only
+# when the compiled graph executes.
 def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     del rows
     return torch.empty_like(buf)
