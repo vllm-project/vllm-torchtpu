@@ -21,6 +21,7 @@ tokens) this cuts ~7 ms per transformer layer (80.8 -> 73.9 ms).
 """
 
 import functools
+from functools import cache as run_once
 
 import jax
 import torch
@@ -68,7 +69,7 @@ def rotary_embedding_wan_forward(
     return apply_rotary_pair_swap(x, cos, sin)
 
 
-@functools.cache
+@run_once
 def _qk_norm_rope_op():
     """Builds the torch custom op wrapping the fused Pallas kernel (once)."""
 
@@ -83,7 +84,7 @@ def _qk_norm_rope_op():
     ) -> tuple[jax.Array, jax.Array]:
         return qk_norm_rope(qkv, wq, wk, cos, sin, eps=eps, head_dim=head_dim)
 
-    op = pallas.jax_op("vllm_torchtpu::wan_qk_norm_rope", wan_qk_norm_rope)
+    op = pallas.jax_op("pallas::wan_qk_norm_rope", wan_qk_norm_rope)
 
     def fake(qkv, wq, wk, cos, sin, eps, head_dim):
         shape = (qkv.shape[0], qkv.shape[1] // 3)

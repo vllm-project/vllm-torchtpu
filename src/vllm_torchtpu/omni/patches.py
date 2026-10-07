@@ -304,7 +304,9 @@ def _patch_wan_fused_qk_norm_rope() -> None:
         wan_self_attention_fused,
     )
 
-    orig_self_attention_forward = WanSelfAttention.forward
+    if hasattr(WanSelfAttention, "_tpu_orig_forward"):
+        return
+    WanSelfAttention._tpu_orig_forward = WanSelfAttention.forward
 
     def _fused_self_attention_forward(
         self: Any,
@@ -313,7 +315,7 @@ def _patch_wan_fused_qk_norm_rope() -> None:
         attn_metadata: Any = None,
     ) -> torch.Tensor:
         if not can_fuse_qk_norm_rope(self, hidden_states, rotary_emb):
-            return orig_self_attention_forward(
+            return WanSelfAttention._tpu_orig_forward(
                 self, hidden_states, rotary_emb, attn_metadata
             )
         return wan_self_attention_fused(self, hidden_states, rotary_emb, attn_metadata)

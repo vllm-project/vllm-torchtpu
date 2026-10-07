@@ -553,16 +553,15 @@ def test_wan_self_attention_fused_matches_native(monkeypatch):
 def test_can_fuse_qk_norm_rope():
     attn = _FakeWanSelfAttention()
     rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
-    tpu = MagicMock(dtype=torch.bfloat16)
-    tpu.device.type = "tpu"
-    assert can_fuse_qk_norm_rope(attn, tpu, rot)
+    bf16_x = torch.ones(1, 3, 64, dtype=torch.bfloat16)
+    assert can_fuse_qk_norm_rope(attn, bf16_x, rot)
     assert not can_fuse_qk_norm_rope(attn, torch.ones(1, 3, 64), rot)
-    assert not can_fuse_qk_norm_rope(attn, tpu, None)
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, None)
     attn.norm_q = torch.nn.LayerNorm(8)  # e.g. DistributedRMSNorm under TP
-    assert not can_fuse_qk_norm_rope(attn, tpu, rot)
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, rot)
 
 
-def test_wan_self_attention_patch_falls_back_off_tpu():
+def test_wan_self_attention_patch_falls_back_on_f32():
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanSelfAttention,
     )
