@@ -455,6 +455,35 @@ def relayout_rope_caches(model: torch.nn.Module):
     logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
+def relayout_rope_tables(model: torch.nn.Module):
+    """Re-materialize model-owned RoPE tables (`_tpu_rope_cache`) row-major.
+
+    DeepSeek V4.1 attentions own compact copies of their rotary tables
+    (shared across layers), which `relayout_rope_caches` does not see. Left
+    dim-0-minor, every step transposed each [103424, 64] table for the
+    row-major Pallas RoPE kernels: 3 x 30 us per 40L 100k decode step.
+    Unlike the full rotary caches (up to [1048576, 64]), these tables only
+    span max_model_len rows, so the row-major padding stays small.
+    """
+    # id(original) -> (original, row-major copy); holding the original keeps
+    # its id from being reused while the map is live.
+    relaid: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for name, module in model.named_modules():
+        table = getattr(module, "_tpu_rope_cache", None)
+        if not isinstance(table, torch.Tensor) or table.ndim != 2:
+            continue
+        if id(table) not in relaid:
+            relaid[id(table)] = (table, _to_row_major(table))
+            logger.info(
+                "Relayouted rope table %s._tpu_rope_cache to {1,0} (shape %s)",
+                name,
+                tuple(table.shape),
+            )
+        module._tpu_rope_cache = relaid[id(table)][1]
+    if relaid:
+        _install_entry_layout_pin()
+
+
 def relayout_hash_tables(model: torch.nn.Module):
     """Re-materialize every MOE hash-routing table row-major."""
     seen: set[int] = set()

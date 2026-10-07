@@ -882,26 +882,7 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
-
-        # Pallas SMEM-aware num_reqs caps.
-        self.num_reqs_most_model_len = (
-            min(
-                PallasAttentionBackend.get_max_num_seqs(
-                    self.most_model_len, self.block_size
-                ),
-                self.max_num_reqs,
-                self.max_num_tokens,
-            )
-            if self.most_model_len is not None
-            else None
-        )
-        self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs(
-                self.max_model_len, self.block_size
-            ),
-            self.max_num_reqs,
-            self.max_num_tokens,
-        )
+        self._init_num_reqs_caps()
 
         self.sample_from_logits_func = self.sample_from_logits
 
@@ -997,6 +978,40 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+
+    def _init_num_reqs_caps(self) -> None:
+        # Pallas SMEM-aware num_reqs caps. DeepSeek-V4.1 v2
+        # (TORCH_TPU_DEEPSEEK_V41) gathers KV blocks via SparseCore / VMEM and
+        # does not prefetch [max_num_seqs, pages_per_seq] into SMEM.
+        uses_rpa_smem_page_table = not (
+            self._is_deepseek_v41 and envs.TPU_DEEPSEEK_V41_IMPL == "v2"
+        )
+        self.num_reqs_most_model_len = (
+            min(
+                (
+                    PallasAttentionBackend.get_max_num_seqs(
+                        self.most_model_len, self.block_size
+                    )
+                    if uses_rpa_smem_page_table
+                    else self.max_num_reqs
+                ),
+                self.max_num_reqs,
+                self.max_num_tokens,
+            )
+            if self.most_model_len is not None
+            else None
+        )
+        self.num_reqs_max_model_len = min(
+            (
+                PallasAttentionBackend.get_max_num_seqs(
+                    self.max_model_len, self.block_size
+                )
+                if uses_rpa_smem_page_table
+                else self.max_num_reqs
+            ),
+            self.max_num_reqs,
+            self.max_num_tokens,
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -4806,6 +4821,7 @@ class TPUModelRunner(GPUModelRunner):
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(self.model)
+        runner_utils.relayout_rope_tables(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
 
@@ -4813,6 +4829,12 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
+            draft_model = getattr(self._async_drafter, "draft_model", None)
+            if draft_model is not None:
+                # Draft layers own compact RoPE tables too; executables are
+                # compiled against row-major tables, so a {0,1} draft table
+                # fails at launch with RuntimeProgramInputMismatch.
+                runner_utils.relayout_rope_tables(draft_model)
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

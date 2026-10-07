@@ -307,6 +307,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             if spec is not None
             else None,
         },
+        # Cached executables bake in the device layout of every parameter.
+        # `runner.utils.relayout_rope_tables` stores the compact RoPE tables
+        # row-major ({1,0}); artifacts compiled against the old {0,1} tables
+        # fail at launch with RuntimeProgramInputMismatch. Bump this tag
+        # whenever a load-time relayout changes a parameter layout.
+        "param_layouts": {"rope_tables": "row_major"},
     }
 
     repo_root = Path(__file__).resolve().parents[2]

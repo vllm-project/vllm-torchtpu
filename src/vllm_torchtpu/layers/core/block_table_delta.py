@@ -40,9 +40,9 @@ import numpy as np
 import torch
 
 # Changed entries one delta upload carries. Larger walks take the full path.
-# 16 requests crossing a block boundary together in every one of 51 groups is
-# about 800 entries.
-DELTA_CAPACITY = 2048
+# 128 requests crossing a block boundary together in every one of 51 groups is
+# 6528 entries.
+DELTA_CAPACITY = 8192
 # Staging layouts kept on device (target walk, drafter walk, chunk offsets).
 MAX_LAYOUTS = 4
 
