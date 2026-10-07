@@ -114,9 +114,7 @@ def inner_kernel(
     )
 
     if cfg.state_plan is None:
-        # Only the checkpoint positions; the extra incoming-state position
-        # (`cfg.state_in_pos`) is never copied out.
-        conv_state_slot_ref[:, : cfg.window_size] = new_conv_state
+        conv_state_slot_ref[...] = new_conv_state
     else:
         # External source tiles: encode each window position's checkpoint
         # through the region's typed view; copy_out pushes the raw bytes
@@ -221,9 +219,7 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[:, : cfg.window_size] = new_recurrent_state.astype(
-            recurrent_slot_ref.dtype
-        )
+        recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
     else:
         for idx in range(cfg.seq_tile_size):
             for t in range(cfg.window_size):
@@ -548,15 +544,12 @@ def fused_conv1d_gdn(
         # weights, activations scratch and compiler temporaries).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        # State tiles hold `window` checkpoints plus one dedicated
-        # incoming-state position (`GDNConfig.state_in_pos`) when window > 1.
-        state_positions = window + (1 if window > 1 else 0)
-        recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
+        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
         bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
             recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
-            + state_positions * (kernel_size - 1) * dim * 4
+            + window * (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
             + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
         )

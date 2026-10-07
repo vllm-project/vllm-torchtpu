@@ -132,27 +132,6 @@ class GDNConfig:
         return self.window_size
 
     @property
-    def state_in_pos(self) -> int:
-        """VMEM window position the initial (incoming) state is DMA'd into.
-
-        With a speculative window (`window_size > 1`) the state tile is
-        INPUT_OUTPUT and double buffered: the pipeline issues copy_in for tile
-        i+1 into the slot whose checkpoint copy_out for tile i-1 is still in
-        flight (wait_out(i-1) runs only at the end of step i). If the incoming
-        state shared position 0 with checkpoint 0, the copy_in could overwrite
-        it before the copy_out read it, writing another request's state into
-        checkpoint 0 in HBM. Use a dedicated extra position `window_size`
-        instead, which copy_out never reads. Without a window keep position 0
-        (unchanged layout).
-        """
-        return self.window_size if self.window_size > 1 else 0
-
-    @property
-    def state_window_alloc(self) -> int:
-        """Window positions allocated per sequence in the VMEM state tiles."""
-        return self.window_size + (1 if self.window_size > 1 else 0)
-
-    @property
     def seq_tile_size(self) -> int:
         if self.mode == GDNMode.PER_SEQ:
             return 1
