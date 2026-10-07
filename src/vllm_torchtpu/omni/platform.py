@@ -69,7 +69,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
-    def set_device(cls, device: torch.device) -> None:
+    def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size
@@ -127,8 +127,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return None
 
     @classmethod
-    def synchronize(cls) -> None:
-        torch.accelerator.synchronize()
+    def synchronize(cls, device: torch.device | int | None = None) -> None:
+        torch.accelerator.synchronize(device)
 
     @classmethod
     def empty_cache(cls) -> None:

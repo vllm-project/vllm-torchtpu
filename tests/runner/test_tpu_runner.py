@@ -1991,10 +1991,8 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         requests={},
     )
     calls = []
-    runner.input_batch.update_req_spec_token_ids = (
-        lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))
-        )
+    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
+        calls.append((request.req_id, list(scheduled[request.req_id])))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2500,3 +2498,29 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
     TPUModelRunner._relayout_tables(runner, draft_model)
     assert seen == []
+
+
+def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
+    from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 42)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda d: f"set_{d}")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(torch.accelerator, "set_stream", lambda s: f"set_stream_{s}")
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda dev=None: "synchronized"
+    )
+
+    with _torch_tpu_wrapper():
+        assert torch.cuda.current_device() == 42
+        assert torch.cuda.set_device(0) == "set_0"
+        assert torch.cuda.is_available() is True
+        assert torch.cuda.device_count() == 8
+        assert torch.cuda.current_stream() is fake_stream
+        assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
+        assert torch.cuda.synchronize() == "synchronized"

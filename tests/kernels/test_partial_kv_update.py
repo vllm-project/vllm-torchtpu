@@ -1,4 +1,4 @@
-"""TPU tests for the in-place partial slot update kernel (b/546309078).
+"""TPU tests for the in-place partial slot update kernel.
 
 The cases here are the ones that actually bit during development, not a
 generic sweep. Each names the failure it guards against, because several of

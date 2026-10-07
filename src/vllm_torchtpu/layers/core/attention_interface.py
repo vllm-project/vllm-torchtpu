@@ -150,7 +150,6 @@ def paged_attention_with_guarded_smem(
     lengths: jax.Array,
     page_indices: jax.Array,
 ):
-    # Addresses b/336316706. Summary:
     # Paged attention kernel stores `lengths` (batch_size * 4 bytes) and
     # `page_indices` (batch_size * num_blocks_per_seq * 4 bytes) in SMEM.
     # Capacity of SMEM is quite limited which is also TPU version dependent.

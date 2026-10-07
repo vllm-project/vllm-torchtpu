@@ -252,7 +252,7 @@ def _attention_kernel(
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
-        # TODO(b/539630772): Add a separate v_scale param and apply it to the
+        # TODO: Add a separate v_scale param and apply it to the
         # PV step.
         if k_scale != 1.0:
             pv *= k_scale

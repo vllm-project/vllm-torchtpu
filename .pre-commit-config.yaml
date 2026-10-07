@@ -104,6 +104,15 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: no-internal-refs
+    name: No internal links, bug numbers or source paths
+    # The repo is public, so internal links, bug and change numbers, and
+    # internal source paths mean nothing to most readers. Put the reasoning in
+    # the comment or cite a public source. A link must start a word or follow
+    # http:// or https://, so paths such as /usr/local/go/bin pass.
+    entry: '(^|[\s(\[{"''`<,]|https?://)(go/[A-Za-z]|b/[0-9]{6,}|cl/[0-9]{6,})|\bgoogle3\b'
+    language: pygrep
+    types: [text]
   - id: pyrefly
     name: Pyrefly type check
     # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather

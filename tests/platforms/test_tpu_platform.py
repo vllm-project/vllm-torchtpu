@@ -1154,3 +1154,50 @@ class TestQwen3VLModelPatches:
         finally:
             if hasattr(torch, "_orig_cumsum_ref"):
                 delattr(torch, "_orig_cumsum_ref")
+
+
+def test_tpu_platform_accelerator_methods(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_device_index",
+        lambda dev: calls.append(("set_device_index", dev)),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda dev=None: calls.append(("synchronize", dev)),
+    )
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_stream",
+        lambda s: calls.append(("set_stream", s)),
+    )
+
+    assert TpuPlatform.is_available() is True
+    assert TpuPlatform.current_device() == 0
+    assert TpuPlatform.current_device_index() == 0
+
+    TpuPlatform.set_device(0)
+    assert calls[-1] == ("set_device_index", 0)
+
+    TpuPlatform.set_device_index(1)
+    assert calls[-1] == ("set_device_index", 1)
+
+    TpuPlatform.synchronize()
+    assert calls[-1] == ("synchronize", None)
+
+    TpuPlatform.synchronize(0)
+    assert calls[-1] == ("synchronize", 0)
+
+    assert TpuPlatform.current_stream() is fake_stream
+
+    TpuPlatform.set_stream(fake_stream)
+    assert calls[-1] == ("set_stream", fake_stream)
