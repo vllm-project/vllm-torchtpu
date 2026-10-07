@@ -168,7 +168,7 @@ The project source is organized under `src/vllm_torchtpu/`:
 ## 5. Development & Testing Guidelines
 
 ### Local Testing via Docker
-For running development and unit tests inside containerized environments using Docker, refer to the [Docker Developer Guide](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/getting_started/docker.md).
+For running development and unit tests inside containerized environments using Docker, refer to the [Docker Developer Guide](./docs/getting_started/docker.md).
 
 ### Physical TPU Tests & Buildkite CI (The `ready` Label Gate)
 Tests requiring physical TPU hardware run in Buildkite CI.

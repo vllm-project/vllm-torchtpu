@@ -1,6 +1,6 @@
 # Testing & CI Guide
 
-`vllm-torchtpu` runs continuous integration on Buildkite across CPU agents (`cpu_64_core`), single-host TPU agents, and multi-chip/multi-host TPU slices (`TPU v7x` and `TPU v6e`).
+`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`) across CPU agents (`cpu_64_core`), 2-chip TPU agents (`tpu_v7x_2_queue`), and 8-chip TPU agents (`tpu_v7x_8_queue`).
 
 ---
 
@@ -12,44 +12,73 @@ Install the `test` dependency group before running `pytest`:
 uv pip install --prerelease=allow -e . --group vllm --group test
 ```
 
+The commands below match the exact marker expressions and file filters executed in `.buildkite/pipeline_tests.yml`:
+
 ### 1. Fast CPU Unit Tests (No TPU Required)
 
-Unmarked unit tests run on CPU using the JAX CPU backend and mocked TPU devices:
+Unmarked unit tests run on CPU using the JAX CPU backend (`CPU_ONLY=1` / `JAX_PLATFORMS=cpu`) and mocked TPU devices:
 
 ```bash
-JAX_PLATFORMS=cpu pytest tests/ -m "not tpu_test and not multichip and not nightly"
+JAX_PLATFORMS=cpu pytest tests/ -sv --timeout=600 \
+  -m "not tpu_test and not multichip and not nightly"
 ```
 
-### 2. Single-Host TPU Tests
+### 2. General Single-Host TPU Tests (2-Chip Queue)
 
-On a TPU VM, run tests marked with `tpu_test`:
+On a TPU VM, run the general `tpu_test` suite (excluding `test_speculative_decoding.py`, which runs in its own dedicated CI step):
 
 ```bash
-pytest tests/ -m "tpu_test and not multichip and not nightly"
+pytest tests/ -sv --timeout=600 \
+  --ignore=tests/entrypoints/llm/test_speculative_decoding.py \
+  -m "tpu_test and not nightly and not multichip"
 ```
 
-### 3. Multi-Chip TPU Tests
+### 3. Multi-Chip TPU Tests (8-Chip Queue)
 
 On an 8-chip (or 8-device TPU v7x) host, run multi-chip distributed and kernel tests:
 
 ```bash
-pytest tests/ -m "multichip and not nightly"
+pytest tests/ -sv --timeout=600 \
+  --ignore=tests/entrypoints/llm/test_speculative_decoding.py \
+  -m "not nightly and multichip"
+```
+
+### 4. Speculative Decoding TPU Tests
+
+Speculative decoding e2e tests (`tests/entrypoints/llm/test_speculative_decoding.py`) carry a module-level `pytestmark = pytest.mark.tpu_test` and are split across 2-chip and 8-chip steps:
+
+```bash
+# 2-chip speculative decoding PR suite
+pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=1800 \
+  -m "not nightly and not multichip"
+
+# 8-chip speculative decoding multichip PR suite (e.g. DP + MTP)
+pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=3600 \
+  -m "not nightly and multichip"
+```
+
+### 5. Omni Multimodal & Diffusion TPU Tests (`tests_omni/`)
+
+With `--extra omni` installed, run the `vllm-omni` test suite:
+
+```bash
+pytest tests_omni/ -sv --timeout=1200 -m "not nightly and omni"
 ```
 
 ---
 
 ## Pytest Markers Reference
 
-Every test in `tests/` and `tests_omni/` is routed to the appropriate CI queue using the markers defined in `pyproject.toml`:
+Every test in `tests/` and `tests_omni/` is routed to the appropriate CI queue using the markers registered in `[tool.pytest.ini_options]` in `pyproject.toml`:
 
 | Marker | Hardware / CI Queue | Description |
 | :--- | :--- | :--- |
-| *(unmarked)* | `cpu_64_core` (`JAX_PLATFORMS=cpu`) | Fast unit tests that do not require physical TPU devices. |
-| `@pytest.mark.tpu_test` | Single-host TPU agent | Tests that require physical TPU hardware (`torch.device("tpu")`). |
-| `@pytest.mark.multichip` | 8-chip TPU agent | Tests that require more than 2 TPU chips (e.g., TP/EP/DP collectives). |
-| `@pytest.mark.spawns_tpu_workers` | Multi-device TPU agent | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; must run before any in-process TPU test in the same `pytest` session. |
-| `@pytest.mark.nightly` | Nightly CI workflow only | Long-running or full-checkpoint tests excluded from per-PR CI gates. Must still be combined with `tpu_test` or `multichip` if TPU hardware is required. |
-| `@pytest.mark.omni` | Omni TPU CI workflow | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
+| *(unmarked)* | `cpu_64_core` (`CPU_ONLY=1`) | Fast unit tests that do not require physical TPU devices. |
+| `@pytest.mark.tpu_test` | `tpu_v7x_2_queue` (Single-host TPU agent) | Tests that require physical TPU hardware (`torch.device("tpu")`). |
+| `@pytest.mark.multichip` | `tpu_v7x_8_queue` (8-chip TPU agent) | Tests that require more than 2 TPU chips (e.g., TP/EP/DP collectives). |
+| `@pytest.mark.spawns_tpu_workers` | Multi-device TPU agent | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; ordered by `tests/conftest.py` to run before any in-process TPU test in the same `pytest` session. |
+| `@pytest.mark.nightly` | Nightly CI workflow (`NIGHTLY=1`) | Long-running or full-checkpoint tests excluded from per-PR CI gates. Must still be combined with `tpu_test` or `multichip` if TPU hardware is required. |
+| `@pytest.mark.omni` | `tpu_v7x_2_queue` (`-omni` image) | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
 
 ---
 
