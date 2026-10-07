@@ -14,6 +14,11 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.block_table_delta import (
+    BlockTableDeltaStager,
+    get_stager,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -516,34 +521,6 @@ def stage_block_table_uploads(
     if not entries:
         return
 
-    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
-        scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        runner._block_table_stage_cpu = scratch
-    flat = scratch[:total]
-    flat.zero_()
-
-    if ctx.position_ids_override is None:
-        offset = 0
-        for builder, (_, block_table_obj, target_num_blocks) in zip(
-            entry_builders, entries
-        ):
-            active_cols = builder._active_block_table_columns(ctx, target_num_blocks)
-            rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
-                num_reqs_padded, target_num_blocks
-            )
-            source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs, :active_cols] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
-            ]
-            offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
-
-    staged_dev = flat.to(runner.device, non_blocking=True)
-
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
     # (replaces one micro-program per group per step).
@@ -564,6 +541,70 @@ def stage_block_table_uploads(
             if builder.is_mamba_group:
                 mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
                 mamba_entry_indices.append(i)
+
+    # Incremental staging keeps the packed buffer on device across steps and
+    # uploads only changed entries (`block_table_delta.py`). Limited to walks
+    # that run the products program, whose outputs are fresh buffers, so the
+    # kept copy is never handed to a consumer that could donate it.
+    is_dummy = ctx.position_ids_override is not None
+    stager: BlockTableDeltaStager | None = None
+    delta_key = None
+    if (len(entries) > 1 or mamba_geom) and envs.TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD:
+        stager = get_stager(runner)
+        if not is_dummy:
+            delta_key = stager.layout_key(entries, num_reqs_padded, ctx.start_index)
+    staged_dev = None
+    if stager is not None and delta_key is not None:
+        staged_dev = stager.try_stage(
+            delta_key, ctx, entries, entry_builders, num_reqs_padded
+        )
+    verify = staged_dev is not None and envs.TPU_VERIFY_INCREMENTAL_BLOCK_TABLE
+
+    if staged_dev is None or verify:
+        total = offset
+        scratch = runner._block_table_stage_cpu
+        if scratch is None or scratch.numel() < total:
+            scratch = torch.zeros(
+                (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            )
+            runner._block_table_stage_cpu = scratch
+        flat = scratch[:total]
+        flat.zero_()
+
+        if not is_dummy:
+            for builder, (_, block_table_obj, target_num_blocks), (off, _, _) in zip(
+                entry_builders, entries, table_geom
+            ):
+                active_cols = builder._active_block_table_columns(
+                    ctx, target_num_blocks
+                )
+                rows = flat[off : off + num_reqs_padded * target_num_blocks].view(
+                    num_reqs_padded, target_num_blocks
+                )
+                source = block_table_obj.get_cpu_tensor()
+                rows[: ctx.num_reqs, :active_cols] = source[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
+                ]
+        # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+
+        if verify:
+            assert stager is not None and delta_key is not None
+            stager.verify(delta_key, flat)
+        else:
+            staged_dev = flat.to(runner.device, non_blocking=True)
+            if stager is not None and is_dummy:
+                stager.warm(staged_dev)
+            elif stager is not None and delta_key is not None:
+                stager.record_full(
+                    delta_key,
+                    ctx,
+                    entries,
+                    entry_builders,
+                    num_reqs_padded,
+                    flat,
+                    staged_dev,
+                )
+    assert staged_dev is not None
 
     if len(entries) == 1 and not mamba_geom:
         # Exactly one group with no mamba derivation: the flat upload is

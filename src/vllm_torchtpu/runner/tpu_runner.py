@@ -61,6 +61,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -353,6 +354,29 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+def _spec_warmup_group_num_blocks(runner: Any, group: Any, max_pos: int) -> int:
+    """Return the KV block count a synthetic warmup request needs in ``group``.
+
+    Fixed-capacity groups such as ``CircularBufferSpec`` (e.g. DeepSeek-V4.1's
+    compressor state ring, ``block_size=8``) hold 1 block per request for their
+    entire lifetime (``max_num_blocks_per_req == 1``), and their worker
+    ``BlockTable`` is sized to that cap rather than ``cdiv(max_model_len, gbs)``.
+    """
+    spec = group.kv_cache_spec
+    max_len = min(max_pos, runner.max_model_len)
+    g_nblk = cdiv(max_len, int(spec.block_size))
+    if isinstance(spec, CircularBufferSpec):
+        return min(
+            g_nblk,
+            int(
+                cast(Any, spec).max_num_blocks_per_req(
+                    getattr(runner, "vllm_config", None), max_len
+                )
+            ),
+        )
+    return g_nblk
 
 
 @contextmanager
@@ -5893,11 +5917,7 @@ class TPUModelRunner(GPUModelRunner):
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
-            )
+            group_num_blocks = _spec_warmup_group_num_blocks(self, group, max_pos)
             block_ids_per_group.append(list(range(top - group_num_blocks, top)))
             max_nblk = max(max_nblk, group_num_blocks)
         if top <= max_nblk + 1:
@@ -6200,10 +6220,10 @@ class TPUModelRunner(GPUModelRunner):
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
-        group_nblks = []
-        for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            group_nblks.append(min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs)))
+        group_nblks = [
+            _spec_warmup_group_num_blocks(self, group, max_pos)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
         nblk = max(group_nblks)
         top = int(self.kv_cache_config.num_blocks)
         if top <= R * nblk + 1:
@@ -6317,8 +6337,7 @@ class TPUModelRunner(GPUModelRunner):
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
+            g_nblk = _spec_warmup_group_num_blocks(self, group, max_pos)
             block_ids_per_group.append(list(range(1, 1 + g_nblk)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
