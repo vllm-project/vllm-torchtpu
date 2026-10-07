@@ -363,6 +363,7 @@ class StateBufferedRef(BaseBufferedRef):
             # One compact update per sequence slot; PCP has no checkpoints.
             assert self.cfg.window_size == 1
             dst_ref = self.compact_output_ref
+            assert dst_ref is not None
 
         vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         dst_ref = granule_view(dst_ref, dst_ref.shape[:1])

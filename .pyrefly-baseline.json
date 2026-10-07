@@ -741,17 +741,17 @@
       "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },

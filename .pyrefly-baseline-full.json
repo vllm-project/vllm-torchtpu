@@ -1546,6 +1546,246 @@
       "concise_description": "`num_lanes` may be uninitialized"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `conv_state_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `recurrent_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_conv_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_recurrent_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "bad-override",
+      "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `ref` with type `Ref` in function `granule_view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "bad-assignment",
+      "concise_description": "`Any | None` is not assignable to variable `dst_ref` with type `Ref`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `ref` with type `Ref` in function `granule_view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.memory_ref.granule_view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.memory_ref.granule_view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `barrier_sem` with type `Array` in function `_all_rank_barrier`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `dict[str, float | int | str]` is not assignable to parameter `metadata` with type `dict[str, str] | None` in function `jax._src.pallas.pallas_call.pallas_call`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/vmem_ldst.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `reshape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/vmem_ldst.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `reshape`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/kernel.py",
       "name": "unbound-name",
       "concise_description": "`q_row` may be uninitialized"
@@ -1801,6 +2041,46 @@
       "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[ExternalStateBufferedRef, ExternalStateBufferedRef]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-override",
       "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
@@ -1837,53 +2117,28 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `ref` with type `Ref` in function `granule_view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `vmem_ref` with type `Ref` in function `StateBufferedRef._wait_slice`"
+      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `ref` with type `Ref` in function `granule_view`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `vmem_ref` with type `Ref` in function `StateBufferedRef._wait_slice`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `whole_block_dma`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
+      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `shape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
@@ -1893,107 +2148,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-return",
-      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `barrier_sem` with type `Array` in function `_all_rank_barrier`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `body_prologue` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, float | int | str]` is not assignable to parameter `metadata` with type `dict[str, str] | None` in function `jax._src.pallas.pallas_call.pallas_call`"
+      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef | ExternalStateBufferedRef, BufferedRef | ExternalStateBufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
@@ -2004,21 +2159,6 @@
       "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -2043,12 +2183,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
+      "concise_description": "Argument `Array` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.legacy_unified.store_external_state`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -2083,47 +2218,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+      "concise_description": "Argument `Array` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.legacy_unified.store_external_state`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -2132,63 +2227,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `in_conv_state` with type `Array` in function `call_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `in_conv_state` with type `Array` in function `call_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Array | None, Unknown]` is not assignable to declared return type `tuple[Array, Array] | tuple[tuple[Array, Array], Array]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `in_conv_state` with type `Array` in function `call_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `in_conv_state` with type `Array` in function `call_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "unbound-name",
-      "concise_description": "`conv_out_dtype` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "unbound-name",
-      "concise_description": "`conv_state_shape` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "unbound-name",
-      "concise_description": "`recurrent_out_dtype` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/decode_kda.py",
