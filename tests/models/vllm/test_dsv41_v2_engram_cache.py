@@ -4,7 +4,11 @@
 Covers all lines and branches in:
 - vllm_torchtpu.models.vllm.deepseek_v41.common.engram
 - vllm_torchtpu.models.vllm.deepseek_v41.v2.cache (lines 20-40)
-- vllm_torchtpu.envs (TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD)
+- vllm_torchtpu.envs (TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD, the alias of
+  TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD=all)
+
+The host-offload lookup path (gather_host, stage_rows, EngramHostLookup and the
+offload modes) is covered by test_dsv41_engram_offload.py.
 """
 
 from __future__ import annotations
@@ -390,96 +394,6 @@ def test_engram_create_embedding_and_row_slice_registration(
         emb.vocab_start_idx,
         emb.part_num_embeddings,
     )
-
-
-def test_engram_init_staging_branches():
-    """Verify _init_staging allocates raw/scale staging only with cpu_offload."""
-    # Branch 1: cpu_offload = True
-    engram_on = object.__new__(Engram)
-    nn.Module.__init__(engram_on)
-    engram_on.embed_tokens = SimpleNamespace(
-        cpu_offload=True, part_n_hash_cols=4, block_size=8
-    )
-    Engram._init_staging(engram_on, max_tokens=10, head_dim=16)
-    for name, last in (("_host_raw", 16), ("_host_scale", 2)):
-        buf = getattr(engram_on, name)
-        assert buf.shape == (10, 4, last)
-        assert buf.dtype == torch.uint8
-        assert buf.device.type == "cpu"
-    assert engram_on._staged_raw.shape == (10, 4, 16)
-    assert engram_on._staged_scale.shape == (10, 4, 2)
-    assert torch.all(engram_on._host_scale == v2_engram._UNIT_SCALE)
-    assert torch.all(engram_on._staged_scale == v2_engram._UNIT_SCALE)
-    assert engram_on.staged_rows.shape == (10, 4, 16)
-
-    # Branch 2: cpu_offload = False
-    engram_off = object.__new__(Engram)
-    nn.Module.__init__(engram_off)
-    engram_off.embed_tokens = SimpleNamespace(cpu_offload=False, part_n_hash_cols=4)
-    Engram._init_staging(engram_off, max_tokens=10, head_dim=16)
-    assert engram_off._staged_raw is None
-    assert engram_off.staged_rows.shape == (10, 4, 16)
-
-
-def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
-    """Verify the raw-gather offload path, tail reset, and both fallbacks."""
-    dim = 16
-    block = 8
-    max_tokens = 8
-    cols = 3
-    one_fp8 = torch.tensor(1.0, dtype=torch.float8_e4m3fn).view(torch.uint8).item()
-
-    def make_engram(cpu_offload: bool):
-        engram = object.__new__(Engram)
-        nn.Module.__init__(engram)
-        embed = MagicMock()
-        embed.cpu_offload = cpu_offload
-        embed.part_n_hash_cols = cols
-        embed.block_size = block
-
-        def mock_gather_raw(hash_ids, raw_out, scale_out):
-            raw_out.fill_(one_fp8)
-            scale_out.fill_(v2_engram._UNIT_SCALE + 2)  # 2**2
-
-        embed.gather_raw = mock_gather_raw
-        engram.embed_tokens = embed
-        Engram._init_staging(engram, max_tokens=max_tokens, head_dim=dim)
-        return engram
-
-    engram = make_engram(cpu_offload=True)
-
-    # Case A: Partial tokens -> tail reset to FP8 zero with unit scale.
-    engram._host_raw.fill_(99)
-    engram._host_scale.fill_(99)
-    engram.prepare_embeddings(torch.zeros(5, cols, dtype=torch.int32))
-    assert torch.all(engram._staged_raw[:5] == one_fp8)
-    assert torch.all(engram._staged_scale[:5] == v2_engram._UNIT_SCALE + 2)
-    assert torch.count_nonzero(engram._staged_raw[5:]) == 0
-    assert torch.all(engram._staged_scale[5:] == v2_engram._UNIT_SCALE)
-    rows = Engram._ready_rows(engram, max_tokens)
-    torch.testing.assert_close(
-        rows[:5], torch.full((5, cols, dim), 4.0, dtype=torch.bfloat16)
-    )
-    assert torch.count_nonzero(rows[5:]) == 0
-
-    # Case B: Exact tokens -> no tail reset.
-    engram.prepare_embeddings(torch.zeros(max_tokens, cols, dtype=torch.int32))
-    torch.testing.assert_close(
-        Engram._ready_rows(engram, max_tokens),
-        torch.full((max_tokens, cols, dim), 4.0, dtype=torch.bfloat16),
-    )
-
-    # Case C/D: Exceeding max_tokens, or no offload staging -> upstream path.
-    fallback_calls = []
-    monkeypatch.setattr(
-        v2_engram.upstream.Engram,
-        "prepare_embeddings",
-        lambda self, hash_ids: fallback_calls.append(self),
-    )
-    engram.prepare_embeddings(torch.zeros(12, cols, dtype=torch.int32))
-    engram_off = make_engram(cpu_offload=False)
-    engram_off.prepare_embeddings(torch.zeros(5, cols, dtype=torch.int32))
-    assert fallback_calls == [engram, engram_off]
 
 
 # ==============================================================================

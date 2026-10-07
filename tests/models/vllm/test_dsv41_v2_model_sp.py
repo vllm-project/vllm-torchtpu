@@ -185,117 +185,71 @@ def test_stage_base_and_wrappers():
 
 
 # ---------------------------------------------------------------------------
-# 4. v2/model.py: DeepseekV41Model helper methods and _prepare_engram
+# 4. v2/model.py: Engram hashing and the host lookup orchestration
 # ---------------------------------------------------------------------------
 
 
-def test_has_cpu_offloaded_engram():
-    model = SimpleNamespace(
-        start_layer=0,
-        end_layer=3,
-        layers=[
-            SimpleNamespace(engram=None),
-            SimpleNamespace(
-                engram=SimpleNamespace(embed_tokens=SimpleNamespace(cpu_offload=False))
-            ),
-            SimpleNamespace(
-                engram=SimpleNamespace(embed_tokens=SimpleNamespace(cpu_offload=True))
-            ),
-        ],
-    )
-    assert v2_model.DeepseekV41Model._has_cpu_offloaded_engram(model) is True
-
-    model.layers[2].engram.embed_tokens.cpu_offload = False
-    assert v2_model.DeepseekV41Model._has_cpu_offloaded_engram(model) is False
-
-
-def test_prepare_engram_early_exits(monkeypatch: pytest.MonkeyPatch):
-    model = SimpleNamespace(
-        engram_hash=None,
-        _has_cpu_offloaded_engram=lambda: False,
-    )
+def test_engram_hashes_early_exits(monkeypatch: pytest.MonkeyPatch):
+    model = SimpleNamespace(engram_hash=None)
     pos = torch.zeros(4, dtype=torch.int32)
     ids = torch.zeros(4, dtype=torch.int32)
 
-    # stage == 'decoder'
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="decoder"
-    ) == (None, None)
-
     # engram_hash is None
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="full"
-    ) == (None, None)
+    assert v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, None) == (
+        None,
+        None,
+    )
 
     # input_ids is None
     model.engram_hash = SimpleNamespace()
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, None, pos, None, stage="full"
-    ) == (None, None)
+    assert v2_model.DeepseekV41Model._engram_hashes(model, None, pos, None) == (
+        None,
+        None,
+    )
 
     # forward context unavailable
     monkeypatch.setattr(
         v2_model.upstream, "is_forward_context_available", lambda: False
     )
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="full"
-    ) == (None, None)
-
-
-def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
-    @dataclass
-    class _FakeSwaMeta:
-        seq_lens: torch.Tensor
-        query_start_loc: torch.Tensor
-        block_table: torch.Tensor | None = None
-
-    @dataclass
-    class _FakeForwardCtx:
-        attn_metadata: Any
-
-    prepared_embeddings: list[torch.Tensor] = []
-
-    class _FakeEngram:
-        layer_hash_index = 0
-
-        def prepare_embeddings(self, h: torch.Tensor) -> None:
-            prepared_embeddings.append(h)
-
-    class _FakeEngramHash:
-        def __init__(self):
-            self.multipliers = torch.zeros((3, 1))
-            self.lookback_depth = 4
-            self.use_slot_cache = True
-            self.swa_cache_module = SimpleNamespace(kv_cache=torch.zeros(1))
-
-        def ensure_cache(self) -> bool:
-            return True
-
-        def dummy_hashes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return torch.zeros((x.shape[0], 3, 1)), torch.ones(
-                x.shape[0], dtype=torch.bool
-            )
-
-        def __call__(self, *args: Any) -> torch.Tensor:
-            return torch.ones((4, 3, 1), dtype=torch.int32)
-
-    model = SimpleNamespace(
-        engram_hash=_FakeEngramHash(),
-        engram_swa_prefix="swa",
-        engram_dp_shared_memory=False,
-        start_layer=0,
-        end_layer=1,
-        layers=[SimpleNamespace(engram=_FakeEngram())],
-        _has_cpu_offloaded_engram=lambda: True,
-        # Device hash path; the host path is covered by test_dsv41_v2_host_engram.
-        _host_hash_inputs=lambda *args: None,
+    assert v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, None) == (
+        None,
+        None,
     )
 
+
+@dataclass
+class _FakeSwaMeta:
+    seq_lens: torch.Tensor
+    query_start_loc: torch.Tensor
+    block_table: torch.Tensor | None = None
+
+
+@dataclass
+class _FakeForwardCtx:
+    attn_metadata: Any
+    additional_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+class _FakeEngramHash:
+    def __init__(self):
+        self.multipliers = torch.zeros((3, 1))
+        self.lookback_depth = 4
+        self.use_slot_cache = True
+        self.swa_cache_module = SimpleNamespace(kv_cache=torch.zeros(1))
+
+    def ensure_cache(self) -> bool:
+        return True
+
+    def dummy_hashes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros((x.shape[0], 3, 1)), torch.ones(x.shape[0], dtype=torch.bool)
+
+    def __call__(self, *args: Any) -> torch.Tensor:
+        return torch.ones((4, 3, 1), dtype=torch.int32)
+
+
+def _patch_engram_context(monkeypatch, attn_metadata):
+    ctx = _FakeForwardCtx(attn_metadata=attn_metadata)
     monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
-    meta = _FakeSwaMeta(
-        seq_lens=torch.tensor([4]), query_start_loc=torch.tensor([0, 4])
-    )
-    ctx = _FakeForwardCtx(attn_metadata=[{"swa": meta}])
     monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: ctx)
     monkeypatch.setattr(v2_model.upstream, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(
@@ -303,90 +257,147 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         "image_sentinel_mask",
         lambda t: torch.zeros_like(t, dtype=torch.bool),
     )
-    monkeypatch.setattr(
-        v2_model.upstream, "gather_engram_hashes", lambda h, dp_shared_memory: h
-    )
     monkeypatch.setattr(v2_model, "_cache_slots", lambda *a: None)
     monkeypatch.setattr(v2_model, "_block_table", lambda *a: None)
+    return ctx
 
+
+def test_engram_hashes_device_path(monkeypatch: pytest.MonkeyPatch):
+    model = SimpleNamespace(
+        engram_hash=_FakeEngramHash(),
+        engram_swa_prefix="swa",
+        engram_dp_shared_memory=False,
+    )
+    meta = _FakeSwaMeta(
+        seq_lens=torch.tensor([4]), query_start_loc=torch.tensor([0, 4])
+    )
+    ctx = _patch_engram_context(monkeypatch, [{"swa": meta}])
     ids = torch.arange(4, dtype=torch.int32)
     pos = torch.arange(4, dtype=torch.int32)
 
-    # 1. skip_lookup=True
-    h, m = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=True
-    )
-    assert h is not None and h.shape == (4, 3, 1)
-    assert m is not None
-
-    # 2. skip_lookup=False, lookback_token_ids=None, use_slot_cache=False
+    # No lookback ids and no slot cache: unsupported.
     model.engram_hash.use_slot_cache = False
     with pytest.raises(NotImplementedError, match="lookback_token_ids"):
-        v2_model.DeepseekV41Model._prepare_engram(
-            model, ids, pos, None, skip_lookup=False
-        )
+        v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, None)
 
-    # 3. skip_lookup=False, lookback_token_ids=None, use_slot_cache=True
+    # No lookback ids with the slot cache: hashes and the keep mask.
     model.engram_hash.use_slot_cache = True
-    h, m = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=False
-    )
+    h, m = v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, None)
     assert h is not None and h.shape == (4, 3, 1)
-    assert len(prepared_embeddings) == 1
+    assert m is not None and bool(m.all())
 
-    # 4. Fallback dummy_hashes collective branch (ensure_cache() is False, DP size > 1)
+    # Lookback ids given, attn_metadata as a dict.
+    ctx.attn_metadata = {"swa": meta}
+    lookback = torch.zeros((1, 4), dtype=torch.int32)
+    h, _ = v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, lookback)
+    assert h is not None
+
+    # Unbound KV cache with DP > 1: collective dummy hashes.
     model.engram_hash.ensure_cache = lambda: False
     monkeypatch.setattr(v2_model.upstream, "get_engram_dp_size", lambda: 2)
-    h_dummy, m_dummy = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=False
-    )
-    assert h_dummy is not None and m_dummy is not None
+    h, m = v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, lookback)
+    assert h is not None and m is not None
 
-    # 5. lookback_token_ids already provided (not None)
-    model.engram_hash.ensure_cache = lambda: True
-    lookback = torch.zeros((1, 4), dtype=torch.int32)
-    h_lookback, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_lookback is not None
-
-    # 6. attn_metadata is direct dict (not list)
-    ctx.attn_metadata = {"swa": meta}
-    h_dict, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_dict is not None
-
-    # 7. gathered_hashes on TPU/non-cpu converted to cpu
-    class _FakeTpuHashes(torch.Tensor):
-        @property
-        def device(self):
-            return SimpleNamespace(type="tpu")
-
-        def to(self, device):
-            return torch.zeros((4, 3, 1), dtype=torch.int32)
-
-    monkeypatch.setattr(
-        v2_model.upstream,
-        "gather_engram_hashes",
-        lambda h, dp_shared_memory: torch.zeros(
-            (4, 3, 1), dtype=torch.int32
-        ).as_subclass(_FakeTpuHashes),
-    )
-    model.layers.append(SimpleNamespace(engram=None))
-    model.end_layer = len(model.layers)
-    h_cpu, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_cpu is not None
-
-    # 8. engram_dp_shared_memory=True when ensure_cache() is False
-    model.engram_hash.ensure_cache = lambda: False
+    # Unbound KV cache with shared DP memory: nothing.
     model.engram_dp_shared_memory = True
-    h_none, m_none = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
+    assert v2_model.DeepseekV41Model._engram_hashes(model, ids, pos, lookback) == (
+        None,
+        None,
     )
-    assert h_none is None and m_none is None
+
+
+def test_engram_hash_ids_host_device_and_profile(monkeypatch: pytest.MonkeyPatch):
+    meta = _FakeSwaMeta(
+        seq_lens=torch.tensor([4]), query_start_loc=torch.tensor([0, 4])
+    )
+    _patch_engram_context(monkeypatch, {"swa": meta})
+    ids = torch.arange(4, dtype=torch.int32)
+    pos = torch.arange(4, dtype=torch.int32)
+    host_hashes = torch.full((4, 2, 24), 7, dtype=torch.int32)
+    stage_hashes = torch.full((4, 2, 24), 9, dtype=torch.int32)
+    engram_hash = _FakeEngramHash()
+    engram_hash.hash_on_host = lambda *args: host_hashes
+    model = SimpleNamespace(
+        engram_host_lookup=object(),
+        engram_hash=engram_hash,
+        engram_swa_prefix="swa",
+        engram_hash_stage=lambda *args: [stage_hashes],
+        _host_hash_inputs=lambda *args: ("host args",),
+    )
+    hash_ids = v2_model.DeepseekV41Model._engram_hash_ids
+
+    # Prompt-only step: hashed on the host; the device copy feeds the stage.
+    device_ids, host_ids = hash_ids(model, ids, pos, None)
+    assert host_ids is host_hashes and torch.equal(device_ids, host_hashes)
+
+    # Other steps: the compiled hash stage, no host copy.
+    model._host_hash_inputs = lambda *args: None
+    device_ids, host_ids = hash_ids(model, ids, pos, None)
+    assert device_ids is stage_hashes and host_ids is None
+
+    # Unbound KV cache (profile run) or no offloaded table: nothing.
+    engram_hash.ensure_cache = lambda: False
+    assert hash_ids(model, ids, pos, None) == (None, None)
+    model.engram_host_lookup = None
+    assert hash_ids(model, ids, pos, None) == (None, None)
+
+
+def test_run_front_all_and_late(monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+    hashes = torch.ones((4, 2, 24), dtype=torch.int32)
+    rows = torch.zeros((4, 1, 3, 264), dtype=torch.uint8)
+
+    def lookup(ids, device):
+        calls.append("lookup")
+        return rows
+
+    def whole(*args, engram_hash_ids=None, engram_rows=None):
+        calls.append("whole")
+        assert engram_hash_ids is hashes and engram_rows is rows
+        return "whole out"
+
+    def split_a(*args, engram_hash_ids=None):
+        calls.append("a")
+        return [("h", "r", "post", "res", "pre")]
+
+    def split_b(*args, engram_hash_ids=None, engram_rows=None):
+        calls.append("b")
+        assert args[2:] == ("h", "r", "post", "res", "pre")
+        assert engram_rows is rows
+        return "b out"
+
+    model = SimpleNamespace(
+        _engram_hash_ids=lambda *args: (hashes, None),
+        engram_host_lookup=lookup,
+        engram_split_a=None,
+        engram_split_b=None,
+    )
+    run = v2_model.DeepseekV41Model._run_front
+    args = (whole, torch.zeros(4), torch.zeros(4), None, None, None)
+
+    # "all": rows fetched, then the whole stage.
+    assert run(model, *args) == "whole out"
+    assert calls == ["lookup", "whole"]
+
+    # "late": stage A launched before the host fetch, then stage B.
+    calls.clear()
+    model.engram_split_a, model.engram_split_b = split_a, split_b
+    assert run(model, *args) == "b out"
+    assert calls == ["a", "lookup", "b"]
+
+    # No hash ids (profile run): no lookup.
+    calls.clear()
+    model._engram_hash_ids = lambda *args: (None, None)
+    model.engram_split_a = model.engram_split_b = None
+    whole_calls = []
+    run(
+        model,
+        lambda *a, engram_hash_ids=None, engram_rows=None: whole_calls.append(
+            (engram_hash_ids, engram_rows)
+        ),
+        *args[1:],
+    )
+    assert calls == [] and whole_calls == [(None, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -416,11 +427,14 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
             self._ced_window = 4
             self._ced_compile_sizes = (4,)
 
-        def _has_cpu_offloaded_engram(self):
-            return False
+        engram_host_lookup = None
+        engram_split_a = None
+        engram_split_b = None
 
-        def _prepare_engram(self, *args, **kwargs):
+        def _engram_hash_ids(self, *args):
             return None, None
+
+        _run_front = v2_model.DeepseekV41Model._run_front
 
         def full_stage(self, *args, **kwargs):
             return torch.ones((4, 16), dtype=torch.bfloat16)
@@ -444,8 +458,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     ids = torch.arange(4, dtype=torch.int32)
     pos = torch.arange(4, dtype=torch.int32)
 
-    # 1. offload_engram = True with use_mega_moe = True
-    model._has_cpu_offloaded_engram = lambda: True
+    # 1. Full stage with use_mega_moe = True
     model.use_mega_moe = True
     out_full = v2_model.DeepseekV41Model.forward(model, ids, pos)
     assert out_full.shape == (4, 16)
@@ -517,8 +530,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     assert out_cpu.shape == (4, 16)
     assert len(synced) == 0
 
-    # 6. offload_engram = False with use_mega_moe = False
-    model._has_cpu_offloaded_engram = lambda: False
+    # 6. use_mega_moe = False
     model.use_mega_moe = False
     out_no_offload = v2_model.DeepseekV41Model.forward(model, ids, pos)
     assert out_no_offload.shape == (4, 16)
@@ -557,7 +569,9 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
         end_layer=4,
         _stage_uses_sequence_parallel=lambda stage: False,
         use_mega_moe=False,
-        _prepare_engram=lambda *a, **kw: (None, None),
+        _engram_hashes=lambda *a, **kw: (None, None),
+        engram_host_lookup=None,
+        _engram_split=None,
         aux_hidden_state_layers=set(),
         layers=[_FakeCallableLayer() for _ in range(4)],
         norm=lambda x: x,
@@ -673,7 +687,9 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
         end_layer=2,
         _stage_uses_sequence_parallel=lambda stage: True,
         use_mega_moe=True,
-        _prepare_engram=lambda *a, **kw: (None, None),
+        _engram_hashes=lambda *a, **kw: (None, None),
+        engram_host_lookup=None,
+        _engram_split=None,
         aux_hidden_state_layers={1, 2},
         layers=[_FakeAuxLayer(), _FakeAuxLayer()],
         norm=lambda x: x,

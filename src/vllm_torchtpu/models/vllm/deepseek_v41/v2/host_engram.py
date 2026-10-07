@@ -1,11 +1,11 @@
 """Host copies of a step's Engram hash inputs, for Host-DRAM Engram tables.
 
-With ``TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`` the Engram rows are gathered on
-the host, so the n-gram hashes must reach the host every step. Hashing on the
-device and copying back (``gathered_hashes.to("cpu")``) blocks on the previous
-step and stops async scheduling from overlapping host work with the device.
-The runner already holds every hash input on the host before uploading it, so
-V4.1 publishes those host copies for the model instead.
+With host-resident Engram tables (``TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD``) the
+rows are gathered on the host, so the n-gram hashes must reach the host. On a
+prompt-only step the runner already holds every hash input on the host before
+uploading it, so V4.1 publishes those host copies for the model, which hashes
+there and skips the device hash stage and its copy back. Steps with generated
+tokens hash on the device: under async scheduling the host does not know them.
 
 Like ``async_fence.py``, this wraps the runner's lookback upload rather than
 editing the shared runner: ``forward_model`` calls

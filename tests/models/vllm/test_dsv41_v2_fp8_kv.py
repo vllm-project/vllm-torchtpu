@@ -213,21 +213,24 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     emb_cpu.lookup(indices, out_cpu)
     assert torch.equal(out_dev, out_cpu)
 
-    # Also exercise Engram._init_staging + Engram.prepare_embeddings: the host
-    # gathers raw FP8/scale bytes (stale tail reset to zero/unit scale) and
-    # _ready_rows dequantizes them, bitwise equal to the host-dequant lookup.
+    # Also exercise the host lookup: the host gathers raw FP8/scale records and
+    # Engram.stage_rows dequantizes them, bitwise equal to the device lookup.
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import EngramHostLookup
+
     engram_stub = object.__new__(Engram)
     torch.nn.Module.__init__(engram_stub)
     engram_stub.embed_tokens = emb_cpu
-    Engram._init_staging(engram_stub, max_tokens=5, head_dim=dim)
-    assert engram_stub._staged_raw is not None
-    engram_stub._host_raw.fill_(77)
-    engram_stub._host_scale.fill_(200)
-    engram_stub.prepare_embeddings(indices)
-    assert torch.equal(engram_stub._ready_rows(indices.shape[0]), out_cpu)
-    tail = engram_stub._ready_rows(5)[indices.shape[0] :]
-    assert torch.count_nonzero(tail) == 0
-    assert torch.all(engram_stub._staged_scale[indices.shape[0] :] == 127)
+    engram_stub.layer_hash_index = 0
+    engram_stub.staged_rows = torch.full(
+        (5, emb_cpu.part_n_hash_cols, dim), 3.0, dtype=torch.bfloat16
+    )
+    rows = EngramHostLookup([engram_stub], threads=1)(
+        indices[:, None, :], torch.device("cpu")
+    )
+    engram_stub.stage_rows(rows[:, engram_stub.host_slot])
+    assert torch.equal(engram_stub.staged_rows[: indices.shape[0]], out_cpu)
+    # Rows past this step keep their previous contents.
+    assert torch.all(engram_stub.staged_rows[indices.shape[0] :] == 3.0)
 
 
 def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():

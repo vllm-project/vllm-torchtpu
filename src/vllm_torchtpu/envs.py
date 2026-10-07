@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
+    TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_K3_SP_PREFILL: bool = False
@@ -364,9 +365,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
     ),
-    # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
-    # total) to Host DRAM so TPU HBM remains available for KV cache and decode.
-    # Opt-in (default False) to trade a small host-staging overhead for HBM.
+    # Where V4.1 Engram tables live; host-resident ones free their HBM (~11.8
+    # GiB per table per device at TP8) for KV cache, and the host fetches each
+    # step's rows.
+    # "late": every table but the earliest layer's; the host round trip
+    # overlaps the layers before the first offloaded one, so decode does not
+    # wait on it.
+    # "all": every table; each decode step waits on the host round trip.
+    # "off": every table in HBM.
+    # "auto" (default): "late" for TPU_DEEPSEEK_V41_IMPL=v2 without
+    # TPU_DEEPSEEK_V41_SP, else "off" (v1's KV sizing can turn the freed HBM
+    # into a tensor over SparseCore's 16 GiB; "late" does not support SP yet).
+    "TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD": env_with_choices(
+        "TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD", "auto", ["auto", "off", "late", "all"]
+    ),
+    # Deprecated alias: 1 means TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD=all.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),

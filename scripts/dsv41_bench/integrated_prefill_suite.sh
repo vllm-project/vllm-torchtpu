@@ -88,8 +88,11 @@ else
 fi
 if [ "$mode" = "full_offload" ]; then
   export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-1}"
+  export TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD:-all}"
 else
   export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}"
+  # The default "auto" offloads on v2; this mode measures tables in HBM.
+  export TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD:-off}"
 fi
 
 CHUNK=${CHUNK:-8192}

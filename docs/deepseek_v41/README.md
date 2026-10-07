@@ -17,7 +17,7 @@ formats are outside this implementation.
 | `models/vllm/deepseek_v41/v1/model.py` | Model assembly and compiled encoder/decoder stages |
 | `models/vllm/deepseek_v41/v1/replay_plan.py` | Prompt-tail replay planning across scheduler chunks |
 | `models/vllm/deepseek_v41/v1/attention.py` | MLA adapter, cache binding and output projection |
-| `models/vllm/deepseek_v41/v1/engram.py` | Upstream hashing, request lookbacks and TPU lookup |
+| `models/vllm/deepseek_v41/common/engram.py` | Engram (shared by v1 and v2): upstream hashing, request lookbacks, TPU lookup and host-resident tables |
 | `models/vllm/deepseek_v41/common/mhc.py` | Delayed mHC (shared by v1 and v2): load-time packed mix weights, Pallas prefill pass, compact Sinkhorn and residual flow |
 | `models/vllm/deepseek_v41/v1/ops.py` | RoPE tables and tensor rotation |
 | `layers/adapter/custom_ops/deepseek_v41/deepseek_v41_cache.py` | Native binding, byte/record and index-page geometry, public slot helpers and cache operations |
@@ -95,6 +95,33 @@ The shared runner changes provide only registration, native-cache binding,
 metadata, Engram lookbacks and compilation-cache invalidation. The vLLM version
 bump also requires the small NVFP4 linear schema adaptation imported by the
 shared quantization registry; it does not select NVFP4 for this model.
+
+## Engram tables in host memory
+
+The two Engram tables (layers 1 and 14) take ~11.8 GiB of HBM each per device
+at TP8. `TPU_DEEPSEEK_V41_ENGRAM_OFFLOAD` decides where they live:
+
+| Value | Tables in host memory | HBM freed per device | Decode cost |
+| --- | --- | --- | --- |
+| `late` | all but the earliest layer's (layer 14's) | ~11.8 GiB | none measured |
+| `all` | both | ~23.6 GiB | ~10% TPOT at 100k |
+| `off` | none | 0 | none |
+| `auto` (default) | `late` for v2 without SP, otherwise `off` | | |
+
+`TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1` is a deprecated alias for `all`.
+
+TPU cannot read host memory from a kernel, so the host gathers this rank's rows
+and uploads them, and the stage that consumes them dequantizes them. The hash
+ids come from the runner's host inputs on prompt-only steps, and from a
+compiled hash stage otherwise. In `late` mode the Full or Encoder stage is split
+at layer 14, and the host fetch runs while layers 0-13 execute. In `all` mode
+every step waits on the fetch before the first layer. `late` does not support
+sequence parallelism (`TPU_DEEPSEEK_V41_SP`); use `all` or `off` with it.
+
+`auto` leaves v1 at `off`. With KV sized by `--gpu-memory-utilization`, v1
+turns the freed HBM into one KV buffer, which can exceed SparseCore's 16 GiB
+per-tensor limit (seen at 17.5 GB with `late`). To offload on v1, also pin
+`--kv-cache-memory-bytes`. v2 is not affected.
 
 ## Launch and validation
 

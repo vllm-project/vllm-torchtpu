@@ -127,7 +127,10 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
     decoder_inputs: list[tuple[torch.Size, torch.Size]] = []
 
     dummy: Any = SimpleNamespace(
-        _has_cpu_offloaded_engram=lambda: False,
+        engram_host_lookup=None,
+        engram_split_a=None,
+        engram_split_b=None,
+        _engram_hash_ids=lambda *args: (None, None),
         _ced_enabled=True,
         _ced_window=4,
         _ced_compile_sizes=(4,),
@@ -139,6 +142,7 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
             or torch.ones((pos.shape[0], 16), dtype=torch.bfloat16)
         ),
     )
+    dummy._run_front = v2_model.DeepseekV41Model._run_front.__get__(dummy)
     dummy._stage_uses_sequence_parallel = (
         v2_model.DeepseekV41Model._stage_uses_sequence_parallel.__get__(dummy)
     )
