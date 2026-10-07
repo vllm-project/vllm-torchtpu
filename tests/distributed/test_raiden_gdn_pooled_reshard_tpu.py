@@ -13,6 +13,8 @@
 # limitations under the License.
 """Raiden GDN pooled resharding vs dense reference."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -25,6 +27,7 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.layers.core import gdn_attention
 
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
+from .tpu_test_utils import run_in_isolated_process
 
 try:
     from kernels.gdn.v3.gdn_pool_state_utils import (
@@ -367,10 +370,7 @@ def _run_reshard_prefill_then_decode(
     )
 
 
-@pytest.mark.parametrize("ssm_dtype_name", ["float32", "bfloat16"])
-@pytest.mark.parametrize("degree", [2, 8])
-@pytest.mark.parametrize("carrier_bytes", [512, 1024])
-def test_pooled_gdn_state_reshard_matches_dense(ssm_dtype_name, degree, carrier_bytes):
+def _check_reshard_matches_dense(ssm_dtype_name, degree, carrier_bytes):
     ssm_dtype = jnp.float32 if ssm_dtype_name == "float32" else jnp.bfloat16
     (
         pre_decode_conv,
@@ -391,7 +391,7 @@ def test_pooled_gdn_state_reshard_matches_dense(ssm_dtype_name, degree, carrier_
     assert bool(jnp.allclose(final_ssm[0], dense_decode_ssm[0], **TOL))
 
 
-def test_qk_pair_layout_scrambles_pooled_gdn_decode():
+def _check_qk_pair_layout_scrambles():
     (
         pre_decode_conv,
         dense_prefill_conv,
@@ -409,3 +409,21 @@ def test_qk_pair_layout_scrambles_pooled_gdn_decode():
     assert not bool(jnp.allclose(pooled_decode_out, dense_decode_out, **TOL))
     assert not bool(jnp.allclose(final_conv[0], dense_decode_conv[0], **TOL))
     assert not bool(jnp.allclose(final_ssm[0], dense_decode_ssm[0], **TOL))
+
+
+# Both tests run JAX on the TPU; keep that runtime out of the pytest process
+# so later tests that start their own engine or worker group can still claim
+# the chips.
+@pytest.mark.parametrize("ssm_dtype_name", ["float32", "bfloat16"])
+@pytest.mark.parametrize("degree", [2, 8])
+@pytest.mark.parametrize("carrier_bytes", [512, 1024])
+def test_pooled_gdn_state_reshard_matches_dense(ssm_dtype_name, degree, carrier_bytes):
+    run_in_isolated_process(
+        functools.partial(
+            _check_reshard_matches_dense, ssm_dtype_name, degree, carrier_bytes
+        )
+    )
+
+
+def test_qk_pair_layout_scrambles_pooled_gdn_decode():
+    run_in_isolated_process(_check_qk_pair_layout_scrambles)
