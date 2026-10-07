@@ -44,7 +44,13 @@ def _repeat_pairs(t: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pair_swap(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Interleaved RoPE of ``x`` (..., D) with half-dim ``cos``/``sin`` (..., D/2)."""
+    """Interleaved RoPE of ``x`` (..., D) with half-dim ``cos``/``sin`` (..., D/2).
+
+    In ``torch.bfloat16`` (the dtype Wan and LingBot-World pass after
+    ``to(x.dtype)``), ``x @ P`` is bit-exact because each column of ``P``
+    has a single ``+-1`` entry. In ``torch.float32``, TPU matmuls default
+    to bf16 input rounding unless high precision is configured.
+    """
     swapped = torch.matmul(x, _pair_swap_matrix(x.shape[-1], x.dtype, x.device))
     return (x * _repeat_pairs(cos) + swapped * _repeat_pairs(sin)).to(x.dtype)
 

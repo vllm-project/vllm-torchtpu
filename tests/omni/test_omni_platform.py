@@ -60,6 +60,7 @@ def test_platform_attributes():
 
 
 def test_rope_pair_swap_matches_native():
+    torch.manual_seed(0)
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
     x = torch.randn(1, 24, 3, 16)
     cos = torch.randn(1, 24, 1, 8)
@@ -67,16 +68,42 @@ def test_rope_pair_swap_matches_native():
     torch.testing.assert_close(
         apply_rotary_pair_swap(x, cos, sin), rope.forward_native(x, cos, sin)
     )
+    x_bf16, cos_bf16, sin_bf16 = (
+        x.bfloat16(),
+        cos.bfloat16(),
+        sin.bfloat16(),
+    )
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x_bf16, cos_bf16, sin_bf16),
+        rope.forward_native(x_bf16, cos_bf16, sin_bf16),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_rope_patch_installed():
+    from unittest.mock import MagicMock
+
     apply_omni_model_specific_patches()
     assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
-    # Non-TPU tensors keep the original CustomOp dispatch.
+    # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
-    x = torch.randn(1, 4, 2, 8)
-    cos, sin = torch.randn(1, 4, 1, 4), torch.randn(1, 4, 1, 4)
-    torch.testing.assert_close(rope(x, cos, sin), rope.forward_native(x, cos, sin))
+    x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    cos = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    sin = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        rope(x, cos, sin), rope.forward_native(x, cos, sin), rtol=0, atol=0
+    )
+
+    # Non-half-dim or Neox calls delegate to _forward_method.
+    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
+    spy = MagicMock(wraps=rope_fallback.forward_native)
+    rope_fallback._forward_method = spy
+    out_fb = rope_fallback(x, cos, sin)
+    spy.assert_called_once_with(x, cos, sin)
+    torch.testing.assert_close(
+        out_fb, rope_fallback.forward_native(x, cos, sin), rtol=0, atol=0
+    )
 
 
 def test_device_control_env_var():
