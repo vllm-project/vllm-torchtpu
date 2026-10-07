@@ -16,6 +16,8 @@ them precisely. IDs are global across the document set: R-1.x–R-8.x live
 here; PR-x (PR discipline), P-x (performance), and Q-x (quantization) live
 in the companion
 [optimization_best_practices.md](optimization_best_practices.md).
+[code_review_guidance.md](code_review_guidance.md) is the third document of
+the set: it defines how these rules are enforced in review.
 
 Two meta-principles organize this document set:
 
@@ -457,6 +459,8 @@ Background material for the rules above.
 - [optimization_best_practices.md](optimization_best_practices.md): PR
   discipline (PR-x), performance (P-x), and quantization (Q-x) rules, and its
   own reference list for TPU hardware and kernel material.
+- [code_review_guidance.md](code_review_guidance.md): how these rules are
+  enforced in review — finding priority, severity rubric, output format.
 
 ## Author checklist (run before sending a PR)
 

@@ -4,6 +4,8 @@ Companion to [coding_guidance.md](coding_guidance.md), which carries the general
 coding rules (R-1.x–R-8.x) and the author checklist. This document carries
 the PR-discipline (§0), performance (§1), and quantization (§2) standards,
 plus a reference reading list (§3).
+[code_review_guidance.md](code_review_guidance.md) covers how the rules in
+both documents are enforced in review.
 Rules here are numbered **PR-\<n\>** (PR discipline), **P-\<n\>**
 (performance), and **Q-\<n\>** (quantization); those IDs cited anywhere in
 the document set refer to the rules below, and R-x.y cited below refers to
