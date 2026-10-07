@@ -8,6 +8,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -100,18 +101,16 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         runs them on the TensorCore, which waits for them. With the SparseCore
         offload, Wan2.2-I2V-A14B at 480x832x81 on 8 v7x cores (CFG 2 x
         Ulysses 4) went from 0.927 to 0.906 and from 0.926 to 0.909 s per step
-        in two A/B runs, with bit-identical output. It is set here, before
-        PjRt initializes below, so it only affects diffusion workers; LLM
-        serving keeps the default. An explicit user setting wins.
+        in two A/B runs, with bit-identical output.
         """
         # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
-        # default.
-        #
-        flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
-        args = os.environ.get("LIBTPU_INIT_ARGS", "")
-        if any(token.split("=", 1)[0] == flag for token in args.split()):
-            return
-        os.environ["LIBTPU_INIT_ARGS"] = f"{args} {flag}=true".strip()
+        # default. This sets os.environ after torch_tpu is imported, but it still
+        # takes effect because libtpu reads LIBTPU_INIT_ARGS when the PjRt client
+        # is created on the first device allocation, the same pre-PjRt window
+        # that _set_shared_slicebuilder_addresses relies on.
+        set_libtpu_flag_default(
+            "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
+        )
 
     @staticmethod
     def _set_shared_slicebuilder_addresses(world_size: int) -> None:

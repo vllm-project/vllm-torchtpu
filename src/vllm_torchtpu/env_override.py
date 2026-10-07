@@ -252,3 +252,20 @@ def _patch_jax_pallas_fori_lowering() -> None:
 from vllm_torchtpu import patch_registry  # noqa: E402
 
 patch_registry.apply("import")
+
+
+def set_libtpu_flag_default(flag_name: str, value: str) -> None:
+    """Append ``<flag_name>=<value>`` to ``LIBTPU_INIT_ARGS`` unless already set.
+
+    Must be called before the PjRt client is initialized (libtpu parses
+    ``LIBTPU_INIT_ARGS`` at PjRt client creation, not when ``libtpu.so`` is
+    loaded). An explicit user setting in ``LIBTPU_INIT_ARGS`` (either
+    ``<flag_name>=...`` or bare ``<flag_name>``) takes precedence.
+    """
+    current = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if any(
+        token.startswith(flag_name + "=") or token == flag_name
+        for token in current.split()
+    ):
+        return
+    os.environ["LIBTPU_INIT_ARGS"] = f"{current} {flag_name}={value}".strip()
