@@ -172,12 +172,13 @@ ignore = [
 # Banned in src/vllm_torchtpu/kernels/ only; see per-file-ignores below.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
+"torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
 "vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
 
 [tool.ruff.lint.per-file-ignores]
-# Kernels stay free of torch and vLLM, so they run and test as plain JAX.
-# Adapter files bridge a kernel to torch. The three files listed after them
-# import torch or vLLM and have not been split yet.
+# Kernels must not import torch, torch_tpu or vLLM directly. Adapter files
+# bridge a kernel to torch. The three files listed after them already import
+# torch or vLLM and have not been split yet.
 "!src/vllm_torchtpu/kernels/**" = ["TID251"]
 "src/vllm_torchtpu/kernels/**/vllm_adapter.py" = ["TID251"]
 "src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
