@@ -1,0 +1,690 @@
+{
+  "$defs": {
+    "Dataset": {
+      "additionalProperties": false,
+      "description": "Where perf prompts come from.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "enum": [
+                "random",
+                "sharegpt"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--dataset-name. Others are added with a lane that uses them."
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--dataset-path, repo-relative or absolute."
+        }
+      },
+      "title": "Dataset",
+      "type": "object"
+    },
+    "DefaultsAgentx": {
+      "additionalProperties": false,
+      "description": "tasks.agentx values, applied only to scenarios that declare tasks.agentx.",
+      "properties": {
+        "duration": {
+          "anyOf": [
+            {
+              "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+              "type": "string"
+            },
+            {
+              "maximum": 86400,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How long the replay runs."
+        },
+        "labels": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsAgentxLabels"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Result row labels."
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+              "type": "string"
+            },
+            {
+              "maximum": 86400,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The task is killed and fails after this; longer than duration, to cover warmup and drain."
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1,
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Relative tolerance of the AgentX gate."
+        }
+      },
+      "title": "DefaultsAgentx",
+      "type": "object"
+    },
+    "DefaultsAgentxLabels": {
+      "additionalProperties": false,
+      "description": "tasks.agentx.labels values.",
+      "properties": {
+        "framework": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Serving framework label; selects InferenceX's metrics parser."
+        },
+        "model_prefix": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "InferenceX model prefix; also selects the trace corpus."
+        },
+        "precision": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Precision label, e.g. fp4."
+        },
+        "spec_decoding": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Speculative decoding method recorded with the row, or none."
+        }
+      },
+      "title": "DefaultsAgentxLabels",
+      "type": "object"
+    },
+    "DefaultsEval": {
+      "additionalProperties": false,
+      "description": "tasks.eval values.",
+      "properties": {
+        "lm_eval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsLmEval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Defaults for tasks.eval.lm_eval."
+        }
+      },
+      "title": "DefaultsEval",
+      "type": "object"
+    },
+    "DefaultsLmEval": {
+      "additionalProperties": false,
+      "description": "tasks.eval.lm_eval values, applied only where tasks.eval.lm_eval is declared.",
+      "properties": {
+        "apply_chat_template": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--apply_chat_template."
+        },
+        "fewshot_as_multiturn": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--fewshot_as_multiturn true."
+        },
+        "gen_kwargs": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--gen_kwargs: a string verbatim, or a mapping as JSON."
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "const": "all",
+                  "type": "string"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Questions per task (per subtask); unset or all runs the full set."
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--model, e.g. local-chat-completions."
+        },
+        "model_args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--model_args entries; the tool adds model and base_url."
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--seed."
+        }
+      },
+      "title": "DefaultsLmEval",
+      "type": "object"
+    },
+    "DefaultsPerf": {
+      "additionalProperties": false,
+      "description": "tasks.perf values, applied only to scenarios that declare tasks.perf.",
+      "properties": {
+        "client_args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Extra client flags, rendered like server.args."
+        },
+        "dataset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dataset"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Prompt source."
+        },
+        "num_prompts": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "$ref": "#/$defs/PerConcurrency"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Prompts per measured run: a number or {per_concurrency: N}."
+        },
+        "num_warmups": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "$ref": "#/$defs/PerConcurrency"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Warmup requests before each measured run (--num-warmups): a number or {per_concurrency: N}."
+        },
+        "percentile_metrics": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "ttft",
+                  "tpot",
+                  "itl",
+                  "e2el"
+                ],
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--percentile-metrics."
+        },
+        "range_ratio_style": {
+          "anyOf": [
+            {
+              "enum": [
+                "symmetric",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How random_range_ratio reads for vllm-bench: symmetric is vllm bench serve's own form; min is translated to it as run_benchmarks.sh does. Not used by inferencex."
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1,
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Relative tolerance of the perf gate."
+        },
+        "warmup_runs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whole warmup passes per cell, discarded, before the measured run."
+        }
+      },
+      "title": "DefaultsPerf",
+      "type": "object"
+    },
+    "DefaultsServer": {
+      "additionalProperties": false,
+      "description": "Server values applied under every scenario.",
+      "properties": {
+        "args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "vllm serve flags for every role: true -> --k, false -> --no-k, a scalar -> --k v, a list or mapping -> --k <compact JSON>."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Env for every server process of every role."
+        },
+        "image": {
+          "anyOf": [
+            {
+              "pattern": "^(ci|[^\\s]+/[^\\s]+)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ci for this build's CI image, otherwise a full image URI with a tag or digest."
+        },
+        "startup_timeout": {
+          "anyOf": [
+            {
+              "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+              "type": "string"
+            },
+            {
+              "maximum": 86400,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Engine startup budget: sets VLLM_ENGINE_READY_TIMEOUT_S, and the readiness wait is this plus a margin."
+        }
+      },
+      "title": "DefaultsServer",
+      "type": "object"
+    },
+    "DefaultsTasks": {
+      "additionalProperties": false,
+      "description": "Task values, each applied only to scenarios that declare that task.",
+      "properties": {
+        "agentx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsAgentx"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Defaults for tasks.agentx."
+        },
+        "eval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsEval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Defaults for tasks.eval."
+        },
+        "perf": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsPerf"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Defaults for tasks.perf."
+        }
+      },
+      "title": "DefaultsTasks",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "PerConcurrency": {
+      "additionalProperties": false,
+      "description": "A count that scales with each cell's concurrency.",
+      "properties": {
+        "per_concurrency": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Multiplied by the cell's concurrency: N x concurrency."
+        }
+      },
+      "title": "PerConcurrency",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "scenarios/defaults.yaml: the choices every scenario starts from.",
+  "properties": {
+    "schema": {
+      "anyOf": [
+        {
+          "const": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Schema version; always 1."
+    },
+    "server": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DefaultsServer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Applied under every scenario."
+    },
+    "tasks": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DefaultsTasks"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Applied only to the tasks a scenario declares."
+    }
+  },
+  "title": "scenarios/defaults.yaml",
+  "type": "object"
+}

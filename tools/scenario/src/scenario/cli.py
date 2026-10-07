@@ -26,7 +26,7 @@ from typing import NoReturn
 
 import click
 
-from scenario import PLAN_FORMAT, __version__
+from scenario import PLAN_FORMAT, __version__, gen
 from scenario.errors import Diagnostic, DiagnosticError
 from scenario.keycheck import check_keys
 from scenario.model.scenario import Scenario
@@ -382,3 +382,30 @@ def run(
                 f"role {role} has hosts 0..{hosts - 1}; got --host-index {host_index}"
             )
     click.echo(render_plan(planned, role, host_index), nl=False)
+
+
+# dev --------------------------------------------------------------------
+
+
+@main.group()
+def dev() -> None:
+    """Commands for working on the tool itself."""
+
+
+@dev.command()
+@click.option(
+    "--check", is_flag=True, help="Write nothing; fail when a generated file is stale."
+)
+def regen(check: bool) -> None:
+    """Regenerate the JSON schemas and REFERENCE.md from the models."""
+    try:
+        root = gen.tool_dir()
+    except FileNotFoundError as error:
+        _fail(str(error))
+    if check:
+        names = gen.stale(root)
+        for name in names:
+            click.echo(f"stale: tools/scenario/{name}; run: {gen.REGEN}", err=True)
+        sys.exit(EXIT_PROBLEMS if names else 0)
+    for name in gen.write(root):
+        click.echo(f"wrote tools/scenario/{name}")

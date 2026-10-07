@@ -1,0 +1,2145 @@
+{
+  "$defs": {
+    "AgentxBaseline": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "description": "AgentX gate baseline: metric name -> value, for the point's concurrency.",
+      "properties": {
+        "_source": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where the numbers came from; documentation only, the gate ignores it."
+        }
+      },
+      "title": "AgentxBaseline",
+      "type": "object"
+    },
+    "AgentxLabels": {
+      "additionalProperties": false,
+      "description": "What InferenceX files the AgentX result row under.",
+      "properties": {
+        "framework": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Serving framework label; selects InferenceX's metrics parser."
+        },
+        "model_prefix": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "InferenceX model prefix; also selects the trace corpus."
+        },
+        "precision": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Precision label, e.g. fp4."
+        },
+        "spec_decoding": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Speculative decoding method recorded with the row, or none."
+        }
+      },
+      "title": "AgentxLabels",
+      "type": "object"
+    },
+    "AgentxTask": {
+      "additionalProperties": false,
+      "description": "InferenceX AgentX trace replay at one concurrency.\n\nOnly what the tool provides is modeled; every other client setting,\nincluding the context length, is pass-through env.",
+      "properties": {
+        "baseline": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/AgentxBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Inline baseline by metric, or {from: <ref>}."
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Concurrent sessions; one value per server."
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+                  "type": "string"
+                },
+                {
+                  "maximum": 86400,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long the replay runs."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Client settings passed through untouched, e.g. AIPERF_MAX_CONTEXT_LENGTH."
+        },
+        "labels": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentxLabels"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Result row labels."
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+                  "type": "string"
+                },
+                {
+                  "maximum": 86400,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The task is killed and fails after this; longer than duration, to cover warmup and drain."
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1,
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Relative tolerance of the AgentX gate."
+        }
+      },
+      "title": "AgentxTask",
+      "type": "object"
+    },
+    "BaselineRef": {
+      "additionalProperties": false,
+      "description": "Gate on another scenario's inline baseline for the same task.",
+      "properties": {
+        "from": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reference id of the scenario whose inline baseline for the same task (and, in a sweep, the same point) gates this one."
+        }
+      },
+      "title": "BaselineRef",
+      "type": "object"
+    },
+    "CustomTask": {
+      "additionalProperties": false,
+      "description": "A command run against the servers, e.g. a correctness script.",
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Argv, run from the repo root."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Extra env. Values may use ${NAME} for names the tool provides (e.g. ${SCENARIO_RESULTS_DIR}); $$ is a literal $."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Unique name; selects the task in --only and names its log."
+        },
+        "skip_rest_if_exit_ge": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Skip the remaining tasks when this one exits with this code or higher."
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+                  "type": "string"
+                },
+                {
+                  "maximum": 86400,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The task is killed and fails after this."
+        }
+      },
+      "title": "CustomTask",
+      "type": "object"
+    },
+    "Dataset": {
+      "additionalProperties": false,
+      "description": "Where perf prompts come from.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "enum": [
+                "random",
+                "sharegpt"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--dataset-name. Others are added with a lane that uses them."
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--dataset-path, repo-relative or absolute."
+        }
+      },
+      "title": "Dataset",
+      "type": "object"
+    },
+    "EvalBaseline": {
+      "additionalProperties": {
+        "patternProperties": {
+          "^[\\w@.-]+,[\\w-]+$": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "description": "Eval gate baseline: lm_eval run key -> {\"<metric>,<filter>\": value}.",
+      "properties": {
+        "_source": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where the numbers came from; documentation only, the gate ignores it."
+        }
+      },
+      "title": "EvalBaseline",
+      "type": "object"
+    },
+    "EvalTask": {
+      "additionalProperties": false,
+      "description": "Accuracy evals, gated against a baseline.",
+      "properties": {
+        "baseline": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/EvalBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Inline baseline by run key, or {from: <ref>}."
+        },
+        "lm_eval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LmEval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "lm-eval runs."
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1,
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Smallest score drop the eval gate allows, in absolute terms; the gate widens it by the measured stderr."
+        }
+      },
+      "title": "EvalTask",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "Kv": {
+      "additionalProperties": false,
+      "description": "The KV transfer side of one engine in a disaggregated scenario.",
+      "properties": {
+        "connector": {
+          "anyOf": [
+            {
+              "const": "TPURaidenConnector",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "KV connector; the tool adds its module path and port wiring."
+        },
+        "role": {
+          "anyOf": [
+            {
+              "enum": [
+                "producer",
+                "consumer",
+                "both"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "KV role of this engine: kv_producer, kv_consumer or kv_both."
+        }
+      },
+      "title": "Kv",
+      "type": "object"
+    },
+    "LmEval": {
+      "additionalProperties": false,
+      "description": "lm-eval against the endpoint's /v1/chat/completions, one run per task.",
+      "properties": {
+        "apply_chat_template": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--apply_chat_template."
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Client-side sweep: every task runs once per value, with num_concurrent set to it, against one server."
+        },
+        "fewshot_as_multiturn": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--fewshot_as_multiturn true."
+        },
+        "gen_kwargs": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--gen_kwargs: a string verbatim, or a mapping as JSON."
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "const": "all",
+                  "type": "string"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Questions per task (per subtask); unset or all runs the full set."
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--model, e.g. local-chat-completions."
+        },
+        "model_args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--model_args entries; the tool adds model and base_url."
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--seed."
+        },
+        "tasks": {
+          "anyOf": [
+            {
+              "items": {
+                "oneOf": [
+                  {
+                    "pattern": "^[^\\s,]+$",
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/LmEvalTask"
+                  }
+                ]
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Task names, or mappings with per-task options."
+        }
+      },
+      "title": "LmEval",
+      "type": "object"
+    },
+    "LmEvalTask": {
+      "additionalProperties": false,
+      "description": "One lm_eval task with options of its own.",
+      "properties": {
+        "confirm_run_unsafe_code": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": false,
+          "description": "--confirm_run_unsafe_code, for code tasks."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Env of this task's lm_eval run, e.g. HF_ALLOW_CODE_EVAL."
+        },
+        "fewshot_as_multiturn": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Overrides lm_eval.fewshot_as_multiturn."
+        },
+        "gen_kwargs": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Replaces lm_eval.gen_kwargs for this task."
+        },
+        "include_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--include_path, for tasks defined in this repo."
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "const": "all",
+                  "type": "string"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Questions (per subtask); overrides lm_eval.limit; all runs the full set."
+        },
+        "limit_per_concurrency": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Raises the limit at each lm_eval.concurrency value to ceil(N x concurrency / subtasks), so that concurrency is reached."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "pattern": "^[^\\s,]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "lm_eval task name."
+        },
+        "subtasks": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Subtasks lm_eval applies the limit to one by one, e.g. 14 for mmlu_pro; divides limit_per_concurrency."
+        }
+      },
+      "title": "LmEvalTask",
+      "type": "object"
+    },
+    "ModelSpec": {
+      "additionalProperties": false,
+      "description": "The model a server loads and the name clients call it by.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "pattern": "^\\S+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What clients call the model; always passed as --served-model-name."
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the server loads (--model): a Hugging Face id, a local path, or a gs:// or s3:// URI. Defaults to name."
+        }
+      },
+      "title": "ModelSpec",
+      "type": "object"
+    },
+    "PerConcurrency": {
+      "additionalProperties": false,
+      "description": "A count that scales with each cell's concurrency.",
+      "properties": {
+        "per_concurrency": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Multiplied by the cell's concurrency: N x concurrency."
+        }
+      },
+      "title": "PerConcurrency",
+      "type": "object"
+    },
+    "PerfBaseline": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PerfCellBaseline"
+      },
+      "description": "Perf gate baseline: cell key -> gated values.",
+      "properties": {
+        "_source": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where the numbers came from; documentation only, the gate ignores it."
+        }
+      },
+      "title": "PerfBaseline",
+      "type": "object"
+    },
+    "PerfCellBaseline": {
+      "additionalProperties": false,
+      "description": "Gated values of one perf cell, in check_regression.py's terms.",
+      "properties": {
+        "completed": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Requests completed; a run must complete at least 95% as many."
+        },
+        "median_tpot_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Median time per output token, ms."
+        },
+        "median_ttft_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Median time to first token, ms; gated only when present."
+        },
+        "num_prompts": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Prompts sent at calibration; not gated."
+        },
+        "output_throughput": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Older name of output_token_throughput, still read by the gate."
+        },
+        "output_token_throughput": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Output tokens per second."
+        },
+        "total_token_throughput": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input and output tokens per second."
+        }
+      },
+      "title": "PerfCellBaseline",
+      "type": "object"
+    },
+    "PerfCellGroup": {
+      "additionalProperties": false,
+      "description": "Explicit perf cells, as an alternative to the isl_osl x concurrency product.",
+      "properties": {
+        "concurrency": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "items": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Client concurrency, or several."
+        },
+        "isl": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "items": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Input length, or several."
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Cell key and --label. May use {isl}, {osl}, {concurrency} and {repeat}; without it the key is isl{I}_osl{O}_c{C}."
+        },
+        "num_prompts": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "$ref": "#/$defs/PerConcurrency"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Prompts per cell; defaults to the task's."
+        },
+        "osl": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "items": {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Output length, or several."
+        },
+        "percentile_metrics": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "ttft",
+                  "tpot",
+                  "itl",
+                  "e2el"
+                ],
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "--percentile-metrics; defaults to the task's."
+        },
+        "repeat": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 1,
+          "description": "Runs of each cell; more than one needs {repeat} in label."
+        }
+      },
+      "title": "PerfCellGroup",
+      "type": "object"
+    },
+    "PerfTask": {
+      "additionalProperties": false,
+      "description": "Fixed-length benchmark cells against the server or router.",
+      "properties": {
+        "baseline": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PerfBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Inline baseline keyed by cell, or {from: <ref>}."
+        },
+        "cells": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PerfCellGroup"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit cells instead of isl_osl x concurrency."
+        },
+        "client": {
+          "anyOf": [
+            {
+              "enum": [
+                "vllm-bench",
+                "inferencex"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "vllm-bench",
+          "description": "vllm-bench runs vllm bench serve; inferencex runs InferenceX's benchmark_serving at the version baked into the image."
+        },
+        "client_args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Extra client flags, rendered like server.args."
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Client concurrency levels."
+        },
+        "dataset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dataset"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Prompt source."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Env for the client process, passed through untouched."
+        },
+        "extra_body": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "JSON merged into every request (--extra-body)."
+        },
+        "isl_osl": {
+          "anyOf": [
+            {
+              "items": {
+                "items": {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 2,
+                "minItems": 2,
+                "type": "array"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "[input length, output length] pairs; one cell per pair and concurrency."
+        },
+        "num_prompts": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "$ref": "#/$defs/PerConcurrency"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Prompts per measured run: a number or {per_concurrency: N}."
+        },
+        "num_warmups": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "$ref": "#/$defs/PerConcurrency"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Warmup requests before each measured run (--num-warmups): a number or {per_concurrency: N}."
+        },
+        "percentile_metrics": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "ttft",
+                  "tpot",
+                  "itl",
+                  "e2el"
+                ],
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "--percentile-metrics."
+        },
+        "random_range_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Length jitter of the random dataset; required with it."
+        },
+        "range_ratio_style": {
+          "anyOf": [
+            {
+              "enum": [
+                "symmetric",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How random_range_ratio reads for vllm-bench: symmetric is vllm bench serve's own form; min is translated to it as run_benchmarks.sh does. Not used by inferencex."
+        },
+        "temperature": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Sampling temperature; unset sends none (server default)."
+        },
+        "tokenizer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Client tokenizer. Unset: the server's pulled weights for an object-storage model, else model.name."
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1,
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Relative tolerance of the perf gate."
+        },
+        "warmup_runs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whole warmup passes per cell, discarded, before the measured run."
+        }
+      },
+      "title": "PerfTask",
+      "type": "object"
+    },
+    "PointBaselines": {
+      "additionalProperties": false,
+      "description": "Baselines of one generated sweep point, by task.",
+      "properties": {
+        "agentx": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/AgentxBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The point's tasks.agentx baseline."
+        },
+        "eval": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/EvalBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The point's tasks.eval baseline."
+        },
+        "perf": {
+          "anyOf": [
+            {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/PerfBaseline"
+                },
+                {
+                  "$ref": "#/$defs/BaselineRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The point's tasks.perf baseline."
+        }
+      },
+      "title": "PointBaselines",
+      "type": "object"
+    },
+    "Role": {
+      "additionalProperties": false,
+      "description": "One engine of a multi-role scenario, e.g. prefill or decode.",
+      "properties": {
+        "args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "vllm serve flags over server.args for this role; null removes an inherited flag."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "anyOf": [
+                    {
+                      "type": [
+                        "string",
+                        "integer"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Env over server.env for this role; null removes an inherited entry."
+        },
+        "kv": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Kv"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "KV transfer role of this engine."
+        },
+        "slice": {
+          "anyOf": [
+            {
+              "enum": [
+                "tpu7x/1x1x1",
+                "tpu7x/2x2x1",
+                "tpu7x/2x2x2",
+                "tpu7x/2x2x4",
+                "tpu7x/2x4x4",
+                "tpu7x/4x4x4"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Slice this role runs on, e.g. tpu7x/2x2x1."
+        }
+      },
+      "title": "Role",
+      "type": "object"
+    },
+    "Router": {
+      "additionalProperties": false,
+      "description": "The proxy in front of a multi-role scenario's engines.",
+      "properties": {
+        "args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Extra router flags, rendered like server.args."
+        },
+        "command": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Argv the wiring flags are appended to, e.g. [python3, examples/disagg/toy_proxy_server.py]."
+        },
+        "type": {
+          "anyOf": [
+            {
+              "const": "toy-proxy",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Selects the wiring flags the tool adds (hosts and ports of the producer and consumer roles)."
+        }
+      },
+      "title": "Router",
+      "type": "object"
+    },
+    "Server": {
+      "additionalProperties": false,
+      "description": "What runs: image, model, slice or roles, flags and env.",
+      "properties": {
+        "args": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9-]*(?:\\.[A-Za-z0-9_-]+)*$": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "additionalProperties": {
+                        "$ref": "#/$defs/JsonValue"
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "vllm serve flags for every role: true -> --k, false -> --no-k, a scalar -> --k v, a list or mapping -> --k <compact JSON>."
+        },
+        "env": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_]*$": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Env for every server process of every role."
+        },
+        "image": {
+          "anyOf": [
+            {
+              "pattern": "^(ci|[^\\s]+/[^\\s]+)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "ci for this build's CI image, otherwise a full image URI with a tag or digest."
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Served name and load path."
+        },
+        "multihost": {
+          "anyOf": [
+            {
+              "enum": [
+                "mp",
+                "ray"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How a multi-host slice runs one engine: vLLM's own multi-node DP (mp) or Ray. Required exactly when a slice has more than one host."
+        },
+        "roles": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z][a-z0-9-]{0,14}$": {
+                  "$ref": "#/$defs/Role"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Two or more roles, e.g. prefill and decode, in run order. Exactly one of slice and roles."
+        },
+        "router": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Router"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Proxy in front of the roles; only with roles."
+        },
+        "scratch": {
+          "anyOf": [
+            {
+              "pattern": "^[1-9]\\d*(Ki|Mi|Gi|Ti)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Temporary space every server host needs, e.g. 64Gi; the target decides where it comes from."
+        },
+        "slice": {
+          "anyOf": [
+            {
+              "enum": [
+                "tpu7x/1x1x1",
+                "tpu7x/2x2x1",
+                "tpu7x/2x2x2",
+                "tpu7x/2x2x4",
+                "tpu7x/2x4x4",
+                "tpu7x/4x4x4"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Slice of the single role. Exactly one of slice and roles."
+        },
+        "startup_timeout": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+                  "type": "string"
+                },
+                {
+                  "maximum": 86400,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Engine startup budget: sets VLLM_ENGINE_READY_TIMEOUT_S, and the readiness wait is this plus a margin."
+        }
+      },
+      "title": "Server",
+      "type": "object"
+    },
+    "Sweep": {
+      "additionalProperties": false,
+      "description": "Points that each run on a fresh server. Exactly one of points, zip, product.",
+      "properties": {
+        "baselines": {
+          "anyOf": [
+            {
+              "patternProperties": {
+                "^[a-z][a-z0-9-]{0,62}$": {
+                  "$ref": "#/$defs/PointBaselines"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Baselines of zip and product points, by point name and task. Named points carry their own."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Point name template for zip and product, e.g. c{tasks.agentx.concurrency}; each {path} is one of the axes."
+        },
+        "points": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SweepPoint"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Named points, for irregular tables."
+        },
+        "product": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "minProperties": 1,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Dotted path -> values; one point per combination, the first axis outermost."
+        },
+        "zip": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "minProperties": 1,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Dotted path -> values; equal lengths, point i takes value i of every axis."
+        }
+      },
+      "title": "Sweep",
+      "type": "object"
+    },
+    "SweepPoint": {
+      "additionalProperties": false,
+      "description": "A named point: an overlay over the scenario for one server.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9-]{0,62}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Unique; results and baselines use it."
+        },
+        "server": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Overlay on server, merged above the scenario for this point."
+        },
+        "tasks": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Overlay on tasks; also holds this point's baselines."
+        }
+      },
+      "title": "SweepPoint",
+      "type": "object"
+    },
+    "Tasks": {
+      "additionalProperties": false,
+      "description": "What runs against the servers. Empty means serve only.",
+      "properties": {
+        "agentx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentxTask"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "AgentX trace replay; must be the only task."
+        },
+        "custom": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/CustomTask"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Commands, run after perf and before eval."
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9-]{0,14}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where tasks and the router run: a role (its first host) or client (a chipless host). Required with server.roles."
+        },
+        "eval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalTask"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Accuracy evals."
+        },
+        "perf": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PerfTask"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Benchmark cells."
+        }
+      },
+      "title": "Tasks",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One workload: the servers to start and the tasks to run against them.",
+  "properties": {
+    "extends": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Parent scenario, merged under this file: mappings merge, lists and scalars replace, null deletes. Baselines are not inherited."
+    },
+    "name": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Unique across scenarios/; names the results directory. Not inherited through extends."
+    },
+    "schema": {
+      "anyOf": [
+        {
+          "const": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Schema version; always 1."
+    },
+    "server": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Server"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What runs."
+    },
+    "sweep": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sweep"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Server-side sweep: each point is a fresh server with its overrides."
+    },
+    "tasks": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Tasks"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What runs against the servers."
+    }
+  },
+  "title": "scenario",
+  "type": "object"
+}
