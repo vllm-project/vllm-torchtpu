@@ -292,16 +292,8 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
-@pytest.mark.parametrize(
-    "dp_size, expert_parallel, coupled",
-    [(2, True, True), (1, True, False), (2, False, False)],
-)
-def test_determine_available_memory_is_min_across_ep_dp(
-    monkeypatch, dp_size, expert_parallel, coupled
-):
-    """EP-coupled DP engines bake their KV extent into the compiled programs,
-    so they must all size the cache from the smallest per-engine budget."""
-    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
+    """Build a TPUWorker whose MIN reduce across DP engines returns at most peer."""
     budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
     monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", str(dp_size))
@@ -326,8 +318,32 @@ def test_determine_available_memory_is_min_across_ep_dp(
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
+    return worker
+
+
+@pytest.mark.parametrize(
+    "dp_size, expert_parallel, coupled",
+    [(2, True, True), (1, True, False), (2, False, False)],
+)
+def test_determine_available_memory_is_min_across_ep_dp(
+    monkeypatch, dp_size, expert_parallel, coupled
+):
+    """EP-coupled DP engines bake their KV extent into the compiled programs,
+    so they must all size the cache from the smallest per-engine budget."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    worker = _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer)
 
     assert worker.determine_available_memory() == (peer if coupled else local)
+
+
+def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
+    """An engine whose own budget fits still fails when a coupled peer's does not."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=2, expert_parallel=True, local=utils.GBYTES, peer=0
+    )
+
+    with pytest.raises(ValueError, match="gpu-memory-utilization"):
+        worker.determine_available_memory()
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")

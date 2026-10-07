@@ -506,7 +506,9 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        available = budget.available - kv_connector_hbm_reserve
+        available = utils.min_across_ep_dp(
+            self.parallel_config, budget.available - kv_connector_hbm_reserve
+        )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -547,7 +549,7 @@ class TPUWorker(WorkerBase):
                 (available - cap) / utils.GBYTES,
             )
             available = cap
-        return utils.min_across_ep_dp(self.parallel_config, available)
+        return available
 
     def _pooling_kv_cache_cap_bytes(self) -> int | None:
         """Deterministic KV budget for pure pooling models, or None.
