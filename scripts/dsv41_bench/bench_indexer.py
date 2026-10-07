@@ -70,6 +70,9 @@ def _build_indexer_inputs(
     topk: int,
     candidate_blocks: int,
     block_size: int,
+    *,
+    q_len: int = 0,
+    query_split: str = "pad16",
 ) -> dict[str, Any]:
     """Construct deterministic CPU inputs for all Indexer sub-operations."""
     import torch
@@ -89,11 +92,16 @@ def _build_indexer_inputs(
     # Inject invalid (-1) tail records on the last 4 columns.
     records_np[:, max(0, width - 4) :] = -1
 
-    # Query split across TP ranks matches `_select_paged_indices` in
-    # `v2/attention.py:777-789`: `rows = 16 * tp_size`.
-    rows_align = 16 * tp_size
-    padding = (tokens // rows_align + 1) * rows_align - tokens
-    part = (tokens + padding) // tp_size
+    # Query split across TP ranks:
+    # - `pad16`: `rows = 16 * tp_size` (`v2/attention.py:777-789`).
+    # - `ceil`: `part = ceil(tokens / tp_size)` (Decode/Verify split).
+    if query_split == "ceil":
+        part = max(1, (tokens + tp_size - 1) // tp_size)
+        padding = part * tp_size - tokens
+    else:
+        rows_align = 16 * tp_size
+        padding = (tokens // rows_align + 1) * rows_align - tokens
+        part = (tokens + padding) // tp_size
 
     q_full = rng.standard_normal((tokens, heads, head_dim)).astype(np.float32) * 0.25
     weights_full = rng.standard_normal((tokens, heads)).astype(np.float32) * (
@@ -103,21 +111,31 @@ def _build_indexer_inputs(
     # Sequence assignments and causal compressed lengths for each token.
     requests_full = np.zeros((tokens,), dtype=np.int32)
     lengths_full = np.zeros((tokens,), dtype=np.int32)
-    active_tokens = tokens - 16 if num_seqs > 1 and tokens >= 64 else tokens
-    base_per_seq = active_tokens // num_seqs
     base_ctx = max(topk + 64, width - tokens // compress_ratio - 32)
     offset = 0
-    for s in range(num_seqs):
-        seg = base_per_seq if s < num_seqs - 1 else (active_tokens - offset)
-        requests_full[offset : offset + seg] = s
-        pos = base_ctx + np.arange(seg, dtype=np.int32)
-        lengths_full[offset : offset + seg] = np.clip(pos, 1, width)
-        offset += seg
-    # Trailing padded tokens (`offset..tokens-1`) have `active_lengths = 0`.
-    lengths_full[active_tokens:] = 0
-    # Also test underfull row at token 0 (`length = 8 < topk`) when `num_seqs > 1`.
-    if num_seqs > 1:
-        lengths_full[0] = 8
+    if q_len > 0:
+        active_tokens = min(tokens, num_seqs * q_len)
+        for s in range(num_seqs):
+            seg = max(0, min(q_len, active_tokens - offset))
+            requests_full[offset : offset + seg] = s
+            pos = base_ctx + np.arange(seg, dtype=np.int32)
+            lengths_full[offset : offset + seg] = np.clip(pos, 1, width)
+            offset += seg
+        lengths_full[active_tokens:] = 0
+    else:
+        active_tokens = tokens - 16 if num_seqs > 1 and tokens >= 64 else tokens
+        base_per_seq = active_tokens // num_seqs
+        for s in range(num_seqs):
+            seg = base_per_seq if s < num_seqs - 1 else (active_tokens - offset)
+            requests_full[offset : offset + seg] = s
+            pos = base_ctx + np.arange(seg, dtype=np.int32)
+            lengths_full[offset : offset + seg] = np.clip(pos, 1, width)
+            offset += seg
+        # Trailing padded tokens (`offset..tokens-1`) have `active_lengths = 0`.
+        lengths_full[active_tokens:] = 0
+        # Also test underfull row at token 0 (`length = 8 < topk`) when `num_seqs > 1`.
+        if num_seqs > 1:
+            lengths_full[0] = 8
 
     num_total_blocks = (width + block_size - 1) // block_size
     candidates_full = rng.integers(
@@ -197,14 +215,22 @@ def _compute_roofline(
     candidate_blocks: int,
     block_size: int,
     measured_ms: float | None,
+    *,
+    num_seqs: int = 1,
+    q_len: int = 0,
 ) -> dict[str, Any]:
     """First-principles hardware roofline for the selected Indexer `subop`."""
     cand_width = min(width, candidate_blocks * block_size)
+    reqs_per_rank = (
+        min(num_seqs, max(1, (min(part, num_seqs * q_len) + q_len - 1) // q_len))
+        if q_len > 0
+        else 1
+    )
     # Full-context (`requests` shared-tile loop) reads `width` BF16 keys once
-    # per active request, plus writes/reads `[part, width]` FP32 scores.
+    # per active request on this rank, plus writes/reads `[part, width]` FP32 scores.
     full_flops = 2.0 * part * heads * width * head_dim
     full_hbm_bytes = (
-        width * head_dim * 2.0
+        reqs_per_rank * width * head_dim * 2.0
         + part * heads * head_dim * 2.0
         + 2.0 * part * width * 4.0
     )
@@ -275,6 +301,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 
     geo = common.Dsv41Geometry()
     tokens = args.chunk_size
+    q_len = int(getattr(args, "q_len", 0))
+    query_split = str(getattr(args, "query_split", "pad16"))
     tp_rank = get_tp_group().rank_in_group
     inp = _build_indexer_inputs(
         args.seed,
@@ -289,6 +317,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         geo.index_topk,
         geo.candidate_topk_blocks,
         geo.candidate_block_size,
+        q_len=q_len,
+        query_split=query_split,
     )
     width = inp["width"]
     part = inp["part"]
@@ -966,6 +996,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                                 geo.candidate_topk_blocks,
                                 geo.candidate_block_size,
                                 statistics.median(s_samples),
+                                num_seqs=args.num_seqs,
+                                q_len=q_len,
                             ),
                             "verify": v_res,
                             "xprof": s_xprof,
@@ -977,9 +1009,12 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         else:
             criteria = common.EXACT
 
+        case_suffix = (
+            f"_Q{q_len}_{query_split}" if (q_len > 0 or query_split != "pad16") else ""
+        )
         case_name = (
             f"indexer_{args.subop}_{args.mode}_T{tokens}_S{args.num_seqs}"
-            f"_KV{args.kv_len}_CR{args.compress_ratio}"
+            f"_KV{args.kv_len}_CR{args.compress_ratio}{case_suffix}"
         )
         g_path = common.golden_path(args.golden_dir, case_name, ctx.rank)
         if args.update_golden or g_path.exists():
@@ -1004,6 +1039,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         geo.candidate_topk_blocks,
         geo.candidate_block_size,
         statistics.median(samples),
+        num_seqs=args.num_seqs,
+        q_len=q_len,
     )
     return {
         "subop": args.subop,
@@ -1012,6 +1049,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         "part_rows": part,
         "width": width,
         "num_seqs": args.num_seqs,
+        "q_len": q_len,
+        "query_split": query_split,
         "kv_len": args.kv_len,
         "compress_ratio": args.compress_ratio,
         "wall_samples_ms": samples,
@@ -1029,6 +1068,21 @@ def main() -> None:
     common.add_common_args(parser, SUBOPS)
     parser.add_argument("--mode", choices=list(MODES), default="precompact")
     parser.add_argument("--compress-ratio", type=int, default=2, choices=[1, 2])
+    parser.add_argument(
+        "--q-len",
+        type=int,
+        default=0,
+        help="Per-request query length (0=prefill, 1=Decode, 6=DSpark Verify).",
+    )
+    parser.add_argument(
+        "--query-split",
+        choices=["pad16", "ceil"],
+        default="pad16",
+        help=(
+            "Query split across TP ranks ('pad16' for 16*tp_size, "
+            "'ceil' for decode/verify)."
+        ),
+    )
     common.run_main("indexer", parser, worker)
 
 

@@ -462,6 +462,142 @@ def reconcile_40_layer_step(
     }
 
 
+def reconcile_40_layer_decode_step(
+    *,
+    num_seqs: int = 16,
+    kv_len: int = 100000,
+) -> dict[str, Any]:
+    """Reconcile isolated Decode (`q=1`) & Verify (`q=6`) subops vs 40L E2E.
+
+    Anti-number-fudging invariant: ONLY independently measured micro-benchmark / E2E
+    numbers with traceable benchmark citations are summed; the difference between
+    eager isolated `pallas.jax_op` walls and fused 40L XLA compilation is reported
+    explicitly as an `[UNVERIFIED]` residual.
+
+    Cited measurements at `num_seqs=16, kv_len=100000, TP=8`:
+    - `bench_sparse_mla_swa.py` (`tpu7x-8`):
+      - `q=1, T=16`: `swa_only = 0.5687 ms` (`min 0.5063 ms`); `all_precompact` (`38L`):
+        `0.5268 ms/layer` (baseline) -> `0.4810 ms/layer` (dynamic
+        `csa_gather` `num_row_subchunks=16`; rank0 `0.6236 -> 0.5784 ms/layer`).
+      - `q=6, T=128`: `swa_only = 1.2681 ms` (`min 1.2009 ms`); `all_precompact`
+        (head-sharded `T_local=128, H_local=8`): `1.2235 ms/layer` (rank0
+        `1.3997 ms/layer`, `x38 = 53.190 ms`) -> `all_token_parallel` (token-parallel
+        `T_local=16, H_local=64`): `0.7691 ms/layer` (rank0
+        `0.7635 ms/layer`, `x38 = 29.011 ms`, `-24.179 ms` across 38 layers).
+    - `bench_indexer.py` (`tpu7x-8`):
+      - `q=1, T=16, query_split="pad16"` (`part=16`): `all = 4.0610 ms/layer`
+        (`2x source layers`), `candidate_filter = 1.6871 ms/layer` + `cache_write =
+        0.4169 ms/layer` (`4x follower layers`) -> `6L total = 16.538 ms`.
+      - `q=1, T=16, query_split="ceil"` (`part=2`): `all = 1.9278 ms/layer`
+        (`2x source layers`), `candidate_filter = 0.9122 ms/layer` + `cache_write =
+        0.4169 ms/layer` (`4x follower layers`) -> `6L total = 9.172 ms` (`-7.366 ms`).
+    - `bench_decode_moe.py` (`tpu7x-8`):
+      - `q=1, T=16`: `fused_ep = 0.8588 ms/layer` (`gmm_only = 0.6742 ms`,
+        `dispatch_combine_only = 0.2581 ms`, `shared_expert_only = 0.1459 ms`).
+      - `q=6, T=96`: `fused_ep = 0.9036 ms/layer` (`gmm_only = 0.7087 ms`).
+    - E2E 40L 100k Decode baseline + 8-rank `C=16` XProf:
+      - `C=16, q=1, kv_len=100000`: TPOT P50 = `22.89 ms` (`peak_active_tpot_p50_avg =
+        22.979 ms`, `695.00 tok/s` peak 10s), `22.070 ms/step` device time (`96.0%`
+        busy) + `0.909 ms/step` host/scheduler gap.
+      - XProf non-overlapping device ops (`21.831 ms/step` in Encoder+Decoder):
+        Indexer (`8L: L2,8,14,20,24,28,32,36`) = `11.528 ms` (`52.81%`),
+        Vector/Norm/RoPE/mHC/Dense = `3.106 ms` (`14.23%`),
+        Collectives (`AllReduce` `2.161 ms` + `AllGather` `0.177 ms`) = `2.338 ms`
+        (`10.71%`), MoE (`gmm_v2` `2.064 ms` + `router_topk` `0.082 ms`) = `2.146 ms`
+        (`9.83%`), Attention (`SWA + SparseMLA` `1.042 ms` + SC KV gather `0.233 ms`) =
+        `1.275 ms` (`5.84%`), HBM copies/DUS/views = `0.997 ms` (`4.57%`),
+        Other (incl. Engram `~0.11 ms`) = `0.441 ms` (`2.02%`).
+    """
+    # 1. q=1 Decode (T=16, C=16, kv_len=100,000)
+    q1_swa_2l_ms = 2 * 0.568677
+    q1_mla_base_38l_ms = 38 * 0.526835
+    q1_mla_opt_38l_ms = 38 * 0.481004
+    q1_idx_pad16_6l_ms = 2 * 4.060962 + 4 * (1.687141 + 0.416890)
+    q1_idx_ceil_6l_ms = 2 * 1.927765 + 4 * (0.912179 + 0.416890)
+    q1_moe_40l_ms = 40 * 0.8588
+
+    q1_base_isolated_ms = round(
+        q1_swa_2l_ms + q1_mla_base_38l_ms + q1_idx_pad16_6l_ms + q1_moe_40l_ms, 3
+    )
+    q1_opt_isolated_ms = round(
+        q1_swa_2l_ms + q1_mla_opt_38l_ms + q1_idx_ceil_6l_ms + q1_moe_40l_ms, 3
+    )
+    q1_isolated_delta_ms = round(q1_opt_isolated_ms - q1_base_isolated_ms, 3)
+    e2e_q1_mean_tpot_ms = 22.979
+    e2e_q1_p50_tpot_ms = 22.89
+    baseline_xprof_device_ms = 22.070
+    baseline_host_gap_ms = 0.909
+    q1_xla_fusion_and_unmeasured_delta_ms = round(
+        e2e_q1_mean_tpot_ms - q1_base_isolated_ms, 3
+    )
+
+    # 2. q=6 DSpark Multi-Token Verify (T=128 bucket, C=16, kv_len=100,000)
+    q6_swa_2l_ms = 2 * 1.268058
+    q6_mla_base_38l_ms = 38 * 1.223467
+    q6_mla_opt_tp_38l_ms = 38 * 0.769130
+    q6_moe_40l_ms = 40 * 0.9036
+    q6_mla_delta_38l_ms = round(q6_mla_opt_tp_38l_ms - q6_mla_base_38l_ms, 3)
+
+    return {
+        "num_seqs": num_seqs,
+        "kv_len": kv_len,
+        "decode_q1_T16": {
+            "swa_2L_ms": round(q1_swa_2l_ms, 3),
+            "sparse_mla_38L_baseline_ms": round(q1_mla_base_38l_ms, 3),
+            "sparse_mla_38L_optimized_ms": round(q1_mla_opt_38l_ms, 3),
+            "sparse_mla_38L_delta_ms": round(q1_mla_opt_38l_ms - q1_mla_base_38l_ms, 3),
+            "indexer_6L_pad16_ms": round(q1_idx_pad16_6l_ms, 3),
+            "indexer_6L_ceil_ms": round(q1_idx_ceil_6l_ms, 3),
+            "indexer_6L_delta_ms": round(q1_idx_ceil_6l_ms - q1_idx_pad16_6l_ms, 3),
+            "moe_40L_isolated_ms": round(q1_moe_40l_ms, 3),
+            "baseline_isolated_sum_ms": q1_base_isolated_ms,
+            "optimized_isolated_sum_ms": q1_opt_isolated_ms,
+            "isolated_delta_ms": q1_isolated_delta_ms,
+            "e2e_mean_tpot_ms": e2e_q1_mean_tpot_ms,
+            "e2e_p50_tpot_ms": e2e_q1_p50_tpot_ms,
+            "baseline_xprof_device_ms": baseline_xprof_device_ms,
+            "baseline_host_gap_ms": baseline_host_gap_ms,
+            "baseline_xprof_breakdown_ms": {
+                "indexer_8L_ms": 11.528,
+                "vector_norm_rope_mhc_dense_ms": 3.106,
+                "collectives_ar_ag_ms": 2.338,
+                "moe_39L_ms": 2.146,
+                "attention_swa_mla_sc_gather_ms": 1.275,
+                "hbm_copies_dus_views_ms": 0.997,
+                "other_engram_ms": 0.441,
+            },
+            "eager_op_vs_xla_fused_delta_ms_unverified": (
+                q1_xla_fusion_and_unmeasured_delta_ms
+            ),
+        },
+        "verify_q6_T128": {
+            "swa_2L_ms": round(q6_swa_2l_ms, 3),
+            "sparse_mla_38L_head_sharded_baseline_ms": round(q6_mla_base_38l_ms, 3),
+            "sparse_mla_38L_token_parallel_ms": round(q6_mla_opt_tp_38l_ms, 3),
+            "sparse_mla_38L_delta_ms": q6_mla_delta_38l_ms,
+            "moe_40L_isolated_ms": round(q6_moe_40l_ms, 3),
+        },
+        "unverified_notes": [
+            (
+                f"[UNVERIFIED] At C=16, q=1, kv_len=100k, eager isolated single-op "
+                f"sum is {q1_base_isolated_ms} ms vs fused 40L XLA E2E TPOT "
+                f"{e2e_q1_mean_tpot_ms} ms (p50 {e2e_q1_p50_tpot_ms} ms, device "
+                f"{baseline_xprof_device_ms} ms + host gap "
+                f"{baseline_host_gap_ms} ms); the "
+                f"{q1_xla_fusion_and_unmeasured_delta_ms} ms delta reflects per-op "
+                f"pallas.jax_op host dispatch + synchronize() overhead in isolated "
+                f"micro-benchmarks vs whole-stage XLA compilation."
+            ),
+            (
+                f"[UNVERIFIED] Dynamic csa_gather num_row_subchunks + "
+                f"use_token_parallel at T>=16*tp_size + ceil query split "
+                f"reduce isolated 40L q=1 subop sum by {q1_isolated_delta_ms} ms "
+                f"and 38L q=6 (T=128) SparseMLA+SWA by {q6_mla_delta_38l_ms} ms."
+            ),
+        ],
+    }
+
+
 def run_decoder_layer_verification(
     subop: str = "all",
     *,
@@ -837,6 +973,7 @@ def run_decoder_layer_verification(
         "tp_size": tp_size,
         "comparisons": comparisons,
         "reconciliation_40_layer": reconcile_40_layer_step(num_tokens=2048),
+        "reconciliation_40_layer_decode": reconcile_40_layer_decode_step(),
     }
 
 
@@ -870,6 +1007,7 @@ def _worker(args: argparse.Namespace) -> int:
         "wall_ms": common.summarize_samples([elapsed_ms]),
         "roofline": roof,
         "reconciliation_40_layer": verify_res["reconciliation_40_layer"],
+        "reconciliation_40_layer_decode": verify_res["reconciliation_40_layer_decode"],
         "comparisons": verify_res["comparisons"],
         "hbm": common.hbm_stats(),
     }

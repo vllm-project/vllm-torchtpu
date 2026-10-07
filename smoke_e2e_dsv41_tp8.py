@@ -48,7 +48,7 @@ os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
 os.environ.setdefault(
     "LIBTPU_INIT_ARGS",
-    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0",
+    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=67108864",
 )
 os.environ.setdefault("TPU_DEEPSEEK_V41_IMPL", "v2")
 os.environ.setdefault("TPU_DEEPSEEK_V41_CED", "1")
@@ -166,6 +166,7 @@ def build_smoke_model_dir(
     out_dir: Path,
     *,
     num_layers: int = 4,
+    keep_dspark: bool = False,
 ) -> Path:
     from vllm.models.deepseek_v41.common.engram import find_next_prime
 
@@ -213,8 +214,13 @@ def build_smoke_model_dir(
 
     tc["engram_vocab_size"] = engram_vocab_size
     tc["engram_num_embeddings"] = [total_embeddings]
-    tc["num_nextn_predict_layers"] = 0
-    tc["dspark_target_layer_ids"] = []
+    if keep_dspark:
+        tc["dspark_target_layer_ids"] = list(range(num_layers - 3, num_layers))
+        tc["dspark_n_routed_experts"] = 16
+        tc["dspark_num_experts_per_tok"] = 2
+    else:
+        tc["num_nextn_predict_layers"] = 0
+        tc["dspark_target_layer_ids"] = []
     # Smaller routed expert count (16 across EP8 = 2/rank) for fast dummy init
     tc["n_routed_experts"] = 16
     tc["num_experts_per_tok"] = 2
@@ -411,6 +417,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-golden", type=Path, default=None)
     parser.add_argument("--verify-against-baseline", type=Path, default=None)
     parser.add_argument("--profile-dir", type=Path, default=None)
+    parser.add_argument("--tensor-parallel-size", type=int, default=8)
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="DP replicas; DP * TP must equal the 8 TPU7x-8 cores",
+    )
+    parser.add_argument(
+        "--speculative-config",
+        type=json.loads,
+        default=None,
+        help='JSON passed to LLM(speculative_config=...), e.g. {"method":"dspark",'
+        '"num_speculative_tokens":5}',
+    )
     return parser.parse_args()
 
 
@@ -494,7 +514,10 @@ def main() -> None:
 
     args = parse_args()
     smoke_dir = build_smoke_model_dir(
-        args.meta_dir, args.smoke_dir, num_layers=args.num_layers
+        args.meta_dir,
+        args.smoke_dir,
+        num_layers=args.num_layers,
+        keep_dspark=args.speculative_config is not None,
     )
     logits_capture_dir = smoke_dir / "logits_capture"
     os.environ["DSV41_SMOKE_LOGITS_DIR"] = str(logits_capture_dir)
@@ -509,8 +532,8 @@ def main() -> None:
     llm_kwargs: dict[str, Any] = {
         "model": str(smoke_dir),
         "load_format": "dummy",
-        "tensor_parallel_size": 8,
-        "data_parallel_size": 1,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
         "enable_expert_parallel": True,
         "enable_ep_weight_filter": True,
         "language_model_only": True,
@@ -526,6 +549,8 @@ def main() -> None:
         "block_size": 16,
         "compilation_config": {"compile_sizes": [16, args.max_num_batched_tokens]},
     }
+    if args.speculative_config is not None:
+        llm_kwargs["speculative_config"] = args.speculative_config
     if args.profile_dir is not None:
         args.profile_dir.mkdir(parents=True, exist_ok=True)
         prof_path = str(args.profile_dir.resolve())

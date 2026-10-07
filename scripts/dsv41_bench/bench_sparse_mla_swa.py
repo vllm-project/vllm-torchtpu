@@ -54,13 +54,21 @@ COMPRESSED_LAYERS = 38
 REUSE_INDEX_LAYERS = 30
 
 
-def _build_query_start_loc(torch, tokens: int, num_seqs: int) -> Any:
-    """Build `query_start_loc` (`int32[num_seqs + 1]`) with 2 tail pad tokens.
+def _build_query_start_loc(torch, tokens: int, num_seqs: int, q_len: int = 0) -> Any:
+    """Build `query_start_loc` (`int32[num_seqs + 1]`).
 
-    When `num_seqs > 1`, sequence lengths are deliberately non-multiples of 64
-    so 64-token SWA tiles straddle request boundaries and exercise the
-    `uncovered` patch path in `_attend_window`.
+    When `q_len > 0` (Decode `q_len=1` or DSpark Verify `q_len=6`), each of the
+    `num_seqs` requests has `q_len` query tokens (`[0, q_len, 2*q_len, ...]`).
+    When `q_len == 0` (prefill chunk), leaves 2 tail pad tokens and uses
+    non-multiples of 64 when `num_seqs > 1` so 64-token SWA tiles straddle
+    request boundaries and exercise the `uncovered` patch path in `_attend_window`.
     """
+    if q_len > 0:
+        if num_seqs * q_len > tokens:
+            raise ValueError(
+                f"num_seqs={num_seqs} * q_len={q_len} exceeds tokens={tokens}"
+            )
+        return torch.arange(num_seqs + 1, dtype=torch.int32) * q_len
     valid_tokens = max(1, tokens - 2)
     if num_seqs == 1:
         return torch.tensor([0, valid_tokens], dtype=torch.int32)
@@ -83,6 +91,7 @@ def _build_swa_inputs(
     tokens: int,
     window_size: int,
     query_start_loc: Any,
+    q_len: int = 0,
 ) -> tuple[Any, Any, Any]:
     """Build `(swa_pool, swa_records, swa_slots)` matching `v2/attention.py`.
 
@@ -104,6 +113,7 @@ def _build_swa_inputs(
     swa_records = torch.full((tokens, window_size), -1, dtype=torch.int32)
     swa_slots = torch.full((tokens,), -1, dtype=torch.int32)
     w_offs = torch.arange(window_size, dtype=torch.int32) - (window_size - 1)
+    lead_offset = window_size if q_len > 0 else (window_size - 3)
 
     for s in range(num_seqs):
         start = int(query_start_loc[s].item())
@@ -112,11 +122,9 @@ def _build_swa_inputs(
         if length <= 0:
             continue
         base_rec = s * (tokens // max(1, num_seqs) + window_size + 16) + window_size
-        # Start logical positions at window_size - 3 so the first 3 tokens of
-        # each request have leading -1 SWA columns (`logical < 0`).
-        seq_pos = torch.arange(length, dtype=torch.int32) + (window_size - 3)
+        seq_pos = torch.arange(length, dtype=torch.int32) + lead_offset
         logical = seq_pos[:, None] + w_offs[None, :]
-        phys = base_rec + logical - (window_size - 3)
+        phys = base_rec + logical - lead_offset
         valid_col = logical >= 0
         swa_records[start:end] = torch.where(valid_col, phys, torch.full_like(phys, -1))
         swa_slots[start:end] = base_rec + torch.arange(length, dtype=torch.int32)
@@ -687,6 +695,7 @@ def _compute_roofline(
     topk: int,
     measured_ms: float | None,
     union_cap: int = 4096,
+    q_len: int = 0,
 ) -> dict[str, Any]:
     """First-principles hardware roofline for the selected `subop` and `mode`."""
     if mode == "token_parallel":
@@ -700,13 +709,21 @@ def _compute_roofline(
         h_local = heads_total // tp_size
         comm_s = 0.0
 
-    num_swa_tiles = max(1, t_local // 64)
-    swa_union_w = 64 + window_size  # 192
-    swa_flops = 4.0 * t_local * h_local * swa_union_w * head_dim
-    swa_hbm_bytes = (
-        num_swa_tiles * swa_union_w * head_dim * 2.0
-        + 2.0 * t_local * h_local * head_dim * 2.0
-    )
+    if q_len > 0:
+        num_active_reqs = max(1, (t_local + q_len - 1) // q_len)
+        swa_flops = 4.0 * t_local * h_local * window_size * head_dim
+        swa_hbm_bytes = (
+            num_active_reqs * (q_len - 1 + window_size) * head_dim * 2.0
+            + 2.0 * t_local * h_local * head_dim * 2.0
+        )
+    else:
+        num_swa_tiles = max(1, t_local // 64)
+        swa_union_w = 64 + window_size  # 192
+        swa_flops = 4.0 * t_local * h_local * swa_union_w * head_dim
+        swa_hbm_bytes = (
+            num_swa_tiles * swa_union_w * head_dim * 2.0
+            + 2.0 * t_local * h_local * head_dim * 2.0
+        )
 
     compact_hbm_bytes = 2.0 * t_local * topk * 4.0
     # Logical bytes gathered by SparseCore (512B NoPE + 128B RoPE per topk entry)
@@ -772,16 +789,36 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 
     geo = common.Dsv41Geometry()
     tokens = args.chunk_size
-    if tokens % 128 != 0:
-        raise ValueError(f"--chunk-size {tokens} must be a multiple of 128")
-    if tokens % ctx.tp_size != 0 or (tokens // ctx.tp_size) % 128 != 0:
-        raise ValueError(
-            f"--chunk-size {tokens} / tp_size={ctx.tp_size} must be a multiple of 128"
-        )
+    q_len = int(getattr(args, "q_len", 0))
+    swa_width_arg = int(getattr(args, "swa_width", 0))
+    if q_len > 0:
+        if tokens % 4 != 0:
+            raise ValueError(
+                f"--chunk-size {tokens} must be a multiple of 4 when --q-len > 0"
+            )
+        if args.mode == "token_parallel" and (
+            tokens % ctx.tp_size != 0 or (tokens // ctx.tp_size) % 4 != 0
+        ):
+            raise ValueError(
+                f"--chunk-size {tokens} / tp_size={ctx.tp_size} must be a multiple of 4"
+            )
+        if args.num_seqs * q_len > tokens:
+            raise ValueError(
+                f"--num-seqs {args.num_seqs} * --q-len {q_len} exceeds "
+                f"--chunk-size {tokens}"
+            )
+    else:
+        if tokens % 128 != 0:
+            raise ValueError(f"--chunk-size {tokens} must be a multiple of 128")
+        if tokens % ctx.tp_size != 0 or (tokens // ctx.tp_size) % 128 != 0:
+            raise ValueError(
+                f"--chunk-size {tokens} / tp_size={ctx.tp_size} must be a "
+                "multiple of 128"
+            )
     heads_total = geo.num_attention_heads
     heads_local = geo.heads_per_rank(ctx.tp_size)
     head_dim = geo.head_dim
-    window_size = geo.sliding_window
+    window_size = swa_width_arg if swa_width_arg > 0 else geo.sliding_window
     topk = geo.index_topk
     scale = float(head_dim**-0.5)
     max_requests = args.num_seqs if args.num_seqs <= 4 else None
@@ -797,9 +834,11 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     sink_full_cpu = (
         torch.randn((heads_total,), generator=rng, dtype=torch.float32) * 0.5
     )
-    query_start_loc_cpu = _build_query_start_loc(torch, tokens, args.num_seqs)
+    query_start_loc_cpu = _build_query_start_loc(
+        torch, tokens, args.num_seqs, q_len=q_len
+    )
     swa_pool_cpu, swa_records_cpu, swa_slots_cpu = _build_swa_inputs(
-        torch, rng, tokens, window_size, query_start_loc_cpu
+        torch, rng, tokens, window_size, query_start_loc_cpu, q_len=q_len
     )
     main_pool_cpu, rope_pool_cpu, pages_cpu, main_records_cpu = _build_main_kv_inputs(
         torch,
@@ -1049,9 +1088,14 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 
         # Helper for Token-Parallel All-to-All (`[T, H/8, D] <-> [T/8, H, D]`).
         tp_group = get_tp_group().device_group
-        t_shard = tokens // ctx.tp_size
-        t_start = tp_rank * t_shard
-        t_end = (tp_rank + 1) * t_shard
+        can_tp = (
+            tokens % ctx.tp_size == 0
+            and (tokens // ctx.tp_size) >= 4
+            and (tokens // ctx.tp_size) % 4 == 0
+        )
+        t_shard = (tokens // ctx.tp_size) if can_tp else tokens
+        t_start = (tp_rank * t_shard) if can_tp else 0
+        t_end = ((tp_rank + 1) * t_shard) if can_tp else tokens
         swa_records_tp = swa_records[t_start:t_end].contiguous()
         main_records_tp = main_records[t_start:t_end].contiguous()
         compacted_records_tp = compacted_records[t_start:t_end].contiguous()
@@ -1516,33 +1560,33 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     sink_hp,
                 ).masked_fill(pad_mask, 0)
                 common.synchronize(precompact_out)
-                q_tp_v = _all_to_all_hp_to_tp(q_hp)
-                tp_out_local = precompact_all_op(
-                    q_tp_v,
-                    swa_pool,
-                    main_pool,
-                    rope_pool,
-                    swa_records_tp,
-                    compacted_records_tp,
-                    pages,
-                    query_start_loc_tp,
-                    sink_full,
-                )
-                tp_out = _all_to_all_tp_to_hp(tp_out_local).masked_fill(pad_mask, 0)
-                common.synchronize(tp_out)
-
                 verify_report["precompact_vs_baseline_exact"] = common.verify_outputs(
                     {"out": precompact_out.cpu()},
                     {"out": base_out.cpu()},
                     common.EXACT,
                     label="precompact vs baseline",
                 )
-                verify_report["token_parallel_vs_baseline"] = common.verify_outputs(
-                    {"out": tp_out.cpu()},
-                    {"out": base_out.cpu()},
-                    common.LOSSLESS,
-                    label="token_parallel vs baseline",
-                )
+                if can_tp:
+                    q_tp_v = _all_to_all_hp_to_tp(q_hp)
+                    tp_out_local = precompact_all_op(
+                        q_tp_v,
+                        swa_pool,
+                        main_pool,
+                        rope_pool,
+                        swa_records_tp,
+                        compacted_records_tp,
+                        pages,
+                        query_start_loc_tp,
+                        sink_full,
+                    )
+                    tp_out = _all_to_all_tp_to_hp(tp_out_local).masked_fill(pad_mask, 0)
+                    common.synchronize(tp_out)
+                    verify_report["token_parallel_vs_baseline"] = common.verify_outputs(
+                        {"out": tp_out.cpu()},
+                        {"out": base_out.cpu()},
+                        common.LOSSLESS,
+                        label="token_parallel vs baseline",
+                    )
                 verify_report["selected_mode_vs_baseline"] = common.verify_outputs(
                     {"out": out["out"].cpu()},
                     {"out": base_out.cpu()},
@@ -1655,15 +1699,128 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                             label="union_gather (num_seqs=4) vs baseline",
                         )
                     )
+                if q_len > 0:
+                    s_max, s_den, s_num = swa_op(q_hp, swa_pool, swa_records)
+                    n_chk, r_chk, k_len = pregather_op(
+                        main_pool, rope_pool, compacted_records, pages, query_start_loc
+                    )
+                    common.synchronize((s_max, s_den, s_num, n_chk, r_chk, k_len))
+                    valid_q = (swa_slots >= 0).cpu()
+                    suite_ops: list[tuple[str, Any]] = [
+                        (
+                            "swa_only",
+                            lambda: swa_op(q_hp, swa_pool, swa_records),
+                        ),
+                        (
+                            "swa_dense_ref",
+                            lambda: swa_ref_op(q_hp, swa_pool, swa_records),
+                        ),
+                        (
+                            "compact_records_only",
+                            lambda: compact_op(main_records),
+                        ),
+                        (
+                            "sc_gather_only",
+                            lambda: sc_gather_op(
+                                main_pool,
+                                rope_pool,
+                                compacted_records,
+                                pages,
+                                query_start_loc,
+                            ),
+                        ),
+                        (
+                            "mla_tc_only",
+                            lambda: mla_tc_op(
+                                q_hp,
+                                n_chk,
+                                r_chk,
+                                k_len,
+                                query_start_loc,
+                                sink_hp,
+                                s_num,
+                                s_den,
+                                s_max,
+                            ).masked_fill(pad_mask, 0),
+                        ),
+                        (
+                            "all_precompact",
+                            lambda: precompact_all_op(
+                                q_hp,
+                                swa_pool,
+                                main_pool,
+                                rope_pool,
+                                swa_records,
+                                compacted_records,
+                                pages,
+                                query_start_loc,
+                                sink_hp,
+                            ).masked_fill(pad_mask, 0),
+                        ),
+                    ]
+                    if can_tp:
+                        suite_ops.append(
+                            (
+                                "all_token_parallel",
+                                lambda: _all_to_all_tp_to_hp(
+                                    precompact_all_op(
+                                        _all_to_all_hp_to_tp(q_hp),
+                                        swa_pool,
+                                        main_pool,
+                                        rope_pool,
+                                        swa_records_tp,
+                                        compacted_records_tp,
+                                        pages,
+                                        query_start_loc_tp,
+                                        sink_full,
+                                    )
+                                ).masked_fill(pad_mask, 0),
+                            )
+                        )
+                    subop_suite_res: dict[str, Any] = {}
+                    swa_win_out = swa_ref_out = None
+                    for s_name, s_fn in suite_ops:
+                        s_samples, s_out = common.time_steps(
+                            ctx, s_fn, warmup=2, iters=5
+                        )
+                        if s_name == "swa_only":
+                            swa_win_out = s_out
+                        elif s_name == "swa_dense_ref":
+                            swa_ref_out = s_out
+                        subop_suite_res[s_name] = {
+                            "wall_median_ms": statistics.median(s_samples),
+                            "wall_min_ms": min(s_samples),
+                        }
+                    assert swa_win_out is not None and swa_ref_out is not None
+                    verify_report["swa_window_vs_dense_attend"] = common.verify_outputs(
+                        {
+                            "max": swa_win_out[0].cpu()[valid_q],
+                            "den": swa_win_out[1].cpu()[valid_q],
+                            "num": swa_win_out[2].cpu()[valid_q],
+                        },
+                        {
+                            "max": swa_ref_out[0].cpu()[valid_q],
+                            "den": swa_ref_out[1].cpu()[valid_q],
+                            "num": swa_ref_out[2].cpu()[valid_q],
+                        },
+                        common.LOSSLESS,
+                        label="swa_only vs _attend",
+                    )
+                    verify_report["decode_subop_suite"] = subop_suite_res
                 criteria = (
                     common.EXACT if args.mode != "token_parallel" else common.LOSSLESS
                 )
         else:
             criteria = common.LOSSLESS
 
+        case_suffix = (
+            f"_Q{q_len}_W{window_size}"
+            if (q_len > 0 or window_size != geo.sliding_window)
+            else ""
+        )
         case_name = (
             f"sparse_mla_swa_{args.subop}_{args.mode}_T{tokens}_S{args.num_seqs}"
-            f"_KV{args.kv_len}_CR{args.compress_ratio}_P{args.page_size}"
+            f"_KV{args.kv_len}_CR{args.compress_ratio}_P{args.page_size}{case_suffix}"
         )
         g_path = common.golden_path(args.golden_dir, case_name, ctx.rank)
         if args.update_golden or g_path.exists():
@@ -1687,12 +1844,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         topk,
         statistics.median(samples),
         union_cap=union_cap,
+        q_len=q_len,
     )
     return {
         "subop": args.subop,
         "mode": args.mode,
         "chunk_size": tokens,
         "num_seqs": args.num_seqs,
+        "q_len": q_len,
+        "window_size": window_size,
         "kv_len": args.kv_len,
         "compress_ratio": args.compress_ratio,
         "page_size": args.page_size,
@@ -1712,6 +1872,18 @@ def main() -> None:
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--compress-ratio", type=int, default=2, choices=[1, 2])
     parser.add_argument("--unique-per-chunk", type=int, default=4096)
+    parser.add_argument(
+        "--q-len",
+        type=int,
+        default=0,
+        help="Per-request query length (0=prefill, 1=Decode, 6=DSpark Verify).",
+    )
+    parser.add_argument(
+        "--swa-width",
+        type=int,
+        default=0,
+        help="Override sliding window width (e.g. 512 causal, 576 DSpark).",
+    )
     common.run_main("sparse_mla_swa", parser, worker)
 
 

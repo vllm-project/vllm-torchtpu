@@ -63,6 +63,8 @@ _PREPARED_KEYS = (
     "TORCH_TPU_TOPOLOGY",
 )
 _PROFILE_SESSION_ENV = "DSV41_BENCH_PROFILE_SESSION_KEY"
+sys.modules.setdefault("common", sys.modules[__name__])
+sys.modules.setdefault("scripts.dsv41_bench.common", sys.modules[__name__])
 
 
 # --------------------------------------------------------------------------

@@ -146,7 +146,7 @@ bench() {
 
 if [ "$mode" != "tier4_only" ]; then
   echo "=== [Step 1] 100k Prefill Benchmarks (c=1, c=4, c=8) ==="
-  bench warm 1 1
+  bench warm 2 2
   bench c1 "${C1_PROMPTS:-2}" 1
   bench c4 "${SAT_PROMPTS:-8}" 4
   bench c8 "${C8_PROMPTS:-8}" 8

@@ -12,7 +12,7 @@ DATA_PARALLELISM=1
 ENABLE_EP=true
 MAX_MODEL_LEN=103424
 MAX_NUM_BATCHED_TOKENS=2048
-MAX_NUM_SEQS=16
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 ASYNC_SCHEDULING=true
 GPU_MEMORY_UTILIZATION=0.85
 # fp8 selects v2's FP8 main KV record and the SparseMLA kernel. TPU V4.1 does
@@ -20,7 +20,7 @@ GPU_MEMORY_UTILIZATION=0.85
 # generic paged attention.
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ISL_OSL_CONFIGS="100000:2048"
-CONCURRENCY_OPTIONS="4 8 16"
+CONCURRENCY_OPTIONS="${CONCURRENCY_OPTIONS:-4 8 16}"
 RANDOM_RANGE_RATIO="0.0"
 BENCHMARK_TEMPERATURE=0
 # Required by run_benchmarks.sh for every config; no eval runs here.
@@ -39,7 +39,9 @@ export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 # 16 x the 1280 MiB single-request budget of deepseek-v41-flash-tp8-ep-100k.
 # On CDK, 16 x 100k requests peaked at 25% of it.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=21474836480 --compilation-config={\"compile_sizes\":[4,8,16,2048]}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"
+COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES} --compilation-config={\"compile_sizes\":${COMPILE_SIZES}}"
 
 # Keep the v7x Engram gather on the runtime default path.
 if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then
