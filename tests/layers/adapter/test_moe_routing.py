@@ -248,3 +248,27 @@ def test_route_hash_table_scales_by_the_layer_factor():
     )
     assert ids.tolist() == [[2, 3], [0, 1]]
     torch.testing.assert_close(weights, torch.full((2, 2), 0.5))
+
+
+@pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_gather_expert_scores_matches_gather_bitwise(scoring_fn):
+    import torch
+
+    torch.manual_seed(0)
+    logits = torch.randn(16, 384) * 8
+    scores = moe_routing._apply_scoring_fn(scoring_fn, logits)
+    # Duplicate ids within a row and every edge expert id.
+    ids = torch.randint(0, 384, (16, 6), dtype=torch.int32)
+    ids[0] = torch.tensor([0, 383, 0, 383, 5, 5])
+    got = moe_routing._gather_expert_scores(scores, ids)
+    want = scores.gather(-1, ids.long())
+    assert got.dtype == want.dtype and got.shape == want.shape
+    assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+
+def test_gather_expert_scores_ignores_nonfinite_unselected_scores():
+    import torch
+
+    scores = torch.tensor([[0.5, float("nan"), float("inf"), 0.25]])
+    got = moe_routing._gather_expert_scores(scores, torch.tensor([[3, 0]]))
+    assert torch.equal(got, torch.tensor([[0.25, 0.5]]))

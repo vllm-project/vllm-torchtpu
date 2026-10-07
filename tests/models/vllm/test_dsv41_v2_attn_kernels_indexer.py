@@ -946,6 +946,7 @@ class TestIndexerOpAndWrapper:
             False,
             False,
             False,
+            0,
         )
         assert f_pool.shape == pool.shape
         assert f_sel.shape == (4, 16)

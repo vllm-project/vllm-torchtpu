@@ -271,3 +271,255 @@ def test_dense_expert_threshold_rejects_invalid_value(monkeypatch, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         envs.environment_variables[name]()
+
+
+def _mxfp4_shapes(m, h, i, e):
+    return (
+        jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
+        jax.ShapeDtypeStruct((e, h // 2, 2 * i), jnp.uint8),
+        jax.ShapeDtypeStruct((e, i // 2, h), jnp.uint8),
+        jax.ShapeDtypeStruct((e, h // 512, 1, 2 * i), jnp.float32),
+        jax.ShapeDtypeStruct((e, i // 512, 1, h), jnp.float32),
+    )
+
+
+@pytest.mark.parametrize("m", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("activation", ["silu", "silu_and_mul_with_clamp", "swigluoai"])
+def test_mxfp4_and_clamped_activations_admitted(m, activation):
+    assert kernel.can_use_dense_expert(
+        *_mxfp4_shapes(m, 5120, 2560, 48),
+        None,
+        None,
+        activation=activation,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        skip_padded_tokens=False,
+    )
+    assert (
+        kernel._select_expert_buffers(
+            max(16, m), 5120, 2560, 48, 64 * 1024**2, 2, 10, 5
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize("m", [4, 16])
+@pytest.mark.parametrize("activation", ["silu_and_mul_with_clamp", "swigluoai"])
+def test_mxfp4_block_scales_match_reference(m, activation, monkeypatch):
+    if jax.default_backend() != "cpu":
+        pytest.skip("CPU Pallas interpreter; run with JAX_PLATFORMS=cpu")
+    from vllm_torchtpu.layers.core.fused_moe_gmm import quantize_to_native_fp4_kmajor
+
+    h, i, e = 1024, 512, 4
+    rng = np.random.default_rng(20261006 + m)
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    w1_f32 = jnp.asarray(rng.normal(scale=0.1, size=(e, h, 2 * i)), jnp.float32)
+    w2_f32 = jnp.asarray(rng.normal(scale=0.1, size=(e, i, h)), jnp.float32)
+    w1, s1 = quantize_to_native_fp4_kmajor(w1_f32, block=512, pack=True)
+    w2, s2 = quantize_to_native_fp4_kmajor(w2_f32, block=512, pack=True)
+    w1_fp4, _ = quantize_to_native_fp4_kmajor(w1_f32, block=512, pack=False)
+    w2_fp4, _ = quantize_to_native_fp4_kmajor(w2_f32, block=512, pack=False)
+
+    route = [0, 2, 3, -1]
+    ids = jnp.asarray(np.tile(route, (m, 1)), jnp.int32)
+    weights = jnp.asarray(np.tile([0.25, 0.5, 0.25, 0.0], (m, 1)), jnp.bfloat16)
+
+    def ref_matmul(lhs, rhs_fp4, scale_4d):
+        result = jnp.zeros((lhs.shape[0], rhs_fp4.shape[1]), jnp.bfloat16)
+        for start in range(0, lhs.shape[1], 512):
+            block = lhs[:, start : start + 512]
+            xs = jnp.max(jnp.abs(block), axis=1, keepdims=True) / 448.0
+            inv = jnp.where(xs == 0, 0, 1 / xs)
+            q = (block * inv).astype(jnp.float8_e4m3fn)
+            part = jnp.matmul(
+                q,
+                rhs_fp4[start : start + 512].astype(jnp.float8_e4m3fn),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            sc = scale_4d[start // 512, 0].astype(jnp.bfloat16)
+            result += (part * xs) * sc
+        return result
+
+    expected = jnp.zeros((m, h), jnp.float32)
+    for expert in sorted(set(route) - {-1}):
+        gate, up = jnp.split(ref_matmul(x, w1_fp4[expert], s1[expert]), 2, axis=1)
+        act = kernel._apply_activation(gate, up, activation)
+        output = ref_matmul(act, w2_fp4[expert], s2[expert])
+        coeff = jnp.sum(
+            jnp.where(ids == expert, weights.astype(jnp.float32), 0), axis=1
+        )
+        expected += jnp.where(
+            coeff[:, None] != 0, output.astype(jnp.float32) * coeff[:, None], 0
+        )
+    expected = np.asarray(expected.astype(jnp.bfloat16), dtype=np.float32)
+
+    monkeypatch.setattr(
+        kernel.pl,
+        "pallas_call",
+        functools.partial(kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        kernel.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    kernel.dense_expert_moe.clear_cache()
+    try:
+        actual = np.asarray(
+            kernel.dense_expert_moe(
+                x,
+                w1,
+                w2,
+                s1,
+                s2,
+                weights,
+                ids,
+                activation=activation,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            ),
+            dtype=np.float32,
+        )
+    finally:
+        kernel.dense_expert_moe.clear_cache()
+    assert np.isfinite(actual).all()
+    relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert relative_l2 < 0.008, relative_l2
+
+
+def test_packing_factor_and_activation_edge_cases(monkeypatch):
+    from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
+
+    x, w1_fp8, w2_fp8, s1, s2 = _shapes(16, 512, 512, 4)
+    _, w1_u8, w2_u8, s1_b, s2_b = _mxfp4_shapes(8, 512, 512, 4)
+
+    assert not kernel.can_use_dense_expert(
+        x,
+        w1_u8,
+        w2_u8,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        x,
+        w1_fp8,
+        w2_fp8,
+        s1_b,
+        s2_b,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        x,
+        w1_fp8,
+        w2_fp8,
+        s1,
+        s2,
+        None,
+        None,
+        activation="gelu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        x,
+        w1_fp8,
+        w2_fp8,
+        s1,
+        s2,
+        x,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        jax.ShapeDtypeStruct((16,), jnp.bfloat16),
+        w1_fp8,
+        w2_fp8,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        x,
+        jax.ShapeDtypeStruct((4, 512, 512), jnp.float8_e4m3fn),
+        w2_fp8,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    assert not kernel.can_use_dense_expert(
+        jax.ShapeDtypeStruct((16, 512), jnp.float32),
+        w1_fp8,
+        w2_fp8,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    with pytest.raises(NotImplementedError, match="Unsupported activation"):
+        kernel._apply_activation(jnp.zeros((2, 2)), jnp.zeros((2, 2)), "gelu")
+
+    captured = {}
+
+    def fake_dense_expert_moe(
+        hidden,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        *,
+        activation="silu",
+        rhs_quant_dtype=None,
+    ):
+        captured["activation"] = activation
+        captured["rhs_quant_dtype"] = rhs_quant_dtype
+        return hidden
+
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 64)
+    monkeypatch.setattr(wrapper, "dense_expert_moe", fake_dense_expert_moe)
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        jax.eval_shape(
+            functools.partial(
+                wrapper.fused_moe_func,
+                topk=6,
+                activation="silu_and_mul_with_clamp",
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            ),
+            jax.ShapeDtypeStruct((8, 512), jnp.bfloat16),
+            w1_u8,
+            w2_u8,
+            s1_b,
+            s2_b,
+            None,
+            None,
+            jax.ShapeDtypeStruct((8, 6), jnp.bfloat16),
+            jax.ShapeDtypeStruct((8, 6), jnp.int32),
+        )
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+    assert captured == {
+        "activation": "silu_and_mul_with_clamp",
+        "rhs_quant_dtype": jnp.float4_e2m1fn,
+    }

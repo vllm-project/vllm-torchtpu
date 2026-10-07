@@ -406,10 +406,13 @@ def test_engram_init_staging_branches():
         assert buf.shape == (10, 4, last)
         assert buf.dtype == torch.uint8
         assert buf.device.type == "cpu"
-    assert engram_on._staged_raw.shape == (10, 4, 16)
-    assert engram_on._staged_scale.shape == (10, 4, 2)
-    assert torch.all(engram_on._host_scale == v2_engram._UNIT_SCALE)
-    assert torch.all(engram_on._staged_scale == v2_engram._UNIT_SCALE)
+    # Device staging is 1-D int32 words (10*4*16 raw bytes, 10*4*2 scale bytes).
+    assert engram_on._staged_raw.shape == (160,)
+    assert engram_on._staged_raw.dtype == torch.int32
+    assert engram_on._staged_scale.shape == (20,)
+    assert engram_on._staged_scale.dtype == torch.int32
+    assert torch.all(engram_on._host_scale == v2_engram._INVALID_SCALE)
+    assert torch.all(engram_on._staged_scale == -1)
     assert engram_on.staged_rows.shape == (10, 4, 16)
 
     # Branch 2: cpu_offload = False
@@ -448,19 +451,23 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
 
     engram = make_engram(cpu_offload=True)
 
-    # Case A: Partial tokens -> tail reset to FP8 zero with unit scale.
+    # Case A: Partial tokens -> only the word-alignment padding tail of the
+    # active slice is reset to the sentinel; stale tail rows stay untouched.
     engram._host_raw.fill_(99)
     engram._host_scale.fill_(99)
     engram.prepare_embeddings(torch.zeros(5, cols, dtype=torch.int32))
-    assert torch.all(engram._staged_raw[:5] == one_fp8)
-    assert torch.all(engram._staged_scale[:5] == v2_engram._UNIT_SCALE + 2)
-    assert torch.count_nonzero(engram._staged_raw[5:]) == 0
-    assert torch.all(engram._staged_scale[5:] == v2_engram._UNIT_SCALE)
-    rows = Engram._ready_rows(engram, max_tokens)
+    assert torch.all(engram._host_raw[:5] == one_fp8)
+    assert torch.all(engram._host_raw[5:] == 99)
+    assert torch.all(engram._host_scale[:5] == v2_engram._UNIT_SCALE + 2)
+    assert torch.all(engram._host_scale_buf[30:40] == v2_engram._INVALID_SCALE)
+    assert torch.all(engram._host_scale_buf[40:48] == 99)
+    staged_raw_5, staged_scale_5 = engram._staged_tensors(5)
+    assert torch.equal(staged_raw_5, engram._host_raw[:5].view(-1).view(torch.int32))
+    assert torch.equal(staged_scale_5, engram._host_scale_buf[:40].view(torch.int32))
+    rows = Engram._ready_rows(engram, 5)
     torch.testing.assert_close(
-        rows[:5], torch.full((5, cols, dim), 4.0, dtype=torch.bfloat16)
+        rows, torch.full((5, cols, dim), 4.0, dtype=torch.bfloat16)
     )
-    assert torch.count_nonzero(rows[5:]) == 0
 
     # Case B: Exact tokens -> no tail reset.
     engram.prepare_embeddings(torch.zeros(max_tokens, cols, dtype=torch.int32))

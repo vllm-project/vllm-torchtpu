@@ -178,3 +178,44 @@ def test_qwen_threshold_boundary_matches_gmm(tensors, monkeypatch, m):
     finally:
         wrapper.fused_moe_func.clear_cache()
         kernel.dense_expert_moe.clear_cache()
+
+
+@pytest.mark.parametrize("m", [4, 8, 16, 64])
+def test_dsv41_mxfp4_block_scales_and_sub_16_tokens_match_gmm(tensors, monkeypatch, m):
+    del tensors
+    rng = np.random.default_rng(20261006 + m)
+    h, i, e = 1024, 512, 4
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    w1 = jnp.asarray(rng.integers(0, 256, size=(e, h // 2, 2 * i), dtype=np.uint8))
+    w2 = jnp.asarray(rng.integers(0, 256, size=(e, i // 2, h), dtype=np.uint8))
+    s1 = jnp.asarray(
+        rng.uniform(0.005, 0.015, size=(e, h // 512, 1, 2 * i)), jnp.float32
+    )
+    s2 = jnp.asarray(rng.uniform(0.005, 0.015, size=(e, i // 512, 1, h)), jnp.float32)
+    ids = jnp.asarray(rng.integers(0, 8, size=(m, 4), dtype=np.int32))
+    weights = jnp.asarray(rng.uniform(0.1, 0.4, size=(m, 4)), jnp.bfloat16)
+    args = (x, w1, w2, s1, s2, None, None, weights, ids)
+    kwargs = dict(
+        experts_start=jnp.array(0, jnp.int32),
+        topk=4,
+        use_ep=True,
+        activation="silu_and_mul_with_clamp",
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        onehot_moe_permute_threshold=32768,
+    )
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 0)
+    wrapper.fused_moe_func.clear_cache()
+    expected = np.asarray(wrapper.fused_moe_func(*args, **kwargs), dtype=np.float32)
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 64)
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        actual = np.asarray(wrapper.fused_moe_func(*args, **kwargs), dtype=np.float32)
+        hlo = wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
+        assert "dense_expert_moe-e_4" in hlo
+        assert actual.shape == (m, h)
+        assert np.isfinite(actual).all()
+        rel = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+        assert rel < 0.002, rel
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+        kernel.dense_expert_moe.clear_cache()

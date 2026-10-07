@@ -26,9 +26,14 @@ import json
 import os
 import pathlib
 import runpy
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+# Ensure CPU execution defaults before importing jax or TPU runtime libraries.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
 import jax.numpy as jnp
 import numpy as np
@@ -43,13 +48,26 @@ if str(_BENCH_DIR) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.dsv41_bench import common  # noqa: E402
+# Reuse existing common module if already loaded (e.g., from selftest) to avoid
+# module shadowing.
+existing_common = sys.modules.get("common")
+if existing_common is not None:
+    common = existing_common
+else:
+    from scripts.dsv41_bench import common  # noqa: E402
 
-sys.modules["common"] = common
+    sys.modules.setdefault("common", common)
+    sys.modules["common"] = common
+
 import bench_indexer as bi  # noqa: E402
 import bench_sparse_mla_swa as bs  # noqa: E402
 
 import smoke_e2e_dsv41_tp8 as smoke  # noqa: E402
+
+bi.common = common
+bs.common = common
+smoke.common = common
+
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (  # noqa: E402
     paged_indexer_jax,
     write_index_keys,
@@ -554,7 +572,7 @@ class TestSmokeE2E:
             smoke.main()
             assert golden_file.exists()
 
-        # Run with --verify-against-baseline
+        # Run with --verify-against-baseline and --speculative-config
         monkeypatch.setattr(
             sys,
             "argv",
@@ -566,12 +584,14 @@ class TestSmokeE2E:
                 str(tmp_path / "smoke_run2"),
                 "--prompt-tokens",
                 "16",
+                "--speculative-config",
+                '{"method":"dspark","num_speculative_tokens":5}',
                 "--verify-against-baseline",
                 str(golden_file),
             ],
         )
         with (
-            patch("vllm.LLM", return_value=mock_llm_inst),
+            patch("vllm.LLM", return_value=mock_llm_inst) as mock_llm_cls,
             patch("smoke_e2e_dsv41_tp8._install_deterministic_dummy_weights"),
             patch("smoke_e2e_dsv41_tp8._install_logits_capture"),
             patch(
@@ -581,6 +601,10 @@ class TestSmokeE2E:
             patch("smoke_e2e_dsv41_tp8.verify_golden", return_value={"ok": True}),
         ):
             smoke.main()
+            assert mock_llm_cls.call_args.kwargs["speculative_config"] == {
+                "method": "dspark",
+                "num_speculative_tokens": 5,
+            }
 
         # Entrypoint via runpy: remove _REPO_ROOT from sys.path to cover line 58
         monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(_REPO_ROOT)])
@@ -661,6 +685,44 @@ class TestBenchIndexer:
         )
         assert inp2["write_records_t"].shape[0] == 8192
         assert (inp2["write_records_t"] == -1).any()
+
+        # 4. q_len > 0 with query_split="ceil" and query_split="pad16"
+        inp_dec_ceil = bi._build_indexer_inputs(
+            rng_seed=42,
+            tokens=16,
+            tp_size=8,
+            tp_rank=0,
+            num_seqs=4,
+            kv_len=512,
+            compress_ratio=2,
+            heads=8,
+            head_dim=128,
+            topk=32,
+            candidate_blocks=8,
+            block_size=16,
+            q_len=1,
+            query_split="ceil",
+        )
+        assert inp_dec_ceil["part"] == 2
+        assert inp_dec_ceil["records_t"].shape[0] == 4
+
+        inp_dec_pad16 = bi._build_indexer_inputs(
+            rng_seed=42,
+            tokens=16,
+            tp_size=8,
+            tp_rank=0,
+            num_seqs=4,
+            kv_len=512,
+            compress_ratio=2,
+            heads=8,
+            head_dim=128,
+            topk=32,
+            candidate_blocks=8,
+            block_size=16,
+            q_len=1,
+            query_split="pad16",
+        )
+        assert inp_dec_pad16["part"] == 16
 
     def test_write_index_keys_and_visible_topk(self):
         inp = bi._build_indexer_inputs(
@@ -835,20 +897,22 @@ class TestBenchIndexer:
         with (
             patch.dict(os.environ, {common._PROFILE_SESSION_ENV: "test_session"}),
             patch("vllm.distributed.get_tp_group") as mock_tp,
-            patch("common.model_wrapper_context"),
-            patch("common.synchronize"),
-            patch("common.hbm_stats", return_value={"hbm": 100}),
-            patch(
-                "common.time_steps",
+            patch.object(common, "model_wrapper_context"),
+            patch.object(common, "synchronize"),
+            patch.object(common, "hbm_stats", return_value={"hbm": 100}),
+            patch.object(
+                common,
+                "time_steps",
                 side_effect=lambda c, step_fn, **kw: ([1.0], step_fn()),
             ),
-            patch(
-                "common.profile_steps",
+            patch.object(
+                common,
+                "profile_steps",
                 side_effect=[None, str(tmp_path / "prof")] * 100,
             ),
-            patch("common.summarize_xplanes", return_value={}),
-            patch("common.check_against_golden", return_value={"golden": "ok"}),
-            patch("common.verify_outputs", return_value={"ok": True}),
+            patch.object(common, "summarize_xplanes", return_value={}),
+            patch.object(common, "check_against_golden", return_value={"golden": "ok"}),
+            patch.object(common, "verify_outputs", return_value={"ok": True}),
             patch("torch_tpu._internal.pallas.jax_op", side_effect=dummy_jax_op),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.initialize_indexer"
@@ -952,7 +1016,7 @@ class TestBenchIndexer:
                 assert res_s["subop"] == s
 
     def test_main_and_entrypoint(self, monkeypatch):
-        with patch("common.run_main") as mock_rm:
+        with patch.object(common, "run_main") as mock_rm:
             bi.main()
             mock_rm.assert_called_once()
 
@@ -978,6 +1042,12 @@ class TestBenchSparseMlaSwa:
         assert q4[0].item() == 0
         assert q4[-1].item() == 254
 
+        q_dec = bs._build_query_start_loc(torch, tokens=16, num_seqs=4, q_len=1)
+        assert q_dec.tolist() == [0, 1, 2, 3, 4]
+
+        with pytest.raises(ValueError, match="exceeds tokens"):
+            bs._build_query_start_loc(torch, tokens=16, num_seqs=4, q_len=6)
+
     def test_build_swa_inputs_branches(self):
         rng = torch.Generator(device="cpu").manual_seed(42)
         tokens = 256
@@ -987,6 +1057,15 @@ class TestBenchSparseMlaSwa:
         q_loc = bs._build_query_start_loc(torch, tokens, num_seqs=2)
         pool, rec, slots = bs._build_swa_inputs(torch, rng, tokens, window_size, q_loc)
         assert rec.shape == (tokens, window_size)
+
+        # Decode q_len > 0 branch
+        q_loc_dec = bs._build_query_start_loc(torch, 16, num_seqs=4, q_len=1)
+        p_dec, r_dec, s_dec = bs._build_swa_inputs(
+            torch, rng, 16, 512, q_loc_dec, q_len=1
+        )
+        assert r_dec.shape == (16, 512)
+        assert (s_dec[:4] >= 0).all()
+        assert (s_dec[4:] == -1).all()
 
         # q_loc with empty length (start == end) to cover line 114 (length <= 0)
         q_loc_empty = torch.tensor([0, 100, 100, 254], dtype=torch.int32)
@@ -1185,6 +1264,23 @@ class TestBenchSparseMlaSwa:
         with pytest.raises(ValueError, match="tp_size=8 must be a multiple of 128"):
             bs.worker(ctx, args2)
 
+        # q_len > 0 and chunk_size % 4 != 0
+        args3 = argparse.Namespace(chunk_size=6, q_len=1)
+        with pytest.raises(
+            ValueError, match="must be a multiple of 4 when --q-len > 0"
+        ):
+            bs.worker(ctx, args3)
+
+        # q_len > 0, mode="token_parallel", and (tokens // tp_size) % 4 != 0
+        args4 = argparse.Namespace(chunk_size=16, q_len=1, mode="token_parallel")
+        with pytest.raises(ValueError, match="tp_size=8 must be a multiple of 4"):
+            bs.worker(ctx, args4)
+
+        # q_len > 0 and num_seqs * q_len > tokens
+        args5 = argparse.Namespace(chunk_size=16, q_len=6, num_seqs=4, mode="baseline")
+        with pytest.raises(ValueError, match="exceeds --chunk-size"):
+            bs.worker(ctx, args5)
+
     def test_worker_all_subops_and_modes(self, tmp_path):
         ctx = common.WorkerContext(0, 8, 8, None, tmp_path)
 
@@ -1200,26 +1296,45 @@ class TestBenchSparseMlaSwa:
             def _len(a):
                 return a[0].shape[0] if a and hasattr(a[0], "shape") else 1024
 
+            def _rec_len(a):
+                return (
+                    a[2].shape[0] if len(a) > 2 and hasattr(a[2], "shape") else _len(a)
+                )
+
             if "sc_gather" in name:
                 return lambda *a, **k: (
-                    torch.zeros((_len(a), 4)),
-                    torch.zeros((_len(a), 4)),
+                    torch.zeros((_rec_len(a), 4)),
+                    torch.zeros((_rec_len(a), 4)),
                 )
             elif "pregather" in name:
                 return lambda *a, **k: (
-                    torch.zeros((1, _len(a), 128, 512)),
-                    torch.zeros((1, _len(a), 32, 64)),
-                    torch.zeros((_len(a),), dtype=torch.int32),
+                    torch.zeros((1, _rec_len(a), 128, 512)),
+                    torch.zeros((1, _rec_len(a), 32, 64)),
+                    torch.zeros((_rec_len(a),), dtype=torch.int32),
                 )
             elif "precompact" in name or "mla_tc" in name:
                 return lambda *a, **k: torch.zeros(
-                    (_len(a), 64 if _len(a) < 1024 else 8, 512)
+                    (
+                        _len(a),
+                        a[0].shape[1]
+                        if a and hasattr(a[0], "shape") and a[0].ndim >= 2
+                        else (64 if _len(a) < 1024 else 8),
+                        512,
+                    )
                 )
             elif "compact" in name:
                 return lambda *a, **k: torch.zeros((_len(a), 128), dtype=torch.int32)
             else:
                 return lambda *a, **k: (
-                    torch.zeros((_len(a), 64 if _len(a) < 1024 else 8, 512)),
+                    torch.zeros(
+                        (
+                            _len(a),
+                            a[0].shape[1]
+                            if a and hasattr(a[0], "shape") and a[0].ndim >= 2
+                            else (64 if _len(a) < 1024 else 8),
+                            512,
+                        )
+                    ),
                     torch.zeros((_len(a), 4)),
                     torch.zeros((_len(a), 4)),
                 )
@@ -1261,19 +1376,20 @@ class TestBenchSparseMlaSwa:
 
         with (
             patch("vllm.distributed.get_tp_group") as mock_tp,
-            patch("common.model_wrapper_context"),
-            patch("common.synchronize"),
-            patch("common.hbm_stats", return_value={"hbm": 100}),
-            patch(
-                "common.time_steps",
+            patch.object(common, "model_wrapper_context"),
+            patch.object(common, "synchronize"),
+            patch.object(common, "hbm_stats", return_value={"hbm": 100}),
+            patch.object(
+                common,
+                "time_steps",
                 side_effect=lambda c, step_fn, **kw: ([1.0], step_fn()),
             ),
-            patch("common.profile_steps", return_value=None),
-            patch("common.check_against_golden", return_value={"golden": "ok"}),
-            patch("common.verify_outputs", return_value={"ok": True}),
+            patch.object(common, "profile_steps", return_value=None),
+            patch.object(common, "check_against_golden", return_value={"golden": "ok"}),
+            patch.object(common, "verify_outputs", return_value={"ok": True}),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.sparse_fp8_attention",
-                return_value=torch.zeros((1024, 8, 512)),
+                side_effect=lambda q, *a, **kw: torch.zeros_like(q),
             ),
             patch(
                 "torch.distributed.all_to_all_single",
@@ -1286,6 +1402,35 @@ class TestBenchSparseMlaSwa:
             ),
             patch("jax.shard_map", side_effect=mock_shard_map),
             patch("torch_tpu._internal.pallas.jax_op", side_effect=dummy_mla_jax_op),
+            patch.object(
+                bs,
+                "_build_swa_inputs",
+                side_effect=lambda t, rng, toks, w_sz, q_loc, q_len=0: (
+                    t.zeros((64, 128), dtype=t.int32),
+                    t.zeros((toks, w_sz), dtype=t.int32),
+                    t.cat(
+                        [
+                            t.zeros((int(q_loc[-1].item()),), dtype=t.int32),
+                            t.full((toks - int(q_loc[-1].item()),), -1, dtype=t.int32),
+                        ]
+                    ),
+                ),
+            ),
+            patch.object(
+                bs,
+                "_build_main_kv_inputs",
+                side_effect=lambda t, rng, toks, kv_l, cr, p_sz, tk, q_loc, upc: (
+                    t.zeros((64, 128), dtype=t.int32),
+                    t.zeros((16, 128), dtype=t.int32),
+                    t.zeros((int(q_loc.numel() - 1), 16), dtype=t.int32),
+                    t.zeros((toks, tk), dtype=t.int32),
+                ),
+            ),
+            patch.object(
+                bs,
+                "_compact_records_torch_ref",
+                side_effect=lambda t, rec: rec.clone(),
+            ),
             patch(
                 "vllm_torchtpu.models.vllm.vllm_model_wrapper_context.get_vllm_model_wrapper_context",
                 return_value=MagicMock(mesh=None),
@@ -1406,8 +1551,36 @@ class TestBenchSparseMlaSwa:
             res_ug2 = bs.worker(ctx, args_ug2)
             assert res_ug2["subop"] == "sc_gather_only"
 
+            # Decode q_len=1 (chunk_size=16) and q_len=6 (chunk_size=128)
+            for c_size, q_l, n_s in [(16, 1, 4), (128, 6, 4)]:
+                args_dec = argparse.Namespace(
+                    chunk_size=c_size,
+                    q_len=q_l,
+                    swa_width=512,
+                    seed=42,
+                    num_seqs=n_s,
+                    kv_len=512,
+                    compress_ratio=2,
+                    page_size=16,
+                    unique_per_chunk=256,
+                    mode="baseline",
+                    subop="all",
+                    verify=True,
+                    golden_dir=tmp_path / "golden",
+                    update_golden=False,
+                    profile=None,
+                    warmup=1,
+                    iters=1,
+                )
+                res_dec = bs.worker(ctx, args_dec)
+                assert "decode_subop_suite" in res_dec["verify"]
+                if c_size == 128:
+                    assert (
+                        "all_token_parallel" in res_dec["verify"]["decode_subop_suite"]
+                    )
+
     def test_main_and_entrypoint(self, monkeypatch):
-        with patch("common.run_main") as mock_rm:
+        with patch.object(common, "run_main") as mock_rm:
             bs.main()
             mock_rm.assert_called_once()
 
@@ -1417,3 +1590,235 @@ class TestBenchSparseMlaSwa:
                 str(_BENCH_DIR / "bench_sparse_mla_swa.py"), run_name="__main__"
             )
         assert exc_info.value.code == 0
+
+
+# ==============================================================================
+# 4. Tests for 93e011ff9 benchmarking config scripts
+# ==============================================================================
+class TestBenchmarkingConfigs:
+    """Unit tests verifying 100k prefill/decode benchmarking config scripts."""
+
+    _CONFIG_DIR = _REPO_ROOT / "scripts" / "vllm" / "benchmarking" / "configs"
+    _PREFILL_SCRIPT = "deepseek-v41-flash-tp8-ep-100k-prefill.sh"
+    _DECODE_SCRIPT = "deepseek-v41-flash-tp8-ep-100k-decode.sh"
+
+    @classmethod
+    def _source_config(
+        cls, script_name: str, env_overrides: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        config_path = cls._CONFIG_DIR / script_name
+        assert config_path.is_file(), f"Config script not found: {config_path}"
+
+        bash_code = f"""
+        source "{config_path}"
+        vars=(
+            MODEL TENSOR_PARALLELISM DATA_PARALLELISM ENABLE_EP
+            MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS
+            ASYNC_SCHEDULING GPU_MEMORY_UTILIZATION KV_CACHE_DTYPE
+            NUM_PROMPTS ISL_OSL_CONFIGS CONCURRENCY_OPTIONS
+            RANDOM_RANGE_RATIO BENCHMARK_TEMPERATURE BENCHMARK_WARMUP_RUNS
+            EVAL_TOLERANCE SERVER_READY_WAIT_MIN
+            OMP_NUM_THREADS NEW_MODEL_DESIGN MODEL_IMPL_TYPE
+            VLLM_USE_BREAKABLE_CUDAGRAPH VLLM_USE_AOT_COMPILE
+            TPU_DEEPSEEK_V41_IMPL TPU_DEEPSEEK_V41_CED
+            EXTRA_SERVE_ARGS LIBTPU_INIT_ARGS
+        )
+        for v in "${{vars[@]}}"; do
+            echo "__VAR__:$v=${{!v}}"
+        done
+        """
+        env = os.environ.copy()
+        for k in (
+            "DEEPSEEK_V41_MODEL",
+            "KV_CACHE_DTYPE",
+            "OMP_NUM_THREADS",
+            "TPU_DEEPSEEK_V41_IMPL",
+            "TPU_DEEPSEEK_V41_CED",
+            "EXTRA_SERVE_ARGS",
+            "LIBTPU_INIT_ARGS",
+        ):
+            env.pop(k, None)
+        if env_overrides:
+            env.update(env_overrides)
+        res = subprocess.run(
+            ["bash", "-c", bash_code],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        result: dict[str, str] = {}
+        for line in res.stdout.splitlines():
+            if line.startswith("__VAR__:"):
+                k, v = line[len("__VAR__:") :].split("=", 1)
+                result[k] = v
+        return result
+
+    def test_config_scripts_exist_and_pass_syntax_check(self):
+        for script_name in (self._PREFILL_SCRIPT, self._DECODE_SCRIPT):
+            script_path = self._CONFIG_DIR / script_name
+            assert script_path.is_file(), f"{script_name} must exist"
+            assert script_path.stat().st_size > 0, f"{script_name} must not be empty"
+
+            res = subprocess.run(
+                ["bash", "-n", str(script_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert res.returncode == 0
+
+    def test_deepseek_v41_flash_100k_prefill_default_config(self):
+        cfg = self._source_config(self._PREFILL_SCRIPT)
+
+        assert cfg["MODEL"] == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert cfg["TENSOR_PARALLELISM"] == "8"
+        assert cfg["DATA_PARALLELISM"] == "1"
+        assert cfg["ENABLE_EP"] == "true"
+        assert cfg["MAX_MODEL_LEN"] == "103424"
+        assert cfg["MAX_NUM_BATCHED_TOKENS"] == "2048"
+        assert cfg["MAX_NUM_SEQS"] == "1"
+        assert cfg["ASYNC_SCHEDULING"] == "true"
+        assert cfg["GPU_MEMORY_UTILIZATION"] == "0.85"
+
+        assert cfg["KV_CACHE_DTYPE"] == "fp8"
+
+        assert cfg["NUM_PROMPTS"] == "4"
+        assert cfg["ISL_OSL_CONFIGS"] == "100000:1"
+        assert cfg["CONCURRENCY_OPTIONS"] == "1"
+        assert cfg["RANDOM_RANGE_RATIO"] == "0.0"
+        assert cfg["BENCHMARK_TEMPERATURE"] == "0"
+        assert cfg["BENCHMARK_WARMUP_RUNS"] == "1"
+        assert cfg["EVAL_TOLERANCE"] == "0.03"
+        assert cfg["SERVER_READY_WAIT_MIN"] == "120"
+
+        assert cfg["OMP_NUM_THREADS"] == "1"
+        assert cfg["NEW_MODEL_DESIGN"] == "1"
+        assert cfg["MODEL_IMPL_TYPE"] == "vllm"
+        assert cfg["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+        assert cfg["VLLM_USE_AOT_COMPILE"] == "0"
+        assert cfg["TPU_DEEPSEEK_V41_IMPL"] == "v2"
+        assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
+
+        extra_args = cfg["EXTRA_SERVE_ARGS"]
+        assert "--no-enable-prefix-caching" in extra_args
+        assert "--enable-ep-weight-filter" in extra_args
+        assert "--safetensors-load-strategy=prefetch" in extra_args
+        assert "--safetensors-prefetch-num-threads=8" in extra_args
+        assert "--block-size=16" in extra_args
+        assert "--kv-cache-memory-bytes=1342177280" in extra_args
+        assert '--compilation-config={"compile_sizes":[2,2048]}' in extra_args
+
+        assert (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+            in cfg["LIBTPU_INIT_ARGS"]
+        )
+
+    def test_deepseek_v41_flash_100k_prefill_env_overrides(self):
+        overrides = {
+            "DEEPSEEK_V41_MODEL": "custom-org/Custom-V41",
+            "KV_CACHE_DTYPE": "auto",
+            "OMP_NUM_THREADS": "4",
+            "TPU_DEEPSEEK_V41_IMPL": "v1",
+            "TPU_DEEPSEEK_V41_CED": "0",
+            "EXTRA_SERVE_ARGS": "--test-flag",
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1024"
+            ),
+        }
+        cfg = self._source_config(self._PREFILL_SCRIPT, env_overrides=overrides)
+
+        assert cfg["MODEL"] == "custom-org/Custom-V41"
+        assert cfg["KV_CACHE_DTYPE"] == "auto"
+        assert cfg["OMP_NUM_THREADS"] == "4"
+        assert cfg["TPU_DEEPSEEK_V41_IMPL"] == "v1"
+        assert cfg["TPU_DEEPSEEK_V41_CED"] == "0"
+        assert cfg["EXTRA_SERVE_ARGS"].startswith("--test-flag ")
+        assert (
+            cfg["LIBTPU_INIT_ARGS"]
+            == "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1024"
+        )
+
+        cfg_append = self._source_config(
+            self._PREFILL_SCRIPT,
+            env_overrides={"LIBTPU_INIT_ARGS": "--xla_tpu_enable_llo_profiling=true"},
+        )
+        assert (
+            cfg_append["LIBTPU_INIT_ARGS"].strip()
+            == "--xla_tpu_enable_llo_profiling=true"
+            " --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+        )
+
+    def test_deepseek_v41_flash_100k_decode_default_config(self):
+        cfg = self._source_config(self._DECODE_SCRIPT)
+
+        assert cfg["MODEL"] == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert cfg["TENSOR_PARALLELISM"] == "8"
+        assert cfg["DATA_PARALLELISM"] == "1"
+        assert cfg["ENABLE_EP"] == "true"
+        assert cfg["MAX_MODEL_LEN"] == "103424"
+        assert cfg["MAX_NUM_BATCHED_TOKENS"] == "2048"
+        assert cfg["MAX_NUM_SEQS"] == "16"
+        assert cfg["ASYNC_SCHEDULING"] == "true"
+        assert cfg["GPU_MEMORY_UTILIZATION"] == "0.85"
+
+        assert cfg["KV_CACHE_DTYPE"] == "fp8"
+
+        assert cfg["ISL_OSL_CONFIGS"] == "100000:2048"
+        assert cfg["CONCURRENCY_OPTIONS"] == "4 8 16"
+        assert cfg["RANDOM_RANGE_RATIO"] == "0.0"
+        assert cfg["BENCHMARK_TEMPERATURE"] == "0"
+        assert cfg["EVAL_TOLERANCE"] == "0.03"
+        assert cfg["SERVER_READY_WAIT_MIN"] == "120"
+
+        assert cfg["OMP_NUM_THREADS"] == "1"
+        assert cfg["NEW_MODEL_DESIGN"] == "1"
+        assert cfg["MODEL_IMPL_TYPE"] == "vllm"
+        assert cfg["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+        assert cfg["VLLM_USE_AOT_COMPILE"] == "0"
+        assert cfg["TPU_DEEPSEEK_V41_IMPL"] == "v2"
+        assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
+
+        extra_args = cfg["EXTRA_SERVE_ARGS"]
+        assert "--no-enable-prefix-caching" in extra_args
+        assert "--enable-ep-weight-filter" in extra_args
+        assert "--safetensors-load-strategy=prefetch" in extra_args
+        assert "--safetensors-prefetch-num-threads=8" in extra_args
+        assert "--block-size=16" in extra_args
+        assert "--kv-cache-memory-bytes=21474836480" in extra_args
+        assert '--compilation-config={"compile_sizes":[4,8,16,2048]}' in extra_args
+
+        assert (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+            in cfg["LIBTPU_INIT_ARGS"]
+        )
+
+    def test_deepseek_v41_flash_100k_decode_env_overrides(self):
+        overrides = {
+            "DEEPSEEK_V41_MODEL": "custom-org/Custom-Decode-V41",
+            "KV_CACHE_DTYPE": "bf16",
+            "EXTRA_SERVE_ARGS": "--decode-extra-flag",
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=512"
+            ),
+        }
+        cfg = self._source_config(self._DECODE_SCRIPT, env_overrides=overrides)
+
+        assert cfg["MODEL"] == "custom-org/Custom-Decode-V41"
+        assert cfg["KV_CACHE_DTYPE"] == "bf16"
+        assert cfg["EXTRA_SERVE_ARGS"].startswith("--decode-extra-flag ")
+        assert (
+            cfg["LIBTPU_INIT_ARGS"]
+            == "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=512"
+        )
+
+    def test_config_script_static_invariants(self):
+        for script_name in (self._PREFILL_SCRIPT, self._DECODE_SCRIPT):
+            content = (self._CONFIG_DIR / script_name).read_text(encoding="utf-8")
+            assert content.startswith("#!/bin/bash\n")
+            assert "# shellcheck disable=SC2034" in content
+            assert 'TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"' in content
+            assert 'TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"' in content
+            assert (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes" in content
+            )

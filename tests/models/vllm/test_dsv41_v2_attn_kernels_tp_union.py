@@ -637,20 +637,68 @@ class TestTokenParallelAttentionDispatchAndHelpers:
             return (
                 token_parallel
                 and cur_tp_size > 1
-                and tokens >= 128 * cur_tp_size
-                and tokens % (128 * cur_tp_size) == 0
+                and tokens >= 16 * cur_tp_size
+                and tokens % (16 * cur_tp_size) == 0
             )
 
         # Falsy branches
         assert not check(False, 8, 2048)  # token_parallel is False
         assert not check(True, 1, 2048)  # tp_size <= 1
-        assert not check(True, 8, 512)  # tokens < 1024
-        assert not check(True, 8, 1500)  # tokens % 1024 != 0
+        assert not check(True, 8, 64)  # tokens < 128
+        assert not check(True, 8, 150)  # tokens % 128 != 0
 
         # Truthy branch
+        assert check(True, 8, 128)
+        assert check(True, 8, 256)
         assert check(True, 8, 1024)
         assert check(True, 8, 2048)
         assert check(True, 8, 8192)
+
+    def test_csa_gather_dynamic_num_row_subchunks(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+
+        fake_sc = SimpleNamespace(num_lanes=8, num_cores=4, num_subcores=16)
+        fake_tpu_info = SimpleNamespace(sparse_core=fake_sc)
+        monkeypatch.setattr(csa_gather.pltpu, "get_tpu_info", lambda: fake_tpu_info)
+        monkeypatch.setattr(
+            csa_gather.plsc, "VectorSubcoreMesh", lambda **kw: SimpleNamespace(**kw)
+        )
+
+        captured_subchunks: list[int] = []
+
+        def fake_pl_kernel(kernel_fn, *, out_type, **kwargs):
+            captured_subchunks.append(kernel_fn.keywords["num_row_subchunks"])
+            n_rows = out_type[0].shape[0]
+            return lambda nope_c, rope_c, idx, valid: (
+                jnp.zeros((n_rows, 128), dtype=jnp.int32),
+                jnp.zeros((n_rows // 4, 128), dtype=jnp.int32),
+            )
+
+        monkeypatch.setattr(csa_gather.pl, "kernel", fake_pl_kernel)
+
+        nope_cache = jnp.zeros((64, 16, 128), dtype=jnp.int32)
+        rope_cache = jnp.zeros((64, 4, 128), dtype=jnp.int32)
+
+        for num_tokens, expected_subchunks in [
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (24, 32),
+            (64, 64),
+        ]:
+            indices = jnp.zeros((num_tokens * 512,), dtype=jnp.int32)
+            nope_out, rope_out = csa_gather.csa_gather(
+                nope_cache,
+                rope_cache,
+                indices,
+                num_valid_indices=None if num_tokens == 4 else num_tokens * 512,
+                top_k=512,
+            )
+            assert nope_out.shape == (num_tokens * 512, 128)
+            assert rope_out.shape == ((num_tokens * 512) // 4, 128)
+            assert captured_subchunks[-1] == expected_subchunks
 
     def test_initialize_paged_attention_init_and_early_return(self):
         from jax.sharding import Mesh

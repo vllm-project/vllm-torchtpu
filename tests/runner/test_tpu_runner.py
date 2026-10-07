@@ -35,7 +35,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
+)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -168,6 +172,45 @@ def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
     runner._warmup_spec_decode_cleanup.assert_called_once_with("__pcp_mtp_warmup__")
+
+
+def test_spec_warmup_clamps_circular_buffer_group_blocks():
+    executed = []
+    ring_spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+    )
+    attn_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
+    ring_group = SimpleNamespace(kv_cache_spec=ring_spec)
+    runner = SimpleNamespace(
+        max_model_len=8192,
+        max_num_tokens=2048,
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=100,
+            kv_cache_groups=[attn_group, ring_group],
+        ),
+        execute_model=MagicMock(side_effect=lambda so: executed.append(so) and None),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(return_value=None),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+    assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
+    assert tpu_runner._spec_warmup_group_num_blocks(runner, ring_group, 2060) == 1
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
+    first_prefill = executed[0].scheduled_new_reqs[0]
+    assert first_prefill.block_ids == (list(range(1, 10)), [1])
+
+    executed.clear()
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=2048, greedy=True)
+    req0 = executed[0].scheduled_new_reqs[0]
+    req1 = executed[1].scheduled_new_reqs[0]
+    assert req0.block_ids == (list(range(1, 10)), [1])
+    assert req1.block_ids == (list(range(10, 19)), [10])
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):

@@ -26,10 +26,13 @@ pytestmark = pytest.mark.cpu_test
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "smoke_e2e_dsv41_tp8.py"
-_spec = importlib.util.spec_from_file_location("smoke_e2e_dsv41_tp8", _SCRIPT)
-smoke = importlib.util.module_from_spec(_spec)
-sys.modules["smoke_e2e_dsv41_tp8"] = smoke
-_spec.loader.exec_module(smoke)
+if "smoke_e2e_dsv41_tp8" in sys.modules:
+    smoke = sys.modules["smoke_e2e_dsv41_tp8"]
+else:
+    _spec = importlib.util.spec_from_file_location("smoke_e2e_dsv41_tp8", _SCRIPT)
+    smoke = importlib.util.module_from_spec(_spec)
+    sys.modules["smoke_e2e_dsv41_tp8"] = smoke
+    _spec.loader.exec_module(smoke)
 
 
 def _write_fake_meta_dir(meta_dir: pathlib.Path) -> None:
@@ -70,6 +73,16 @@ def test_build_smoke_model_dir_4l_and_6l(tmp_path):
     assert cfg_6l["kv_source_layer_ids"] == [1, 3]
     assert cfg_6l["index_source_layer_ids"] == [1, 3, 4]
     assert cfg_6l["candidate_source_layer_id"] == 3
+
+    out_dspark = smoke.build_smoke_model_dir(
+        meta_dir, tmp_path / "smoke_4l_dspark", num_layers=4, keep_dspark=True
+    )
+    cfg_dspark = json.loads((out_dspark / "config.json").read_text(encoding="utf-8"))[
+        "text_config"
+    ]
+    assert cfg_dspark["dspark_target_layer_ids"] == [1, 2, 3]
+    assert cfg_dspark["dspark_n_routed_experts"] == 16
+    assert cfg_dspark["dspark_num_experts_per_tok"] == 2
 
 
 def test_extract_top_logprobs_and_verify_golden(tmp_path):
@@ -214,3 +227,10 @@ def test_verify_golden_tied_argmax_and_tp_shifted_logprobs(tmp_path):
     }
     with pytest.raises(common.VerificationError):
         smoke.verify_golden(bad_actual, golden_path)
+
+
+def test_default_libtpu_init_args_sc_all_gather_threshold():
+    content = _SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=67108864" in content
+    )

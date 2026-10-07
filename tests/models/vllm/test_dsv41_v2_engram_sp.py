@@ -457,9 +457,7 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
         return proj + pos_in[:, None, None].to(proj.dtype) * 0.01
 
     full_index_q = _project_fn(qr, positions)
-    rows = 16 * tp
-    padding = (count // rows + 1) * rows - count
-    part = (count + padding) // tp
+    part, _ = v2_attn._query_split(count, tp)
     projected_shapes: list[torch.Size] = []
     captured_q_parts: list[torch.Tensor] = []
 
@@ -660,3 +658,307 @@ def test_partitioned_moe_routing_bitwise_equal(monkeypatch):
     assert route_gather_shapes == [torch.Size([local_tokens, topk // 2 + topk])]
     assert torch.equal(part_weights, ref_weights)
     assert torch.equal(part_ids, ref_ids)
+
+
+def test_stage_attention_cache_scope_shares_addressing(monkeypatch):
+    """stage_attention_cache_scope shares stage-invariant token/window
+    addressing and shared-owner index/compressed records across layers while
+    indexing each layer's own distinct block_tables (row_offset=0).
+    """
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
+    count = 4
+    capacity = 8
+    positions = torch.tensor([0, 63, 65, 130], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 3, 3], dtype=torch.int32)
+
+    def _make_paged_cache(pages_tensor: torch.Tensor, row_offset: int = 0) -> Any:
+        c = MagicMock(spec=PagedCacheRows)
+        c.numel.return_value = 1024
+        c.shape = (64, 64, 512)
+        c.page_stride = 64
+        c.row_offset = row_offset
+        c.row_indices = lambda slots, ro=row_offset: ro + slots // 64 * 64 + slots % 64
+        c.pages.return_value = pages_tensor
+        return c
+
+    comp_cache_1 = _make_paged_cache(
+        torch.tensor([[10, 11, 12], [13, 14, 15]], dtype=torch.int32)
+    )
+    comp_cache_2 = _make_paged_cache(
+        torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32)
+    )
+    idx_cache_1 = _make_paged_cache(
+        torch.tensor([[30, 31, 32], [33, 34, 35]], dtype=torch.int32)
+    )
+    idx_cache_2 = _make_paged_cache(
+        torch.tensor([[40, 41, 42], [43, 44, 45]], dtype=torch.int32)
+    )
+    shared_topk_buf = torch.full((16, 8), -1, dtype=torch.int32)
+    static_ctx = {
+        "attn_0": SimpleNamespace(kv_cache=comp_cache_1),
+        "attn_2": SimpleNamespace(kv_cache=comp_cache_2),
+    }
+
+    def _make_layer(
+        layer_id: int,
+        *,
+        is_kv_source: bool,
+        is_index_source: bool,
+        kv_source_id: int,
+        index_source_id: int,
+        selected_rows: list[list[int]] | None = None,
+    ) -> Any:
+        attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(attn)
+        attn.prefix = f"attn_{layer_id}"
+        attn.compress_ratio = 2
+        attn._max_model_len = capacity * 2
+        attn._config = {"index_topk": 4}
+        attn._fp8_kv = True
+        attn.window_size = 128
+        attn.n_local_heads = 2
+        attn.head_dim = 8
+        attn.scale = 0.25
+        attn._ced_decoder = False
+        attn._ced_global_from_encoder = False
+        attn.compressed_cache_prefix = f"attn_{kv_source_id}"
+        attn.kv_source_layer_id = kv_source_id
+        attn.index_source_layer_id = index_source_id
+        attn.topk_indices_buffer = shared_topk_buf
+        attn.attn_sink = torch.zeros(2, dtype=torch.float32)
+        attn.register_buffer(
+            "_full_attn_sink", torch.zeros(2, dtype=torch.float32), persistent=False
+        )
+        attn.register_buffer(
+            "_tp_rank_1d", torch.tensor([0], dtype=torch.int32), persistent=False
+        )
+        attn._precompact_records = True
+        attn._token_parallel_attn = True
+        attn._swa_max_requests = 4
+        attn.swa_cache_layer = SimpleNamespace(
+            prefix=f"swa_{layer_id}",
+            kv_cache=_make_paged_cache(
+                torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+            ),
+        )
+        attn.kv_cache = comp_cache_1 if kv_source_id == 0 else comp_cache_2
+        attn._static_forward_context = static_ctx
+        attn.wq_b = lambda qr: qr
+        attn._rotate = lambda x, pos: x
+        attn._quantize_indexer = lambda x: x
+        if is_kv_source:
+            comp: Any = object.__new__(v2_attn.DeepseekCompressor)
+            torch.nn.Module.__init__(comp)
+            comp.head_dim = 8
+            comp.compress_ratio = 2
+            comp.rms_norm_eps = 1e-6
+            comp.norm = SimpleNamespace(weight=torch.ones(8, dtype=torch.float32))
+            comp.state_cache = SimpleNamespace(
+                prefix=f"state_{layer_id}",
+                kv_cache=_make_paged_cache(
+                    torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int32)
+                ),
+            )
+            attn.compressor = comp
+        else:
+            attn.compressor = None
+        if is_index_source:
+            idx_cache = idx_cache_1 if kv_source_id == 0 else idx_cache_2
+            attn.indexer = SimpleNamespace(
+                head_dim=8,
+                n_head=2,
+                wk=lambda lat: lat,
+                k_norm=lambda k: k,
+                k_cache=SimpleNamespace(
+                    prefix=f"idx_{kv_source_id}",
+                    compress_ratio=2,
+                    kv_cache=idx_cache,
+                ),
+            )
+            assert selected_rows is not None
+            sel_tensor = torch.tensor(selected_rows, dtype=torch.int32)
+            attn._select_paged_indices = (
+                lambda qr, pos, ic, irec, reqs, w, lens, slots, pend, st=sel_tensor: (
+                    captured_idx_recs.append(irec.clone()) or st.clone()
+                )
+            )
+        else:
+            attn.indexer = None
+        return attn
+
+    # Give EVERY cache prefix its own distinct block_table (row_offset=0),
+    # matching 40-layer vLLM where all 51 kv_cache_groups alias from byte 0
+    # and differ exclusively via metadata[prefix].block_tables.
+    prefix_names = (
+        "swa_0",
+        "swa_1",
+        "swa_2",
+        "swa_3",
+        "swa_4",
+        "state_0",
+        "state_2",
+        "attn_0",
+        "attn_2",
+        "idx_0",
+        "idx_2",
+    )
+    metadata = {
+        k: SimpleNamespace(
+            seq_lens=torch.tensor([3, 0], dtype=torch.int32),
+            block_tables=torch.tensor(
+                [[i * 6 + 1, i * 6 + 2, i * 6 + 3], [i * 6 + 4, i * 6 + 5, i * 6 + 6]],
+                dtype=torch.int32,
+            ),
+            query_start_loc=query_start_loc,
+        )
+        for i, k in enumerate(prefix_names)
+    }
+    forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+
+    captured_inserts: list[torch.Tensor] = []
+    captured_states: list[torch.Tensor] = []
+    captured_idx_recs: list[torch.Tensor] = []
+
+    monkeypatch.setattr(
+        v2_attn,
+        "_insert",
+        lambda cache, slots, val, mask: captured_inserts.append(slots.clone()),
+    )
+
+    def _fake_save_compress_norm(
+        kv_score,
+        pos,
+        state_cache,
+        slot_mapping,
+        qsl,
+        reqs,
+        nw,
+        eps,
+        ratio,
+        latent,
+    ):
+        del kv_score, pos, state_cache, qsl, reqs, nw, eps, ratio
+        captured_states.append(slot_mapping.clone())
+        latent.fill_(1.0)
+
+    monkeypatch.setattr(v2_attn, "save_compress_norm", _fake_save_compress_norm)
+
+    row_slots_calls = 0
+    orig_row_slots = v2_attn._row_slots
+
+    def _counting_row_slots(cache, table, reqs, log):
+        nonlocal row_slots_calls
+        row_slots_calls += 1
+        return orig_row_slots(cache, table, reqs, log)
+
+    req_row_slots_calls = 0
+    orig_req_row_slots = v2_attn._request_row_slots
+
+    def _counting_req_row_slots(cache, table, width):
+        nonlocal req_row_slots_calls
+        req_row_slots_calls += 1
+        return orig_req_row_slots(cache, table, width)
+
+    monkeypatch.setattr(v2_attn, "_row_slots", _counting_row_slots)
+    monkeypatch.setattr(v2_attn, "_request_row_slots", _counting_req_row_slots)
+
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def _fake_sparse_fp8_attn(
+        q, swa_cache, main_cache, records, main_records, *args, **kwargs
+    ):
+        del swa_cache, main_cache, args, kwargs
+        captured.append((records.clone(), main_records.clone()))
+        return q.clone()
+
+    monkeypatch.setattr(v2_attn, "sparse_fp8_attention", _fake_sparse_fp8_attn)
+
+    qr = torch.ones((count, 16), dtype=torch.bfloat16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+    kv_score = torch.ones((count, 10), dtype=torch.float32)
+    idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
+
+    l0 = _make_layer(
+        0,
+        is_kv_source=True,
+        is_index_source=True,
+        kv_source_id=0,
+        index_source_id=0,
+        selected_rows=[[0, -1, -1, -1], [0, 1, -1, -1], [0, 1, 2, -1], [0, -1, -1, -1]],
+    )
+    l1 = _make_layer(
+        1,
+        is_kv_source=False,
+        is_index_source=False,
+        kv_source_id=0,
+        index_source_id=0,
+    )
+    l2 = _make_layer(
+        2,
+        is_kv_source=True,
+        is_index_source=True,
+        kv_source_id=2,
+        index_source_id=2,
+        selected_rows=[[0, -1, -1, -1], [1, 2, -1, -1], [0, 2, 3, -1], [1, -1, -1, -1]],
+    )
+    l3 = _make_layer(
+        3,
+        is_kv_source=False,
+        is_index_source=True,
+        kv_source_id=2,
+        index_source_id=3,
+        selected_rows=[[0, -1, -1, -1], [0, 3, -1, -1], [1, 2, 3, -1], [2, -1, -1, -1]],
+    )
+    l4 = _make_layer(
+        4,
+        is_kv_source=False,
+        is_index_source=False,
+        kv_source_id=2,
+        index_source_id=3,
+    )
+    layers = (l0, l1, l2, l3, l4)
+
+    # 1. Baseline without stage_attention_cache_scope
+    for lyr in layers:
+        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+        lyr._prepare_tpu(None, qr, kv, None, kv_score, idx_w, positions, out)
+    ref_captured = list(captured)
+    ref_inserts = list(captured_inserts)
+    ref_states = list(captured_states)
+    ref_idx_recs = list(captured_idx_recs)
+    assert row_slots_calls == 5
+    assert req_row_slots_calls == 3
+
+    # 2. With stage_attention_cache_scope: 3-page SWA fast path eliminates
+    #    _row_slots completely (0 calls), _request_row_slots runs once per
+    #    distinct indexer.k_cache.prefix (2 calls for idx_0 and idx_2, reused by l3),
+    #    and all per-layer slots/records match the baseline bitwise.
+    captured.clear()
+    captured_inserts.clear()
+    captured_states.clear()
+    captured_idx_recs.clear()
+    row_slots_calls = 0
+    req_row_slots_calls = 0
+    with v2_attn.stage_attention_cache_scope():
+        for lyr in layers:
+            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+            lyr._prepare_tpu(None, qr, kv, None, kv_score, idx_w, positions, out)
+    assert row_slots_calls == 0
+    assert req_row_slots_calls == 2
+    for got, ref in zip(captured_states, ref_states, strict=True):
+        assert torch.equal(got, ref)
+    for got, ref in zip(captured_inserts, ref_inserts, strict=True):
+        assert torch.equal(got, ref)
+    for got, ref in zip(captured_idx_recs, ref_idx_recs, strict=True):
+        assert torch.equal(got, ref)
+    for (rec_got, main_got), (rec_ref, main_ref) in zip(
+        captured, ref_captured, strict=True
+    ):
+        assert torch.equal(rec_got, rec_ref)
+        assert torch.equal(main_got, main_ref)

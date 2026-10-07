@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
+from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc
 
@@ -29,6 +29,15 @@ def _inputs(tokens, dim, seed=0):
     base = torch.from_numpy(0.5 * rng.standard_normal(MIXES)).float()
     previous_pre = torch.from_numpy(rng.uniform(0.0, 1.0, (tokens, MULT))).float()
     return residual, fn, scale, base, previous_pre
+
+
+def _post_inputs(tokens, dim, seed=1):
+    rng = np.random.default_rng(seed)
+    x = torch.from_numpy(rng.standard_normal((tokens, dim))).bfloat16()
+    post_mix = torch.from_numpy(rng.uniform(0.0, 2.0, (tokens, MULT, 1))).float()
+    comb_mix = torch.from_numpy(rng.uniform(0.0, 1.0, (tokens, MULT, MULT))).float()
+    comb_mix = comb_mix / comb_mix.sum(dim=-1, keepdim=True)
+    return x, post_mix, comb_mix
 
 
 def _jax(t: torch.Tensor) -> jax.Array:
@@ -65,6 +74,54 @@ def _check(tokens, dim, packed):
     np.testing.assert_allclose(_np(value), _np(want[2]), rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
+def _check_post_pre(tokens, dim, packed):
+    residual, fn, scale, base, previous_pre = _inputs(tokens, dim)
+    x, post_mix, comb_mix = _post_inputs(tokens, dim)
+    weight = mhc.pack_mix_weight(fn) if packed else fn
+    got = mhc.delayed_post_pre_flat_jax(
+        _jax(x),
+        _jax(residual.flatten(1)),
+        _jax(post_mix),
+        _jax(comb_mix),
+        _jax(weight),
+        _jax(scale),
+        _jax(base),
+        _jax(previous_pre),
+        *CONSTANTS,
+    )
+    # 1. Exact bitwise parity against two-step (_post_jax -> delayed_pre_flat_jax)
+    step_flat = mhc._post_jax(
+        _jax(x), _jax(residual.flatten(1)), _jax(post_mix), _jax(comb_mix)
+    )
+    step_pre = mhc.delayed_pre_flat_jax(
+        step_flat,
+        _jax(weight),
+        _jax(scale),
+        _jax(base),
+        _jax(previous_pre),
+        *CONSTANTS,
+    )
+    flat_new, post, comb, value, new_pre = got
+    np.testing.assert_array_equal(_np(flat_new), _np(step_flat))
+    for g, s in zip((post, comb, value, new_pre), step_pre):
+        np.testing.assert_array_equal(_np(g), _np(s))
+
+    # 2. Close agreement with vLLM PyTorch reference
+    want_res = mhc_post_torch(x, residual, post_mix, comb_mix)
+    want = mhc_pre_delayed_torch(
+        want_res, fn, scale, base, *CONSTANTS, pre_mix=previous_pre
+    )
+    np.testing.assert_allclose(
+        _np(flat_new.reshape(tokens, MULT, dim)),
+        _np(want_res),
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+    for g, w in ((post, want[0]), (comb, want[1]), (new_pre, want[3])):
+        np.testing.assert_allclose(_np(g), _np(w), rtol=GATE_RTOL, atol=GATE_ATOL)
+    np.testing.assert_allclose(_np(value), _np(want[2]), rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
 @pytest.mark.cpu_test
 def test_packed_weight_is_exact_split():
     _, fn, *_ = _inputs(1, 256)
@@ -87,6 +144,7 @@ def test_torch_and_jax_packing_agree():
 def test_xla_path_matches_torch_reference(tokens, packed):
     """Token counts the Pallas pass does not take."""
     _check(tokens, 256, packed)
+    _check_post_pre(tokens, 256, packed)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -95,3 +153,4 @@ def test_pallas_path_matches_torch_reference(tokens, dim, packed):
     if jax.default_backend() != "tpu":
         pytest.skip("Pallas TPU kernel needs TPU hardware")
     _check(tokens, dim, packed)
+    _check_post_pre(tokens, dim, packed)

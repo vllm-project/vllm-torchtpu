@@ -981,6 +981,8 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
 
     vllm_cfg.parallel_config.pipeline_parallel_size = 1
-    vllm_cfg.speculative_config = SimpleNamespace()
-    with pytest.raises(NotImplementedError, match="requires no speculation"):
+    vllm_cfg.speculative_config = SimpleNamespace(method="mtp")
+    with pytest.raises(
+        NotImplementedError, match="does not support speculative method"
+    ):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)

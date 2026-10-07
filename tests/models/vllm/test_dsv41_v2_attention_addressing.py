@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
+    _index_page_records,
+    _query_split,
     _request_row_slots,
     _row_slots,
 )
@@ -19,6 +21,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    PagedCacheRows,
+    gather_cache_page_values,
     gather_cache_pieces,
     gather_cache_values,
     merge_halves,
@@ -108,6 +112,34 @@ def test_gather_cache_values_split_order(elements):
     )
 
 
+@pytest.mark.parametrize("elements", [512, 128])
+def test_pack_bf16_words_and_split_pieces_roundtrip(elements):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+        _pack_bf16_words,
+        merge_pieces,
+        split_pieces,
+    )
+
+    rng = np.random.default_rng(elements)
+    raw = rng.standard_normal((16, elements)).astype(np.float32)
+    values = jnp.asarray(raw, dtype=jnp.bfloat16)
+    got_words = _pack_bf16_words(values)
+    ref_words = jax.lax.bitcast_convert_type(
+        values.reshape(values.shape[0], -1, 2), jnp.int32
+    )
+    np.testing.assert_array_equal(np.asarray(got_words), np.asarray(ref_words))
+
+    pieces = elements // 128
+    q = jnp.asarray(rng.standard_normal((8, 64, elements)), dtype=jnp.bfloat16)
+    q_pieces = split_pieces(q, pieces)
+    assert q_pieces.shape == (pieces, 8, 64, 128)
+    num = jnp.asarray(rng.standard_normal((pieces, 8, 64, 128)), dtype=jnp.float32)
+    np.testing.assert_array_equal(
+        np.asarray(merge_pieces(split_pieces(merge_pieces(num), pieces)), np.float32),
+        np.asarray(merge_pieces(num), np.float32),
+    )
+
+
 @pytest.mark.parametrize("width", [64, 200])
 def test_paged_attention_matches_dense(width):
     rng = np.random.default_rng(width)
@@ -155,6 +187,176 @@ def test_paged_index_scores_matches_dense(tokens, width):
     dense = np.asarray((jnp.maximum(logits, 0) * weights[:, :, None]).sum(1))
     valid = (records >= 0) & (np.arange(width)[None] < lengths[:, None])
     np.testing.assert_allclose(got[valid], dense[valid], rtol=1e-5, atol=1e-3)
+
+
+def _paged_records(rng, rows, width, page, pool_records):
+    """`_request_row_slots`-style records: random pages, contiguous inside."""
+    pages = -(-width // page)
+    table = rng.integers(0, pool_records // page, (rows, pages))
+    logical = np.arange(width)
+    return (table[:, logical // page] * page + logical % page).astype(np.int32)
+
+
+@pytest.mark.parametrize("page", [8, 16])
+def test_gather_cache_page_values_matches_records(page):
+    rng = np.random.default_rng(page)
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, 1, 6 * page, page, 512)[0]
+    records[-page:] = -1  # an invalid page reads arbitrary rows
+    expected = gather_cache_values(pool, jnp.asarray(records), 128, split=True)
+    got = gather_cache_page_values(pool, jnp.asarray(records[::page]), page, 128)
+    valid = records >= 0
+    assert got.shape == expected.shape
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32)[valid], np.asarray(expected, np.float32)[valid]
+    )
+    with pytest.raises(ValueError, match="whole pool word rows"):
+        gather_cache_page_values(pool, jnp.asarray(records[::page]), 3, 128)
+
+
+@pytest.mark.parametrize(
+    "tokens,width,page", [(3, 300, 16), (8, 2560, 16), (2, 640, 8)]
+)
+def test_paged_index_scores_page_gather_bitwise(tokens, width, page):
+    rng = np.random.default_rng(width)
+    dim, heads = 128, 4
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, tokens, width, page, 512)
+    records[0, -(width % page or page) :] = -1  # a trailing invalid page
+    lengths = rng.integers(0, width + 1, tokens).astype(np.int32)
+    q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+    args = (q, pool, jnp.asarray(records), weights, lengths)
+    expected = np.asarray(paged_index_scores_jax(*args))
+    got = np.asarray(paged_index_scores_jax(*args, page_records=page))
+    valid = (records >= 0) & (np.arange(width)[None] < lengths[:, None])
+    np.testing.assert_array_equal(got[valid], expected[valid])
+
+
+@pytest.mark.parametrize(
+    "candidate_write,candidate_filter",
+    [(False, False), (True, False), (False, True)],
+)
+@pytest.mark.parametrize("unordered", [False, True])
+@pytest.mark.parametrize("block_size,page", [(16, 16), (8, 16), (16, 8)])
+def test_paged_indexer_page_gather_matches_records(
+    candidate_write, candidate_filter, unordered, block_size, page
+):
+    """Decode (one token per request row): page gathers select identically."""
+    rng = np.random.default_rng(5)
+    width, topk, tokens = 640, 64, 6
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, tokens, width, page, 512)
+    records[1, -page:] = -1
+    lengths = rng.integers(topk + 1, width + 1, tokens).astype(np.int32)
+    lengths[-1] = 0  # a padding row
+    q = jnp.asarray(rng.standard_normal((tokens, 4, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
+    candidates = jnp.asarray(
+        rng.integers(-1, width // block_size, (tokens, 8)), dtype=jnp.int32
+    )
+    args = (
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        jnp.arange(tokens, dtype=jnp.int32),
+        topk,
+        block_size,
+        candidate_write,
+        candidate_filter,
+        unordered,
+    )
+    expected = paged_indexer_jax(*args)
+    got = paged_indexer_jax(*args, page_records=page)
+    for a, b in zip(got, expected):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("width,page", [(1300, 16), (700, 8)])
+def test_paged_index_scores_shared_rows_page_gather_bitwise(width, page):
+    """Prefill (tokens share request rows): page gathers score identically."""
+    rng = np.random.default_rng(width)
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, 3, width, page, 512)
+    records[1, -(width % page or page) :] = -1
+    requests = np.sort(rng.integers(0, 2, 40)).astype(np.int32)  # row 2 unused
+    lengths = rng.integers(0, width + 1, 40).astype(np.int32)
+    q = jnp.asarray(rng.standard_normal((40, 4, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((40, 4)), jnp.float32)
+    args = (q, pool, jnp.asarray(records), weights, lengths, jnp.asarray(requests))
+    expected = np.asarray(paged_index_scores_jax(*args))
+    got = np.asarray(paged_index_scores_jax(*args, page_records=page))
+    token_records = records[requests]
+    valid = (token_records >= 0) & (np.arange(width)[None] < lengths[:, None])
+    np.testing.assert_array_equal(got[valid], expected[valid])
+
+
+def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
+    """Unordered candidate scoring on SparseCore selects the top_k set."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+
+    def fake_sparsecore(scores, k, lengths):
+        columns = jnp.arange(scores.shape[1])[None]
+        masked = jnp.where(columns < lengths[:, None], scores, -jnp.inf)
+        values, indices = jax.lax.top_k(masked, k)
+        # Reversed, like an unordered selection.
+        return jnp.where(values > -jnp.inf, indices, -1)[:, ::-1]
+
+    monkeypatch.setattr(attention_kernels, "_sparsecore_top_k", fake_sparsecore)
+    rng = np.random.default_rng(9)
+    width, topk, block_size, tokens = 4096, 64, 16, 4
+    pool, records, _, lengths, q, weights = _request_inputs(rng, tokens, tokens, width)
+    # Long rows: total key reads exceed the candidate pool -> candidate_context.
+    lengths = rng.integers(3500, width + 1, tokens).astype(np.int32)
+    lengths[-1] = 0  # a padding row selects nothing
+    candidates = rng.integers(-1, width // block_size, (tokens, 128)).astype(np.int32)
+    candidates[0, :8] = candidates[0, 8]  # duplicate blocks
+    args = (
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        jnp.asarray(candidates),
+        jnp.arange(tokens, dtype=jnp.int32),
+        topk,
+        block_size,
+        False,
+        True,
+    )
+    ordered, _ = paged_indexer_jax(*args, unordered=False)
+    got, _ = paged_indexer_jax(*args, unordered=True)
+    np.testing.assert_array_equal(
+        np.asarray(got), np.asarray(attention_kernels._compact_selected(ordered))
+    )
+    assert (np.asarray(got)[-1] == -1).all()
+
+
+def test_index_page_records_requires_row_aligned_pages():
+    raw = torch.zeros((64, 128), dtype=torch.int32)
+
+    def cache(block, stride, offset, dtype=torch.bfloat16, dim=128):
+        record = dim * dtype.itemsize
+        layout = ((4, block, dim), dtype, stride * record, offset * record)
+        return PagedCacheRows(raw, layout)
+
+    assert _index_page_records(cache(16, 32, 16)) == 16
+    assert _index_page_records(cache(16, 32, 1)) == 0  # offset splits a row
+    assert _index_page_records(cache(16, 33, 0)) == 0  # stride splits a row
+    assert _index_page_records(cache(3, 4, 0)) == 0  # page ends mid-row
+    assert _index_page_records(cache(8, 8, 0, torch.float32, 64)) == 0
+    assert _index_page_records(raw) == 0
 
 
 def _request_inputs(rng, requests_count, tokens, width, heads=4, dim=128):
@@ -467,3 +669,36 @@ def test_paged_indexer_candidate_filter_shared_tiles_and_decode_branches(
     )
     np.testing.assert_array_equal(np.asarray(got_pub), np.asarray(ref_pub))
     np.testing.assert_array_equal(np.asarray(got_sel), np.asarray(ref_sel))
+
+
+@pytest.mark.parametrize("ranks", [2, 4, 8])
+def test_query_split_parts_are_even_and_covered(ranks):
+    for count in range(1, 2 * 2048 + 1):
+        part, padding = _query_split(count, ranks)
+        assert part >= 2 and part % 2 == 0
+        assert 0 <= ranks * part - count <= padding
+        assert ranks * (part - 2) < count  # no whole spare part per rank
+
+
+def test_query_split_traces_one_graph_for_all_buckets():
+    # A 1-row part (ceil split at T=4/8 on 8 ranks) 0/1-specialized and traced
+    # a second graph; the base 16-row split traced one.
+    from torch._dynamo.testing import CompileCounter
+
+    def split(x):
+        part, padding = _query_split(x.shape[0], 8)
+        mine = 3 * part + torch.arange(part, dtype=torch.int32)
+        rows = torch.cat((x, x.new_zeros((padding, *x.shape[1:])))).index_select(
+            0, mine
+        )
+        return rows.repeat(8, 1)[: x.shape[0]]
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(split, backend=counter)
+    for tokens in (2048, 4, 8, 16):
+        x = torch.randn(tokens, 4)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled(x)
+    torch._dynamo.reset()
+    assert counter.frame_count == 1

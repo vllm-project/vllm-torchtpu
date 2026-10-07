@@ -1011,6 +1011,127 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+def _routing_case(seed, num_tokens, topk, local_num_experts, local_frac):
+    rng = np.random.default_rng(seed)
+    ids = rng.integers(0, local_num_experts, (num_tokens, topk)).astype(np.int32)
+    ids[rng.random((num_tokens, topk)) >= local_frac] = -1
+    weights = rng.random((num_tokens, topk)).astype(np.float32)
+    # Zero weights mark padded tokens for skip_padded_tokens.
+    weights[rng.random((num_tokens, topk)) < 0.1] = 0
+    hidden = rng.standard_normal((num_tokens, 16)).astype(np.float32)
+    return (
+        jnp.asarray(hidden, jnp.bfloat16),
+        jnp.asarray(ids),
+        jnp.asarray(weights, jnp.bfloat16),
+    )
+
+
+@pytest.mark.parametrize(
+    "num_tokens, topk, local_num_experts, local_frac",
+    [
+        (16, 6, 48, 0.125),  # DSv4.1 decode geometry on one EP rank.
+        (64, 6, 48, 1.0),  # Every key local: many duplicates per bucket.
+        (8, 8, 4, 0.5),
+        (5, 3, 2, 0.0),  # No local key at all.
+        (85, 6, 1, 1.0),  # m = 510: just under the cap, one bucket.
+    ],
+)
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+def test_prepare_routed_pairwise_sort_matches_comparison_sort(
+    num_tokens, topk, local_num_experts, local_frac, skip_padded_tokens
+):
+    hidden, ids, weights = _routing_case(
+        num_tokens, num_tokens, topk, local_num_experts, local_frac
+    )
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    prep = jax.jit(
+        prepare_routed_gmm_inputs,
+        static_argnames=(*common, "use_sparse_core", "onehot_moe_permute_threshold"),
+    )
+    onehot_out = prep(
+        hidden,
+        ids,
+        weights,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=fused_moe_gmm._ONEHOT_AUTO_CAP,
+        **common,
+    )
+    plain_out = prep(
+        hidden,
+        ids,
+        weights,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+        **common,
+    )
+    for got, want in zip(onehot_out, plain_out):
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def _num_sorts(num_tokens, topk, threshold):
+    hidden, ids, weights = _routing_case(0, num_tokens, topk, 48, 0.5)
+    jaxpr = jax.make_jaxpr(
+        lambda h, i, w: prepare_routed_gmm_inputs(
+            h,
+            i,
+            w,
+            local_num_experts=48,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=threshold,
+        )
+    )(hidden, ids, weights)
+    return str(jaxpr).count(" sort[")
+
+
+def test_prepare_routed_onehot_permute_runs_no_sort():
+    assert _num_sorts(16, 6, threshold=fused_moe_gmm._ONEHOT_AUTO_CAP) == 0
+
+
+def test_prepare_routed_onehot_permute_above_cap_keeps_sorts():
+    # An explicit threshold can admit more rows than the pairwise M x M
+    # comparison is meant for; those keep the comparison sorts.
+    m = fused_moe_gmm._ONEHOT_AUTO_CAP + 6
+    assert _num_sorts(m // 6, 6, threshold=m) > 0
+
+
+def test_prepare_routed_ragged_permute_matches_comparison_sort(monkeypatch):
+    # The ragged path takes its positions and group sizes from the counting
+    # sort; stub the SparseCore gather with the plain one it stands for.
+    def _plain_gather(x, indices, starts, ends):
+        rows = jnp.arange(indices.shape[0]) < ends[0]
+        return jnp.where(rows[:, None], x[indices], 0)
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", _plain_gather)
+    hidden, ids, weights = _routing_case(1, 16, 6, 48, 1.0)
+    common = dict(local_num_experts=48, topk=6, use_ep=True)
+    ragged_out = prepare_routed_gmm_inputs(
+        hidden,
+        ids,
+        weights,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+        **common,
+    )
+    plain_out = prepare_routed_gmm_inputs(
+        hidden,
+        ids,
+        weights,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+        **common,
+    )
+    for got, want in zip(ragged_out, plain_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk

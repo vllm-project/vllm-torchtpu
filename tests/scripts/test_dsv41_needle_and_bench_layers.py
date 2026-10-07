@@ -775,8 +775,17 @@ class TestBenchDecoderLayer:
             )
             assert res["subop"] == subop
             assert len(res["comparisons"]) > 0
-            for name, comp in res["comparisons"].items():
+            for _name, comp in res["comparisons"].items():
                 assert comp["ok"] is True
+
+        # Also test subop="all" includes reconciliation_40_layer_decode
+        res_all = bench_decoder_layer.run_decoder_layer_verification(
+            "all", num_tokens=64, tp_size=8, seed=42, device="cpu"
+        )
+        assert "reconciliation_40_layer_decode" in res_all
+        rec_dec = bench_decoder_layer.reconcile_40_layer_decode_step()
+        assert rec_dec["decode_q1_T16"]["isolated_delta_ms"] < 0.0
+        assert rec_dec["verify_q6_T128"]["sparse_mla_38L_delta_ms"] < 0.0
 
     def test_run_decoder_layer_verification_failure_raises(self) -> None:
         # Test that failed comparison triggers line 832: raise common.VerificationError

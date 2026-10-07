@@ -214,20 +214,27 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     assert torch.equal(out_dev, out_cpu)
 
     # Also exercise Engram._init_staging + Engram.prepare_embeddings: the host
-    # gathers raw FP8/scale bytes (stale tail reset to zero/unit scale) and
-    # _ready_rows dequantizes them, bitwise equal to the host-dequant lookup.
+    # gathers raw FP8/scale bytes (invalid rows and the stale tail only get the
+    # sentinel scale; raw bytes stay stale, here FP8 NaN 0x7F) and _ready_rows
+    # unpacks the int32 staging and dequantizes it, bitwise equal to the
+    # host-dequant lookup.
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import _INVALID_SCALE
+
     engram_stub = object.__new__(Engram)
     torch.nn.Module.__init__(engram_stub)
     engram_stub.embed_tokens = emb_cpu
     Engram._init_staging(engram_stub, max_tokens=5, head_dim=dim)
     assert engram_stub._staged_raw is not None
-    engram_stub._host_raw.fill_(77)
+    engram_stub._host_raw.fill_(0x7F)
     engram_stub._host_scale.fill_(200)
     engram_stub.prepare_embeddings(indices)
-    assert torch.equal(engram_stub._ready_rows(indices.shape[0]), out_cpu)
-    tail = engram_stub._ready_rows(5)[indices.shape[0] :]
-    assert torch.count_nonzero(tail) == 0
-    assert torch.all(engram_stub._staged_scale[indices.shape[0] :] == 127)
+    got = engram_stub._ready_rows(indices.shape[0])
+    assert torch.equal(got.view(torch.int16), out_cpu.view(torch.int16))
+    assert engram_stub._active_raw.shape[0] == indices.shape[0]
+    assert engram_stub._active_scale.shape[0] == indices.shape[0]
+    assert torch.all(engram_stub._host_scale[2, 1] == _INVALID_SCALE)
+    assert torch.all(engram_stub._host_scale[indices.shape[0] :] == 200)
+    assert torch.all(engram_stub._host_raw[indices.shape[0] :] == 0x7F)
 
 
 def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():
@@ -246,6 +253,32 @@ def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():
     assert torch.equal(got.isnan(), ref.isnan())
     keep = ~ref.isnan()
     assert torch.equal(got[keep].view(torch.int16), ref[keep].view(torch.int16))
+
+
+def test_dequant_fp8_rows_invalid_scale_is_positive_zero():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import (
+        _INVALID_SCALE,
+        dequant_fp8_rows,
+    )
+
+    # Every FP8 byte (incl. NaN 0x7F/0xFF and -0) under the sentinel -> +0;
+    # the other block keeps its exact value.
+    raw = torch.arange(256, dtype=torch.int32).to(torch.uint8).repeat(1, 2)
+    scale = torch.tensor([[_INVALID_SCALE, 127]], dtype=torch.uint8)
+    got = dequant_fp8_rows(raw, scale, 256).view(torch.int16)
+    assert torch.count_nonzero(got[:, :256]) == 0
+    ref = raw[:, 256:].view(torch.float8_e4m3fn).to(torch.bfloat16).view(torch.int16)
+    keep = ~raw[:, 256:].view(torch.float8_e4m3fn).float().isnan()
+    assert torch.equal(got[:, 256:][keep], ref[keep])
+
+
+def test_unpack_bytes_round_trips_host_int32_view():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import _unpack_bytes
+
+    data = torch.randint(0, 256, (4 * 37,), dtype=torch.int32).to(torch.uint8)
+    words = data.view(torch.int32).clone()
+    assert torch.equal(_unpack_bytes(words, data.numel()), data)
+    assert torch.equal(_unpack_bytes(words[:10], 37), data[:37])
 
 
 def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
