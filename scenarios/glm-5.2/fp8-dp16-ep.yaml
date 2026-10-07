@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=../../tools/scenario/schema/scenario.schema.json
+# GLM-5.2-FP8 on a two-host v7x slice over Ray: attention DP16 with EP, each
+# device its own attention replica, measured at saturation (concurrency 1024).
+schema: 1
+name: glm-5.2-fp8-dp16-ep
+server:
+  model:
+    name: zai-org/GLM-5.2-FP8
+    path: gs://tpu-commons-ci/glm/GLM-5.2-FP8
+  slice: tpu7x/2x2x2
+  multihost: ray
+  startup_timeout: 2h
+  args:
+    load-format: runai_streamer
+    tensor-parallel-size: 1
+    data-parallel-size: 16
+    enable-expert-parallel: true
+    # The exact nominal length of 8192 in + 1024 out.
+    max-model-len: 9216
+    # Per engine: at DP16 the MoE dispatch (topk 4 x DP 16 x batched tokens) has
+    # to stay at 65536; 2048 faults the SparseCore on the first batch.
+    max-num-batched-tokens: 1024
+    # Per DP engine: 64 x 16 = 1024 sequences, the benchmark concurrency.
+    max-num-seqs: 64
+    gpu-memory-utilization: 0.90
+    kv-cache-dtype: fp8
+    # With EP over object storage each rank streams only its own experts.
+    enable-ep-weight-filter: true
+    safetensors-load-strategy: prefetch
+    tool-call-parser: glm47
+    enable-auto-tool-choice: true
+    reasoning-parser: glm45
+tasks:
+  perf:
+    isl_osl: [[8192, 1024]]
+    concurrency: [1024]
+    num_prompts: 2048
+    random_range_ratio: 0.0
+    temperature: 0
+    warmup_runs: 1
+    baseline:
+      isl8192_osl1024_c1024:
+        completed: 2048
+        median_tpot_ms: 276.99
+        num_prompts: 2048
+        output_token_throughput: 2537.45
+        total_token_throughput: 22837.03
+  eval:
+    lm_eval:
+      tasks: [mmlu_pro]
+      model_args: {num_concurrent: 32, timeout: 7200}
+      fewshot_as_multiturn: false
+      # Today's string, kept verbatim: lm-eval reads it as key=value, so the
+      # stop sequence is that literal text. A mapping would change the eval.
+      gen_kwargs: "until=['<|im_end|>']"
+    tolerance: 0.025
+    baseline:
+      mmlu_pro:
+        "exact_match,custom-extract": 0.7629
+        "exact_match_stderr,custom-extract": 0.0111

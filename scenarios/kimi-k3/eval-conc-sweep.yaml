@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../tools/scenario/schema/scenario.schema.json
+# Kimi-K3 accuracy against lm_eval client concurrency: one server boot, then every
+# task at each concurrency, ascending, in the nightly's eval form (plain chat,
+# thinking off). max-num-seqs covers the top concurrency, so each value is really
+# served concurrently.
+schema: 1
+name: kimi-k3-eval-conc-sweep
+extends: kimi-k3/tp32-ep
+server:
+  args:
+    max-model-len: 16384
+    max-num-seqs: 256
+    # Decode steps carry up to max-num-seqs tokens; the TP32 buckets would pad
+    # every such step to 8192 tokens.
+    compilation-config: {compile_sizes: [1, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096, 8192]}
+tasks:
+  perf: null
+  eval:
+    lm_eval:
+      concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+      model_args: {num_concurrent: null, max_retries: 3, timeout: 3600}
+      tasks:
+        # The limit is per subject and mmlu_pro has 14; raised so that 2 x the
+        # concurrency questions exist.
+        - {name: mmlu_pro, limit: 10, limit_per_concurrency: 2, subtasks: 14}
+        - name: gsm8k
+          limit: 128
+          limit_per_concurrency: 2
+          # The default 256 max_gen_toks cuts K3's worked answers short.
+          gen_kwargs: {chat_template_kwargs: {thinking: false}, max_gen_toks: 1024}
