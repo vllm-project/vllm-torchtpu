@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
+    TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -357,6 +358,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
+    ),
+    # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
+    # total) to Host DRAM so TPU HBM remains available for KV cache and decode.
+    # Opt-in (default False) so default behavior preserves device-resident tables.
+    "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

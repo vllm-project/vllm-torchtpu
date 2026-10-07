@@ -264,14 +264,468 @@ def paged_attention_jax(
     return (numerator / denominator[..., None]).astype(q.dtype)
 
 
+def _compact_selected(records: jax.Array) -> jax.Array:
+    """Sort valid (>= 0) indices ascending and move -1 to the tail."""
+    limit = jnp.iinfo(jnp.int32).max
+    records = jnp.sort(jnp.where(records >= 0, records, limit), axis=-1)
+    return jnp.where(records == limit, -1, records)
+
+
 def compact_records(records: jax.Array) -> jax.Array:
     """Pad to 128 columns and move -1 to the tail: sparse_mla's valid prefix."""
     width = records.shape[1]
     padded = max(128, -(-width // 128) * 128)
     records = jnp.pad(records, ((0, 0), (0, padded - width)), constant_values=-1)
-    limit = jnp.iinfo(jnp.int32).max
-    records = jnp.sort(jnp.where(records >= 0, records, limit), axis=-1)
-    return jnp.where(records == limit, -1, records)
+    return _compact_selected(records)
+
+
+def _pad_compacted_records(records: jax.Array) -> jax.Array:
+    """Pad already-compacted records to a 128-column multiple with -1."""
+    width = records.shape[1]
+    padded = max(128, -(-width // 128) * 128)
+    if padded == width:
+        return records
+    return jnp.pad(records, ((0, 0), (0, padded - width)), constant_values=-1)
+
+
+def compute_chunk_union_gather_indices(
+    compacted_records: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    page_size: int,
+    total_num_pages: int,
+    chunk_size: int = 128,
+    union_cap: int = 4096,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute per-chunk sorted unique physical KV row union and inverse map.
+
+    Deduplicates logical ``(seq_id, record)`` entries across each ``chunk_size``
+    query chunk via a 128-lane-aligned associative ``int32`` ``.add(1)``
+    presence table (offloaded to SparseCore with zero ``jnp.sort``), translates
+    only the ``union_cap`` unique logical entries through ``page_indices``
+    (eliminating ``gather_page_ids`` on the full ``[num_tokens, topk]`` tensor),
+    and builds the exact inverse map ``inv_idx`` via ``jnp.cumsum``.
+
+    Returns:
+      union_phys: ``int32[num_chunks, union_cap]`` physical KV rows per chunk.
+      inv_idx: ``int32[num_chunks, chunk_size, topk]`` index into ``union_phys``.
+      num_unique: ``int32[num_chunks]`` count of unique valid KV rows per chunk.
+    """
+    num_tokens, topk = compacted_records.shape
+    num_chunks = (num_tokens + chunk_size - 1) // chunk_size
+    padded_tokens = num_chunks * chunk_size
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    logical_rows_per_seq = pages_per_seq * page_size
+    total_logical_rows = max_num_seqs * logical_rows_per_seq
+    table_size = ((total_logical_rows + 128) // 128) * 128
+
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs, dtype=jnp.int32),
+        tokens_per_seq,
+        total_repeat_length=num_tokens,
+    )
+    if padded_tokens > num_tokens:
+        pad_t = padded_tokens - num_tokens
+        compacted_records = jnp.pad(
+            compacted_records, ((0, pad_t), (0, 0)), constant_values=-1
+        )
+        seq_ids_segment = jnp.pad(seq_ids_segment, (0, pad_t), constant_values=0)
+
+    is_pad = compacted_records < 0
+    combined_logical = seq_ids_segment[:, None] * logical_rows_per_seq + jnp.clip(
+        compacted_records, 0, max(0, logical_rows_per_seq - 1)
+    )
+    chunk_log = combined_logical.reshape(num_chunks, chunk_size * topk)
+    chunk_pad = is_pad.reshape(num_chunks, chunk_size * topk)
+
+    safe_log = jnp.where(chunk_pad, total_logical_rows, chunk_log)
+    chunk_rows = jnp.arange(num_chunks, dtype=jnp.int32)[:, None]
+    counts = (
+        jnp.zeros((num_chunks, table_size), dtype=jnp.int32)
+        .at[chunk_rows, safe_log]
+        .add(1)
+    )
+    present = counts[:, :total_logical_rows] > 0
+    num_unique = jnp.sum(present, axis=1)
+
+    union_log = jax.vmap(
+        lambda p: jnp.nonzero(p, size=union_cap, fill_value=0)[0].astype(jnp.int32)
+    )(present)
+    if jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+
+        union_page_ids = sparse_mla.gather_page_ids(
+            page_indices,
+            union_log // page_size,
+            jnp.zeros((num_chunks,), dtype=jnp.int32),
+            1,
+            block_tokens=sparse_mla._largest_divisor(num_chunks, 8),
+        )
+    else:
+        union_page_ids = page_indices[union_log // page_size]
+    union_phys_valid = union_page_ids * page_size + (union_log % page_size)
+
+    u_arange = jnp.arange(union_cap, dtype=jnp.int32)[None, :]
+    flat_u = jnp.arange(num_chunks * union_cap, dtype=jnp.int32).reshape(
+        num_chunks, union_cap
+    )
+    scattered_phys = ((flat_u * 104729) % total_num_pages) * page_size + (
+        (flat_u * 15485863) % page_size
+    )
+    union_phys = jnp.where(
+        u_arange < num_unique[:, None], union_phys_valid, scattered_phys
+    )
+
+    row_to_slot = jnp.cumsum(present.astype(jnp.int32), axis=1) - 1
+    clamped_log = jnp.where(chunk_pad, 0, chunk_log)
+    inv_idx = jnp.clip(
+        jnp.take_along_axis(row_to_slot, clamped_log, axis=1),
+        0,
+        union_cap - 1,
+    ).reshape(num_chunks, chunk_size, topk)
+    return union_phys, inv_idx, num_unique
+
+
+def unpack_union_rope_words(u_rope: jax.Array, topk: int) -> jax.Array:
+    """Unpack ``csa_gather``'s ``(union_cap // 4, 128)`` to ``(union_cap, 32)``."""
+    union_cap = u_rope.shape[0] * 4
+    num_periods = union_cap // topk
+    half_rows = topk // 4
+    periods = u_rope.reshape(num_periods, half_rows, 128)
+
+    def _unpack_half(h: jax.Array) -> jax.Array:
+        lo, hi = h[:, :, :32], h[:, :, 32:64]
+        even = jnp.bitwise_or(jnp.bitwise_and(lo, 0xFFFF), jnp.left_shift(hi, 16))
+        odd = jnp.bitwise_or(
+            jax.lax.shift_right_logical(lo, 16),
+            jnp.bitwise_and(hi, jnp.int32(-65536)),
+        )
+        return jnp.stack([even, odd], axis=2).reshape(num_periods, half_rows * 2, 32)
+
+    return jnp.concatenate(
+        [_unpack_half(periods[:, :, :64]), _unpack_half(periods[:, :, 64:])],
+        axis=1,
+    ).reshape(union_cap, 32)
+
+
+def repack_chunk_rope_words(r32: jax.Array) -> jax.Array:
+    """Pack ``(chunk_size, topk, 32)`` words into ``(chunk_size, topk // 4, 128)``."""
+    chunk_size, topk, _ = r32.shape
+    half_k = topk // 2
+    half_rows = topk // 4
+
+    def _pack_half(h: jax.Array) -> jax.Array:
+        pairs = h.reshape(chunk_size, half_rows, 2, 32)
+        even, odd = pairs[:, :, 0, :], pairs[:, :, 1, :]
+        c0 = jnp.bitwise_or(jnp.bitwise_and(even, 0xFFFF), jnp.left_shift(odd, 16))
+        c1 = jnp.bitwise_or(
+            jax.lax.shift_right_logical(even, 16),
+            jnp.bitwise_and(odd, jnp.int32(-65536)),
+        )
+        return jnp.concatenate([c0, c1], axis=2)
+
+    return jnp.concatenate(
+        [_pack_half(r32[:, :half_k, :]), _pack_half(r32[:, half_k:, :])],
+        axis=2,
+    )
+
+
+def remap_union_kv_to_chunk(
+    u_nope: jax.Array,
+    u_rope: jax.Array,
+    inv_idx: jax.Array,
+    topk: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Remap gathered union ``(u_nope, u_rope)`` to ``(chunk_size, topk, ...)``."""
+    g_nope = u_nope[inv_idx]
+    u_rope_words = unpack_union_rope_words(u_rope, topk)
+    g_rope = repack_chunk_rope_words(u_rope_words[inv_idx])
+    return g_nope, g_rope
+
+
+def gather_sparse_kv_chunk_with_union_fallback(
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    union_phys_chunk: jax.Array,
+    inv_idx_chunk: jax.Array,
+    num_unique_chunk: jax.Array,
+    chunk_records: jax.Array,
+    chunk_seq_ids: jax.Array,
+    page_indices: jax.Array,
+    *,
+    max_num_seqs: int,
+    start_pos: int,
+    batch_end: jax.Array,
+    topk: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather chunk KV via union table, falling back to direct gather on overflow.
+
+    When ``num_unique_chunk <= union_cap``, gathers only the ``union_cap`` unique
+    physical rows and remaps via ``inv_idx_chunk``. If ``num_unique_chunk >
+    union_cap``, ``jax.lax.cond`` falls back to direct ``[chunk_size, topk]``
+    gather so that ``num_unique > union_cap`` never truncates KV rows.
+    """
+    total_num_pages, page_size, nope_lanes = cache_kv_nope.shape
+    _, _, rope_lanes = cache_kv_rope.shape
+    chunk_size = chunk_records.shape[0]
+    union_cap = union_phys_chunk.shape[0]
+    has_valid = batch_end > start_pos
+
+    def _union_branch(_: None) -> tuple[jax.Array, jax.Array]:
+        if jax.default_backend() == "tpu":
+            from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
+                csa_gather,
+                sparse_mla,
+            )
+
+            num_valid_union = jnp.where(
+                has_valid,
+                jnp.minimum(union_cap, sparse_mla.align_to(num_unique_chunk, topk)),
+                0,
+            )
+            u_nope, u_rope = csa_gather.csa_gather(
+                cache_kv_nope,
+                cache_kv_rope,
+                union_phys_chunk,
+                num_valid_indices=num_valid_union,
+                top_k=topk,
+            )
+        else:
+            flat_nope = cache_kv_nope.reshape(total_num_pages * page_size, nope_lanes)
+            flat_rope_words = cache_kv_rope.reshape(
+                total_num_pages * page_size, rope_lanes // 4
+            )
+            u_nope = flat_nope[union_phys_chunk]
+            u_rope = repack_chunk_rope_words(
+                flat_rope_words[union_phys_chunk].reshape(
+                    union_cap // topk, topk, rope_lanes // 4
+                )
+            ).reshape(union_cap // 4, rope_lanes)
+        return remap_union_kv_to_chunk(u_nope, u_rope, inv_idx_chunk, topk)
+
+    def _direct_branch(_: None) -> tuple[jax.Array, jax.Array]:
+        seq_page_ids = chunk_records // page_size
+        token_offset = chunk_records % page_size
+        if jax.default_backend() == "tpu":
+            from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
+                csa_gather,
+                sparse_mla,
+            )
+
+            page_ids = sparse_mla.gather_page_ids(
+                page_indices,
+                seq_page_ids,
+                chunk_seq_ids,
+                max_num_seqs,
+                block_tokens=sparse_mla._largest_divisor(chunk_size, 8),
+            )
+        else:
+            page_table = page_indices.reshape(max_num_seqs, -1)
+            page_ids = page_table[chunk_seq_ids[:, None], jnp.clip(seq_page_ids, 0)]
+
+        is_padding = chunk_records == -1
+        flat_idx = start_pos * topk + jnp.arange(
+            chunk_size * topk, dtype=jnp.int32
+        ).reshape(chunk_size, topk)
+        scattered_page_ids = (flat_idx * 104729) % total_num_pages
+        scattered_token_offset = (flat_idx * 15485863) % page_size
+        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
+        direct_indices = (page_ids * page_size + token_offset).reshape(-1)
+
+        if jax.default_backend() == "tpu":
+            from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+
+            g_nope, g_rope = csa_gather.csa_gather(
+                cache_kv_nope,
+                cache_kv_rope,
+                direct_indices,
+                num_valid_indices=(batch_end - start_pos) * topk,
+                top_k=topk,
+            )
+            return (
+                g_nope.reshape(chunk_size, topk, -1),
+                g_rope.reshape(chunk_size, topk // 4, -1),
+            )
+        flat_nope = cache_kv_nope.reshape(total_num_pages * page_size, nope_lanes)
+        flat_rope_words = cache_kv_rope.reshape(
+            total_num_pages * page_size, rope_lanes // 4
+        )
+        g_nope = flat_nope[direct_indices].reshape(chunk_size, topk, nope_lanes)
+        g_rope = repack_chunk_rope_words(
+            flat_rope_words[direct_indices].reshape(chunk_size, topk, rope_lanes // 4)
+        )
+        return g_nope, g_rope
+
+    return jax.lax.cond(
+        num_unique_chunk <= union_cap,
+        _union_branch,
+        _direct_branch,
+        operand=None,
+    )
+
+
+def sparse_ragged_paged_attention_union_gather(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sinks: jax.Array,
+    swa_accumution: jax.Array,
+    swa_l: jax.Array,
+    swa_m: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    gather_and_attention_chunk_size: int = 128,
+    attention_kernel_batch_size: int = 16,
+    union_cap: int = 4096,
+) -> jax.Array:
+    """``sparse_ragged_paged_attention`` with per-chunk SparseCore Union Gather."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+
+    _, actual_num_q_heads, actual_head_dim = q.shape
+    q = sparse_mla.prepare_q_inputs(q)
+    head_dim = q.shape[-1]
+    attention_sinks = jnp.pad(
+        attention_sinks,
+        (0, q.shape[1] - actual_num_q_heads),
+        constant_values=jnp.finfo(attention_sinks.dtype).min,
+    )
+    swa_accumution, swa_l, swa_m = sparse_mla.prepare_swa_inputs(
+        swa_accumution, swa_l, swa_m
+    )
+
+    total_num_pages, page_size, _ = cache_kv_nope.shape
+    _, num_q_heads, _ = q.shape
+    topk = topk_indices.shape[-1]
+    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+    union_cap_aligned = max(topk, sparse_mla.align_to(union_cap, topk))
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs, dtype=jnp.int32),
+        tokens_per_seq,
+        total_repeat_length=q.shape[0],
+    )
+
+    union_phys, inv_idx_all, num_unique_all = compute_chunk_union_gather_indices(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        page_size=page_size,
+        total_num_pages=total_num_pages,
+        chunk_size=gather_and_attention_chunk_size,
+        union_cap=union_cap_aligned,
+    )
+
+    num_chunks = sparse_mla.cdiv(q.shape[0], gather_and_attention_chunk_size)
+    valid_total = cu_q_lens[distribution[2]]
+
+    for i in range(num_chunks):
+        start_pos = i * gather_and_attention_chunk_size
+        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        chunk_size = end_pos - start_pos
+        kbs = sparse_mla._largest_divisor(chunk_size, attention_kernel_batch_size)
+        batch_end = start_pos + (
+            sparse_mla.cdiv(
+                jnp.maximum(0, jnp.minimum(valid_total, end_pos) - start_pos),
+                kbs,
+            )
+            * kbs
+        )
+        gathered_nope_buffer, gathered_rope_buffer = (
+            gather_sparse_kv_chunk_with_union_fallback(
+                cache_kv_nope,
+                cache_kv_rope,
+                union_phys[i],
+                inv_idx_all[i, :chunk_size],
+                num_unique_all[i],
+                topk_indices[start_pos:end_pos],
+                seq_ids_segment[start_pos:end_pos],
+                page_indices,
+                max_num_seqs=max_num_seqs,
+                start_pos=start_pos,
+                batch_end=batch_end,
+                topk=topk,
+            )
+        )
+
+        end_seq_idx = jnp.maximum(start_pos, batch_end)
+        grid = (sparse_mla.cdiv(end_seq_idx - start_pos, kbs),)
+        in_specs = [
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ]
+        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+        _, topk_rows, lanes = gathered_nope_buffer.shape
+        _, rope_rows, _ = gathered_rope_buffer.shape
+        num_l_heads = sparse_mla.align_to(num_q_heads, 128)
+        scratch_shapes = [
+            pltpu.VMEM((2, kbs, topk_rows * 4, lanes), jnp.uint8),
+            pltpu.VMEM((2, kbs, rope_rows * 2, lanes), jnp.bfloat16),
+            pltpu.VMEM((2, kbs, num_q_heads, head_dim), q.dtype),
+            pltpu.VMEM((2, kbs, num_q_heads, head_dim), q.dtype),
+            pltpu.VMEM((2, kbs, num_l_heads), jnp.float32),
+            pltpu.VMEM((2, kbs, num_l_heads), jnp.float32),
+            pltpu.VMEM((2, kbs, num_q_heads, head_dim), q.dtype),
+            pltpu.SemaphoreType.DMA((7, 2)),
+        ]
+        scalar_prefetches = (
+            kv_lens,
+            jnp.array([start_pos, end_seq_idx, valid_total], jnp.int32),
+            jnp.zeros((2,), jnp.int32),
+            jnp.full((2,), -1, jnp.int32),
+        )
+        scope_name = f"SparseMLA-p_{topk_rows}-bz_{kbs}-gcz_{chunk_size}"
+        kernel = jax.named_scope(scope_name)(
+            pl.pallas_call(
+                functools.partial(
+                    sparse_mla._attention_kernel,
+                    sm_scale=sm_scale,
+                    batch_size=kbs,
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=len(scalar_prefetches),
+                    in_specs=in_specs,
+                    out_specs=out_specs,
+                    grid=grid,
+                    scratch_shapes=scratch_shapes,
+                ),
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary",),
+                    vmem_limit_bytes=sparse_mla.DEFAULT_VMEM_LIMIT_BYTES,
+                    disable_bounds_checks=True,
+                ),
+                out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                input_output_aliases={5: 0},
+                name=scope_name,
+            )
+        )
+        q = kernel(
+            *scalar_prefetches,
+            attention_sinks,
+            q,
+            gathered_nope_buffer,
+            gathered_rope_buffer,
+            swa_accumution,
+            swa_l,
+            swa_m,
+        )
+    return sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
 
 
 def sparse_fp8_attention_jax(
@@ -287,6 +741,9 @@ def sparse_fp8_attention_jax(
     scale: float,
     page_size: int,
     max_requests: int | None = None,
+    precompacted: bool = False,
+    union_gather: bool = False,
+    union_cap: int = 4096,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -297,6 +754,8 @@ def sparse_fp8_attention_jax(
     ``[0, tokens]``, records are raw rows.
 
     ``max_requests`` bounds requests per batch (see `_attend_window`).
+    ``precompacted`` skips ``compact_records`` when ``main_records`` already has
+    valid indices sorted ascending at the prefix and ``-1`` at the tail.
     """
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
@@ -320,11 +779,32 @@ def sparse_fp8_attention_jax(
         jax.lax.optimization_barrier((state, main_pool, rope_pool))
     )
     count = main_pool.shape[0] // page_size
+    compacted = (
+        _pad_compacted_records(main_records)
+        if precompacted
+        else compact_records(main_records)
+    )
+    if union_gather:
+        return sparse_ragged_paged_attention_union_gather(
+            q,
+            main_pool.reshape(count, page_size, main_pool.shape[1]),
+            rope_pool.reshape(count, page_size // 4, rope_pool.shape[1]),
+            compacted,
+            pages.reshape(-1),
+            query_start_loc,
+            jnp.array([0, 0, pages.shape[0]], jnp.int32),
+            sink.astype(jnp.float32),
+            numerator.astype(q.dtype),
+            denominator,
+            maximum,
+            sm_scale=scale,
+            union_cap=union_cap,
+        )
     return sparse_ragged_paged_attention(
         q,
         main_pool.reshape(count, page_size, main_pool.shape[1]),
         rope_pool.reshape(count, page_size // 4, rope_pool.shape[1]),
-        compact_records(main_records),
+        compacted,
         pages.reshape(-1),
         query_start_loc,
         jnp.array([0, 0, pages.shape[0]], jnp.int32),
@@ -336,12 +816,31 @@ def sparse_fp8_attention_jax(
     )
 
 
+def slice_token_parallel_attention_inputs(
+    swa_records: jax.Array,
+    main_records: jax.Array,
+    query_start_loc: jax.Array,
+    tp_rank: jax.Array,
+    tp_size: int,
+    tokens: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Slice ``[tokens, ...]`` records and ``query_start_loc`` to this rank's shard."""
+    tokens_local = tokens // tp_size
+    rank_idx = tp_rank.reshape(())
+    start = rank_idx * tokens_local
+    swa_local = jax.lax.dynamic_slice_in_dim(swa_records, start, tokens_local, axis=0)
+    main_local = jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
+    q_loc_local = jnp.clip(query_start_loc - start, 0, tokens_local)
+    return swa_local, main_local, q_loc_local
+
+
 def initialize_paged_attention():
     global _attention_op, _fp8_attention_op
     if _attention_op is not None:
         return
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal import pallas
+    from vllm.distributed import get_tp_group
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         get_vllm_model_wrapper_context,
@@ -355,6 +854,18 @@ def initialize_paged_attention():
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
+    try:
+        tp_group = get_tp_group().device_group
+        tp_size = tp_group.size() if tp_group is not None else 1
+    except Exception:
+        tp_group = None
+        tp_size = 1
+    if tp_size > 1 and tp_group is not None:
+        tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
+    else:
+        tp_mesh = mesh
+    in_specs = (P(),) * 11
+    out_spec = P()
 
     def fp8_attention(
         q: jax.Array,
@@ -366,22 +877,100 @@ def initialize_paged_attention():
         pages: jax.Array,
         query_start_loc: jax.Array,
         sink: jax.Array,
+        full_sink: jax.Array,
+        tp_rank: jax.Array,
         scale: float,
         page_size: int,
         max_requests: int | None,
+        precompacted: bool,
+        token_parallel: bool,
+        union_gather: bool,
+        union_cap: int,
     ) -> jax.Array:
+        tokens = q.shape[0]
+        use_token_parallel = (
+            token_parallel
+            and tp_size > 1
+            and tokens >= 128 * tp_size
+            and tokens % (128 * tp_size) == 0
+        )
+        if use_token_parallel:
+
+            def _token_parallel_body(
+                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id
+            ):
+                q_tok = jax.lax.all_to_all(
+                    q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
+                )
+                s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
+                    s_r, m_r, q_loc, r_id, tp_size, tokens
+                )
+                out_tok = sparse_fp8_attention_jax(
+                    q_tok,
+                    s_p,
+                    m_p,
+                    r_p,
+                    s_r_tok,
+                    m_r_tok,
+                    pgs,
+                    q_loc_tok,
+                    f_snk,
+                    scale=scale,
+                    page_size=page_size,
+                    max_requests=max_requests,
+                    precompacted=precompacted,
+                    union_gather=union_gather,
+                    union_cap=union_cap,
+                )
+                return jax.lax.all_to_all(
+                    out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
+                )
+
+            return jax.shard_map(
+                _token_parallel_body,
+                mesh=tp_mesh,
+                in_specs=in_specs,
+                out_specs=out_spec,
+                check_vma=False,
+            )(
+                q,
+                swa_pool,
+                main_pool,
+                rope_pool,
+                swa_records,
+                main_records,
+                pages,
+                query_start_loc,
+                sink,
+                full_sink,
+                tp_rank,
+            )
+
         # Mosaic calls require explicit manual partitioning on a multi-device
         # mesh; each device attends over its own replicated cache.
         return jax.shard_map(
-            functools.partial(
-                sparse_fp8_attention_jax,
-                scale=scale,
-                page_size=page_size,
-                max_requests=max_requests,
+            lambda q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, _f_snk, _r_id: (
+                sparse_fp8_attention_jax(
+                    q_l,
+                    s_p,
+                    m_p,
+                    r_p,
+                    s_r,
+                    m_r,
+                    pgs,
+                    q_loc,
+                    snk,
+                    scale=scale,
+                    page_size=page_size,
+                    max_requests=max_requests,
+                    precompacted=precompacted,
+                    union_gather=union_gather,
+                    union_cap=union_cap,
+                )
             ),
-            mesh=mesh,
-            in_specs=(P(),) * 9,
-            out_specs=P(),
+            mesh=tp_mesh,
+            in_specs=in_specs,
+            out_specs=out_spec,
             check_vma=False,
         )(
             q,
@@ -393,13 +982,15 @@ def initialize_paged_attention():
             pages,
             query_start_loc,
             sink,
+            full_sink,
+            tp_rank,
         )
 
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
-        mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None, None, None),
+        mesh=tp_mesh,
+        input_partition_specs=in_specs + (None,) * 7,
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -422,6 +1013,12 @@ def sparse_fp8_attention(
     pages=None,
     starts=None,
     max_requests=None,
+    precompacted=False,
+    token_parallel=False,
+    full_sink=None,
+    tp_rank=None,
+    union_gather=False,
+    union_cap=4096,
 ):
     """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages)."""
     assert _fp8_attention_op is not None and main.rope is not None
@@ -431,6 +1028,12 @@ def sparse_fp8_attention(
         page_size = main.raw.shape[0]
         pages = main_records.new_zeros((1, 1))
         starts = main_records.new_tensor([0, q.shape[0]])
+    if full_sink is None:
+        full_sink = sink
+    if tp_rank is None:
+        tp_rank = main_records.new_zeros((1,), dtype=torch.int32)
+    else:
+        tp_rank = tp_rank.reshape(1).int()
     return _fp8_attention_op(
         q,
         swa.raw,
@@ -441,9 +1044,15 @@ def sparse_fp8_attention(
         pages.int(),
         starts.int(),
         sink,
+        full_sink,
+        tp_rank,
         scale,
         page_size,
         max_requests,
+        precompacted,
+        token_parallel,
+        union_gather,
+        union_cap,
     )
 
 
@@ -733,11 +1342,17 @@ def select_indices_jax(
         else:
             # One extra column absorbs invalid candidate IDs; no 3-D membership
             # tensor and no dependence on the order of candidate IDs.
+            padded_blocks = ((blocks + 128) // 128) * 128
             valid = (candidates >= 0) & (candidates < blocks)
             ids = jnp.where(valid, candidates, blocks)
-            membership = jnp.zeros((count, blocks + 1), jnp.bool_)
-            membership = membership.at[jnp.arange(count)[:, None], ids].set(True)
-            allowed = jnp.take_along_axis(membership, logical // block_size, axis=1)
+            membership = (
+                jnp.zeros((count, padded_blocks), jnp.int32)
+                .at[jnp.arange(count)[:, None], ids]
+                .add(1)
+            )
+            allowed = jnp.broadcast_to(
+                membership[:, :blocks, None] > 0, (count, blocks, block_size)
+            ).reshape(count, blocks * block_size)[:, :width]
             # Match the upstream batch-wide short-context bypass.
             scores = jnp.where(allowed | (batch_max <= topk), scores, -jnp.inf)
     # Ascending: preserves V4.1's logical, hence attention accumulation, order.
@@ -746,7 +1361,10 @@ def select_indices_jax(
     )
     values = jnp.take_along_axis(scores, jnp.maximum(indices, 0), axis=1)
     valid = (indices >= 0) & (values > -jnp.inf)
-    return jnp.where(valid, indices, -1).astype(jnp.int32), published
+    selected = jnp.where(valid, indices, -1).astype(jnp.int32)
+    if unordered:
+        selected = _compact_selected(selected)
+    return selected, published
 
 
 def paged_indexer_jax(
@@ -812,8 +1430,9 @@ def paged_indexer_jax(
             token_records, jnp.minimum(logical, width - 1), axis=1
         )
         compact = jnp.where(valid, compact, -1)
-        # This bounds both key reads and QK work by the candidate pool size.
-        compact_lengths = jnp.full_like(lengths, compact.shape[1])
+        # This bounds both key reads and QK work by the candidate pool size;
+        # zero-length padding rows do not trigger key reads.
+        compact_lengths = jnp.where(lengths > 0, compact.shape[1], 0)
         scores = paged_index_scores_jax(q, pool, compact, weights, compact_lengths)
         scores = jnp.where(compact >= 0, scores, -jnp.inf)
         output_width = min(topk, width)
@@ -823,6 +1442,13 @@ def paged_indexer_jax(
         values, indices = jax.lax.top_k(scores, output_width)
         selected = jnp.take_along_axis(logical, indices, axis=1)
         selected_valid = values > -jnp.inf
+        if unordered:
+            return (
+                _compact_selected(
+                    jnp.where(selected_valid, selected, -1).astype(jnp.int32)
+                ),
+                candidates,
+            )
         # The dense reference fills an underfull top-k with the lowest logical
         # -inf positions, then sorts all positions before masking them. Preserve
         # those padding locations too: moving padding across a 64-key attention
@@ -847,10 +1473,23 @@ def paged_indexer_jax(
         selected_valid = jnp.take_along_axis(selected_valid, order, axis=1)
         return jnp.where(selected_valid, selected, -1).astype(jnp.int32), candidates
 
-    # Preserve the reference's batch-wide short-context bypass. That branch
-    # scans at most topk keys; long contexts never enter the full-history path.
+    # Preserve the reference's batch-wide short-context bypass, and use the
+    # shared-key-tile full_context path whenever the active requests' total
+    # key reads are at most the per-token candidate key reads (e.g. prefill,
+    # where all tokens of a request share one key tile in full_context).
     longest = lengths.max() if batch_max is None else batch_max.max()
-    return jax.lax.cond(longest <= topk, full_context, candidate_context, None)
+    row_lengths = (
+        jnp.zeros((records.shape[0],), jnp.int32)
+        .at[requests]
+        .max(jnp.maximum(lengths, 0))
+    )
+    cand_keys = jnp.sum(lengths > 0) * (candidates.shape[1] * block_size)
+    return jax.lax.cond(
+        (longest <= topk) | (row_lengths.sum() <= cand_keys),
+        full_context,
+        candidate_context,
+        None,
+    )
 
 
 def write_index_keys(

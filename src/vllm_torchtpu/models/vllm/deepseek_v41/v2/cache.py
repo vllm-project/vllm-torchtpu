@@ -20,6 +20,13 @@ NOPE_SCALE_PERIOD = 64
 ROPE_WORDS = 32
 
 
+# TPU7x SparseCore hardware addressing limit: a single HBM tensor passed to
+# SparseCore (`csa_gather` on the shared `int32[rows, 128]` main KV pool) must
+# not exceed 16 GiB (1 << 34 = 17,179,869,184 bytes). Leave 64 MiB of page
+# alignment headroom below 16 GiB when sizing the shared backing pool.
+SPARSECORE_MAX_POOL_BYTES = (16 << 30) - (64 << 20)
+
+
 def uses_fp8_rope_companion(vllm_config) -> bool:
     return "DeepseekV41ForCausalLM" in (
         vllm_config.model_config.hf_config.architectures or []
@@ -27,10 +34,10 @@ def uses_fp8_rope_companion(vllm_config) -> bool:
 
 
 def reserve_rope_companion(vllm_config, available: int) -> int:
-    """Leave room for the RoPE companion: a quarter of the pool's bytes."""
+    """Leave room for the RoPE companion and cap at SparseCore's 16 GiB tensor limit."""
     if not uses_fp8_rope_companion(vllm_config):
         return available
-    return available * 4 // 5
+    return min(available * 4 // 5, SPARSECORE_MAX_POOL_BYTES)
 
 
 @dataclass
