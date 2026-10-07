@@ -2299,3 +2299,161 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+    def test_modify_prev_results_drains_copy_state_when_request_seq_lens_empty(
+        self,
+    ):
+        """When request_seq_lens is empty:
+        - Partial prefill sets copy_state=None -> skips wait_for_copy.
+        - A finished decode step invalidated by _update_states (copy_state!=None,
+          spec_logprobs=None) or a partial prefill with spec_logprobs MUST drain
+          wait_for_copy so in-flight PCIe D2H buffers are not freed early."""
+        runner = self._setup_runner(max_num_reqs=1)
+        wait_partial_prefill = MagicMock()
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=["req-0"],
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[0],
+            num_draft_per_req=None,
+            copy_state=None,
+            wait_for_copy=wait_partial_prefill,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+        wait_partial_prefill.assert_not_called()
+
+        wait_invalidated_decode = MagicMock(return_value=None)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=["req-0"],
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=None,
+            copy_state=SimpleNamespace(spec_logprobs=None),
+            wait_for_copy=wait_invalidated_decode,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+        wait_invalidated_decode.assert_called_once_with()
+
+        wait_with_spec = MagicMock(return_value=None)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=["req-0"],
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[0],
+            num_draft_per_req=None,
+            copy_state=SimpleNamespace(spec_logprobs=object()),
+            wait_for_copy=wait_with_spec,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+        wait_with_spec.assert_called_once_with()
+
+
+@pytest.mark.parametrize("start_index", [0, 1])
+@pytest.mark.parametrize("num_computed", [0, 17])
+@pytest.mark.parametrize("num_scheduled", [4, 32])
+def test_prepare_inputs_single_req_fast_path_matches_general_path(
+    start_index, num_computed, num_scheduled
+):
+    """Verify TPUModelRunner._prepare_inputs num_reqs==1 fast path produces
+    identical input_ids and position_ids as the general multi-req path."""
+    max_num_reqs = 4
+    max_model_len = 128
+    rng = np.random.default_rng(1234 + start_index * 100 + num_computed)
+    token_ids_cpu = rng.integers(
+        1, 50000, size=(max_num_reqs, max_model_len), dtype=np.int32
+    )
+
+    def _make_fake_runner(batch_num_reqs):
+        token_ids_copy = token_ids_cpu.copy()
+        num_computed_np = np.array([5, 11, 9, 3], dtype=np.int32)
+        num_computed_np[start_index] = num_computed
+        positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+        query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+        seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+        from vllm_torchtpu.layers.core.sequence_layout import (
+            AllSequenceLayoutPlanner,
+        )
+
+        return SimpleNamespace(
+            reorder_batch_threshold=1,
+            sequence_layout_planner=AllSequenceLayoutPlanner(),
+            _dp_target_bucket=None,
+            input_batch=SimpleNamespace(
+                num_reqs=batch_num_reqs,
+                req_ids=[f"req-{i}" for i in range(max_num_reqs)],
+                num_computed_tokens_cpu=num_computed_np,
+                token_ids_cpu=token_ids_copy,
+                token_ids_cpu_tensor=torch.from_numpy(token_ids_copy),
+                num_prompt_tokens=np.full(max_num_reqs, 64, dtype=np.int32),
+            ),
+            _wait_input_staging_fence=lambda: None,
+            most_model_len=None,
+            num_reqs_max_model_len=max_num_reqs,
+            num_reqs_most_model_len=max_num_reqs,
+            max_num_reqs=max_num_reqs,
+            uses_mrope=False,
+            arange_np=np.arange(max_model_len, dtype=np.int32),
+            positions_cpu=positions_cpu,
+            positions_np=positions_cpu.numpy(),
+            input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+            query_start_loc_cpu=query_start_loc_cpu,
+            query_start_loc_np=query_start_loc_cpu.numpy(),
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_np=seq_lens_cpu.numpy(),
+            _check_attention_schedule=lambda *a: None,
+            _pcp_enabled=False,
+            _mtp_enabled=False,
+            device=torch.device("cpu"),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+            _pre_async_results=None,
+            _decode_device_cache_key=None,
+            _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+            _has_mamba_state=False,
+            mamba_slot_read_offsets=None,
+            _mamba_ckpt_window=1,
+            _unified_kv_layout=False,
+            empty_slot_mappings=None,
+            _build_attention_metadata=lambda **kw: ({}, None),
+            lora_config=None,
+            _prepare_async_token_substitution_indices=lambda *a: (
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.int32),
+            ),
+            _collect_mamba_state_seed_copies=lambda *a: None,
+            num_tokens_paddings=[16, 64, 128],
+            pcp_size=1,
+            dcp_size=1,
+        )
+
+    # 1) Single-request slice [start_index : start_index + 1] -> `elif num_reqs == 1:`
+    runner_fast = _make_fake_runner(start_index + 1)
+    sched_fast = SimpleNamespace(
+        total_num_scheduled_tokens=num_scheduled,
+        num_scheduled_tokens={f"req-{start_index}": num_scheduled},
+    )
+    TPUModelRunner._prepare_inputs(
+        runner_fast, sched_fast, start_index=start_index, num_decode_reqs=0
+    )
+
+    # 2) Two-request slice [start_index : start_index + 2] -> general `else:` path
+    runner_gen = _make_fake_runner(start_index + 2)
+    sched_gen = SimpleNamespace(
+        total_num_scheduled_tokens=num_scheduled + 2,
+        num_scheduled_tokens={
+            f"req-{start_index}": num_scheduled,
+            f"req-{start_index + 1}": 2,
+        },
+    )
+    TPUModelRunner._prepare_inputs(
+        runner_gen, sched_gen, start_index=start_index, num_decode_reqs=0
+    )
+
+    assert torch.equal(
+        runner_fast.input_ids[:num_scheduled],
+        runner_gen.input_ids[:num_scheduled],
+    )
+    assert torch.equal(
+        runner_fast.position_ids[:num_scheduled],
+        runner_gen.position_ids[:num_scheduled],
+    )
+    assert int(runner_fast.seq_lens_np[0]) == num_computed + num_scheduled
+    assert int(runner_fast.seq_lens_np[0]) == int(runner_gen.seq_lens_np[0])

@@ -96,3 +96,38 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+def test_sequence_parallel_uses_ep_group(monkeypatch, communicator, method, count):
+    # SP shards tokens across TP too, so DP=1 must still exchange over EP.
+    dp, ep = Mock(world_size=1), Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep)
+    ep.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    ep.reduce_scatter.return_value = torch.tensor([[11, 12]])
+    tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    if method == "combine":
+        ep.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
+        assert result is ep.reduce_scatter.return_value
+    else:
+        assert ep.all_gather.call_count == count
+        for actual, expected in zip(result, tensors):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
+    dp.all_gather.assert_not_called()
+    dp.reduce_scatter.assert_not_called()
+
+
+def test_router_logits_alias_gathered_once(monkeypatch, communicator):
+    ep = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep)
+    ep.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    hidden = torch.tensor([[1, 2]])
+    gathered, logits = communicator.dispatch_router_logits(
+        hidden, hidden, is_sequence_parallel=True
+    )
+    assert logits is gathered
+    ep.all_gather.assert_called_once_with(hidden, dim=0)

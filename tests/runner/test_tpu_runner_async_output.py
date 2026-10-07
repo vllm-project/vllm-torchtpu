@@ -231,3 +231,29 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+def test_get_output_skips_wait_when_all_requests_discarded():
+    class _ForbiddenWaitEvent:
+        def wait(self):
+            raise AssertionError("copy_ready_event.wait() should not be called")
+
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[],
+        chunk_real_lens=[],
+        copy_ready_event=_ForbiddenWaitEvent(),
+        completed=False,
+        spec_logprobs=None,
+    )
+    out = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["prefill-req-0"],
+            req_id_to_index={"prefill-req-0": 0},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=copy_state,
+        discard_sampled_tokens_req_indices=[0],
+    ).get_output()
+    assert out.sampled_token_ids == [[]]
+    assert out.logprobs is None

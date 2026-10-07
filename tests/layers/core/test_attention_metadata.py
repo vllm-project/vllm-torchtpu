@@ -589,3 +589,122 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
+
+    def test_active_block_table_columns_buckets_partial_prefill(self):
+        """Partial-prefill steps copy only power-of-2 bucketed active columns
+        while preserving full-row strides for downstream kernels."""
+        runner = self._make_runner_mock(
+            most_model_len=None,
+            num_groups=1,
+            max_num_blocks_per_req=128,
+            max_num_reqs=4,
+        )
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+
+        # max seq_len = 256 -> ceil(256 / 16) = 16 active blocks (power of 2).
+        seq_lens = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
+        ctx_staged = AttentionMetadataBuilderContext(
+            num_reqs=1,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.tensor([0, 256, 256, 256, 256], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx_staged
+        assert builder._active_block_table_columns(ctx_staged, 128) == 16
+
+        stage_block_table_uploads(runner, ctx_staged, 4)
+        meta_staged = builder.build(
+            common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+        )
+
+        ctx_unstaged = AttentionMetadataBuilderContext(
+            num_reqs=1,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.tensor([0, 256, 256, 256, 256], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx_unstaged
+        meta_unstaged = builder.build(
+            common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+        )
+
+        source_bt = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        for meta in (meta_staged, meta_unstaged):
+            reshaped = meta.block_tables.reshape(4, 128)
+            assert torch.equal(reshaped[0, :16], source_bt[0, :16])
+            assert torch.equal(reshaped[0, 16:], torch.zeros(112, dtype=torch.int32))
+            assert torch.equal(reshaped[1:], torch.zeros((3, 128), dtype=torch.int32))
+
+    def test_active_block_table_columns_compressed_group_target_block_size(self):
+        """Compressed KV cache groups with target_block_size > runner.block_size
+        compute active block columns using the group's own target_block_size."""
+        runner = self._make_runner_mock(
+            most_model_len=None,
+            num_groups=2,
+            max_num_blocks_per_req=128,
+            max_num_reqs=4,
+        )
+        runner.input_batch.block_table[1].max_num_blocks_per_req = 64
+        runner.input_batch.block_table[1].get_cpu_tensor.return_value = (
+            torch.arange(4 * 64, dtype=torch.int32).reshape(4, 64) + 100
+        )
+        # Group 0: uncompressed (block_size=16). Group 1: 2x compressed (block_size=32).
+        builder_uncompressed = self._make_builder(runner, kv_cache_group_id=0)
+        compressed_spec = FullAttentionSpec(
+            block_size=32,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            page_size_padded=16384,
+        )
+        builder_compressed = AttentionMetadataBuilder(
+            kv_cache_spec=compressed_spec,
+            layer_names=["attn_compressed.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=1,
+        )
+        self._make_attn_groups(runner, [builder_uncompressed, builder_compressed])
+        assert builder_uncompressed.target_block_size == 16
+        assert builder_compressed.target_block_size == 32
+
+        # seq_len = 512 -> 32 blocks for group 0, 16 blocks for group 1.
+        seq_lens = torch.tensor([512, 0, 0, 0], dtype=torch.int32)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=1,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            seq_lens_cpu=(512, 0, 0, 0),
+            query_start_loc=torch.tensor([0, 512, 512, 512, 512], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        assert builder_uncompressed._active_block_table_columns(ctx, 128) == 32
+        assert builder_compressed._active_block_table_columns(ctx, 64) == 16
+
+        stage_block_table_uploads(runner, ctx, 4)
+        meta_u = builder_uncompressed.build(
+            common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+        )
+        meta_c = builder_compressed.build(
+            common_prefix_len=0, common_attn_metadata=self._make_cm(4)
+        )
+        bt_u = runner.input_batch.block_table[0].get_cpu_tensor.return_value
+        bt_c = runner.input_batch.block_table[1].get_cpu_tensor.return_value
+        assert torch.equal(meta_u.block_tables.reshape(4, 128)[0, :32], bt_u[0, :32])
+        assert torch.equal(
+            meta_u.block_tables.reshape(4, 128)[0, 32:],
+            torch.zeros(96, dtype=torch.int32),
+        )
+        assert torch.equal(meta_c.block_tables.reshape(4, 64)[0, :16], bt_c[0, :16])
+        assert torch.equal(
+            meta_c.block_tables.reshape(4, 64)[0, 16:],
+            torch.zeros(48, dtype=torch.int32),
+        )

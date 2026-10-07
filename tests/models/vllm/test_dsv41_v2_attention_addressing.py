@@ -341,3 +341,129 @@ def test_attend_window_branch_free_matches_conditional(lengths):
     )
     for e, g in zip(expected, got):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
+
+
+@pytest.mark.parametrize(
+    "candidate_write,candidate_filter,short_ctx",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
+def test_paged_indexer_unordered_is_precompacted(
+    candidate_write, candidate_filter, short_ctx
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+        _pad_compacted_records,
+        compact_records,
+    )
+
+    rng = np.random.default_rng(19)
+    width, topk, block_size = 640, 64, 16
+    pool, records, requests, lengths, q, weights = _request_inputs(rng, 3, 24, width)
+    if short_ctx:
+        lengths = np.minimum(lengths, topk // 2)
+    else:
+        lengths = np.maximum(lengths, topk + 1)
+    # Include underfull/zero-length rows to test -1 tail compaction.
+    lengths[0] = 0
+    lengths[1] = 5
+    candidates = jnp.asarray(
+        rng.integers(-1, width // block_size, (24, 3)), dtype=jnp.int32
+    )
+    ordered_sel, ordered_pub = paged_indexer_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        jnp.asarray(requests),
+        topk,
+        block_size,
+        candidate_write,
+        candidate_filter,
+        unordered=False,
+    )
+    unordered_sel, unordered_pub = paged_indexer_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        jnp.asarray(requests),
+        topk,
+        block_size,
+        candidate_write,
+        candidate_filter,
+        unordered=True,
+    )
+    np.testing.assert_array_equal(np.asarray(unordered_pub), np.asarray(ordered_pub))
+    np.testing.assert_array_equal(
+        np.asarray(_pad_compacted_records(unordered_sel)),
+        np.asarray(compact_records(ordered_sel)),
+    )
+
+
+@pytest.mark.parametrize("unordered", [False, True])
+@pytest.mark.parametrize("decode_mode", [False, True])
+def test_paged_indexer_candidate_filter_shared_tiles_and_decode_branches(
+    unordered, decode_mode
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+        select_indices_jax,
+    )
+
+    rng = np.random.default_rng(31)
+    width, topk, block_size = 640, 64, 16
+    pool, records, requests, lengths, q, weights = _request_inputs(rng, 2, 16, width)
+    lengths = np.maximum(lengths, topk * 4)
+    if decode_mode:
+        # Only 1 active token (rest padded with length 0) so
+        # row_lengths.sum() > cand_keys exercises candidate_context.
+        lengths[1:] = 0
+    candidates = jnp.asarray(
+        rng.integers(-1, width // block_size, (16, 4)), dtype=jnp.int32
+    )
+    got_sel, got_pub = paged_indexer_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        jnp.asarray(requests),
+        topk,
+        block_size,
+        candidate_write=False,
+        candidate_filter=True,
+        unordered=unordered,
+    )
+    scores = paged_index_scores_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        jnp.asarray(requests),
+    )
+    scores = jnp.where(
+        jnp.take(jnp.asarray(records) >= 0, jnp.asarray(requests), axis=0),
+        scores,
+        -jnp.inf,
+    )
+    ref_sel, ref_pub = select_indices_jax(
+        scores,
+        jnp.asarray(lengths),
+        candidates,
+        topk,
+        block_size,
+        candidate_write=False,
+        candidate_filter=True,
+        unordered=unordered,
+    )
+    np.testing.assert_array_equal(np.asarray(got_pub), np.asarray(ref_pub))
+    np.testing.assert_array_equal(np.asarray(got_sel), np.asarray(ref_sel))
