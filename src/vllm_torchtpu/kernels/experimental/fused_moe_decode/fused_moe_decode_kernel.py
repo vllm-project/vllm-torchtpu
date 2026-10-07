@@ -106,6 +106,7 @@ def _kernel(
     nb,
     n_ranks,
     weight_dtype,
+    rows=None,
 ):
     """One rank's MoE block. Shapes use m tokens (padded to 16), h hidden, i
     and i_s the routed and shared intermediate sizes of this rank's slice, E
@@ -126,6 +127,8 @@ def _kernel(
       shared_w2_hbm [i_s, h], shared_w2_scale_hbm [1, h]: the shared expert.
     Output:
       out_ref [m, h] bf16: shared + routed output summed over the n ranks.
+        With `rows` set (DP attention), [r_pad, h]: only this rank's `rows`
+        token rows of that sum, r_pad = rows padded to the sublane tile.
     Scratch:
       w1_ring [nb, h, 2 i], w2_ring [nb, i, h], w1_scale_ring [nb, 1, 2 i],
         w2_scale_ring [nb, 1, h]: weight ring, one expert per slot.
@@ -137,6 +140,8 @@ def _kernel(
       acc_bf16 [m, h] bf16: the same, as the all-reduce source.
       recv [n, m, c] bf16: reduce-scatter slots, one per sending rank.
       red [m, c] bf16: this rank's reduced column chunk.
+      With `rows` set, acc_bf16 and recv are [n, r_pad, h] (row slab d is
+      peer d's tokens) and red is unused.
       ids_ref [E] int32 (SMEM): active expert ids, compacted.
       sem_ref DMA [nb, 4]: ring slot transfers (w1, w2, w1 scale, w2 scale).
       shared_sem DMA [4]: shared expert transfers.
@@ -280,6 +285,38 @@ def _kernel(
             jnp.matmul(xq_ref[...], w1_ring[0], preferred_element_type=jnp.float32),
         )
 
+    if rows is not None:
+        # DP attention: reduce-scatter over token rows, no all-gather. Rank d
+        # receives every rank's partial of tokens [d * rows, (d + 1) * rows),
+        # sums them and keeps that slice. Each peer's slab is a whole leading
+        # index of acc_bf16 / recv, so it is tile aligned for any rows.
+        for d in range(n_ranks):
+            acc_bf16[d, :rows, :] = acc_ref[d * rows : (d + 1) * rows, :].astype(
+                acc_bf16.dtype
+            )
+        pl.semaphore_wait(barrier, n_ranks)
+        scatter = [
+            pltpu.make_async_remote_copy(
+                acc_bf16.at[d],
+                recv.at[me],
+                rs_send.at[d],
+                rs_recv,
+                device_id=(jnp.int32(d),),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            for d in range(n_ranks)
+        ]
+        for copy in scatter:
+            copy.start()
+        pltpu.make_async_copy(recv, recv, rs_recv).wait()
+        acc = recv[0].astype(jnp.float32)
+        for s in range(1, n_ranks):
+            acc = acc + recv[s].astype(jnp.float32)
+        out_ref[...] = acc.astype(out_ref.dtype)
+        for copy in scatter:
+            copy.wait_send()
+        return
+
     # All-reduce: reduce-scatter column chunks, sum, all-gather.
     acc_bf16[...] = acc_ref[...].astype(acc_bf16.dtype)
     # Every peer has entered this call, so its receive buffer is live.
@@ -371,11 +408,13 @@ def fused_moe_decode(
     *,
     n_ranks,
     expert_start=None,
+    scatter_rows=False,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
     Returns the TP-all-reduced (shared + routed) MoE output, BF16 [tokens,
-    hidden], identical on every rank.
+    hidden], identical on every rank (with scatter_rows, only this rank's
+    rows; see below).
 
     Args:
       rank: this rank's mesh index, an int32 array of one element
@@ -399,12 +438,22 @@ def fused_moe_decode(
         first expert; the rank holds experts [expert_start, expert_start + E)
         and topk_ids are global. Routes to other ranks' experts contribute
         nothing here and are summed in by the all-reduce. None for TP experts.
+      scatter_rows: for DP attention. The caller all-gathered every rank's
+        tokens and routing rank-major, so `hidden` holds the global batch.
+        The all-reduce becomes a reduce-scatter over token rows: rank r
+        returns only its own rows [r * tokens / n_ranks, (r + 1) * tokens /
+        n_ranks), [tokens / n_ranks, H], and no all-gather runs. Needs tokens
+        % n_ranks == 0. The wire is BF16 when tokens / n_ranks is a multiple
+        of 16, else FP32.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
     quantizes the hidden states and the activated intermediate to, so both
     matmuls run in it with FP32 accumulation.
     """
     tokens, h = hidden.shape
+    if scatter_rows and tokens % n_ranks:
+        raise ValueError(f"scatter_rows needs tokens % n_ranks == 0; got {tokens}")
+    rows = tokens // n_ranks if scatter_rows else None
     experts, i, _ = w2.shape
     pad = (-tokens) % 16
     if pad:
@@ -434,6 +483,15 @@ def fused_moe_decode(
     weight_dtype = w1.dtype
     nb = _weight_ring_depth(h, i, weight_dtype)
     chunk = h // n_ranks
+    if rows is None:
+        out_rows, wire = m, hidden.dtype
+        acc_bf16_shape, recv_shape, red_shape = (m, h), (n_ranks, m, chunk), (m, chunk)
+    else:
+        # BF16 packs 16 rows per tile; smaller slabs go over the wire in FP32.
+        wire = hidden.dtype if rows % 16 == 0 else jnp.float32
+        out_rows = rows if rows % 16 == 0 else -(-rows // 8) * 8
+        acc_bf16_shape = recv_shape = (n_ranks, out_rows, h)
+        red_shape = (8, 128)  # unused
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -444,8 +502,9 @@ def fused_moe_decode(
             nb=nb,
             n_ranks=n_ranks,
             weight_dtype=weight_dtype,
+            rows=rows,
         ),
-        out_shape=jax.ShapeDtypeStruct((m, h), hidden.dtype),
+        out_shape=jax.ShapeDtypeStruct((out_rows, h), wire),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 3
@@ -463,9 +522,9 @@ def fused_moe_decode(
                 pltpu.VMEM((m, h), weight_dtype),
                 pltpu.VMEM((m, 2 * i), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
-                pltpu.VMEM((m, h), hidden.dtype),
-                pltpu.VMEM((n_ranks, m, chunk), hidden.dtype),
-                pltpu.VMEM((m, chunk), hidden.dtype),
+                pltpu.VMEM(acc_bf16_shape, wire),
+                pltpu.VMEM(recv_shape, wire),
+                pltpu.VMEM(red_shape, wire),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((nb, 4)),
                 pltpu.SemaphoreType.DMA((4,)),
@@ -479,7 +538,8 @@ def fused_moe_decode(
             collective_id=0,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
-        name=f"fused_moe_decode-e_{experts}-m_{m}-h_{h}-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
+        name=f"fused_moe_decode{'_rs' if rows else ''}-e_{experts}-m_{m}-h_{h}"
+        f"-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
     )(
         active,
         rank.reshape(1).astype(jnp.int32),
@@ -495,4 +555,6 @@ def fused_moe_decode(
         shared_w2,
         shared_w2_scale,
     )
+    if rows is not None:
+        return out[:rows].astype(hidden.dtype)
     return out[:tokens] if pad else out

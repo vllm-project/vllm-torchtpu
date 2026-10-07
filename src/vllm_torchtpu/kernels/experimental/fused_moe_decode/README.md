@@ -23,7 +23,9 @@ out = fused_moe_decode(
     topk_weights, topk_ids,      # [T, k] from the caller's router
     n_ranks=8,
     expert_start=None,    # global id of the first local expert (EP); None for TP
+    scatter_rows=False,   # True for DP attention, see below
 )  # -> [T, H] bf16, all-reduced, identical on every rank
+   #    scatter_rows=True: [T / n_ranks, H], this rank's rows only
 ```
 
 - Call it inside `shard_map` over the mesh, one call per rank.
@@ -32,6 +34,10 @@ out = fused_moe_decode(
 - **EP experts:** each rank holds whole experts `[expert_start, expert_start + E)`.
   `topk_ids` stay global; routes owned by other ranks are skipped and summed in
   by the all-reduce.
+- `scatter_rows=True` (DP attention): `hidden`, `topk_weights` and `topk_ids`
+  are the global batch, all-gathered rank-major by the caller. The all-reduce
+  becomes a reduce-scatter over token rows. Rank `r` returns rows
+  `[r·T/n, (r+1)·T/n)` and no all-gather runs. Needs `T % n_ranks == 0`.
 - `vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype)` returns the
   VMEM one call declares. The adapter uses it to refuse a token cap that cannot
   compile.
@@ -50,8 +56,8 @@ Use it when all of these hold:
 
 - Decode or other small batches: up to a few hundred tokens per step. Above
   that, prefill-style kernels win.
-- Attention is TP. Every rank sees every token, and the MoE output is
-  all-reduced. (DP attention: see below.)
+- Attention is TP (every rank sees every token, output all-reduced), or DP with
+  `scatter_rows=True` (see below).
 - The MoE is TP-sharded, or EP with `ep_size == mesh size`.
 - Weights are FP8 with per-channel scales, the activation is SiLU, and there
   are no expert biases.
@@ -71,10 +77,17 @@ GMM path.
 
 ### DP attention
 
-The kernel can serve DP attention, where each rank owns different tokens. The
-caller all-gathers the tokens and their routing before the call, so the kernel
-sees the global batch, and keeps only its own rows of the output. The token cap
-then counts global tokens, not tokens per rank.
+With DP attention each rank owns T/n tokens. The caller all-gathers every
+rank's tokens and routing, rank-major, and calls the kernel with
+`scatter_rows=True`. The kernel computes the experts over the global batch and
+ends with a reduce-scatter over token rows, so each rank gets back exactly its
+own T/n rows. The kernel runs no all-gather. Things to know:
+
+- The token cap counts global tokens: a cap of 256 at DP8 is 32 tokens per
+  rank. Larger DP decode batches are better served by fused EP MoE, which
+  works on each rank's own rows.
+- The start all-gather runs in XLA, outside the kernel, and is not hidden.
+- Small per-rank row counts (T/n not a multiple of 16) use an FP32 wire.
 
 The serving adapter does not support DP attention yet; that is TBD. Today it
 arms only with TP attention (DP 1).
@@ -99,7 +112,8 @@ arms only with TP attention (DP 1).
 - **Shared expert in-kernel.** Its slice is loaded once at entry and computed
   first, gated by `sigmoid(x · w_g)`.
 - **In-kernel all-reduce.** It is a remote-DMA reduce-scatter over column
-  chunks, then an all-gather, with bf16 on the wire. The cross-rank barrier is
+  chunks, then an all-gather, with bf16 on the wire. With `scatter_rows` it is
+  a reduce-scatter over token rows only. The cross-rank barrier is
   signalled at entry and waited only before the reduce-scatter, so the expert
   loop hides it.
 - **Limits.** All tokens, the accumulator and the reduce-scatter buffers stay

@@ -1,9 +1,9 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 """8-device parity for the fused MoE decode kernel (routed + shared expert +
-in-kernel all-reduce), with the experts TP-sliced (every rank holds all E) or
-EP-sharded (rank r holds global experts [r*E, (r+1)*E)); the shared expert is
-always a TP slice."""
+in-kernel all-reduce, or its reduce-scatter-only DP mode), with the experts
+TP-sliced (every rank holds all E) or EP-sharded (rank r holds global experts
+[r*E, (r+1)*E)); the shared expert is always a TP slice."""
 
 import functools
 
@@ -259,3 +259,65 @@ def test_vmem_bound_matches_build_limits():
     assert vmem_bytes(1024, 4096, 128, 128, 512, 8, jnp.float8_e4m3fn) > have
     assert vmem_bytes(256, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) <= have
     assert vmem_bytes(512, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) > have
+
+
+@pytest.mark.parametrize("m", [8, 32, 128])
+@pytest.mark.parametrize("ep", [False, True])
+def test_scatter_rows_is_own_slice_of_all_reduce(setup, m, ep):
+    """scatter_rows=True (DP attention: reduce-scatter only, no all-gather)
+    returns on rank r exactly rows [r*m/N, (r+1)*m/N) of the all-reduce mode's
+    output. The BF16 wire (m/N % 16 == 0) is bit-identical; the FP32 wire used
+    for small row counts differs only by the all-reduce's BF16 rounding."""
+    mesh, sh, rank, weights, shared_gate_weight = setup
+    rng = np.random.default_rng(100 + m)
+    x = rng.normal(size=(m, H)).astype(np.float32)
+    n_global = N * E if ep else E
+    ids = np.stack(
+        [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
+    tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
+    args = (
+        rank,
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        *weights,
+        shared_gate_weight,
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
+    )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def call(rank, x, *rest, scatter_rows):
+        return fused_moe_decode(
+            rank.reshape(-1),
+            x,
+            *rest,
+            n_ranks=N,
+            expert_start=rank.reshape(()) * E if ep else None,
+            scatter_rows=scatter_rows,
+        )
+
+    def run(scatter_rows):
+        out = jax.jit(
+            jax.shard_map(
+                functools.partial(call, scatter_rows=scatter_rows),
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )(*args)
+        return np.asarray(out.astype(jnp.float32))
+
+    full = run(False).reshape(N, m, H)[0]
+    own = run(True)
+    assert own.shape == (m, H)
+    assert np.isfinite(own).all()
+    if (m // N) % 16 == 0:
+        np.testing.assert_array_equal(own, full)
+    else:
+        rel = np.linalg.norm(own - full, axis=1) / np.maximum(
+            np.linalg.norm(full, axis=1), 1e-30
+        )
+        assert rel.max() < 1e-2
+    # Positive control: a one-row shift of the slices must not match.
+    assert not np.allclose(np.roll(own, 1, axis=0), full, rtol=1e-2, atol=1e-3)
