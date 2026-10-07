@@ -97,9 +97,10 @@ repos:
     pass_filenames: false
   - id: check-license-header
     name: Python files carry the Apache 2.0 license header
-    # Either form counts: the full Apache text or the one-line SPDX tag.
-    # `\A\Z` matches an empty file, so a bare __init__.py passes.
-    entry: '\A\Z|Licensed under the Apache License|SPDX-License-Identifier: Apache-2\.0'
+    # Either form counts: the full Apache text or the one-line SPDX tag. It
+    # must sit in the comment block at the top of the file, after an optional
+    # shebang. `\A\Z` matches an empty file, so a bare __init__.py passes.
+    entry: '\A\Z|\A(#![^\n]*\n)?(#[^\n]*\n|\n)*?#[^\n]*(Licensed under the Apache License|SPDX-License-Identifier: Apache-2\.0)'
     language: pygrep
     args: [--negate, --multiline]
     types: [python]
