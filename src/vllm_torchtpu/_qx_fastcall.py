@@ -47,6 +47,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     stance_mod = torch._dynamo.eval_frame
     state: dict[str, Any] = {
         "entry": None,  # (guard_manager, direct_fn, entry_count)
+        "entries": [],  # MRU list of (guard_manager, direct_fn)
+        "count": -1,
         "disabled": not simple_sig,
         "logged": False,
     }
@@ -68,37 +70,48 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
 
     def _refresh(f_locals: dict | None) -> None:
         state["entry"] = None
+        state["entries"] = []
+        state["count"] = -1
         if f_locals is None:
             return
         try:
             entries = _region_entries(code, region)
             if not entries:
                 return
-            entry = entries[0]
-            ecode = entry.code
-            if (
-                ecode.co_freevars != freevars
-                or ecode.co_argcount != code.co_argcount
-                or ecode.co_kwonlyargcount != code.co_kwonlyargcount
-                or ecode.co_varnames[: nargs + code.co_kwonlyargcount]
-                != code.co_varnames[: nargs + code.co_kwonlyargcount]
-            ):
-                state["disabled"] = True
-                logger.info(
-                    "QX_FAST_COMPILED_CALL: %s disabled (transformed code "
-                    "signature/closure differs)",
-                    fn.__qualname__,
+            built: list[tuple[Any, Any]] = []
+            mru_idx = -1
+            for entry in entries:
+                ecode = entry.code
+                if (
+                    ecode.co_freevars != freevars
+                    or ecode.co_argcount != code.co_argcount
+                    or ecode.co_kwonlyargcount != code.co_kwonlyargcount
+                    or ecode.co_varnames[: nargs + code.co_kwonlyargcount]
+                    != code.co_varnames[: nargs + code.co_kwonlyargcount]
+                ):
+                    state["disabled"] = True
+                    logger.info(
+                        "QX_FAST_COMPILED_CALL: %s disabled (transformed code "
+                        "signature/closure differs)",
+                        fn.__qualname__,
+                    )
+                    return
+                gm = entry.guard_manager
+                direct = types.FunctionType(
+                    ecode, fn.__globals__, fn.__name__, fn.__defaults__, closure
                 )
+                direct.__kwdefaults__ = fn.__kwdefaults__
+                if mru_idx < 0 and gm.check(f_locals):
+                    mru_idx = len(built)
+                built.append((gm, direct))
+            if mru_idx < 0:
                 return
-            gm = entry.guard_manager
-            # MRU entry must accept the frame the slow call just ran with.
-            if not gm.check(f_locals):
-                return
-            direct = types.FunctionType(
-                ecode, fn.__globals__, fn.__name__, fn.__defaults__, closure
-            )
-            direct.__kwdefaults__ = fn.__kwdefaults__
-            state["entry"] = (gm, direct, _entry_count(code))
+            if mru_idx > 0:
+                built.insert(0, built.pop(mru_idx))
+            count = _entry_count(code)
+            state["entries"] = built
+            state["count"] = count
+            state["entry"] = (built[0][0], built[0][1], count)
         except Exception:  # noqa: BLE001 - fall back to dynamo for good
             state["disabled"] = True
             logger.warning(
@@ -115,29 +128,35 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     @functools.wraps(fn)
     def qx_fast_compiled(*args: Any, **kwargs: Any) -> Any:
         if not state["disabled"]:
-            cached = state["entry"]
+            entries = state["entries"]
             if (
-                cached is not None
+                entries
                 and _c_eval_frame.get_eval_frame_callback() is None
                 and stance_mod._stance.stance == "default"
                 and not torch.compiler.is_compiling()
             ):
-                gm, direct, count = cached
                 f_locals = _f_locals(args, kwargs)
-                if (
-                    f_locals is not None
-                    and _entry_count(code) == count
-                    and gm.check(f_locals)
-                ):
-                    if not state["logged"]:
-                        state["logged"] = True
-                        logger.info(
-                            "QX_FAST_COMPILED_CALL: first direct dispatch of %s",
-                            fn.__qualname__,
-                        )
-                    _note(True)
-                    return direct(*args, **kwargs)
-            f_locals = _f_locals(args, kwargs)
+                if f_locals is not None and _entry_count(code) == state["count"]:
+                    for idx, (gm, direct) in enumerate(entries):
+                        if gm.check(f_locals):
+                            if idx > 0:
+                                item = entries.pop(idx)
+                                entries.insert(0, item)
+                                state["entry"] = (
+                                    item[0],
+                                    item[1],
+                                    state["count"],
+                                )
+                            if not state["logged"]:
+                                state["logged"] = True
+                                logger.info(
+                                    "QX_FAST_COMPILED_CALL: first direct dispatch of %s",
+                                    fn.__qualname__,
+                                )
+                            _note(True)
+                            return direct(*args, **kwargs)
+            else:
+                f_locals = _f_locals(args, kwargs)
             out = compiled(*args, **kwargs)
             _note(False)
             _refresh(f_locals)
