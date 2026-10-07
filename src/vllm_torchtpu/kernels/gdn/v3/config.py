@@ -122,11 +122,6 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
-    # Stream states through separate refill and write-back VMEM buffers
-    # (the refill holding only window position 0) instead of one shared
-    # input_output buffer, so a tile's refill never waits for the write-back
-    # of the tile two before it. Costs VMEM; see `split_state_fits`.
-    split_state: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -148,20 +143,14 @@ class GDNConfig:
         it before the copy_out read it, writing another request's state into
         checkpoint 0 in HBM. Use a dedicated extra position `window_size`
         instead, which copy_out never reads. Without a window keep position 0
-        (unchanged layout). With `split_state` the refill has its own buffer
-        holding only position 0.
+        (unchanged layout).
         """
-        return self.window_size if self._extra_in_pos else 0
+        return self.window_size if self.window_size > 1 else 0
 
     @property
     def state_window_alloc(self) -> int:
-        """Window positions allocated per sequence in the shared VMEM state
-        tiles."""
-        return self.window_size + (1 if self._extra_in_pos else 0)
-
-    @property
-    def _extra_in_pos(self) -> bool:
-        return self.window_size > 1 and not self.split_state
+        """Window positions allocated per sequence in the VMEM state tiles."""
+        return self.window_size + (1 if self.window_size > 1 else 0)
 
     @property
     def seq_tile_size(self) -> int:

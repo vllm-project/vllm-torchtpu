@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest import mock
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from absl.testing import parameterized
 
-from vllm_torchtpu.kernels.gdn.v3 import memory_ref, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import wrapper
 
 pytestmark = pytest.mark.tpu_test
 
@@ -862,54 +860,3 @@ class GDNAttentionTest(parameterized.TestCase):
         # reference; Step B (continuation) must match the second half.
         np.testing.assert_allclose(output_a, output_ref[:half], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(output_b, output_ref[half:], rtol=2e-2, atol=2e-2)
-
-    @parameterized.named_parameters(
-        # Default selection: tile 2 with split state buffers.
-        ("split_buffers", 40, True),
-        # Tile 4 on the shared buffer (drain before refill), the layout
-        # used where split buffers do not fit. A distinct batch size keeps
-        # it from reusing the other case's jit cache entry.
-        ("shared_buffer", 36, False),
-    )
-    def test_decode_states_repeat_exactly_at_64_v_heads(self, n, allow_split):
-        # Nine or ten decode tiles at 64 v-heads (DP8): the write-back of a
-        # tile used to race the refill of its VMEM slot two tiles later.
-        n_kq, n_v, d, kernel_size = 16, 64, 128, 4
-        dim = n_kq * d * 2 + n_v * d
-        rngs = iter(jax.random.split(jax.random.key(17), 8))
-        conv_state = jax.random.normal(next(rngs), (n + 1, kernel_size - 1, dim))
-        recurrent_state = 0.1 * jax.random.normal(next(rngs), (n + 1, n_v, d, d))
-        kwargs = dict(
-            qkv=jax.random.normal(next(rngs), (n, dim)),
-            b=jax.random.normal(next(rngs), (n, n_v)),
-            a=jax.random.normal(next(rngs), (n, n_v)),
-            conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
-            conv_bias=None,
-            a_log=jax.random.normal(next(rngs), (n_v,)),
-            dt_bias=jax.random.normal(next(rngs), (n_v,)),
-            query_start_loc=jnp.arange(n + 1, dtype=jnp.int32),
-            state_indices=jnp.arange(1, n + 1, dtype=jnp.int32),
-            distribution=jnp.array([n, n, n], dtype=jnp.int32),
-            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d,
-            d_v=d,
-            kernel_size=kernel_size,
-            batched_only=True,
-        )
-        fits = memory_ref.split_state_fits if allow_split else lambda *_: False
-        with mock.patch.object(memory_ref, "split_state_fits", fits):
-            runs = [
-                wrapper.fused_conv1d_gdn(
-                    conv_state=jnp.copy(conv_state),
-                    recurrent_state=jnp.copy(recurrent_state),
-                    **kwargs,
-                )
-                for _ in range(3)
-            ]
-        (conv0, rec0), out0 = runs[0]
-        for (conv, rec), out in runs[1:]:
-            np.testing.assert_array_equal(np.asarray(rec), np.asarray(rec0))
-            np.testing.assert_array_equal(np.asarray(conv), np.asarray(conv0))
-            np.testing.assert_array_equal(np.asarray(out), np.asarray(out0))

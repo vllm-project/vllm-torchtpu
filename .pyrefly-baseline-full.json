@@ -1893,7 +1893,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-return",
-      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, ExternalStateBufferedRef | StateBufferedRef | tuple[ExternalStateBufferedRef | StateBufferedRef, ExternalStateBufferedRef | StateBufferedRef], ExternalStateBufferedRef | StateBufferedRef | tuple[ExternalStateBufferedRef | StateBufferedRef, ExternalStateBufferedRef | StateBufferedRef], BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef | tuple[StateBufferedRef, StateBufferedRef], StateBufferedRef | tuple[StateBufferedRef, StateBufferedRef], OutBufferedRef]`"
+      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",

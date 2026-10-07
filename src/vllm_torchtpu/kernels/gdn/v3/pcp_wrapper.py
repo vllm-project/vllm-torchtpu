@@ -793,9 +793,6 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             recurrent_state_output_ref=recurrent_state_updates_ref,
         )
     )
-    # The PCP path never splits the state buffers.
-    assert isinstance(conv_alloc, memory_ref.StateBufferedRef)
-    assert isinstance(recurrent_alloc, memory_ref.StateBufferedRef)
 
     num_tiles = metadata_ref.num_tiles[...]
     active_stages = stage_metadata_ref.num_stages[...]
