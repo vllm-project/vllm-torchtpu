@@ -4220,6 +4220,11 @@ class TPUModelRunner(GPUModelRunner):
                          and self.cache_config.mamba_cache_mode == "align")
         granularity = chunk_granularity(self.cache_config.block_size,
                                         self.max_num_tokens, block_aligned)
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import \
+                PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+            q_block = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+            granularity = -(-granularity // q_block) * q_block
         self._pp_chunk_granularity = granularity
         extra = sorted(
             set(chunk_buckets(self.max_num_tokens, granularity)) -

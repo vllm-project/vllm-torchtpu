@@ -16,6 +16,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 
 """
 import functools
+import os as tpu_envs_os
 import math
 from typing import Optional, Tuple
 
@@ -537,6 +538,15 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     output_spec = P(pcp_axis, None, None)
     out_specs = ((conv_state_spec, recurrent_state_spec), output_spec)
 
+    # ragged_all_to_all inside a pipeline-stage program halts the stages that
+    # do not own the slice origin (RuntimeUnexpectedCoreHalt at program
+    # termination validation), so under PP use the dense exchange.
+    from vllm_torchtpu.distributed.mesh_utils import get_stage_device_table
+    use_ragged_exchange = get_stage_device_table() is None
+    _force = tpu_envs_os.environ.get("VLLM_GDN_PCP_DENSE_EXCHANGE")
+    if _force is not None:
+        use_ragged_exchange = _force != "1"
+
     def _pcp_prefill_fn(
         local_qkv,
         local_b,
@@ -593,13 +603,20 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         local_descriptors = _select_replicated_shard_for_pcp_rank(
             descriptors_by_rank, pcp_axis, pcp_size, axis=0)[0]
 
-        qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
-            interleaved_qkv,
-            pcp_axis,
-            pcp_size,
-            local_descriptors,
-            send_sizes_by_rank,
-        )
+        if use_ragged_exchange:
+            qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
+                interleaved_qkv,
+                pcp_axis,
+                pcp_size,
+                local_descriptors,
+                send_sizes_by_rank,
+            )
+        else:
+            # Dense exchange + request-major scatter (same scheme as BA).
+            packed_qkv_shard = _exchange_pcp_token_shards_for_head_shards(
+                interleaved_qkv, pcp_axis, pcp_size)
+            qkv_shard = jnp.zeros_like(packed_qkv_shard).at[
+                scatter_indices].set(packed_qkv_shard, mode="drop")
         ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
             packed_ba_shard, mode="drop")
         ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)
@@ -1277,6 +1294,15 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     output_spec = P(pcp_axis, None, None)
     out_specs = (pool_spec, output_spec)
 
+    # ragged_all_to_all inside a pipeline-stage program halts the stages that
+    # do not own the slice origin (RuntimeUnexpectedCoreHalt at program
+    # termination validation), so under PP use the dense exchange.
+    from vllm_torchtpu.distributed.mesh_utils import get_stage_device_table
+    use_ragged_exchange = get_stage_device_table() is None
+    _force = tpu_envs_os.environ.get("VLLM_GDN_PCP_DENSE_EXCHANGE")
+    if _force is not None:
+        use_ragged_exchange = _force != "1"
+
     def _pooled_pcp_prefill_fn(
         local_qkv,
         local_b,
@@ -1332,13 +1358,20 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         local_descriptors = _select_replicated_shard_for_pcp_rank(
             descriptors_by_rank, pcp_axis, pcp_size, axis=0)[0]
 
-        qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
-            interleaved_qkv,
-            pcp_axis,
-            pcp_size,
-            local_descriptors,
-            send_sizes_by_rank,
-        )
+        if use_ragged_exchange:
+            qkv_shard = _ragged_exchange_pcp_token_shards_for_head_shards(
+                interleaved_qkv,
+                pcp_axis,
+                pcp_size,
+                local_descriptors,
+                send_sizes_by_rank,
+            )
+        else:
+            # Dense exchange + request-major scatter (same scheme as BA).
+            packed_qkv_shard = _exchange_pcp_token_shards_for_head_shards(
+                interleaved_qkv, pcp_axis, pcp_size)
+            qkv_shard = jnp.zeros_like(packed_qkv_shard).at[
+                scatter_indices].set(packed_qkv_shard, mode="drop")
         ba_shard = jnp.zeros_like(packed_ba_shard).at[scatter_indices].set(
             packed_ba_shard, mode="drop")
         ba_shard = ba_shard.reshape(ba_shard.shape[0], local_n_v, 2)

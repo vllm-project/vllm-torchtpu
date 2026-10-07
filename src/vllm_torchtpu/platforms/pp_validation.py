@@ -45,12 +45,18 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     unsupported = None
     remedy = ""
-    if parallel_config.tensor_parallel_size > 1:
-        # A stage spans devices only as a prefill context-parallel group,
-        # whose kernels and collectives are compiled for the stage alone.
-        unsupported = "tensor parallelism inside a stage"
-        remedy = (" Use --tensor-parallel-size 1 (a stage may span devices "
-                  "with --prefill-context-parallel-size).")
+    import os as _os
+    if (parallel_config.tensor_parallel_size > 1
+            and getattr(parallel_config, "prefill_context_parallel_size", 1)
+            <= 1
+            and _os.environ.get("VLLM_TPU_PP_ALLOW_TP") != "1"):
+        # On this branch stage groups are built by resolve_pcp_topology_order
+        # when prefill_context_parallel_size > 1 (covering PP xPCP and
+        # PP x TP x PCP). Pure PP x TP (pcp=1) requires VLLM_TPU_PP_ALLOW_TP=1
+        # or the pp-tp-stages branch.
+        unsupported = "tensor parallelism inside a stage without PCP"
+        remedy = (" Use --tensor-parallel-size 1, or combine with "
+                  "--prefill-context-parallel-size > 1.")
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async
         # placeholder substitution reads from the device.

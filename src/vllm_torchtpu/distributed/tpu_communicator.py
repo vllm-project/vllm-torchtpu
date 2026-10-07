@@ -19,6 +19,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
+from vllm_torchtpu.distributed.stage_collectives import stage_collective
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -34,6 +36,22 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    # Under PP x TP x PCP the TP and PCP groups' collectives run as JAX
+    # programs over the whole stage (see stage_collectives).
+    def all_reduce(self, input_):
+        out = stage_collective("all_reduce", self.unique_name, input_)
+        return super().all_reduce(input_) if out is None else out
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        out = stage_collective("all_gather", self.unique_name, input_, dim)
+        return super().all_gather(input_, dim) if out is None else out
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        out = stage_collective("reduce_scatter", self.unique_name, input_,
+                               dim)
+        return super().reduce_scatter(input_,
+                                      dim) if out is None else out
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)

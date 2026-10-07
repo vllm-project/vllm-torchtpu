@@ -84,12 +84,20 @@ def resolve_pcp_topology_order(
     # world ranks (mesh_utils), not on the ring order of the topology.
     if pp_size != 1:
         from vllm_torchtpu.distributed.mesh_utils import stage_group_ranks
-        groups = stage_group_ranks(pp_size, pcp_size)
+        from vllm.distributed.parallel_state import get_world_group
+
+        from vllm_torchtpu.distributed.mesh_utils import (
+            _collect_rank_to_device_id, _get_current_global_rank,
+            _get_tpu_global_device_id)
+        device_ids = _collect_rank_to_device_id(get_world_group(),
+                                                _get_current_global_rank(),
+                                                _get_tpu_global_device_id())
+        groups = stage_group_ranks(pp_size, pcp_size, tp_size, device_ids)
         model_config = getattr(vllm_config, "model_config", None)
         if model_config is None or not getattr(model_config, "is_moe", False):
             groups.pop("ep")
-        logger.info("Pipeline stage layout | pp=%d pcp=%d -> %s", pp_size,
-                    pcp_size, groups)
+        logger.info("Pipeline stage layout | pp=%d tp=%d pcp=%d -> %s",
+                    pp_size, tp_size, pcp_size, groups)
         return groups
 
     # dp > 1 is only visible here under expert parallelism: TPUWorker

@@ -13,10 +13,12 @@ def _config(pp=2,
             speculative=None,
             kv_transfer=None,
             tp=1,
+            pcp=1,
             layer_types=None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp,
-                                        tensor_parallel_size=tp),
+                                        tensor_parallel_size=tp,
+                                        prefill_context_parallel_size=pcp),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         speculative_config=speculative,
         kv_transfer_config=kv_transfer,
@@ -93,6 +95,10 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
 def test_rejects_tensor_parallel_stages():
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
+
+
+def test_accepts_tensor_and_context_parallel_stages():
+    validate_pipeline_parallel_config(_config(pp=2, tp=2, pcp=2))
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):

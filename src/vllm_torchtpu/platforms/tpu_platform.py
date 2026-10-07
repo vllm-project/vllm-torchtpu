@@ -654,8 +654,16 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
+            min_token_size = 16
+            if pcp_config.enabled:
+                from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import \
+                    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+                min_token_size = max(
+                    min_token_size,
+                    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+                )
             compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
+                min_token_size=min_token_size,
                 max_token_size=scheduler_config.max_num_batched_tokens,
                 extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
             )

@@ -41,6 +41,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu.distributed.mesh_utils import (STAGE_AXIS_NAME,
+                                                  _uses_mesh_device_assignment,
                                                   get_stage_device_table,
                                                   stage_collective_devices)
 from vllm_torchtpu.logger import init_logger
@@ -64,10 +65,12 @@ def make_jax_callable(cls, *, collective_devices: list[int] | None, **kwargs):
     try:
         return cls(collective_devices=collective_devices, **kwargs)
     except TypeError as exc:
+        if _uses_mesh_device_assignment() and kwargs.get("mesh") is not None:
+            return cls(**kwargs)
         raise NotImplementedError(
             "a kernel restricted to a pipeline stage needs a torch_tpu whose "
-            "JaxCallable takes collective_devices (subgroup-collective "
-            "programs)") from exc
+            "JaxCallable takes collective_devices (#3931) or derives "
+            "device_assignment from mesh.devices (#4059)") from exc
 
 
 def _takes_output_partition_specs() -> bool:

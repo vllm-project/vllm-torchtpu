@@ -14,6 +14,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.mesh_utils import _uses_mesh_device_assignment
 from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
 from vllm_torchtpu.distributed.sharded_jax_op import (make_jax_callable,
                                                       stage_tag_for_mesh)
@@ -131,6 +132,10 @@ class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
         call_kwargs = {}
         if getattr(self, "collective_devices", None):
             call_kwargs["collective_devices"] = self.collective_devices
+        elif _uses_mesh_device_assignment() and self.mesh is not None:
+            call_kwargs["device_assignment"] = [
+                int(d.id) for d in self.mesh.devices.flat
+            ]
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
             mlir_fingerprint,

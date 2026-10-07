@@ -146,3 +146,63 @@ def test_tagged_callable_needs_a_torch_tpu_that_takes_the_tag():
         sharded_jax_op.make_jax_callable(Old,
                                          collective_devices=[2, 3],
                                          name="a")
+
+
+def test_stage_mesh_1d_under_4059_mesh_device_assignment(monkeypatch):
+    monkeypatch.setattr(mesh_utils, "_STAGE_TABLE", TABLE)
+    monkeypatch.setattr(mesh_utils, "_uses_mesh_device_assignment",
+                        lambda: True)
+    monkeypatch.setattr(sharded_jax_op, "_uses_mesh_device_assignment",
+                        lambda: True)
+    devices = [SimpleNamespace(id=i) for i in range(8)]
+    monkeypatch.setattr(jax, "devices", Mock(return_value=devices))
+    mesh = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(axis_names=
+                                                                    ("pcp", )))
+    monkeypatch.setattr(jax.sharding, "Mesh", mesh)
+
+    first = mesh_utils.get_or_create_cp_mesh("pcp", group=None)
+    dev_ids = [d.id for d in mesh.call_args.args[0]]
+    # Stage 3 has world ranks (6, 7) -> physical PJRT device_ids (2, 3).
+    assert dev_ids == [2, 3]
+    assert mesh.call_args.kwargs == {"axis_names": ("pcp", )}
+    assert mesh_utils.get_or_create_stage_mesh("pcp") is first
+
+
+def test_stage_groups_with_tp_and_pcp_and_device_order(monkeypatch):
+    _world(monkeypatch, range(8))
+    device_ids = {0: 0, 1: 1, 2: 4, 3: 5, 4: 6, 5: 7, 6: 2, 7: 3}
+    groups = mesh_utils.stage_group_ranks(2, 2, tp_size=2,
+                                          device_ids=device_ids)
+    # Stage 0 ranks [0, 1, 2, 3] (dev 0, 1, 4, 5); Stage 1 sorted by dev id
+    # -> [6, 7, 4, 5] (dev 2, 3, 6, 7).
+    assert groups == {
+        "pcp": [[0, 1], [2, 3], [6, 7], [4, 5]],
+        "tp": [[0, 2], [1, 3], [6, 4], [7, 5]],
+        "pp": [[0, 6], [1, 7], [2, 4], [3, 5]],
+        "ep": [[0, 1, 2, 3], [6, 7, 4, 5]],
+    }
+
+
+def test_stage_mesh_2d_with_tp_lanes_under_4059(monkeypatch):
+    table_2x4 = mesh_utils.StageDeviceTable(
+        stages=(0, 0, 0, 0, 1, 1, 1, 1),
+        columns=(0, 1, 2, 3, 2, 3, 0, 1),
+        device_ids=(0, 1, 4, 5, 6, 7, 2, 3),
+        stage=1,
+        column=0,
+    )
+    monkeypatch.setattr(mesh_utils, "_STAGE_TABLE", table_2x4)
+    monkeypatch.setattr(mesh_utils, "_uses_mesh_device_assignment",
+                        lambda: True)
+    devices = [SimpleNamespace(id=i) for i in range(8)]
+    monkeypatch.setattr(jax, "devices", Mock(return_value=devices))
+    mesh = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(
+        axis_names=("stage_tp", "pcp")))
+    monkeypatch.setattr(jax.sharding, "Mesh", mesh)
+
+    group = SimpleNamespace(world_size=2)
+    mesh_utils.get_or_create_cp_mesh("pcp", group=group)
+    grid = [[d.id for d in row] for row in mesh.call_args.args[0]]
+    assert grid == [[2, 3], [6, 7]]
+    assert mesh.call_args.kwargs == {"axis_names": ("stage_tp", "pcp")}
+

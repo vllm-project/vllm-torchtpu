@@ -16,6 +16,7 @@ from jax.sharding import Mesh, PartitionSpec
 from vllm.logger import init_logger
 
 from vllm_torchtpu.distributed.mesh_utils import (StageDeviceTable,
+                                                  _uses_mesh_device_assignment,
                                                   gather_stage_device_table)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -38,8 +39,9 @@ def get_or_create_pp_mesh() -> Mesh:
         return _MESH
     _TABLE = gather_stage_device_table()
     devices_by_id = {int(device.id): device for device in jax.devices()}
-    _MESH = Mesh(np.asarray(
-        [devices_by_id[rank] for rank in range(len(_TABLE.stages))]),
+    mesh_dev_ids = (list(_TABLE.device_ids) if _uses_mesh_device_assignment()
+                    else list(range(len(_TABLE.stages))))
+    _MESH = Mesh(np.asarray([devices_by_id[d] for d in mesh_dev_ids]),
                  axis_names=(AXIS, ))
     logger.info(
         "PP hand-off mesh (rank order): %s",

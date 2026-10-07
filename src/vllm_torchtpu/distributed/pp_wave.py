@@ -156,8 +156,15 @@ class PPWave:
         self.last = self.size - 1
         # This device's column in its stage: the same column of every stage
         # holds the same token rows.
-        self.column = get_pcp_rank()
-        self.columns = get_pcp_world_size()
+        from vllm_torchtpu.distributed.mesh_utils import \
+            get_stage_device_table
+        table = get_stage_device_table()
+        if table is not None:
+            self.column = int(table.column)
+            self.columns = int(table.num_columns)
+        else:
+            self.column = get_pcp_rank()
+            self.columns = get_pcp_world_size()
         if (set(template) != {HIDDEN_STATES, RESIDUAL}
                 or template[HIDDEN_STATES] != template[RESIDUAL]
                 or len(template[HIDDEN_STATES][0]) != 1):
@@ -171,9 +178,17 @@ class PPWave:
         # A stage that spans more than one chip must not have a program in
         # flight while the slice-wide hand-off runs: with the two running
         # at once a core of the stage stops inside a stage collective (see
-        # the module docstring). One-chip stages keep the pipelined
-        # launch.
-        self.drain_before_handoff = stage_spans_chips() > 1
+        # the module docstring). A one-chip stage with PCP > 1 has the same
+        # hazard in a milder form: an in-flight stage program races the
+        # hand-off and corrupts outputs (nondeterministic garbage on Qwen3.5
+        # PP4xPCP2). Only one-chip, one-column stages keep the pipelined
+        # launch. VLLM_PP_WAVE_ALWAYS_DRAIN=0/1 overrides.
+        import os
+        drain = stage_spans_chips() > 1 or self.columns > 1
+        override = os.environ.get("VLLM_PP_WAVE_ALWAYS_DRAIN")
+        if override is not None:
+            drain = override == "1"
+        self.drain_before_handoff = drain
         self.zero = torch.zeros((self.max_rows, hidden),
                                 dtype=dtype,
                                 device=device)
