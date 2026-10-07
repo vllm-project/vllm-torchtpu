@@ -174,6 +174,25 @@ def test_scenario_env_names(variants: dict[str, Data]) -> None:
     assert TOOL_OWNED_ENV.covers("JAX_PLATFORMS")
 
 
+def test_agentx_names_are_scenario_env_outside_agentx(
+    variants: dict[str, Data],
+) -> None:
+    """MODEL is the tool's on the AgentX command only, so a custom task may set it."""
+    data = variants["pd"]
+    data["server"]["env"]["CONC"] = "4"
+    data["tasks"]["custom"][0]["env"] |= {"MODEL": "m", "TP": "8"}
+    planned = build(data)
+    assert {"CONC", "MODEL", "TP"} <= scenario_env_names(planned)
+    assert ownership_problems(planned, PodTarget().reserved) == []
+    greedy = EnvNames(frozenset({"MODEL"}))
+    assert ownership_problems(planned, greedy)[0] == (
+        "the target reserves MODEL, which the tool sets"
+    )
+    agentx = build(variants["agentx"])
+    assert "MODEL" not in scenario_env_names(agentx)
+    assert "AIPERF_MAX_CONTEXT_LENGTH" in scenario_env_names(agentx)
+
+
 def test_ownership_problems(variants: dict[str, Data]) -> None:
     planned = build(variants["pd"])
     assert ownership_problems(planned, PodTarget().reserved) == []

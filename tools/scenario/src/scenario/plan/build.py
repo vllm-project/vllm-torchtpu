@@ -166,7 +166,7 @@ def _role_plan(
     kv_flags: tuple[Value, ...] = ()
     if view.kv is not None:
         kv_plan, kv_flags, kv_env = kv_wiring(view.kv)
-        env |= kv_env | raiden_identity(view.name, position, shape.hosts)
+        env |= kv_env | raiden_identity(view.name, position)
     scenario_env = env_items(dict(view.env))
     hosts = []
     for index in range(shape.hosts):

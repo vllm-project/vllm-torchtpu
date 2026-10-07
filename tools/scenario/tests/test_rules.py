@@ -513,6 +513,14 @@ CASES = [
         "must be longer than duration (1h), to cover warmup and drain",
     ),
     Case(
+        "V-41",
+        "agentx",
+        {"tasks.agentx.fast": True},
+        "tasks.agentx.duration",
+        "is 1h, but fast mode fixes the window at 20m and ignores duration",
+        hint="set duration: 20m, or fast: false",
+    ),
+    Case(
         "V-38",
         "agentx",
         {"sweep": {"name": "x"}},
@@ -615,7 +623,7 @@ def test_every_scenario_rule_has_a_case() -> None:
 def test_rule_table_is_complete_and_ordered() -> None:
     ids = [rule.id for rule in rule_table()]
     # V-25 is unused: each sweep point is its own workload and may change shape.
-    assert ids == [f"V-{n:02d}" for n in range(1, 41) if n != 25]
+    assert ids == [f"V-{n:02d}" for n in range(1, 42) if n != 25]
     assert all(rule.summary for rule in rule_table())
 
 
@@ -688,6 +696,27 @@ def test_agentx_env_names_the_tool_sets(agentx: Data, name: str) -> None:
     (issue,) = issues_for(agentx)
     assert issue.rule == "V-11"
     assert issue.path == ("tasks", "agentx", "env", name)
+
+
+@pytest.mark.parametrize("duration", ["20m", 1200])
+def test_agentx_fast_with_its_window(agentx: Data, duration: object) -> None:
+    put(agentx, "tasks.agentx.fast", True)
+    put(agentx, "tasks.agentx.duration", duration)
+    assert issues_for(agentx) == []
+
+
+@pytest.mark.parametrize("name", ["MODEL", "TP", "CONC", "RESULT_DIR"])
+def test_agentx_names_are_free_outside_agentx(
+    single: Data, pd: Data, name: str
+) -> None:
+    """The tool sets them on the AgentX command only; elsewhere they are free."""
+    put(single, f"server.env.{name}", "x")
+    put(single, f"tasks.perf.env.{name}", "x")
+    put(single, f"{LM}.tasks", [{"name": "mmlu_pro", "env": {name: "x"}}])
+    assert issues_for(single) == []
+    put(pd, f"server.roles.decode.env.{name}", "x")
+    put(pd, f"{CUSTOM_ENV}.{name}", "x")
+    assert issues_for(pd) == []
 
 
 def test_inferencex_perf_env_keeps_the_import_path(single: Data) -> None:

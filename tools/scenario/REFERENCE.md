@@ -193,6 +193,7 @@ InferenceX AgentX trace replay at one concurrency.
 |---|---|---|---|
 | `concurrency` | positive integer | required | Concurrent sessions; one value per server. |
 | `duration` | duration: 2h, 90m, 4h10m, 30s or seconds | required; defaults.yaml can set it | How long the replay runs. |
+| `fast` | boolean | `false` | InferenceX's bring-up mode (AIPERF_EXPERIMENTAL_FAST): a fixed 20m window and one warmup per lane; duration must then be 20m. Its numbers are bring-up evidence, not a canonical result. |
 | `timeout` | duration: 2h, 90m, 4h10m, 30s or seconds | required; defaults.yaml can set it | The task is killed and fails after this; longer than duration, to cover warmup and drain. |
 | `labels` | [AgentxLabels](#agentxlabels) | required; defaults.yaml can set it | Result row labels. |
 | `env` | env map: name to string | `{}` | Client settings passed through untouched, e.g. AIPERF_MAX_CONTEXT_LENGTH. |
@@ -459,6 +460,7 @@ tasks.eval.lm_eval values, applied only where tasks.eval.lm_eval is declared.
 | V-38 | scenario | a sweep has one form, axes under server.* or tasks.*, unique names |
 | V-39 | resolve | sweep axis paths exist in the resolved scenario |
 | V-40 | resolve | --set does not touch a sweep axis |
+| V-41 | scenario | tasks.agentx.fast runs a 20m window, so duration is 20m |
 
 ## Derived plumbing
 
@@ -478,7 +480,7 @@ because of another value; choices belong in `scenarios/defaults.yaml`.
 | P-09 | startup timeout | VLLM_ENGINE_READY_TIMEOUT_S=\<server.startup_timeout> on every host; the readiness wait, GET /health on port 8000, lasts startup_timeout + 600 s from the server's start. | `VLLM_ENGINE_READY_TIMEOUT_S` |
 | P-10 | accelerator env | TPU_ACCELERATOR_TYPE=\<accelerator> on every TPU host. | `TPU_ACCELERATOR_TYPE` |
 | P-11 | KV wiring | A role with kv: --kv-transfer-config {kv_connector, kv_connector_module_path, kv_role, kv_port: 14579}, TPU_KV_TRANSFER_PORT=9100 and TPU_SIDE_CHANNEL_PORT=9600. | `TPU_KV_TRANSFER_PORT`, `TPU_SIDE_CHANNEL_PORT` |
-| P-12 | Raiden identity | A role with kv at position r among the roles: TPU_KV_TRANSFER_NAMESPACE=\<role>, TPU_RAIDEN_ENGINE_ID=\<role>-engine, TPU_RAIDEN_JOB_NAME=\<role>, TPU_RAIDEN_RESHARD_PORT_BASE=27000+1000r and TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100+1000r; with several hosts also TPU_RAIDEN_ADVERTISE_HOST=\<role_ips:role>, every host's IPv4 in DP-rank order. | `TPU_KV_TRANSFER_NAMESPACE`, `TPU_RAIDEN_ENGINE_ID`, `TPU_RAIDEN_JOB_NAME`, `TPU_RAIDEN_RESHARD_PORT_BASE`, `TPU_RAIDEN_STORE_DISPATCH_PORT_BASE`, `TPU_RAIDEN_ADVERTISE_HOST` |
+| P-12 | Raiden identity | A role with kv at position r among the roles: TPU_KV_TRANSFER_NAMESPACE=\<role>, TPU_RAIDEN_ENGINE_ID=\<role>-engine, TPU_RAIDEN_JOB_NAME=\<role>, TPU_RAIDEN_RESHARD_PORT_BASE=27000+1000r, TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100+1000r and TPU_RAIDEN_ADVERTISE_HOST=\<role_ips:role>, every host's IPv4 in DP-rank order (one address on a single host; the store-mode connector requires it). | `TPU_KV_TRANSFER_NAMESPACE`, `TPU_RAIDEN_ENGINE_ID`, `TPU_RAIDEN_JOB_NAME`, `TPU_RAIDEN_RESHARD_PORT_BASE`, `TPU_RAIDEN_STORE_DISPATCH_PORT_BASE`, `TPU_RAIDEN_ADVERTISE_HOST` |
 | P-13 | router | On the driver host: \<router.command> --host 0.0.0.0 --port 8100 --prefiller-hosts \<role_head:producer> --prefiller-ports 8000 --decoder-hosts \<role_head:consumer> --decoder-ports 8000, then router.args; ready on GET /healthcheck. | none |
 | P-14 | driver and endpoint | One role: its first host drives. Several roles: tasks.driver, a role's first host or a chipless client host. Tasks connect to the router (127.0.0.1:8100) when there is one, else to the driver role's own API (127.0.0.1:8000), or from a client host to the first role's head. | none |
 | P-15 | client tokenizer | --tokenizer \<tasks.perf.tokenizer> when set; else, for an object-storage model.path, --tokenizer \<pulled_model_dir>, which falls back to model.name when the pulled directory holds no config.json; else none. | none |
@@ -487,11 +489,13 @@ because of another value; choices belong in `scenarios/defaults.yaml`.
 | P-18 | chipless driver env | A chipless client driver's tasks and router get VLLM_PLUGINS empty and TORCH_DEVICE_BACKEND_AUTOLOAD=0, so vLLM's CLI from the TPU image does not start a TPU platform on a host without chips. | `VLLM_PLUGINS`, `TORCH_DEVICE_BACKEND_AUTOLOAD` |
 | P-19 | remote-code warm | Before serve on mp hosts after the first, when trust-remote-code is set and model.path is object storage: python3 -m scenario.runtime.warm \<model.path>, best effort, at most 600 s, so the hosts do not race to write the model's remote code. | none |
 | P-20 | chips | The chips of the server roles, hosts x chips per host (never TensorCores); the AgentX client divides throughput by them (TP, or PREFILL_TP and DECODE_TP per worker for P/D). | none |
-| P-21 | InferenceX client env | The InferenceX perf client gets PYTHONPATH=\<baked checkout>. The AgentX client gets its baked runtime (AIPERF_RUNTIME_DIR, PYTHONPATH, PYTHONSAFEPATH), the endpoint (AIPERF_SERVER_URL), SERVED_MODEL_NAME and MODEL=\<model.name>, the labels (MODEL_PREFIX, PRECISION, FRAMEWORK, SPEC_DECODING), CONC and DURATION, RESULT_DIR and AGENTIC_OUTPUT_DIR (\<results_dir>), RESULT_FILENAME=agentx_c\<N>, RUNNER_TYPE=\<accelerator>, the chip counts of P-20 (one role: IS_MULTINODE=false, TP=\<chips>, PP_SIZE, DCP_SIZE and PCP_SIZE 1; P/D: IS_MULTINODE=true, DISAGG=true, PREFILL_NUM_WORKERS, PREFILL_TP, DECODE_NUM_WORKERS, DECODE_TP, power measurement off), EVAL_ONLY=false, KV_OFFLOADING=none, IS_AGENTIC=1, AIPERF_EXPERIMENTAL_FAST=0 and the three Dynamo switches off. | `AIPERF_RUNTIME_DIR`, `PYTHONPATH`, `PYTHONSAFEPATH`, `AIPERF_SERVER_URL`, `SERVED_MODEL_NAME`, `MODEL`, `MODEL_PREFIX`, `PRECISION`, `FRAMEWORK`, `SPEC_DECODING`, `CONC`, `DURATION`, `RESULT_DIR`, `RESULT_FILENAME`, `AGENTIC_OUTPUT_DIR`, `RUNNER_TYPE`, `IS_MULTINODE`, `TP`, `PP_SIZE`, `DCP_SIZE`, `PCP_SIZE`, `DISAGG`, `PREFILL_NUM_WORKERS`, `PREFILL_TP`, `DECODE_NUM_WORKERS`, `DECODE_TP`, `ENABLE_AGENTX_POWER`, `REQUIRE_POWER`, `IS_AGENTIC`, `EVAL_ONLY`, `KV_OFFLOADING`, `AIPERF_EXPERIMENTAL_FAST`, `AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS`, `AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING`, `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID` |
+| P-21 | InferenceX client env | The InferenceX perf client gets PYTHONPATH=\<baked checkout>. The AgentX client gets its baked runtime (AIPERF_RUNTIME_DIR, PYTHONPATH, PYTHONSAFEPATH), the endpoint (AIPERF_SERVER_URL), SERVED_MODEL_NAME and MODEL=\<model.name>, the labels (MODEL_PREFIX, PRECISION, FRAMEWORK, SPEC_DECODING), CONC and DURATION, RESULT_DIR and AGENTIC_OUTPUT_DIR (\<results_dir>), RESULT_FILENAME=agentx_c\<N>, RUNNER_TYPE=\<accelerator>, the chip counts of P-20 (one role: IS_MULTINODE=false, TP=\<chips>, PP_SIZE, DCP_SIZE and PCP_SIZE 1; P/D: IS_MULTINODE=true, DISAGG=true, PREFILL_NUM_WORKERS, PREFILL_TP, DECODE_NUM_WORKERS, DECODE_TP, power measurement off), AIPERF_EXPERIMENTAL_FAST from tasks.agentx.fast (1 or 0), EVAL_ONLY=false, KV_OFFLOADING=none, IS_AGENTIC=1 and the three Dynamo switches off. | `AIPERF_RUNTIME_DIR`, `PYTHONPATH`, `PYTHONSAFEPATH`, `AIPERF_SERVER_URL`, `SERVED_MODEL_NAME`, `MODEL`, `MODEL_PREFIX`, `PRECISION`, `FRAMEWORK`, `SPEC_DECODING`, `CONC`, `DURATION`, `RESULT_DIR`, `RESULT_FILENAME`, `AGENTIC_OUTPUT_DIR`, `RUNNER_TYPE`, `IS_MULTINODE`, `TP`, `PP_SIZE`, `DCP_SIZE`, `PCP_SIZE`, `DISAGG`, `PREFILL_NUM_WORKERS`, `PREFILL_TP`, `DECODE_NUM_WORKERS`, `DECODE_TP`, `ENABLE_AGENTX_POWER`, `REQUIRE_POWER`, `IS_AGENTIC`, `EVAL_ONLY`, `KV_OFFLOADING`, `AIPERF_EXPERIMENTAL_FAST`, `AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS`, `AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING`, `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID` |
 
 ## Reserved names
 
-A scenario may not set these env names, since the tool sets them.
+A scenario may not set these env names where the tool sets them. A
+name reserved in one block only, such as the AgentX client's MODEL in
+`tasks.agentx.env`, stays free in every other block.
 
 | Env | Reserved in | Set from |
 |---|---|---|
@@ -558,7 +562,7 @@ A scenario may not set these env names, since the tool sets them.
 | `IS_AGENTIC` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
 | `EVAL_ONLY` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
 | `KV_OFFLOADING` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
-| `AIPERF_EXPERIMENTAL_FAST` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
+| `AIPERF_EXPERIMENTAL_FAST` | `tasks.agentx.env` | tasks.agentx.fast |
 | `AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
 | `AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING` | `tasks.agentx.env` | the tool, fixed for a vLLM server |
 | `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID` | `tasks.agentx.env` | the tool, fixed for a vLLM server |

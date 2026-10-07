@@ -156,6 +156,18 @@
           ],
           "description": "Client settings passed through untouched, e.g. AIPERF_MAX_CONTEXT_LENGTH."
         },
+        "fast": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": false,
+          "description": "InferenceX's bring-up mode (AIPERF_EXPERIMENTAL_FAST): a fixed 20m window and one warmup per lane; duration must then be 20m. Its numbers are bring-up evidence, not a canonical result."
+        },
         "labels": {
           "anyOf": [
             {

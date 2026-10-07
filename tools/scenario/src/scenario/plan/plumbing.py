@@ -321,9 +321,10 @@ RAIDEN_PORT_STRIDE = 1000
     "Raiden identity",
     "A role with kv at position r among the roles: "
     "TPU_KV_TRANSFER_NAMESPACE=<role>, TPU_RAIDEN_ENGINE_ID=<role>-engine, "
-    "TPU_RAIDEN_JOB_NAME=<role>, TPU_RAIDEN_RESHARD_PORT_BASE=27000+1000r and "
-    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100+1000r; with several hosts also "
-    "TPU_RAIDEN_ADVERTISE_HOST=<role_ips:role>, every host's IPv4 in DP-rank order.",
+    "TPU_RAIDEN_JOB_NAME=<role>, TPU_RAIDEN_RESHARD_PORT_BASE=27000+1000r, "
+    "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100+1000r and "
+    "TPU_RAIDEN_ADVERTISE_HOST=<role_ips:role>, every host's IPv4 in DP-rank "
+    "order (one address on a single host; the store-mode connector requires it).",
     env=(
         "TPU_KV_TRANSFER_NAMESPACE",
         "TPU_RAIDEN_ENGINE_ID",
@@ -333,18 +334,16 @@ RAIDEN_PORT_STRIDE = 1000
         "TPU_RAIDEN_ADVERTISE_HOST",
     ),
 )
-def raiden_identity(role: str, position: int, hosts: int) -> dict[str, Value]:
+def raiden_identity(role: str, position: int) -> dict[str, Value]:
     offset = RAIDEN_PORT_STRIDE * position
-    env: dict[str, Value] = {
+    return {
         "TPU_KV_TRANSFER_NAMESPACE": role,
         "TPU_RAIDEN_ENGINE_ID": f"{role}-engine",
         "TPU_RAIDEN_JOB_NAME": role,
         "TPU_RAIDEN_RESHARD_PORT_BASE": str(RAIDEN_PORT_BASE + offset),
         "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE": str(RAIDEN_DISPATCH_PORT_BASE + offset),
+        "TPU_RAIDEN_ADVERTISE_HOST": Ref("role_ips", role=role),
     }
-    if hosts > 1:
-        env["TPU_RAIDEN_ADVERTISE_HOST"] = Ref("role_ips", role=role)
-    return env
 
 
 ROUTER_HEALTH_PATH = "/healthcheck"
@@ -530,14 +529,13 @@ INFERENCEX_DIR = "/opt/infx/InferenceX/inferencex-e2e"
 AIPERF_RUNTIME_DIR = "/opt/infx/runtime"
 AGENTX_PYTHON = f"{AIPERF_RUNTIME_DIR}/venv/bin/python"
 
-# AgentX inputs with one value for a vLLM server: no KV offloading, the full
-# run rather than the short bring-up mode, and Dynamo's routing switches off.
-# IS_AGENTIC makes a bad value fail before the replay instead of after it.
+# AgentX inputs with one value for a vLLM server: no KV offloading and
+# Dynamo's routing switches off. IS_AGENTIC makes a bad value fail before the
+# replay instead of after it.
 AGENTX_FIXED_ENV: Mapping[str, str] = {
     "EVAL_ONLY": "false",
     "KV_OFFLOADING": "none",
     "IS_AGENTIC": "1",
-    "AIPERF_EXPERIMENTAL_FAST": "0",
     "AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS": "3600",
     "AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING": "0",
     "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID": "false",
@@ -556,8 +554,9 @@ AGENTX_FIXED_ENV: Mapping[str, str] = {
     "the chip counts of P-20 (one role: IS_MULTINODE=false, TP=<chips>, "
     "PP_SIZE, DCP_SIZE and PCP_SIZE 1; P/D: IS_MULTINODE=true, DISAGG=true, "
     "PREFILL_NUM_WORKERS, PREFILL_TP, DECODE_NUM_WORKERS, DECODE_TP, power "
-    "measurement off), EVAL_ONLY=false, KV_OFFLOADING=none, IS_AGENTIC=1, "
-    "AIPERF_EXPERIMENTAL_FAST=0 and the three Dynamo switches off.",
+    "measurement off), AIPERF_EXPERIMENTAL_FAST from tasks.agentx.fast (1 or 0), "
+    "EVAL_ONLY=false, KV_OFFLOADING=none, IS_AGENTIC=1 and the three Dynamo "
+    "switches off.",
     env=tuple(dict.fromkeys([*AGENTX_CLIENT_ENV, *INFERENCEX_PERF_ENV])),
 )
 def agentx_env(
@@ -580,6 +579,7 @@ def agentx_env(
         "AGENTIC_OUTPUT_DIR": Ref("results_dir"),
         "RESULT_FILENAME": f"agentx_c{task.concurrency}",
         "RUNNER_TYPE": roles[0].accelerator,
+        "AIPERF_EXPERIMENTAL_FAST": "1" if task.fast else "0",
         **AGENTX_FIXED_ENV,
     }
     if len(roles) == 1:

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validation rules V-01..V-40.
+"""Validation rules V-01..V-41.
 
 Field types enforce the rules about one value. The rules here need several
 fields of one validated scenario (a scenario without a sweep, or one point
@@ -34,6 +34,7 @@ from scenario.model.server import RoleView
 from scenario.model.sweep import POINT_NAME, Sweep, expand
 from scenario.model.tasks import (
     BUILTIN_TASKS,
+    FAST_WINDOW_S,
     LABEL_FIELDS,
     LABEL_PLACEHOLDER,
     LmEvalTask,
@@ -731,6 +732,19 @@ def _agentx_timeout(s: Scenario) -> Iterator[Issue]:
             ("tasks", "agentx", "timeout"),
             f"must be longer than duration ({format_duration(agentx.duration)}), "
             "to cover warmup and drain",
+        )
+
+
+@_rule("V-41", "tasks.agentx.fast runs a 20m window, so duration is 20m")
+def _agentx_fast(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is not None and agentx.fast and agentx.duration != FAST_WINDOW_S:
+        window = format_duration(FAST_WINDOW_S)
+        yield Issue(
+            ("tasks", "agentx", "duration"),
+            f"is {format_duration(agentx.duration)}, but fast mode fixes the "
+            f"window at {window} and ignores duration",
+            hint=f"set duration: {window}, or fast: false",
         )
 
 

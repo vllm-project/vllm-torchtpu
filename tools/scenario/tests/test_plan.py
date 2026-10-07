@@ -243,8 +243,7 @@ def test_p12_raiden_identity(variants: dict[str, Data]) -> None:
     assert (
         env(prefill.host_plans[0].tool_env)["TPU_RAIDEN_RESHARD_PORT_BASE"] == "27000"
     )
-    assert "TPU_RAIDEN_ADVERTISE_HOST" not in env(prefill.host_plans[0].tool_env)
-    for role in build(variants["k3_pd"]).roles:
+    for role in [prefill, decode, *build(variants["k3_pd"]).roles]:
         for host in role.host_plans:
             advertise = env(host.tool_env)["TPU_RAIDEN_ADVERTISE_HOST"]
             assert advertise == Ref("role_ips", role=role.name)
@@ -401,6 +400,16 @@ def test_p20_p21_agentx_env(variants: dict[str, Data]) -> None:
         # Chips, not devices: 4 hosts x 4 chips of a 2x2x4 slice.
         "TP": "16",
     }
+
+
+def test_p21_agentx_fast_mode(variants: dict[str, Data]) -> None:
+    data = variants["agentx"]
+    data["tasks"]["agentx"] |= {"fast": True, "duration": "20m"}
+    agentx_env = env(task(build(data), AgentxTaskPlan).command.env)
+    assert (agentx_env["AIPERF_EXPERIMENTAL_FAST"], agentx_env["DURATION"]) == (
+        "1",
+        "1200",
+    )
 
 
 def test_p20_p21_agentx_against_pd(variants: dict[str, Data], agentx: Data) -> None:

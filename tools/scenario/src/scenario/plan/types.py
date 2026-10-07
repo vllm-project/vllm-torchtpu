@@ -248,6 +248,22 @@ TaskPlan = PerfTaskPlan | AgentxTaskPlan | CustomTaskPlan | EvalTaskPlan
 TASK_KINDS = ("perf", "agentx", "custom", "eval")
 
 
+def task_commands(task: TaskPlan) -> Iterator[tuple[str, Command]]:
+    """A task's commands in run order, each with a label."""
+    if isinstance(task, PerfTaskPlan):
+        for cell in task.cells:
+            for index, command in enumerate(cell.warmups):
+                yield f"perf {cell.key} warmup{index + 1}", command
+            yield f"perf {cell.key}", cell.measured
+    elif isinstance(task, AgentxTaskPlan):
+        yield "agentx", task.command
+    elif isinstance(task, CustomTaskPlan):
+        yield f"custom {task.name}", task.command
+    else:
+        for run in task.runs:
+            yield f"eval {run.key}", run.command
+
+
 @dataclass(frozen=True, slots=True)
 class DriverPlan:
     """Where tasks and the router run, and what they connect to."""
@@ -384,15 +400,4 @@ class Plan:
                 if host.serve is not None:
                     yield f"{where} serve", host.serve
         for task in self.driver.tasks:
-            if isinstance(task, PerfTaskPlan):
-                for cell in task.cells:
-                    for index, command in enumerate(cell.warmups):
-                        yield f"perf {cell.key} warmup{index + 1}", command
-                    yield f"perf {cell.key}", cell.measured
-            elif isinstance(task, AgentxTaskPlan):
-                yield "agentx", task.command
-            elif isinstance(task, CustomTaskPlan):
-                yield f"custom {task.name}", task.command
-            else:
-                for run in task.runs:
-                    yield f"eval {run.key}", run.command
+            yield from task_commands(task)

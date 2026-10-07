@@ -83,7 +83,9 @@ _AGENTX_ROLES = "the server roles and their chip counts"
 _AGENTX_FIXED = "the tool, fixed for a vLLM server"
 
 # Inputs of the InferenceX AgentX client that the tool sets per point; every
-# other client setting is the scenario's pass-through env.
+# other client setting is the scenario's pass-through env. The tool sets them
+# on the AgentX command alone, so only tasks.agentx.env reserves them: server,
+# role, perf, lm_eval and custom-task env may use the same names.
 AGENTX_CLIENT_ENV: Mapping[str, str] = MappingProxyType(
     {
         "AIPERF_RUNTIME_DIR": _AGENTX_IMAGE,
@@ -117,7 +119,7 @@ AGENTX_CLIENT_ENV: Mapping[str, str] = MappingProxyType(
         "IS_AGENTIC": _AGENTX_FIXED,
         "EVAL_ONLY": _AGENTX_FIXED,
         "KV_OFFLOADING": _AGENTX_FIXED,
-        "AIPERF_EXPERIMENTAL_FAST": _AGENTX_FIXED,
+        "AIPERF_EXPERIMENTAL_FAST": "tasks.agentx.fast",
         "AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS": _AGENTX_FIXED,
         "AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING": _AGENTX_FIXED,
         "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID": _AGENTX_FIXED,

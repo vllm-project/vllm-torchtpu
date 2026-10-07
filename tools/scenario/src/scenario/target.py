@@ -23,7 +23,15 @@ precedence would decide the value, so a clash is an error instead.
 from dataclasses import dataclass
 from typing import Literal, NamedTuple, Protocol, runtime_checkable
 
-from scenario.plan.types import Plan, RoleShape, Shape
+from scenario.plan.types import (
+    AgentxTaskPlan,
+    PerfTaskPlan,
+    Plan,
+    RoleShape,
+    Shape,
+    TaskPlan,
+    task_commands,
+)
 from scenario.reserved import (
     AGENTX_CLIENT_ENV,
     CHIPLESS_DRIVER_ENV,
@@ -31,6 +39,7 @@ from scenario.reserved import (
     RAY_ENV,
     TOOL_ENV,
     TOOL_ENV_PREFIXES,
+    tool_env_owner,
 )
 
 __all__ = [
@@ -67,7 +76,10 @@ class EnvNames(NamedTuple):
 
 
 # Every name the Plan may set somewhere: on server hosts, in the driver's
-# task env, or in a task command's env.
+# task env, or in one task command's env. A target's env reaches every process
+# of its pods, so a target may reserve none of these. A scenario may still use
+# the names the tool sets in one context only (the AgentX client's MODEL, say)
+# everywhere else.
 TOOL_OWNED_ENV = EnvNames(
     frozenset(
         {
@@ -118,14 +130,29 @@ class AfterTask:
     timeout_s: int = 600
 
 
+def _task_tool_env(task: TaskPlan) -> frozenset[str]:
+    """Names the tool sets in this task's commands, beyond the shared ones."""
+    if isinstance(task, AgentxTaskPlan):
+        return frozenset(AGENTX_CLIENT_ENV)
+    if isinstance(task, PerfTaskPlan) and task.client == "inferencex":
+        return frozenset(INFERENCEX_PERF_ENV)
+    return frozenset()
+
+
 def scenario_env_names(plan: Plan) -> frozenset[str]:
     """The env names the scenario sets in a Plan, on hosts and in tasks."""
     names: set[str] = set()
     for role in plan.roles:
         for host in role.host_plans:
             names.update(name for name, _ in host.scenario_env)
-    for _, command in plan.commands():
-        names.update(name for name, _ in command.env if not TOOL_OWNED_ENV.covers(name))
+    for task in plan.driver.tasks:
+        tool = _task_tool_env(task)
+        for _, command in task_commands(task):
+            names.update(
+                name
+                for name, _ in command.env
+                if name not in tool and tool_env_owner(name) is None
+            )
     return frozenset(names)
 
 

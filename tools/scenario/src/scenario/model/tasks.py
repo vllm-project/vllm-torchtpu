@@ -292,6 +292,11 @@ class AgentxLabels(Model):
     )
 
 
+# InferenceX's fast mode replaces DURATION with this window (infx/bench/agentic/
+# replay.py), so a fast run states it rather than a duration it would ignore.
+FAST_WINDOW_S = 1200
+
+
 def _one_concurrency(value: object) -> object:
     if isinstance(value, list):
         raise fail(
@@ -314,6 +319,12 @@ class AgentxTask(Model):
         description="Concurrent sessions; one value per server."
     )
     duration: Duration = Field(description="How long the replay runs.")
+    fast: bool = Field(
+        default=False,
+        description="InferenceX's bring-up mode (AIPERF_EXPERIMENTAL_FAST): a "
+        "fixed 20m window and one warmup per lane; duration must then be 20m. "
+        "Its numbers are bring-up evidence, not a canonical result.",
+    )
     timeout: Duration = Field(
         description="The task is killed and fails after this; longer than "
         "duration, to cover warmup and drain."

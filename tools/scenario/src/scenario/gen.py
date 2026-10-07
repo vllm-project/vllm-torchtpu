@@ -378,7 +378,9 @@ def reference() -> str:
     lines += [
         "## Reserved names",
         "",
-        "A scenario may not set these env names, since the tool sets them.",
+        "A scenario may not set these env names where the tool sets them. A",
+        "name reserved in one block only, such as the AgentX client's MODEL in",
+        "`tasks.agentx.env`, stays free in every other block.",
         "",
     ]
     lines += table(("Env", "Reserved in", "Set from"), _reserved_rows())
