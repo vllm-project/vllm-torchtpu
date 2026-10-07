@@ -400,6 +400,45 @@ def merge_halves(x: jax.Array) -> jax.Array:
     return _permute(x, jnp.argsort(piece_order(x.shape[-1])))
 
 
+def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
+    """Reorder the last axis into ``[pieces, *x.shape[:-1], d // pieces]``.
+
+    Placing ``pieces`` on the leading axis instead of the second-to-last axis
+    preserves ``(heads, 128)`` as the minor dimensions on TPU, avoiding 5D
+    sublane-padded ``(..., pieces=4, 128)`` reshapes (~5.95 ms/chunk).
+    """
+    import jax.numpy as jnp
+
+    dim = x.shape[-1]
+    order = piece_order(dim)
+    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, dim // pieces)
+    return jnp.einsum(
+        "...d,dpe->p...e",
+        x,
+        perm.astype(x.dtype),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ).astype(x.dtype)
+
+
+def merge_pieces(x: jax.Array) -> jax.Array:
+    """Inverse of `split_pieces`, contracting leading ``pieces`` into the last axis."""
+    import jax.numpy as jnp
+
+    pieces = x.shape[0]
+    piece_dim = x.shape[-1]
+    dim = pieces * piece_dim
+    order = piece_order(dim)
+    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, piece_dim)
+    return jnp.einsum(
+        "p...e,dpe->...d",
+        x,
+        perm.astype(x.dtype),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ).astype(x.dtype)
+
+
 def _valid_records(cache, records, record_words):
     import jax.numpy as jnp
 
@@ -481,6 +520,36 @@ def gather_cache_values(
     return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
 
 
+def gather_cache_page_values(
+    cache: jax.Array, first_records: jax.Array, page_records: int, elements: int
+) -> jax.Array:
+    """`gather_cache_values` (``split=True``) of whole pages.
+
+    Returns BF16 ``[pages * page_records, elements]`` for records
+    ``first + 0 .. first + page_records - 1`` of every ``first`` in
+    ``first_records``: one windowed gather of ``page_records`` contiguous
+    records per page instead of one gather per record. The caller guarantees
+    that each page's records are contiguous and that ``first`` starts a pool
+    word row; negative ``first`` reads arbitrary distinct rows (callers mask).
+    """
+    import jax.numpy as jnp
+
+    record_words = elements // 2
+    if ROW_WORDS % record_words or (page_records * record_words) % ROW_WORDS:
+        raise ValueError("Pages must cover whole pool word rows")
+    per_row = ROW_WORDS // record_words
+    rows = page_records * record_words // ROW_WORDS
+    first_records = first_records.reshape(-1)
+    spread = jnp.arange(first_records.size, dtype=first_records.dtype) * rows
+    spread %= max(1, cache.shape[0] - rows + 1)
+    starts = jnp.where(first_records >= 0, first_records // per_row, spread)
+    # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
+    # lowers to a windowed gather that measured ~25x slower on TPU7x.
+    indices = (starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]).reshape(-1)
+    words = cache[indices].reshape(first_records.size * page_records, record_words)
+    return jnp.concatenate(_split_words(words), axis=1)
+
+
 def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     """BF16 ``[n, 512]`` latents -> DSV4 FP8 NoPE rows and RoPE words.
 
@@ -540,6 +609,7 @@ def initialize_cache_ops():
     _write_op = pallas.jax_op(
         "pallas::dsv41v2_cache_write",
         _scatter_rows,
+        donate_argnums=(0,),
         mesh=get_vllm_model_wrapper_context().mesh,
         input_partition_specs=(P(), P(), P()),
     )
@@ -656,6 +726,27 @@ def merge_sub_rows(
     return rows, jnp.concatenate(pieces, axis=1)
 
 
+def _pack_bf16_words(values: jax.Array) -> jax.Array:
+    """Pack BF16 ``[n, 2 * width]`` into int32 ``[n, width]`` via `split_halves`.
+
+    A direct ``bitcast_convert_type(values.reshape(n, -1, 2), int32)`` lowers on
+    TPU to stride-2 lane slices ``[0:511:2]`` and ``[1:512:2]`` (~6.0 ms/chunk
+    across 21 SWA/compressor writes). Reordering via `split_halves` (MXU 0/1
+    matmul) places even and odd elements into contiguous 128-lane halves first.
+    """
+    import jax.numpy as jnp
+
+    half_width = min(values.shape[1] // 2, ROW_WORDS)
+    split = split_halves(values).reshape(values.shape[0], -1, 2, half_width)
+    even = jax.lax.bitcast_convert_type(
+        split[:, :, 0, :].astype(jnp.float32), jnp.int32
+    )
+    odd = jax.lax.bitcast_convert_type(split[:, :, 1, :].astype(jnp.float32), jnp.int32)
+    return (jax.lax.shift_right_logical(even, 16) | (odd & jnp.int32(-65536))).reshape(
+        values.shape[0], values.shape[1] // 2
+    )
+
+
 def scatter_cache_values(
     cache: jax.Array, records: jax.Array, values: jax.Array
 ) -> jax.Array:
@@ -674,11 +765,20 @@ def scatter_cache_values(
     words = (
         values
         if values.dtype == jnp.int32
-        else jax.lax.bitcast_convert_type(
-            values.reshape(values.shape[0], -1, 2)
-            if values.dtype == jnp.bfloat16
-            else values,
-            jnp.int32,
+        else (
+            _pack_bf16_words(values)
+            if (
+                values.dtype == jnp.bfloat16
+                and jax.default_backend() == "tpu"
+                and values.shape[1] >= 2 * ROW_WORDS
+                and values.shape[1] % (2 * ROW_WORDS) == 0
+            )
+            else jax.lax.bitcast_convert_type(
+                values.reshape(values.shape[0], -1, 2)
+                if values.dtype == jnp.bfloat16
+                else values,
+                jnp.int32,
+            )
         )
     )
     width = words.shape[1]

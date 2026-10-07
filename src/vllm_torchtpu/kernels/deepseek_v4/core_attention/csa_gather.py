@@ -217,7 +217,7 @@ def csa_gather(
       indices: (N,) int32. Token indices into the caches; N a multiple of
         top_k.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
-        gather, a multiple of top_k. A subcore skips every top_k period that
+        gather, a multiple of top_k. A subcore skips every chunk that
         starts at or past this count, leaving those output rows unwritten.
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
@@ -267,7 +267,15 @@ def csa_gather(
     # See `outer_pipeline` for details.
     num_streams = 4
     assert out_size % top_k == 0
-    num_row_subchunks = top_k // row_subchunk_size
+    max_subchunks = top_k // row_subchunk_size
+    target_subchunks = (out_size + num_cores * row_subchunk_size - 1) // (
+        num_cores * row_subchunk_size
+    )
+    num_row_subchunks = num_streams
+    while num_row_subchunks < max_subchunks and (
+        num_row_subchunks < target_subchunks or max_subchunks % num_row_subchunks != 0
+    ):
+        num_row_subchunks += num_streams
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size

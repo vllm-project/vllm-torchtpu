@@ -253,6 +253,170 @@ def delayed_pre_flat_jax(
     return post[..., None], comb, value, new_pre
 
 
+def _post_jax(
+    x: jax.Array,
+    flat: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+) -> jax.Array:
+    """XLA 2D stream recombine matching `_post_kernel` accumulation order."""
+    mult = comb_res_mix.shape[-1]
+    dim = flat.shape[-1] // mult
+    x_f32 = x.reshape(-1, dim).astype(flat.dtype).astype(jnp.float32)
+    post = post_layer_mix.reshape(-1, mult)
+    comb = comb_res_mix.reshape(-1, mult, mult)
+    streams = [
+        flat[:, i * dim : (i + 1) * dim].astype(jnp.float32) for i in range(mult)
+    ]
+    out_streams = []
+    for j in range(mult):
+        acc = post[:, j : j + 1] * x_f32
+        for i in range(mult):
+            acc = acc + comb[:, i, j : j + 1] * streams[i]
+        out_streams.append(acc.astype(flat.dtype))
+    return jnp.concatenate(out_streams, axis=1)
+
+
+def _flat_post_pre_sums(
+    sub_x, flat, post_layer_mix, comb_res_mix, weight, previous_pre, mixes, tile
+):
+    """One Pallas pass fusing `mhc_post_2d` with `_flat_pre_sums`."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+
+    def kernel(
+        sub_x_ref,
+        res_ref,
+        post_ref,
+        comb_ref,
+        w_ref,
+        pre_ref,
+        out_res_ref,
+        mix_ref,
+        square_ref,
+        value_ref,
+    ):
+        sub_x_f32 = sub_x_ref[...].astype(jnp.float32)
+        post = post_ref[...]
+        comb = comb_ref[...]
+        old_bf = [res_ref[:, i * dim : (i + 1) * dim] for i in range(mult)]
+        for j in range(mult):
+            acc = post[:, j : j + 1] * sub_x_f32
+            for i in range(mult):
+                k = i * mult + j
+                acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
+            out_res_ref[:, j * dim : (j + 1) * dim] = acc.astype(out_res_ref.dtype)
+        pre = pre_ref[...]
+        terms, sums = [], []
+        for m in range(mult):
+            x = out_res_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
+            terms.append(pre[:, m : m + 1] * x)
+            sums.append(jnp.sum(x * x, axis=1, keepdims=True))
+        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
+        square_ref[...] = functools.reduce(jnp.add, sums)
+        parts = jnp.dot(
+            out_res_ref[...], w_ref[...], preferred_element_type=jnp.float32
+        )
+        mix_ref[...] = (
+            parts[:, :mixes]
+            + parts[:, mixes : 2 * mixes]
+            + parts[:, 2 * mixes : 3 * mixes]
+        )
+
+    def row(i):
+        return i, 0
+
+    return pl.pallas_call(
+        kernel,
+        grid=(tokens // tile,),
+        in_specs=[
+            pl.BlockSpec((tile, dim), row),
+            pl.BlockSpec((tile, width), row),
+            pl.BlockSpec((tile, mult), row),
+            pl.BlockSpec((tile, mult * mult), row),
+            pl.BlockSpec(weight.shape, lambda i: (0, 0)),
+            pl.BlockSpec((tile, mult), row),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile, width), row),
+            pl.BlockSpec((tile, mixes), row),
+            pl.BlockSpec((tile, 1), row),
+            pl.BlockSpec((tile, dim), row),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((tokens, width), flat.dtype),
+            jax.ShapeDtypeStruct((tokens, mixes), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, dim), flat.dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=48 * 1024 * 1024
+        ),
+    )(sub_x, flat, post_layer_mix, comb_res_mix, weight, previous_pre)
+
+
+def delayed_post_pre_flat_jax(
+    x: jax.Array,
+    flat: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    previous_pre: jax.Array,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Fused `post` + `delayed_pre_flat_jax` seam for `shifted_post_pre`."""
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+    constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
+    mixes = mult * (mult + 2)
+    if tokens < 64 or tokens % 64 or 3 * mixes > 128:
+        flat_new = jax.lax.optimization_barrier(
+            _post_jax(
+                x,
+                flat,
+                post_layer_mix,
+                comb_res_mix,
+            )
+        )
+        post, comb, value, new_pre = delayed_pre_jax(
+            flat_new.reshape(tokens, mult, dim),
+            flat_new,
+            fn,
+            scale,
+            base,
+            previous_pre,
+            *constants,
+        )
+        return flat_new, post, comb, value, new_pre
+    tile = 64
+    weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
+    flat_new, mixes_out, square, value = _flat_post_pre_sums(
+        x.reshape(tokens, dim).astype(flat.dtype),
+        flat,
+        post_layer_mix.reshape(tokens, mult),
+        comb_res_mix.reshape(tokens, mult * mult),
+        weight,
+        previous_pre,
+        mixes,
+        tile,
+    )
+    new_pre, post, comb = _pre_gates(
+        mixes_out, square, mult, dim, scale, base, *constants
+    )
+    return flat_new, post[..., None], comb, value, new_pre
+
+
 def initialize_delayed_mhc():
     global _pre_op
     if _pre_op is not None:
@@ -313,8 +477,31 @@ def initialize_delayed_mhc():
 
     _pre_flat_op.register_fake(fake_flat)
 
+    global _post_pre_flat_op
+    _post_pre_flat_op = pallas.jax_op(
+        "pallas::deepseek_v41_delayed_mhc_post_pre_flat",
+        delayed_post_pre_flat_jax,
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(),) * 8 + (None,) * 5,
+    )
+
+    def fake_post_pre_flat(
+        x, flat, post_layer_mix, comb_res_mix, fn, scale, base, previous_pre, *args
+    ):
+        tokens, mult = previous_pre.shape
+        return (
+            torch.empty_like(flat),
+            scale.new_empty((tokens, mult, 1)),
+            scale.new_empty((tokens, mult, mult)),
+            flat.new_empty((tokens, flat.shape[1] // mult)),
+            scale.new_empty((tokens, mult)),
+        )
+
+    _post_pre_flat_op.register_fake(fake_post_pre_flat)
+
 
 _pre_flat_op = None
+_post_pre_flat_op = None
 
 
 def delayed_pre(residual, x, fn, scale, base, previous_pre, *constants):
@@ -324,6 +511,32 @@ def delayed_pre(residual, x, fn, scale, base, previous_pre, *constants):
             residual.flatten(1), fn, scale, base, previous_pre, *constants
         )
     return _pre_op(residual, x, fn, scale, base, previous_pre, *constants)
+
+
+def delayed_post_pre(
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    scale,
+    base,
+    previous_pre,
+    *constants,
+):
+    assert _post_pre_flat_op is not None
+    flat_new, post, comb, value, next_pre = _post_pre_flat_op(
+        x,
+        residual.flatten(1),
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        scale,
+        base,
+        previous_pre,
+        *constants,
+    )
+    return flat_new.view_as(residual), post, comb, value, next_pre
 
 
 _post_op = None
@@ -349,6 +562,17 @@ def collapse(x, pre_mix):
     return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
 
 
+def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # First layer uses residual[:, 0], not the newly computed gate.
+    # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP
+    # profile_run does not pass a SymIntArrayRef `[s0 // tp, 4]` to
+    # `aten.new_zeros` in fx_to_mlir.
+    first_stream = (torch.arange(residual.shape[1], device=residual.device) == 0).to(
+        dtype=dtype
+    )
+    return torch.zeros_like(residual[:, :, 0], dtype=dtype) + first_stream
+
+
 def pre(
     residual,
     fn,
@@ -366,16 +590,7 @@ def pre(
 ):
     if residual.device.type == "tpu":
         if pre_mix is None:
-            # First layer uses residual[:, 0], not the newly computed gate.
-            # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP
-            # profile_run does not pass a SymIntArrayRef `[s0 // tp, 4]` to
-            # `aten.new_zeros` in fx_to_mlir.
-            first_stream = (
-                torch.arange(residual.shape[1], device=residual.device) == 0
-            ).to(dtype=hc_scale.dtype)
-            pre_mix = (
-                torch.zeros_like(residual[:, :, 0], dtype=hc_scale.dtype) + first_stream
-            )
+            pre_mix = _default_pre_mix(residual, hc_scale.dtype)
         post, comb, value, next_pre = delayed_pre(
             residual,
             x,
@@ -433,6 +648,28 @@ def shifted_post_pre(
         raise ValueError("TPU mHC does not use CUDA streams")
     if reduce_results:
         x = tensor_model_parallel_all_reduce(x)
+    if residual.device.type == "tpu" and _post_pre_flat_op is not None:
+        if pre_mix is None:
+            pre_mix = _default_pre_mix(residual, hc_scale.dtype)
+        residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        if norm_weight is not None:
+            value = rms_norm(value, norm_weight, norm_eps)
+        aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+        return residual, post_mix, comb_mix, value, next_pre, aux
     residual = post(x, residual, post_layer_mix, comb_res_mix)
     aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
     return (

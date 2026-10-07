@@ -1,21 +1,26 @@
 """Paged attention, exact index selection and index-cache publication."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 import torch
 
 from .cache import (
+    ROW_WORDS,
+    gather_cache_page_values,
     gather_cache_pieces,
     gather_cache_values,
-    merge_halves,
+    merge_pieces,
     scatter_cache_values,
     split_halves,
+    split_pieces,
 )
 
 _attention_op = None
 _fp8_attention_op = None
+_fp8_attention_qo_op = None
 
 
 def _attention_state(q):
@@ -38,17 +43,15 @@ def _attend(q, pool, records, state, scale, tile=64):
     # Gather BF16 rows once outside; keep FP32 scratch tiled. Rows and q use
     # the split element order (no per-element unpack gather), as stacked
     # pieces contracted in one dot; attention is invariant to a shared
-    # permutation of the head dimension.
+    # permutation of the head dimension. Keep `pieces` on axis 0 (`pthd`) so
+    # `(heads, 128)` stays on the minor tiled axes without sublane padding.
     gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
     count = gathered.shape[0]
     gathered = gathered.reshape(count, tokens, records.shape[1], -1)
 
-    def pieces(x):
-        return split_halves(x).reshape(*x.shape[:-1], count, -1)
-
-    q = pieces(q).astype(jnp.float32)
+    q = split_pieces(q, count).astype(jnp.float32)
     maximum, denominator, numerator = state
-    state = maximum, denominator, pieces(numerator)
+    state = maximum, denominator, split_pieces(numerator, count)
 
     def step(index, carry):
         maximum, denominator, numerator = carry
@@ -61,7 +64,7 @@ def _attend(q, pool, records, state, scale, tile=64):
         )
         scores = (
             jnp.einsum(
-                "thpd,ptkd->thk",
+                "pthd,ptkd->thk",
                 q,
                 kv.astype(jnp.float32),
                 preferred_element_type=jnp.float32,
@@ -73,8 +76,8 @@ def _attend(q, pool, records, state, scale, tile=64):
         correction = jnp.exp(maximum - new_max)
         exponentials = jnp.exp(scores - new_max[..., None])
         denominator = denominator * correction + exponentials.sum(-1)
-        numerator = numerator * correction[..., None, None] + jnp.einsum(
-            "thk,ptkd->thpd",
+        numerator = numerator * correction[None, ..., None] + jnp.einsum(
+            "thk,ptkd->pthd",
             exponentials.astype(jnp.bfloat16),
             kv,
             preferred_element_type=jnp.float32,
@@ -84,7 +87,7 @@ def _attend(q, pool, records, state, scale, tile=64):
     maximum, denominator, numerator = jax.lax.fori_loop(
         0, records.shape[1] // tile, step, state
     )
-    return maximum, denominator, merge_halves(numerator.reshape(*q.shape[:2], dim))
+    return maximum, denominator, merge_pieces(numerator)
 
 
 def _window_union(records, tile):
@@ -126,7 +129,7 @@ def _window_union(records, tile):
         jnp.clip(columns, 0, union.shape[1] - 1),
         axis=2,
     )
-    # Verify instead of trusting contiguity: every own record must land on
+    # Verify instead of trusting contiguity: every own row must land on
     # the same physical row.
     covered = in_block & (mapped == rows).all(-1)
     c = jnp.arange(union.shape[1])[None, None, :]
@@ -160,7 +163,7 @@ def _attend_window(
     """
     tokens, heads, dim = q.shape
     width = records.shape[1]
-    if tokens % tile or tokens < 2 * tile or width % 64:
+    if tokens % tile or tokens < 2 * tile or width % 64 or width > 512:
         return _attend(q, pool, records, state, scale)
     union, mask, uncovered = _window_union(records, tile)
     count = union.shape[0]
@@ -174,7 +177,7 @@ def _attend_window(
         kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
 
         def split(x):
-            return split_halves(x).reshape(count, tile, heads, pieces, -1)
+            return split_pieces(x.reshape(count, tile, heads, dim), pieces)
 
         maximum, denominator, numerator = state
         shape = (count, tile, heads)
@@ -183,7 +186,7 @@ def _attend_window(
         numerator = split(numerator)
         scores = (
             jnp.einsum(
-                "nthpd,pnkd->nthk",
+                "pnthd,pnkd->nthk",
                 split(q).astype(jnp.float32),
                 kv.astype(jnp.float32),
                 preferred_element_type=jnp.float32,
@@ -195,8 +198,8 @@ def _attend_window(
         correction = jnp.exp(maximum - new_max)
         exponentials = jnp.exp(scores - new_max[..., None])
         denominator = denominator * correction + exponentials.sum(-1)
-        numerator = numerator * correction[..., None, None] + jnp.einsum(
-            "nthk,pnkd->nthpd",
+        numerator = numerator * correction[None, ..., None] + jnp.einsum(
+            "nthk,pnkd->pnthd",
             exponentials.astype(jnp.bfloat16),
             kv,
             preferred_element_type=jnp.float32,
@@ -204,7 +207,7 @@ def _attend_window(
         result = (
             new_max.reshape(tokens, heads),
             denominator.reshape(tokens, heads),
-            merge_halves(numerator.reshape(tokens, heads, dim)),
+            merge_pieces(numerator).reshape(tokens, heads, dim),
         )
 
         # Recompute uncovered tokens from their own records.
@@ -835,7 +838,7 @@ def slice_token_parallel_attention_inputs(
 
 
 def initialize_paged_attention():
-    global _attention_op, _fp8_attention_op
+    global _attention_op, _fp8_attention_op, _fp8_attention_qo_op
     if _attention_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -891,8 +894,8 @@ def initialize_paged_attention():
         use_token_parallel = (
             token_parallel
             and tp_size > 1
-            and tokens >= 128 * tp_size
-            and tokens % (128 * tp_size) == 0
+            and tokens >= 16 * tp_size
+            and tokens % (16 * tp_size) == 0
         )
         if use_token_parallel:
 
@@ -994,6 +997,265 @@ def initialize_paged_attention():
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
+    def fp8_attention_qo(
+        qr: jax.Array,
+        qr_local: jax.Array,
+        wq_b: jax.Array,
+        wq_b_scale: jax.Array,
+        wq_b_full: jax.Array,
+        wq_b_full_scale: jax.Array,
+        positions: jax.Array,
+        cos_sin_cache: jax.Array,
+        swa_pool: jax.Array,
+        main_pool: jax.Array,
+        rope_pool: jax.Array,
+        swa_records: jax.Array,
+        main_records: jax.Array,
+        pages: jax.Array,
+        query_start_loc: jax.Array,
+        sink: jax.Array,
+        full_sink: jax.Array,
+        tp_rank: jax.Array,
+        wo_a: jax.Array,
+        wo_a_scale: jax.Array,
+        wo_a_full: jax.Array,
+        wo_a_full_scale: jax.Array,
+        valid: jax.Array,
+        scale: float,
+        page_size: int,
+        max_requests: int | None,
+        precompacted: bool,
+        head_dim: int,
+    ) -> jax.Array:
+        """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
+
+        Returns this rank's ``wo_b`` input ``[T, o_lora_rank]``. With the
+        token-parallel shape condition of `fp8_attention`, each rank projects q
+        for its own SP token shard ``qr_local`` with the all-gathered
+        ``wq_b_full`` (no q ``all_to_all``) and applies ``wo_a`` for every
+        ``o_group`` on the shard, so the return ``all_to_all`` carries
+        ``[T/tp, groups, o_lora_rank]`` instead of ``[T/tp, heads, head_dim]``.
+        Otherwise it runs the head-sharded path with the
+        local ``wq_b``/``wo_a``. Per token, head and group both paths are the
+        same quantized matmul, RoPE, attention and ``wo_a`` math as the unfused
+        `_prepare_tpu` + ``_o_proj`` sequence.
+        """
+        from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+        from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
+            _o_proj_jax,
+            _rope_jax,
+        )
+
+        tokens = positions.shape[0]
+        tokens_local = qr_local.shape[0]
+        attn_kwargs = dict(
+            scale=scale,
+            page_size=page_size,
+            max_requests=max_requests,
+            precompacted=precompacted,
+        )
+        if (
+            tp_size > 1
+            and tokens >= 128 * tp_size
+            and tokens % (128 * tp_size) == 0
+            and tokens_local * tp_size == tokens
+        ):
+
+            def _local_body(
+                q_in,
+                wq,
+                wqs,
+                pos,
+                cs,
+                s_p,
+                m_p,
+                r_p,
+                s_r,
+                m_r,
+                pgs,
+                q_loc,
+                f_snk,
+                r_id,
+                w,
+                ws,
+                ok,
+            ):
+                s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
+                    s_r, m_r, q_loc, r_id, tp_size, tokens
+                )
+                start = r_id.reshape(()) * tokens_local
+                pos_tok = jax.lax.dynamic_slice_in_dim(pos, start, tokens_local, axis=0)
+                ok_tok = jax.lax.dynamic_slice_in_dim(ok, start, tokens_local, axis=0)
+                q_tok = _quantized_matmul_jax(q_in, wq, wqs)
+                q_tok = _rope_jax(
+                    q_tok.reshape(tokens_local, -1, head_dim), pos_tok, cs
+                )
+                out_tok = sparse_fp8_attention_jax(
+                    q_tok,
+                    s_p,
+                    m_p,
+                    r_p,
+                    s_r_tok,
+                    m_r_tok,
+                    pgs,
+                    q_loc_tok,
+                    f_snk,
+                    **attn_kwargs,
+                )
+                out_tok = jnp.where(
+                    ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
+                )
+                projected = _o_proj_jax(out_tok, pos_tok, cs, w, ws, head_dim=head_dim)
+                projected = projected.reshape(tokens_local, tp_size, -1)
+                gathered = jax.lax.all_to_all(
+                    projected, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
+                )
+                return gathered.reshape(tokens, -1)
+
+            return jax.shard_map(
+                _local_body,
+                mesh=tp_mesh,
+                in_specs=(P(),) * 17,
+                out_specs=out_spec,
+                check_vma=False,
+            )(
+                qr_local,
+                wq_b_full,
+                wq_b_full_scale,
+                positions,
+                cos_sin_cache,
+                swa_pool,
+                main_pool,
+                rope_pool,
+                swa_records,
+                main_records,
+                pages,
+                query_start_loc,
+                full_sink,
+                tp_rank,
+                wo_a_full,
+                wo_a_full_scale,
+                valid,
+            )
+
+        def _sharded_body(
+            q_in, wq, wqs, pos, cs, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, w, ws, ok
+        ):
+            if tp_size > 1 and q_in.shape[0] < tokens:
+                q_in = jax.lax.all_gather(q_in, axis_name="tp", axis=0, tiled=True)[
+                    :tokens
+                ]
+            q = _quantized_matmul_jax(q_in, wq, wqs)
+            q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
+            out = sparse_fp8_attention_jax(
+                q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **attn_kwargs
+            )
+            out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
+            return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
+
+        return jax.shard_map(
+            _sharded_body,
+            mesh=tp_mesh,
+            in_specs=(P(),) * 16,
+            out_specs=out_spec,
+            check_vma=False,
+        )(
+            qr,
+            wq_b,
+            wq_b_scale,
+            positions,
+            cos_sin_cache,
+            swa_pool,
+            main_pool,
+            rope_pool,
+            swa_records,
+            main_records,
+            pages,
+            query_start_loc,
+            sink,
+            wo_a,
+            wo_a_scale,
+            valid,
+        )
+
+    _fp8_attention_qo_op = pallas.jax_op(
+        "pallas::dsv41v2_sparse_fp8_attention_qo",
+        fp8_attention_qo,
+        mesh=tp_mesh,
+        input_partition_specs=(P(),) * 23 + (None,) * 5,
+    )
+    # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
+    _fp8_attention_qo_op.register_fake(
+        lambda qr, *args: qr.new_empty((args[5].shape[0], args[17].shape[-1]))
+    )
+
+
+def sparse_fp8_attention_qo(
+    qr,
+    qr_local,
+    wq_b,
+    wq_b_scale,
+    wq_b_full,
+    wq_b_full_scale,
+    positions,
+    cos_sin_cache,
+    swa,
+    main,
+    swa_records,
+    main_records,
+    sink,
+    full_sink,
+    tp_rank,
+    wo_a,
+    wo_a_scale,
+    wo_a_full,
+    wo_a_full_scale,
+    valid,
+    scale,
+    pages,
+    starts,
+    max_requests,
+    precompacted,
+    head_dim,
+):
+    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``."""
+    assert _fp8_attention_qo_op is not None and main.rope is not None
+    page_size = main.shape[1]
+    if pages is None:
+        page_size = main.raw.shape[0]
+        pages = main_records.new_zeros((1, 1))
+        starts = main_records.new_tensor([0, positions.shape[0]])
+    return _fp8_attention_qo_op(
+        qr,
+        qr_local,
+        wq_b,
+        wq_b_scale,
+        wq_b_full,
+        wq_b_full_scale,
+        positions,
+        cos_sin_cache,
+        swa.raw,
+        main.raw,
+        main.rope,
+        swa_records.int(),
+        main_records.int(),
+        pages.int(),
+        starts.int(),
+        sink,
+        full_sink,
+        tp_rank.reshape(1).int(),
+        wo_a,
+        wo_a_scale.reshape(-1),
+        wo_a_full,
+        wo_a_full_scale.reshape(-1),
+        valid.int(),
+        scale,
+        page_size,
+        max_requests,
+        precompacted,
+        head_dim,
+    )
+
 
 def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
     assert _attention_op is not None
@@ -1056,6 +1318,14 @@ def sparse_fp8_attention(
     )
 
 
+# Index-score tile: about `_INDEX_KEYS_PER_ITER` keys (all query rows) per
+# loop iteration, at most `_INDEX_MAX_TILE` columns (see paged_index_scores_jax).
+# 64K/8K vs 16K/2K: L24 candidate_filter 0.307 -> 0.254 ms at 3 rows, 100K
+# context; parts of >= 128 rows (prefill) keep the 512 floor.
+_INDEX_KEYS_PER_ITER = 65536
+_INDEX_MAX_TILE = 8192
+
+
 def paged_index_scores_jax(
     q: jax.Array,
     pool: jax.Array,
@@ -1063,22 +1333,31 @@ def paged_index_scores_jax(
     weights: jax.Array,
     lengths: jax.Array,
     requests: jax.Array | None = None,
+    page_records: int | None = None,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
     ``records`` is ``[tokens, width]``, or ``[requests, width]`` when
     ``requests`` maps each token to its row: every token of a request then
     shares one paged gather of the key tile instead of reading it again.
+    ``page_records``: records per cache page when logical rows ``k * page ..``
+    of every records row are one page's contiguous, pool-word-aligned records
+    (`_request_row_slots` layout); score tiles, shared or per-token, then
+    gather whole pages (see `gather_cache_page_values`).
     """
     tokens, dim = q.shape[0], q.shape[-1]
     if requests is not None and tokens <= records.shape[0]:
         # Decode: request rows are padded, so sharing gathers only adds reads.
         records, requests = jnp.take(records, requests, axis=0), None
     width = records.shape[1]
-    # Keep about 16K keys per iteration: small (decode) batches otherwise run
-    # many latency-bound tiny gathers. Prefill batches use 512: with 128 the
-    # loop is iteration-latency bound (2.3x slower at T=512 over 16.9K rows).
-    budget = min(max(512, min(2048, 16384 // max(tokens, 1))), -(-width // 128) * 128)
+    # Keep about `_INDEX_KEYS_PER_ITER` keys per iteration: small (decode)
+    # batches otherwise run many latency-bound tiny gathers. Prefill batches use
+    # 512: with 128 the loop is iteration-latency bound (2.3x slower at T=512
+    # over 16.9K rows).
+    budget = min(
+        max(512, min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(tokens, 1))),
+        -(-width // 128) * 128,
+    )
     tile = 1 << (budget.bit_length() - 1)
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
@@ -1089,6 +1368,12 @@ def paged_index_scores_jax(
         # Upstream quantized MQA logits and the weighted head reduction are
         # FP32. BF16 cache storage is not a request to round the dot product.
         return (jnp.maximum(logits, 0) * weights).sum(1)
+
+    pages = (
+        page_records is not None
+        and tile % page_records == 0
+        and (page_records * dim // 2) % ROW_WORDS == 0
+    )
 
     if requests is not None:
         # One request row at a time, each bounded by its own longest token:
@@ -1108,7 +1393,12 @@ def paged_index_scores_jax(
                 addresses = jax.lax.dynamic_slice(
                     records, (row, index * tile), (1, tile)
                 ).reshape(-1)
-                keys = gather_cache_values(pool, addresses, dim, split=True)
+                if pages:
+                    keys = gather_cache_page_values(
+                        pool, addresses[::page_records], page_records, dim
+                    )
+                else:
+                    keys = gather_cache_values(pool, addresses, dim, split=True)
                 values = head_sum(
                     jnp.einsum(
                         "thd,cd->thc",
@@ -1136,9 +1426,14 @@ def paged_index_scores_jax(
         # the loop materializes [tokens, max_context / ratio, dim] even when
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
-        keys = gather_cache_values(
-            pool, addresses.reshape(-1), dim, split=True
-        ).reshape(records.shape[0], tile, dim)
+        if pages:
+            # Tiles start on page boundaries: one gather per page.
+            keys = gather_cache_page_values(
+                pool, addresses[:, ::page_records], page_records, dim
+            )
+        else:
+            keys = gather_cache_values(pool, addresses.reshape(-1), dim, split=True)
+        keys = keys.reshape(records.shape[0], tile, dim)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         return jax.lax.dynamic_update_slice_in_dim(
             result, head_sum(logits), index * tile, axis=1
@@ -1252,8 +1547,11 @@ def _visible_top_k(
     top-k set in any order, ``-1`` padded instead of ``-inf`` columns; large
     selections then run on SparseCore over the full width, bounded by
     ``lengths`` instead of buckets (no SparseCore op inside `lax.switch`).
+    Decode query parts (fewer than 16 rows) also run on SparseCore, unpadded:
+    XLA ``top_k`` over 100K columns was 0.53 ms slower at L20 for 3 rows, and
+    padding to a 16-row tile ran 2 subcore waves instead of 1.
     """
-    rows, width = scores.shape
+    width = scores.shape[1]
     if (
         unordered
         and lengths is not None
@@ -1261,11 +1559,7 @@ def _visible_top_k(
         and width % 16 == 0
         and k % 16 == 0
     ):
-        # SparseCore top-k selects 16-row tiles; padding rows select nothing.
-        padding = -rows % 16
-        scores = jnp.pad(scores, ((0, padding), (0, 0)), constant_values=-jnp.inf)
-        lengths = jnp.pad(jnp.minimum(lengths, width), (0, padding))
-        return _sparsecore_top_k(scores, k, lengths)[:rows]
+        return _sparsecore_top_k(scores, k, jnp.minimum(lengths, width))
 
     def select(columns, scores):
         scores = scores[:, :columns]
@@ -1384,14 +1678,19 @@ def paged_indexer_jax(
     candidate_filter: bool,
     unordered: bool = False,
     batch_max: jax.Array | None = None,
+    page_records: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
-    ``batch_max``: see `select_indices_jax`.
+    ``batch_max``: see `select_indices_jax`. ``page_records``: see
+    `paged_index_scores_jax`; candidate scoring gathers runs of
+    ``gcd(block_size, page_records)`` records (a block lies in one page).
     """
 
     def full_context(_):
-        scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+        scores = paged_index_scores_jax(
+            q, pool, records, weights, lengths, requests, page_records
+        )
         scores = jnp.where(jnp.take(records >= 0, requests, axis=0), scores, -jnp.inf)
         return select_indices_jax(
             scores,
@@ -1411,7 +1710,6 @@ def paged_indexer_jax(
 
     def candidate_context(_):
         # Candidates differ per token, so this path reads per-token records.
-        token_records = jnp.take(records, requests, axis=0)
         # Sort before expanding so equal-score ties retain the full-context
         # top_k's logical ordering. Duplicate and invalid blocks cannot select
         # the same key twice or read outside this request's causal history.
@@ -1429,16 +1727,36 @@ def paged_indexer_jax(
         )
         valid = logical < jnp.minimum(lengths[:, None], width)
         valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
-        compact = jnp.take_along_axis(
-            token_records, jnp.minimum(logical, width - 1), axis=1
-        )
+        # Gather only the candidate columns: per-token copies of whole
+        # records rows ([tokens, width]) cost more than the candidates.
+        compact = records[requests[:, None], jnp.minimum(logical, width - 1)]
         compact = jnp.where(valid, compact, -1)
         # This bounds both key reads and QK work by the candidate pool size;
         # zero-length padding rows do not trigger key reads.
         compact_lengths = jnp.where(lengths > 0, compact.shape[1], 0)
-        scores = paged_index_scores_jax(q, pool, compact, weights, compact_lengths)
+        # Candidate blocks are aligned runs of a page's contiguous records.
+        segment = math.gcd(block_size, page_records) if page_records else None
+        scores = paged_index_scores_jax(
+            q, pool, compact, weights, compact_lengths, page_records=segment
+        )
         scores = jnp.where(compact >= 0, scores, -jnp.inf)
         output_width = min(topk, width)
+        if (
+            unordered
+            and scores.shape[1] >= 2048
+            and scores.shape[1] % 16 == 0
+            and output_width % 16 == 0
+        ):
+            # Same finite top-k set as `jax.lax.top_k` below (SparseCore never
+            # selects -inf); `_compact_selected` sorts, so order is irrelevant.
+            picked = _sparsecore_top_k(scores, output_width, compact_lengths)
+            selected = jnp.take_along_axis(logical, jnp.maximum(picked, 0), axis=1)
+            return (
+                _compact_selected(
+                    jnp.where(picked >= 0, selected, -1).astype(jnp.int32)
+                ),
+                candidates,
+            )
         padding = max(0, output_width - scores.shape[1])
         scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=-jnp.inf)
         logical = jnp.pad(logical, ((0, 0), (0, padding)), constant_values=width)
@@ -1522,7 +1840,9 @@ def update_and_select_jax(
     candidate_write: bool,
     candidate_filter: bool,
     unordered: bool,
+    page_records: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
     updated = write_index_keys(pool, write_records, keys)
     selected, published = paged_indexer_jax(
         q,
@@ -1538,6 +1858,7 @@ def update_and_select_jax(
         candidate_filter,
         unordered,
         batch_max,
+        page_records or None,
     )
     return updated, selected, published
 
@@ -1558,7 +1879,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 10 + (None,) * 5,
+        input_partition_specs=(P(),) * 10 + (None,) * 6,
     )
 
     def fake(
@@ -1577,6 +1898,7 @@ def initialize_indexer():
         candidate_write,
         candidate_filter,
         unordered,
+        page_records=0,
     ):
         return (
             torch.empty_like(pool),
@@ -1606,11 +1928,13 @@ def paged_indexer(
     candidate_filter,
     unordered=False,
     batch_max=None,
+    page_records=None,
 ):
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
     ``batch_max`` (default ``lengths.max()``) is the longest length of the
-    whole batch when the queries are only part of it.
+    whole batch when the queries are only part of it. ``page_records``: see
+    `paged_index_scores_jax`.
     """
     assert _indexer_op is not None
     if batch_max is None:
@@ -1631,4 +1955,5 @@ def paged_indexer(
         candidate_write,
         candidate_filter,
         unordered,
+        page_records or 0,
     )
