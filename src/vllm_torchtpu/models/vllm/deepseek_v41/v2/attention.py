@@ -304,12 +304,6 @@ def _gather_query_rows(rows):
     return rows[:, :width].contiguous() if padding else rows
 
 
-def _gather_strided_rows(rows, ranks):
-    """`_gather_query_rows` when rank r holds query rows r, r + ranks, ..."""
-    rows = _gather_query_rows(rows)
-    return rows.unflatten(0, (ranks, -1)).transpose(0, 1).flatten(0, 1)
-
-
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
     safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
@@ -858,22 +852,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Scoring and selection are independent per query, but every TP rank
         # holds the whole batch: split the queries over ranks and gather the
         # selections. Every rank still writes all index keys (replicated cache).
-        # Rank r takes queries r, r + ranks, ..., so a decode batch spreads its
-        # real queries over every rank instead of filling rank 0 first. Each
-        # rank gets a multiple of 8 rows: with 3 rows per rank, decode output
-        # was corrupted once a rank held two real queries (cause unknown).
-        # The row count is arithmetic on the token count rather than a branch,
-        # which would freeze the traced bucket's choice
-        # (compilation/shape_variants.py). Padding rows have zero length and
-        # select nothing. Always pad at least one row: a zero-size pad guards
-        # on the count (torch.cat skips empty inputs).
+        # Each rank takes a contiguous block of 8-row multiples rather than at
+        # least 16 rows: per-rank cost follows its row count, and a decode
+        # batch no longer lands entirely on rank 0. (With 3 rows per rank,
+        # decode output was corrupted once a rank held two real queries;
+        # cause unknown, so keep multiples of 8.) The row count is
+        # arithmetic on the token count rather than a branch, which would
+        # freeze the traced bucket's choice (compilation/shape_variants.py).
+        # Padding rows have zero length and select nothing. Always pad at
+        # least one row: a zero-size pad guards on the count (torch.cat skips
+        # empty inputs).
         ranks = get_tensor_model_parallel_world_size()
         split = ranks > 1
         queries = (qr, positions, weights, active_lengths, candidates, requests)
         if split:
             part = (count // ranks // 8 + 1) * 8
             padding = part * ranks - count
-            mine = self._tp_rank + ranks * torch.arange(
+            mine = self._tp_rank * part + torch.arange(
                 part, dtype=torch.int32, device=qr.device
             )
             fills = (0, 0, 0, 0, -1, 0)
@@ -911,9 +906,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             batch_max=active_lengths.max(),
         )
         if split:
-            selected = _gather_strided_rows(selected, ranks)[:count]
+            selected = _gather_query_rows(selected)[:count]
             if candidate_write:
-                published = _gather_strided_rows(published, ranks)[:count]
+                published = _gather_query_rows(published)[:count]
         index_cache.raw.copy_(updated_cache)
         if candidate_write:
             self.candidate_block_buffer.copy_(
