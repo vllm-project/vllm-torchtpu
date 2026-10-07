@@ -231,3 +231,14 @@ def agentx() -> dict[str, Any]:
             "baselines": {"c1": {"agentx": {"output_tput_per_gpu": 15.1}}},
         },
     }
+
+
+@pytest.fixture
+def variants(
+    single: dict[str, Any], pd: dict[str, Any], agentx: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Every plan_fixtures variant, built from fresh copies of the fixtures."""
+    from plan_fixtures import VARIANTS
+
+    base = {"single": single, "pd": pd, "agentx": agentx}
+    return {name: make(base) for name, make in VARIANTS.items()}

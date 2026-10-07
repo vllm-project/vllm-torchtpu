@@ -42,3 +42,5 @@ testpaths = ["tests"]
 # importlib mode: test module names may repeat across the directories one
 # presubmit session collects.
 addopts = ["--import-mode=importlib"]
+# Shared test helpers (plan_fixtures.py) import by name.
+pythonpath = ["tests"]
