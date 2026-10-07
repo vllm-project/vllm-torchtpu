@@ -7,9 +7,12 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
+
 from .cache import (
     ROW_WORDS,
     gather_cache_page_values,
+    gather_cache_page_words,
     gather_cache_pieces,
     gather_cache_values,
     merge_pieces,
@@ -894,10 +897,13 @@ def initialize_paged_attention():
         use_token_parallel = (
             token_parallel
             and tp_size > 1
-            and tokens >= 16 * tp_size
-            and tokens % (16 * tp_size) == 0
+            and tokens >= 6 * tp_size
+            and tokens % tp_size == 0
         )
         if use_token_parallel:
+            tokens_local = tokens // tp_size
+            padded_local = -(-tokens_local // 8) * 8
+            pad_rows = padded_local - tokens_local
 
             def _token_parallel_body(
                 q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id
@@ -908,6 +914,14 @@ def initialize_paged_attention():
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
                 )
+                if pad_rows:
+                    q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
+                    s_r_tok = jnp.pad(
+                        s_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
+                    )
+                    m_r_tok = jnp.pad(
+                        m_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
+                    )
                 out_tok = sparse_fp8_attention_jax(
                     q_tok,
                     s_p,
@@ -925,6 +939,8 @@ def initialize_paged_attention():
                     union_gather=union_gather,
                     union_cap=union_cap,
                 )
+                if pad_rows:
+                    out_tok = out_tok[:-pad_rows]
                 return jax.lax.all_to_all(
                     out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
                 )
@@ -1322,8 +1338,12 @@ def sparse_fp8_attention(
 # loop iteration, at most `_INDEX_MAX_TILE` columns (see paged_index_scores_jax).
 # 64K/8K vs 16K/2K: L24 candidate_filter 0.307 -> 0.254 ms at 3 rows, 100K
 # context; parts of >= 128 rows (prefill) keep the 512 floor.
-_INDEX_KEYS_PER_ITER = 65536
-_INDEX_MAX_TILE = 8192
+# 16K vs 8K max tile at 2..8 rows (decode B <= 64 at TP=8, 128K / 16K):
+# 106K keys 0.268 -> 0.227 ms, 16K keys 0.062 -> 0.052 ms at 2 rows, and
+# 128K keeps tile=16K at part=6,8 (B=48,64: candidate_filter -13.0% / -10.2%);
+# 32K+ is slower.
+_INDEX_KEYS_PER_ITER = 262144
+_INDEX_MAX_TILE = 16384
 
 
 def paged_index_scores_jax(
@@ -1346,9 +1366,6 @@ def paged_index_scores_jax(
     gather whole pages (see `gather_cache_page_values`).
     """
     tokens, dim = q.shape[0], q.shape[-1]
-    if requests is not None and tokens <= records.shape[0]:
-        # Decode: request rows are padded, so sharing gathers only adds reads.
-        records, requests = jnp.take(records, requests, axis=0), None
     width = records.shape[1]
     # Keep about `_INDEX_KEYS_PER_ITER` keys per iteration: small (decode)
     # batches otherwise run many latency-bound tiny gathers. Prefill batches use
@@ -1359,8 +1376,8 @@ def paged_index_scores_jax(
         -(-width // 128) * 128,
     )
     tile = 1 << (budget.bit_length() - 1)
-    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
-    scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
+    padded_width = width + (-width % tile)
+    scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
     weights = weights.astype(jnp.float32)[:, :, None]
 
@@ -1375,11 +1392,12 @@ def paged_index_scores_jax(
         and (page_records * dim // 2) % ROW_WORDS == 0
     )
 
-    if requests is not None:
+    if requests is not None and tokens > records.shape[0]:
         # One request row at a time, each bounded by its own longest token:
         # all tokens score the row's shared key tile, and only that row's
         # tokens keep the result. Rows without tokens (padding) run no tiles,
         # so work scales with active requests, not the padded row count.
+        records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
         row_lengths = (
             jnp.zeros((records.shape[0],), jnp.int32)
             .at[requests]
@@ -1415,11 +1433,64 @@ def paged_index_scores_jax(
                 )
 
             trips = jnp.minimum(
-                (row_lengths[row] + tile - 1) // tile, records.shape[1] // tile
+                (row_lengths[row] + tile - 1) // tile, padded_width // tile
             )
             return jax.lax.fori_loop(0, trips, step, result)
 
         return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
+
+    trips = jnp.minimum(
+        (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, padded_width // tile
+    )
+    if pages and dim == index_word_scores.DIM and q.dtype == jnp.bfloat16:
+        # Score the gathered word rows in place: splitting them into
+        # BF16 keys and relaying out [rows, 2, 64] -> [keys, 128] cost three
+        # HBM passes per tile (8.7 of 17.5 us per 8K-key tile at 2 rows).
+        # The kernel emits record order: a packed [tokens, slots, rows]
+        # result cost 68 us per call to interleave in XLA.
+        assert page_records is not None  # implied by `pages`
+        page = page_records
+        rows = tile // index_word_scores.SLOTS
+
+        def _run_word_loop(rec):
+            rec = jnp.pad(rec, ((0, 0), (0, -width % tile)), constant_values=-1)
+            n_rows = rec.shape[0]
+
+            def word_step(index, result):
+                addresses = jax.lax.dynamic_slice_in_dim(
+                    rec, index * tile, tile, axis=1
+                )
+                words = gather_cache_page_words(pool, addresses[:, ::page], page, dim)
+                values = _score_word_rows(
+                    q, weights, words.reshape(n_rows, rows, ROW_WORDS)
+                )
+                return jax.lax.dynamic_update_slice_in_dim(
+                    result, values, index * tile, axis=1
+                )
+
+            return jax.lax.fori_loop(0, trips, word_step, scores)[:, :width]
+
+        if requests is not None and tokens >= 6 and tokens % 6 == 0:
+            group_tokens = 6
+            groups = tokens // group_tokens
+            can_group = jnp.all(
+                requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
+            )
+            return jax.lax.cond(
+                can_group,
+                lambda _: _run_word_loop(
+                    jnp.take(records, requests[::group_tokens], axis=0)
+                ),
+                lambda _: _run_word_loop(jnp.take(records, requests, axis=0)),
+                None,
+            )
+        if requests is not None:
+            records = jnp.take(records, requests, axis=0)
+        return _run_word_loop(records)
+
+    if requests is not None:
+        records = jnp.take(records, requests, axis=0)
+    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
     def step(index, result):
         # Read only the tile consumed by this iteration. Gathering before
@@ -1427,6 +1498,7 @@ def paged_index_scores_jax(
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
         if pages:
+            assert page_records is not None
             # Tiles start on page boundaries: one gather per page.
             keys = gather_cache_page_values(
                 pool, addresses[:, ::page_records], page_records, dim
@@ -1439,17 +1511,31 @@ def paged_index_scores_jax(
             result, head_sum(logits), index * tile, axis=1
         )
 
-    return jax.lax.fori_loop(
-        0,
-        jnp.minimum(
-            (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, records.shape[1] // tile
-        ),
-        step,
-        scores,
-    )[:, :width]
+    return jax.lax.fori_loop(0, trips, step, scores)[:, :width]
 
 
 _indexer_op = None
+
+
+def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
+    """`index_word_scores.score_word_rows` on every device (replicated)."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    score = functools.partial(
+        index_word_scores.score_word_rows, interpret=jax.default_backend() != "tpu"
+    )
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except Exception:  # Standalone (tests): one device, no mesh.
+        return score(q, weights, words)
+    # Mosaic calls need manual partitioning; every device scores locally.
+    return jax.shard_map(
+        score, mesh=mesh, in_specs=(P(), P(), P()), out_specs=P(), check_vma=False
+    )(q, weights, words)
 
 
 def _prefix_count(mask: jax.Array, block: int = 128) -> jax.Array:
@@ -1796,17 +1882,22 @@ def paged_indexer_jax(
 
     # Preserve the reference's batch-wide short-context bypass, and use the
     # shared-key-tile full_context path whenever the active requests' total
-    # key reads are at most the per-token candidate key reads (e.g. prefill,
-    # where all tokens of a request share one key tile in full_context).
+    # key reads are at most the per-token candidate key reads in prefill
+    # (q.shape[0] > records.shape[0], where all tokens of a request share one
+    # key tile in full_context).
     longest = lengths.max() if batch_max is None else batch_max.max()
-    row_lengths = (
-        jnp.zeros((records.shape[0],), jnp.int32)
-        .at[requests]
-        .max(jnp.maximum(lengths, 0))
-    )
-    cand_keys = jnp.sum(lengths > 0) * (candidates.shape[1] * block_size)
+    if q.shape[0] > records.shape[0]:
+        row_lengths = (
+            jnp.zeros((records.shape[0],), jnp.int32)
+            .at[requests]
+            .max(jnp.maximum(lengths, 0))
+        )
+        cand_keys = jnp.sum(lengths > 0) * (candidates.shape[1] * block_size)
+        use_full_context = (longest <= topk) | (row_lengths.sum() <= cand_keys)
+    else:
+        use_full_context = longest <= topk
     return jax.lax.cond(
-        (longest <= topk) | (row_lengths.sum() <= cand_keys),
+        use_full_context,
         full_context,
         candidate_context,
         None,

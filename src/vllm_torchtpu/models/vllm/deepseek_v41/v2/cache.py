@@ -520,17 +520,13 @@ def gather_cache_values(
     return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
 
 
-def gather_cache_page_values(
+def gather_cache_page_words(
     cache: jax.Array, first_records: jax.Array, page_records: int, elements: int
 ) -> jax.Array:
-    """`gather_cache_values` (``split=True``) of whole pages.
+    """Raw int32 word rows ``[pages * rows, ROW_WORDS]`` of whole pages.
 
-    Returns BF16 ``[pages * page_records, elements]`` for records
-    ``first + 0 .. first + page_records - 1`` of every ``first`` in
-    ``first_records``: one windowed gather of ``page_records`` contiguous
-    records per page instead of one gather per record. The caller guarantees
-    that each page's records are contiguous and that ``first`` starts a pool
-    word row; negative ``first`` reads arbitrary distinct rows (callers mask).
+    Each row holds ``ROW_WORDS // (elements // 2)`` consecutive records of
+    its page, in the split element order; see `gather_cache_page_values`.
     """
     import jax.numpy as jnp
 
@@ -546,7 +542,25 @@ def gather_cache_page_values(
     # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
     # lowers to a windowed gather that measured ~25x slower on TPU7x.
     indices = (starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]).reshape(-1)
-    words = cache[indices].reshape(first_records.size * page_records, record_words)
+    return cache[indices]
+
+
+def gather_cache_page_values(
+    cache: jax.Array, first_records: jax.Array, page_records: int, elements: int
+) -> jax.Array:
+    """`gather_cache_values` (``split=True``) of whole pages.
+
+    Returns BF16 ``[pages * page_records, elements]`` for records
+    ``first + 0 .. first + page_records - 1`` of every ``first`` in
+    ``first_records``: one windowed gather of ``page_records`` contiguous
+    records per page instead of one gather per record. The caller guarantees
+    that each page's records are contiguous and that ``first`` starts a pool
+    word row; negative ``first`` reads arbitrary distinct rows (callers mask).
+    """
+    import jax.numpy as jnp
+
+    words = gather_cache_page_words(cache, first_records, page_records, elements)
+    words = words.reshape(first_records.size * page_records, elements // 2)
     return jnp.concatenate(_split_words(words), axis=1)
 
 
