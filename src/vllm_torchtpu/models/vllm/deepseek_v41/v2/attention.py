@@ -13,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -221,10 +222,10 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
             slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
             query_start_loc = state_metadata.query_start_loc
             requests = _token_requests(state_metadata, positions)
-        latent = torch.empty(
-            (kv_score.shape[0], self.head_dim),
-            dtype=torch.bfloat16,
-            device=kv_score.device,
+        latent = (
+            torch.zeros_like(positions[:, None], dtype=torch.bfloat16)
+            .expand(-1, self.head_dim)
+            .contiguous()
         )
         save_compress_norm(
             kv_score,
@@ -359,6 +360,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     use_fp8_ds_mla_layout = False
     _ced_decoder = False
     _ced_global_from_encoder = False
+    _sp_sharded_input = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -398,6 +400,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "_tp_rank_1d",
+            self._tp_rank.reshape(1),
+            persistent=False,
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        self.register_buffer(
+            "_full_attn_sink",
+            self.attn_sink.detach().float().repeat(tp_size).contiguous(),
+            persistent=False,
+        )
         self._config = vllm_config.model_config.hf_config.to_dict()
         self._max_model_len = vllm_config.model_config.max_model_len
         # Branch-free SWA patch (`_attend_window`) only while its static
@@ -405,6 +418,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # (tpu7x-2): max_num_seqs 1 +4.6%, 4 +1.6%, 8 -4.3% prefill.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
+        self._precompact_records = self._fp8_kv
+        self._token_parallel_attn = self._fp8_kv
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
@@ -413,6 +428,69 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if spec is None or not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
+
+    # Mirrors upstream vllm/models/deepseek_v41/attention.py:561-596
+    # (DeepseekV41Attention.forward) with SP-sharded input projection support
+    # and SymInt-safe o_padded allocation.
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del llama_4_scaling
+        num_tokens = positions.shape[0]
+        # Allocate o_padded from positions via zeros_like + expand so TorchTPU's
+        # lowering does not call torch.empty on a compound SymInt expression.
+        o_padded = (
+            torch.zeros_like(
+                positions[:, None, None],
+                dtype=hidden_states.dtype,
+            )
+            .expand(-1, self.padded_heads, self.head_dim)
+            .contiguous()
+        )
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
+        )
+        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        if self._sp_sharded_input:
+            if indexer_weights is not None:
+                assert qr.dtype == kv.dtype == indexer_weights.dtype
+                packed = sp_all_gather(torch.cat((qr, kv, indexer_weights), dim=-1))[
+                    :num_tokens
+                ]
+                qr, kv, indexer_weights = (
+                    t.contiguous()
+                    for t in packed.split(
+                        (self.q_lora_rank, self.head_dim, self.indexer.n_head),
+                        dim=-1,
+                    )
+                )
+            else:
+                assert qr.dtype == kv.dtype
+                packed = sp_all_gather(torch.cat((qr, kv), dim=-1))[:num_tokens]
+                qr, kv = (
+                    t.contiguous()
+                    for t in packed.split(
+                        (self.q_lora_rank, self.head_dim),
+                        dim=-1,
+                    )
+                )
+            if kv_score is not None:
+                kv_score = sp_all_gather(kv_score)[:num_tokens]
+        self._prepare_and_attn_fn(
+            hidden_states,
+            qr,
+            kv,
+            qr_scale,
+            kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+        return self._o_proj(o, positions)
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
@@ -439,6 +517,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # another quantizer. Power-of-two FP8 scales remain with Q/K, so weights
         # must NOT fold the Q scale a second time.
         return round_fp8_activation(values, self.indexer.head_dim)
+
+    def _project_index_q(self, qr, positions):
+        index_q = _value(self.indexer.wq_b(qr)).reshape(
+            -1, self.indexer.n_head, self.indexer.head_dim
+        )
+        return self._quantize_indexer(self._rotate(index_q, positions))
 
     def _split_qkv_and_norm(self, qr_kv):
         return (
@@ -507,14 +591,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         _insert(index_cache, index_slots, keys, valid)
         return None
 
-    def write_encoder_global_kv(self, hidden_states, positions):
+    def write_encoder_global_kv(
+        self, hidden_states, positions, *, sp_sharded: bool = False
+    ):
         """Publish decoder global KV for all encoder tokens before replay."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.kv_cache.numel():
             return
-        self._write_global_kv(
-            self.compressor.project(hidden_states), positions, defer_index_write=False
-        )
+        kv_score = self.compressor.project(hidden_states)
+        if sp_sharded:
+            kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
+        self._write_global_kv(kv_score, positions, defer_index_write=False)
 
     def _prepare_tpu(
         self,
@@ -528,8 +615,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         output,
     ):
         metadata = get_forward_context().attn_metadata
-        output.zero_()
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
+            output.zero_()
             return
         swa = metadata[self.swa_cache_layer.prefix]
         swa_cache = self.swa_cache_layer.kv_cache
@@ -544,15 +631,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         kv = self._rotate(kv, positions)
         _insert(self.swa_cache_layer.kv_cache, swa_slots, kv, swa_slots >= 0)
-        index_q = weights = None
+        weights = None
         pending_index_write = None
         if self.compressor is not None and not self._ced_global_from_encoder:
             pending_index_write = self._write_global_kv(kv_score, positions)
         if self.indexer is not None and not self._all_indices_fit:
-            index_q = _value(self.indexer.wq_b(qr)).reshape(
-                -1, self.indexer.n_head, self.indexer.head_dim
-            )
-            index_q = self._quantize_indexer(self._rotate(index_q, positions))
             weights = (
                 index_weights.float()
                 * self.indexer.head_dim**-0.5
@@ -583,17 +666,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             source = self._static_forward_context[self.compressed_cache_prefix]
             source_meta = metadata[self.compressed_cache_prefix]
             capacity = max(1, self._max_model_len // self.compress_ratio)
-            logical_compressed = torch.arange(capacity, device=positions.device)
-            logical_compressed = logical_compressed[None, :].expand(count, -1)
             lengths = ((positions + 1) // self.compress_ratio)[:, None]
             if self.indexer is not None:
                 if self._all_indices_fit:
+                    logical_compressed = torch.arange(
+                        capacity, device=positions.device
+                    )[None, :].expand(count, -1)
                     selected = logical_compressed.masked_fill(
-                        logical_compressed >= lengths, -1
+                        (logical_compressed >= lengths) | (swa_slots[:, None] < 0), -1
                     ).int()
                 else:
                     indexer = self.indexer
-                    index_q = cast(torch.Tensor, index_q)
                     weights = cast(torch.Tensor, weights)
                     keys_meta = metadata[indexer.k_cache.prefix]
                     index_cache = indexer.k_cache.kv_cache
@@ -607,7 +690,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             )
                         )
                         selected = self._select_paged_indices(
-                            index_q,
+                            qr,
+                            positions,
                             index_cache,
                             index_records,
                             requests,
@@ -617,6 +701,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             pending_index_write,
                         )
                     else:
+                        index_q = self._project_index_q(qr, positions)
+                        logical_compressed = torch.arange(
+                            capacity, device=positions.device
+                        )[None, :].expand(count, -1)
                         keys = _read_rows(
                             index_cache,
                             _block_table(keys_meta),
@@ -696,6 +784,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     pages,
                     starts,
                     self._swa_max_requests,
+                    precompacted=self._precompact_records,
+                    token_parallel=self._token_parallel_attn,
+                    full_sink=self._full_attn_sink,
+                    tp_rank=self._tp_rank_1d,
                 )
             else:
                 result = paged_attention(
@@ -725,7 +817,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
     def _select_paged_indices(
         self,
-        index_q,
+        qr,
+        positions,
         index_cache,
         records,
         requests,
@@ -736,7 +829,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     ):
         """Publish explicit index-cache and logical-selection outputs."""
         indexer = self.indexer
-        count = index_q.shape[0]
+        count = qr.shape[0]
         has_candidates = indexer.indexer_op.candidate_blocks is not None
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
@@ -753,7 +846,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if pending_index_write is not None
             else (
                 swa_slots.new_empty((0,), dtype=torch.int32),
-                index_q.new_empty((0, index_q.shape[-1])),
+                qr.new_empty((0, indexer.head_dim)),
             )
         )
         # Scoring and selection are independent per query, but every TP rank
@@ -766,22 +859,30 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # zero-size pad guards on the count (torch.cat skips empty inputs).
         ranks = get_tensor_model_parallel_world_size()
         split = ranks > 1
-        queries = (index_q, weights, active_lengths, candidates, requests)
+        queries = (qr, positions, weights, active_lengths, candidates, requests)
         if split:
             rows = 16 * ranks
             padding = (count // rows + 1) * rows - count
             part = (count + padding) // ranks
             mine = self._tp_rank * part + torch.arange(
-                part, dtype=torch.int32, device=index_q.device
+                part, dtype=torch.int32, device=qr.device
             )
-            fills = (0, 0, 0, -1, 0)
+            fills = (0, 0, 0, 0, -1, 0)
             queries = tuple(
                 torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
                     0, mine
                 )
                 for x, fill in zip(queries, fills)
             )
-        q_part, weights_part, lengths_part, candidates_part, requests_part = queries
+        (
+            qr_part,
+            positions_part,
+            weights_part,
+            lengths_part,
+            candidates_part,
+            requests_part,
+        ) = queries
+        q_part = self._project_index_q(qr_part, positions_part)
         updated_cache, selected, published = paged_indexer(
             q_part,
             index_cache,
@@ -903,6 +1004,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
         VllmDeepseekV4MLAAttention.process_weights_after_loading(self, act_dtype)
         self._assert_o_proj_supported()
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            self._full_attn_sink.copy_(
+                tensor_model_parallel_all_gather(
+                    self.attn_sink.detach().float().contiguous(), dim=0
+                )
+            )
+        else:
+            self._full_attn_sink.copy_(self.attn_sink.detach().float())
         # Register before TorchDynamo captures the first model forward.
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op

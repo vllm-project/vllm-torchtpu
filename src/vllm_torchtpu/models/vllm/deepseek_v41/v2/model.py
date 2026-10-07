@@ -14,6 +14,7 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
     collapse,
@@ -29,26 +30,84 @@ from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import plan_decoder_replay
 from .engram import Engram, NgramHashState
+from .host_engram import HOST_ENGRAM_KEY, install_host_engram_inputs
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
 
 
+def _ced_config(
+    vllm_config, *, warn_prefix_caching: bool = False, fallback_config=None
+) -> tuple[bool, int]:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    enable_prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
+    ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
+    if ced_enabled and enable_prefix_caching:
+        if warn_prefix_caching:
+            logger.warning(
+                "CED bounded replay requires prefix caching disabled; "
+                "using full forward to retain cached SWA state semantics"
+            )
+        ced_enabled = False
+    hf_config = getattr(
+        getattr(vllm_config, "model_config", None), "hf_config", fallback_config
+    )
+    assert hf_config is not None
+    ced_boundary = hf_config.num_hidden_layers // 2
+    return ced_enabled, ced_boundary
+
+
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
+    def __init__(self, vllm_config, prefix: str = "", **kwargs) -> None:
+        layer_idx = upstream.extract_layer_index(prefix)
+        ced_enabled, ced_boundary = _ced_config(vllm_config)
+        if ced_enabled and layer_idx >= ced_boundary:
+            with device_hooks(upstream, _use_sequence_parallel=lambda _: False):
+                super().__init__(vllm_config, prefix=prefix, **kwargs)
+        else:
+            super().__init__(vllm_config, prefix=prefix, **kwargs)
+        if hasattr(self, "attn"):
+            self.attn._sp_sharded_input = bool(
+                getattr(self, "use_sequence_parallel", False)
+            )
+
     forward = bind_device_ops(
         upstream.DeepseekV4DecoderLayer.forward,
         mhc_pre_delayed_tilelang=pre,
         mhc_post_tilelang=post,
         mhc_shifted_post_pre=shifted_post_pre,
+        sp_all_gather=lambda x: x,
+    )
+
+
+_upstream_use_sequence_parallel = upstream._use_sequence_parallel
+
+
+def _use_sequence_parallel(vllm_config) -> bool:
+    """Upstream gate, plus an opt-in TP+EP sequence-parallel path at DP1."""
+    if _upstream_use_sequence_parallel(vllm_config):
+        return True
+    parallel = vllm_config.parallel_config
+    return bool(
+        envs.TPU_DEEPSEEK_V41_SP
+        and parallel.pipeline_parallel_size == 1
+        and parallel.enable_expert_parallel
+        and parallel.tensor_parallel_size > 1
     )
 
 
 class _StageBase(torch.nn.Module):
-    def __init__(self, *, owner, vllm_config, prefix=""):
+    def __init__(self, *, owner, vllm_config, prefix="", compile_tag=None):
         super().__init__()
         # Parameters retain their upstream model.layers checkpoint paths. A
         # registered parent reference would create a module-ownership cycle.
         object.__setattr__(self, "owner", owner)
+        if compile_tag is not None:
+            # The TPU compile-prefix patch keys the first trace's cache_dir off
+            # self.prefix; a bucket-warmup retrace re-inits with
+            # _compile_prefix. Both must name the same directory, or the
+            # retrace cannot hand over buckets the first trace compiled.
+            self.prefix = compile_tag
 
 
 @support_torch_compile(
@@ -116,6 +175,132 @@ class DeepseekV41DecoderStage(_StageBase):
 
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
+    def _has_cpu_offloaded_engram(self) -> bool:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None and getattr(
+                engram.embed_tokens, "cpu_offload", False
+            ):
+                return True
+        return False
+
+    def _host_hash_inputs(self, input_ids, swa_metadata, lookback_token_ids):
+        """CPU ``hash_on_host`` arguments for this step, or None.
+
+        Applies only to Host-DRAM Engram tables outside compilation, when the
+        runner published host copies (``host_engram.py``) and every scheduled
+        token is a prompt token. Slices follow the device tensors' static
+        shapes, so the host hashes cover exactly the device rows.
+        """
+        if (
+            lookback_token_ids is None
+            or torch.compiler.is_compiling()
+            or not self._has_cpu_offloaded_engram()
+        ):
+            return None
+        host = upstream.get_forward_context().additional_kwargs.get(HOST_ENGRAM_KEY)
+        if host is None or not host.all_prompt:
+            return None
+        ids = host.input_ids[: input_ids.shape[0]]
+        lookback = host.lookback_token_ids[: lookback_token_ids.shape[0]]
+        return (
+            ids,
+            host.positions[: input_ids.shape[0]],
+            host.query_start_loc[: swa_metadata.query_start_loc.shape[0]],
+            upstream.image_sentinel_mask(ids),
+            lookback,
+            upstream.image_sentinel_mask(lookback),
+        )
+
+    def _prepare_engram(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        lookback_token_ids: torch.Tensor | None,
+        *,
+        stage: str = "full",
+        skip_lookup: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        engram_hashes: torch.Tensor | None = None
+        engram_mask: torch.Tensor | None = None
+        if (
+            stage != "decoder"
+            and self.engram_hash is not None
+            and input_ids is not None
+            and upstream.is_forward_context_available()
+        ):
+            attn_metadata = upstream.get_forward_context().attn_metadata
+            if isinstance(attn_metadata, list):
+                attn_metadata = attn_metadata[upstream.dbo_current_ubatch_id()]
+            if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
+                assert self.engram_swa_prefix is not None
+                swa_metadata = attn_metadata[self.engram_swa_prefix]
+                # Image-span tokens are dead: they break n-grams (hash op
+                # takes True=dead) and their gate is zeroed (Engram.forward
+                # takes True=keep).
+                image_mask = upstream.image_sentinel_mask(input_ids)
+                engram_mask = ~image_mask
+                if skip_lookup:
+                    # `Engram.embed` only reads `hash_ids.shape[0]` (`self._ready_rows(
+                    # hash_ids.shape[0])`) after `prepare_embeddings` has populated
+                    # `staged_rows` outside the compiled stage.
+                    num_layers = int(self.engram_hash.multipliers.shape[0])
+                    engram_hashes = input_ids[:, None, None].expand(-1, num_layers, 1)
+                    assert engram_hashes.shape[0] == input_ids.shape[0]
+                    return engram_hashes, engram_mask
+                if lookback_token_ids is None:
+                    if not self.engram_hash.use_slot_cache:
+                        raise NotImplementedError(
+                            "engram needs `lookback_token_ids` from the model "
+                            "runner (the DBO/ubatch wrapper drops model kwargs)"
+                        )
+                    num_reqs = swa_metadata.seq_lens.shape[0]
+                    lookback_token_ids = input_ids.new_full(
+                        (num_reqs, self.engram_hash.lookback_depth), -1
+                    )
+                host = self._host_hash_inputs(
+                    input_ids, swa_metadata, lookback_token_ids
+                )
+                if host is not None:
+                    engram_hashes = self.engram_hash.hash_on_host(*host)
+                else:
+                    engram_hashes = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        image_mask,
+                        lookback_token_ids,
+                        upstream.image_sentinel_mask(lookback_token_ids),
+                        _cache_slots(
+                            self.engram_hash.swa_cache_module.kv_cache,
+                            swa_metadata,
+                            positions,
+                        ),
+                        _block_table(swa_metadata),
+                    )
+            elif not self.engram_dp_shared_memory and upstream.get_engram_dp_size() > 1:
+                # DP-sharded lookups are collective, so a replica skipping the
+                # hash still has to reach them.
+                engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            if engram_hashes is not None and not skip_lookup:
+                # Gather all Engram rows before entering the decoder layers.
+                # One gather feeds every layer sharing the DP-split table.
+                gathered_hashes = upstream.gather_engram_hashes(
+                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+                )
+                if (
+                    self._has_cpu_offloaded_engram()
+                    and gathered_hashes.device.type != "cpu"
+                ):
+                    gathered_hashes = gathered_hashes.to("cpu")
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    engram = getattr(layer, "engram", None)
+                    if engram is not None:
+                        engram.prepare_embeddings(
+                            gathered_hashes[:, engram.layer_hash_index]
+                        )
+        return engram_hashes, engram_mask
+
     def forward(
         self,
         input_ids,
@@ -124,31 +309,53 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
-        if not self._ced_enabled:
-            return self.full_stage(
+        offload_engram = self._has_cpu_offloaded_engram()
+        if offload_engram:
+            input_ids_prep = (
+                input_ids.to(torch.int64)
+                if self.use_mega_moe and input_ids is not None
+                else input_ids
+            )
+            self._prepare_engram(
+                input_ids_prep,
+                positions,
+                lookback_token_ids,
+                stage="encoder" if self._ced_enabled else "full",
+            )
+            self._engram_prepared_outside_stage = True
+        try:
+            if not self._ced_enabled:
+                return self.full_stage(
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    lookback_token_ids,
+                )
+            context = upstream.get_forward_context()
+            metadata = context.attn_metadata
+            first = (
+                next(iter(metadata.values())) if isinstance(metadata, dict) else None
+            )
+            plan = (
+                plan_decoder_replay(
+                    first,
+                    self._ced_window,
+                    positions.shape[0],
+                    self._ced_compile_sizes,
+                )
+                if first is not None
+                else None
+            )
+            encoded = self.encoder_stage(
                 input_ids,
                 positions,
                 intermediate_tensors,
                 inputs_embeds,
                 lookback_token_ids,
             )
-        context = upstream.get_forward_context()
-        metadata = context.attn_metadata
-        first = next(iter(metadata.values())) if isinstance(metadata, dict) else None
-        plan = (
-            plan_decoder_replay(
-                first, self._ced_window, positions.shape[0], self._ced_compile_sizes
-            )
-            if first is not None
-            else None
-        )
-        encoded = self.encoder_stage(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            lookback_token_ids,
-        )
+        finally:
+            self._engram_prepared_outside_stage = False
         # Match the runner's convention for compiled backends that wrap the
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
@@ -156,8 +363,18 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         hidden, pre_mix = encoded
         if plan is not None and not plan.indices:
             # The scheduler ignores logits for incomplete prefills. The
-            # encoder has still published every global KV row for this chunk.
+            # encoder has still published every global KV row for this chunk;
+            # skip the inter-stage SP all-gather when no decoder replay runs.
             return hidden.new_zeros((positions.shape[0], self.config.hidden_size))
+        if self._stage_uses_sequence_parallel("encoder"):
+            # Outside the compiled stages: the replay plan indexes full rows.
+            hidden = upstream.sp_all_gather(hidden)[: positions.shape[0]]
+            pre_mix = upstream.sp_all_gather(pre_mix)[: positions.shape[0]]
+            if hidden.device.type == "tpu":
+                # Materialize the eager inter-stage SP all-gather before
+                # slicing and launching the compiled decoder stage so
+                # DEFER_AND_FUSE does not fuse both stages across the boundary.
+                synchronize_tensors((hidden, pre_mix))
 
         if plan is None:
             decoder_metadata = metadata
@@ -224,6 +441,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         result = output.new_zeros((positions.shape[0] + 1, output.shape[-1]))
         return result.index_copy_(0, indices, output)[:-1]
 
+    def _stage_uses_sequence_parallel(self, stage: str) -> bool:
+        # Under CED=1, encoder_stage (L0..L19) runs SP while decoder_stage
+        # (L20..L39) runs TP on the bounded replay / decode rows.
+        return bool(self.use_sequence_parallel and stage != "decoder")
+
     # Keep the upstream forward order; adapt its Engram metadata access here,
     # alongside attention/compressor adapters, so the runner stays model-neutral.
     def _forward_stage(
@@ -239,6 +461,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     ) -> torch.Tensor | upstream.IntermediateTensors:
         start_layer = self._ced_boundary if stage == "decoder" else self.start_layer
         end_layer = self._ced_boundary if stage == "encoder" else self.end_layer
+        stage_sp = self._stage_uses_sequence_parallel(stage)
         if stage == "decoder":
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
@@ -253,76 +476,33 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
-        # Engram n-gram hashes for the whole (flattened) batch, computed once
-        # on the full token stream — before any sequence-parallel sharding —
-        # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
-        engram_hashes: torch.Tensor | None = None
-        engram_mask: torch.Tensor | None = None
-        if (
-            stage != "decoder"
-            and self.engram_hash is not None
-            and input_ids is not None
-            and upstream.is_forward_context_available()
-        ):
-            attn_metadata = upstream.get_forward_context().attn_metadata
-            if isinstance(attn_metadata, list):
-                attn_metadata = attn_metadata[upstream.dbo_current_ubatch_id()]
-            if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
-                assert self.engram_swa_prefix is not None
-                swa_metadata = attn_metadata[self.engram_swa_prefix]
-                # Image-span tokens are dead: they break n-grams (hash op
-                # takes True=dead) and their gate is zeroed (Engram.forward
-                # takes True=keep).
-                image_mask = upstream.image_sentinel_mask(input_ids)
-                engram_mask = ~image_mask
-                if lookback_token_ids is None:
-                    if not self.engram_hash.use_slot_cache:
-                        raise NotImplementedError(
-                            "engram needs `lookback_token_ids` from the model "
-                            "runner (the DBO/ubatch wrapper drops model kwargs)"
-                        )
-                    num_reqs = swa_metadata.seq_lens.shape[0]
-                    lookback_token_ids = input_ids.new_full(
-                        (num_reqs, self.engram_hash.lookback_depth), -1
-                    )
-                engram_hashes = self.engram_hash(
-                    input_ids,
-                    positions,
-                    swa_metadata.query_start_loc,
-                    image_mask,
-                    lookback_token_ids,
-                    upstream.image_sentinel_mask(lookback_token_ids),
-                    _cache_slots(
-                        self.engram_hash.swa_cache_module.kv_cache,
-                        swa_metadata,
-                        positions,
-                    ),
-                    _block_table(swa_metadata),
-                )
-            elif not self.engram_dp_shared_memory and upstream.get_engram_dp_size() > 1:
-                # DP-sharded lookups are collective, so a replica skipping the
-                # hash still has to reach them.
-                engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
-            if engram_hashes is not None:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                gathered_hashes = upstream.gather_engram_hashes(
-                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
-                )
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+        skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
+            torch.compiler.is_compiling() and self._has_cpu_offloaded_engram()
+        )
+        engram_hashes, engram_mask = self._prepare_engram(
+            input_ids,
+            positions,
+            lookback_token_ids,
+            stage=stage,
+            skip_lookup=skip_lookup,
+        )
 
         full_num_tokens = positions.shape[0]
-        if self.use_sequence_parallel:
+        if stage_sp:
+            # sp_padding_mask slices by the SP chunk under a size-oblivious
+            # guard, which lets Dynamo assume chunk >= 2 and then refuse the
+            # smallest token bucket at warmup. Guard chunk == 1 explicitly so
+            # every bucket specializes consistently.
+            tp_size = upstream.get_tensor_model_parallel_world_size()
+            sp_chunk = -(-hidden_states.shape[0] // tp_size)
+            _ = bool(sp_chunk == 1)
             if (
                 upstream.envs.VLLM_MOE_SKIP_PADDING
                 and upstream.is_forward_context_available()
+                and upstream.get_forward_context().is_padding is not None
             ):
+                # A None mask means "no padding"; materializing one in-graph
+                # (new_zeros of a symbolic size) fails torch_tpu lowering.
                 forward_context = upstream.get_forward_context()
                 forward_context.is_padding = upstream.sp_padding_mask(
                     forward_context.is_padding, hidden_states
@@ -332,6 +512,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
         residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = encoder_pre_mix
+        if stage_sp and pre_mix is not None:
+            # CED decoder replay: encoder rows arrive unsharded.
+            pre_mix = upstream.sp_shard(pre_mix)
         if not upstream.get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
@@ -356,7 +539,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
             if previous_aux is not None:
                 # idx is the one-based id of the layer whose post this is.
-                if self.use_sequence_parallel:
+                if stage_sp:
                     previous_aux = upstream.sp_all_gather(previous_aux)[
                         :full_num_tokens
                     ]
@@ -366,7 +549,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             hidden_states = post(hidden_states, residual, post_mix, res_mix)
             if self.end_layer in self.aux_hidden_state_layers:
                 final_aux = hidden_states.mean(dim=1)
-                if self.use_sequence_parallel:
+                if stage_sp:
                     final_aux = upstream.sp_all_gather(final_aux)[:full_num_tokens]
                 aux_hidden_by_layer[self.end_layer] = final_aux
 
@@ -376,7 +559,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder = self.layers[self._ced_boundary]
             assert pre_mix is not None
             normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
-            decoder.attn.write_encoder_global_kv(normalized, positions)
+            decoder.attn.write_encoder_global_kv(
+                normalized, positions, sp_sharded=stage_sp
+            )
             return hidden_states, pre_mix
 
         aux_hidden_states = [
@@ -393,7 +578,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
         if self._mtp_hidden_buffer is not None:
-            if self.use_sequence_parallel:
+            if stage_sp:
                 hidden_states = upstream.sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = upstream.sp_all_gather(pre_mix)[:full_num_tokens]
             num_tokens = hidden_states.shape[0]
@@ -405,7 +590,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         assert pre_mix is not None
         hidden_states = collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
-        if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
+        if stage_sp and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = upstream.sp_all_gather(hidden_states)[:full_num_tokens]
         if len(aux_hidden_states) > 0:
@@ -434,22 +619,32 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 NgramHashState=NgramHashState,
                 DeepseekV4DecoderLayer=DeepseekV41DecoderLayer,
                 DeepseekV4MoE=DeepseekV41MoE,
+                _use_sequence_parallel=_use_sequence_parallel,
             ),
             device_hooks(torch.cuda, Stream=lambda: None),
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if self.use_sequence_parallel:
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            sizes = vllm_config.compilation_config.compile_sizes or []
+            too_small = sorted(int(s) for s in sizes if 0 < int(s) < 2 * tp_size)
+            if too_small:
+                # With real weights a 1-token-per-rank bucket halts the TPU
+                # core at warmup ([USER] fatal error); >= 2 tokens per rank
+                # serves correctly. Root cause not yet isolated.
+                raise ValueError(
+                    "TPU_DEEPSEEK_V41_SP needs every token bucket >= 2 * TP "
+                    f"({2 * tp_size}); got {too_small}. Set "
+                    "--compilation-config '{\"compile_sizes\": [...]}' accordingly."
+                )
+            logger.info("DeepSeek V4.1 sequence parallel enabled (TP-sharded tokens)")
         compact_rope_caches(
             (layer.attn for layer in self.layers),
             vllm_config.model_config.max_model_len,
         )
-        self._ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
-        if self._ced_enabled and vllm_config.cache_config.enable_prefix_caching:
-            logger.warning(
-                "CED bounded replay requires prefix caching disabled; "
-                "using full forward to retain cached SWA state semantics"
-            )
-            self._ced_enabled = False
-        self._ced_boundary = self.config.num_hidden_layers // 2
+        self._ced_enabled, self._ced_boundary = _ced_config(
+            vllm_config, warn_prefix_caching=True, fallback_config=self.config
+        )
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n
@@ -458,10 +653,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
         if self._ced_enabled:
             if (
-                self.use_sequence_parallel
-                or getattr(
-                    vllm_config.parallel_config, "prefill_context_parallel_size", 1
-                )
+                getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
                 != 1
             ):
                 raise NotImplementedError(
@@ -490,6 +682,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     owner=self,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.encoder_stage",
+                    compile_tag="v41_encoder",
                 )
             self.encoder_stage._compile_prefix = "v41_encoder"
             with set_model_tag("v41_decoder"):
@@ -497,6 +690,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     owner=self,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.decoder_stage",
+                    compile_tag="v41_decoder",
                 )
             self.decoder_stage._compile_prefix = "v41_decoder"
             logger.info(
@@ -538,6 +732,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             from .async_fence import install_lookback_fence
 
             install_lookback_fence()
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+            # Host-DRAM Engram tables: hash on the host from the runner's host
+            # inputs instead of copying device hashes back every step.
+            install_host_engram_inputs()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.

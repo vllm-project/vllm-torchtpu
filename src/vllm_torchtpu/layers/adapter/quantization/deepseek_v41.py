@@ -1,5 +1,6 @@
 """V4.1 model bindings for the shared DeepSeek V4 TPU quantization path."""
 
+from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
@@ -39,3 +40,17 @@ class DeepseekV41MoE(DeepseekV4MoE):
             FusedMoEFactory=v4_factory,
         ):
             super().__init__(vllm_config, *args, **kwargs)
+
+    def forward(self, hidden_states, input_ids=None):
+        if (
+            self.use_sequence_parallel
+            and input_ids is not None
+            and self.gate.tid2eid is not None
+            and self.experts.do_naive_dispatch_combine
+        ):
+            # Hash routing indexes its table by token id, so the ids must line
+            # up row-for-row with the hidden states the experts see. Under SP
+            # the runner gathers those over the EP group (TpuDeviceCommunicator)
+            # but passes input_ids through as this rank's shard.
+            input_ids = get_ep_group().all_gather(input_ids, dim=0)
+        return super().forward(hidden_states, input_ids)

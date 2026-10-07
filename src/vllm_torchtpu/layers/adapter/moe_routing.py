@@ -133,6 +133,44 @@ def maybe_simulate_routing(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
+def _gather_partitioned_topk(
+    group,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-gather rank-local ``(topk_weights, topk_ids)`` across ``group``.
+
+    When ``topk_weights`` is 16-bit (``bfloat16`` / ``float16``), ``topk`` is
+    even, and ``topk_ids`` is ``int32``, both tensors are bit-packed into a
+    single ``int32[T_local, topk // 2 + topk]`` tensor before ``all_gather``
+    so only one collective runs (42.7x smaller than gathering ``f32[T, 384]``
+    router logits for DeepSeek-V4.1-Flash).
+    """
+    if (
+        topk_weights.dtype in (torch.bfloat16, torch.float16)
+        and topk % 2 == 0
+        and topk_ids.dtype == torch.int32
+    ):
+        half_k = topk // 2
+        packed = torch.cat(
+            [
+                topk_weights.contiguous().view(torch.int32),
+                topk_ids.contiguous(),
+            ],
+            dim=-1,
+        )
+        gathered = group.all_gather(packed, dim=0)
+        return (
+            gathered[:, :half_k].contiguous().view(topk_weights.dtype),
+            gathered[:, half_k:].contiguous(),
+        )
+    return (
+        group.all_gather(topk_weights.contiguous(), dim=0),
+        group.all_gather(topk_ids.contiguous(), dim=0),
+    )
+
+
 def route(
     layer,
     hidden_states: torch.Tensor,
@@ -161,6 +199,28 @@ def route(
             topk=topk,
             renormalize=layer.renormalize,
         )
+    if router_logits.shape[0] < hidden_states.shape[0]:
+        from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+        is_sp = bool(
+            getattr(getattr(layer, "moe_config", None), "is_sequence_parallel", False)
+        )
+        group = get_ep_group() if is_sp else get_dp_group()
+        local_t = router_logits.shape[0]
+        local_input_ids = input_ids
+        if input_ids is not None and input_ids.numel() == hidden_states.shape[0]:
+            rank = group.rank_in_group
+            local_input_ids = input_ids.flatten()[rank * local_t : (rank + 1) * local_t]
+        local_weights, local_ids = select_experts(
+            hidden_states=hidden_states[:local_t],
+            router_logits=router_logits,
+            topk=topk,
+            renormalize=layer.renormalize,
+            scoring_fn=layer.scoring_func,
+            layer=layer,
+            input_ids=local_input_ids,
+        )
+        return _gather_partitioned_topk(group, local_weights, local_ids, topk)
     return select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,

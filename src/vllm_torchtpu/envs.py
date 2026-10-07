@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_SP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -354,6 +355,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # Opt in to upstream V4.1 sequence parallelism (token-sharded mHC, norms,
+    # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.
+    # Upstream enables it only with DP>1 or MegaMoE.
+    "TPU_DEEPSEEK_V41_SP": env_bool("TPU_DEEPSEEK_V41_SP"),
     # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
@@ -361,7 +366,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
     # total) to Host DRAM so TPU HBM remains available for KV cache and decode.
-    # Opt-in (default False) so default behavior preserves device-resident tables.
+    # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),

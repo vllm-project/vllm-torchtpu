@@ -367,8 +367,15 @@ def pre(
     if residual.device.type == "tpu":
         if pre_mix is None:
             # First layer uses residual[:, 0], not the newly computed gate.
-            pre_mix = residual.new_zeros(residual.shape[:2], dtype=hc_scale.dtype)
-            pre_mix[:, 0] = 1
+            # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP
+            # profile_run does not pass a SymIntArrayRef `[s0 // tp, 4]` to
+            # `aten.new_zeros` in fx_to_mlir.
+            first_stream = (
+                torch.arange(residual.shape[1], device=residual.device) == 0
+            ).to(dtype=hc_scale.dtype)
+            pre_mix = (
+                torch.zeros_like(residual[:, :, 0], dtype=hc_scale.dtype) + first_stream
+            )
         post, comb, value, next_pre = delayed_pre(
             residual,
             x,

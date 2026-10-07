@@ -15,6 +15,7 @@
 
 from collections.abc import Callable
 
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -22,6 +23,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
@@ -131,6 +133,22 @@ class VllmMoERunner(MoERunner):
             # An armed fused method also reports supports_internal_mk, so
             # upstream's generic DP/EP dispatch is a no-op. The only work
             # being bypassed here is its explicit PCP all-gather pair.
+            return hidden_states, router_logits
+        if (
+            self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size <= 1
+            and self.routed_experts.quant_method.is_monolithic
+            and self.routed_experts.custom_routing_function is None
+            and moe_routing._SIMULATION_STRATEGY is None
+            and router_logits is not hidden_states
+        ):
+            group = (
+                get_ep_group()
+                if self.moe_config.is_sequence_parallel
+                else get_dp_group()
+            )
+            if group.world_size > 1:
+                hidden_states = group.all_gather(hidden_states, dim=0)
             return hidden_states, router_logits
         return super()._maybe_dispatch(hidden_states, router_logits)
 
