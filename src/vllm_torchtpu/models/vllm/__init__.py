@@ -7,6 +7,9 @@ _K3_DSPARK_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:K3DSparkForCausalLM"
 _DSV4_DSPARK_MODEL = (
     "vllm_torchtpu.models.vllm.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM"
 )
+_DSV41_DSPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.deepseek_v41.v2.dspark:DSparkDeepseekV41ForCausalLM"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -29,4 +32,5 @@ def register_models() -> None:
     )
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
+    ModelRegistry.register_model("DSparkV41DraftModel", _DSV41_DSPARK_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

@@ -25,12 +25,21 @@ from ..common.mhc import (
     pre,
     shifted_post_pre,
 )
-from .attention import DeepseekV41Attention, _block_table, _cache_slots
+from .attention import (
+    DeepseekV41Attention,
+    _block_table,
+    _cache_slots,
+    stage_attention_cache_scope,
+)
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import plan_decoder_replay
 from .engram import Engram, NgramHashState
-from .host_engram import HOST_ENGRAM_KEY, install_host_engram_inputs
+from .host_engram import (
+    HOST_ENGRAM_KEY,
+    gather_host_engram_hashes,
+    install_host_engram_inputs,
+)
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
@@ -55,6 +64,26 @@ def _ced_config(
     assert hf_config is not None
     ced_boundary = hf_config.num_hidden_layers // 2
     return ced_enabled, ced_boundary
+
+
+def _scatter_decoder_rows(
+    tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
+) -> torch.Tensor:
+    result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
+    return result.index_copy_(0, indices, tensor)[:-1]
+
+
+def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
+    # Unroll the small static HC stream axis (hc_mult=4) instead of emitting a
+    # second HLO reduce over dim=1 alongside collapse(hidden_states, pre_mix).
+    # XLA MultiOutputFusion otherwise fuses the bf16 mean reduce and f32
+    # collapse reduce into a mixed-type tuple reduce fusion that aborts in
+    # libtpu FusionEmitter::ComputeWindowConfigInternal at N=2048.
+    streams = hidden_states.float().unbind(dim=1)
+    acc = streams[0]
+    for s in streams[1:]:
+        acc = acc + s
+    return (acc * (1.0 / len(streams))).to(hidden_states.dtype)
 
 
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
@@ -188,9 +217,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         """CPU ``hash_on_host`` arguments for this step, or None.
 
         Applies only to Host-DRAM Engram tables outside compilation, when the
-        runner published host copies (``host_engram.py``) and every scheduled
-        token is a prompt token. Slices follow the device tensors' static
-        shapes, so the host hashes cover exactly the device rows.
+        runner published host-ready copies (``host_engram.py``). Slices follow
+        the device tensors' static shapes, so the host hashes cover exactly the
+        device rows.
         """
         if (
             lookback_token_ids is None
@@ -199,7 +228,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         ):
             return None
         host = upstream.get_forward_context().additional_kwargs.get(HOST_ENGRAM_KEY)
-        if host is None or not host.all_prompt:
+        if host is None or not host.can_hash_on_host:
             return None
         ids = host.input_ids[: input_ids.shape[0]]
         lookback = host.lookback_token_ids[: lookback_token_ids.shape[0]]
@@ -238,12 +267,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # Image-span tokens are dead: they break n-grams (hash op
                 # takes True=dead) and their gate is zeroed (Engram.forward
                 # takes True=keep).
-                image_mask = upstream.image_sentinel_mask(input_ids)
-                engram_mask = ~image_mask
                 if skip_lookup:
                     # `Engram.embed` only reads `hash_ids.shape[0]` (`self._ready_rows(
                     # hash_ids.shape[0])`) after `prepare_embeddings` has populated
                     # `staged_rows` outside the compiled stage.
+                    engram_mask = ~upstream.image_sentinel_mask(input_ids)
                     num_layers = int(self.engram_hash.multipliers.shape[0])
                     engram_hashes = input_ids[:, None, None].expand(-1, num_layers, 1)
                     assert engram_hashes.shape[0] == input_ids.shape[0]
@@ -263,7 +291,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 )
                 if host is not None:
                     engram_hashes = self.engram_hash.hash_on_host(*host)
+                    engram_mask = ~upstream.image_sentinel_mask(host[0])
                 else:
+                    image_mask = upstream.image_sentinel_mask(input_ids)
+                    engram_mask = ~image_mask
                     engram_hashes = self.engram_hash(
                         input_ids,
                         positions,
@@ -285,13 +316,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
-                gathered_hashes = upstream.gather_engram_hashes(
-                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+                gathered_hashes = gather_host_engram_hashes(
+                    engram_hashes,
+                    dp_shared_memory=self.engram_dp_shared_memory,
+                    gather_fn=upstream.gather_engram_hashes,
                 )
-                if (
-                    self._has_cpu_offloaded_engram()
-                    and gathered_hashes.device.type != "cpu"
-                ):
+                if self._has_cpu_offloaded_engram():
                     gathered_hashes = gathered_hashes.to("cpu")
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
@@ -313,7 +343,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
-                if self.use_mega_moe and input_ids is not None
+                if self.use_mega_moe
+                and input_ids is not None
+                and input_ids.device.type == "cpu"
                 else input_ids
             )
             self._prepare_engram(
@@ -360,12 +392,22 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
             encoded = encoded[0]
-        hidden, pre_mix = encoded
+        if len(encoded) == 3:
+            hidden, pre_mix, encoder_aux = encoded
+        else:
+            hidden, pre_mix = encoded
+            encoder_aux = []
         if plan is not None and not plan.indices:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;
             # skip the inter-stage SP all-gather when no decoder replay runs.
-            return hidden.new_zeros((positions.shape[0], self.config.hidden_size))
+            zero_hidden = hidden.new_zeros(
+                (positions.shape[0], self.config.hidden_size)
+            )
+            aux_layers = getattr(self, "aux_hidden_state_layers", ())
+            if aux_layers:
+                return zero_hidden, [zero_hidden for _ in aux_layers]
+            return zero_hidden
         if self._stage_uses_sequence_parallel("encoder"):
             # Outside the compiled stages: the replay plan indexes full rows.
             hidden = upstream.sp_all_gather(hidden)[: positions.shape[0]]
@@ -437,9 +479,31 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if isinstance(output, (list, tuple)) and len(output) == 1:
             output = output[0]
         if indices is None:
+            if isinstance(output, (list, tuple)) and len(output) == 2:
+                dec_hidden, dec_aux = output
+                return dec_hidden, [*encoder_aux, *dec_aux]
+            if encoder_aux:
+                return output, list(encoder_aux)
             return output
-        result = output.new_zeros((positions.shape[0] + 1, output.shape[-1]))
-        return result.index_copy_(0, indices, output)[:-1]
+        total_rows = positions.shape[0]
+        if isinstance(output, (list, tuple)) and len(output) == 2:
+            dec_hidden, dec_aux = output
+            return (
+                _scatter_decoder_rows(dec_hidden, indices, total_rows),
+                [
+                    *encoder_aux,
+                    *[
+                        _scatter_decoder_rows(aux, indices, total_rows)
+                        for aux in dec_aux
+                    ],
+                ],
+            )
+        if encoder_aux:
+            return (
+                _scatter_decoder_rows(output, indices, total_rows),
+                list(encoder_aux),
+            )
+        return _scatter_decoder_rows(output, indices, total_rows)
 
     def _stage_uses_sequence_parallel(self, stage: str) -> bool:
         # Under CED=1, encoder_stage (L0..L19) runs SP while decoder_stage
@@ -521,48 +585,74 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        for idx, layer in enumerate(
-            islice(self.layers, start_layer, end_layer),
-            start=start_layer,
-        ):
-            hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-                engram_hashes,
-                engram_mask,
-                capture_previous_aux=idx in self.aux_hidden_state_layers,
-            )
-            if previous_aux is not None:
-                # idx is the one-based id of the layer whose post this is.
-                if stage_sp:
-                    previous_aux = upstream.sp_all_gather(previous_aux)[
-                        :full_num_tokens
-                    ]
-                aux_hidden_by_layer[idx] = previous_aux
-        if layer is not None:
-            # The last layer has no successor to fold its post into.
-            hidden_states = post(hidden_states, residual, post_mix, res_mix)
-            if self.end_layer in self.aux_hidden_state_layers:
-                final_aux = hidden_states.mean(dim=1)
-                if stage_sp:
-                    final_aux = upstream.sp_all_gather(final_aux)[:full_num_tokens]
-                aux_hidden_by_layer[self.end_layer] = final_aux
+        if stage == "decoder" and start_layer in self.aux_hidden_state_layers:
+            assert hidden_states is not None
+            aux_hidden = _mean_hc_streams(hidden_states)
+            if stage_sp:
+                aux_hidden = upstream.sp_all_gather(aux_hidden)[:full_num_tokens]
+            aux_hidden_by_layer[start_layer] = aux_hidden
+        with stage_attention_cache_scope():
+            for idx, layer in enumerate(
+                islice(self.layers, start_layer, end_layer),
+                start=start_layer,
+            ):
+                (
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    pre_mix,
+                    previous_aux,
+                ) = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    engram_hashes,
+                    engram_mask,
+                    capture_previous_aux=(
+                        idx in self.aux_hidden_state_layers and residual is not None
+                    ),
+                )
+                if previous_aux is not None:
+                    # idx is the one-based id of the layer whose post this is.
+                    if stage_sp:
+                        previous_aux = upstream.sp_all_gather(previous_aux)[
+                            :full_num_tokens
+                        ]
+                    aux_hidden_by_layer[idx] = previous_aux
+            if layer is not None:
+                # The last layer has no successor to fold its post into.
+                hidden_states = post(hidden_states, residual, post_mix, res_mix)
+                if (
+                    stage != "encoder"
+                    and self.end_layer in self.aux_hidden_state_layers
+                ):
+                    final_aux = _mean_hc_streams(hidden_states)
+                    if stage_sp:
+                        final_aux = upstream.sp_all_gather(final_aux)[:full_num_tokens]
+                    aux_hidden_by_layer[self.end_layer] = final_aux
 
-        if stage == "encoder":
-            # Decoder Full-mode global KV depends only on the complete encoder
-            # output. Publish it before the host selects the SWA replay rows.
-            decoder = self.layers[self._ced_boundary]
-            assert pre_mix is not None
-            normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
-            decoder.attn.write_encoder_global_kv(
-                normalized, positions, sp_sharded=stage_sp
-            )
-            return hidden_states, pre_mix
+            if stage == "encoder":
+                # Decoder Full-mode global KV depends only on the complete encoder
+                # output. Publish it before the host selects the SWA replay rows.
+                decoder = self.layers[self._ced_boundary]
+                assert pre_mix is not None
+                normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
+                decoder.attn.write_encoder_global_kv(
+                    normalized, positions, sp_sharded=stage_sp
+                )
+                encoder_aux = [
+                    aux_hidden_by_layer[layer_id]
+                    for layer_id in self.aux_hidden_state_layers
+                    if layer_id in aux_hidden_by_layer
+                ]
+                if encoder_aux:
+                    return hidden_states, pre_mix, encoder_aux
+                return hidden_states, pre_mix
 
         aux_hidden_states = [
             aux_hidden_by_layer[layer_id]
@@ -624,6 +714,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             device_hooks(torch.cuda, Stream=lambda: None),
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        if spec_cfg is None or getattr(spec_cfg, "method", None) != "mtp":
+            # Upstream allocates _mtp_hidden_buffer whenever use_eagle() is
+            # True (including dspark). Only deepseek_mtp consumes it.
+            self._mtp_hidden_buffer = None
         if self.use_sequence_parallel:
             tp_size = vllm_config.parallel_config.tensor_parallel_size
             sizes = vllm_config.compilation_config.compile_sizes or []
@@ -726,8 +821,16 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             or vllm_config.parallel_config.data_parallel_size != 1
         ):
             raise NotImplementedError("V4.1 TPU currently requires PP1 and DP1")
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError("V4.1 TPU currently requires no speculation")
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
+            "dspark",
+            "ngram",
+            "suffix",
+        ):
+            raise NotImplementedError(
+                f"V4.1 TPU does not support speculative method "
+                f"{getattr(spec_cfg, 'method', None)!r}"
+            )
         if vllm_config.scheduler_config.async_scheduling:
             from .async_fence import install_lookback_fence
 
