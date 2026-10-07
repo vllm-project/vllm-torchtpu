@@ -34,6 +34,23 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.topk(scores, k=k, dim=-1)
 
 
+def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    """`scores.gather(-1, topk_ids)`, without a gather.
+
+    On TPU the 96-element gather out of `[T, num_experts]` runs as a serial
+    gather fusion (~3-4 us per MoE layer at decode). Selecting with a one-hot
+    mask over the expert axis and summing is the same value bit for bit: each
+    row of the sum has exactly one selected term and the rest are exact zeros,
+    so no rounding happens. `where` (not a multiply) keeps a non-finite score
+    in an unselected column from leaking into the result. The one difference
+    is the sign of zero (-0.0 + 0.0 is +0.0), which the scoring functions
+    here cannot produce: their scores are all >= +0.
+    """
+    experts = torch.arange(scores.shape[-1], device=scores.device)
+    selected = topk_ids.long().unsqueeze(-1) == experts
+    return torch.where(selected, scores.unsqueeze(-2), 0).sum(dim=-1)
+
+
 # Resolve the routing-simulation strategy once, at import, outside the compiled
 # forward pass. Doing the validation and the (test-only) warning here keeps them
 # off the traced hot path. We cache the strategy implementation and call its
@@ -264,7 +281,7 @@ def _hash_moe_select(
     target_shape = list(scores.shape)
     target_shape[-1] = topk_ids.shape[-1]
     topk_ids = topk_ids.reshape(target_shape)
-    topk_weights = scores.gather(-1, topk_ids)
+    topk_weights = _gather_expert_scores(scores, topk_ids)
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
@@ -354,7 +371,7 @@ def select_experts(
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        topk_weights = _gather_expert_scores(scores, topk_ids)
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 
