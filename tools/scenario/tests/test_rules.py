@@ -323,6 +323,18 @@ CASES = [
         "has no entry for gsm8k",
     ),
     Case(
+        "V-21",
+        "single",
+        {
+            f"{LM}.concurrency": [1, 2],
+            f"{LM}.model_args": {"timeout": 7200},
+            "tasks.eval.baseline": {"mmlu_pro_c4": {"exact_match,none": 0.5}},
+        },
+        "tasks.eval.baseline",
+        "has an extra entry mmlu_pro_c4",
+        hint="its keys are among the run keys: mmlu_pro_c1, mmlu_pro_c2",
+    ),
+    Case(
         "V-22",
         "pd",
         {"tasks.custom[0].name": "eval"},
@@ -368,34 +380,7 @@ CASES = [
         "point baselines go under sweep.baselines",
     ),
     Case(
-        "V-25",
-        "agentx",
-        {f"{AGENTX_ZIP}[server.slice]": ["tpu7x/2x2x4"] * 4},
-        "sweep.zip[server.slice]",
-        "a sweep point keeps the scenario's image, slices, roles",
-    ),
-    Case(
-        "V-25",
-        "agentx",
-        {"sweep": {"points": [{"name": "a", "server": {"multihost": "mp"}}]}},
-        "sweep.points[0].server.multihost",
-        "a sweep point keeps the scenario's image",
-    ),
-    Case(
-        "V-25",
-        "agentx",
-        {
-            "sweep": {
-                "points": [
-                    {"name": "a", "server": {"roles": {"p": {"slice": "tpu7x/1x1x1"}}}}
-                ]
-            }
-        },
-        "sweep.points[0].server.roles.p.slice",
-        "a sweep point keeps the scenario's image",
-    ),
-    Case(
-        "V-25",
+        "V-38",
         "agentx",
         {f"{AGENTX_ZIP}.name": ["a", "b", "c", "d"]},
         "sweep.zip.name",
@@ -629,7 +614,8 @@ def test_every_scenario_rule_has_a_case() -> None:
 
 def test_rule_table_is_complete_and_ordered() -> None:
     ids = [rule.id for rule in rule_table()]
-    assert ids == [f"V-{n:02d}" for n in range(1, 41)]
+    # V-25 is unused: each sweep point is its own workload and may change shape.
+    assert ids == [f"V-{n:02d}" for n in range(1, 41) if n != 25]
     assert all(rule.summary for rule in rule_table())
 
 
@@ -684,3 +670,30 @@ def test_check_sweep_on_its_own() -> None:
     assert check_sweep(sweep) == []
     bad = Sweep.model_validate({"zip": {"tasks.x": [1], "tasks.y": [1, 2]}})
     assert [issue.rule for issue in check_sweep(bad)] == ["V-33", "V-38"]
+
+
+def test_eval_sweep_baseline_may_name_some_runs(single: Data) -> None:
+    put(single, f"{LM}.concurrency", [1, 2])
+    put(single, f"{LM}.model_args", {"timeout": 7200})
+    put(single, "tasks.eval.baseline", {"mmlu_pro_c2": {"exact_match,none": 0.5}})
+    assert issues_for(single) == []
+
+
+@pytest.mark.parametrize(
+    "name", ["SPEC_DECODING", "PREFILL_TP", "AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING"]
+)
+def test_agentx_env_names_the_tool_sets(agentx: Data, name: str) -> None:
+    put(agentx, f"tasks.agentx.env.{name}", "x")
+    del agentx["sweep"]
+    (issue,) = issues_for(agentx)
+    assert issue.rule == "V-11"
+    assert issue.path == ("tasks", "agentx", "env", name)
+
+
+def test_inferencex_perf_env_keeps_the_import_path(single: Data) -> None:
+    put(single, "tasks.perf.client", "inferencex")
+    put(single, "tasks.perf.range_ratio_style", DROP)
+    put(single, "tasks.perf.env", {"PYTHONPATH": "/x"})
+    (issue,) = issues_for(single)
+    assert issue.rule == "V-11"
+    assert "inferencex client" in issue.message

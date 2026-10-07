@@ -145,15 +145,14 @@ def test_ref_or_path_rejects(value: str) -> None:
     assert error(common.RefOrPath, value)["type"] == "ref_id"
 
 
-def test_env_map_coerces_numbers() -> None:
-    assert check(common.EnvMap, {"A": 8, "B": 0.5, "C": "x"}) == {
-        "A": "8",
-        "B": "0.5",
-        "C": "x",
-    }
+def test_env_map_coerces_integers() -> None:
+    assert check(common.EnvMap, {"A": 8, "C": "x"}) == {"A": "8", "C": "x"}
 
 
-def test_env_map_rejects_bool_and_null() -> None:
+def test_env_map_rejects_float_bool_and_null() -> None:
+    assert error(common.EnvMap, {"A": 0.9})["msg"] == (
+        'env values are strings or integers; quote it as written, e.g. "0.9"'
+    )
     assert "quote it" in error(common.EnvMap, {"A": True})["msg"]
     assert 'write ""' in error(common.EnvMap, {"A": None})["msg"]
 

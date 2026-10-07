@@ -148,3 +148,23 @@ def test_assign_errors(path: tuple[str | int, ...], message: str) -> None:
     value = None if message.startswith("null") else 1
     with pytest.raises(AssignError, match=message.replace("[", r"\[")):
         assign(data, prov, path, value, B)
+
+
+def test_gen_kwargs_mapping_replaces_whole() -> None:
+    path = ("tasks", "eval", "lm_eval", "gen_kwargs")
+    lower = {"tasks": {"eval": {"lm_eval": {"gen_kwargs": {"a": 1, "b": {"c": 2}}}}}}
+    upper = {"tasks": {"eval": {"lm_eval": {"gen_kwargs": {"b": {"d": 3}}}}}}
+    data, prov = merged((lower, A), (upper, B))
+    assert data["tasks"]["eval"]["lm_eval"]["gen_kwargs"] == {"b": {"d": 3}}
+    assert prov.origin(path) == B
+    assert prov.superseded[path] == [A]
+    assert (*path, "b", "d") not in prov.leaves
+
+
+def test_assign_inside_gen_kwargs_owns_the_whole_value() -> None:
+    path = ("tasks", "eval", "lm_eval", "gen_kwargs")
+    data, prov = merged(({"tasks": {"eval": {"lm_eval": {"gen_kwargs": {"a": 1}}}}}, A))
+    assign(data, prov, (*path, "b"), 2, B)
+    assert data["tasks"]["eval"]["lm_eval"]["gen_kwargs"] == {"a": 1, "b": 2}
+    assert prov.origin(path) == B
+    assert prov.superseded[path] == [A]

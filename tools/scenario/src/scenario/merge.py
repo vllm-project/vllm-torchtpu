@@ -16,7 +16,8 @@
 Rules: mappings merge per key, lists and scalars replace, null deletes (a
 missing key stays missing). Inside `server.roles.<r>.args` and `.env` a null
 is kept: it removes the inherited server-level key for that role when the
-role's args are combined with server.args.
+role's args are combined with server.args. A few mappings are one value to
+the program that reads them, and replace as a whole like a list.
 """
 
 import copy
@@ -87,6 +88,16 @@ class Provenance:
         )
 
 
+# lm-eval takes --gen_kwargs as one value, so a mapping from a lower layer is
+# replaced, never merged key by key.
+_WHOLE_MAPPINGS: tuple[KeyPath, ...] = (("tasks", "eval", "lm_eval", "gen_kwargs"),)
+
+
+def replaces_whole(path: KeyPath) -> bool:
+    """Whether a mapping at `path` replaces the lower layer's value as a whole."""
+    return path in _WHOLE_MAPPINGS
+
+
 def keeps_null(path: KeyPath) -> bool:
     """Whether a null at `path` is a value rather than a deletion."""
     return (
@@ -137,7 +148,7 @@ def merge_into(
             continue
         prov.deleted.pop(path, None)
         lower = acc.get(key)
-        if isinstance(value, dict):
+        if isinstance(value, dict) and not replaces_whole(path):
             if not isinstance(lower, dict):
                 if key in acc:
                     _replace(acc, prov, path)
@@ -165,7 +176,8 @@ def assign(
     """Set `path` to `value` as a one-key layer; missing mappings are created.
 
     A `[i]` segment indexes an existing list item. A list counts as one leaf,
-    so assigning inside one makes the whole list's origin `origin`.
+    and so does a mapping that replaces as a whole, so assigning inside one
+    makes the whole value's origin `origin`.
 
     Raises:
         AssignError: the path crosses a scalar, or indexes past a list's end.
@@ -187,10 +199,7 @@ def assign(
             prov.nodes[walked] = origin
         node = node[key]
     last = path[-1]
-    list_path = next(
-        (path[:depth] for depth in range(len(path)) if isinstance(path[depth], int)),
-        None,
-    )
+    list_path = _leaf_holding(path)
     if list_path is None:
         merge_into(node, prov, {last: value}, lambda _: origin, path[:-1])
         return
@@ -214,3 +223,13 @@ def assign(
         prov.forget(path)
     else:
         _record_tree(prov, path, value, lambda _: origin)
+
+
+def _leaf_holding(path: KeyPath) -> KeyPath | None:
+    """The list or whole-value mapping that `path` points inside, if any."""
+    for depth, key in enumerate(path):
+        if isinstance(key, int):
+            return path[:depth]
+        if depth + 1 < len(path) and replaces_whole(path[: depth + 1]):
+            return path[: depth + 1]
+    return None

@@ -53,7 +53,13 @@ from scenario.merge import (
     merge_into,
 )
 from scenario.model.baseline import BaselineRef
-from scenario.model.rules import check_scenario, check_sweep, sweep_baseline_message
+from scenario.model.rules import (
+    baseline_key_problem,
+    baseline_keys,
+    check_scenario,
+    check_sweep,
+    sweep_baseline_message,
+)
 from scenario.model.scenario import SCHEMA_VERSION, Defaults, Scenario
 from scenario.model.sweep import ExpandedPoint, Sweep, expand
 from scenario.model.tasks import BUILTIN_TASKS, VLLM_BENCH_ONLY_DEFAULTS
@@ -313,54 +319,6 @@ def _schema_issues(data: dict[str, Any]) -> list[Issue]:
     return []
 
 
-def _shape(model: Scenario) -> dict[KeyPath, object]:
-    """What decides a point's pods; equal across points (V-25)."""
-    server = model.server
-    roles = tuple((name, role.slice) for name, role in (server.roles or {}).items())
-    return {
-        ("server", "image"): server.image,
-        ("server", "multihost"): server.multihost,
-        ("server", "slice"): server.slice,
-        ("server", "roles"): roles,
-        ("server", "router"): server.router is not None,
-        ("server", "scratch"): server.scratch,
-        ("tasks", "driver"): model.tasks.driver,
-    }
-
-
-def _shape_changes(results: Sequence[Resolved]) -> list[Diagnostic]:
-    first, *others = results
-    expected = _shape(first.model)
-    diagnostics = []
-    for other in others:
-        for path, value in _shape(other.model).items():
-            if value != expected[path]:
-                origin = other.provenance.locate(path)
-                message = (
-                    f"point {other.point} differs from point {first.point} here; a "
-                    "sweep point keeps the scenario's image, slices, roles, "
-                    "multihost, router, scratch and driver"
-                )
-                diagnostics.append(
-                    Diagnostic(
-                        origin.source,
-                        origin.line,
-                        format_path(path),
-                        message,
-                        rule="V-25",
-                    )
-                )
-    return diagnostics
-
-
-def _baseline_keys(model: Scenario, task: str) -> tuple[str, ...] | None:
-    if task == "perf" and model.tasks.perf is not None:
-        return tuple(cell.key for cell in model.tasks.perf.cell_list())
-    if task == "eval" and model.tasks.eval is not None:
-        return model.tasks.eval.lm_eval.run_keys()
-    return None
-
-
 @dataclass(frozen=True)
 class _Point:
     """One point's layer: steps that may declare tasks, then its baselines."""
@@ -592,8 +550,6 @@ class Resolver:
             )
             if resolved is not None:
                 results.append(resolved)
-        if len(results) > 1:
-            report.diagnostics.extend(_shape_changes(results))
         return results
 
     def _overrides(self, sets: tuple[str, ...], report: _Report) -> list[Override]:
@@ -819,13 +775,15 @@ class Resolver:
                 "to that scenario directly",
                 None,
             )
-        want = _baseline_keys(model, task)
+        rule = baseline_keys(model, task)
         have = tuple(other.baseline.model_extra or {})
-        if want is not None and set(want) != set(have):
+        if rule is not None and baseline_key_problem(set(have), *rule) is not None:
+            want, subset = rule
+            among = "are among" if subset else "are"
             return (
                 None,
                 f"{ref} has {task} baseline keys {', '.join(have)}, but this task's "
-                f"keys are {', '.join(want)}",
+                f"keys {among} {', '.join(want)}",
                 None,
             )
         dumped = other.baseline.model_dump(by_alias=True, exclude_none=True)

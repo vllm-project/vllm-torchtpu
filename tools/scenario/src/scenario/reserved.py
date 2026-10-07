@@ -16,6 +16,10 @@
 The tool sets these from other fields. With two owners of one name,
 precedence would decide the value, so a scenario setting one fails instead.
 Each name maps to what the tool sets it from; that is what the error says.
+
+The models check scenarios against these names, plan() sets them, and
+targets check their own env against them, so this module imports nothing
+from the rest of the package.
 """
 
 from collections.abc import Mapping, Sequence
@@ -74,28 +78,54 @@ CHIPLESS_DRIVER_ENV: Mapping[str, str] = MappingProxyType(
 )
 
 _AGENTX_RUN = "the point and the results layout"
+_AGENTX_IMAGE = "the InferenceX checkout baked into the image"
+_AGENTX_ROLES = "the server roles and their chip counts"
+_AGENTX_FIXED = "the tool, fixed for a vLLM server"
 
 # Inputs of the InferenceX AgentX client that the tool sets per point; every
 # other client setting is the scenario's pass-through env.
 AGENTX_CLIENT_ENV: Mapping[str, str] = MappingProxyType(
     {
+        "AIPERF_RUNTIME_DIR": _AGENTX_IMAGE,
+        "PYTHONPATH": _AGENTX_IMAGE,
+        "PYTHONSAFEPATH": _AGENTX_IMAGE,
+        "AIPERF_SERVER_URL": "the tool (endpoint)",
+        "SERVED_MODEL_NAME": "server.model.name",
         "MODEL": "server.model.name",
         "MODEL_PREFIX": "tasks.agentx.labels.model_prefix",
         "PRECISION": "tasks.agentx.labels.precision",
         "FRAMEWORK": "tasks.agentx.labels.framework",
+        "SPEC_DECODING": "tasks.agentx.labels.spec_decoding",
         "CONC": "tasks.agentx.concurrency",
         "DURATION": "tasks.agentx.duration",
         "RESULT_DIR": _AGENTX_RUN,
         "RESULT_FILENAME": _AGENTX_RUN,
         "AGENTIC_OUTPUT_DIR": _AGENTX_RUN,
-        "IS_MULTINODE": "the server roles",
-        "TP": "the chip count of the server roles",
         "RUNNER_TYPE": "the slice's accelerator",
-        "IS_AGENTIC": "the tool",
-        "EVAL_ONLY": "the tool",
-        "KV_OFFLOADING": "the tool",
+        "IS_MULTINODE": _AGENTX_ROLES,
+        "TP": _AGENTX_ROLES,
+        "PP_SIZE": _AGENTX_ROLES,
+        "DCP_SIZE": _AGENTX_ROLES,
+        "PCP_SIZE": _AGENTX_ROLES,
+        "DISAGG": _AGENTX_ROLES,
+        "PREFILL_NUM_WORKERS": _AGENTX_ROLES,
+        "PREFILL_TP": _AGENTX_ROLES,
+        "DECODE_NUM_WORKERS": _AGENTX_ROLES,
+        "DECODE_TP": _AGENTX_ROLES,
+        "ENABLE_AGENTX_POWER": _AGENTX_FIXED,
+        "REQUIRE_POWER": _AGENTX_FIXED,
+        "IS_AGENTIC": _AGENTX_FIXED,
+        "EVAL_ONLY": _AGENTX_FIXED,
+        "KV_OFFLOADING": _AGENTX_FIXED,
+        "AIPERF_EXPERIMENTAL_FAST": _AGENTX_FIXED,
+        "AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS": _AGENTX_FIXED,
+        "AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING": _AGENTX_FIXED,
+        "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID": _AGENTX_FIXED,
     }
 )
+
+# Env of the InferenceX perf client that the tool sets.
+INFERENCEX_PERF_ENV: Mapping[str, str] = MappingProxyType({"PYTHONPATH": _AGENTX_IMAGE})
 
 
 def tool_env_owner(name: str) -> str | None:

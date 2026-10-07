@@ -29,9 +29,21 @@ from typing import Literal
 from scenario.errors import Issue
 from scenario.model.baseline import EvalBaseline, PerfBaseline
 from scenario.model.common import format_duration
-from scenario.model.reserved import (
+from scenario.model.scenario import Scenario
+from scenario.model.server import RoleView
+from scenario.model.sweep import POINT_NAME, Sweep, expand
+from scenario.model.tasks import (
+    BUILTIN_TASKS,
+    LABEL_FIELDS,
+    LABEL_PLACEHOLDER,
+    LmEvalTask,
+    PerfCell,
+)
+from scenario.paths import KeyPath, parse_path
+from scenario.reserved import (
     AGENTX_CLIENT_ENV,
     CHIPLESS_DRIVER_ENV,
+    INFERENCEX_PERF_ENV,
     LM_EVAL_MODEL_ARGS,
     PERF_CLIENT_ARGS,
     RAY_ENV,
@@ -41,17 +53,6 @@ from scenario.model.reserved import (
     custom_task_env,
     tool_env_owner,
 )
-from scenario.model.scenario import Scenario
-from scenario.model.server import RoleView
-from scenario.model.sweep import POINT_NAME, Sweep, SweepPoint, expand
-from scenario.model.tasks import (
-    BUILTIN_TASKS,
-    LABEL_FIELDS,
-    LABEL_PLACEHOLDER,
-    LmEvalTask,
-    PerfCell,
-)
-from scenario.paths import KeyPath, is_prefix, parse_path
 
 Stage = Literal["field", "scenario", "resolve", "validate"]
 Check = Callable[[Scenario], Iterator[Issue]]
@@ -238,7 +239,7 @@ def _env_blocks(s: Scenario) -> Iterator[tuple[KeyPath, Mapping[str, str | None]
         yield ("server", "roles", name, "env"), role.env, "server"
     tasks = s.tasks
     if tasks.perf is not None:
-        yield ("tasks", "perf", "env"), tasks.perf.env, "task"
+        yield ("tasks", "perf", "env"), tasks.perf.env, f"perf:{tasks.perf.client}"
     if tasks.agentx is not None:
         yield ("tasks", "agentx", "env"), tasks.agentx.env, "agentx"
     if tasks.eval is not None:
@@ -268,17 +269,23 @@ def _tool_env(s: Scenario) -> Iterator[Issue]:
                 )
             elif owner := tool_env_owner(name):
                 yield Issue(where, f"{name} is set by the tool ({owner}); remove it")
-            elif kind == "task" and chipless and name in CHIPLESS_DRIVER_ENV:
+            elif kind == "perf:inferencex" and name in INFERENCEX_PERF_ENV:
                 yield Issue(
                     where,
-                    f"{name} is set by the tool on a client driver "
-                    f"({CHIPLESS_DRIVER_ENV[name]}); remove it",
+                    f"{name} is set by the tool for the inferencex client "
+                    f"({INFERENCEX_PERF_ENV[name]}); remove it",
                 )
             elif kind == "agentx" and name in AGENTX_CLIENT_ENV:
                 yield Issue(
                     where,
                     f"{name} is set by the tool from {AGENTX_CLIENT_ENV[name]}; "
                     "remove it",
+                )
+            elif kind != "server" and chipless and name in CHIPLESS_DRIVER_ENV:
+                yield Issue(
+                    where,
+                    f"{name} is set by the tool on a client driver "
+                    f"({CHIPLESS_DRIVER_ENV[name]}); remove it",
                 )
 
 
@@ -461,35 +468,51 @@ def _cell_keys(s: Scenario) -> Iterator[Issue]:
         seen.add(cell.key)
 
 
-def _key_diff(
-    path: KeyPath, have: set[str], want: tuple[str, ...], kind: str
-) -> Iterator[Issue]:
-    missing = [key for key in want if key not in have]
+def baseline_keys(s: Scenario, task: str) -> tuple[tuple[str, ...], bool] | None:
+    """The keys a task's baseline may hold, and whether a subset of them is enough.
+
+    An eval sweep runs every task at every concurrency, and the gate checks
+    only the runs a baseline names, so its baseline may name some of them.
+    """
+    if task == "perf" and s.tasks.perf is not None:
+        return tuple(cell.key for cell in s.tasks.perf.cell_list()), False
+    if task == "eval" and s.tasks.eval is not None:
+        lm_eval = s.tasks.eval.lm_eval
+        return lm_eval.run_keys(), lm_eval.concurrency is not None
+    return None
+
+
+def baseline_key_problem(
+    have: set[str], want: tuple[str, ...], subset: bool
+) -> str | None:
+    missing = [] if subset else [key for key in want if key not in have]
     extra = sorted(have - set(want))
     parts = []
     if missing:
         parts.append(f"no entry for {', '.join(missing)}")
     if extra:
         parts.append(f"an extra entry {', '.join(extra)}")
-    if parts:
-        yield Issue(
-            path,
-            f"has {' and '.join(parts)}",
-            hint=f"its keys are the {kind} keys: {', '.join(want)}",
-        )
+    return f"has {' and '.join(parts)}" if parts else None
 
 
-@_rule("V-21", "inline baseline keys equal the task's cell or run keys")
+@_rule("V-21", "inline baseline keys are the task's cell or run keys")
 def _baseline_keys(s: Scenario) -> Iterator[Issue]:
-    perf, evals = s.tasks.perf, s.tasks.eval
-    if perf is not None and isinstance(perf.baseline, PerfBaseline):
-        keys = tuple(cell.key for cell in perf.cell_list())
-        have = set(perf.baseline.model_extra or {})
-        yield from _key_diff(("tasks", "perf", "baseline"), have, keys, "cell")
-    if evals is not None and isinstance(evals.baseline, EvalBaseline):
-        have = set(evals.baseline.model_extra or {})
-        keys = evals.lm_eval.run_keys()
-        yield from _key_diff(("tasks", "eval", "baseline"), have, keys, "run")
+    for task, kind in (("perf", "cell"), ("eval", "run")):
+        block = getattr(s.tasks, task)
+        rule = baseline_keys(s, task)
+        if rule is None or not isinstance(block.baseline, PerfBaseline | EvalBaseline):
+            continue
+        want, subset = rule
+        problem = baseline_key_problem(
+            set(block.baseline.model_extra or {}), want, subset
+        )
+        if problem is not None:
+            among = "among the" if subset else "the"
+            yield Issue(
+                ("tasks", task, "baseline"),
+                problem,
+                hint=f"its keys are {among} {kind} keys: {', '.join(want)}",
+            )
 
 
 def _interpolation_problems(value: str, provided: frozenset[str]) -> Iterator[str]:
@@ -553,7 +576,6 @@ def sweep_baseline_message(sweep: Sweep) -> str:
     return f"is not allowed with a sweep; put it {where}"
 
 
-_declare("V-25", "sweep points keep the pods' shape", "scenario")
 _declare("V-26", "name is unique across scenarios/", "validate")
 _declare("V-29", "extends: the parent exists, no cycle, depth <= 5", "resolve")
 _declare(
@@ -712,7 +734,7 @@ def _agentx_timeout(s: Scenario) -> Iterator[Issue]:
         )
 
 
-@_rule("V-38", "a sweep has one form, and names every point uniquely")
+@_rule("V-38", "a sweep has one form, axes under server.* or tasks.*, unique names")
 def _sweep(s: Scenario) -> Iterator[Issue]:
     if s.sweep is not None:
         yield from check_sweep(s.sweep)
@@ -722,44 +744,13 @@ _declare("V-33", "zip axes have equal lengths", "scenario")
 _declare("V-39", "sweep axis paths exist in the resolved scenario", "resolve")
 _declare("V-40", "--set does not touch a sweep axis", "resolve")
 
-# Paths whose change would give a point other pods than its siblings.
-_SHAPE_PATHS: tuple[KeyPath, ...] = (
-    ("server", "image"),
-    ("server", "multihost"),
-    ("server", "slice"),
-    ("server", "scratch"),
-    ("server", "router"),
-    ("tasks", "driver"),
-)
-_SHAPE_MESSAGE = (
-    "a sweep point keeps the scenario's image, slices, roles, multihost, router, "
-    "scratch and driver"
-)
-
-
-def _shape_path(path: KeyPath) -> bool:
-    if any(is_prefix(shape, path) for shape in _SHAPE_PATHS):
-        return True
-    if path[:2] == ("server", "roles"):
-        return len(path) <= 3 or path[3] == "slice"
-    return False
-
-
-def _overlay_issues(point: SweepPoint, base: KeyPath) -> Iterator[Issue]:
-    for root, overlay in (("server", point.server), ("tasks", point.tasks)):
-        for key, value in overlay.items():
-            path = (root, key)
-            if any(is_prefix(shape, path) for shape in _SHAPE_PATHS):
-                yield Issue((*base, *path), _SHAPE_MESSAGE, rule="V-25")
-            elif path == ("server", "roles") and isinstance(value, dict):
-                for role, role_overlay in value.items():
-                    if isinstance(role_overlay, dict) and "slice" in role_overlay:
-                        where = (*base, "server", "roles", role, "slice")
-                        yield Issue(where, _SHAPE_MESSAGE, rule="V-25")
-
 
 def check_sweep(sweep: Sweep, base: KeyPath = ("sweep",)) -> list[Issue]:
-    """Problems of a sweep block on its own (V-24, V-25, V-33, V-38)."""
+    """Problems of a sweep block on its own (V-24, V-33, V-38).
+
+    Each point is its own workload, so a point may change any server or task
+    field, the slices included.
+    """
     issues: list[Issue] = []
     forms = [form for form in ("points", "zip", "product") if getattr(sweep, form)]
     if len(forms) != 1:
@@ -801,7 +792,6 @@ def check_sweep(sweep: Sweep, base: KeyPath = ("sweep",)) -> list[Issue]:
                     )
                 )
             seen.add(point.name)
-            issues.extend(_overlay_issues(point, path))
         return issues
 
     axes = sweep.axes
@@ -810,14 +800,12 @@ def check_sweep(sweep: Sweep, base: KeyPath = ("sweep",)) -> list[Issue]:
         where = (*base, form, text)
         if len(path) < 2 or path[0] not in ("server", "tasks"):
             issues.append(
-                Issue(where, "axes override server.* or tasks.* only", rule="V-25")
+                Issue(where, "axes override server.* or tasks.* only", rule="V-38")
             )
         elif "baseline" in path:
             issues.append(
                 Issue(where, "point baselines go under sweep.baselines", rule="V-24")
             )
-        elif _shape_path(path):
-            issues.append(Issue(where, _SHAPE_MESSAGE, rule="V-25"))
     if sweep.zip is not None:
         lengths = {text: len(values) for text, values in sweep.zip.items()}
         if len(set(lengths.values())) > 1:

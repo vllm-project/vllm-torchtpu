@@ -314,6 +314,46 @@ def test_lm_eval_defaults_need_lm_eval(repo: Repo) -> None:
     ]
 
 
+def test_gen_kwargs_replaces_the_lower_layer(repo: Repo) -> None:
+    repo.write(
+        "evals",
+        """\
+        schema: 1
+        name: evals
+        server: {model: {name: m}, slice: tpu7x/2x2x1}
+        tasks:
+          eval:
+            tolerance: 0.02
+            lm_eval:
+              tasks: [gsm8k]
+              gen_kwargs: {chat_template_kwargs: {thinking: false}, max_gen_toks: 64}
+        """,
+    )
+    repo.write(
+        "evals-child",
+        """\
+        schema: 1
+        name: evals-child
+        extends: evals
+        tasks:
+          eval:
+            lm_eval:
+              gen_kwargs: {chat_template_kwargs: {enable_thinking: false}}
+        """,
+    )
+    resolved = repo.one("evals-child", "tasks.eval.lm_eval.gen_kwargs.until=x")
+    assert resolved.model.tasks.eval.lm_eval.gen_kwargs == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "until": "x",
+    }
+    path = ("tasks", "eval", "lm_eval", "gen_kwargs")
+    assert resolved.provenance.origin(path).layer == "set:0"
+    assert [o.layer for o in resolved.provenance.superseded[path]] == [
+        "extends:evals",
+        "scenario",
+    ]
+
+
 def test_inferencex_perf_gets_no_vllm_bench_defaults(repo: Repo) -> None:
     repo.write(
         "ix",
@@ -605,13 +645,11 @@ def test_sweep_problems(repo: Repo) -> None:
     ]
 
 
-def test_points_keep_the_pods_shape(repo: Repo) -> None:
+def test_points_may_change_the_pods(repo: Repo) -> None:
     repo.write("pd", PD)
-    assert repo.errors("pd") == [
-        "scenarios/pd.yaml:25: server.roles: point slim differs from point base "
-        "here; a sweep point keeps the scenario's image, slices, roles, multihost, "
-        "router, scratch and driver"
-    ]
+    base, slim = repo.resolve("pd")
+    assert list(base.model.server.roles) == ["prefill", "decode", "spare"]
+    assert list(slim.model.server.roles) == ["prefill", "decode"]
 
 
 def test_from_baselines(repo: Repo) -> None:
@@ -667,6 +705,24 @@ def test_from_baselines(repo: Repo) -> None:
         "scenarios/glm/mp3.yaml:4: tasks.eval.baseline.from: no scenario glm/bas "
         "(did you mean glm/base, glm/mp, glm/mp3?)"
     ]
+
+
+def test_from_baseline_of_an_eval_sweep(repo: Repo) -> None:
+    sweep = """\
+        schema: 1
+        name: {name}
+        server: {{model: {{name: m}}, slice: tpu7x/2x2x1}}
+        tasks:
+          eval:
+            tolerance: 0.02
+            lm_eval: {{tasks: [gsm8k], concurrency: [1, 2]}}
+            baseline: {baseline}
+        """
+    repo.write(
+        "ev/a", sweep.format(name="a", baseline='{gsm8k_c2: {"exact_match,none": 0.9}}')
+    )
+    repo.write("ev/b", sweep.format(name="b", baseline="{from: ev/a}"))
+    assert set(repo.one("ev/b").ref_baselines["eval"].baseline) == {"gsm8k_c2"}
 
 
 def test_warnings_do_not_fail(repo: Repo) -> None:

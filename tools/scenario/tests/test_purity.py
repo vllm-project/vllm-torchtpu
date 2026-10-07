@@ -29,6 +29,7 @@ PURE_MODULES = [
     "merge.py",
     "overrides.py",
     "paths.py",
+    "reserved.py",
     "resolve.py",
     "model/*.py",
     "plan/*.py",

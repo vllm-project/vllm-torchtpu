@@ -350,7 +350,13 @@ EnvName = Annotated[
 def _env_value(value: object) -> object:
     if isinstance(value, bool):
         raise fail("env_value", 'env values are strings; quote it: "1" or "true"')
-    if isinstance(value, int | float):
+    if isinstance(value, float):
+        # YAML reads 0.90 as 0.9, so the value would not be what was written.
+        raise fail(
+            "env_value",
+            f'env values are strings or integers; quote it as written, e.g. "{value}"',
+        )
+    if isinstance(value, int):
         return str(value)
     if value is None:
         raise fail(
@@ -363,9 +369,9 @@ def _env_value(value: object) -> object:
 EnvValue = Annotated[
     str,
     BeforeValidator(_env_value),
-    WithJsonSchema({"type": ["string", "integer", "number"]}),
+    WithJsonSchema({"type": ["string", "integer"]}),
 ]
-"""A string; numbers are accepted and kept as written by `str()`."""
+"""A string; an integer is accepted and stored as its decimal text."""
 
 EnvMap = dict[EnvName, EnvValue]
 """Env name to value."""

@@ -218,10 +218,7 @@ def agentx() -> dict[str, Any]:
                     "framework": "vllm",
                     "spec_decoding": "none",
                 },
-                "env": {
-                    "AIPERF_EXPERIMENTAL_FAST": "0",
-                    "AIPERF_MAX_CONTEXT_LENGTH": "131072",
-                },
+                "env": {"AIPERF_MAX_CONTEXT_LENGTH": "131072"},
                 "tolerance": 0.05,
             }
         },
