@@ -30,7 +30,7 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +44,8 @@ from jax.experimental.pallas import tpu_sc as plsc
 LANES = 16
 NUM_BUCKETS = 256
 # Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered by
-# emit_pipeline to 256KB out of the 512KB tile memory).
+# emit_pipeline to 256KB out of the 512KB tile memory). Rows that would need more
+# than 16 slices use slices of up to twice this, single-buffered instead.
 MAX_SLICE_WORDS = 32 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
@@ -555,7 +556,8 @@ def _topk_body(
                     )
 
     cores_per_chip = num_sc_cores * num_subcores
-    buf_count = 1 if num_waves == 1 else 2
+    # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
+    buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
     if p == 1:
         in_specs = (
             pl.BlockSpec(
@@ -761,7 +763,9 @@ def _sc_topk_direct(
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
-    slots, keys = out
+    # pl.kernel and set_xla_metadata are untyped upstream; both return the
+    # out_type pytree here.
+    slots, keys = cast(tuple[jax.Array, jax.Array | None], out)
     slots_2d = slots.reshape(padded_b, k)[:b]
     if return_scores:
         assert keys is not None
@@ -775,7 +779,9 @@ def _pick_partition(b: int, n: int, k: int) -> int:
 
     subcore utilization across subcores while fitting in VMEM and VMEM_SHARED.
     """
-    p_min = _cdiv(n, MAX_SLICE_WORDS)
+    # A cooperative group must fit on one SparseCore's 16 subcores; past that,
+    # slices grow beyond MAX_SLICE_WORDS and run single-buffered (~5% slower).
+    p_min = min(16, _cdiv(n, MAX_SLICE_WORDS))
     p = 1
     while p < p_min:
         p *= 2

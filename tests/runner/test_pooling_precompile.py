@@ -766,6 +766,7 @@ def test_runner_sampling_precompile_bypassed_for_pooling(monkeypatch, is_pooling
     names = (
         "_precompile_compute_selected_logits",
         "_precompile_compute_logits_from_hidden_states",
+        "_precompile_compute_top_tokens",
         "_precompile_structured_decoding",
         "_precompile_sample_from_logits",
         "_precompile_gather_logprobs",
