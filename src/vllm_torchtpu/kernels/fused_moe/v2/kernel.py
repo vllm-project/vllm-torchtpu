@@ -382,6 +382,7 @@ def expert_ffn_blockscale(
                 )
                 part = part * scales[b : (b + 1), n_start:n_end]
                 acc = part if acc is None else acc + part
+            assert acc is not None
             chunks.append(acc)
         return jnp.concatenate(chunks, axis=-1)
 
@@ -1017,6 +1018,7 @@ def _build_fused_ep_moe_kernel(
             packed_rows = rhs_qb // PACK4
 
             def w1_block(b, n_start, n_end):
+                # N.B. b is the contraction-block index.
                 if wait_slab is not None and n_start == 0:
                     wait_slab(w1_copy, b)
                 block = pltpu.bitcast(
@@ -1027,6 +1029,9 @@ def _build_fused_ep_moe_kernel(
                     ],
                     FP4,
                 ).astype(FP8)
+                # slab_retired starts the next expert's gate/up DMA into the
+                # same VMEM slot. That is only safe after the last read of
+                # the current slab.
                 if (
                     slab_retired is not None
                     and b == hidden // rhs_qb - 1
