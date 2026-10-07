@@ -213,6 +213,57 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
     )(flat, weight, previous_pre)
 
 
+def _collapse_flat(flat: jax.Array, previous_pre: jax.Array) -> jax.Array:
+    """``(previous_pre[..., None] * flat.view(T, M, D).f32).sum(1)`` from slices.
+
+    The ``[T, M, D]`` FP32 view costs XLA a relayout copy of the whole
+    residual (``reshape`` to ``T(4,128)``) before the reduce. Summing the
+    ``D``-wide column slices avoids it. For ``M == 4`` the sum uses the order
+    XLA's reduce applies to that view, ``(s0 + s2) + (s1 + s3)``, so the result
+    is bitwise equal. Other ``M`` keep the view.
+    """
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+    if mult != 4:
+        residual = flat.reshape(tokens, mult, dim).astype(jnp.float32)
+        return (previous_pre[..., None] * residual).sum(1)
+    terms = [
+        previous_pre[:, m : m + 1]
+        * flat[:, m * dim : (m + 1) * dim].astype(jnp.float32)
+        for m in range(mult)
+    ]
+    return (terms[0] + terms[2]) + (terms[1] + terms[3])
+
+
+def _delayed_pre_flat_small(
+    flat: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    previous_pre: jax.Array,
+    *constants,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """XLA `delayed_pre_jax` on a flat residual, collapsed by `_collapse_flat`.
+
+    The value `delayed_pre_jax` derives from the ``[T, M, D]`` view is unused
+    and dead-code eliminated, so the view's relayout copy disappears.
+    """
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    post, comb, _, new_pre = delayed_pre_jax(
+        flat.reshape(tokens, mult, width // mult),
+        flat,
+        fn,
+        scale,
+        base,
+        previous_pre,
+        *constants,
+    )
+    value = _collapse_flat(flat, previous_pre).astype(flat.dtype)
+    return post, comb, value, new_pre
+
+
 def delayed_pre_flat_jax(
     flat: jax.Array,
     fn: jax.Array,
@@ -237,15 +288,7 @@ def delayed_pre_flat_jax(
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
     if tokens < 64 or tokens % 64 or 3 * mixes > 128:
-        return delayed_pre_jax(
-            flat.reshape(tokens, mult, dim),
-            flat,
-            fn,
-            scale,
-            base,
-            previous_pre,
-            *constants,
-        )
+        return _delayed_pre_flat_small(flat, fn, scale, base, previous_pre, *constants)
     tile = 128 if tokens % 128 == 0 else 64
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
@@ -389,14 +432,8 @@ def delayed_post_pre_flat_jax(
                 comb_res_mix,
             )
         )
-        post, comb, value, new_pre = delayed_pre_jax(
-            flat_new.reshape(tokens, mult, dim),
-            flat_new,
-            fn,
-            scale,
-            base,
-            previous_pre,
-            *constants,
+        post, comb, value, new_pre = _delayed_pre_flat_small(
+            flat_new, fn, scale, base, previous_pre, *constants
         )
         return flat_new, post, comb, value, new_pre
     tile = 64

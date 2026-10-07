@@ -60,7 +60,7 @@ def _select_ragged_gather_reduce(version: str):
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 512
+_ONEHOT_AUTO_CAP = 768
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -69,7 +69,7 @@ def resolve_onehot_permute_threshold() -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
-    Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
+    Auto (env unset/empty/negative) resolves to ``min(2 * SC block rows - 1,
     _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
@@ -85,7 +85,7 @@ def resolve_onehot_permute_threshold() -> int:
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
+    threshold = min(2 * block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
 
