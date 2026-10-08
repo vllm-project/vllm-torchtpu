@@ -14,6 +14,7 @@
 """Raiden GDN pooled resharding vs dense reference."""
 
 import functools
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import RegionSpec
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
+from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
 from vllm_torchtpu.layers.core import gdn_attention
 
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
@@ -64,6 +66,10 @@ def test_qk_pair_layout_rejected_for_pooled_gdn(monkeypatch):
         )
 
 
+# The solver block size follows the local value-head count, so a head shard
+# and the full-width reference would sum in a different order. Pin it so both
+# sides run the same arithmetic and only the transfer is under test.
+@mock.patch.object(GDNConfig, "triangular_block_size", property(lambda self: 16))
 def _run_reshard_prefill_then_decode(
     ssm_dtype, degree, carrier_bytes, *, pair_blocked: bool
 ):
