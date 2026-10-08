@@ -212,16 +212,17 @@ def omni_runner_function(
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Group ``omni_runner`` tests by model within each module to spin up once."""
-    first_seen: dict[tuple[Any, tuple[str, str | None, str]], int] = {}
+    first_seen: dict[tuple[str, tuple[str, str | None, str]], int] = {}
 
-    def _sort_key(idx_and_item: tuple[int, pytest.Item]) -> tuple[int, int]:
+    def _sort_key(idx_and_item: tuple[int, pytest.Item]) -> tuple[int, str, int]:
         idx, item = idx_and_item
         group = 0 if item.get_closest_marker("spawns_tpu_workers") else 1
+        file_path = item.nodeid.split("::")[0]
         callspec = getattr(item, "callspec", None)
         if callspec is None or "omni_runner" not in callspec.params:
-            return (group, idx)
-        key = (item.module, _omni_runner_cache_key(callspec.params["omni_runner"]))
-        return (group, first_seen.setdefault(key, idx))
+            return (group, file_path, idx)
+        key = (file_path, _omni_runner_cache_key(callspec.params["omni_runner"]))
+        return (group, file_path, first_seen.setdefault(key, idx))
 
     indexed = sorted(enumerate(items), key=_sort_key)
     items[:] = [item for _, item in indexed]
