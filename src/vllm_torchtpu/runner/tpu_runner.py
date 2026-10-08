@@ -162,8 +162,9 @@ from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
+    extract_input_lens_for_tracing,
     extract_kv_lens_for_tracing,
-    extract_request_ids_for_tracing,
+    extract_request_details_for_tracing,
 )
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
@@ -3716,15 +3717,26 @@ class TPUModelRunner(GPUModelRunner):
             trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
                 trace_kwargs.update(
-                    extract_request_ids_for_tracing(
-                        self.input_batch.req_ids, start_index, num_reqs
-                    )
-                )
-                trace_kwargs.update(
                     extract_kv_lens_for_tracing(
                         self.input_batch.num_computed_tokens_cpu, start_index, num_reqs
                     )
                 )
+                trace_kwargs.update(
+                    extract_input_lens_for_tracing(
+                        self.input_batch.num_prompt_tokens, start_index, num_reqs
+                    )
+                )
+                if envs.TPU_TRACE_REQUEST_DETAILS:
+                    trace_kwargs.update(
+                        extract_request_details_for_tracing(
+                            self.input_batch.req_ids,
+                            self.input_batch.num_prompt_tokens,
+                            self.input_batch.num_computed_tokens_cpu,
+                            scheduler_output.num_scheduled_tokens,
+                            start_index,
+                            num_reqs,
+                        )
+                    )
 
             if self.phase_based_profiler and batch_composition_stats is not None:
                 stats_map = {
@@ -3742,12 +3754,13 @@ class TPUModelRunner(GPUModelRunner):
                     )
 
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
-            if "min_kv_len" in trace_kwargs:
-                trace_name += (
-                    f", kv_len min={trace_kwargs['min_kv_len']} "
-                    f"avg={trace_kwargs['avg_kv_len']} "
-                    f"max={trace_kwargs['max_kv_len']}"
-                )
+            for key in ("kv_len", "isl"):
+                if f"min_{key}" in trace_kwargs:
+                    trace_name += (
+                        f", {key} min={trace_kwargs[f'min_{key}']} "
+                        f"avg={trace_kwargs[f'avg_{key}']} "
+                        f"max={trace_kwargs[f'max_{key}']}"
+                    )
 
             with (
                 TraceAnnotation(

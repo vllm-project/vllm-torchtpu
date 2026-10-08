@@ -204,6 +204,33 @@ out.
 
 Prefer a single ISL/OSL cell so the trace maps to one workload shape.
 
+### Request lengths on `ModelForward` events
+
+Every forward in a trace is a host-side `ModelForward` event named after its
+batch, for example:
+
+```
+ModelForward: 4 reqs, 16 toks, kv_len min=5120 avg=40210 max=582299, isl min=900 avg=36004 max=581870
+```
+
+`kv_len` is the KV context length (tokens already cached before the step) and
+`isl` the input sequence length (prompt tokens). The same `min_`/`avg_`/`max_`
+values are event args.
+
+To see every request rather than the summary, start the server with
+`TPU_TRACE_REQUEST_DETAILS=1`. Each `ModelForward` event then also carries a
+`reqs` arg with one space-separated `req_id/isl/kv_len/new_tokens` entry per
+request, where `new_tokens` is what the request schedules in this step:
+
+```
+reqs=cmpl-1a2b-0/581870/582296/4 cmpl-3c4d-0/900/0/512 ...
+```
+
+The list stops after 256 requests (about 15 KB per event). When a forward has
+more, `reqs` ends with `+N more` and a `reqs_omitted=N` arg says how many were
+left out; the summary in the name still covers all of them. The flag does not
+change the compiled model or the compile cache key.
+
 ## Phased profiling
 
 A serving benchmark mixes prefill and decode work in a single stream, so one

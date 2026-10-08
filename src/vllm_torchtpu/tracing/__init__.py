@@ -6,15 +6,17 @@ from vllm_torchtpu.tracing.annotation import (
     is_trace_annotation_enabled,
 )
 from vllm_torchtpu.tracing.utils import (
+    extract_input_lens_for_tracing,
     extract_kv_lens_for_tracing,
-    extract_request_ids_for_tracing,
+    extract_request_details_for_tracing,
     trim_request_id_suffix,
 )
 
 __all__ = [
     "TraceAnnotation",
     "is_trace_annotation_enabled",
+    "extract_input_lens_for_tracing",
     "extract_kv_lens_for_tracing",
-    "extract_request_ids_for_tracing",
+    "extract_request_details_for_tracing",
     "trim_request_id_suffix",
 ]

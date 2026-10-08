@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_TRACE_REQUEST_DETAILS: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
@@ -595,6 +596,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
+    # Add each request's id, input length, KV length and new tokens to every
+    # ModelForward trace event, next to their min/max/avg. ~60 bytes per
+    # request, capped at the first 256 requests of each forward.
+    "TPU_TRACE_REQUEST_DETAILS": env_bool("TPU_TRACE_REQUEST_DETAILS"),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
