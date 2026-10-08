@@ -179,12 +179,12 @@ steps:
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Omni multimodal and diffusion models, on the -omni image. The FLUX test
-      # compares against a golden image under $HF_HOME/golden. Bare metal stages
-      # it onto the host before the container starts; here only $HF_HOME/hub is
-      # the shared cache, so the pod stages it with the same script. The weights
-      # come through the shared cache, downloaded by the first run that needs
-      # them.
+      # Omni multimodal and diffusion models, on the -omni image. The FLUX and
+      # Qwen tests compare against golden files under $HF_HOME/golden. Bare
+      # metal stages it onto the host before the container starts; here only
+      # $HF_HOME/hub is the shared cache, so the pod stages it with the same
+      # script. The weights come through the shared cache, downloaded by the
+      # first run that needs them.
       - label: ":kubernetes: Unit Tests - Omni (PR)"
         key: "unit_tests_omni_pr"
         <<: *tpu_step

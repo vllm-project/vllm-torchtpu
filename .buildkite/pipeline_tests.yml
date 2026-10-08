@@ -156,6 +156,7 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
@@ -234,6 +235,7 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:

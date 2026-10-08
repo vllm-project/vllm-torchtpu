@@ -1,16 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU component tests for Qwen-Image RoPE frequency embeddings."""
+"""In-process TPU component tests for Qwen-Image-Edit.
+
+Tested components:
+- QwenEmbedRope and QwenEmbedLayer3DRope: TPU RoPE frequency generation parity
+  vs CPU under torch.inference_mode() (including the txt_freqs clone patch).
+- RotaryEmbedding: Cross-attention q/k rotation parity vs float64 CPU reference.
+- TpuSDPAImpl: Unmasked joint attention parity (the production path for
+  batch-1 requests) vs float64 CPU reference.
+"""
+
+import math
 
 import pytest
 import torch
+import torch.nn.functional as F
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedLayer3DRope,
     QwenEmbedRope,
 )
 
+from vllm_torchtpu.omni.attention import TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
 pytestmark = [pytest.mark.omni]
+
+
+def _assert_numerical_parity(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    min_cos_sim: float = 0.999,
+):
+    a_flat = actual.flatten().float()
+    r_flat = reference.flatten().float()
+
+    norm_a = torch.linalg.norm(a_flat)
+    norm_r = torch.linalg.norm(r_flat)
+    if norm_a > 0 and norm_r > 0:
+        cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
+        assert cos_sim >= min_cos_sim, (
+            f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
+        )
+
+    torch.testing.assert_close(
+        actual.float(),
+        reference.float(),
+        atol=atol,
+        rtol=rtol,
+        msg="TPU kernel output diverged from CPU baseline",
+    )
 
 
 class TestQwenEmbedRopeOnTpu:
@@ -87,3 +127,157 @@ class TestQwenEmbedRopeOnTpu:
         torch.testing.assert_close(
             vid_imag.cpu(), torch.imag(ref_vid), atol=1e-5, rtol=1e-5
         )
+
+
+def _complex_rotary_reference(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """CPU math in float64 representing _apply_qwen_image_rotary_emb."""
+    x_f64 = x.to(torch.float64)
+    freqs_f64 = freqs.to(torch.complex128)
+    paired = torch.view_as_complex(x_f64.reshape(*x_f64.shape[:-1], -1, 2))
+    return torch.view_as_real(paired * freqs_f64.unsqueeze(1)).flatten(3)
+
+
+class TestQwenRotaryKernelApplication:
+    """Test QwenImageCrossAttention q/k rotation on TPU vs float64 CPU reference."""
+
+    def test_apply_qwen_rope_numeric_parity_on_tpu(self):
+        torch.manual_seed(42)
+        batch_size = 1
+        num_heads = 24
+        head_size = 128
+
+        video_fhw = [(1, 32, 32)]
+        txt_seq_len = 256
+        vid_seq_len = 32 * 32
+
+        rope = RotaryEmbedding(is_neox_style=False)
+        embedder = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+
+        vid_freqs_cpu, txt_freqs_cpu = embedder(
+            video_fhw, [txt_seq_len] * batch_size, device=torch.device("cpu")
+        )
+        vid_freqs_tpu, txt_freqs_tpu = embedder(
+            video_fhw, [txt_seq_len] * batch_size, device=torch.device("tpu")
+        )
+
+        q_vid_cpu = torch.randn(
+            batch_size, vid_seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        q_txt_cpu = torch.randn(
+            batch_size, txt_seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+
+        q_vid_tpu = q_vid_cpu.to(device="tpu")
+        q_txt_tpu = q_txt_cpu.to(device="tpu")
+
+        ref_q_vid = _complex_rotary_reference(
+            q_vid_cpu.double(), vid_freqs_cpu.to(torch.complex128)
+        )
+        ref_q_txt = _complex_rotary_reference(
+            q_txt_cpu.double(), txt_freqs_cpu.to(torch.complex128)
+        )
+
+        vid_cos = torch.real(vid_freqs_tpu).to(torch.bfloat16)
+        vid_sin = torch.imag(vid_freqs_tpu).to(torch.bfloat16)
+        txt_cos = torch.real(txt_freqs_tpu).to(torch.bfloat16)
+        txt_sin = torch.imag(txt_freqs_tpu).to(torch.bfloat16)
+
+        tpu_q_vid = rope(q_vid_tpu, vid_cos, vid_sin)
+        tpu_q_txt = rope(q_txt_tpu, txt_cos, txt_sin)
+
+        _assert_numerical_parity(
+            tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0
+        )  # Measured max abs error: 0.030761
+        _assert_numerical_parity(
+            tpu_q_txt.cpu(), ref_q_txt, atol=5e-2, rtol=0.0
+        )  # Measured max abs error: 0.025155
+
+        # Must-fail control: Neox rotation (chunked halves) instead of interleaved pairs
+        bad_rope = RotaryEmbedding(is_neox_style=True)
+        bad_tpu_q_vid = bad_rope(q_vid_tpu, vid_cos, vid_sin)
+        with pytest.raises(AssertionError):
+            _assert_numerical_parity(
+                bad_tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0
+            )
+
+
+def _unmasked_sdpa_reference(q, k, v, scale):
+    batch, seq, heads, d = q.shape
+    out = torch.zeros_like(q)
+
+    for h in range(heads):
+        qh = q[:, :, h, :]
+        kh = k[:, :, h, :]
+        vh = v[:, :, h, :]
+
+        scores = torch.bmm(qh, kh.transpose(1, 2)) * scale
+        probs = F.softmax(scores, dim=-1)
+        out[:, :, h, :] = torch.bmm(probs, vh)
+
+    return out
+
+
+class TestQwenJointAttention:
+    """Test TpuSDPAImpl with Qwen joint text+image attention configuration."""
+
+    def test_qwen_joint_attention_numeric_parity_on_tpu(self):
+        torch.manual_seed(42)
+        batch_size = 1
+        num_heads = 24
+        head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
+
+        # Production scale: text=256, target=1024, condition=4096 => total 5376
+        seq_len = 5376
+
+        impl = TpuSDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=scale,
+        )
+
+        q_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        k_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        v_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+
+        # Unmasked is the production path for batch size 1.
+        attn_metadata = None
+
+        ref_out = _unmasked_sdpa_reference(
+            q_cpu.double(), k_cpu.double(), v_cpu.double(), scale
+        )
+
+        q_tpu = q_cpu.to(device="tpu")
+        k_tpu = k_cpu.to(device="tpu")
+        v_tpu = v_cpu.to(device="tpu")
+
+        tpu_out = impl.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
+
+        tpu_out_cpu = tpu_out.cpu()
+
+        assert tpu_out.device.type == "tpu"
+        assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
+        assert torch.all(torch.isfinite(tpu_out_cpu))
+
+        _assert_numerical_parity(
+            tpu_out_cpu, ref_out, atol=1e-3, rtol=1e-2
+        )  # Measured max abs error: 0.000482
+
+        # Bitwise replay test
+        tpu_out_2 = impl.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
+        tpu_out_2_cpu = tpu_out_2.cpu()
+        torch.testing.assert_close(tpu_out_cpu, tpu_out_2_cpu, atol=0.0, rtol=0.0)
+
+        # Must-fail control: doubling the softmax scale
+        impl_bad = TpuSDPAImpl(
+            num_heads=num_heads, head_size=head_size, softmax_scale=scale * 2.0
+        )
+        tpu_out_bad = impl_bad.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
+        with pytest.raises(AssertionError):
+            _assert_numerical_parity(tpu_out_bad.cpu(), ref_out, atol=1e-3, rtol=1e-2)
