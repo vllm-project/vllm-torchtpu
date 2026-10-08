@@ -204,7 +204,7 @@ cat results/<sweep_id>/sweep.json
 
 On completion, `JsonResultRecorder` automatically synchronizes results to Google Cloud Storage under
 `gs://cloud-tpu-inference-eval-staging/incoming/<user>/<sweep_id>/`, where `<user>` is resolved from
-`USER_LDAP` / git email / `$USER` (see `core/env.py`). Pass `--no-upload-gcs` to disable the upload.
+the recorder owner (defaults to `$USER`, see `core/json_recorder.py`). Pass `--no-upload-gcs` to disable the upload.
 
 ### C. Resuming an Interrupted Sweep
 
