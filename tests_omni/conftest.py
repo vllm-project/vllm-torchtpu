@@ -115,16 +115,11 @@ class OmniRunner:
 
     def _cleanup_process(self) -> None:
         with contextlib.suppress(Exception):
-            matched = [
-                p
-                for p in psutil.process_iter(["pid", "name", "cmdline"])
-                if "enginecore" in " ".join(p.info.get("cmdline") or ()).lower()
-                or "enginecore" in (p.info.get("name") or "").lower()
-            ]
-            for p in matched:
+            children = psutil.Process().children(recursive=True)
+            for p in children:
                 with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                     p.terminate()
-            _, alive = psutil.wait_procs(matched, timeout=5)
+            _, alive = psutil.wait_procs(children, timeout=5)
             for p in alive:
                 with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                     p.kill()
