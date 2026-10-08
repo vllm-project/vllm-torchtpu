@@ -127,15 +127,28 @@ def gather_page_ids(
 
 
 def _floor_divmod_const(x: jax.Array, d: int) -> tuple[jax.Array, jax.Array]:
-    """Exact int32 `(x // d, x % d)` (floor semantics) for a static `d > 0`.
+    """Computes exact integer `(x // d, x % d)` without hardware integer division.
 
-    In-kernel: powers of two are a shift and a mask; anything else is an f32
-    reciprocal estimate refined once on the (small, f32-exact) remainder and
-    fixed up by one step, so no vector integer division is needed.
+    TPU vector units lack a native vector `idiv` instruction. This function
+    emulates floor div/mod with maximum efficiency:
+    - Powers of 2: Uses bitwise shift (`>>`) and bitmask (`&`).
+    - Arbitrary integers: Uses a reciprocal float32 multiplication followed by
+      a remainder refinement and a ±1 clamp to guarantee bit-exact results.
+
+    Args:
+        x: Input int32 tensor of arbitrary shape.
+        d: Static positive integer divisor (must be > 0).
+
+    Returns:
+        A tuple `(quotient, remainder)` where `quotient = x // d` and
+        `remainder = x % d`, both int32 arrays with exact floor semantics.
     """
+    # Fast path: powers of 2 (e.g., page_size = 256) use bitwise operations.
     if d & (d - 1) == 0:
         shift = d.bit_length() - 1
         return lax.shift_right_arithmetic(x, jnp.int32(shift)), x & jnp.int32(d - 1)
+
+    # General path: reciprocal float32 multiplication.
     inv = np.float32(1.0 / d)
     q = jnp.floor(x.astype(jnp.float32) * inv).astype(jnp.int32)
     r = x - q * jnp.int32(d)
@@ -165,15 +178,25 @@ def _capped_window_indices_kernel(
     pages_per_seq: int,
     total_num_pages: int,
 ):
-    """`prepare_gather_indices` for one (window, chunk, token block)."""
+    """Translates logical top-k slots to physical memory rows for one tile.
+
+    Executes on TPU vector cores for a single (window `w`, chunk `c`, tile `tb`).
+    - Valid slots: looks up their physical page in the page table.
+    - Empty slots (-1): hashes them to pseudo-random physical rows using primes
+      to prevent memory bank conflicts on SparseCore during gathering."""
     del live_windows_ref
     w = pl.program_id(0)
     c = pl.program_id(1)
     tb = pl.program_id(2)
     idx = topk_ref[...]
     is_padding = idx == -1
+
+    # 1. Translate logical index -> (logical sequence page, token offset within page).
     seq_page, token_offset = _floor_divmod_const(idx, page_size)
     logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
+
+    # 2. Look up the physical page from the sequence's page table.
+    # Processed in chunks of _GATHER_PAGE_CHUNK to stay within vector register limits.
     page = jnp.zeros_like(logical)
     for pc in range(windows_ref.shape[1] // _GATHER_PAGE_CHUNK):
         window_chunk = windows_ref[
@@ -184,7 +207,10 @@ def _capped_window_indices_kernel(
             window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
         )
         page = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page)
-    # The "-1" scatter of `prepare_gather_indices`, on the same flat index.
+
+    # 3. Handle empty padding slots (-1) with pseudo-random scattering.
+    # If all -1s read row 0, SparseCore would bottleneck on memory bank 0.
+    # Multiplying unique slot coordinates by large primes hashes -1s uniformly.
     row = (
         c * chunk_size
         + tb * block_tokens
@@ -192,12 +218,17 @@ def _capped_window_indices_kernel(
     )
     col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
     flat_element_index = row * topk + col
+
     _, scattered_page = _floor_divmod_const(
         flat_element_index * 104729, total_num_pages
     )
     _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
+
+    # Use the real page/offset for valid slots; use scattered values for -1 padding.
     page = jnp.where(is_padding, scattered_page, page)
     token_offset = jnp.where(is_padding, scattered_offset, token_offset)
+
+    # 4. Write physical row (page * page_size + offset) straight into output layout.
     out_ref[...] = page * page_size + token_offset
 
 
@@ -213,17 +244,29 @@ def prepare_capped_window_indices(
     total_num_pages: int,
     block_tokens: int | None = None,
 ) -> jax.Array:
-    """Physical gather rows of every chunk, window-major, live windows only.
+    """Launches the TPU kernel to translate logical slots to physical rows.
 
-    Returns i32[num_chunks * W * chunk_size, topk_cap], W = topk // topk_cap:
-    chunk c's rows `[c * W * chunk, (c + 1) * W * chunk)` are exactly the
-    `window_indices` the capped path of `sparse_attention_chunk` builds from
-    `prepare_gather_indices` (window w = rows `[w * chunk, (w + 1) * chunk)`).
-    Only windows `< live_windows` are written -- the grid is
-    `(live_windows, num_chunks, chunk_size // block_tokens)` -- so the page
-    translation reads and writes `live_windows * topk_cap` slots per token
-    instead of `topk`; rows of later windows are left unwritten, which is safe
-    as long as every chunk's gather is bounded to `live_windows` windows.
+    This function configures and launches the `_capped_window_indices_kernel`.
+    By sizing the Pallas grid dimension to `live_windows` (typically 1), it only
+    translates slots for windows that will actually be read by the gather,
+    leaving unneeded windows unwritten.
+
+    Args:
+        topk_indices: Shape [num_tokens, topk]. Logical token positions to gather.
+        page_indices: Flattened page table mapping logical pages to physical pages.
+        cu_q_lens: Cumulative query token count per sequence (ragged boundaries).
+        live_windows: Scalar from `capped_live_windows` determining how many
+          512-slot windows to translate (1 to 4).
+        chunk_size: Attention chunk size (e.g. 256).
+        topk_cap: Window capacity (e.g. 512).
+        page_size: Tokens per physical page (e.g. 256).
+        total_num_pages: Total physical cache pages allocated.
+        block_tokens: Token sub-tile size inside each chunk (e.g. 16 or 32).
+
+    Returns:
+        Array of shape [num_chunks * num_windows * chunk_size, topk_cap]
+        containing physical cache rows formatted directly in the layout
+        expected by the downstream SparseCore gather.
     """
     num_tokens, topk = topk_indices.shape
     if num_tokens % chunk_size or topk % topk_cap:
@@ -242,10 +285,14 @@ def prepare_capped_window_indices(
     blocks_per_chunk = chunk_size // block_tokens
     max_num_seqs = cu_q_lens.shape[0] - 1
     pages_per_seq = page_indices.shape[0] // max_num_seqs
+
+    # Align page table width to vector register boundaries (_GATHER_PAGE_CHUNK).
     padded_pps = align_to(pages_per_seq, _GATHER_PAGE_CHUNK)
     page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
     if padded_pps != pages_per_seq:
         page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
+
+    # Associate each token with its sequence ID to look up its page table row.
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_ids_segment = jnp.repeat(
         jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
@@ -271,15 +318,18 @@ def prepare_capped_window_indices(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
+                # Spec 0: Page table for this token block
                 pl.BlockSpec(
                     (block_tokens, padded_pps),
                     lambda w, c, tb, lw: (token_block(w, c, tb, lw), 0),
                 ),
+                # Spec 1: Top-k indices for this token block
                 pl.BlockSpec(
                     (block_tokens, topk_cap),
                     lambda w, c, tb, lw: (token_block(w, c, tb, lw), w),
                 ),
             ],
+            # Direct-in-place write: places output straight into windowed chunk layout.
             out_specs=pl.BlockSpec(
                 (block_tokens, topk_cap),
                 lambda w, c, tb, lw: ((c * num_windows + w) * blocks_per_chunk + tb, 0),
@@ -306,23 +356,55 @@ def capped_live_windows(
     topk_cap: int,
     num_windows: int,
 ) -> jax.Array:
-    """Max over chunks of the capped path's per-chunk `live_windows`.
+    """Calculates how many `topk_cap` (512-slot) windows the capped path must process.
 
-    Per chunk, `sparse_attention_chunk` bounds its gather to the windows the
-    chunk's gridded rows `[start, batch_end)` reach; this is the largest such
-    bound over all chunks (rows past `batch_end` count one window).
+    Instead of blindly gathering all possible windows (e.g., 4 windows = 2,048 slots),
+    this function inspects all active query tokens in the batch and finds the
+    maximum number of windows required by any single token.
+
+    Args:
+        kv_lens: Array of shape [num_tokens] containing the number of valid KV
+            cache entries each query token owns on this DCP rank.
+        token_end: Scalar integer marking the end of real tokens in the buffer.
+            Tokens at or beyond this index are padding.
+        chunk_size: Token chunk size processed per attention loop step (e.g., 256).
+        kernel_batch_size: Hardware execution tile size (e.g., 8 or 16 rows)
+            processed together by the TPU vector units.
+        topk_cap: Capacity of a single window (e.g., 512 slots).
+        num_windows: Maximum number of windows possible (e.g., 4 for 2,048 slots).
+
+    Returns:
+        A scalar i32 in the range [1, num_windows].
+        - 1 if all active tokens fit within the first window (<= topk_cap keys).
+        - >1 only if at least one active token overflows into later windows.
+        The window prep translates this many windows per chunk, and no chunk's
+        gather reaches past them.
     """
     num_tokens = kv_lens.shape[0]
+
+    # Map each token to its offset and start position within its chunk.
     local = np.arange(num_tokens, dtype=np.int32) % chunk_size
     start = np.arange(num_tokens, dtype=np.int32) - local
+
+    # Count how many real tokens fall within each chunk before hitting token_end.
     valid_rows = jnp.clip(token_end - start, 0, chunk_size)
+
+    # Round up valid rows to the hardware tile size (kernel_batch_size)
+    # because TPU vector units execute complete tiles, not individual rows.
     grid_rows = (valid_rows + kernel_batch_size - 1) // kernel_batch_size
     grid_rows = grid_rows * kernel_batch_size
+
+    # Compute windows needed per token:
+    # - If inside the active hardware grid: ceil(kv_len / topk_cap).
+    # - Outside it (padding, rows the grid never reaches): 1, so they never raise
+    #   the bound.
     token_windows = jnp.where(
         local < grid_rows,
         (jnp.maximum(kv_lens, 1) + topk_cap - 1) // topk_cap,
         1,
     )
+
+    # The worst case over all active tokens, clamped to [1, num_windows].
     return jnp.clip(jnp.max(token_windows), 1, num_windows).astype(jnp.int32)
 
 

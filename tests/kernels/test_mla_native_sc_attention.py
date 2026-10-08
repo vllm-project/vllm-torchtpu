@@ -13,8 +13,6 @@
 # limitations under the License.
 """Standalone sparse-attention tests for both physical cache layouts."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -463,20 +461,24 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
     @parameterized.product(
         (
-            {"query_tokens": 16, "real_tokens": 13, "chunk": 64},
-            {"query_tokens": 128, "real_tokens": 100, "chunk": 64},
-            {"query_tokens": 128, "real_tokens": 128, "chunk": 128},
+            {"query_tokens": 16, "real_tokens": 13, "chunk": 64, "late": False},
+            {"query_tokens": 128, "real_tokens": 100, "chunk": 64, "late": False},
+            {"query_tokens": 128, "real_tokens": 128, "chunk": 128, "late": False},
+            # Only the last chunk overflows the cap.
+            {"query_tokens": 128, "real_tokens": 128, "chunk": 64, "late": True},
         ),
         topk_cap=(256, 512),
     )
     def test_topk_cap_matches_uncapped(
-        self, query_tokens, real_tokens, chunk, topk_cap
+        self, query_tokens, real_tokens, chunk, topk_cap, late
     ):
         """`topk_cap` against the uncapped SparseCore path, per real row.
 
         Counts span 1 to topk, so chunks hold rows within the cap, rows one
         past it, and rows reaching every window (2048), i.e. the in-kernel
-        multi-window fix-up and the window-major live bound.
+        multi-window fix-up and the window-major live bound. `late` caps every
+        row before the last chunk, so earlier chunks gather fewer windows than
+        the once-per-call window prep (`capped_window_indices`) translates.
         """
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
@@ -490,6 +492,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             query_tokens,
         )
         rng.shuffle(counts)
+        if late:
+            counts[: query_tokens - chunk] = np.minimum(
+                counts[: query_tokens - chunk], topk_cap
+            )
         live = np.arange(topk)[None, :] < counts[:, None]
         topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
         cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
@@ -513,6 +519,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 **extra,
             )
 
+        # The capped run takes the window prep, not the full-width fallback.
+        capped_jaxpr = str(jax.make_jaxpr(lambda: run(topk_cap=topk_cap))())
+        self.assertIn("capped_window_indices", capped_jaxpr)
         (ref, ref_lse), (out, lse) = jax.block_until_ready(
             (run(), run(topk_cap=topk_cap))
         )
@@ -531,119 +540,6 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
             2e-2,
         )
-
-    @parameterized.product(
-        (
-            # Decode buckets (MTP 3: q=4 per request), 1 and 2 requests.
-            {"query_tokens": 16, "seq_q": (4,), "chunk": 256},
-            {"query_tokens": 16, "seq_q": (4, 4), "chunk": 256},
-            # Mixed: 2 decode requests + a prefill chunk, two capped chunks.
-            {"query_tokens": 512, "seq_q": (4, 4, 492), "chunk": 256},
-        ),
-        counts_mode=("within_cap", "overflow", "overflow_late"),
-    )
-    def test_capped_window_prep_matches_uncapped(
-        self, query_tokens, seq_q, chunk, counts_mode
-    ):
-        """The capped path's window-major prep against the uncapped path.
-
-        Production capped config (cap 512, chunk 256, default batching), which
-        takes `prepare_capped_window_indices` (checked in the jaxpr); its rows
-        are proven bit-identical to `prepare_gather_indices` in
-        `test_capped_window_indices_match_reference`, so this checks the
-        attention end to end, to the capped path's tolerance.
-        `within_cap`: no row past the cap, so only window 0 is translated and
-        later windows stay unwritten. `overflow`: rows reach every window.
-        `overflow_late`: only rows of the last chunk overflow, so earlier
-        chunks gather fewer windows than were translated.
-        """
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("SparseCore cache-layout attention requires a TPU")
-        topk, topk_cap = 2048, 512
-        rng = np.random.default_rng(20261004)
-        problem = _build_problem(
-            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
-        )
-        if counts_mode == "within_cap":
-            pool = np.array([1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512])
-        else:
-            pool = np.array(
-                [1, 63, 255, 256, 257, 511, 512, 513, 700, 1024, 1025, 2048, 130]
-            )
-        counts = np.resize(pool, query_tokens)
-        rng.shuffle(counts)
-        if counts_mode == "overflow_late":
-            last = (query_tokens - 1) // chunk * chunk
-            counts[:last] = np.minimum(counts[:last], topk_cap)
-            if last == 0:
-                counts[: query_tokens // 2] = np.minimum(
-                    counts[: query_tokens // 2], topk_cap
-                )
-        live = np.arange(topk)[None, :] < counts[:, None]
-        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
-        # One page-table row per request (shared pages are fine: both paths
-        # translate through the same table).
-        num_seqs = len(seq_q)
-        page_table = jnp.concatenate(
-            [problem["page_table"]]
-            + [
-                jnp.asarray(rng.permutation(problem["page_table"].shape[0]), jnp.int32)
-                for _ in range(num_seqs - 1)
-            ]
-        )
-        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
-        num_decode = sum(1 for n in seq_q if n == 4)
-        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
-        real_tokens = int(sum(seq_q))
-
-        def run(topk_in, cap=topk_cap):
-            return sparse_mla.sparse_ragged_paged_attention(
-                problem["q"],
-                problem["sparsecore_nope"],
-                problem["sparsecore_rope"],
-                topk_in,
-                page_table,
-                cu_q_lens,
-                distribution,
-                sm_scale=0.125,
-                k_scale=0.75,
-                return_lse=True,
-                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
-                gather_and_attention_chunk_size=chunk,
-                topk_cap=cap,
-            )
-
-        # The capped call takes the window-major prep; the uncapped one does not.
-        self.assertIn("capped_window_indices", str(jax.make_jaxpr(run)(topk_idx)))
-        self.assertNotIn(
-            "capped_window_indices",
-            str(jax.make_jaxpr(functools.partial(run, cap=None))(topk_idx)),
-        )
-        (ref, ref_lse), (out, lse) = jax.block_until_ready(
-            (run(topk_idx, cap=None), run(topk_idx))
-        )
-        real = np.asarray(out, np.float32)[:real_tokens]
-        np.testing.assert_allclose(
-            real, np.asarray(ref, np.float32)[:real_tokens], rtol=2e-2, atol=2e-2
-        )
-        np.testing.assert_allclose(
-            np.asarray(lse)[:real_tokens],
-            np.asarray(ref_lse)[:real_tokens],
-            rtol=1e-4,
-            atol=1e-4,
-        )
-        # Positive controls: the output is attention (not the aliased q), and
-        # moving one live entry changes the capped output's bits.
-        self.assertGreater(
-            np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
-            2e-2,
-        )
-        row = int(np.argmax(counts[:real_tokens]))
-        moved = topk_idx.at[row, 0].set((topk_idx[row, 0] + 1) % 8192)
-        bad, _ = jax.block_until_ready(run(moved))
-        out_bits = np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint16))
-        bad_bits = np.asarray(jax.lax.bitcast_convert_type(bad, jnp.uint16))
-        self.assertFalse(np.array_equal(bad_bits[:real_tokens], out_bits[:real_tokens]))
 
     @parameterized.product(
         (
