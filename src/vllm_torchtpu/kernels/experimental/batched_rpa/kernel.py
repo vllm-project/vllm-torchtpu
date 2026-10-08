@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -416,6 +417,31 @@ def generate_mask(
     return masks
 
 
+def block_fully_visible(
+) -> jax.Array | None:
+    """Scalar: True iff `generate_mask` would be all-True for every batch entry.
+
+    Returns None when the fast path is statically unavailable. The causal test
+    `q_kv_diff >= causal_offset - bq_start` holds for the whole tile iff it
+    holds at the smallest `q_kv_diff` (1 - bkv_sz) of the first q chunk
+    (bq_start=0), i.e. the block's last key is at or before the first query row.
+    """
+    if not flash_attention.vpu_diet_enabled():
+        return None
+    if cfgs.mode != configs.RpaCase.MIXED or cfgs.model.sliding_window is not None:
+        return None
+    full = None
+    for b_idx in range(cfgs.batch_size):
+        if step_meta.local_k_start is not None:
+            full_b = jnp.logical_and(full_b, step_meta.local_k_start[b_idx] <= 0)
+        if step_meta.local_k_end is not None:
+            full_b = jnp.logical_and(
+                full_b, step_meta.local_k_end[b_idx] >= cfgs.bkv_sz
+            )
+        full = full_b if full is None else jnp.logical_and(full, full_b)
+    return full
+
+
 def rpa_body(
     step: jax.Array,
     slot: int | jax.Array,
@@ -505,6 +531,48 @@ def rpa_body(
         cfgs=cfgs,
     )
 
+    run_step = functools.partial(
+        _rpa_step,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        step=step,
+        step_meta=step_meta,
+        cfgs=cfgs,
+    )
+    if full is None:
+        run_step(apply_mask=True)
+        return
+
+    @pl.when(full)
+    def _unmasked():
+        run_step(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full))
+    def _masked():
+        run_step(apply_mask=True)
+def _rpa_step(
+    # Inputs.
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    # Outputs
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    # Scratches.
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    step: jax.Array,
+    apply_mask: bool,
+    cfgs: configs.RpaConfigs,
+):
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -642,18 +710,20 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
             stitch_meta=stitch_meta,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
+        custom_mask = None
+        if apply_mask:
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
 
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
