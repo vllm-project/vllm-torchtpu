@@ -615,3 +615,76 @@ def test_dp_lockstep_sharded_off_without_lockstep():
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
     assert proposer._dp_lockstep_sharded() is False
+
+
+def test_static_attn_and_dummy_inputs_avoid_eager_device_ops():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer.vllm_config.model_config.get_hidden_size = lambda: 16
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                weight=torch.empty((4, 16), dtype=torch.bfloat16)
+            ),
+            layers=[],
+        )
+    )
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda n: None,
+    )
+
+    qsl, rd = proposer._get_static_attn_tensors(padded_num_reqs=4)
+    assert qsl.tolist() == [0, 6, 12, 18, 24]
+    assert rd.tolist() == [0, 0, 4]
+
+    _, dummy_md = proposer._dummy_kv_update_inputs(
+        num_tokens=18, num_reqs=4, num_blocks=2
+    )
+    assert dummy_md.seq_lens.tolist() == [18, 0, 0, 0]
+    assert dummy_md.query_start_loc.tolist() == [0, 18, 18, 18, 18]
+    assert dummy_md.request_distribution.tolist() == [0, 0, 4]
+
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(torch.zeros((3, 5), dtype=torch.int32), torch.zeros((18, 16)))
+    )
+    proposer._dummy_draft_forward(num_tokens=18, use_max_model_len=True, sync=False)
+    assert (18, 3) in proposer._dummy_draft_input_cache
+    cached_first = proposer._dummy_draft_input_cache[(18, 3)]
+    assert cached_first[2].tolist() == [0, 6, 12, 18]
+    assert cached_first[3].tolist() == [6, 6, 6]
+    proposer._dummy_draft_forward(num_tokens=18, use_max_model_len=False, sync=False)
+    assert proposer._dummy_draft_input_cache[(18, 3)] is cached_first
+
+
+def test_rc39b_layout_draft_block_avoids_scatter_and_supports_tensor_num_reqs(
+    monkeypatch,
+):
+    proposer = _make_proposer(draft_tp=1)
+    assert hasattr(proposer, "_cpu_base_tokens")
+    assert hasattr(proposer, "_cpu_draft_input_ids")
+
+    def _forbid_scatter(*args, **kwargs):
+        raise AssertionError("scatter_ must not be called in _layout_draft_block")
+
+    monkeypatch.setattr(torch.Tensor, "scatter_", _forbid_scatter)
+
+    base_tokens = torch.tensor([42, 77], dtype=torch.int32)
+    base_pos = torch.tensor([[5], [12]], dtype=torch.int32)
+    ids, pos, sl = proposer._layout_draft_block(
+        base_tokens, base_pos, block_size=4, padded_len=8, mask_token_id=0
+    )
+    assert ids.tolist() == [42, 0, 0, 0, 77, 0, 0, 0]
+    assert pos.tolist() == [5, 6, 7, 8, 12, 13, 14, 15]
+    assert sl.tolist() == [9, 16]
+
+    qsl = torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32)
+    pos_in = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+    bounds_int = proposer._request_window_bounds(qsl, pos_in, 2, 4)
+    bounds_ten = proposer._request_window_bounds(
+        qsl, pos_in, torch.tensor([2], dtype=torch.int32), 4
+    )
+    for b_i, b_t in zip(bounds_int, bounds_ten):
+        assert torch.equal(b_i, b_t)

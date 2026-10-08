@@ -74,6 +74,70 @@ def _rewrite_dspark_name(name: str, mapper: WeightsMapper) -> str | None:
     return mapped.removeprefix("model.")
 
 
+def compute_dspark_swa_draft_attention(
+    q: torch.Tensor,
+    sw_cache_kv: torch.Tensor,
+    new_kv: torch.Tensor,
+    *,
+    seq_len: int,
+    effective_seq_len: int | None = None,
+    sliding_window: int = 128,
+    sm_scale: float | None = None,
+    non_causal_block: bool = True,
+) -> torch.Tensor:
+    """Execute DSpark SWA draft block attention (`layers.61..63` contract, RC36-B).
+
+    Given query block `q` of shape `[q_len, num_heads, head_dim]`, pre-existing
+    sliding-window cache `sw_cache_kv` of shape `[max_seq_len, head_dim]`, and
+    `new_kv` of shape `[q_len, head_dim]` at the tail of `seq_len`:
+    - Writes `new_kv` into `sw_cache_kv[seq_len - q_len : seq_len]`.
+    - When `effective_seq_len` is clamped to `populated_tokens + q_len` (after a
+      cold `1P(MTP=false) -> 1D(MTP=true)` handoff), restricts the SWA key span
+      to the last `effective_seq_len` tokens
+      `[seq_len - effective_seq_len : seq_len]` instead of reading uninitialized
+      HBM slots in `[seq_len - sliding_window : seq_len - effective_seq_len]`.
+    """
+    q_len, num_heads, head_dim = q.shape
+    scale = float(head_dim**-0.5) if sm_scale is None else float(sm_scale)
+    eff_len = int(
+        seq_len if effective_seq_len is None else min(seq_len, effective_seq_len)
+    )
+    if eff_len < q_len:
+        raise ValueError(f"effective_seq_len ({eff_len}) must be >= q_len ({q_len})")
+    ctx_start = max(0, int(seq_len) - min(int(sliding_window), eff_len))
+    ctx_end = int(seq_len) - q_len
+    if ctx_end > ctx_start:
+        k_ctx = sw_cache_kv[ctx_start:ctx_end]
+        k_all = torch.cat([k_ctx, new_kv], dim=0)
+    else:
+        k_all = new_kv
+
+    total_k = k_all.shape[0]
+    k_pos = torch.arange(int(seq_len) - total_k, int(seq_len), device=q.device)
+    q_pos = torch.arange(int(seq_len) - q_len, int(seq_len), device=q.device).unsqueeze(
+        1
+    )
+    dist = q_pos - k_pos.unsqueeze(0)
+    keep = (dist >= 0) & (dist < int(sliding_window))
+    if non_causal_block:
+        in_q_block = (k_pos.unsqueeze(0) >= int(seq_len) - q_len) & (
+            k_pos.unsqueeze(0) < int(seq_len)
+        )
+        keep = keep | in_q_block
+
+    q_f32 = q.to(torch.float32)
+    k_f32 = k_all.to(torch.float32)
+    scores = torch.einsum("qhd,kd->qhk", q_f32, k_f32) * scale
+    scores = torch.where(
+        keep.unsqueeze(1),
+        scores,
+        torch.full_like(scores, torch.finfo(torch.float32).min),
+    )
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.einsum("qhk,kd->qhd", probs, k_f32)
+    return out.to(q.dtype)
+
+
 def _insert_context_kv(
     attn, kv: torch.Tensor, positions: torch.Tensor, metadata
 ) -> None:
@@ -103,17 +167,20 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
+    eff_seq_lens = getattr(metadata, "clamped_seq_lens", None)
+    if eff_seq_lens is None:
+        eff_seq_lens = metadata.seq_lens
     # only writes the SWA cache, and the clones keep the traced signature.
     operands = (
         dummy_q,
         kv,
         orig_sw_cache,
-        metadata.seq_lens,
+        eff_seq_lens,
         metadata.block_tables,
         metadata.query_start_loc,
         metadata.request_distribution,
         orig_sw_cache.clone(),
-        metadata.seq_lens.clone(),
+        eff_seq_lens.clone(),
         (positions + 1).to(torch.int32) // attn.compress_ratio,
         metadata.block_tables.clone(),
         metadata.query_start_loc.clone(),
@@ -130,6 +197,8 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4Model(nn.Module):
+    has_moe = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
@@ -141,6 +210,8 @@ class DSparkDeepseekV4Model(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
+        self.has_moe = True
+        self.num_moe_layers = self.num_dspark_layers
 
         # Aliased to the target's embedding by the proposer's sharing
         # utility after load (has_own_embed_tokens=False).
@@ -162,7 +233,9 @@ class DSparkDeepseekV4Model(nn.Module):
             dtype=torch.int32,
         )
 
-        current_vllm_config = get_current_vllm_config()
+        current_vllm_config = (
+            vllm_config if vllm_config is not None else get_current_vllm_config()
+        )
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
@@ -172,6 +245,10 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
                 for i in range(self.num_dspark_layers)
             ]
+        )
+        self._has_hash_moe = any(
+            getattr(layer.ffn.gate, "tid2eid", None) is not None
+            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
         )
         # The SWA kernel's non-causal block mode walks key blocks sized from
         # the sliding window, so a block longer than the window would
@@ -226,6 +303,31 @@ class DSparkDeepseekV4Model(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
+    def _dp_gather_hash_moe_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """All-gather input_ids over the DP group when DSpark hash-MoE layers
+        route DP-gathered tokens.
+        """
+        from vllm.distributed import get_dp_group
+
+        dp_group = get_dp_group()
+        if dp_group.world_size == 1:
+            return input_ids
+        hash_layers = [
+            layer
+            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
+            if getattr(layer.ffn.gate, "tid2eid", None) is not None
+        ]
+        if not hash_layers:
+            return input_ids
+        wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
+        assert len(wants) == 1, (
+            "DSpark DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
+            "DP-gathers the token rows"
+        )
+        if not wants.pop():
+            return input_ids
+        return dp_group.all_gather(input_ids, dim=0)
+
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux states))."""
         return self.main_norm(self.main_proj(aux_hidden_states))
@@ -272,12 +374,16 @@ class DSparkDeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for hyper-connections ([T,H] -> [T,hc,H]).
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        moe_input_ids = input_ids
+        if input_ids is not None and self._has_hash_moe:
+            moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
+
         residual = post_mix = res_mix = None
         for layer in self.layers:
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
-                input_ids,
+                moe_input_ids,
                 post_mix,
                 res_mix,
                 residual,
@@ -303,6 +409,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Opt into DFlashProposer's model-native context-KV path: this draft
     # owns its latent-KV projection, cache-layer names and paged insert.
     owns_context_kv = True
+    has_moe = True
+    num_moe_layers = 3
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -311,6 +419,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.has_moe = True
+        self.num_moe_layers = self.model.num_dspark_layers
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)

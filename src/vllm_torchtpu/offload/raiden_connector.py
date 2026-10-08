@@ -45,12 +45,14 @@ Core mechanisms:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
+import vllm.v1.kv_offload.base as kv_offload_base
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -91,12 +93,28 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    filter_target_only_kv_caches,
+    get_num_target_hidden_layers,
+    is_target_only_kv_enabled,
 )
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _build_offload_key(block_hash: bytes, group_idx: int) -> OffloadKey:
+    """Construct an upstream vLLM ``OffloadKey`` (`NewType("OffloadKey", bytes)`)."""
+    if dataclasses.is_dataclass(OffloadKey):
+        return OffloadKey(block_hash=block_hash, group_id=group_idx)  # type: ignore[call-arg]
+    make_fn = getattr(kv_offload_base, "make_offload_key", None)
+    if callable(make_fn):
+        return make_fn(bytes(block_hash), int(group_idx))
+    return OffloadKey(
+        bytes(block_hash) + int(group_idx).to_bytes(4, "big", signed=False)
+    )
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -313,6 +331,151 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     )
         super().update_connector_output(connector_output)
 
+    def has_pending_push_work(self) -> bool:
+        """Report True while store jobs are parked in ``_fence_pending`` (RC35-B).
+
+        Store jobs popped from ``_pending_store_jobs`` by ``build_connector_meta``
+        wait in ``self._fence_pending`` until all worker ranks retire their
+        device save fences. Including ``self._fence_pending`` here prevents
+        the scheduler/shutdown loop from declaring push work drained before
+        fenced store jobs are submitted to ``RaidenOffloadingManager``.
+        """
+        if bool(self._fence_pending):
+            return True
+        super_fn = getattr(super(), "has_pending_push_work", None)
+        if callable(super_fn):
+            return bool(super_fn())
+        return bool(getattr(self, "_pending_store_jobs", None))
+
+    def reset_cache(self) -> None:
+        """Cancel store jobs parked in ``_fence_pending`` on cache reset (RC35-B)."""
+        for parked in self._fence_pending.values():
+            self._raiden_manager.on_store_job_cancelled(parked.keys)
+        self._fence_pending.clear()
+        super_fn = getattr(super(), "reset_cache", None)
+        if callable(super_fn):
+            super_fn()
+
+    def estimate_external_prefix_warmth(
+        self, request: Request, num_computed_tokens: int
+    ) -> int:
+        """Estimate contiguous external tokens resident in Raiden without
+        pinning (RC35-C).
+
+        Matches upstream ``OffloadingConnectorScheduler`` chunking
+        (``self.config.kv_group_configs`` with ``hashes_per_chunk``,
+        ``tokens_per_chunk``, and ``make_offload_key(block_hash, group_idx)``)
+        and DeepSeek-V4 hybrid ``MLA + SWA`` alignment where
+        ``is_store_reachable_swa_chunk`` only stores the trailing
+        ``sliding_window_size_in_chunks`` SWA chunk(s) at each full-attention
+        alignment boundary.
+        """
+        max_num_tokens = max(int(getattr(request, "num_tokens", 0)) - 1, 0)
+        if num_computed_tokens >= max_num_tokens:
+            return 0
+        probe_fn = getattr(self._raiden_manager, "probe_key_resident", None)
+        if not callable(probe_fn):
+            return 0
+        block_hashes = getattr(request, "block_hashes", None) or ()
+        if not block_hashes:
+            return 0
+
+        cfg = getattr(self, "config", None)
+        kv_group_configs = (
+            getattr(cfg, "kv_group_configs", None) if cfg is not None else None
+        )
+        if kv_group_configs:
+            full_attn_groups = [
+                g
+                for g in kv_group_configs
+                if getattr(g, "sliding_window_size_in_chunks", None) is None
+            ]
+            swa_groups = [
+                g
+                for g in kv_group_configs
+                if getattr(g, "sliding_window_size_in_chunks", None) is not None
+            ]
+            max_hit_size_tokens = max_num_tokens
+            if full_attn_groups:
+                for g in full_attn_groups:
+                    tpc = int(g.tokens_per_chunk)
+                    hpc = max(int(getattr(g, "hashes_per_chunk", 1)), 1)
+                    total_chunks = min(
+                        max_hit_size_tokens // tpc, len(block_hashes) // hpc
+                    )
+                    start_chunk_idx = num_computed_tokens // tpc
+                    if total_chunks <= start_chunk_idx:
+                        return 0
+                    hit_chunks = 0
+                    for chunk_idx in range(start_chunk_idx, total_chunks):
+                        hash_idx = chunk_idx * hpc + hpc - 1
+                        key = _build_offload_key(
+                            block_hashes[hash_idx], int(g.group_idx)
+                        )
+                        if not probe_fn(key):
+                            break
+                        hit_chunks += 1
+                    if hit_chunks == 0:
+                        return 0
+                    max_hit_size_tokens = min(
+                        max_hit_size_tokens, tpc * (start_chunk_idx + hit_chunks)
+                    )
+                    if max_hit_size_tokens <= num_computed_tokens:
+                        return 0
+
+            if not swa_groups:
+                return max(0, max_hit_size_tokens - num_computed_tokens)
+
+            align_tokens = max(
+                int(g.tokens_per_chunk) for g in (full_attn_groups or swa_groups)
+            )
+            max_aligned = (max_hit_size_tokens // align_tokens) * align_tokens
+            for candidate_hit_tokens in range(
+                max_aligned, num_computed_tokens, -align_tokens
+            ):
+                swa_all_ok = True
+                for swa_g in swa_groups:
+                    swa_tpc = int(swa_g.tokens_per_chunk)
+                    swa_hpc = max(int(getattr(swa_g, "hashes_per_chunk", 1)), 1)
+                    sw_chunks = int(swa_g.sliding_window_size_in_chunks)
+                    end_swa_chunk = candidate_hit_tokens // swa_tpc
+                    min_swa_chunk = num_computed_tokens // swa_tpc
+                    if end_swa_chunk <= min_swa_chunk or end_swa_chunk * swa_hpc > len(
+                        block_hashes
+                    ):
+                        swa_all_ok = False
+                        break
+                    start_swa_chunk = max(min_swa_chunk, end_swa_chunk - sw_chunks)
+                    for c_idx in range(start_swa_chunk, end_swa_chunk):
+                        hash_idx = c_idx * swa_hpc + swa_hpc - 1
+                        key = _build_offload_key(
+                            block_hashes[hash_idx], int(swa_g.group_idx)
+                        )
+                        if not probe_fn(key):
+                            swa_all_ok = False
+                            break
+                    if not swa_all_ok:
+                        break
+                if swa_all_ok:
+                    return candidate_hit_tokens - num_computed_tokens
+            return 0
+
+        block_size = int(getattr(self, "block_size", 0) or 0)
+        if block_size <= 0:
+            return 0
+        group_ids = getattr(self, "_group_ids", (0,))
+        start_block_idx = num_computed_tokens // block_size
+        end_block_idx = max_num_tokens // block_size
+        external_blocks = 0
+        for block_idx in range(start_block_idx, min(end_block_idx, len(block_hashes))):
+            block_hash = block_hashes[block_idx]
+            if not all(
+                probe_fn(_build_offload_key(block_hash, int(gid))) for gid in group_ids
+            ):
+                break
+            external_blocks += 1
+        return external_blocks * block_size
+
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
@@ -405,6 +568,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return self.connector_scheduler.take_events()
         return []
 
+    def estimate_external_prefix_warmth(
+        self, request: Request, num_computed_tokens: int
+    ) -> int:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.estimate_external_prefix_warmth(
+                request, num_computed_tokens
+            )
+        return 0
+
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
         self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
@@ -418,6 +590,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         """
         assert self.connector_worker is not None
         num_blocks = self.connector_worker.kv_cache_config.num_blocks
+        worker_vllm_cfg = getattr(self.connector_worker, "vllm_config", None)
+        if is_target_only_kv_enabled(worker_vllm_cfg):
+            kv_caches = filter_target_only_kv_caches(
+                kv_caches,
+                num_target_layers=get_num_target_hidden_layers(worker_vllm_cfg),
+            )
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
         for layer_kv_cache in kv_caches.values():
@@ -449,6 +627,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
             )
 
+        # DeepSeek-V4 registers pools with different page sizes (e.g. HCA 128 KiB
+        # next to smaller CSA / SWA / indexer pages). KVCacheManagerBase
+        # (pre-CL-976485301) sizes its per-block host buffer from
+        # pool_tensors[0], so put the largest page first; otherwise the host
+        # staging buffer is too small for the HCA pool's D2H/H2D copies. The sort
+        # is stable and every group references every pool by index below, so the
+        # reordering is purely a layout choice.
+        pool_tensors.sort(key=lambda pool_tensor: -pool_tensor.page_size_bytes)
+
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
@@ -466,22 +653,79 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
         )
 
-    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        assert self.connector_worker is not None
-        meta = self._get_connector_metadata()
-        assert isinstance(meta, RaidenOffloadingConnectorMetadata)
+    def record_pending_fences(self) -> None:
+        """Enqueue deferred KV pool writes and record stream fence events (RC35-A).
 
+        Idempotent within a step (`meta.fence_job_ids` is cleared once recorded).
+        On an idle DP rank that runs `_run_dp_idle_pairing`, calling this BEFORE
+        the dummy forward passes allows the prior step's KV writes to retire
+        while the dummy forward executes, eliminating 1 extra step of fence lag.
+        """
+        if self.connector_worker is None:
+            return
+        meta = getattr(self, "_connector_metadata", None)
+        if meta is None and hasattr(self, "_get_connector_metadata"):
+            try:
+                meta = self._get_connector_metadata()
+            except (AssertionError, Exception):
+                meta = None
+        if not isinstance(meta, RaidenOffloadingConnectorMetadata):
+            return
         if meta.fence_job_ids:
-            # Establish an asynchronous device fence before acknowledging store jobs:
-            # 1. Dispatch any deferred pool writes so they precede the fence event.
-            # 2. Record a stream event to track completion without host-side blocking.
-            assert self._pool_sync_tensors, (
-                "KV pool tensors must be registered before the save fence"
-            )
+            if not self._pool_sync_tensors:
+                logger.debug(
+                    "record_pending_fences: KV pool sync tensors not registered "
+                    "yet; skipping save fence",
+                )
+                return
             _enqueue_pool_writes(self._pool_sync_tensors)
             self._pending_fences.append(
                 (set(meta.fence_job_ids), _record_fence_event())
             )
+            meta.fence_job_ids.clear()
+
+    def start_load_kv(self, forward_context: Any = None, **kwargs) -> None:
+        """Start async Raiden KV transfers safely without asserting on None metadata."""
+        if self.connector_worker is None:
+            return
+        meta = getattr(self, "_connector_metadata", None)
+        if meta is None and hasattr(self, "_get_connector_metadata"):
+            try:
+                meta = self._get_connector_metadata()
+            except (AssertionError, Exception):
+                meta = None
+        if not isinstance(meta, RaidenOffloadingConnectorMetadata):
+            return
+        if hasattr(self.connector_worker, "start_kv_transfers"):
+            self.connector_worker.start_kv_transfers(meta)
+        elif hasattr(self.connector_worker, "start_load_kv"):
+            self.connector_worker.start_load_kv(meta, **kwargs)
+
+    def wait_for_save(self) -> None:
+        """Wait for in-flight KV save operations; safe no-op on
+        TPURaidenOffloadingConnector.
+        """
+        pass
+
+    def clear_connector_metadata(self) -> None:
+        """Clear bound connector metadata after step completion."""
+        self._connector_metadata = None
+
+    def _get_connector_metadata(self) -> Any:
+        """Safely return connector metadata without asserting (RC43)."""
+        return getattr(self, "_connector_metadata", None)
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        if self.connector_worker is None:
+            return set(), set()
+        meta = getattr(self, "_connector_metadata", None)
+        if meta is None and hasattr(self, "_get_connector_metadata"):
+            try:
+                meta = self._get_connector_metadata()
+            except (AssertionError, Exception):
+                meta = None
+
+        self.record_pending_fences()
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.
@@ -495,12 +739,13 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._pending_fences = still_pending
 
         finished_recving: set[str] = set()
-        for job_id in meta.finished_store_job_ids:
-            self._completed_jobs[job_id] = 1
-        for job_id, req_id in meta.finished_load_jobs.items():
-            self._completed_jobs[job_id] = 1
-            finished_recving.add(req_id)
-        self._load_error_block_ids.update(meta.failed_load_device_block_ids)
+        if isinstance(meta, RaidenOffloadingConnectorMetadata):
+            for job_id in meta.finished_store_job_ids:
+                self._completed_jobs[job_id] = 1
+            for job_id, req_id in meta.finished_load_jobs.items():
+                self._completed_jobs[job_id] = 1
+                finished_recving.add(req_id)
+            self._load_error_block_ids.update(meta.failed_load_device_block_ids)
 
         return set(), finished_recving
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import threading
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -23,12 +25,14 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.offload.raiden_store import is_target_only_kv_enabled
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    model_has_moe,
     normalize_draft_config,
 )
 from vllm_torchtpu.utils import synchronize_tensors
@@ -39,18 +43,72 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
-    """Whether a draft carries MoE layers, i.e. emits EP collectives.
+def clamp_swa_seq_lens_scalar_python(
+    seq_lens: Sequence[int] | np.ndarray,
+    populated_tokens: Sequence[int] | np.ndarray,
+    cold_handoff_mask: Sequence[bool] | np.ndarray,
+    block_size: int,
+) -> list[int]:
+    """Reference scalar Python loop for cold-handoff SWA window clamping (RC36-B)."""
+    n = len(seq_lens)
+    out: list[int] = [0] * n
+    b = int(block_size)
+    for i in range(n):
+        s = int(seq_lens[i])
+        if bool(cold_handoff_mask[i]):
+            cand = int(populated_tokens[i]) + b
+            out[i] = cand if cand < s else s
+        else:
+            out[i] = s
+    return out
 
-    Missing a MoE draft here is a hang, not an error: under EP-DP lockstep
-    the busy rank's draft forward waits on all-to-alls that the idle ranks never issue.
+
+def clamp_swa_seq_lens_vectorized_numpy(
+    seq_lens_np: np.ndarray,
+    populated_tokens_np: np.ndarray,
+    cold_handoff_mask_np: np.ndarray,
+    block_size: int,
+) -> np.ndarray:
+    """Standard vectorized NumPy baseline for cold-handoff SWA window clamping."""
+    clamped = np.minimum(seq_lens_np, populated_tokens_np + np.int32(block_size))
+    return np.where(cold_handoff_mask_np, clamped, seq_lens_np)
+
+
+_SWA_UNCLAMPED_CAP_I32 = np.int32(2_147_483_647)
+
+
+def precompute_swa_effective_cap(
+    populated_tokens_np: np.ndarray,
+    cold_handoff_mask_np: np.ndarray,
+    block_size: int,
+    cap_buf: np.ndarray | None = None,
+) -> np.ndarray:
+    """Fold `(populated_tokens, cold_handoff_mask, block_size)` into a single
+    `int32` effective SWA cap per request (`populated + block_size` when cold,
+    `INT32_MAX` when warm) so the draft hot path needs only 1 `np.minimum` call."""
+    n = populated_tokens_np.shape[0]
+    out = np.empty(n, dtype=np.int32) if cap_buf is None else cap_buf[:n]
+    np.add(populated_tokens_np[:n], np.int32(block_size), out=out)
+    out[~cold_handoff_mask_np[:n]] = _SWA_UNCLAMPED_CAP_I32
+    return out
+
+
+def clamp_swa_seq_lens_fast_inplace(
+    seq_lens_np: np.ndarray,
+    effective_cap_np: np.ndarray,
+    out_buf: np.ndarray,
+) -> np.ndarray:
+    """Zero-allocation single-ufunc SWA window clamping (RC36-B).
+
+    Folds `cold_handoff_mask` and `populated_tokens + block_size` into
+    `effective_cap_np` (`INT32_MAX` for warm requests), reducing the per-draft-step
+    clamping kernel from 3 heap-allocating ufuncs (`add`, `minimum`, `where`) to
+    1 in-place SIMD `np.minimum(seq_lens_np, effective_cap_np, out=out_buf)`.
     """
-    from vllm.model_executor.layers.fused_moe import MoERunner
-    from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
-    if is_mixture_of_experts(draft_model):
-        return True
-    return any(isinstance(m, MoERunner) for m in draft_model.modules())
+    n = seq_lens_np.shape[0]
+    out_view = out_buf[:n]
+    np.minimum(seq_lens_np[:n], effective_cap_np[:n], out=out_view)
+    return out_view
 
 
 class DFlashProposer:
@@ -114,9 +172,50 @@ class DFlashProposer:
         self._dummy_kv_input_cache: dict[
             tuple, tuple[list[torch.Tensor], AttentionMetadata]
         ] = {}
+        self._dummy_draft_input_cache: dict[
+            tuple[int, int],
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
+        for r in getattr(runner, "num_reqs_paddings", []):
+            self._zero_draft_lengths(int(r))
+
+        # RC36-B: Per-request SWA draft KV populated-window tracking and
+        # pre-allocated in-place NumPy clamping buffers for cold 1P1D handoffs.
+        self._swa_state_lock = threading.Lock()
+        self._req_draft_populated_tokens: dict[str, int] = {}
+        self._req_draft_valid_start_pos: dict[str, int] = {}
+        self._req_draft_cold_handoff: dict[str, bool] = {}
+        raw_max_reqs = getattr(runner, "max_num_reqs", 512)
+        max_reqs_cap = max(
+            int(raw_max_reqs) if isinstance(raw_max_reqs, int) else 512, 512
+        )
+        raw_sw = self.dflash_config.get("sliding_window") or getattr(
+            hf_config, "sliding_window", None
+        )
+        self._draft_swa_window_size: int = (
+            int(raw_sw) if isinstance(raw_sw, int) and raw_sw > 0 else 128
+        )
+        self._swa_populated_np = np.zeros(max_reqs_cap, dtype=np.int32)
+        self._swa_cold_mask_np = np.zeros(max_reqs_cap, dtype=np.bool_)
+        self._swa_scratch_np = np.zeros(max_reqs_cap, dtype=np.int32)
+        self._swa_out_np = np.zeros(max_reqs_cap, dtype=np.int32)
+        # RC39-B: Pre-allocated CPU scratch buffers and cached [1] int32 device
+        # tensors for num_reqs so compiled input builders do not specialize on
+        # Python int num_reqs or emit scatter_ HLO kernels.
+        self._cpu_base_tokens = np.zeros(max_reqs_cap, dtype=np.int32)
+        self._cpu_draft_input_ids = np.full(
+            max_reqs_cap * self.block_size, self.mask_token_id, dtype=np.int32
+        )
+        self._num_reqs_tpu_cache: dict[int, torch.Tensor] = {}
 
     @property
     def block_size(self) -> int:
@@ -130,12 +229,12 @@ class DFlashProposer:
         attention metadata.
         """
         if padded_num_reqs not in self._static_attn_tensors_cache:
-            qsl = (
-                torch.arange(
-                    padded_num_reqs + 1, dtype=torch.int32, device=self.runner.device
-                )
-                * self.block_size
-            )
+            qsl = torch.arange(
+                0,
+                (padded_num_reqs + 1) * self.block_size,
+                self.block_size,
+                dtype=torch.int32,
+            ).to(self.runner.device)
             rd = torch.tensor(
                 [0, 0, padded_num_reqs], dtype=torch.int32, device=self.runner.device
             )
@@ -291,6 +390,135 @@ class DFlashProposer:
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
 
+    def _ensure_swa_buffers_capacity(self, capacity: int) -> None:
+        if capacity <= self._swa_out_np.shape[0]:
+            return
+        new_cap = max(capacity, self._swa_out_np.shape[0] * 2)
+        self._swa_populated_np = np.zeros(new_cap, dtype=np.int32)
+        self._swa_cold_mask_np = np.zeros(new_cap, dtype=np.bool_)
+        self._swa_scratch_np = np.zeros(new_cap, dtype=np.int32)
+        self._swa_out_np = np.zeros(new_cap, dtype=np.int32)
+
+    def record_request_draft_kv_tokens(
+        self,
+        req_id: str,
+        num_new_tokens: int,
+        *,
+        start_pos: int | None = None,
+        is_cold_handoff: bool | None = None,
+    ) -> int:
+        """Record newly populated context tokens in the draft SWA KV cache (RC36-B).
+
+        Thread-safe and idempotent across repeat handoffs. Tracks how many
+        contiguous context tokens have been written into `layers.61..63` on
+        `1D` so cold-handoff requests clamp their SWA window to populated slots.
+        """
+        if not isinstance(req_id, str) or not req_id.strip():
+            raise ValueError("req_id must be a non-empty string")
+        if int(num_new_tokens) < 0:
+            raise ValueError(
+                f"num_new_tokens must be non-negative; got {num_new_tokens}"
+            )
+        new_toks = int(num_new_tokens)
+        window = self._draft_swa_window_size
+        with self._swa_state_lock:
+            is_new = req_id not in self._req_draft_populated_tokens
+            if is_new or is_cold_handoff is True:
+                if is_cold_handoff is not None:
+                    cold = bool(is_cold_handoff)
+                elif start_pos is not None and int(start_pos) > 0:
+                    cold = is_target_only_kv_enabled(self.vllm_config)
+                else:
+                    cold = False
+                eff_start = int(start_pos or 0) if cold else 0
+                self._req_draft_valid_start_pos[req_id] = eff_start
+                if cold:
+                    populated = min(window, new_toks)
+                    self._req_draft_cold_handoff[req_id] = populated < window
+                else:
+                    populated = min(window, int(start_pos or 0) + new_toks)
+                    self._req_draft_cold_handoff[req_id] = False
+                self._req_draft_populated_tokens[req_id] = populated
+                return populated
+
+            prev = self._req_draft_populated_tokens[req_id]
+            populated = min(window, prev + new_toks)
+            self._req_draft_populated_tokens[req_id] = populated
+            if populated >= window:
+                self._req_draft_cold_handoff[req_id] = False
+            return populated
+
+    def evict_request_draft_kv_state(self, req_id: str) -> None:
+        """Remove finished/aborted request state from draft SWA tracking."""
+        with self._swa_state_lock:
+            self._req_draft_populated_tokens.pop(req_id, None)
+            self._req_draft_valid_start_pos.pop(req_id, None)
+            self._req_draft_cold_handoff.pop(req_id, None)
+
+    def clamp_cold_handoff_swa_seq_lens(
+        self,
+        seq_lens: torch.Tensor,
+        req_ids: Sequence[str | None] | None = None,
+        *,
+        start_index: int = 0,
+        num_reqs: int | None = None,
+        block_size: int | None = None,
+    ) -> torch.Tensor:
+        """Clamp draft SWA `seq_lens` to `populated_tokens + block_size` for
+        requests in cold-handoff state (RC36-B).
+
+        When no request is in cold-handoff state (e.g. symmetric `1P(MTP=true)`
+        or after `populated_tokens >= sliding_window`), returns `seq_lens`
+        unchanged with zero tensor allocations.
+        """
+        with self._swa_state_lock:
+            if not self._req_draft_cold_handoff or not any(
+                self._req_draft_cold_handoff.values()
+            ):
+                return seq_lens
+            if req_ids is None:
+                batch = getattr(self.runner, "input_batch", None)
+                req_ids = getattr(batch, "req_ids", None)
+            if not isinstance(req_ids, (list, tuple)) or not req_ids:
+                return seq_lens
+
+            padded_n = int(seq_lens.shape[0])
+            live_n = (
+                min(int(num_reqs), padded_n)
+                if num_reqs is not None
+                else min(len(req_ids) - int(start_index), padded_n)
+            )
+            if live_n <= 0:
+                return seq_lens
+
+            self._ensure_swa_buffers_capacity(padded_n)
+            cap_buf = self._swa_scratch_np[:padded_n]
+            cap_buf.fill(_SWA_UNCLAMPED_CAP_I32)
+            eff_block = int(self.block_size if block_size is None else block_size)
+
+            any_active_cold = False
+            for i in range(live_n):
+                idx = int(start_index) + i
+                rid = req_ids[idx] if idx < len(req_ids) else None
+                if rid is not None and self._req_draft_cold_handoff.get(rid, False):
+                    any_active_cold = True
+                    cap_buf[i] = (
+                        self._req_draft_populated_tokens.get(rid, 1) + eff_block
+                    )
+
+            if not any_active_cold:
+                return seq_lens
+
+            seq_lens_np = seq_lens.detach().cpu().numpy().astype(np.int32, copy=False)
+            clamped_np = clamp_swa_seq_lens_fast_inplace(
+                seq_lens_np,
+                cap_buf,
+                self._swa_out_np,
+            )
+            return torch.from_numpy(clamped_np.copy()).to(
+                device=seq_lens.device, dtype=seq_lens.dtype
+            )
+
     def _build_draft_attn_metadata(
         self,
         chunk: DraftChunkInputs,
@@ -307,6 +535,12 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs
         )
+        effective_seq_lens = self.clamp_cold_handoff_swa_seq_lens(
+            seq_lens,
+            start_index=chunk.start_index,
+            num_reqs=chunk.num_reqs,
+            block_size=self.block_size,
+        )
         # num_reqs must be the REAL request count: the staging walk copies
         # exactly ctx.num_reqs block-table rows, and rows beyond the live
         # batch hold departed requests' freed block ids. With the real
@@ -315,7 +549,7 @@ class DFlashProposer:
             num_reqs=chunk.num_reqs,
             start_index=chunk.start_index,
             use_max_model_len=chunk_ctx.use_max_model_len,
-            seq_lens=seq_lens,
+            seq_lens=effective_seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             position_ids_override=chunk_ctx.position_ids_override,
@@ -365,6 +599,15 @@ class DFlashProposer:
         if position_ids_device.dim() > 1:
             position_ids_device = position_ids_device[0]
 
+        num_reqs_arg: int | torch.Tensor = num_reqs
+        if (
+            isinstance(query_start_loc_device, torch.Tensor)
+            and query_start_loc_device.device.type == "tpu"
+        ):
+            num_reqs_arg = self._get_num_reqs_tpu(
+                int(num_reqs), query_start_loc_device.device
+            )
+
         # Route to the appropriate pre-compiled XLA Graph
         if next_tokens_device is not None:
             # No spec metadata means nothing was verified this step, so every
@@ -377,7 +620,7 @@ class DFlashProposer:
                 query_start_loc_device,
                 position_ids_device,
                 draft_lengths,
-                num_reqs,
+                num_reqs_arg,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -388,7 +631,7 @@ class DFlashProposer:
                 device_seed,
                 query_start_loc_device,
                 position_ids_device,
-                num_reqs,
+                num_reqs_arg,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -400,6 +643,20 @@ class DFlashProposer:
             )
 
         return input_ids, positions, seq_lens
+
+    def _get_num_reqs_tpu(self, num_reqs: int, device: torch.device) -> torch.Tensor:
+        """Cached 1-element int32 device tensor for `num_reqs` so compiled
+        input builders trace a static `(1,)` tensor shape instead of
+        recompiling per Python `int` `num_reqs` (RC39-B)."""
+        cache = getattr(self, "_num_reqs_tpu_cache", None)
+        if cache is None:
+            cache = {}
+            self._num_reqs_tpu_cache = cache
+        t = cache.get(num_reqs)
+        if t is None or t.device != device:
+            t = torch.tensor([num_reqs], dtype=torch.int32, device=device)
+            cache[num_reqs] = t
+        return t
 
     def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
         """Cached all-zero `draft_lengths` for a chunk without spec
@@ -413,8 +670,8 @@ class DFlashProposer:
         )
         zeros = self._zero_draft_lengths_cache.get(padded_num_reqs)
         if zeros is None:
-            zeros = torch.zeros(
-                padded_num_reqs, dtype=torch.int32, device=self.runner.device
+            zeros = torch.zeros(padded_num_reqs, dtype=torch.int32).to(
+                self.runner.device
             )
             self._zero_draft_lengths_cache[padded_num_reqs] = zeros
         return zeros
@@ -451,6 +708,44 @@ class DFlashProposer:
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
+    def _record_chunk_draft_kv_tokens(
+        self, chunk: DraftChunkInputs, positions: torch.Tensor
+    ) -> None:
+        """Record context tokens per request for cold-handoff SWA tracking."""
+        if not is_target_only_kv_enabled(self.vllm_config) and not (
+            self._req_draft_cold_handoff and any(self._req_draft_cold_handoff.values())
+        ):
+            return
+        batch = getattr(self.runner, "input_batch", None)
+        req_ids = getattr(batch, "req_ids", None)
+        if not isinstance(req_ids, (list, tuple)) or not req_ids:
+            return
+        attn_ctx = getattr(chunk, "attn_ctx", None)
+        qsl = getattr(attn_ctx, "query_start_loc", None)
+        if qsl is None or not isinstance(qsl, torch.Tensor):
+            return
+        if qsl.numel() < 2:
+            return
+        qsl_cpu = qsl.detach().cpu().tolist()
+        pos_cpu = (
+            positions.detach().cpu().tolist()
+            if isinstance(positions, torch.Tensor)
+            else []
+        )
+        num_reqs = min(int(chunk.num_reqs), len(qsl_cpu) - 1)
+        for i in range(num_reqs):
+            rid_idx = int(chunk.start_index) + i
+            if rid_idx >= len(req_ids):
+                break
+            rid = req_ids[rid_idx]
+            if not rid:
+                continue
+            q_start = int(qsl_cpu[i])
+            q_end = int(qsl_cpu[i + 1])
+            num_new = max(0, q_end - q_start)
+            start_pos = int(pos_cpu[q_start]) if q_start < len(pos_cpu) else 0
+            self.record_request_draft_kv_tokens(rid, num_new, start_pos=start_pos)
+
     def _update_draft_kv_cache_from_target(self, chunk) -> None:
         """
         Projects the target model's hidden states into the draft model's KV cache.
@@ -475,6 +770,7 @@ class DFlashProposer:
         if positions.dim() > 1:
             positions = positions[0]
         positions = positions[:num_tokens]
+        self._record_chunk_draft_kv_tokens(chunk, positions)
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
         with set_vllm_model_wrapper_context(
@@ -506,11 +802,17 @@ class DFlashProposer:
         """
         runner = self.runner
         num_reqs = runner.input_batch.num_reqs
+        step_chunks = getattr(runner, "_dp_step_num_chunks", 0)
         if num_reqs == 0:
+            if self._dp_lockstep_sharded() and step_chunks > 0:
+                self.run_dp_dummy_draft(step_chunks)
             return []
 
         chunks = self.draft_chunks
         if not chunks:
+            if self._dp_lockstep_sharded() and step_chunks > 0:
+                self.run_dp_dummy_draft(step_chunks)
+                return []
             raise RuntimeError("DFlash propose called but no draft chunks captured.")
 
         block_size = self.block_size
@@ -522,7 +824,7 @@ class DFlashProposer:
         # follow the same phase structure (never interleave per chunk).
         extra_chunks = 0
         if self._dp_lockstep_sharded():
-            extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
+            extra_chunks = max(0, step_chunks - len(chunks))
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
         for chunk in chunks:
@@ -667,25 +969,33 @@ class DFlashProposer:
         # matching what the runner hands the real update.
         target_hidden = self.vllm_config.model_config.get_hidden_size()
         assert self.draft_model is not None
-        dtype = self.draft_model.model.embed_tokens.weight.dtype
+        embed_tokens = getattr(
+            getattr(self.draft_model, "model", None), "embed_tokens", None
+        )
+        embed_weight = getattr(embed_tokens, "weight", None)
+        dtype = (
+            embed_weight.dtype
+            if embed_weight is not None
+            else (
+                getattr(self.vllm_config.model_config, "dtype", None) or torch.bfloat16
+            )
+        )
         dummy_hidden = [
-            torch.zeros((num_tokens, target_hidden), dtype=dtype, device=runner.device)
+            torch.zeros((num_tokens, target_hidden), dtype=dtype).to(runner.device)
             for _ in self._target_layer_ids
         ]
-        dummy_positions = torch.zeros(
-            num_tokens, dtype=torch.int32, device=runner.device
-        )
+        dummy_positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
 
-        block_tables = torch.zeros(
-            (num_reqs * num_blocks,), dtype=torch.int32, device=runner.device
+        block_tables = torch.zeros((num_reqs * num_blocks,), dtype=torch.int32).to(
+            runner.device
         )
-        seq_lens = torch.zeros((num_reqs,), dtype=torch.int32, device=runner.device)
-        seq_lens[0] = num_tokens
+        seq_lens_cpu = torch.zeros((num_reqs,), dtype=torch.int32)
+        seq_lens_cpu[0] = num_tokens
+        seq_lens = seq_lens_cpu.to(runner.device)
 
-        query_start_loc = torch.zeros(
-            (num_reqs + 1,), dtype=torch.int32, device=runner.device
-        )
-        query_start_loc[1:] = num_tokens
+        query_start_loc_cpu = torch.full((num_reqs + 1,), num_tokens, dtype=torch.int32)
+        query_start_loc_cpu[0] = 0
+        query_start_loc = query_start_loc_cpu.to(runner.device)
 
         request_distribution = torch.tensor(
             [0, 0, num_reqs], dtype=torch.int32, device=runner.device
@@ -745,27 +1055,42 @@ class DFlashProposer:
                 f"its query block size {block_size}"
             )
 
-        input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(runner.device)
-        positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
-
         # Map actual request count based on block allocations; the guard
         # above makes this >= 1.
         actual_num_reqs = num_tokens // block_size
-
         num_tokens_per_req = num_tokens // actual_num_reqs
-        query_lens = [num_tokens_per_req] * actual_num_reqs
-        query_start_loc = torch.cumsum(
-            torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
-        ).to(runner.device)
-
-        seq_lens = (
-            torch.ones((actual_num_reqs,), dtype=torch.int32).to(runner.device)
-            * num_tokens_per_req
-        )
-
-        request_distribution = torch.tensor(
-            [0, 0, actual_num_reqs], dtype=torch.int32
-        ).to(runner.device)
+        cache_key = (num_tokens, actual_num_reqs)
+        cached = self._dummy_draft_input_cache.get(cache_key)
+        if cached is None:
+            input_ids = torch.zeros((num_tokens,), dtype=torch.int32).to(runner.device)
+            positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
+            query_start_loc = torch.arange(
+                0,
+                (actual_num_reqs + 1) * num_tokens_per_req,
+                num_tokens_per_req,
+                dtype=torch.int32,
+            ).to(runner.device)
+            seq_lens = torch.full(
+                (actual_num_reqs,), num_tokens_per_req, dtype=torch.int32
+            ).to(runner.device)
+            request_distribution = torch.tensor(
+                [0, 0, actual_num_reqs], dtype=torch.int32
+            ).to(runner.device)
+            cached = (
+                input_ids,
+                positions,
+                query_start_loc,
+                seq_lens,
+                request_distribution,
+            )
+            self._dummy_draft_input_cache[cache_key] = cached
+        (
+            input_ids,
+            positions,
+            query_start_loc,
+            seq_lens,
+            request_distribution,
+        ) = cached
 
         per_layer_attn_metadata = self._build_attn_metadata_for_draft(
             num_reqs=actual_num_reqs,
@@ -807,7 +1132,12 @@ class DFlashProposer:
         Runs on the decode path, so it must not wait on the host."""
         runner = self.runner
         bucket = runner._dp_target_bucket
-        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
+        if bucket is None:
+            bucket = (
+                runner.num_tokens_paddings[0]
+                if getattr(runner, "num_tokens_paddings", None)
+                else 16
+            )
         self._dummy_precompute_and_update_kv_cache(
             num_tokens=bucket,
             num_reqs=runner.num_reqs_max_model_len,
@@ -827,7 +1157,7 @@ class DFlashProposer:
         lockstep: it is TP-sharded, or it carries expert-parallel MoE
         layers. A replicated, MoE-free draft is entirely rank-local and
         takes no part in the lockstep pairing (as in Eagle3Proposer)."""
-        if not self.runner._dp_lockstep_enabled():
+        if not getattr(self.runner, "_dp_lockstep_enabled", lambda: False)():
             return False
         if not self._draft_replicated:
             return True
@@ -835,7 +1165,7 @@ class DFlashProposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            self._draft_has_moe_cache = _draft_has_moe_layers(self.draft_model)
+            self._draft_has_moe_cache = model_has_moe(self.draft_model)
         return self._draft_has_moe_cache
 
     @torch.no_grad()
@@ -1009,7 +1339,7 @@ class DFlashProposer:
         self,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: int | torch.Tensor,
         padded_num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per padded request row: the clamped request index, a
@@ -1020,7 +1350,11 @@ class DFlashProposer:
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
+        if isinstance(num_reqs, torch.Tensor):
+            max_req_idx = torch.clamp(num_reqs.to(torch.int32) - 1, min=0)
+            safe_req_indices = torch.minimum(req_indices, max_req_idx)
+        else:
+            safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
         start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
@@ -1045,26 +1379,42 @@ class DFlashProposer:
         device = base_tokens.device
         padded_num_reqs = base_tokens.shape[0]
 
-        # Format input_ids with base tokens and MASK placeholders
-        input_ids = torch.full(
-            (padded_len,), mask_token_id, dtype=torch.int32, device=device
-        )
-        scatter_indices = torch.arange(
-            0,
-            padded_num_reqs * block_size,
-            block_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        input_ids.scatter_(0, scatter_indices, base_tokens)
-
+        # RC39-B: Format input_ids with base tokens at slot 0 of each block and
+        # MASK placeholders at slots 1..block_size-1 via out-of-place 2D broadcast
+        # torch.where instead of in-place input_ids.scatter_(...), eliminating
+        # tt_jit_dflash__layout_draft_block_scatter and copy__as_strided_inverse.
         offsets = torch.arange(
             0, block_size, dtype=torch.int32, device=device
         ).unsqueeze(0)
-        positions_unpadded = (base_pos + offsets).flatten()
-        positions = F.pad(
-            positions_unpadded, (0, padded_len - positions_unpadded.shape[0]), value=0
+        mask_block = torch.full(
+            (padded_num_reqs, block_size),
+            mask_token_id,
+            dtype=torch.int32,
+            device=device,
         )
+        input_ids_unpadded = torch.where(
+            offsets == 0,
+            base_tokens.to(torch.int32).unsqueeze(1),
+            mask_block,
+        ).reshape(-1)
+        if padded_len > input_ids_unpadded.shape[0]:
+            input_ids = F.pad(
+                input_ids_unpadded,
+                (0, padded_len - input_ids_unpadded.shape[0]),
+                value=mask_token_id,
+            )
+        else:
+            input_ids = input_ids_unpadded
+
+        positions_unpadded = (base_pos + offsets).reshape(-1)
+        if padded_len > positions_unpadded.shape[0]:
+            positions = F.pad(
+                positions_unpadded,
+                (0, padded_len - positions_unpadded.shape[0]),
+                value=0,
+            )
+        else:
+            positions = positions_unpadded
         # Clamp to max_model_len to prevent out-of-bounds RoPE and kernel indexing.
         positions = torch.clamp(positions, max=self._max_model_len - 1)
         seq_lens = torch.clamp(
@@ -1079,7 +1429,7 @@ class DFlashProposer:
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
         draft_lengths: torch.Tensor,
-        num_reqs: int,
+        num_reqs: int | torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1095,7 +1445,7 @@ class DFlashProposer:
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
             draft_lengths: Number of verified drafts per request (0 for prompt chunks).
-            num_reqs: Number of active requests.
+            num_reqs: Number of active requests (int or 1-element int32 tensor).
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1115,11 +1465,18 @@ class DFlashProposer:
         padded_num_reqs = padded_len // block_size
 
         # Pad target output tokens to static shape on-device
-        next_tokens_device_padded = F.pad(
-            next_tokens_device,
-            (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
-            value=invalid_token_id,
-        ).to(torch.int32)
+        if next_tokens_device.shape[0] < padded_num_reqs:
+            next_tokens_device_padded = F.pad(
+                next_tokens_device,
+                (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
+                value=invalid_token_id,
+            ).to(torch.int32)
+        elif next_tokens_device.shape[0] > padded_num_reqs:
+            next_tokens_device_padded = next_tokens_device[:padded_num_reqs].to(
+                torch.int32
+            )
+        else:
+            next_tokens_device_padded = next_tokens_device.to(torch.int32)
 
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
             self._request_window_bounds(
@@ -1136,13 +1493,13 @@ class DFlashProposer:
         base_tokens = next_tokens_device_padded.gather(
             1, last_valid_col.unsqueeze(1)
         ).squeeze(1)
-        # Replace invalid_token_id (-1) with mask_token_id for padding rows.
+        # Replace invalid_token_id (-1) and padding rows with mask_token_id.
         base_tokens = torch.where(
-            base_tokens == invalid_token_id,
+            (base_tokens == invalid_token_id) | (valid_mask.squeeze(1) == 0),
             torch.full_like(base_tokens, mask_token_id),
             base_tokens,
         )
-        num_accepted = num_valid.unsqueeze(1).to(torch.int32)
+        num_accepted = (num_valid.unsqueeze(1) * valid_mask).to(torch.int32)
 
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
@@ -1162,7 +1519,7 @@ class DFlashProposer:
         device_seed: torch.Tensor,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: int | torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1175,7 +1532,7 @@ class DFlashProposer:
             device_seed: 1D Tensor of shape [num_reqs] containing base tokens.
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
-            num_reqs: Number of active requests.
+            num_reqs: Number of active requests (int or 1-element int32 tensor).
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1193,14 +1550,20 @@ class DFlashProposer:
         padded_num_reqs = padded_len // block_size
 
         # Pad seed tokens to static shape on-device
-        base_tokens = F.pad(
-            device_seed, (0, padded_num_reqs - device_seed.shape[0]), value=0
-        ).to(torch.int32)
+        if device_seed.shape[0] < padded_num_reqs:
+            base_tokens = F.pad(
+                device_seed, (0, padded_num_reqs - device_seed.shape[0]), value=0
+            ).to(torch.int32)
+        elif device_seed.shape[0] > padded_num_reqs:
+            base_tokens = device_seed[:padded_num_reqs].to(torch.int32)
+        else:
+            base_tokens = device_seed.to(torch.int32)
 
         # Anchor one past the last prompt token in the chunk.
         _, valid_mask, _, last_positions = self._request_window_bounds(
             query_start_loc, position_ids, num_reqs, padded_num_reqs
         )
+        base_tokens = (base_tokens * valid_mask.squeeze(1)).to(torch.int32)
         base_pos = ((last_positions + 1) * valid_mask).to(torch.int32)
 
         return self._layout_draft_block(

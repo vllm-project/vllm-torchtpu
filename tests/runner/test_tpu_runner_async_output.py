@@ -15,7 +15,14 @@
 import numpy as np
 import pytest
 import torch
-from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
+
+try:
+    from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
+except ImportError:
+    from tests.test_m3_raiden_dspark_ep32 import _install_vllm_test_stubs
+
+    _install_vllm_test_stubs()
+    from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -29,6 +36,14 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
 )
+
+
+@pytest.fixture
+def device():
+    try:
+        return torch.device("tpu")
+    except Exception:
+        return torch.device("cpu")
 
 
 @pytest.mark.tpu_test
@@ -239,3 +254,86 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+def test_pack_and_pad_helpers_and_per_req_rejection_sampling():
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        _random_rejection_sample_with_segment,
+    )
+    from vllm_torchtpu.runner.tpu_runner import (
+        _pack_prefill_bonus_and_drafts,
+        _pad_next_tokens_tpu,
+        _pad_non_verify_selected_tokens,
+    )
+
+    bonus = torch.tensor([[10], [20]], dtype=torch.int64)
+    drafts = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    packed = _pack_prefill_bonus_and_drafts(bonus, drafts)
+    assert packed.tolist() == [10, 11, 12, 13, 20, 21, 22, 23]
+
+    selected = torch.tensor([[42], [99]], dtype=torch.int32)
+    padded_non_verify = _pad_non_verify_selected_tokens(selected, num_spec_tokens=3)
+    assert padded_non_verify.tolist() == [
+        [42, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [99, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+    ]
+
+    padded_next = _pad_next_tokens_tpu(torch.tensor([1, 2, 3], dtype=torch.int32), 2)
+    assert padded_next.tolist() == [1, 2, 3, 0, 0]
+
+    # Verify per-request (num_reqs, 1) temperatures/top_k/top_p gather inside
+    # _random_rejection_sample_with_segment matches pre-expanded (total_tokens, 1).
+    eager_fn = torch._dynamo.disable(_random_rejection_sample_with_segment)
+    draft_token_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    num_draft_tokens = torch.tensor([2, 2], dtype=torch.int32)
+    target_logits = torch.tensor(
+        [
+            [0.1, 5.0, 0.2, 0.1, 0.1, 0.1],
+            [0.1, 0.2, 5.0, 0.1, 0.1, 0.1],
+            [0.1, 0.1, 0.2, 5.0, 0.1, 0.1],
+            [0.1, 0.1, 0.1, 0.2, 5.0, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    bonus_token_ids = torch.tensor([5, 5], dtype=torch.int32)
+    segment_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    group_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+    req_temps = torch.tensor([[0.8], [1.2]], dtype=torch.float32)
+    req_top_k = torch.tensor([[0], [0]], dtype=torch.int32)
+    req_top_p = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
+    accept_u = torch.full((4,), 0.01, dtype=torch.float32)
+    recover_u = torch.full((4, 6), 0.5, dtype=torch.float32)
+
+    out_per_req = eager_fn(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=2,
+        temperatures=req_temps,
+        top_k=req_top_k,
+        top_p=req_top_p,
+        accept_u=accept_u,
+        recover_u=recover_u,
+        synthetic_conditional_rates=None,
+        synthetic_mode=False,
+    )
+    out_expanded = eager_fn(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=2,
+        temperatures=req_temps[segment_ids],
+        top_k=req_top_k[segment_ids],
+        top_p=req_top_p[segment_ids],
+        accept_u=accept_u,
+        recover_u=recover_u,
+        synthetic_conditional_rates=None,
+        synthetic_mode=False,
+    )
+    assert torch.equal(out_per_req, out_expanded)

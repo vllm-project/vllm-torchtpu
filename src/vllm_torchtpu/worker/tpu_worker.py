@@ -603,7 +603,15 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
+        if getattr(runner, "_dp_step_executed_in_empty_execute_model", False):
+            # RC39-A: execute_model(total_num_scheduled_tokens == 0) already
+            # executed _dp_coordinated_step + _run_dp_idle_pairing on this
+            # scheduler tick (under step_with_batch_queue -> run_busy_loop).
+            # Consume the flag and return without issuing a second collective.
+            runner._dp_step_executed_in_empty_execute_model = False
+            return
         bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
+        runner._dp_step_num_chunks = target_num_chunks
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.
@@ -615,6 +623,17 @@ class TPUWorker(WorkerBase):
                 use_max_model_len=True,
             )
             return
+        if target_num_chunks > 0 and has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            record_fences = getattr(kv_connector, "record_pending_fences", None)
+            if callable(record_fences):
+                try:
+                    record_fences()
+                except Exception:
+                    logger.debug(
+                        "execute_dummy_batch: record_pending_fences skipped",
+                        exc_info=True,
+                    )
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)

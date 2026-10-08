@@ -166,3 +166,35 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+def test_rc39c_query_block_size_before_super_init_and_cpu_scratch_sizing():
+    # RC39-C: _query_block_size(K) must not raise AttributeError even before
+    # super().__init__() finishes, and DFlashProposer.__init__'s
+    # _cpu_draft_input_ids must reflect sample_from_anchor (K vs K + 1).
+    bare = DSparkProposer.__new__(DSparkProposer)
+    assert bare._query_block_size(5) == 5
+
+    p_dense = _make_proposer(
+        {
+            "dspark_noise_token_id": 7,
+            "dspark_block_size": 5,
+            **_LAYER_IDS,
+        },
+        num_speculative_tokens=5,
+    )
+    assert p_dense.sample_from_anchor is True
+    assert p_dense.block_size == 5
+    assert p_dense._cpu_draft_input_ids.shape == (512 * 5,)
+
+    p_bonus = _make_proposer(
+        {
+            "mask_token_id": 7,
+            "sample_from_anchor": False,
+            **_LAYER_IDS,
+        },
+        num_speculative_tokens=5,
+    )
+    assert p_bonus.sample_from_anchor is False
+    assert p_bonus.block_size == 6
+    assert p_bonus._cpu_draft_input_ids.shape == (512 * 6,)

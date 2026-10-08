@@ -209,6 +209,22 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+
+
+def _assemble_spec_next_tokens_impl(
+    nt: torch.Tensor, drafts: torch.Tensor
+) -> torch.Tensor:
+    # Last non-padding column per row is the bonus.
+    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
+    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
+    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1)  # [num_reqs, 1+K]
+    return src.reshape(-1)  # [num_reqs * (1 + K)]
+
+
+_assemble_spec_next_tokens_compiled = _tpu_compile(_assemble_spec_next_tokens_impl)
+
+
 def assemble_spec_next_tokens(
     next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int
 ) -> torch.Tensor:
@@ -229,11 +245,42 @@ def assemble_spec_next_tokens(
     """
     nt = next_tokens[:num_reqs]
     drafts = drafts[:num_reqs]
-    # Last non-padding column per row is the bonus.
-    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
-    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
-    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1)  # [num_reqs, 1+K]
-    return src.reshape(-1)  # [num_reqs * (1 + K)]
+    fn = (
+        _assemble_spec_next_tokens_compiled
+        if nt.device.type == "tpu"
+        else _assemble_spec_next_tokens_impl
+    )
+    return fn(nt, drafts)
+
+
+def _subtract_num_rejected_tokens_impl(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_subtract = torch.where(
+        seq_lens_subtract_indices >= 0,
+        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
+        0,
+    )
+    seq_lens = seq_lens - seq_subtract
+
+    pos_subtract = torch.where(
+        positions_subtract_indices >= 0,
+        num_rejected[positions_subtract_indices.clamp(min=0)],
+        0,
+    )
+    if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
+        pos_subtract = pos_subtract.unsqueeze(0)
+    positions = positions - pos_subtract
+    return seq_lens, positions
+
+
+_subtract_num_rejected_tokens_compiled = _tpu_compile(
+    _subtract_num_rejected_tokens_impl
+)
 
 
 def subtract_num_rejected_tokens(
@@ -260,23 +307,29 @@ def subtract_num_rejected_tokens(
         positions_subtract_indices: ``[total_tokens]`` index into ``num_rejected``
             for each position slot, ``-1`` to leave it unchanged.
     """
-    zero = num_rejected.new_zeros(())
-    seq_subtract = torch.where(
-        seq_lens_subtract_indices >= 0,
-        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
-        zero,
+    fn = (
+        _subtract_num_rejected_tokens_compiled
+        if seq_lens.device.type == "tpu"
+        else _subtract_num_rejected_tokens_impl
     )
-    seq_lens = seq_lens - seq_subtract
+    return fn(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
 
-    pos_subtract = torch.where(
-        positions_subtract_indices >= 0,
-        num_rejected[positions_subtract_indices.clamp(min=0)],
-        zero,
-    )
-    if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
-        pos_subtract = pos_subtract.unsqueeze(0)
-    positions = positions - pos_subtract
-    return seq_lens, positions
+
+def _extract_draft_token_ids_impl(
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    return input_ids[logits_indices[target_logits_indices + 1]]
+
+
+_extract_draft_token_ids_compiled = _tpu_compile(_extract_draft_token_ids_impl)
 
 
 def extract_draft_token_ids(
@@ -287,7 +340,22 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    fn = (
+        _extract_draft_token_ids_compiled
+        if input_ids.device.type == "tpu"
+        else _extract_draft_token_ids_impl
+    )
+    return fn(input_ids, logits_indices, target_logits_indices)
+
+
+def _compute_num_rejected_impl(
+    nt: torch.Tensor, num_draft: torch.Tensor
+) -> torch.Tensor:
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1)
+    return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+_compute_num_rejected_compiled = _tpu_compile(_compute_num_rejected_impl)
 
 
 def compute_num_rejected(
@@ -301,5 +369,10 @@ def compute_num_rejected(
         num_draft: ``[num_reqs]`` scheduled draft count per request.
     """
     num_reqs = num_draft.shape[0]
-    num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
-    return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+    nt = next_tokens[:num_reqs]
+    fn = (
+        _compute_num_rejected_compiled
+        if nt.device.type == "tpu"
+        else _compute_num_rejected_impl
+    )
+    return fn(nt, num_draft)

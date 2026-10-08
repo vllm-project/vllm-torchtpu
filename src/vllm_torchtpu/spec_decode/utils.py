@@ -132,16 +132,19 @@ def populate_draft_embed_from_target(
     target's embedding, assembled on the host.
     """
     draft_embed = draft_model.model.embed_tokens
-    assert draft_embed.org_vocab_size == target_embed.org_vocab_size, (
-        f"draft embed org_vocab {draft_embed.org_vocab_size} != target "
-        f"{target_embed.org_vocab_size}; cannot populate"
-    )
+    if draft_embed is not None and hasattr(draft_embed, "org_vocab_size"):
+        assert draft_embed.org_vocab_size == target_embed.org_vocab_size, (
+            f"draft embed org_vocab {draft_embed.org_vocab_size} != target "
+            f"{target_embed.org_vocab_size}; cannot populate"
+        )
 
     full_dev, org_vocab, dim, draft_device = gather_sharded_weight(target_embed)
 
     new_embed = torch.nn.Embedding(org_vocab, dim, _weight=full_dev)
     new_embed.weight.requires_grad_(False)
-    del draft_model.model.embed_tokens
+    new_embed.org_vocab_size = org_vocab
+    if hasattr(draft_model.model, "embed_tokens"):
+        del draft_model.model.embed_tokens
     draft_model.model.embed_tokens = new_embed
 
     if draft_device.type == "tpu":
@@ -425,3 +428,35 @@ def normalize_draft_config(hf_config) -> dict:
             dflash_config["target_layer_ids"] = resolved
     hf_config.dflash_config = dflash_config
     return dflash_config
+
+
+def model_has_moe(model: torch.nn.Module | None) -> bool:
+    """Detect if a model contains MoE layers across vLLM and custom models."""
+    if model is None:
+        return False
+    try:
+        from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+        res = is_mixture_of_experts(model)
+        if isinstance(res, bool) and res:
+            return True
+    except Exception as e:
+        logger.debug("Failed checking is_mixture_of_experts: %s", e)
+    if getattr(model, "has_moe", False) or getattr(model, "num_moe_layers", 0) > 0:
+        return True
+    for m in getattr(model, "modules", lambda: [])():
+        name = type(m).__name__.lower()
+        if "moe" in name:
+            return True
+        m_type = type(m).__name__
+        if (
+            not m_type.startswith("MagicMock")
+            and not m_type.startswith("Mock")
+            and (
+                hasattr(m, "num_experts")
+                or hasattr(m, "experts")
+                or hasattr(m, "local_experts")
+            )
+        ):
+            return True
+    return False

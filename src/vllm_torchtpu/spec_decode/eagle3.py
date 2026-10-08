@@ -32,6 +32,7 @@ from vllm_torchtpu.spec_decode.utils import (
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    model_has_moe,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -2011,9 +2012,7 @@ class Eagle3Proposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            self._draft_has_moe_cache = model_has_moe(self.draft_model)
         return self._draft_has_moe_cache
 
     def _dp_lockstep_sharded(self) -> bool:

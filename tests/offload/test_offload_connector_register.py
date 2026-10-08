@@ -11,11 +11,27 @@ strided views into shared pool tensors.
 Runs on CPU tensors: the canonicalization is pure storage arithmetic.
 """
 
+import os
+import sys
 from types import SimpleNamespace
 
 import torch
 
-from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+for _cand_path in (
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src")),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+):
+    if os.path.isdir(_cand_path) and _cand_path not in sys.path:
+        sys.path.insert(0, _cand_path)
+
+try:
+    import vllm  # noqa: F401
+except ImportError:
+    import tests.test_m3_raiden_dspark_ep32 as _m3_test_bootstrap  # noqa: F401
+
+from vllm_torchtpu.offload.raiden_connector import (  # noqa: E402
+    TPURaidenOffloadingConnector,
+)
 
 NUM_BLOCKS = 4
 
@@ -104,6 +120,7 @@ def test_register_kv_caches_ds_v4_alias_groups():
 
     canonical = captured[0]
 
-    # Aliases collapse: four layer entries, three distinct arrays.
+    # Aliases collapse: four layer entries, three distinct arrays sorted
+    # descending by page_size_bytes.
     assert len(canonical.tensors) == 3
-    assert [t.page_size_bytes for t in canonical.tensors] == [256, 64, 128]
+    assert [t.page_size_bytes for t in canonical.tensors] == [256, 128, 64]

@@ -80,6 +80,7 @@ import enum
 import hashlib
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -575,6 +576,69 @@ class RaidenOffloadingManager(OffloadingManager):
         if not all_local:
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
+
+    def probe_key_resident(self, key: OffloadKey) -> bool:
+        """Non-pinning residence probe for PrefixAwareScheduler warmth scoring (RC35-C).
+
+        Uses ``self._probe`` (which never increments pin refcounts or triggers
+        eviction) and does not populate ``self._remote_slices``, so scheduling
+        lookahead across a window of waiting requests leaves LRU state and
+        in-flight slice bookkeeping untouched.
+        """
+        if key in getattr(self, "_inflight_store_keys", ()):
+            return True
+        expand_fn = getattr(self, "_sub_hashes", None) or getattr(
+            self, "_expand_sub_hashes", None
+        )
+        if expand_fn is None:
+            return False
+        sub_hashes = expand_fn(key)
+        if not sub_hashes:
+            return False
+        allow_remote = bool(getattr(self, "_enable_global", False))
+        probe_results = self._probe(sub_hashes, enable_global=allow_remote)
+        if not probe_results or len(probe_results) < len(sub_hashes):
+            return False
+        bs = getattr(self, "_block_status", None)
+        resident_statuses = ()
+        if bs is not None:
+            resident_statuses = (
+                bs.HOST,
+                bs.HOST_AND_HBM,
+            ) + ((bs.REMOTE,) if allow_remote else ())
+        items = (
+            probe_results.items() if isinstance(probe_results, dict) else probe_results
+        )
+        hash_to_adm = getattr(self, "_hash_to_admission", {})
+        for item in items:
+            sub_hash, block = (
+                item if isinstance(item, tuple) and len(item) == 2 else (None, item)
+            )
+            if block is None:
+                return False
+            curr_bs = bs or (type(block.status) if hasattr(block, "status") else None)
+            if curr_bs is not None and hasattr(block, "status"):
+                curr_resident_statuses = resident_statuses or (
+                    (curr_bs.HOST, curr_bs.HOST_AND_HBM)
+                    + ((curr_bs.REMOTE,) if allow_remote else ())
+                )
+                if block.status in curr_resident_statuses:
+                    continue
+                if (
+                    hasattr(curr_bs, "HBM")
+                    and block.status == curr_bs.HBM
+                    and sub_hash in hash_to_adm
+                ):
+                    continue
+                return False
+            is_null = getattr(block, "is_null", None)
+            if (
+                callable(is_null)
+                and is_null()
+                and not getattr(block, "remote_addr", "")
+            ):
+                return False
+        return True
 
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
@@ -1225,6 +1289,164 @@ class RaidenOffloadingManager(OffloadingManager):
             time.sleep(0.0005)
 
 
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_DRAFT_PREFIX_TOKENS = ("mtp", "draft", "dflash", "dspark")
+
+
+def is_target_only_kv_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """True when Raiden KV transfer should exclude draft/MTP KV caches (RC36-A)."""
+    if envs.VLLM_TPU_RAIDEN_TARGET_ONLY_KV:
+        return True
+    if vllm_config is None:
+        return False
+    kv_transfer_cfg = getattr(vllm_config, "kv_transfer_config", None)
+    extra_cfg = getattr(kv_transfer_cfg, "kv_connector_extra_config", None)
+    if isinstance(extra_cfg, Mapping) and "target_only_kv" in extra_cfg:
+        val = extra_cfg.get("target_only_kv", False)
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(val, (bool, int)):
+            return bool(val)
+    return False
+
+
+def get_num_target_hidden_layers(vllm_config: VllmConfig | None) -> int | None:
+    """Resolve the target model's `num_hidden_layers` (e.g. 61 for DeepSeek-V4)."""
+    if vllm_config is None:
+        return None
+    model_cfg = getattr(vllm_config, "model_config", None)
+    if model_cfg is None:
+        return None
+    for attr in ("hf_text_config", "hf_config"):
+        hf_cfg = getattr(model_cfg, attr, None)
+        num_layers = getattr(hf_cfg, "num_hidden_layers", None)
+        if isinstance(num_layers, int) and num_layers > 0:
+            return num_layers
+    return None
+
+
+def is_draft_kv_layer_name(
+    layer_name: str, num_target_layers: int | None = None
+) -> bool:
+    """Identify draft/MTP KV cache layer names (e.g. `layers.61..63` on DSv4)."""
+    parts = [p.lower() for p in layer_name.split(".") if p]
+    if any(p in _DRAFT_PREFIX_TOKENS or p.startswith("mtp_") for p in parts):
+        return True
+    if num_target_layers is not None and num_target_layers > 0:
+        match = _LAYER_INDEX_RE.search(layer_name)
+        if match is not None and int(match.group(1)) >= num_target_layers:
+            return True
+    return False
+
+
+def infer_draft_kv_tensor_count(vllm_config: VllmConfig | None) -> int:
+    """Infer how many draft KV cache tensors speculative decoding adds when
+    `kv_cache_config` is not passed directly to `derive_offload_namespace`."""
+    if vllm_config is None:
+        return 0
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    if spec_cfg is None:
+        return 0
+    draft_model_cfg = getattr(spec_cfg, "draft_model_config", None)
+    draft_hf = getattr(draft_model_cfg, "hf_config", None)
+    for attr in ("n_mtp_layers", "num_nextn_predict_layers", "num_draft_layers"):
+        val = getattr(draft_hf, attr, None)
+        if isinstance(val, int) and val > 0:
+            return val
+    if hasattr(draft_hf, "to_dict"):
+        hf_dict = draft_hf.to_dict()
+        for key in ("n_mtp_layers", "num_nextn_predict_layers", "num_draft_layers"):
+            val = hf_dict.get(key)
+            if isinstance(val, int) and val > 0:
+                return val
+    method = str(getattr(spec_cfg, "method", "") or "").lower()
+    if method in ("dspark", "dflash", "mtp", "deepseek_mtp"):
+        return (
+            3
+            if method == "dspark"
+            else int(getattr(spec_cfg, "num_speculative_tokens", 1) or 1)
+        )
+    return 0
+
+
+def resolve_target_only_kv_counts(
+    vllm_config: VllmConfig | None,
+    kv_cache_config: KVCacheConfig | None,
+    num_kv_cache_groups: int,
+    num_kv_cache_tensors: int,
+) -> tuple[int, int]:
+    """Return `(target_num_groups, target_num_tensors)` excluding draft/MTP layers."""
+    num_target_layers = get_num_target_hidden_layers(vllm_config)
+    if kv_cache_config is not None:
+        groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
+        tensors = getattr(kv_cache_config, "kv_cache_tensors", None) or ()
+        if groups:
+            target_groups = [
+                g
+                for g in groups
+                if not getattr(g, "layer_names", None)
+                or any(
+                    not is_draft_kv_layer_name(name, num_target_layers)
+                    for name in g.layer_names
+                )
+            ]
+            num_kv_cache_groups = len(target_groups)
+        if tensors and any(getattr(t, "shared_by", None) is not None for t in tensors):
+            target_tensors = [
+                t
+                for t in tensors
+                if not getattr(t, "shared_by", None)
+                or any(
+                    not is_draft_kv_layer_name(name, num_target_layers)
+                    for name in t.shared_by
+                )
+            ]
+            return num_kv_cache_groups, len(target_tensors)
+        draft_layers_in_groups = sum(
+            1
+            for g in groups
+            for name in (getattr(g, "layer_names", None) or ())
+            if is_draft_kv_layer_name(name, num_target_layers)
+        )
+        if draft_layers_in_groups > 0:
+            return (
+                num_kv_cache_groups,
+                max(1, num_kv_cache_tensors - draft_layers_in_groups),
+            )
+
+    draft_count = infer_draft_kv_tensor_count(vllm_config)
+    if draft_count > 0 and num_kv_cache_tensors > draft_count:
+        return num_kv_cache_groups, num_kv_cache_tensors - draft_count
+    return num_kv_cache_groups, num_kv_cache_tensors
+
+
+def filter_target_only_kv_caches(
+    kv_caches: Mapping[str, Any],
+    num_target_layers: int | None = None,
+) -> dict[str, Any]:
+    """Filter a `layer_name -> kv_cache` mapping to target-model layers only."""
+    if num_target_layers is None:
+        # Infer target layer count when both main MLA/indexer caches and SWA-only
+        # draft layers exist (e.g. DSv4 target layers 0..60 + draft SWA 61..63).
+        non_swa_indices = []
+        all_indices = []
+        for name in kv_caches:
+            m = _LAYER_INDEX_RE.search(name)
+            if m is not None:
+                idx = int(m.group(1))
+                all_indices.append(idx)
+                if "swa_cache" not in name:
+                    non_swa_indices.append(idx)
+        if non_swa_indices and max(all_indices) > max(non_swa_indices):
+            num_target_layers = max(non_swa_indices) + 1
+    filtered = {
+        name: cache
+        for name, cache in kv_caches.items()
+        if not is_draft_kv_layer_name(name, num_target_layers)
+    }
+    return filtered if filtered else dict(kv_caches)
+
+
 def derive_offload_namespace(
     vllm_config: VllmConfig,
     *,
@@ -1237,6 +1459,8 @@ def derive_offload_namespace(
     num_kv_cache_tensors: int,
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
+    kv_cache_config: KVCacheConfig | None = None,
+    target_only_kv: bool | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1254,6 +1478,18 @@ def derive_offload_namespace(
     Returns:
         A 16-byte SHA-256 digest unique to this engine and layout configuration.
     """
+    use_target_only = (
+        is_target_only_kv_enabled(vllm_config)
+        if target_only_kv is None
+        else bool(target_only_kv)
+    )
+    if use_target_only:
+        num_kv_cache_groups, num_kv_cache_tensors = resolve_target_only_kv_counts(
+            vllm_config,
+            kv_cache_config,
+            num_kv_cache_groups,
+            num_kv_cache_tensors,
+        )
     model_config = vllm_config.model_config
     # A multi-shape layout hands over sets, whose iteration order is not
     # stable across processes -- `torch.dtype` hashes by identity, so
@@ -2268,6 +2504,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
+            kv_cache_config=kv_cache_config,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
@@ -2361,7 +2598,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         if self._worker is None:
             from vllm.distributed import parallel_state
 
-            rank = parallel_state.get_world_group().rank_in_group
+            # The Raiden controller enumerates the workers of ONE model replica,
+            # i.e. one TP group. With multi-host DP the global world rank keeps
+            # growing across replicas (DP x TP) and indexes past the controller's
+            # worker slots, so use the rank within the TP group.
+            rank = parallel_state.get_tp_group().rank_in_group
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (

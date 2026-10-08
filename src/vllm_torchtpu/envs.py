@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_RAIDEN_TARGET_ONLY_KV: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -985,6 +986,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # RC36-A: Exclude draft/MTP KV caches (e.g. DSpark layers.61..63) from
+    # Raiden namespace derivation, pool manifest registration, and HBM storage
+    # registration so asymmetric 1P(MTP=false) -> 1D(MTP=true) disaggregation
+    # transfers only the 246 target KV tensors across 122 backing storages.
+    "VLLM_TPU_RAIDEN_TARGET_ONLY_KV": env_bool(
+        "VLLM_TPU_RAIDEN_TARGET_ONLY_KV", default=False
+    ),
 }
 
 

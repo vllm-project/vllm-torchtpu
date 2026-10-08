@@ -1480,9 +1480,41 @@ class Dsv4LayerEntry(NamedTuple):
     array: Any
 
 
+def _infer_dsv4_num_target_layers(named_kv_caches: Mapping[str, Any]) -> int | None:
+    """Infer target layer count (e.g. 61 for DSv4) by finding the highest
+    layer index that owns a main MLA/indexer cache rather than SWA-only draft cache."""
+    non_swa_indices: list[int] = []
+    all_indices: list[int] = []
+    for name in named_kv_caches:
+        idx = layer_index_from_name(name)
+        if idx is not None:
+            all_indices.append(idx)
+            if "swa_cache" not in name:
+                non_swa_indices.append(idx)
+    if non_swa_indices and max(all_indices) > max(non_swa_indices):
+        return max(non_swa_indices) + 1
+    return None
+
+
+def _is_dsv4_draft_layer_name(layer_name: str, num_target_layers: int | None) -> bool:
+    parts = [p.lower() for p in str(layer_name).split(".") if p]
+    if any(
+        p in ("mtp", "draft", "dflash", "dspark") or p.startswith("mtp_") for p in parts
+    ):
+        return True
+    if num_target_layers is not None and num_target_layers > 0:
+        idx = layer_index_from_name(layer_name)
+        if idx is not None and idx >= num_target_layers:
+            return True
+    return False
+
+
 def _dsv4_classify(
     kv_cache_groups: Sequence[Any],
     named_kv_caches: Mapping[str, Any],
+    *,
+    target_only_kv: bool = False,
+    num_target_layers: int | None = None,
 ) -> list[Dsv4LayerEntry]:
     """Split DSv4's layers into one `Dsv4LayerEntry` per (layer, array).
 
@@ -1490,9 +1522,18 @@ def _dsv4_classify(
     feeds. Iteration is in cache-group order, then declared layer order, so
     both transfer peers build the same pool list.
     """
+    effective_target_layers = (
+        (num_target_layers or _infer_dsv4_num_target_layers(named_kv_caches))
+        if target_only_kv
+        else None
+    )
     kv_tag_by_layer: dict[str, str] = {}
     for group in kv_cache_groups:
         for layer_name in group.layer_names:
+            if target_only_kv and _is_dsv4_draft_layer_name(
+                layer_name, effective_target_layers
+            ):
+                continue
             if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
                 continue
             if "swa_cache" in layer_name:
@@ -1504,6 +1545,10 @@ def _dsv4_classify(
     entries: list[Dsv4LayerEntry] = []
     for group_index, group in enumerate(kv_cache_groups):
         for layer_name in group.layer_names:
+            if target_only_kv and _is_dsv4_draft_layer_name(
+                layer_name, effective_target_layers
+            ):
+                continue
             cache = named_kv_caches.get(layer_name)
             if cache is None:
                 raise ManifestError(
@@ -1594,6 +1639,8 @@ def build_dsv4_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
+    target_only_kv: bool | None = None,
+    num_target_layers: int | None = None,
 ) -> PoolManifest:
     """Builds the Pool Manifest for DeepSeek-V4, one pool per (layer, array).
 
@@ -1610,7 +1657,17 @@ def build_dsv4_pool_manifest(
     if not kv_cache_groups:
         raise ManifestError("DSv4 admission needs at least one KV cache group")
 
-    entries = _dsv4_classify(kv_cache_groups, named_kv_caches)
+    use_target_only = (
+        bool(tpu_envs.VLLM_TPU_RAIDEN_TARGET_ONLY_KV)
+        if target_only_kv is None
+        else bool(target_only_kv)
+    )
+    entries = _dsv4_classify(
+        kv_cache_groups,
+        named_kv_caches,
+        target_only_kv=use_target_only,
+        num_target_layers=num_target_layers,
+    )
 
     binding, _ = _binding_for(
         [(entry.layer_name, entry.array) for entry in entries], raw_tensors

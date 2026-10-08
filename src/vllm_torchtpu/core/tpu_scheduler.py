@@ -18,6 +18,19 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
+_PROCESS_CROSS_DP_HAS_ACTIVE_DECODE: bool = False
+
+
+def set_process_cross_dp_active_decode(active: bool) -> None:
+    """Update the process-level cross-DP active decode indicator."""
+    global _PROCESS_CROSS_DP_HAS_ACTIVE_DECODE
+    _PROCESS_CROSS_DP_HAS_ACTIVE_DECODE = bool(active)
+
+
+def get_process_cross_dp_active_decode() -> bool:
+    """Return the process-level cross-DP active decode indicator."""
+    return bool(_PROCESS_CROSS_DP_HAS_ACTIVE_DECODE)
+
 
 class TpuDpScheduler(AsyncScheduler):
     """Scheduler that aligns prefill admission across DP ranks.

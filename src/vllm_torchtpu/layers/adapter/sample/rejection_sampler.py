@@ -451,6 +451,14 @@ def _random_rejection_sample_with_segment(
     valid_draft_token_ids = draft_token_ids >= 0
     safe_draft_token_ids = draft_token_ids.clamp(min=0)
 
+    if total_tokens > 0 and temperatures.shape[0] != total_tokens:
+        safe_seg_ids = segment_ids.to(torch.int64).clamp(
+            min=0, max=max(temperatures.shape[0] - 1, 0)
+        )
+        temperatures = torch.index_select(temperatures, 0, safe_seg_ids)
+        top_k = torch.index_select(top_k, 0, safe_seg_ids)
+        top_p = torch.index_select(top_p, 0, safe_seg_ids)
+
     # Shape the target distribution with temperature + top-k/top-p, then
     # softmax. Greedy rows carry temperature == 0.0, so dividing by
     # (temperatures + TEMPERATURE_EPS) collapses them to a one-hot at argmax.
