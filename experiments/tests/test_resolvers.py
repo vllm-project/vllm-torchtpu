@@ -1068,6 +1068,112 @@ class TestCheckpointIntegrityGate(unittest.TestCase):
             self.assertTrue(
                 os.path.exists(os.path.join(save_dir, "config.json")))
 
+    @staticmethod
+    def _write_two_layer_base(base_dir: str):
+        """Tiny single-shard base with two layers, each q_proj + norm."""
+        import json
+
+        from safetensors.torch import save_file
+
+        os.makedirs(base_dir)
+        tensors = {
+            "model.language_model.layers.0.self_attn.q_proj.weight":
+            torch.ones(8, 8),
+            "model.language_model.layers.0.input_layernorm.weight":
+            torch.ones(8),
+            "model.language_model.layers.1.self_attn.q_proj.weight":
+            torch.ones(8, 8),
+            "model.language_model.layers.1.input_layernorm.weight":
+            torch.ones(8),
+            "model.language_model.embed_tokens.weight":
+            torch.ones(16, 8),
+        }
+        save_file(tensors, os.path.join(base_dir, "model.safetensors"))
+        with open(os.path.join(base_dir, "config.json"), "w") as f:
+            json.dump({"architectures": ["Gemma4ForConditionalGeneration"]}, f)
+        return tensors
+
+    def test_save_substituted_checkpoint_raises_on_key_mismatch(self):
+        """
+        A replacement state dict whose keys carry a wrapper prefix matches
+        nothing in the shards. Silently writing a dense copy would score a
+        dense model as sparse, so this must raise.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            save_dir = os.path.join(tmpdir, "saved")
+            self._write_two_layer_base(base_dir)
+            replacements = {
+                "wrapped.model.language_model.layers.1.self_attn.q_proj.weight":
+                torch.zeros(8, 8),
+            }
+            with self.assertRaisesRegex(ValueError, "replaced 0 tensors"):
+                ModelSplicer.save_substituted_checkpoint(
+                    base_model_dir=base_dir,
+                    output_dir=save_dir,
+                    replacement_state_dict=replacements,
+                    target_layer_indices={1},
+                )
+
+    def test_save_substituted_checkpoint_raises_when_targets_outside_dict(
+            self):
+        """Keys match, but none fall in the target layers: still 0 replaced."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            save_dir = os.path.join(tmpdir, "saved")
+            self._write_two_layer_base(base_dir)
+            replacements = {
+                "model.language_model.layers.1.self_attn.q_proj.weight":
+                torch.zeros(8, 8),
+            }
+            with self.assertRaisesRegex(ValueError, "replaced 0 tensors"):
+                ModelSplicer.save_substituted_checkpoint(
+                    base_model_dir=base_dir,
+                    output_dir=save_dir,
+                    replacement_state_dict=replacements,
+                    target_layer_indices={0},
+                )
+
+    def test_save_substituted_checkpoint_matching_keys_replace_expected(self):
+        """Matching keys substitute exactly the target-layer tensors."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            save_dir = os.path.join(tmpdir, "saved")
+            base = self._write_two_layer_base(base_dir)
+            # Full model state dict: every key, layer 1 pruned to zeros
+            replacements = {k: v.clone() for k, v in base.items()}
+            replacements[
+                "model.language_model.layers.1.self_attn.q_proj.weight"] = (
+                    torch.zeros(8, 8))
+
+            ModelSplicer.save_substituted_checkpoint(
+                base_model_dir=base_dir,
+                output_dir=save_dir,
+                replacement_state_dict=replacements,
+                target_layer_indices={1},
+            )
+            ModelSplicer.assert_checkpoint_integrity(base_dir, save_dir)
+            with safe_open(os.path.join(save_dir, "model.safetensors"),
+                           framework="pt",
+                           device="cpu") as sf:
+                # Layer 1 (q_proj + norm) substituted, layer 0 kept dense
+                self.assertTrue(
+                    torch.equal(
+                        sf.get_tensor(
+                            "model.language_model.layers.1.self_attn.q_proj.weight"
+                        ), torch.zeros(8, 8)))
+                self.assertTrue(
+                    torch.equal(
+                        sf.get_tensor(
+                            "model.language_model.layers.0.self_attn.q_proj.weight"
+                        ), torch.ones(8, 8)))
+
 
 class TestResolverRegistry(unittest.TestCase):
     """Tests ResolverRegistry factory and resolver lifecycle."""
