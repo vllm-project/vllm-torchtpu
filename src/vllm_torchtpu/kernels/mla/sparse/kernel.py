@@ -1179,7 +1179,10 @@ def sparse_ragged_paged_attention(
         and q.shape[0] % uniform_chunk == 0
     )
     window_indices_all = None
+    chunk_window_rows = 0  # rows of `window_indices_all` per chunk
     if window_prep:
+        assert topk_cap is not None
+        chunk_window_rows = topk // topk_cap * uniform_chunk
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
@@ -1260,10 +1263,7 @@ def sparse_ragged_paged_attention(
                 None
                 if window_indices_all is None
                 else window_indices_all[
-                    i * topk * uniform_chunk // topk_cap : (i + 1)
-                    * topk
-                    * uniform_chunk
-                    // topk_cap
+                    i * chunk_window_rows : (i + 1) * chunk_window_rows
                 ]
             ),
         )
