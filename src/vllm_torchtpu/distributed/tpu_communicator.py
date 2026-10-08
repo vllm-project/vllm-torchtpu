@@ -18,6 +18,11 @@ sums those matching-TP partials across DP and returns this DP rank's token
 slice. vLLM's existing ``reduce_results`` TP all-reduce remains responsible for
 the final TP-side reduction. Callers must pass equal token counts on each DP
 rank.
+
+Sequence-parallel MoE layers gather and scatter over the EP group instead. A
+step below the sequence-parallel row threshold (``sequence_parallel.min_rows``)
+keeps every row on every rank, so its dispatch is a no-op and its combine is an
+EP all-reduce.
 """
 
 import torch
@@ -28,6 +33,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
+from vllm_torchtpu.layers.adapter import sequence_parallel, small_all_reduce_op
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -44,6 +50,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Every TP all-reduce (row-parallel output projections, GDN out-proj,
+        # vocab embedding, MoE reduce_results) comes through here.
+        return small_all_reduce_op.all_reduce_or(input_, self.ranks, super().all_reduce)
+
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None
@@ -59,6 +70,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            return hidden_states, router_logits
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
@@ -78,6 +91,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            return hidden_states, topk_weights, topk_ids
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, topk_weights, topk_ids
@@ -92,4 +107,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states
-        return moe_combine_reduce_scatter(group, hidden_states)
+        if sequence_parallel.rows_are_replicated(is_sequence_parallel):
+            # Every rank holds every row: sum the expert partials in place.
+            return group.all_reduce(hidden_states)
+        if is_sequence_parallel:
+            return moe_combine_reduce_scatter(group, hidden_states)
+        # DP-only combine: the Pallas reduce-scatter when armed for the DP mesh.
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: moe_combine_reduce_scatter(group, x)
+        )
