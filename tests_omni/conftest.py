@@ -87,13 +87,12 @@ class OmniRunner:
         cleanup_test_environment()
         self.model_name = model_name
         self.seed = seed
-        self.omni: Any = None
+        self.omni: Omni | None = None
         kwargs.setdefault("stage_init_timeout", 600)
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
         kwargs.setdefault("seed", seed)
 
-        self.omni: Omni | None = None
         try:
             from vllm_omni.entrypoints.omni import Omni
 
