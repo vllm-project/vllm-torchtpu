@@ -2786,3 +2786,39 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.current_stream() is fake_stream
         assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
         assert torch.cuda.synchronize() == "synchronized"
+
+
+def test_solo_prefill_async_results_skips_wait_for_copy():
+    """An incomplete-prefill step samples 0 tokens; the next step must not block."""
+    copy_mock = MagicMock()
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        _pre_async_results=SimpleNamespace(
+            req_ids=["req-prefill"],
+            request_seq_lens=[],
+            req_id_to_index_copy={},
+            discard_sampled_tokens_req_indices=[0],
+            num_draft_per_req=None,
+            wait_for_copy=copy_mock.wait_for_copy,
+        ),
+    )
+
+    TPUModelRunner._modify_prev_results(runner)
+    copy_mock.wait_for_copy.assert_not_called()
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    copy_mock.wait_for_copy.assert_not_called()
+    assert runner._pre_async_results is None
+
+
+def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
+    """A disjoint previous batch that sampled tokens must still be rolled back."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
+        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
+        _modify_prev_results=MagicMock(),
+    )
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_called_once()
+    assert runner._pre_async_results is None
