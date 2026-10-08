@@ -902,10 +902,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # key.
     "RAIDEN_STORAGE_PROPERTIES": env_str("RAIDEN_STORAGE_PROPERTIES", ""),
     # Experimental, for testing only: lets the storage tier start under
-    # pipeline parallelism, which it otherwise refuses. Storage files are
-    # keyed by TP and PCP rank, so pipeline stages overwrite each other's
-    # files and a block read back from storage can carry another stage's KV.
-    # The experimental_raiden_storage_skip_parallelism_check key in
+    # pipeline parallelism, which is refused by default until end-to-end
+    # validation completes. The
+    # experimental_raiden_storage_skip_parallelism_check key in
     # kv_connector_extra_config wins over it.
     "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK": env_bool(
         "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK", default=False
