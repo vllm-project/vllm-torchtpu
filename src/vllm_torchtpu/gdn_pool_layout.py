@@ -8,9 +8,9 @@ from dataclasses import dataclass
 # accepts a single pooled buffer instead of a separate conv/ssm pair.
 # KimiLinearForCausalLM runs its KDA layers through the gather/scatter pooled
 # op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3 kernel)
-# instead. Other hybrid architectures unpack two state tensors unconditionally,
-# so they stay on the per-layer KV caches until they grow a pooled path.
-# Extend this set in the same change that adds one.
+# instead, and so does GLM-5.3. Other hybrid architectures unpack two state
+# tensors unconditionally, so they stay on the per-layer KV caches until they
+# grow a pooled path. Extend this set in the same change that adds one.
 QWEN_GDN_ARCHITECTURES = frozenset(
     {
         "Qwen3NextForCausalLM",
@@ -29,6 +29,13 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # pool.
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        # GLM-5.3 (glm5_next) runs its KDA layers through the same pooled op
+        # when GLM53_KDA_BACKEND=kimi (the default). Its attention layers use
+        # the RPA pool, one token per row, which the layer passes to the op
+        # explicitly. The legacy GLM kernels (GLM53_KDA_BACKEND=legacy) need
+        # the per-layer caches: set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
     }
 )
 

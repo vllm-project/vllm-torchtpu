@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    GLM53_KDA_BACKEND: str = ""
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -399,6 +400,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # GLM-5.3-Flash KDA kernels: "kimi" (default, empty) or "legacy".
+    # Validated in glm53_kda_vllm_layer_tpu.glm53_kda_backend().
+    "GLM53_KDA_BACKEND": env_str("GLM53_KDA_BACKEND", ""),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
