@@ -362,6 +362,12 @@ def test_a2a_merge_matches_the_all_gather_merge(dcp_size, chunk_tokens):
     _, args, kwargs = _dcp_case(dcp_size, 5)
     kwargs["chunk_tokens"] = chunk_tokens
 
+    # The default merge must not pay the all-to-all: it is what a token bucket
+    # below TPU_DCP_INDEXER_A2A_MIN_TOKENS compiles.
+    hlo = streamindex_topk_dcp.lower(*args, **kwargs).as_text()
+    assert "all_to_all" not in hlo and "all-to-all" not in hlo, (
+        "the default merge lowered an all-to-all"
+    )
     hlo = streamindex_topk_dcp.lower(*args, **kwargs, a2a_merge=True).as_text()
     assert "all_to_all" in hlo or "all-to-all" in hlo, (
         "no all-to-all in the a2a path: it ran the all-gather merge, so this"

@@ -212,6 +212,18 @@ def _resolve_indexer_kv_cache_mode(
     return "pallas", kv_layout
 
 
+def _dcp_indexer_a2a_for_bucket(
+    num_tokens: int, enabled: bool, min_tokens: int
+) -> bool:
+    """Whether the DCP indexer merge for this token bucket uses the all-to-all.
+
+    `num_tokens` is the static padded bucket, so this picks one merge per
+    compiled variant: decode-sized buckets keep the all-gather merge and
+    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    """
+    return enabled and num_tokens >= min_tokens
+
+
 def _cp_scatter_indexer_k(
     cache_kv: jax.Array,
     k_packed: jax.Array,
@@ -465,6 +477,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
+        a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -518,7 +531,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
-                a2a_merge=a2a_merge,
+                a2a_merge=_dcp_indexer_a2a_for_bucket(
+                    q.shape[0], a2a_merge, a2a_min_tokens
+                ),
             )
             return cache_kv, local_topk
 
