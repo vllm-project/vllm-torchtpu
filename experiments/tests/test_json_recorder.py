@@ -268,3 +268,26 @@ def test_json_result_recorder_upload_gcs_disabled(tmp_path, loaded_schema):
         data = json.load(f)
     assert data["status"] == "COMPLETED"
     jsonschema.validate(instance=data, schema=loaded_schema)
+
+
+def test_json_result_recorder_honours_no_upload_env(tmp_path, monkeypatch):
+    """EXPERIMENTS_NO_UPLOAD_GCS=1 disables uploads even if requested."""
+    monkeypatch.setenv("EXPERIMENTS_NO_UPLOAD_GCS", "1")
+    recorder = JsonResultRecorder(json_file=str(tmp_path / "sweep.json"),
+                                  sweep_id="20260828_140000",
+                                  upload_gcs=True)
+    assert recorder.upload_gcs is False
+
+    with unittest.mock.patch("core.json_recorder.subprocess.run") as mock_run:
+        recorder.finalize("COMPLETED")
+        mock_run.assert_not_called()
+
+
+def test_json_result_recorder_upload_enabled_without_env(
+        tmp_path, monkeypatch):
+    """Without the env override the constructor argument is respected."""
+    monkeypatch.delenv("EXPERIMENTS_NO_UPLOAD_GCS", raising=False)
+    recorder = JsonResultRecorder(json_file=str(tmp_path / "sweep.json"),
+                                  sweep_id="20260828_140001",
+                                  upload_gcs=True)
+    assert recorder.upload_gcs is True
