@@ -461,6 +461,8 @@ def _random_rejection_sample_with_segment(
     # Accept test is the Leviathan ratio min(1, p(x) / q(x))
     # Our draft is greedy for now, so for q: drafted token
     # x (q(x) == 1, 0 elsewhere) and the ratio collapses to p(x).
+    # Accept iff u < p(x): torch.rand can return exactly 0.0, and u <= p(x)
+    # would then accept a token with p(x) == 0, e.g. one top-k masked out.
     target_token_probs = target_probs.gather(
         -1, safe_draft_token_ids.unsqueeze(-1)
     ).squeeze(-1)
@@ -472,7 +474,7 @@ def _random_rejection_sample_with_segment(
         accepted = torch.where(
             is_greedy,
             draft_token_ids == target_logits_argmax,
-            target_token_probs >= accept_u,
+            accept_u < target_token_probs,
         )
     accepted = accepted & valid_draft_token_ids
 

@@ -697,7 +697,10 @@ def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(device):
     assert torch.equal(output, expected)
 
 
-def test_rejection_sampler_random_top_k_forces_recovery(device):
+# torch.rand can return exactly 0.0; a draft that top-k masks out has
+# p(x) == 0 and must still be rejected.
+@pytest.mark.parametrize("accept_u_value", [0.01, 0.0])
+def test_rejection_sampler_random_top_k_forces_recovery(device, accept_u_value):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
@@ -710,7 +713,7 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
     temperatures = torch.ones((1, 1), dtype=torch.float32, device=device)
     top_k = torch.tensor([[1]], dtype=torch.int32, device=device)
     top_p = torch.ones((1, 1), dtype=torch.float32, device=device)
-    accept_u = torch.tensor([0.01], dtype=torch.float32, device=device)
+    accept_u = torch.tensor([accept_u_value], dtype=torch.float32, device=device)
     recover_u = torch.full_like(target_logits, 0.5)
 
     output = sampler(
