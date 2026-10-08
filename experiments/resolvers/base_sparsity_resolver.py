@@ -49,13 +49,13 @@ class BaseSparsityResolver(BaseResolver):
         if sparse_indices == set(range(len(sparse_indices))):
             return
 
-        ordered = sorted(sparse_indices)
         if resolver_config.get("allow_nonprefix_splice"):
             print(
                 ">>> [RESOLVER] Proceeding because allow_nonprefix_splice is set."
             )
             return
 
+        ordered = sorted(sparse_indices)
         raise ValueError(
             f"Refusing to splice non-prefix layer set {ordered} with strategy {strategy}. "
             "SparseGPT calibration requires sequential prefix layers. "
@@ -172,6 +172,15 @@ class BaseSparsityResolver(BaseResolver):
             num_sparse_layers=num_sparse_layers,
             strategy=strategy,
             total_layers=total_layers)
+        sparse_indices = set(range(min_layer, max_layer))
+        can_splice = bool(reference_sparse_model) and os.path.exists(
+            reference_sparse_model)
+
+        # Validate the layer set BEFORE the cache lookup and before
+        # _cleanup_old_spliced_dirs so an invalid config can never delete
+        # valid cached splices on its way to raising.
+        if can_splice:
+            self._assert_spliceable(sparse_indices, strategy, resolver_config)
 
         ckpt_name = self.generate_checkpoint_name(
             arch_type=arch.model_type,
@@ -199,10 +208,7 @@ class BaseSparsityResolver(BaseResolver):
         self._cleanup_old_spliced_dirs(base_sparse_dir, ckpt_path)
 
         # 2. Fast cross-shard layer splicing from 100% sparse reference model
-        if reference_sparse_model and os.path.exists(reference_sparse_model):
-            sparse_indices = set(range(min_layer, max_layer))
-            BaseSparsityResolver._assert_spliceable(sparse_indices, strategy,
-                                                    resolver_config)
+        if can_splice:
             print(
                 f">>> [RESOLVER] Splicing {num_sparse_layers} layers from reference {reference_sparse_model}..."
             )
