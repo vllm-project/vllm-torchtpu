@@ -83,6 +83,35 @@ class TestBaseSparsityResolverStrategies(unittest.TestCase):
         self.assertEqual(start, 25)
         self.assertEqual(end, 35)
 
+    def test_assert_spliceable_table(self):
+        """
+        Table test for the prefix-only splice guard. Prefix sets (contiguous
+        and starting at layer 0), the empty set and the full stack are
+        accepted; any non-zero-start or gapped set raises unless
+        allow_nonprefix_splice is set.
+        """
+        ok = [
+            ("prefix", {0, 1, 2}, {}),
+            ("empty", set(), {}),
+            ("full_stack", set(range(60)), {}),
+            ("bypass", {2, 3}, {
+                "allow_nonprefix_splice": True
+            }),
+        ]
+        for name, indices, cfg in ok:
+            with self.subTest(name=name):
+                self.resolver._assert_spliceable(indices, name, cfg)
+
+        bad = [
+            ("last_to_first", {1, 2, 3}, r"\[1, 2, 3\]"),
+            ("gapped", {0, 1, 3}, r"\[0, 1, 3\]"),
+            ("middle_out", set(range(25, 35)), r"\[25, 26, .*34\]"),
+        ]
+        for name, indices, pattern in bad:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    self.resolver._assert_spliceable(indices, name, {})
+
     def test_cleanup_old_spliced_dirs(self):
         """
         Arrange-Act-Assert: Validates automated disk management and temporary spliced directory cleanup.
@@ -301,11 +330,55 @@ class TestResolversEndToEnd(unittest.TestCase):
             os.path.exists(
                 os.path.join(model_path, "model.safetensors.index.json")))
 
-        # Invalid non-prefix splice raises ValueError
+        # Invalid non-prefix splice raises ValueError ...
         invalid_config = dict(resolver_config)
         invalid_config["strategy"] = "last_to_first"
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, r"\[2, 3\]"):
             resolver.resolve(current_config, invalid_config)
+
+        # ... and must NOT have deleted the valid cached splice on its way
+        # to raising (guard runs before _cleanup_old_spliced_dirs).
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(model_path, "model.safetensors.index.json")),
+            "invalid config must not delete valid cached splices")
+
+    def test_splice_guard_end_to_end(self):
+        """
+        Table test of the splice guard through resolve() on the 4-layer
+        safetensors fixture (no mocks): prefix / empty / full-stack resolve,
+        last_to_first and middle_out raise, allow_nonprefix_splice bypasses.
+        """
+        resolver = BaseSparsityResolver()
+        base_cfg = {
+            "base_model": self.dense_dir,
+            "reference_sparse_model": self.sparse_dir,
+            "checkpoint_base_dir": self.work_dir,
+        }
+        ok = [
+            ("prefix_{0,1,2}", "first_to_last", 3, {}),
+            ("empty", "first_to_last", 0, {}),
+            ("full_stack", "first_to_last", 4, {}),
+            ("middle_out_full", "middle_out", 4, {}),
+            ("bypass_{2,3}", "last_to_first", 2, {
+                "allow_nonprefix_splice": True
+            }),
+        ]
+        for name, strategy, n, extra in ok:
+            with self.subTest(name=name):
+                cfg = dict(base_cfg, strategy=strategy, **extra)
+                path, _ = resolver.resolve({"num_sparse_layers": n}, cfg)
+                self.assertTrue(os.path.isdir(path), name)
+
+        bad = [
+            ("last_to_first_{1,2,3}", "last_to_first", 3, r"\[1, 2, 3\]"),
+            ("middle_out_{1,2}", "middle_out", 2, r"\[1, 2\]"),
+        ]
+        for name, strategy, n, pattern in bad:
+            with self.subTest(name=name):
+                cfg = dict(base_cfg, strategy=strategy)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    resolver.resolve({"num_sparse_layers": n}, cfg)
 
     def test_weight_scaler_resolver_resolve(self):
         """
