@@ -3744,3 +3744,69 @@ def test_max_loop_bucket_is_static_under_lockstep():
     assert proposer._max_loop_bucket() == 8
     with pytest.raises(AssertionError, match="DP-coordinated per-chunk bound is 1"):
         proposer._loop_bucket(2)
+
+
+# --------------------------------------------------------------------------
+# The MTP draft megakernel (the megakernel program's attach_draft)
+# --------------------------------------------------------------------------
+
+
+def _verify_chunk(rows_per_req):
+    """A step-0 chunk whose requests verify `rows_per_req` rows each."""
+    return SimpleNamespace(
+        num_reqs=len(rows_per_req),
+        query_start_loc_np=np.cumsum([0, *rows_per_req]).astype(np.int32),
+        attn_ctx=SimpleNamespace(position_ids_override=None),
+    )
+
+
+def test_forward_draft_runs_verify_step0_on_the_mtp_megakernel_program(monkeypatch):
+    """Step 0 of a pure decode-verify batch runs the megakernel program, twice
+    on its first use (compile, then run) and once after. A batch with a
+    partial request keeps the draft's own program."""
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer.speculative_config.num_speculative_tokens = 3
+    log = []
+    proposer.draft_model = _RecordingProgram("draft", log)
+    proposer._mtp_mk_step0 = _RecordingProgram("mk", log)
+    proposer._mtp_mk = SimpleNamespace(
+        use_for_step=lambda _md, _rows, *, step0: step0,
+        note_step=lambda _key, run: run,
+    )
+
+    def step0(rows_per_req):
+        return proposer._forward_draft(
+            chunk=_verify_chunk(rows_per_req),
+            input_ids=torch.zeros(16, dtype=torch.int32),
+            positions=torch.zeros(16, dtype=torch.int32),
+            target_hidden_states=torch.zeros((16, 2)),
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+            step0_gather_indices=torch.zeros(4, dtype=torch.int64),
+        )
+
+    step0([4, 4])
+    assert log == [("mk", 0), ("mk", 0)]
+    assert proposer._mtp_mk_step0_warm is True
+    step0([4, 4, 4])
+    step0([4, 2])
+    assert log == [("mk", 0), ("mk", 0), ("mk", 0), ("draft", 0)]
+
+
+def test_check_draft_megakernel_warm_rejects_a_cold_program():
+    """After the spec-decode warmup, every draft program of a bound
+    megakernel must have run: the first real step would trace a cold one."""
+    proposer = _make_proposer(method="mtp")
+    proposer.check_draft_megakernel_warm()
+    proposer._mtp_mk = SimpleNamespace(bound=True)
+    proposer._mtp_mk_step0 = proposer._mtp_fused_loop_mk = object()
+    proposer._mtp_fused_loop_mk_warm = True
+
+    with pytest.raises(RuntimeError, match=r"warmup: step 0\. See"):
+        proposer.check_draft_megakernel_warm()
+    proposer._mtp_mk.bound = False
+    proposer.check_draft_megakernel_warm()
+    proposer._mtp_mk.bound = True
+    proposer._mtp_mk_step0_warm = True
+    proposer.check_draft_megakernel_warm()
