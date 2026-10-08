@@ -257,8 +257,7 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     into different fused programs than later identical requests (those start
     from an empty queue because the previous output's ``.cpu()`` flushed it).
     The first request after startup therefore differs numerically from later
-    same-seed requests (tests_omni/models/wan/test_wan_pr.py::
-    test_wan_deterministic_seed_parity_tpu).
+    same-seed requests
     """
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
