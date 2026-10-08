@@ -43,7 +43,6 @@ from typing import Any
 
 import psutil
 import pytest
-from vllm.distributed import cleanup_dist_env_and_memory
 
 from tests.tpu_release import wait_for_tpu_release
 
@@ -52,6 +51,8 @@ omni_fixture_lock = threading.Lock()
 
 def cleanup_test_environment() -> None:
     """Tear down distributed state and wait for TPU device nodes to be released."""
+    from vllm.distributed import cleanup_dist_env_and_memory
+
     cleanup_dist_env_and_memory()
     gc.collect()
     wait_for_tpu_release()
