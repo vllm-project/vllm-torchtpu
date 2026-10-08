@@ -78,6 +78,18 @@ def _apply_scoring_fn(logits, scoring_fn):
     )
 
 
+def _row_routes(scores, gate_l):
+    """Per-token `[rows, 1]` mask: True iff the row has a finite score and logit.
+
+    `gate_l` is checked too: under sigmoid/sqrtsoftplus a `-inf` logit scores a
+    finite `0`, so replica padding (`token_layout.split(..., fill_value=-jnp.inf)`)
+    would otherwise pass the score check.
+    """
+    return jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & jnp.any(
+        jnp.isfinite(gate_l), axis=-1, keepdims=True
+    )
+
+
 def _combine_arrivals(
     arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
@@ -517,13 +529,16 @@ def fused_ep_moe_v2(
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
+        # a finite 0, so replica padding would otherwise pass the score check.
+        row_routes = _row_routes(scores, gate_l)
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -696,6 +711,9 @@ def fused_ep_moe_v2(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they

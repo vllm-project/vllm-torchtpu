@@ -332,3 +332,27 @@ steps:
       - *kube_plugin
     commands:
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-1p1d-4dp8tp.yaml
+
+  # The second Kimi-K3 pair: the same TP8 x DP4 x EP32 shape, replaying the
+  # InferenceX AgentX trace corpus from a chipless client pod instead of running
+  # the correctness stages. This is the workload the submission is scored on.
+  #
+  # Last, and after the correctness pair rather than beside it: each pair takes
+  # two 2x2x4 slices, so two at once is four and Kueue would evict one to serve
+  # the other. One dependency is enough - that step already waits for everything
+  # the chips are borrowed by - and failure is allowed, since this lane needs the
+  # chips free rather than the steps before it green.
+  - label: ":kubernetes: :tpu: Perf: Nightly Kimi-K3 AgentX 1P1D (TPU v7x 2x2x4 x2)"
+    key: "perf_nightly_kimi_k3_agentx_1p1d"
+    depends_on:
+      - "build_docker"
+      - step: "perf_nightly_kimi_k3_1p1d"
+        allow_failure: true
+    if: 'build.env("NIGHTLY") == "1"'
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml

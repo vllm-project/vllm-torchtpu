@@ -42,8 +42,15 @@ AGENTX_CONC_LIST="1 2 4 8"
 # vLLM row uses.
 AGENTX_MODEL_PREFIX=kimik3
 AGENTX_PRECISION=fp4
-# Printed under the summary, for reading our numbers against a published row.
-AGENTX_REFERENCE_ROW="InferenceX dashboard, 8x B300 vLLM, taken 2026-09-07; out tok/s per GPU @ P90 interactivity: c1 15.1@203, c2 18.6@133, c4 23.4@121, c8 40.6@64, c16 58.4@32, c24 66.3@22, c48 75.7@12.5, c70 87.6@7.9"
+# Printed under the summary, for reading our numbers against a published row, in
+# the same unit the table reports: output tokens per dollar. The dashboard gives
+# tok/s per GPU, so each point is that over B300's $2.26/GPU-hour, the
+# "owning at large hyperscaler volume" tier of the SemiAnalysis TCO model that
+# InferenceX costs its own rows with (inferencex.semianalysis.com/chips/b300).
+# Interactivity is the P90 the dashboard reports at that concurrency, in tok/s
+# per user, and it is half the comparison: a cheaper token at 8 tok/s/user is not
+# the same product as a dearer one at 200.
+AGENTX_REFERENCE_ROW="InferenceX dashboard, 8x B300 vLLM, taken 2026-09-07; out tok/\$ @ P90 interactivity tok/s/user, at B300 \$2.26/GPU-hour: c1 24.1k@203, c2 29.6k@133, c4 37.3k@121, c8 64.7k@64, c16 93.0k@32, c24 105.6k@22, c48 120.6k@12.5, c70 139.5k@7.9"
 
 # Not the AgentX cases. run_benchmarks.sh insists on a fixed-sequence cell
 # before it will hand back a live server, and these are the smallest one that
