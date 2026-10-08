@@ -663,6 +663,33 @@ def test_rejection_sampler_synthetic_random_placeholder_recovers_target(device):
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_synthetic_random_one_hot_target_recovers_draft(device):
+    # top_k=1 makes the target one-hot at the draft, so a synthetic rejection
+    # leaves no residual mass and the row recovers the draft itself.
+    sampler = _synthetic_sampler([0.0], device)
+    target_logits = torch.tensor([[0.0, 1.0, 9.0, 2.0]], device=device)
+    segment_ids, group_indices = _segment_info([1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([3], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.ones((1, 1), device=device),
+        top_k=torch.ones((1, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((1, 1), device=device),
+        accept_u=torch.zeros(1, device=device),
+        recover_u=torch.tensor([[0.99, 0.99, 0.01, 0.99]], device=device),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[2, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
 def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(device):
     sampler = _synthetic_sampler([0.0], device)
     draft_token_ids = torch.tensor([3, 1], dtype=torch.int32, device=device)

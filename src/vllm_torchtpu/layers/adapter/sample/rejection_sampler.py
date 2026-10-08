@@ -503,15 +503,14 @@ def _random_rejection_sample_with_segment(
         recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
         dim=-1,
     ).to(torch.int32)
-    # Synthetic rejection can leave no residual mass for a one-hot target.
+    # Greedy rows recover the target argmax. Synthetic rejection can also leave
+    # a random row with no residual mass: its target is one-hot at the draft,
+    # so the draft is that row's unique argmax, which it recovers as well.
     has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
     recovered_token_ids = torch.where(
-        has_recovery_mass,
+        is_greedy | ~has_recovery_mass,
+        target_logits_argmax,
         recovered_token_ids,
-        torch.argmax(target_probs, dim=-1).to(torch.int32),
-    )
-    recovered_token_ids = torch.where(
-        is_greedy, target_logits_argmax, recovered_token_ids
     )
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
