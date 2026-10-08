@@ -14,6 +14,15 @@ HIGHEST matmul precision throughout. Given the same H and W it reproduces the
 CPU reference to float32 rounding (100% of masks; tests/test_tpu_sparsegpt_solver.py).
 
 ``tpu_gemma4.calibrate_layers_tpu`` is the Gemma-4 calibrator built on it.
+
+Attribution Notice:
+    Adapted from SparseGPT (https://github.com/IST-DASLab/sparsegpt,
+    Apache-2.0) via this package's ``sparsegpt.py``. Modifications include:
+      - JAX port: jit-compiled Cholesky / triangular solves and a
+        ``lax.fori_loop`` column sweep so the solve runs on Cloud TPU.
+      - N:M semantics: N weights kept per group of M (as in ``sparsegpt.py``).
+      - Rank-based group top-k with lowest-index tie-break; a precomputed
+        (U, dead, ok) may be shared by matrices with a common input.
 """
 
 from __future__ import annotations

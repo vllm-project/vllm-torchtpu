@@ -1,3 +1,20 @@
+"""
+sparsegpt.py
+------------
+SparseGPT (Frantar & Alistarh, 2023) one-shot pruning solver: the CPU
+reference implementation of this package.
+
+Attribution Notice:
+    Adapted from SparseGPT (https://github.com/IST-DASLab/sparsegpt,
+    Apache-2.0). Modifications include:
+      - N:M semantics: N weights are kept per group of M (``prunem - prunen``
+        pruned), matching the sparsity-config vocabulary used here.
+      - Hessian inversion via ``torch.linalg.solve_triangular`` on the
+        Cholesky factor and rank-1 OBS updates via ``addr_``.
+      - Factorized ``_factorize_hessian`` and ``_obs_prune_blocks`` helpers
+        shared with ``sparsity/lrc.py``.
+"""
+
 import math
 import time
 from typing import Optional, Tuple
