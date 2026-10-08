@@ -184,6 +184,34 @@ class TestSparseGPT(unittest.TestCase):
         # Clean up
         sparsegpt.free()
 
+    def test_sparsegpt_1of4_keeps_one_per_block(self):
+        """
+        Regression for the N:M semantic (N kept per block of M): a 1:4
+        fasterprune must leave exactly one non-zero in every aligned group
+        of 4 input columns, i.e. 75% zeros. 2:4 is symmetric and cannot
+        detect a swap of N and M-N.
+        """
+        torch.manual_seed(0)
+        linear = nn.Linear(16, 8, bias=False)
+        linear.weight.data = torch.randn(8, 16)
+        sparsegpt = SparseGPT(linear)
+        for _ in range(4):
+            inp = torch.randn(4, 16)
+            sparsegpt.add_batch(inp, linear(inp))
+
+        sparsegpt.fasterprune(sparsity=0, prunen=1, prunem=4, blocksize=16)
+
+        weight = linear.weight.data
+        self.assertFalse(torch.isnan(weight).any())
+        nonzero_per_block = (weight.view(8, 4, 4) != 0).sum(-1)
+        self.assertTrue(
+            torch.all(nonzero_per_block == 1),
+            f"expected 1 survivor per 4-block, got "
+            f"{nonzero_per_block.tolist()}")
+        zero_ratio = (weight == 0).sum().item() / weight.numel()
+        self.assertAlmostEqual(zero_ratio, 0.75, places=6)
+        sparsegpt.free()
+
     def test_sparsegpt_lrc_prune_tall_matrix(self):
         """
         Arrange-Act-Assert: Verify LRC alternating minimization with Gram-matrix eigh on tall matrix (d_out >= d_in).
