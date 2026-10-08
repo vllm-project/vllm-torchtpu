@@ -21,8 +21,8 @@
     },
     "sweep_id": {
       "type": "string",
-      "description": "Unique sweep identifier (e.g. '20260827_235950').",
-      "pattern": "^[0-9]{8}_[0-9]{6}(_[a-z0-9]+)?$"
+      "description": "Unique sweep identifier: an auto-generated timestamp (e.g. '20260827_235950') or a custom --experiment-id.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
     },
     "created_at": {
       "type": "string",
