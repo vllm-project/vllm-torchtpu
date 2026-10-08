@@ -589,7 +589,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
-    # at 16 and 32 tokens a single Pallas kernel per rank, at other token
+    # at 16, 32 and 64 tokens a single Pallas kernel per rank, at other token
     # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
     # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
     # the real token count from its padding mask), otherwise every layer keeps

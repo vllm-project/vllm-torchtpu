@@ -37,12 +37,25 @@ GLM52_TP16 = dict(h=6144, e=256, i=128, fs=128, topk=8)
 SMALL = dict(h=4096, e=8, i=128, fs=128, topk=4)
 ROUTED_SCALE = 2.5
 # (rows, n_valid) called directly: zero and full for 16 rows; fold, trim and
-# full for 32. The 16-row fold path runs through the adapter's op body
-# (BODY_CASE), which derives n_valid from a padding mask.
-CASES = ((16, 0), (16, 16), (32, 1), (32, 12), (32, 32))
+# full for 32; fold (8, the most rows that fold), trim (16) and full with
+# padding (33, the fewest tokens only this bucket serves) for 64. Zero and
+# unpadded full run the same code at every row count, so 64 rows skip them
+# (the worker runs under a timeout); arming's all-reduce self-test runs both
+# at 64 rows on the device. The 16-row fold path runs through the adapter's
+# op body (BODY_CASE), which derives n_valid from a padding mask.
+CASES = (
+    (16, 0),
+    (16, 16),
+    (32, 1),
+    (32, 12),
+    (32, 32),
+    (64, 8),
+    (64, 16),
+    (64, 33),
+)
 BODY_CASE = (16, 7)
 # A token count the kernel does not admit: the op body's psum path.
-CHAIN_ROWS = 64
+CHAIN_ROWS = 128
 # Kernel vs an f32 reference with dequantized weights and unquantized
 # activations, i.e. the kernel's FP8 activations and bf16 roundings: measured
 # rel-L2 0.044 to 0.046 and cos >= 0.9989 on these inputs.
@@ -77,7 +90,8 @@ def _glm52_shapes(rows, **kwargs):
 
 
 @pytest.mark.parametrize(
-    "rows, admitted", [(16, True), (32, True), (8, False), (48, False), (64, False)]
+    "rows, admitted",
+    [(16, True), (32, True), (64, True), (8, False), (48, False), (128, False)],
 )
 def test_admits_the_decode_buckets_at_glm52_shapes(monkeypatch, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
@@ -116,6 +130,12 @@ def test_row_paths_at_glm52_shapes(monkeypatch):
     assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 16, h)) == [16, 5, 0]
     assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 32, h)) == [
         32,
+        5,
+        16,
+        0,
+    ]
+    assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 64, h)) == [
+        64,
         5,
         16,
         0,

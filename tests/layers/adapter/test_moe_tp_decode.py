@@ -314,6 +314,7 @@ def test_arming_moves_shared_expert_scale_and_all_reduce_into_the_op(harness):
     assert torch.equal(sibling(hidden_states=x, router_logits=x), sibling_before)
     assert sibling_shared.calls == calls + 1 and harness.all_reduces == 2
     assert "armed 2/3 target and 1/1 drafter" in harness.logs[-1]
+    assert "kernel token counts [16, 32, 64]" in harness.logs[-1]
     assert "routing is not sigmoid" in harness.logs[-1]
 
 
