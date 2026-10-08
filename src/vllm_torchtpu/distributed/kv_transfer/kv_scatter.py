@@ -28,6 +28,7 @@ can take seconds for N=64; warmup amortizes it.
 from __future__ import annotations
 
 import functools
+from typing import Any, cast
 
 import torch
 
@@ -39,14 +40,14 @@ logger = init_logger(__name__)
 # a working JAX install.
 _jax_import_error: BaseException | None = None
 try:
-    import jax  # noqa: F401
+    import jax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     from torch_tpu._internal import pallas as ttpu_pallas
 except Exception as e:  # pragma: no cover
     _jax_import_error = e
-    pl = None  # type: ignore[assignment]
-    pltpu = None  # type: ignore[assignment]
+    pl = cast(Any, None)
+    pltpu = cast(Any, None)
     ttpu_pallas = None  # type: ignore[assignment]
 
 
@@ -138,7 +139,7 @@ if _jax_import_error is None:
         )
 
 else:  # pragma: no cover
-    _make_multi_layer_scatter_kernel = None  # type: ignore[assignment]
+    _make_multi_layer_scatter_kernel = cast(Any, None)
 
 
 def prepare_scatter_args(

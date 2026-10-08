@@ -13,10 +13,12 @@
 # limitations under the License.
 """TPU W4A16 MoE implementation for Compressed Tensors.
 
-This class supprts W4A16 and W4A8 quantization scheme where weights are quantized in int4 format.
+This class supprts W4A16 and W4A8 quantization scheme where weights are quantized in
+int4 format.
 """
 
 import ctypes
+from typing import TYPE_CHECKING, cast
 
 import jax.numpy as jnp
 import torch
@@ -26,7 +28,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     RoutedExperts,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
     CompressedTensorsWNA16MoEMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -42,12 +44,18 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
     release_memory_to_os,
     requantize_int4_to_fp4_weights,
     requantize_int4_weights,
 )
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
+        StagedParameter,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
@@ -72,6 +80,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.num_bits = int(getattr(weight_quant, "num_bits", 4))
+        # vLLM types packed_factor as Fraction; the TPU kernel uses an int.
+        # pyrefly: ignore[bad-assignment]
         self.packed_factor = 32 // self.num_bits
         self.strategy = getattr(weight_quant, "strategy", "group")
         self.group_size = getattr(weight_quant, "group_size", None)
@@ -81,14 +91,12 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
-    # Both of the following would otherwise be inherited, and upstream reads
-    # self.wna16_backend in each - set only by the __init__ skipped above. The
-    # TPU path never builds an upstream MoE kernel (apply_monolithic calls the
-    # GMM kernels directly), so it has no quant config to hand over and no
-    # backend that could rebalance experts. Same as the fp8 and nvfp4 methods.
-    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
-        return None
-
+    # The inherited version reads self.wna16_backend, which only the upstream
+    # __init__ skipped above sets. RoutedExperts.__init__ asks when EPLB is
+    # enabled, outside VllmMoERunner's reach, and the TPU path has no upstream
+    # MoE backend that could rebalance experts. The inherited
+    # get_fused_moe_quant_config reads it too, but VllmMoERunner never calls
+    # that hook on a monolithic method.
     @property
     def supports_eplb(self) -> bool:
         return False
@@ -146,6 +154,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         # Bypass upstream create weights method as well
         # to prevent upfront TPU HBM pre-allocation during weight creation,
         # which leads to OOM during weight loading from GCS Streamer/HF without EP
+        layer = cast("TpuRoutedExperts", layer)
         self._validate_w4a16_scheme()
 
         if self.strategy == "channel":
@@ -159,7 +168,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             ):
                 raise ValueError(
                     f"hidden_size ({hidden_size}) and intermediate_size_per_partition "
-                    f"({intermediate_size_per_partition}) must be divisible by group_size ({self.group_size})"
+                    f"({intermediate_size_per_partition}) must be divisible by "
+                    f"group_size ({self.group_size})"
                 )
             num_groups_w13 = hidden_size // self.group_size
             num_groups_w2 = intermediate_size_per_partition // self.group_size
@@ -202,7 +212,10 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             ("w13_weight_scale", w13_scale_shape, params_dtype),
             ("w2_weight_scale", w2_scale_shape, params_dtype),
         ]:
-            param = torch.nn.Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
+            param = cast(
+                "StagedParameter",
+                torch.nn.Parameter(torch.empty(0, dtype=dtype), requires_grad=False),
+            )
             param._orig_shape = shape
             layer.register_parameter(name, param)
             set_weight_attrs(param, extra_weight_attrs)
@@ -275,6 +288,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         For INT4: performs bitwise xor to flip the sign bit.
         Copies weight from cpu to tpu
         """
+        layer = cast("TpuRoutedExperts", layer)
         self._validate_w4a16_scheme()
         self._validate_int32_weight_carriers(layer)
 
@@ -333,6 +347,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = get_fused_moe_activation(layer.activation, layer.moe_config)
 
         # Quantization-independent routing decision (simulation override ->

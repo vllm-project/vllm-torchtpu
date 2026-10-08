@@ -43,7 +43,8 @@ def _upstream_compute_hash():
     """The genuine implementation, whether or not the patch already ran.
 
     Another test may have built a VllmConfig, which runs
-    ``TpuPlatform.check_and_update_config()`` -> ``patch_registry.apply("platform_activation")``.
+    ``TpuPlatform.check_and_update_config()`` ->
+    ``patch_registry.apply("platform_activation")``.
     """
     return (
         getattr(VllmConfig, "_tpu_upstream_compute_hash", None)

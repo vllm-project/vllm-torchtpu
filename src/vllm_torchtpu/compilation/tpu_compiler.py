@@ -133,12 +133,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, offload retry and drain limits, a weight-load sync cadence, a
-    # debug log switch, and the local-rank offsets, which move a worker to a
-    # different chip without changing the executable it runs.
+    # checks, the raiden offload storage tier, offload retry and drain
+    # limits, a weight-load sync cadence, a debug log switch, and the
+    # local-rank offsets, which move a worker to a different chip without
+    # changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",
+    "RAIDEN_STORAGE_CAPACITY_GB",
+    "RAIDEN_STORAGE_PATH",
+    "RAIDEN_STORAGE_PROPERTIES",
+    "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
     "TORCH_TPU_BASE_PORT",
@@ -149,9 +155,15 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    # Scheduler prefix-cache hit length only.
+    "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Pooling: the static pooler is a separate backend="tpu" helper outside the
+    # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
+    "VLLM_TPU_STATIC_POOLER",
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -175,17 +187,24 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Still listed: on this base `pp_shift.py` is a second caller, so the
+    # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
-    # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
-    # the kernel's remote DMAs resolve their peer coordinates against, so an
-    # edit to the ordering changes where every routed row goes without
-    # changing a byte of the kernel.
+    # And the mesh they export with: `build_ep_mesh` decides the axis, the
+    # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
+    "vllm_torchtpu/distributed/pcp.py",
+    # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
+    "vllm_torchtpu/distributed/dcp.py",
+    "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
+    # the wrapper mesh or with none, like `build_ep_mesh` above.
+    "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
@@ -429,6 +448,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         tracing_ctx = (
             torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
         )
+        # Each call builds one program. Kernels number their scheduling groups
+        # from 1 within it, so the HLO, and with it torch_tpu's cache key, does
+        # not depend on what this process compiled before: every rank then
+        # builds the same key for a bucket and can hit an executable another
+        # rank already put in the Tier-2 cache.
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        config.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 

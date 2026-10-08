@@ -14,18 +14,20 @@
 # limitations under the License.
 
 # Multi-host Disaggregated Serving E2E on TPU (e.g., tpu_v7x_16_queue: 2 hosts x 8 chips).
-# Node 0 (Head): Prefill role (PCP8, TP1) + Proxy server + Correctness smoke test.
-# Node 1 (Worker): Decode role (DP8, TP1).
+# Node 0 (Head): Prefill role + Proxy server + Correctness smoke test.
+# Node 1 (Worker): Decode role.
+#
+# DISAGG_SCRIPT picks which pair runs. The default is Qwen3.5 at PCP8/DP8; the
+# DSv4 nightly sets it to run_dsv4_pd_correctness.sh, which is DP8 on both
+# sides. Everything outside the container is identical either way, so the two
+# differ only in the script name, the results directory and a handful of
+# forwarded variables.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Bootstrap environment & credentials
 # ---------------------------------------------------------------------------
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true
@@ -34,8 +36,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/ci_image.sh"
+DISAGG_SCRIPT="${DISAGG_SCRIPT:-./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh}"
+DISAGG_RUN_ROOT="${DISAGG_RUN_ROOT:-/perf_eval_results/qwen35_p8d8_disagg_ci}"
+if [ ! -f "${REPO_ROOT}/${DISAGG_SCRIPT#./}" ]; then
+  echo "ERROR: DISAGG_SCRIPT does not exist: ${DISAGG_SCRIPT}" >&2
+  exit 1
+fi
+echo "Disagg script: ${DISAGG_SCRIPT}  results: ${DISAGG_RUN_ROOT}"
+
+IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
@@ -194,7 +203,7 @@ CONTAINER_ENV_COMMON=(
   -e HF_TOKEN="${HF_TOKEN:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
-  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
   -e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
   -e PREFILL_HOST="${HEAD_INTERNAL_IP}"
   -e DECODE_HOST="${WORKER_IP}"
@@ -209,10 +218,20 @@ CONTAINER_ENV_COMMON=(
   -e DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
   -e PREFILL_TPU_KV_TRANSFER_PORT="${PREFILL_TPU_KV_TRANSFER_PORT:-9100}"
   -e DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
-  -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
+  -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-$(( ${PREFILL_PCP:-8} * ${PREFILL_TP:-1} ))}"
   -e PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
   -e STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
-  -e RUN_ROOT="/perf_eval_results/qwen35_p8d8_disagg_ci"
+  -e RUN_ROOT="${DISAGG_RUN_ROOT}"
+  ${DECODE_DCP:+-e DECODE_DCP="${DECODE_DCP}"}
+  ${TPU_RAIDEN_DST_SHARDS:+-e TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS}"}
+  ${VLLM_KV_CACHE_LAYOUT:+-e VLLM_KV_CACHE_LAYOUT="${VLLM_KV_CACHE_LAYOUT}"}
+  ${PREFILL_BLOCK_SIZE:+-e PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE}"}
+  ${DECODE_BLOCK_SIZE:+-e DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE}"}
+  ${PREFILL_DP:+-e PREFILL_DP="${PREFILL_DP}"}
+  ${ENABLE_PREFIX_CACHING:+-e ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING}"}
+  ${ASYNC_SCHEDULING:+-e ASYNC_SCHEDULING="${ASYNC_SCHEDULING}"}
+  ${DSV4_PD_CONCURRENCY:+-e DSV4_PD_CONCURRENCY="${DSV4_PD_CONCURRENCY}"}
+  ${DSV4_PD_LARGE_LINES:+-e DSV4_PD_LARGE_LINES="${DSV4_PD_LARGE_LINES}"}
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"}
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"}
   ${LOAD_FORMAT:+-e LOAD_FORMAT="${LOAD_FORMAT}"}
@@ -220,6 +239,8 @@ CONTAINER_ENV_COMMON=(
   ${MAX_MODEL_LEN:+-e MAX_MODEL_LEN="${MAX_MODEL_LEN}"}
   ${MAX_NUM_BATCHED_TOKENS:+-e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS}"}
   ${MAX_NUM_SEQS:+-e MAX_NUM_SEQS="${MAX_NUM_SEQS}"}
+  ${PREFILL_MAX_NUM_SEQS:+-e PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS}"}
+  ${DECODE_MAX_NUM_SEQS:+-e DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS}"}
   ${PREFILL_COMPILE_SIZES:+-e PREFILL_COMPILE_SIZES="${PREFILL_COMPILE_SIZES}"}
   ${DECODE_COMPILE_SIZES:+-e DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256,4096}"}
   ${NUM_GPU_BLOCKS_OVERRIDE:+-e NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE}"}
@@ -233,7 +254,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /workspace/vllm-torchtpu -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}'"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -243,7 +264,7 @@ docker pull "${IMAGE_TAG}" || true
 
 set +e
 docker run --name disagg-head --privileged --net=host --shm-size=128g --device /dev/fuse \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   -v "${HOST_HF_HOME}:/root/.cache/huggingface" \
   -v "${PERSIST_ROOT}/perf_eval_results:/perf_eval_results" \
   -e ROLE=head \
@@ -251,7 +272,7 @@ docker run --name disagg-head --privileged --net=host --shm-size=128g --device /
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
-  bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'
+  bash -c "umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}"
 HEAD_EXIT_CODE=$?
 set -e
 

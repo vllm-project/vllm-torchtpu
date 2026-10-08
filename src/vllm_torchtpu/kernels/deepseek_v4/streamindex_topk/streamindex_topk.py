@@ -14,6 +14,7 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +24,6 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     sparsecore_topk,
@@ -31,8 +31,16 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
+    dcp_sc_compact,
     metadata,
 )
+
+try:
+    from vllm_torchtpu.logger import init_logger
+
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
@@ -76,8 +84,10 @@ def kernel(
     # Input
     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
-    cache_kv_hbm_ref,  # HEAD_ALONG_SUBLANE: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # HEAD_ALONG_SUBLANE:
+    #     [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
+    cache_kv_hbm_ref,
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
     *score_refs,
@@ -501,6 +511,85 @@ def prepare_outputs(out):
 # 8-bit KV data packs 4 values into every 32-bit sublane word.
 KV_PACKING = 4
 
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+_INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int | str]] = set()
+
+
+def indexer_kv_layout(
+    block_size: int,
+    mode: str | None = None,
+) -> KVLayout:
+    """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
+
+    `sal` requires `block_size` to be a positive multiple of 128 and is not
+    supported by Raiden GLM Stage-3 admission (`build_glm_mla_pool_manifest` /
+    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry).
+    When `sal` is selected by default and Raiden GLM admission is enabled, or
+    when `block_size < 128` or `block_size % 128 != 0`, this helper selects
+    `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
+    allocation and op execution always agree on the layout. Explicitly
+    requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
+    """
+    try:
+        from vllm_torchtpu import envs
+
+        raiden_glm_admission = envs.use_raiden_glm_admission()
+        explicit_env = envs.is_indexer_kv_cache_mode_explicit()
+        env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+    except ImportError:
+        raiden_glm_admission = False
+        explicit_env = False
+        env_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+
+    if mode is None:
+        raw_mode = env_mode
+        explicit_mode = explicit_env
+    else:
+        raw_mode = mode
+        explicit_mode = True
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if resolved == "sal":
+        if raiden_glm_admission:
+            if explicit_mode:
+                raise ValueError(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible with "
+                    "Raiden GLM admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and "
+                    "TPU_RAIDEN_GLM_ADMISSION=1), which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or unset it to allow "
+                    "automatic fallback)."
+                )
+            key: tuple[str, int | str] = (resolved, "raiden_glm_admission")
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible "
+                    "with Raiden GLM admission (which requires packed-row "
+                    "HEAD_ALONG_SUBLANE layout for dsa.idx); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        if block_size < 128 or block_size % 128 != 0:
+            key = (resolved, int(block_size))
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r requires block_size to be a "
+                    "positive multiple of 128 (got block_size=%d); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer.",
+                    resolved,
+                    block_size,
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        return KVLayout.SEQ_ALONG_LANE
+    return KVLayout.HEAD_ALONG_SUBLANE
+
 
 def get_kv_cache_shape(
     total_num_pages: int,
@@ -510,6 +599,10 @@ def get_kv_cache_shape(
 ) -> tuple[int, ...]:
     """Returns the packed uint8 index KV cache shape for a given layout."""
     kv_layout = KVLayout.parse(kv_layout)
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
     head_dim = align_to(actual_head_dim, 128)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         if page_size % 128 != 0:
@@ -709,8 +802,9 @@ def streamindex_topk(
         the DCP attention kernels need an LSE output.
 
     Returns:
-      Top-K indices in global compressed space, or `(indices, scores)` if
-      `return_scores`. Unfilled slots are `-1` with score `-inf`.
+      Top-K indices in this rank's local compressed space, or
+      `(indices, scores)` if `return_scores`. Unfilled slots are `-1` with
+      score `-inf`.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
@@ -1037,6 +1131,7 @@ def streamindex_topk(
                 scheduling_group_id=scheduling_group_id,
                 **spec,
             )
+        assert scores is not None
         return scores
 
     def _common_path(_):
@@ -1143,16 +1238,9 @@ def streamindex_topk(
         )
         scores_out = scores_out[:max_num_tokens, :k]
 
-        # Columns are rank-local; callers (and the merge) want global positions.
-        filled = out >= 0
-        global_idxs = jnp.where(
-            filled,
-            cp_local_to_global(out, cp_rank, cp_size, interleave_c),
-            -1,
-        )
         if not return_scores:
-            return global_idxs
-        return global_idxs, scores_out
+            return out
+        return out, scores_out
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
@@ -1182,123 +1270,6 @@ def streamindex_topk(
     )
 
 
-def _topk_over_candidate_axis(scores: jax.Array, k: int) -> jax.Array:
-    """Exact top-k over the full candidate row; `-inf` slots never win."""
-    return sparsecore_topk(
-        scores,
-        k,
-        row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
-        write_empty_rows=True,
-    )
-
-
-def _merge_by_all_gather(
-    idxs: jax.Array,
-    scores: jax.Array,
-    k: int,
-    dcp_size: int,
-    dcp_rank: jax.Array,
-    dcp_axis_name: str,
-) -> jax.Array:
-    """Merge on the candidate axis; `[T, k]` global positions, `-1` in the
-    slots this rank did not produce."""
-    rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
-    payload = lax.all_gather(
-        jnp.concatenate([scores, rank_col], axis=1),
-        dcp_axis_name,
-        axis=1,
-        tiled=True,
-    )
-    # [T, dcp * (k+1)] -> [T, dcp, k+1]: column k is the chunk's source rank.
-    payload = payload.reshape(payload.shape[0], dcp_size, k + 1)
-    src = payload[:, :, k].astype(jnp.int32)
-
-    slots = _topk_over_candidate_axis(
-        payload[:, :, :k].reshape(payload.shape[0], dcp_size * k), k
-    )
-    # Keep only winners this rank produced.
-    safe = jnp.maximum(slots, 0)
-    ours = (slots >= 0) & (
-        jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
-    )
-    return jnp.where(ours, jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1), -1)
-
-
-def _merge_by_all_to_all(
-    idxs: jax.Array,
-    scores: jax.Array,
-    k: int,
-    dcp_size: int,
-    dcp_axis_name: str,
-) -> jax.Array:
-    """Merge on the token axis; `[T, k]` global positions, the whole global
-    top-k on every rank, so the caller still has to narrow it."""
-    # Stage 1. Rank `j` collects every rank's candidates for token block `j`.
-    # The indices ride along: the resolving rank did not produce them.
-    payload = lax.all_to_all(
-        jnp.concatenate([scores, idxs], axis=1),
-        dcp_axis_name,
-        split_axis=0,
-        concat_axis=1,
-        tiled=True,
-    )
-    # [T/dcp, dcp * 2k] -> [T/dcp, dcp, 2k], rank-major along axis 1.
-    payload = payload.reshape(-1, dcp_size, 2 * k)
-    rows = payload.shape[0]
-
-    # Stage 2. This rank's token block, merged into the exact global top-k.
-    slots = _topk_over_candidate_axis(payload[:, :, :k].reshape(rows, dcp_size * k), k)
-    block_idxs = payload[:, :, k:].reshape(rows, dcp_size * k)
-    merged = jnp.take_along_axis(block_idxs, jnp.maximum(slots, 0), axis=1)
-    merged = jnp.where(slots >= 0, merged, -1)
-
-    # Stage 3. Rank-major blocks back on every rank, restoring token order.
-    return lax.all_gather(merged, dcp_axis_name, axis=0, tiled=True)
-
-
-def _select_owned_winners(
-    merged: jax.Array,
-    dcp_size: int,
-    interleave_c: int,
-    dcp_rank: jax.Array | int,
-) -> jax.Array:
-    """Keep the winners this rank owns, left-packed as rank-local indices.
-
-    Every rank filters the identical `merged` global top-k list with its own
-    `dcp_rank`. Because `cp_owner_rank` partitions `[0, total_kv_positions)` onto
-    `range(dcp_size)`, the results across all ranks form an exact partition of
-    the global top-k: no winner is duplicated and none is lost. This is an
-    arithmetic identity regardless of buffer occupancy, which is why this requires
-    no capacity bounding and never truncates -- a rank owns at most all `k`
-    winners, and the output width is `k`.
-
-    Args:
-      merged: i32[num_rows, k] global compressed positions in `sparsecore_topk`
-        order, `-1` padded. Identical on every rank.
-      dcp_size: number of context-parallel ranks.
-      interleave_c: chunk-interleave width in compressed tokens.
-      dcp_rank: i32 scalar, this shard's index along the DCP axis.
-
-    Returns:
-      i32[num_rows, k] of rank-local cache indices for the winners this rank owns,
-      packed into a prefix and `-1` padded.
-    """
-    num_rows, width = merged.shape
-    mine = (merged >= 0) & (cp_owner_rank(merged, dcp_size, interleave_c) == dcp_rank)
-    local = cp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
-
-    # Exclusive prefix count of owned winners gives each entry's destination slot.
-    # At most `width` entries can be `mine`, so `slot <= width - 1`.
-    slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
-    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
-
-    # An extra column past the end (`width`) absorbs entries owned by other ranks;
-    # they all write -1 to the dump column, which is sliced off at the end.
-    out = jnp.full((num_rows, width + 1), -1, dtype=jnp.int32)
-    out = out.at[rows, jnp.where(mine, slot, width)].set(jnp.where(mine, local, -1))
-    return out[:, :width]
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1312,8 +1283,10 @@ def _select_owned_winners(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "a2a_merge",
     ),
 )
 def streamindex_topk_dcp(
@@ -1335,8 +1308,10 @@ def streamindex_topk_dcp(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    a2a_merge: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1349,28 +1324,34 @@ def streamindex_topk_dcp(
          on its owner rank. Thus, every true global winner is guaranteed to
          survive into its owner's local candidate list.
       2. Candidate All-Gather: A single `all_gather` along the candidate axis
-         (axis 1) exchanges candidate *scores* plus one trailing column naming
-         the rank that produced them: `[T, k+1] -> [T, dcp_size * (k+1)]`,
-         reshaped to `[T, dcp_size, k+1]`. The indices are not exchanged.
+         (axis 1) exchanges candidate *scores* only, rank-major:
+         `[T, k] -> [T, dcp_size * k]`. The indices are not exchanged, so they
+         never leave the rank that produced them.
       3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
          `[T, dcp_size * k]` scores to select the exact top-k global winners:
          `[T, dcp_size * k] -> [T, k]`.
-      4. Rank-Local Filtering: Each rank keeps the slots whose chunk's gathered
-         source rank equals `dcp_rank`, resolves them against its own pre-gather
-         indices at `slot % k`. Both `slot // k` and `slot % k` are functions of
-         the chunk width alone, not of the order the chunks arrived in. The rest
-         are marked `-1`,
-         then `_select_owned_winners` maps them to local shard coordinates
-         (`cp_global_to_local`) and packs them into a `-1` padded prefix. The
-         ranks' outputs still form an exact partition of the global top-k.
+      4. Rank-Local Filtering: `dcp_sc_compact.pack_owned_winners` keeps the
+         slots whose chunk came from `dcp_rank`, resolves them against this
+         rank's own pre-gather indices at `slot % k`, and left-packs them into a
+         `-1` padded prefix via fused SparseCore gather and compaction.
+         Those indices are rank-local already -- they never crossed the gather
+         -- so no coordinate conversion is needed and ownership is decided in
+         exactly one place. The ranks' outputs form an exact partition of the
+         global top-k.
 
     By gathering candidates along axis 1 upfront rather than partitioning tokens
     over an `all_to_all`, all communication is consolidated into a single upfront
     collective phase, avoiding the barrier latency of a multi-phase pipeline and
     preserving the token axis `T` unpartitioned.
 
-    `TPU_DCP_INDEXER_A2A_MERGE=1` swaps steps 2-3 for an `all_to_all` that
-    partitions the token axis, then an `all_gather(axis=0)` restoring it.
+    `a2a_merge` makes the opposite trade for steps 2-3: an `all_to_all` hands
+    rank `j` every rank's candidate scores for token block `j`, it merges only
+    that `T / dcp_size` block, and an `all_gather(axis=0)` of the int32 slots
+    restores the token axis. Each rank then receives `T * k` scores plus `T * k`
+    slots instead of `T * dcp_size * k` scores, and merges `T / dcp_size` rows
+    instead of `T`, at the cost of a second, dependent collective. Step 4 is
+    unchanged: a slot still names its source rank and that rank's own list, so
+    the indices never travel on either path.
 
     Args:
       q: replicated query tokens, in natural request-major order
@@ -1393,11 +1374,15 @@ def streamindex_topk_dcp(
       buffer_count: buffer count for pallas kernel.
       vmem_limit_bytes: vmem limit for pallas kernel.
       decode_req_batch_size: maximum decode batch size per iteration.
+      kv_layout: memory layout of `cache_kv` (`HEAD_ALONG_SUBLANE` or
+        `SEQ_ALONG_LANE`).
       chunk_tokens: forwarded to `streamindex_topk` for the per-rank local
         scoring pass; see there for the semantics. Chunking cuts the replicated
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
         two compose.
       dcp_axis_name: name of the DCP mesh axis.
+      a2a_merge: merge over the token axis with an `all_to_all` instead of over
+        the candidate axis with an `all_gather`; see above. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1426,7 +1411,6 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
-    interleave_c = interleave_size // compression_ratio
 
     def _local(
         q,
@@ -1455,6 +1439,7 @@ def streamindex_topk_dcp(
             buffer_count=buffer_count,
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
+            kv_layout=kv_layout,
             enable_early_exit=False,
             chunk_tokens=chunk_tokens,
             cp_size=dcp_size,
@@ -1463,14 +1448,28 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        if envs.TPU_DCP_INDEXER_A2A_MERGE:
-            merged = _merge_by_all_to_all(idxs, scores, k, dcp_size, dcp_axis_name)
-        else:
-            merged = _merge_by_all_gather(
-                idxs, scores, k, dcp_size, dcp_rank, dcp_axis_name
+        if a2a_merge:
+            # Stage 1. Rank `j` collects every rank's scores for token block
+            # `j`: [T, k] -> [T / dcp, dcp * k], rank-major like the gather.
+            scores = lax.all_to_all(
+                scores, dcp_axis_name, split_axis=0, concat_axis=1, tiled=True
             )
+        else:
+            # Stage 1. All-gather the scores; the indices stay home.
+            scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
-        return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
+        # Stage 2. Full width as the row length: -inf entries (unfilled local
+        # slots, padding tokens) are never selected, so they need no masking.
+        slots = sparsecore_topk(
+            scores,
+            k,
+            row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
+            write_empty_rows=True,
+        )
+        if a2a_merge:
+            # Every rank's merged block back, in token order: [T, k] slots.
+            slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
+        return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
 
     replicated = P()
     return jax.shard_map(

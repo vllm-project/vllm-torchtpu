@@ -21,6 +21,7 @@ import pytest
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     TilePlanField,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
+    query_row_positions,
 )
 
 pytestmark = pytest.mark.multichip
@@ -259,3 +260,180 @@ def test_metadata_jax_schedule_rejects_nonpositive_interleave_size(interleave_si
             interleave_size=interleave_size,
             q_block_size=4,
         )
+
+
+@pytest.mark.parametrize("length,groups", [(8192, 32), (8191, 39)])
+def test_partial_interleaves_share_query_tiles(length, groups):
+    """P8191 must not replay the ring for each tiny boundary fragment."""
+    build = jax.jit(
+        build_pcp_streaming_schedule_inputs_from_metadata_jax,
+        static_argnames=(
+            "global_bucket_tokens",
+            "local_kv_cache_num_blocks",
+            "page_size",
+            "pcp_size",
+            "interleave_size",
+            "q_block_size",
+        ),
+    )
+    result = build(
+        kv_lens=np.full(8, length, np.int32),
+        page_indices=np.zeros((8, 8), np.int32),
+        cu_q_lens=np.arange(9, dtype=np.int32) * length,
+        distribution=np.array([0, 0, 8], np.int32),
+        global_bucket_tokens=65536,
+        local_kv_cache_num_blocks=128,
+        page_size=128,
+        pcp_size=16,
+        interleave_size=128,
+        q_block_size=512,
+    )
+    np.testing.assert_array_equal(np.asarray(result[4]), [8, groups])
+
+
+@pytest.mark.parametrize("pcp_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("history", [0, 17, 128 * 1024])
+def test_packed_tiles_cover_exact_batch_flat_query_rows(pcp_size, history):
+    lengths = np.array([1, 127, 129, 8191, 8192, 8193, 0], np.int32)
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    interleave, block = 128, 512
+    bucket = (
+        ((int(cu[-1]) + pcp_size * block - 1) // (pcp_size * block)) * pcp_size * block
+    )
+    result = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+        kv_lens=lengths + history,
+        page_indices=np.zeros((len(lengths), 256), np.int32),
+        cu_q_lens=cu,
+        distribution=np.array([0, 0, len(lengths) - 1], np.int32),
+        global_bucket_tokens=bucket,
+        local_kv_cache_num_blocks=256,
+        page_size=256,
+        pcp_size=pcp_size,
+        interleave_size=interleave,
+        q_block_size=block,
+    )
+    plan = np.asarray(result[0])[:, 0, : pcp_size * TilePlanField.NUM_FIELDS].reshape(
+        -1, pcp_size, TilePlanField.NUM_FIELDS
+    )
+    prefixes = np.zeros(pcp_size, np.int32)
+    for req, length in enumerate(lengths):
+        request_tiles = plan[plan[:, 0, TilePlanField.REQ_ID] == req]
+        active = request_tiles[:, 0, TilePlanField.CURRENT_NUM_GROUPS] > 0
+        request_tiles = request_tiles[active]
+        owned_counts = []
+        for rank in range(pcp_size):
+            global_rows = np.arange(cu[req], cu[req + 1])
+            expected = global_rows[(global_rows // interleave) % pcp_size == rank]
+            owned_counts.append(len(expected))
+            positions, offsets = [], []
+            for tile in request_tiles[:, rank]:
+                size = int(tile[TilePlanField.Q_TILE_SIZE])
+                offset = int(tile[TilePlanField.Q_HBM_OFFSET])
+                rows = np.arange(size)
+                positions.extend(
+                    query_row_positions(
+                        tile[TilePlanField.Q_GLOBAL_START],
+                        offset,
+                        rows,
+                        pcp_size=pcp_size,
+                        interleave_size=interleave,
+                    )
+                )
+                offsets.extend(offset + rows)
+            np.testing.assert_array_equal(positions, history + expected - cu[req])
+            np.testing.assert_array_equal(
+                offsets, prefixes[rank] + np.arange(len(expected))
+            )
+            prefixes[rank] += len(expected)
+        assert len(request_tiles) == (max(owned_counts) + block - 1) // block
+        if length:
+            # The final tile alone captures the full fresh KV, even if some
+            # ranks have already exhausted their local query rows.
+            np.testing.assert_array_equal(
+                request_tiles[:, 0, TilePlanField.CAPTURE_CURRENT_KV],
+                np.arange(len(request_tiles)) == len(request_tiles) - 1,
+            )
+            assert request_tiles[-1, 0, TilePlanField.CURRENT_EFFECTIVE_LEN] == length
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4])
+@pytest.mark.parametrize("history", [0, 17])
+def test_packed_query_causality_against_dense_attention(pcp_size, history):
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.reference import (
+        build_runtime_schedule_reference,
+    )
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+        RuntimeScheduleField as R,
+    )
+
+    lengths = np.array([7, 19, 9], np.int32)
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    interleave, block, page = 2, 8, 4
+    bucket = (
+        ((int(cu[-1]) + pcp_size * block - 1) // (pcp_size * block)) * pcp_size * block
+    )
+    result = build_pcp_streaming_schedule_inputs_from_metadata_jax(
+        kv_lens=lengths + history,
+        page_indices=np.zeros((3, 16), np.int32),
+        cu_q_lens=cu,
+        distribution=np.array([0, 0, 3], np.int32),
+        global_bucket_tokens=bucket,
+        local_kv_cache_num_blocks=16,
+        page_size=page,
+        pcp_size=pcp_size,
+        interleave_size=interleave,
+        q_block_size=block,
+    )
+    reference = build_runtime_schedule_reference(
+        np.asarray(result[0]),
+        np.asarray(result[1]),
+        pcp_size=pcp_size,
+        page_size=page,
+        interleave_size=interleave,
+    )
+    plan = np.asarray(result[0])[:, 0, : pcp_size * TilePlanField.NUM_FIELDS].reshape(
+        -1, pcp_size, TilePlanField.NUM_FIELDS
+    )
+    rng = np.random.default_rng(42)
+    for tile_idx, tile in enumerate(plan):
+        req = int(tile[0, TilePlanField.REQ_ID])
+        for rank, row in enumerate(tile):
+            size = int(row[TilePlanField.Q_TILE_SIZE])
+            if not size:
+                continue
+            positions = query_row_positions(
+                row[TilePlanField.Q_GLOBAL_START],
+                row[TilePlanField.Q_HBM_OFFSET],
+                np.arange(size),
+                pcp_size=pcp_size,
+                interleave_size=interleave,
+            )
+            kv_positions = []
+            for schedules in (reference.current_rows, reference.history_rows):
+                for group in schedules[tile_idx]:
+                    for entry in group[:, rank]:
+                        if entry[R.REQ_ID] < 0:
+                            continue
+                        local = np.arange(entry[R.KV_VALID_LEN])
+                        kv_positions.extend(
+                            entry[R.KV_GLOBAL_START]
+                            + local // interleave * pcp_size * interleave
+                            + local % interleave
+                        )
+            kv_positions = np.asarray(kv_positions, np.int32)
+            q = rng.normal(size=(size, 8))
+            k = rng.normal(size=(history + lengths[req], 8))
+            v = rng.normal(size=(history + lengths[req], 8))
+            for i, position in enumerate(positions):
+                visible = kv_positions[kv_positions <= position]
+                np.testing.assert_array_equal(np.sort(visible), np.arange(position + 1))
+                scores = q[i] @ k[visible].T
+                probs = np.exp(scores - scores.max())
+                probs /= probs.sum()
+                actual = probs @ v[visible]
+                scores = q[i] @ k[: position + 1].T
+                probs = np.exp(scores - scores.max())
+                probs /= probs.sum()
+                np.testing.assert_allclose(
+                    actual, probs @ v[: position + 1], atol=1e-12
+                )

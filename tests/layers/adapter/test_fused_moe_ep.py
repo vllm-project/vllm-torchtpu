@@ -30,6 +30,7 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
 # count against it, because the kernel requires one equal block per shard.
@@ -158,7 +159,9 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         closures.append(fn)
         return Mock()
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", build)
+    # This branch builds the fused EP op with Torchtpu's native
+    # jax_op; the local shim it used to go through is gone.
+    monkeypatch.setattr(bridge, "jax_op", build)
     kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
     monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
     groups = ((0, 1),)
@@ -230,6 +233,28 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
         == "op"
     )
     assert seen and seen[0][_MESH_ORDER_ARG] == order
+
+
+def test_mesh_expert_order_is_none_when_ranks_follow_device_ids():
+    """The permutation exists only to undo a mesh ordered by device id; where
+    EP rank order already is device order the op must be handed nothing."""
+    seen = []
+    assert (
+        _prebuild(
+            _layer(),
+            ep_order=tuple(range(_STUB_EP)),
+            build_op=lambda *args, **kwargs: seen.append(args) or "op",
+        )
+        == "op"
+    )
+    assert seen and seen[0][_MESH_ORDER_ARG] is None
+
+
+def test_ep_rank_order_is_none_without_a_group():
+    from vllm_torchtpu.distributed import ep_mesh
+
+    with patch.object(ep_mesh, "get_ep_group", return_value=None):
+        assert ep_mesh.ep_rank_order() is None
 
 
 def test_refused_without_the_env_flag():
@@ -434,11 +459,11 @@ def test_mesh_expert_order(order, expected):
 
 
 def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
-    """An EP-rank-ordered mesh deadlocks on the first remote DMA; the mesh is
-    in ascending device-id order, so this is what says which rank sits where."""
+    """The mesh is in ascending device-id order (the rank-ordered one makes the
+    fused MoE's all-gathers slow), so this is what says which rank sits where."""
     from vllm_torchtpu.distributed import ep_mesh
 
-    # EP ranks 0..7 sitting on these device ids. Sorted ascending, rank r ends
+    # EP ranks 0..7 on a tpu7x host's device ids. Sorted ascending, rank r ends
     # up at the position of its device id.
     device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
@@ -450,22 +475,6 @@ def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
 
     assert order == tuple(rank for _, rank in sorted(zip(device_ids, range(8))))
     assert order == (0, 1, 6, 7, 2, 3, 4, 5)
-
-
-def test_sharded_jax_op_still_matches_the_line_it_replaces():
-    """`sharded_jax_op` finds its one line by string-matching torch_tpu's
-    installed source. On a miss it falls back to stock with only a warning,
-    and the fused op then sizes its outputs mesh-wide -- a device-time shape
-    error, long after load. Fail here instead, on a torch_tpu bump."""
-    import inspect
-
-    from torch_tpu._internal.pallas import pallas as pallas_impl
-
-    from vllm_torchtpu.distributed import sharded_jax_op as sjo
-
-    source = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    assert sjo._STOCK_PLACEHOLDER_LINE in source
-    assert sjo._build_sharded_callable_cls() is not pallas_impl.JaxCallable
 
 
 def test_supports_internal_mk_tracks_both_owners():
@@ -511,8 +520,8 @@ def test_env_flag_alone_does_not_claim_the_collectives():
         assert prop.fget(SimpleNamespace()) is False
 
 
-class TestFusedOutputIsReducedPatch:
-    """`_patch_moe_runner_fused_output_is_reduced` rewrites an upstream class.
+class TestFusedOutputIsReduced:
+    """`VllmMoERunner._fused_output_is_reduced` overrides an upstream answer.
 
     It is the guard that stops vLLM all-reducing an output the kernel already
     combined, so it has to be right about three things: it stays out of runs
@@ -520,77 +529,32 @@ class TestFusedOutputIsReducedPatch:
     `skip_final_all_reduce`, and it answers per layer.
     """
 
-    @staticmethod
-    def _fresh_runner_cls():
-        """A MoERunner with the patch un-applied, restored after the test."""
-        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
-
-        return mr.MoERunner
-
-    @pytest.fixture(autouse=True)
-    def _restore(self):
-        cls = self._fresh_runner_cls()
-        saved = cls.__dict__.get("_fused_output_is_reduced")
-        saved_flag = cls.__dict__.get("_tpu_fused_output_reduced_patch")
-        if hasattr(cls, "_tpu_fused_output_reduced_patch"):
-            del cls._tpu_fused_output_reduced_patch
-        yield cls
-        if saved is not None:
-            cls._fused_output_is_reduced = saved
-        if saved_flag is not None:
-            cls._tpu_fused_output_reduced_patch = saved_flag
-        elif hasattr(cls, "_tpu_fused_output_reduced_patch"):
-            del cls._tpu_fused_output_reduced_patch
-
-    def _apply(self):
-        import vllm_torchtpu
-
-        vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
-
-    def _runner(self, cls, *, armed, skip_final_all_reduce=False):
-        """A stub standing in for a MoERunner, with `original` forced False."""
+    def _answer(self, *, armed, skip_final_all_reduce=False):
         # `moe_kernel=None` is what the TPU fp8 method actually has, and it
         # is what makes upstream's own getter return False -- so a True here
-        # can only have come from the patch.
+        # can only have come from the override.
         quant_method = SimpleNamespace(moe_kernel=None)
         if armed:
             setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, "op")
-        runner = SimpleNamespace(
-            _quant_method=quant_method,
-            moe_config=SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce),
-        )
-        return cls._fused_output_is_reduced.fget(runner)
+        runner = VllmMoERunner.__new__(VllmMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+        runner.moe_config = SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce)
+        return runner._fused_output_is_reduced
 
-    def test_not_installed_without_the_env_flag(self, _restore):
-        cls = _restore
-        before = cls.__dict__.get("_fused_output_is_reduced")
+    def test_defers_to_upstream_without_the_env_flag(self):
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False):
-            self._apply()
-        assert cls.__dict__.get("_fused_output_is_reduced") is before
-        assert not getattr(cls, "_tpu_fused_output_reduced_patch", False)
+            assert self._answer(armed=True) is False
 
-    def test_reports_reduced_only_for_an_armed_layer(self, _restore):
-        cls = _restore
+    def test_reports_reduced_only_for_an_armed_layer(self):
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-        assert cls._tpu_fused_output_reduced_patch is True
-        assert self._runner(cls, armed=True) is True
-        assert self._runner(cls, armed=False) is False
+            assert self._answer(armed=True) is True
+            assert self._answer(armed=False) is False
 
-    def test_defers_to_upstream_under_skip_final_all_reduce(self, _restore):
+    def test_defers_to_upstream_under_skip_final_all_reduce(self):
         """The upstream assert requires an un-reduced fused output there."""
-        cls = _restore
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-        assert self._runner(cls, armed=True, skip_final_all_reduce=True) is False
-
-    def test_is_idempotent(self, _restore):
-        cls = _restore
-        with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            self._apply()
-            first = cls.__dict__["_fused_output_is_reduced"]
-            self._apply()
-        assert cls.__dict__["_fused_output_is_reduced"] is first
+            assert self._answer(armed=True, skip_final_all_reduce=True) is False
 
 
 def _fp4_layer(block=512, hidden=512, inter=512):

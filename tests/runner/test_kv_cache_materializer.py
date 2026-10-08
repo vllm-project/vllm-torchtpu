@@ -251,7 +251,7 @@ def test_attention_only_allocates_direct_cache_without_raw_backing():
     assert attn_cache.is_contiguous()
 
 
-def test_direct_attention_materialization_maps_kernel_block_sizes_after_encoder_only_gap():
+def test_direct_attention_materialization_maps_kernel_block_sizes_after_encoder_only_gap():  # noqa: E501
     cfg = make_attention_encoder_attention_config(num_blocks=4)
 
     materialized = materialize_kv_cache_tensors(

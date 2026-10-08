@@ -21,4 +21,21 @@ steps:
         agents:
           queue: cpu_64_core
         commands:
-          - bash .buildkite/scripts/setup_docker_env.sh
+          - bash .buildkite/scripts/setup_docker_env.sh dev
+        # The torch-tpu virtual registry sometimes 404s a wheel it serves
+        # moments later; a build that fails that way passes on the next try.
+        retry: &image_build_retry
+          automatic:
+            - exit_status: 1
+              limit: 1
+
+      - label: ":docker: Build and Push Omni CI Image"
+        key: "build_docker_omni"
+        # Empty, and so not skipped, unless bootstrap.sh uploads no tests lane,
+        # the only lane that runs on this image.
+        skip: "${OMNI_IMAGE_SKIP:-}"
+        agents:
+          queue: cpu_64_core
+        commands:
+          - bash .buildkite/scripts/setup_docker_env.sh omni
+        retry: *image_build_retry

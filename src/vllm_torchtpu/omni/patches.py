@@ -29,8 +29,9 @@ def apply_omni_tpu_patches() -> None:
     #
     # REMOVAL / FIX CONDITION:
     # This patch can be removed/reduced once:
-    # 1. OmniTpuPlatform.record_device_event() implements hardware synchronization
-    #    (torch.tpu.synchronize()) to ensure execution completes before COMPUTE_DONE.
+    # 1. OmniTpuPlatform.record_device_event() implements hardware
+    #    synchronization (torch.accelerator.synchronize()) to ensure execution
+    #    completes before COMPUTE_DONE.
     # 2. AOT compilation caching stabilizes startup compile times.
     # -------------------------------------------------------------------------
     import os
@@ -47,9 +48,10 @@ def apply_omni_tpu_patches() -> None:
     # Used in temporal/audio diffusion alignment (Wan 2.2 S2V, LongCat, audio vocoders).
     #
     # UPSTREAM STATUS & REMOVAL CONDITION:
-    # Fixed upstream in torch_tpu commit a0b184ed27d ("Implement aten::upsample_linear1d.out",
-    # Sep 14, 2026). This CPU fallback patch can be deleted once vllm-torchtpu
-    # bumps to a torch_tpu development wheel >= 0.1.1.dev20260914 containing that commit.
+    # Fixed upstream in torch_tpu commit a0b184ed27d
+    # ("Implement aten::upsample_linear1d.out", Sep 14, 2026). This CPU fallback patch
+    # can be deleted once vllm-torchtpu bumps to a torch_tpu development wheel
+    # >= 0.1.1.dev20260914 containing that commit.
     # -------------------------------------------------------------------------
     orig_interpolate = torch.nn.functional.interpolate
 
@@ -80,8 +82,9 @@ def apply_omni_model_specific_patches() -> None:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
     # 1. Pickling a device tensor aborts process: In torch_tpu, calling
-    #    pickle.dumps on a device tensor hits ABSL_CHECK(tensor.storage().allocator() == nullptr)
-    #    in csrc/eager/tensor_to_buffer.cc:260-261, terminating the worker process
+    #    pickle.dumps on a device tensor hits
+    #    ABSL_CHECK(tensor.storage().allocator() == nullptr) in
+    #    csrc/eager/tensor_to_buffer.cc:260-261, terminating the worker process
     #    with SIGABRT (exit code 134) with no Python traceback.
     # 2. libtpu per-process lockfile prevents cross-process init:
     #    Holding TPU tensors across process boundaries causes the CPU-only

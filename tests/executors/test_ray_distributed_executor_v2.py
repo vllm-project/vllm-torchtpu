@@ -22,8 +22,6 @@ from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
     get_tpu_bundles_for_indices,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 class MockParallelConfig:
     def __init__(self):
@@ -388,7 +386,8 @@ class TestTpuRayDistributedExecutorV2:
             )
             assert local_readers == [ordered_indices.index(0)]
 
-            # Verify the environment variables passed to each worker during initialize_worker.remote()
+            # Verify the environment variables passed to each worker during
+            # initialize_worker.remote()
             # Worker 0 (Rank 0, Node 1)
             mock_worker_actor_1.initialize_worker.remote.assert_called_once()
             args_w0 = mock_worker_actor_1.initialize_worker.remote.call_args[0]
@@ -889,7 +888,9 @@ class TestTpuRayDistributedExecutorV2:
 
 
 def test_ray_distributed_executor_bundle_expansion():
-    """Verify V1 executor bundle index expansion for host-level and chip-level bundles."""
+    """Verify V1 executor bundle index expansion for host-level and
+    chip-level bundles.
+    """
 
     def expand_bundles(bundle_indices, world_size):
         if len(bundle_indices) < world_size:
@@ -905,8 +906,8 @@ def test_ray_distributed_executor_bundle_expansion():
             return expanded_indices
         elif len(bundle_indices) != world_size:
             raise ValueError(
-                f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
-                f"world_size ({world_size})."
+                f"Number of bundle indices ({len(bundle_indices)}) must be less "
+                f"than or equal to world_size ({world_size})."
             )
         return bundle_indices
 

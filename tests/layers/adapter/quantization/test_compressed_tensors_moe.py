@@ -4,16 +4,16 @@ import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (  # noqa: E501
     VllmCompressedTensorsMoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
     VllmCompressedTensorsW4A16MoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -61,9 +61,12 @@ class FakeActivation:
 
 
 # Need to mock vllm.model_executor.layers.fused_moe.RoutedExperts isinstance check
-# Because VllmCompressedTensorsMoEMethod.get_moe_method asserts isinstance(layer, RoutedExperts)
+# Because VllmCompressedTensorsMoEMethod.get_moe_method asserts
+# isinstance(layer, RoutedExperts)
 class FakeRoutedExperts(RoutedExperts):
-    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM config requirements."""
+    """Subclass RoutedExperts to pass isinstance check without triggering full vLLM
+    config requirements.
+    """
 
     def __init__(self, experts_per_token=2):
         torch.nn.Module.__init__(self)
@@ -79,7 +82,8 @@ class TestCompressedTensorsConfigRouting:
     """Verify that VllmCompressedTensorsConfig correctly routes configs."""
 
     def test_get_moe_method_routing(self, monkeypatch):
-        # We need to mock _is_int4_w4aN, _is_weight_fp8 to make them independent of full configs, or use correct FakeQuantArgs
+        # We need to mock _is_int4_w4aN, _is_weight_fp8 to make them independent of full
+        # configs, or use correct FakeQuantArgs
         config = MagicMock(spec=VllmCompressedTensorsConfig)
 
         # Monkeypatch _is_mxfp4

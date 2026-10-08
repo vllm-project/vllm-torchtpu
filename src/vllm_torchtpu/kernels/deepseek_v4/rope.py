@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -61,12 +62,14 @@ class CosSinRef(pltpu.BufferedRef):
         src_ref: tuple[jax.Ref, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ) -> None:
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        dest_ref = self.window_ref.at[slot]  # (tile_n, rotary_dim)
+        dest_ref = cast(jax.Ref, self.window_ref.at[slot])  # (tile_n, rotary_dim)
         width = self.window_ref.shape[-1]
 
         @pl.loop(0, self.tile_n, unroll=True)
@@ -81,6 +84,8 @@ class CosSinRef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ) -> None:
         del src_ref, grid_indices
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_wait_in_slot
         vmem_ref = self.window_ref.at[slot]
         pltpu.make_async_copy(vmem_ref, vmem_ref, self.sem_recvs.at[slot]).wait()
@@ -498,13 +503,16 @@ def rope(
       ``x`` with the trailing ``rotary_dim`` channels rotated, same shape and
       dtype. ``x`` is donated -- the kernel updates the buffer in place.
     """
-    return _rope_call(
-        x,
-        positions,
-        cos_sin_cache,
-        inverse=inverse,
-        quant_dtype=None,
-        name=name,
+    return cast(
+        jax.Array,
+        _rope_call(
+            x,
+            positions,
+            cos_sin_cache,
+            inverse=inverse,
+            quant_dtype=None,
+            name=name,
+        ),
     )
 
 
@@ -585,11 +593,14 @@ def rope_quant(
     Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
     inside the kernel.
     """
-    return _rope_call(
-        x,
-        positions,
-        cos_sin_cache,
-        inverse=inverse,
-        quant_dtype=quant_dtype,
-        name=name,
+    return cast(
+        tuple[jax.Array, jax.Array],
+        _rope_call(
+            x,
+            positions,
+            cos_sin_cache,
+            inverse=inverse,
+            quant_dtype=quant_dtype,
+            name=name,
+        ),
     )

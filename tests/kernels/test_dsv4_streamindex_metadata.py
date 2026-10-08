@@ -21,6 +21,7 @@ from absl.testing import absltest, parameterized
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
 
+@pytest.mark.tpu_test
 class MetadataTest(parameterized.TestCase):
     @parameterized.named_parameters(
         (
@@ -170,7 +171,8 @@ class MetadataTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.array(meta.start_seq_idx)[:4], [0, 0, 0, 0])
 
         # seq 0: q_len=64 -> nbq=2 (bq 0..1), kv_len=128 -> nbkv=2 (bkv 0..1) => 4 tiles
-        # seq 1: q_len=192 -> nbq=6 (bq 0..5), kv_len=256 -> nbkv=4 (bkv 0..3) => 24 tiles
+        # seq 1: q_len=192 -> nbq=6 (bq 0..5), kv_len=256 -> nbkv=4 (bkv 0..3)
+        #   => 24 tiles
         # Total tiles = 4 + 24 = 28
         self.assertEqual(int(meta.num_steps[0]), 28)
         # Check seq 0 tiles (first 4)
@@ -311,7 +313,6 @@ class MetadataTest(parameterized.TestCase):
         print("=" * 60 + "\n")
 
 
-@pytest.mark.cpu_test
 class ChunkedMetadataTest(parameterized.TestCase):
     """`chunk_token_start` as a tuple of chunk starts.
 

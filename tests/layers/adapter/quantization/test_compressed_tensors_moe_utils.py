@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
 )
 
@@ -40,7 +40,8 @@ class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
 
         weight_name = "w13_weight_packed"
         # Since tp_size=2, tp_rank=0, we expect the first half of dim 0 to be taken.
-        # loaded_weight shape should have dim 0 divisible by tp_size (e.g. 16 -> 8 loaded per rank)
+        # loaded_weight shape should have dim 0 divisible by tp_size
+        # (e.g. 16 -> 8 loaded per rank)
         loaded_weight = torch.ones((16, 16), dtype=torch.float16) * 2.0
 
         # Call hook for w1

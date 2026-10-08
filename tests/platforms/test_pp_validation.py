@@ -113,3 +113,11 @@ def test_accepts_the_ray_v2_executor(monkeypatch):
     monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1")
     validate_pipeline_parallel_config(_config(pp=2))
+
+
+def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
+    # GLM-5.2: every layer is sparse attention with its own latent cache.
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    validate_pipeline_parallel_config(
+        _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
+    )

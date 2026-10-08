@@ -199,7 +199,8 @@ def main() -> int:
                 " tokenizer-based sizing above)"
             )
             return 1
-    # Allow sufficient time for asynchronous host DRAM transfer and global registry publication.
+    # Allow sufficient time for asynchronous host DRAM transfer and global
+    # registry publication.
     time.sleep(2 * args.publish_wait_s)
 
     print("=== replaying through B ===")

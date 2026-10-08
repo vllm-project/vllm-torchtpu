@@ -13,18 +13,18 @@
 # limitations under the License.
 """Compressed Tensors MoE Dispatcher for TPU."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
-from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
     VllmCompressedTensorsW4A16MoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -33,7 +33,9 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+    from compressed_tensors.quantization import QuantizationArgs
+
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
         VllmCompressedTensorsConfig,
     )
 
@@ -41,12 +43,14 @@ if TYPE_CHECKING:
 class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
     """TPU dispatcher for Compressed Tensors MoE schemes."""
 
+    # Ignored and FP8 layers get methods outside the compressed-tensors
+    # hierarchy, so the return type is their common base.
     @staticmethod
     def get_moe_method(
         quant_config: "VllmCompressedTensorsConfig",  # type: ignore
         layer: torch.nn.Module,
         layer_name: str,
-    ) -> CompressedTensorsMoEMethod:
+    ) -> FusedMoEMethodBase:
         assert isinstance(layer, RoutedExperts)
 
         # RoutedExperts was made by combining multiple Linears so need to
@@ -72,11 +76,13 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         if scheme_dict is None:  # ignored layer
             return VllmUnquantizedFusedMoEMethod(quant_config.get_moe_config(layer))
 
-        weight_quant = scheme_dict.get("weights")
-        input_quant = scheme_dict.get("input_activations")
+        weight_quant = cast("QuantizationArgs", scheme_dict.get("weights"))
+        input_quant = cast(
+            "QuantizationArgs | None", scheme_dict.get("input_activations")
+        )
 
         # Have to keep the imports here to prevent circular import
-        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (
+        from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
             _build_fp8_config,
             _is_int4_w4aN,
             _is_weight_fp8,
@@ -85,10 +91,11 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         # 1. Dispatch W4A16 MoE
         if _is_int4_w4aN(weight_quant):
             # NOTE: We route both W4AN configurations to the same runner.
-            # Under the hood, the GMM kernel (gmm_v2.py) always receives maybe_quantize_lhs=True
-            # for INT4 weights. If group_size < 128 (e.g. 16 or 32 for DeepSeek), the kernel
-            # will automatically fallback to dequantize-before-matmul (running as W4A16).
-            # If group_size >= 128, it will dynamically quantize activations (running as W4A8).
+            # Under the hood, the GMM kernel (gmm_v2.py) always receives
+            # maybe_quantize_lhs=True for INT4 weights. If group_size < 128
+            # (e.g. 16 or 32 for DeepSeek), the kernel will automatically fallback to
+            # dequantize-before-matmul (running as W4A16). If group_size >= 128, it will
+            # dynamically quantize activations (running as W4A8).
             return VllmCompressedTensorsW4A16MoEMethod(
                 weight_quant, input_quant, quant_config.get_moe_config(layer)
             )

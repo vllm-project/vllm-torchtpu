@@ -21,8 +21,6 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
 from vllm_torchtpu.platforms.tpu_block_size_utils import _hybrid_mamba_state_layout
 
-pytestmark = pytest.mark.cpu_test
-
 K_HEADS = 4
 V_HEADS = 32
 HEAD_DIM = 128
@@ -89,8 +87,9 @@ def test_qkvz_checkpoint_load_preserves_whole_heads(
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail,
-            rank=rank: f"QKVZ checkpoint partition: TP={tp_size}, rank={rank}\n{detail}",
+            msg=lambda detail, rank=rank: (
+                f"QKVZ checkpoint partition: TP={tp_size}, rank={rank}\n{detail}"
+            ),
         )
 
 
@@ -107,8 +106,9 @@ def test_conv_checkpoint_uses_same_head_ownership(make_gdn_attention, tp_size):
             expected,
             rtol=0,
             atol=0,
-            msg=lambda detail,
-            rank=rank: f"Conv checkpoint partition: TP={tp_size}, rank={rank}\n{detail}",
+            msg=lambda detail, rank=rank: (
+                f"Conv checkpoint partition: TP={tp_size}, rank={rank}\n{detail}"
+            ),
         )
 
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 """DeepSeek-V4 mixture-of-experts layer."""
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -105,8 +107,10 @@ class DeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
+            e_score_correction_bias=cast(
+                torch.Tensor | None, self.gate.e_score_correction_bias
+            ),
+            hash_indices_table=cast(torch.Tensor | None, self.gate.tid2eid),
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
@@ -123,6 +127,19 @@ class DeepseekV4MoE(nn.Module):
             object.__setattr__(
                 self.experts.routed_experts, "hash_indices_table", self.gate.tid2eid
             )
+
+    @property
+    def routes_dp_gathered_tokens(self) -> bool:
+        """Whether the experts see the DP-gathered batch or this rank's rows.
+
+        Hash routing indexes its table by token id, so the ids handed down
+        have to line up row-for-row with the hidden states the experts get.
+        The runner gathers them only while the quant method does not own its
+        own dispatch; an armed fused-EP layer does, and then the experts --
+        and the ids -- stay local. Asked of the layer rather than assumed,
+        because arming is decided per layer at weight load.
+        """
+        return self.experts.do_naive_dispatch_combine
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None

@@ -24,7 +24,10 @@ Modes:
     - State Bytes: 2048 (dim) x 4 (bytes per fp32) = 8192 bytes
     - Head Dim:    448 fp8 + 64 lane-periodic scales = 512 bytes
     - Cache:       [num_pages, _, 4, 128] uint8 (where _ = state_block_size * 16
-    or kv_block_size)
+    or kv_block_size), allocated as [num_pages, _, 128] int32
+    - RoPE Cache:  64 bf16 = 128 bytes, [num_pages, kv_block_size // 4, 4, 128]
+    uint8, allocated as [num_pages, kv_block_size // 4, 128] int32 (see
+    `csa_cache_layout`)
 
   CSA-Indexer:
     - State Bytes: 512 (dim) x 4 (bytes per fp32) = 2048 bytes
@@ -35,6 +38,7 @@ Modes:
 
 import dataclasses
 import enum
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -54,7 +58,7 @@ class Mode(enum.Enum):
     CSA_INDEXER = "csa_indexer"
 
 
-_MODE_DEFAULTS = {
+_MODE_DEFAULTS: dict[Mode, dict[str, Any]] = {
     Mode.HCA: dict(
         head_dim=512,
         rope_head_dim=64,
@@ -381,7 +385,8 @@ class Configs:
 
     @property
     def state_rows_per_token(self) -> int:
-        """Number of physical HBM rows occupied by one token's full state (kv + score)."""
+        """Number of physical HBM rows occupied by one token's full state
+        (kv + score)."""
         return state_rows_per_token(
             self.dims.mode, self.dims.head_dim, self.dims.overlap
         )
@@ -471,7 +476,11 @@ class Configs:
         return (self._tile_n, self.dims.rope_head_dim)
 
     def cache_shape(self, num_pages: int) -> tuple[int, ...]:
-        """Shape of the global HBM KV cache."""
+        """Shape of the global HBM KV cache, as uint8 slabs.
+
+        CSA's arrays are allocated as ``(num_pages, rows, 128)`` int32
+        (`csa_cache_layout`), the same bytes as this shape.
+        """
         return (num_pages, self.physical_page_size) + self.cache_last_dims
 
     def state_cache_shape(self, num_pages: int) -> tuple[int, ...]:
@@ -479,6 +488,6 @@ class Configs:
         return (num_pages, self.state_physical_page_size) + self.cache_last_dims
 
     def rope_cache_shape(self, num_pages: int) -> tuple[int, ...]:
-        """Shape of the global HBM RoPE cache."""
+        """Shape of the global HBM RoPE cache, as uint8 slabs."""
         assert self.dims.has_rope_cache
         return (num_pages, self.rope_page_size, 4, 128)

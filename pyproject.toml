@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm_torchtpu"
+name = "vllm-torchtpu-core"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
@@ -12,7 +12,7 @@ readme = "README.md"
 # unsatisfiable-requirements failure partway through a Docker build.
 requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm_torchtpu Contributors" }
+    { name = "vLLM TorchTPU Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,9 +27,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    # vllm: see the `vllm` dependency group below.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -37,14 +35,14 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260912075415",
+    "torch-tpu==0.1.1+release.2026.9.22.20261003154636",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    "tpu-sync-torch==0.0.1.dev20261002213151",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
@@ -62,8 +60,8 @@ dependencies = [
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
-    "jax==0.10.2",
-    "jaxlib==0.10.2",
+    "jax==0.11.2",
+    "jaxlib==0.11.2",
     # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
     # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
     # per-config LIBTPU_INIT_ARGS additions under
@@ -75,23 +73,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Required for running tests
-test = [
-    # tests/kernels/ and tests/layers/ use absl.testing.
-    "absl-py",
-    "pytest",
-    "pytest-mock",
-    "pytest-timeout",
-    "pytest-cov",
-    "parameterized",
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
-]
-
-# Dev tools (linting, formatting)
-dev = [
-    "yapf>=0.43.0",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -125,12 +106,41 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
+# Dev / CI / Docker only. These are PEP 735 dependency groups, not extras:
+# groups are never written into the built wheel's metadata, so their git URLs
+# do not block a PyPI upload (PyPI rejects direct-URL requirements, even in
+# extras). Install with `--group <name>` (uv, or pip >= 25.1).
+[dependency-groups]
+# vLLM built from source. Deliberately NOT in `dependencies`: the combined
+# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
+# on top would overwrite it. Opt in with `pip install -e . --group vllm`.
+vllm = [
+    # Note: we **intentionally** build vllm from source, see README.
+    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+]
+
+# Required for running tests
+test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+    "pytest-cov",
+    "parameterized",
+    # Not published on PyPI; lives in vLLM's tests/ directory.
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+]
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
-    "cpu_test: tests that run without accelerator hardware",
+    "tpu_test: tests that require TPU hardware; CI runs them on a single-host TPU agent",
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
+    "omni: tests that run omni multimodal and diffusion models",
 ]
 
 [tool.ruff]
@@ -144,58 +154,36 @@ force-exclude = true
 exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 
 [tool.ruff.lint]
-# E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
-# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
-# G logging calls, ISC string concatenation.
-# Line length (E501) is in E5 and is not selected.
-select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+# E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
+# bugs, SIM needless complexity, G logging calls, ISC string concatenation,
+# T20 print calls, S110 `except: pass`, TID251 banned imports.
+# E501 fails a line longer than 88 characters, the width `ruff format` wraps
+# code at. The formatter does not split comments or strings, so wrap those by
+# hand.
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110", "TID251"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.
     "B905",   # zip() without an explicit strict=
     "B007",   # loop control variable not used in the body
     "UP032",  # .format() that could be an f-string
-
-    # Firing today and not fixed yet. `ruff check --fix` does not clear any of
-    # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
-    # change. Delete the entry once its count reaches zero.
-    "G004",    #  39  f-string passed to a logging call
-    "SIM108",  #  15  if/else that could be a conditional expression
-    "SIM102",  #  13  nested if that could be one
-    "SIM117",  #  12  nested with statements
-    "SIM105",  #  12  try/except/pass that could be contextlib.suppress
-    "UP022",   #   4  subprocess stdout=PIPE, stderr=PIPE
-    "ISC002",  #   3  implicit string concatenation over several lines
-    "SIM401",  #   2  if/else that could be dict.get
-    "SIM103",  #   2  returning a condition through if/else
-    "B904",    #   2  raise inside except without from
-    "UP047",   #   1  generic function that could use PEP 695 syntax
-    "UP040",   #   1  TypeAlias that could be the type statement
-    "UP031",   #   1  printf-style string formatting
-    "SIM115",  #   1  open() outside a context manager
-    "B020",    #   1  loop variable shadows the iterable
-    "B011",    #   1  assert False
 ]
 
+# Banned in src/vllm_torchtpu/kernels/ only; see per-file-ignores below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
+"torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
+"vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+
 [tool.ruff.lint.per-file-ignores]
-# Paths isort still owns, one per line, so a migration PR deletes exactly the
-# lines for the paths it converts. Every entry has a twin in `exclude` under
-# [tool.ruff.format] and in `files` on the isort and yapf hooks in
-# .pre-commit-config.yaml. All three move together, otherwise two tools format
-# the same file. Use `dir/**` or a full path: in a `*` pattern the star also
-# matches `/`, so `dir/*.py` silently covers the whole subtree.
-
-
-
-
-
-
-
-
-
-
-
-
+# Kernels must not import torch, torch_tpu or vLLM directly. Adapter files
+# bridge a kernel to torch. The three files listed after them already import
+# torch or vLLM and have not been split yet.
+"!src/vllm_torchtpu/kernels/**" = ["TID251"]
+"src/vllm_torchtpu/kernels/**/vllm_adapter.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
@@ -208,40 +196,43 @@ ignore = [
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
 
+# Library code logs through vllm_torchtpu.logger. Tests, scripts and
+# command-line tools print to the terminal on purpose.
+"!src/**" = ["T20"]
+"src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
+
 [tool.ruff.format]
 docstring-code-format = true
-
-# Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
-exclude = [
-
-
-
-
-
-
-
-
-
-
-
-
-]
 
 [tool.pyrefly]
 project-includes = ["src"]
 
-# Start at `basic`, which covers unambiguous mistakes (undefined names, bad
-# unpacking, wrong keyword arguments). Raising this to `default` adds ~300 more
-# findings, mostly attribute and argument types on the JAX/torch boundary;
-# that is worth doing as follow-up work, not as part of enabling the checker.
-preset = "basic"
+# Errors listed in the baseline file do not fail the check; any error not
+# listed does. To retire an entry, fix the code and delete the entry, or
+# regenerate the file with `pyrefly check --update-baseline`.
+preset = "default"
+baseline = ".pyrefly-baseline.json"
 
-# CI runs pre-commit without installing our dependencies, and `vllm` is
-# installed as an editable package behind a custom path hook that no static
-# checker can resolve. Listing these makes an unresolved import degrade to
-# `Any` instead of erroring, so local and CI runs agree. `ignore-missing-imports`
-# only applies when the module is genuinely unresolvable - when a package is
-# installed with type information, it is still checked normally.
+# Entries match on file, error kind, and message text. A baselined error keeps
+# matching when lines move, and a new error of the same kind next to it is
+# still reported. The baseline can hide only an exact repeat of a recorded
+# message in the same file.
+baseline-matching-mode = "concise-description"
+baseline-format = "minimal"
+
+# Never consult a Python environment. Every third-party import resolves to
+# `Any`, so the pre-commit hook, its CI job, and a bare `pyrefly check`
+# report the same errors and the baseline above matches in all three.
+# tools/typecheck_full.sh passes the CI image's site-packages explicitly and
+# uses .pyrefly-baseline-full.json, so calls into torch, jax and vllm are
+# checked there against their real signatures.
+# With no interpreter to ask, the Python version must be stated too, or
+# pyrefly assumes its own default and stdlib stubs drift between runners.
+skip-interpreter-query = true
+python-version = "3.12"
+
+# With no environment to query, every import below is unresolvable. Listing
+# them makes an unresolved import degrade to `Any` instead of erroring.
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",

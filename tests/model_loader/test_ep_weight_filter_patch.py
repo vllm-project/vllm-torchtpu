@@ -10,8 +10,11 @@ widens the suffix allowlist. No TPU, no network.
 
 import torch
 
+from vllm_torchtpu import model_loader_patches
 from vllm_torchtpu.model_loader_patches import (
+    _local_tensor_ranges,
     _should_skip_weight_tpu,
+    _start_ep_range_prefetch,
     patch_default_loader_ep_weight_filter,
 )
 
@@ -33,6 +36,13 @@ def test_remote_expert_packed_and_scale_skipped():
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_packed"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight"), _LOCAL)
+
+
+def test_remote_expert_dsv4_scale_skipped():
+    # DeepSeek-V4 stores the per-expert MXFP4 block scales as ``.scale``.
+    name = "layers.3.ffn.experts.{}.w1.scale"
+    assert _should_skip_weight_tpu(name.format(500), _LOCAL)
+    assert not _should_skip_weight_tpu(name.format(27), _LOCAL)
 
 
 def test_local_expert_packed_and_scale_kept():
@@ -68,8 +78,27 @@ def test_dense_and_fused_names_kept():
 # ---------------------------------------------------------------------------
 
 
+def _restore_iterators(monkeypatch):
+    from vllm.model_executor.model_loader import default_loader, weight_utils
+
+    monkeypatch.setattr(
+        weight_utils,
+        "safetensors_weights_iterator",
+        weight_utils.safetensors_weights_iterator,
+    )
+    monkeypatch.setattr(
+        default_loader,
+        "safetensors_weights_iterator",
+        default_loader.safetensors_weights_iterator,
+    )
+
+
 def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
-    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
 
     # Register teardown restoration of the attributes the patch overwrites.
     monkeypatch.setattr(
@@ -82,11 +111,15 @@ def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
     # would not undo the stamp the patch sets. setattr registers a teardown
     # that deletes (or restores) it.
     monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
 
     patch_default_loader_ep_weight_filter()
     assert weight_utils.should_skip_weight is _should_skip_weight_tpu
     assert ep_weight_filter.should_skip_weight is _should_skip_weight_tpu
     assert weight_utils._tpu_ep_filter_patch is True
+    assert default_loader.safetensors_weights_iterator is (
+        weight_utils.safetensors_weights_iterator
+    )
 
     # A second call must not re-apply over a foreign value.
     foreign = object()
@@ -157,3 +190,151 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
     # Skipped tensors must never be read from disk, not just not yielded.
     assert f"{e}.7.w1.weight_packed" not in read_names
     assert f"{e}.7.w1.weight_scale" not in read_names
+
+
+# ---------------------------------------------------------------------------
+# EP-local range prefetch
+# ---------------------------------------------------------------------------
+
+_E = "model.layers.0.mlp.experts"
+
+
+def _save_shard(tmp_path):
+    from safetensors.torch import save_file
+
+    # Two remote experts sit between the local ones and the dense tensor, so
+    # the kept tensors form more than one byte range.
+    tensors = {
+        f"{_E}.0.w1.weight_packed": torch.ones(64, dtype=torch.uint8),
+        f"{_E}.0.w1.scale": torch.ones(4, dtype=torch.uint8),
+        f"{_E}.5.w1.weight_packed": torch.ones(64, dtype=torch.uint8),
+        f"{_E}.6.w1.weight_packed": torch.ones(64, dtype=torch.uint8),
+        f"{_E}.7.w1.scale": torch.ones(4, dtype=torch.uint8),
+        "model.layers.0.self_attn.o_proj.weight": torch.ones(4, 4),
+    }
+    shard = tmp_path / "model-00001.safetensors"
+    save_file(tensors, str(shard))
+    return str(shard)
+
+
+def _header(path):
+    import json
+    import struct
+
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    return 8 + n, header
+
+
+def test_local_tensor_ranges_cover_exactly_the_kept_tensors(tmp_path):
+    shard = _save_shard(tmp_path)
+    base, header = _header(shard)
+
+    ranges = _local_tensor_ranges(shard, {0})
+
+    covered = set()
+    for lo, hi in ranges:
+        covered.update(range(lo, hi))
+    for name, info in header.items():
+        start, end = (base + o for o in info["data_offsets"])
+        span = set(range(start, end))
+        if _should_skip_weight_tpu(name, {0}):
+            assert not span & covered, name
+        else:
+            assert span <= covered, name
+    # Ranges are sorted, disjoint and non-adjacent (adjacent spans merge).
+    assert all(a[1] < b[0] for a, b in zip(ranges, ranges[1:]))
+
+
+def test_local_tensor_ranges_all_local_is_one_range(tmp_path):
+    shard = _save_shard(tmp_path)
+    base, header = _header(shard)
+    end = base + max(info["data_offsets"][1] for info in header.values())
+
+    assert _local_tensor_ranges(shard, {0, 5, 6, 7}) == [(base, end)]
+
+
+def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
+    import os
+
+    shard = _save_shard(tmp_path)
+
+    import threading
+
+    started = []
+
+    class _RecordedThread(threading.Thread):
+        def start(self):
+            started.append(self)
+            super().start()
+
+    reads = []
+    real_pread = os.pread
+
+    def tracking_pread(fd, n, off):
+        reads.append((off, off + n))
+        return real_pread(fd, n, off)
+
+    monkeypatch.setattr(model_loader_patches.threading, "Thread", _RecordedThread)
+    monkeypatch.setattr(model_loader_patches.os, "pread", tracking_pread)
+
+    _start_ep_range_prefetch([shard], {0}, num_threads=2, block_size=16)
+    for thread in started:
+        thread.join(timeout=30)
+
+    expected = set()
+    for lo, hi in _local_tensor_ranges(shard, {0}):
+        expected.update(range(lo, hi))
+    read = set()
+    for lo, hi in reads:
+        assert hi - lo <= 16
+        read.update(range(lo, hi))
+    assert read == expected
+
+
+def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
+    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+
+    shard = _save_shard(tmp_path)
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+
+    original = weight_utils.safetensors_weights_iterator
+    strategies = []
+
+    def recording_iterator(files, use_tqdm, strategy=None, local_ids=None, **kw):
+        strategies.append(strategy)
+        return original(files, use_tqdm, strategy, local_ids, **kw)
+
+    prefetches = []
+    monkeypatch.setattr(
+        weight_utils, "safetensors_weights_iterator", recording_iterator
+    )
+    monkeypatch.setattr(
+        model_loader_patches,
+        "_start_ep_range_prefetch",
+        lambda files, ids, threads, block: prefetches.append((files, ids)),
+    )
+    patch_default_loader_ep_weight_filter()
+    iterator = weight_utils.safetensors_weights_iterator
+
+    names = {
+        name for name, _ in iterator([shard], False, "prefetch", local_expert_ids={0})
+    }
+    assert strategies == ["lazy"]
+    assert prefetches == [([shard], {0})]
+    assert f"{_E}.0.w1.scale" in names
+    assert f"{_E}.7.w1.scale" not in names
+
+    # Filter off: upstream prefetch runs unchanged.
+    list(iterator([shard], False, "prefetch", local_expert_ids=None))
+    assert strategies == ["lazy", "prefetch"]
+    assert len(prefetches) == 1

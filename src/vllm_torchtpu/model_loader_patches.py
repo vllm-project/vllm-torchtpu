@@ -50,8 +50,13 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
+import json
 import os
+import struct
+import threading
+import time
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -62,8 +67,9 @@ logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
+# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
+_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
@@ -77,7 +83,9 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     return expert_id not in local_expert_ids
 
 
-def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
+def _should_skip_weight_tpu(
+    weight_name: str, local_expert_ids: set[int] | None
+) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
@@ -87,7 +95,7 @@ def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> boo
     """
     if local_expert_ids is None:
         return False
-    return _should_skip(name, local_expert_ids)
+    return _should_skip(weight_name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -197,6 +205,8 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
+                # run_start is set whenever a size is appended to run_sizes.
+                assert run_start is not None
                 requests.append(FileChunks(len(requests), path, run_start, run_sizes))
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
@@ -353,42 +363,175 @@ def patch_default_loader_ep_weight_filter() -> None:
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
     """
-    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
 
     if getattr(weight_utils, "_tpu_ep_filter_patch", False):
         return
     weight_utils.should_skip_weight = _should_skip_weight_tpu
     ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
+
+    # With the filter on, upstream's "prefetch" strategy still reads whole
+    # files: rank r reads sorted_files[r::world_size] in full, every expert
+    # included. Under EP across hosts that pulls the other hosts' experts into
+    # this host's page cache, while the files another host's ranks prefetched
+    # are read here through mmap page faults. Prefetch only the byte ranges of
+    # the tensors this rank keeps instead, across every file.
+    original_iterator = weight_utils.safetensors_weights_iterator
+
+    @functools.wraps(original_iterator)
+    def safetensors_weights_iterator(
+        hf_weights_files,
+        use_tqdm_on_load,
+        safetensors_load_strategy=None,
+        local_expert_ids=None,
+        **kwargs,
+    ):
+        if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+            _start_ep_range_prefetch(
+                sorted(hf_weights_files, key=weight_utils._natural_sort_key),
+                local_expert_ids,
+                kwargs.get(
+                    "safetensors_prefetch_num_threads",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+                ),
+                kwargs.get(
+                    "safetensors_prefetch_block_size",
+                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+                ),
+            )
+            safetensors_load_strategy = "lazy"
+        return original_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            safetensors_load_strategy,
+            local_expert_ids,
+            **kwargs,
+        )
+
+    weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.safetensors_weights_iterator = safetensors_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
+        "local tensors (DefaultModelLoader)."
     )
+
+
+def _local_tensor_ranges(
+    path: str, local_expert_ids: set[int]
+) -> list[tuple[int, int]]:
+    """Merged [start, end) file offsets of the tensors this rank keeps."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    base = 8 + header_len
+    spans = sorted(
+        (base + v["data_offsets"][0], base + v["data_offsets"][1])
+        for name, v in header.items()
+        if name != "__metadata__" and not _should_skip(name, local_expert_ids)
+    )
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _start_ep_range_prefetch(
+    sorted_files: list[str],
+    local_expert_ids: set[int],
+    num_threads: int,
+    block_size: int,
+) -> None:
+    """Read this rank's tensors into the page cache in a background thread.
+
+    Reads go in the iterator's file order, in ``block_size`` chunks over
+    ``num_threads`` threads, so the lazy safetensors iterator that follows
+    finds its pages cached. Dense tensors are kept by every rank; ranks on
+    one host share those pages.
+    """
+
+    def run() -> None:
+        start = time.perf_counter()
+        fds: list[int] = []
+        jobs: list[tuple[int, int, int]] = []
+        try:
+            for path in sorted_files:
+                fd = os.open(path, os.O_RDONLY)
+                fds.append(fd)
+                for lo, hi in _local_tensor_ranges(path, local_expert_ids):
+                    jobs.extend(
+                        (fd, off, min(block_size, hi - off))
+                        for off in range(lo, hi, block_size)
+                    )
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                total = sum(
+                    executor.map(lambda j: len(os.pread(j[0], j[2], j[1])), jobs)
+                )
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
+                "%.1f s (%.2f GiB/s)",
+                total / 2**30,
+                len(sorted_files),
+                elapsed,
+                total / 2**30 / max(elapsed, 1e-9),
+            )
+        except Exception:
+            logger.warning("[ep-prefetch] prefetch failed", exc_info=True)
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    logger.info(
+        "[ep-prefetch] started: %d files, %d local experts, num_threads=%d, "
+        "block_size=%d bytes",
+        len(sorted_files),
+        len(local_expert_ids),
+        num_threads,
+        block_size,
+    )
+    threading.Thread(target=run, name="ep-range-prefetch", daemon=True).start()
+
+
+def _evict_one_checkpoint_file(fpath: str) -> float | None:
+    if not os.path.isfile(fpath):
+        return None
+    try:
+        file_size_gb = os.path.getsize(fpath) / (1024**3)
+        with open(fpath, "rb") as f:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        logger.info(
+            "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
+            fpath,
+            file_size_gb,
+        )
+        return file_size_gb
+    except Exception as e:
+        logger.warning(
+            "[tpu-model-loader] Failed to evict page cache for %s: %s",
+            fpath,
+            e,
+        )
+        return None
 
 
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
     """Drop clean host page cache for weight files via posix_fadvise."""
-    evicted_count = 0
-    evicted_gb = 0.0
-    for fpath in files:
-        if os.path.isfile(fpath):
-            try:
-                file_size_gb = os.path.getsize(fpath) / (1024**3)
-                with open(fpath, "rb") as f:
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                evicted_gb += file_size_gb
-                evicted_count += 1
-                logger.info(
-                    "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
-                    fpath,
-                    file_size_gb,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[tpu-model-loader] Failed to evict page cache for %s: %s",
-                    fpath,
-                    e,
-                )
+    if not files:
+        return
+    max_workers = min(len(files), os.cpu_count() or 32)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        sizes = list(executor.map(_evict_one_checkpoint_file, files))
+    evicted_count = sum(s is not None for s in sizes)
+    evicted_gb = sum(s for s in sizes if s is not None)
     gc.collect()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
@@ -402,9 +545,14 @@ def patch_default_model_loader_page_cache() -> None:
 
     Reading large models from local disk leaves significant clean page cache
     in host memory. Evicting via posix_fadvise(DONTNEED) drops this
-    immediately after weights are loaded into TPU HBM, freeing host memory
-    for runtime allocations such as large KV cache offloading.
+    once weights are loaded into TPU HBM, freeing host memory for runtime
+    allocations such as large KV cache offloading.
     Guarded by TPU_EVICT_WEIGHTS_PAGE_CACHE (default: False).
+
+    ``load_weights`` only records the files; the eviction itself runs from
+    ``evict_loaded_weights_page_cache`` once the runner has loaded every
+    model. A draft model that reads the same checkpoint (e.g. MTP) would
+    otherwise re-read it from cold disk right after it was evicted.
     """
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
         return
@@ -426,17 +574,8 @@ def patch_default_model_loader_page_cache() -> None:
 
     def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
         original_load_weights(self, model, model_config)
-
-        if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
-            return
-
-        # Host page cache is shared across ranks; only local rank 0 issues the eviction
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-        if local_rank == 0 and hasattr(self, "_loaded_weight_files"):
-            try:
-                _evict_checkpoint_page_cache(self._loaded_weight_files)
-            except Exception as e:
-                logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
+        if hasattr(self, "_loaded_weight_files"):
+            _loaded_weight_files.update(dict.fromkeys(self._loaded_weight_files))
 
     dl.DefaultModelLoader._prepare_weights = _prepare_weights
     dl.DefaultModelLoader.load_weights = load_weights
@@ -444,6 +583,29 @@ def patch_default_model_loader_page_cache() -> None:
     logger.info(
         "Applied TPU patch: DefaultModelLoader page cache eviction on load completion."
     )
+
+
+# Weight files loaded by DefaultModelLoader and not yet evicted, in load order.
+_loaded_weight_files: dict[str, None] = {}
+
+
+def evict_loaded_weights_page_cache() -> None:
+    """Evict host page cache for every weight file loaded so far.
+
+    Called by the runner after the target and any draft model are loaded.
+    """
+    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
+        return
+    files = list(_loaded_weight_files)
+    _loaded_weight_files.clear()
+    # Host page cache is shared across ranks; only local rank 0 issues the eviction
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    if local_rank != 0:
+        return
+    try:
+        _evict_checkpoint_page_cache(files)
+    except Exception as e:
+        logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
 
 
 # Shards every expert of a parameter receives, keyed by the shard written.

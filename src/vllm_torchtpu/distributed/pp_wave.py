@@ -110,10 +110,7 @@ def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ..
 
     sync.synchronize(None, wait=False)
     out = op(*carried)
-    if isinstance(out, torch.Tensor):
-        out = (out,)
-    else:
-        out = tuple(out)
+    out = (out,) if isinstance(out, torch.Tensor) else tuple(out)
     sync.synchronize(list(out), wait=False)
     return out
 

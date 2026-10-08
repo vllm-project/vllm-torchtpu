@@ -5,8 +5,6 @@ from vllm_torchtpu.tracing.options import (
     resolve_profile_dir_and_opts,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 def test_resolve_profile_dir_only():
     profile_dir, standard, advanced = resolve_profile_dir_and_opts(
@@ -97,3 +95,15 @@ def test_resolve_with_profile_prefix_and_profiler_kwargs():
     assert profile_dir == "/tmp/base/custom_run"
     assert standard["host_tracer_level"] == 3
     assert advanced["e2e_true"] is True
+
+
+def test_resolve_with_env_vars(monkeypatch):
+    monkeypatch.setenv("PYTHON_TRACER_LEVEL", "0")
+    monkeypatch.setenv("HOST_TRACER_LEVEL", "1")
+    monkeypatch.setenv("DEVICE_TRACER_LEVEL", "2")
+    monkeypatch.setenv("TPU_TRACE_MODE", "TRACE_COMPUTE_AND_SYNC")
+    profile_dir, standard, advanced = resolve_profile_dir_and_opts("/tmp/base")
+    assert standard["python_tracer_level"] == 0
+    assert standard["host_tracer_level"] == 1
+    assert standard["device_tracer_level"] == 2
+    assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"

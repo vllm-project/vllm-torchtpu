@@ -31,7 +31,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     as_token_bytes,
     get_dst_rows,
     pack_tokens,
-    update_sparse_mla_kv_cache_dcp,
+    update_sparse_mla_kv_cache_dcp_jax,
     update_sparse_mla_kv_cache_jax,
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
@@ -431,7 +431,7 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
     def _run_group(self, inputs, dcp_size, interleave_size, nope_spec, rope_spec):
         """Every rank's shards after the whole group has written."""
         return [
-            update_sparse_mla_kv_cache_dcp(
+            update_sparse_mla_kv_cache_dcp_jax(
                 _empty(nope_spec),
                 _empty(rope_spec),
                 inputs["kv_c"],
@@ -527,9 +527,8 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
 
         Bit-for-bit, for any legal interleave -- the sharded path collapses to
         the same (page, slot) arithmetic rather than to something that merely
-        holds the same tokens. Against the pure-XLA golden, because that is the
-        twin the DCP writer still is: it has yet to be routed through the
-        SparseCore scatter kernel the unsharded writer now uses.
+        holds the same tokens. Both goldens here; the SparseCore writers are
+        checked against them in `test_mla_kv_cache_scatter.py`.
 
         Every ordinal is kept in range, because that is the one place the two
         genuinely differ: `block_tables` holds *virtual* ordinals here, so an
@@ -549,7 +548,7 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
         plain = update_sparse_mla_kv_cache_jax(
             *args, nope_spec=NOPE_SPEC, rope_spec=ROPE_SPEC
         )
-        sharded = update_sparse_mla_kv_cache_dcp(
+        sharded = update_sparse_mla_kv_cache_dcp_jax(
             *args,
             jnp.int32(0),
             nope_spec=NOPE_SPEC,
@@ -599,7 +598,7 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
         """Both writers validate identically; the DCP one used to check less."""
         inputs = self._inputs(2, 4)
         with self.assertRaisesRegex(AssertionError, "nope cache"):
-            update_sparse_mla_kv_cache_dcp(
+            update_sparse_mla_kv_cache_dcp_jax(
                 jnp.zeros(NOPE_SPEC.shape, jnp.bfloat16),
                 _empty(ROPE_SPEC),
                 inputs["kv_c"],

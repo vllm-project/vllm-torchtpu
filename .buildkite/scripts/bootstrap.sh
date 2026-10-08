@@ -22,20 +22,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
+# Echoes the build's bare-metal job priority and its Kueue priority class (empty
+# for none), in that order.
 determine_job_priority() {
   local priority=""
+  local workload_priority=""
   echo "--- Determining job priority" >&2
   if [[ "${NIGHTLY:-0}" == "1" ]]; then
     # Nightly build (Lowest priority)
     priority="$PRIORITY_NIGHTLY"
+    workload_priority="low"
     echo "Build type: Nightly - Priority: $priority" >&2
   elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
-    # Pre-merge PR tests
-    priority="$PRIORITY_PRE_MERGE"
-    echo "Build type: Pre-merge (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    local labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+    if grep -qx "oncall-fix" <<< "${labels//,/$'\n'}"; then
+      # PR that fixes a CI or nightly breakage (Highest priority)
+      priority="$PRIORITY_ONCALL_FIX"
+      workload_priority="oncall-fix"
+      echo "Build type: On-call fix (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    else
+      # Pre-merge PR tests
+      priority="$PRIORITY_PRE_MERGE"
+      workload_priority="pre-merge"
+      echo "Build type: Pre-merge (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
+    fi
   elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
-    # Post-merge tests on main (Highest priority)
+    # Post-merge tests on main
     priority="$PRIORITY_POST_MERGE"
+    workload_priority="post-merge"
     echo "Build type: Post-merge (Main branch) - Priority: $priority" >&2
   else
     # Default priority for other branches or manual builds
@@ -43,12 +57,23 @@ determine_job_priority() {
     echo "Build type: General - Priority: $priority" >&2
   fi
 
-  echo "$priority"
+  echo "$priority $workload_priority"
 }
 
-JOB_PRIORITY=$(determine_job_priority)
+job_priorities=$(determine_job_priority)
+read -r JOB_PRIORITY WORKLOAD_PRIORITY <<< "$job_priorities"
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
+# The kube launcher submits every workload of the build at this Kueue priority
+# class (ci-infra launch.py). None leaves them unclassed, at 0: above the
+# nightlies, as a default build ranks on bare metal.
+if [[ -n "$WORKLOAD_PRIORITY" ]]; then
+  buildkite-agent meta-data set "WORKLOAD_PRIORITY" "$WORKLOAD_PRIORITY"
+fi
+if [[ "$JOB_PRIORITY" == "$PRIORITY_ONCALL_FIX" ]]; then
+  buildkite-agent annotate --style warning --context oncall-fix \
+    "Runs at on-call priority (\`oncall-fix\` label): ahead of every other build, including main."
+fi
 
 # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 echo "--- :git: Checking if CI build should be skipped"
@@ -73,8 +98,12 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   echo "Files changed:"
   echo "${FILES_CHANGED}"
 
-  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE)
-  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$)" || true)
+  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE,
+  # .git-blame-ignore-revs, .pyrefly-baseline.json). The pre-commit GitHub Action
+  # checks .pyrefly-baseline.json and no Buildkite step reads it.
+  # .pyrefly-baseline-full.json stays out of this list: only the Buildkite type
+  # check reads it.
+  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)" || true)
 
   if [[ -z "${NON_SKIPPABLE_FILES}" && -n "${FILES_CHANGED}" ]]; then
     echo "Only documentation/non-code files changed. Skipping CI build."
@@ -82,78 +111,23 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   else
     echo "Code files changed. Proceeding with pipeline upload."
   fi
+fi
 
-  # --- Require the 'ready' label before spending agent time on a PR ---
-  echo "--- :label: Checking for the 'ready' label on PR #${BUILDKITE_PULL_REQUEST}"
-
-  # Buildkite only populates this on pull_request webhook events. PR builds
-  # triggered by a push arrive as GitHub 'push' events, so fall back to asking
-  # the GitHub API. The repo is private, so that call has to be authenticated.
-  PR_LABELS="${BUILDKITE_PULL_REQUEST_LABELS:-}"
-
-  if [[ -z "${PR_LABELS}" ]]; then
-    # Reuse the GitHub App credential helper the agents already use to clone this
-    # repo (configured system-wide by ci-infra), so there is no extra secret,
-    # IAM grant or token rotation to own here.
-    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-      GITHUB_TOKEN=$(GIT_TERMINAL_PROMPT=0 git credential fill \
-        <<< $'protocol=https\nhost=github.com\n' 2>/dev/null \
-        | sed -n 's/^password=//p' || true)
-    fi
-
-    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-      echo "Could not mint a GitHub token from the agent's git credential helper."
-      echo "Cannot verify labels. Failing closed."
-      exit 1
-    fi
-
-    # Give GitHub a moment to make a just-applied label readable.
-    sleep 5
-
-    PR_API_URL="https://api.github.com/repos/vllm-project/vllm-torchtpu/pulls/${BUILDKITE_PULL_REQUEST}"
-    HTTP_CODE=$(curl -sS -o pr_details.json -w '%{http_code}' \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "Accept: application/vnd.github+json" \
-      "${PR_API_URL}" || echo "000")
-
-    if [[ "${HTTP_CODE}" != "200" ]]; then
-      echo "GitHub API returned HTTP ${HTTP_CODE} for ${PR_API_URL}."
-      echo "Cannot verify labels. Failing closed."
-      exit 1
-    fi
-
-    PR_LABELS=$(jq -r '[.labels[].name] | join(",")' < pr_details.json)
-    rm -f pr_details.json
-  fi
-
-  echo "PR labels: ${PR_LABELS:-<none>}"
-
-  # Match the whole label, so 'not-ready' or 'ready-for-review' don't count.
-  if ! grep -qx "ready" <<< "${PR_LABELS//,/$'\n'}"; then
-    echo "Missing 'ready' label on PR #${BUILDKITE_PULL_REQUEST}. Failing build."
-    echo "Add the 'ready' label to the PR when it should run full CI."
-    exit 1
-  fi
-
-  echo "Found 'ready' label. Proceeding with pipeline upload."
+# Decided before anything is uploaded, and exported so the pipeline files can
+# interpolate ${CI_FLEET}; see ci_fleet.sh.
+echo "--- :kubernetes: Choosing bare metal or kube"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/ci_fleet.sh"
+resolve_ci_fleet
+if [[ "${CI_FLEET}" == "kube" ]]; then
+  buildkite-agent annotate --style info --context ci-fleet \
+    "Runs on the kube fleet (${CI_FLEET_REASON})."
 fi
 
 echo "--- Starting Buildkite Bootstrap"
 
 # Resolve and Publish Version Metadata
 INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
-
-# Sanity-check the pipeline slug to catch renames or typos immediately
-if [ "${BUILDKITE:-false}" == "true" ] || [ -n "${BUILDKITE_PIPELINE_SLUG:-}" ]; then
-  case "${BUILDKITE_PIPELINE_SLUG:-}" in
-    "vllm-torchtpu-ci"|"vllm-torchtpu-dev"|"${INTEGRATION_SLUG}")
-      ;;
-    *)
-      echo "ERROR: Unrecognized BUILDKITE_PIPELINE_SLUG '${BUILDKITE_PIPELINE_SLUG:-}'. Expected one of: vllm-torchtpu-ci, vllm-torchtpu-dev, ${INTEGRATION_SLUG}" >&2
-      exit 1
-      ;;
-  esac
-fi
 
 if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   # Integration pipeline tests upstream HEAD
@@ -178,14 +152,53 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-echo "Uploading Perf and Eval Pipeline"
-upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
+# The suite's lanes, in upload order. Lane <lane> is
+# .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
+# kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
+# scheduled kube pipeline names its own lane - and defaults to all of them.
+ALL_LANES="verify perf integration tests"
+lanes="${CI_LANES:-${ALL_LANES}}"
+for lane in ${lanes}; do
+  if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
+    echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2
+    exit 1
+  fi
+done
+suffix=""
+if [[ "${CI_FLEET}" == "kube" ]]; then
+  suffix="_kube"
+fi
+missing=()
+for lane in ${ALL_LANES}; do
+  if [[ " ${lanes} " != *" ${lane} "* ]]; then
+    continue
+  fi
+  file=".buildkite/pipeline_${lane}${suffix}.yml"
+  if [[ ! -f "${file}" ]]; then
+    missing+=("${file}")
+    continue
+  fi
+  echo "Uploading ${file}"
+  upload_with_priority "${file}" "$JOB_PRIORITY"
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  # A lane asked for by name has to exist; the whole suite on a target that
+  # lacks a lane runs the rest and says what it left out.
+  if [[ -n "${CI_LANES:-}" ]]; then
+    echo "ERROR: CI_LANES asks for ${missing[*]}, which does not exist" >&2
+    exit 1
+  fi
+  buildkite-agent annotate --style warning --context ci-fleet-gaps \
+    "Not run on ${CI_FLEET}: no ${missing[*]} yet."
+fi
 
-echo "Uploading Integration Tests Pipeline"
-upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
-
-echo "Uploading Unit Tests Pipeline"
-upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
+# pipeline_build.yml skips the -omni image build when this is non-empty.
+# Buildkite rejects the upload if a skip reason is over 70 characters.
+OMNI_IMAGE_SKIP=""
+if [[ " ${lanes} " != *" tests "* ]]; then
+  OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+fi
+export OMNI_IMAGE_SKIP
 
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"

@@ -32,7 +32,9 @@ logger = init_logger(__name__)
 
 class DSparkProposer(DFlashProposer):
     def __init__(self, runner, vllm_config: VllmConfig):
-        hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        hf_config = speculative_config.draft_model_config.hf_config
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
         super().__init__(runner, vllm_config)
@@ -54,6 +56,20 @@ class DSparkProposer(DFlashProposer):
                 f"num_speculative_tokens={K} does not match the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "
                 "machinery is trained for exactly that block length."
+            )
+        # vLLM 0.29 drafting options this proposer does not implement yet.
+        spec = self.speculative_config
+        if (
+            spec.draft_sample_method != "greedy"
+            or spec.enable_adaptive_verification
+            or spec.dspark_draft_topk is not None
+        ):
+            raise ValueError(
+                "DSpark on TPU does not support draft_sample_method="
+                f"{spec.draft_sample_method!r}, enable_adaptive_verification="
+                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
+                f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
+                "block is implemented."
             )
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
@@ -102,6 +118,7 @@ class DSparkProposer(DFlashProposer):
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
         """
+        assert self.draft_model is not None
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,

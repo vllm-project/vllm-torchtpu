@@ -107,7 +107,8 @@ def get_batch_composition_stats(
         num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
         num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
 
-        # This is the number of tokens already processed for this request (before this step)
+        # This is the number of tokens already processed for this request
+        # (before this step)
         num_already_computed = int(num_computed_tokens_per_req[i])  # Cast from np.int32
         min_kv_len = min(min_kv_len, num_already_computed)
 
@@ -131,7 +132,7 @@ def get_batch_composition_stats(
                 # It's a single token for an ongoing request, so it's decode
                 num_decode_tokens += 1
 
-    stats = {
+    stats: dict[str, Any] = {
         "batch_id": batch_id,
         "total_num_scheduled_tokens": total_num_scheduled_tokens,
         "num_prefill_tokens": num_prefill_tokens,
@@ -145,7 +146,9 @@ def get_batch_composition_stats(
 
 
 class PhaseBasedProfiler:
-    """Implements a phase-based profiler for PyTorch/XLA, profiling different inference phases."""
+    """Implements a phase-based profiler for PyTorch/XLA, profiling different
+    inference phases.
+    """
 
     def __init__(
         self,
@@ -162,7 +165,8 @@ class PhaseBasedProfiler:
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
         self.num_steps_to_profile_for: int = num_steps_to_profile_for
-        # Skip initial decode steps to avoid profiling XLA compilation and warmup overhead
+        # Skip initial decode steps to avoid profiling XLA compilation
+        # and warmup overhead
         self.num_decode_steps_to_skip: int = num_decode_steps_to_skip
         self.decode_steps_skipped: int = 0
         # Wait for KV cache to reach a certain length before profiling decode-only phase
@@ -274,8 +278,8 @@ class PhaseBasedProfiler:
             self.profiling_n_steps_left = self.num_steps_to_profile_for
             self.current_phase = phase.name.lower()
 
-            logger.info(f"Starting profiling for {self.current_phase} phase")
-            logger.info(f"Batch composition stats: {batch_composition_stats}")
+            logger.info("Starting profiling for %s phase", self.current_phase)
+            logger.info("Batch composition stats: %s", batch_composition_stats)
             phase_dir = os.path.join(self.profile_dir, self.current_phase)
             os.makedirs(phase_dir, exist_ok=True)
 
@@ -335,7 +339,7 @@ class PhaseBasedProfiler:
             self.profile_context = None
 
         self._merge_profile_directories()
-        logger.info(f"Profiling for {self.current_phase} phase finished")
+        logger.info("Profiling for %s phase finished", self.current_phase)
         self.current_phase = ""
         self.profiling_n_steps_left = 0
 

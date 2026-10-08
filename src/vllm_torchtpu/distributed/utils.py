@@ -15,7 +15,7 @@ def set_node_kv_ip_port(ip_port: tuple[int, str, int]):
     _NODES_KV_IP_PORT[node_id] = (ip, port)
 
 
-def get_kv_ips() -> str:
+def get_kv_ips() -> str | list[str]:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
         # Node-sorted: the consumer indexes the advertised lists by node id.
         return [ip for _, (ip, _) in sorted(_NODES_KV_IP_PORT.items())]
@@ -23,7 +23,7 @@ def get_kv_ips() -> str:
         return get_host_ip()
 
 
-def get_kv_ports() -> str:
+def get_kv_ports() -> str | list[int]:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
         return [port for _, (_, port) in sorted(_NODES_KV_IP_PORT.items())]
     else:

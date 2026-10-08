@@ -2,9 +2,9 @@
 import importlib
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -60,6 +60,23 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_across_ep_dp(parallel_config, value: int) -> int:
+    """Return the minimum of `value` across the DP engines coupled by EP.
+
+    EP-coupled engines must compile identical programs, so a value baked into
+    them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
+    """
+    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+        return value
+    from vllm.distributed.parallel_state import get_dp_group
+
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+    )
+    return int(t.item())
+
+
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
@@ -72,7 +89,8 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
                 hbm_used = device.memory_stats()["bytes_in_use"]
                 hbm_limit = device.memory_stats()["bytes_limit"]
                 logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
+                    "Get memory stats for device %s. "
+                    "Assuming all devices have the same usage.",
                     device,
                 )
                 usage.extend([(hbm_used, hbm_limit)] * len(devices))
@@ -238,7 +256,7 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
+def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes | int]:
     """
     A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
     """
@@ -259,7 +277,7 @@ def time_function(func):
         end_time = time.perf_counter()
         execution_time = end_time - start_time
         logger.debug(
-            f"Function '{func.__name__}' executed in {execution_time:.4f} seconds."
+            "Function '%s' executed in %.4f seconds.", func.__name__, execution_time
         )
         return result
 
@@ -267,7 +285,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    kv_caches: Mapping[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
@@ -289,7 +307,7 @@ def tpu_bind_kv_cache(
             if isinstance(cache, (list, tuple)):
                 runner_kv_caches.extend(cache)
             else:
-                runner_kv_caches.append(cache)
+                runner_kv_caches.append(cast(torch.Tensor, cache))
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
@@ -300,8 +318,9 @@ def synchronize_device() -> None:
 
     Differences vs. `synchronize_tensors(tensors=...)`:
     - `synchronize_device()` is equivalent to `torch.cuda.synchronize()`. It waits for
-      enqueued hardware stream operations to finish on PJRT, but does NOT trigger deferred
-      graph compilation or materialization for uninstantiated PyTorch Eager tensors.
+      enqueued hardware stream operations to finish on PJRT, but does NOT trigger
+      deferred graph compilation or materialization for uninstantiated
+      PyTorch Eager tensors.
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
@@ -312,17 +331,19 @@ def synchronize_tensors(
     tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,
 ) -> None:
-    """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).
+    """Synchronize TPU execution and force materialization of deferred tensors
+    (Graph Sync).
 
     Differences vs. `synchronize_device()`:
-    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the deferred tensor
-      graph producing `tensors`, compile and enqueue the graph to PJRT, and materialize the
-      resulting buffers in device memory.
-    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands without
-      building/compiling pending deferred graphs.
-    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should be synchronized
-      (e.g., weight materialization across multiple tensors). Prefer `synchronize_device()` when
-      synchronizing immediately after a computation or across the entire device.
+    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the
+      deferred tensor graph producing `tensors`, compile and enqueue the graph to PJRT,
+      and materialize the resulting buffers in device memory.
+    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands
+      without building/compiling pending deferred graphs.
+    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should
+      be synchronized (e.g., weight materialization across multiple tensors). Prefer
+      `synchronize_device()` when synchronizing immediately after a computation or
+      across the entire device.
     """
     from torch_tpu._internal import sync
 

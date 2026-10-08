@@ -100,6 +100,12 @@ def _prepare_worker_env() -> dict[str, str]:
     env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    env.setdefault("TPU_SKIP_MDS_QUERY", "true")
+    # vllm_torchtpu.tpu_info does not yet honor TPU_SKIP_MDS_QUERY for every
+    # lookup, so provide the single-host metadata explicitly as well.
+    env.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x")
+    env.setdefault("TPU_NAME", "pcp-entry-barrier-ut")
+    env.setdefault("TPU_WORKER_ID", "0")
     return env
 
 
@@ -140,7 +146,9 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
     return tuple(int(tensor.cpu().item()) for tensor in gathered)
 
 
-def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
+def _build_mesh(
+    jax, np, global_device_ids: tuple[int, ...], pcp_axis_name: str, tp_axis_name: str
+):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
         device_id for device_id in global_device_ids if device_id not in devices_by_id
@@ -150,8 +158,10 @@ def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
             f"JAX does not expose worker TPU ids {missing}; "
             f"available={sorted(devices_by_id)}"
         )
-    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
+    devices = np.asarray(
+        [devices_by_id[device_id] for device_id in global_device_ids]
+    ).reshape(WORLD_SIZE, 1)
+    return jax.sharding.Mesh(devices, axis_names=(pcp_axis_name, tp_axis_name))
 
 
 def _make_inputs(torch, sync, rank: int):
@@ -365,10 +375,11 @@ def _run_worker(result_dir: Path) -> None:
 
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
             PCP_AXIS_NAME,
+            TP_AXIS_NAME,
         )
 
         global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
-        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
+        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME, TP_AXIS_NAME)
         caches, prefill_args, decode_args = _make_inputs(torch, sync, rank)
         prefill, decode = _build_compiled_steps(torch, mesh)
 

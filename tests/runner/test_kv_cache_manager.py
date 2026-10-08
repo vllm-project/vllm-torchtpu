@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_torchtpu import utils
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -150,6 +151,7 @@ def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
         )
 
 
+@pytest.mark.tpu_test
 class TestKVCacheManager:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
@@ -268,6 +270,23 @@ class TestKVCacheManager:
         mock_mem_info.assert_called_once()
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
+
+    def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
+        """Pinned block counts must be sized from the DP-wide minimum budget."""
+        local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+        budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+        monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+        self.runner.vllm_config.parallel_config.enable_expert_parallel = True
+        monkeypatch.setattr(
+            "vllm.distributed.parallel_state.get_dp_group",
+            lambda: SimpleNamespace(cpu_group=None),
+        )
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda t, **_: t.clamp_(max=peer)
+        )
+
+        assert self.runner.kv_cache_manager._available_kv_cache_hbm() == peer
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -919,9 +938,11 @@ class TestKVCacheManager:
             self.runner.initialize_kv_cache(kv_cache_config)
 
     def test_initialize_kv_cache_block_major(self):
-        """Verifies that block-major initialization allocates a single shared bundle backing all layer views."""
+        """Verifies that block-major initialization allocates a single shared bundle
+        backing all layer views."""
         num_blocks = 4
-        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact uniform tiling.
+        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact
+        # uniform tiling.
         per_layer_shape = (16, 4, 1, 128)
         # FullAttentionSpec.real_page_size_bytes for (16, 2, 128, bf16) is
         # block_size * (k+v) * head_size * itemsize = 16 * 4 * 128 * 2 = 16384.
@@ -993,7 +1014,8 @@ class TestKVCacheManager:
         ):
             self.runner.initialize_kv_cache(kv_cache_config)
 
-        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and layer index mappings.
+        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and
+        # layer index mappings.
         assert isinstance(self.runner._kv_cache_bundle, torch.Tensor)
         expected_bundle_shape = (num_blocks, len(layer_names)) + per_layer_shape
         assert tuple(self.runner._kv_cache_bundle.shape) == expected_bundle_shape
@@ -1004,7 +1026,8 @@ class TestKVCacheManager:
             "attn.2": 2,
         }
 
-        # Verify that bound per-layer views alias the underlying bundle storage via strided slices.
+        # Verify that bound per-layer views alias the underlying bundle storage via
+        # strided slices.
         created = mock_bind.call_args[0][0]
         for idx, name in enumerate(layer_names):
             view = created[name]
@@ -1016,7 +1039,8 @@ class TestKVCacheManager:
                 == self.runner._kv_cache_bundle.untyped_storage().data_ptr()
             )
 
-        # Verify that mutating a per-layer strided view modifies the bundle in-place while isolating other layers.
+        # Verify that mutating a per-layer strided view modifies the bundle in-place
+        # while isolating other layers.
         target = 1
         created[layer_names[target]].fill_(7)
         assert torch.all(self.runner._kv_cache_bundle[:, target] == 7), (
@@ -1031,7 +1055,8 @@ class TestKVCacheManager:
             )
 
     def test_initialize_kv_cache_block_major_rejects_mamba(self):
-        """Verifies that standard dense block-major initialization fails closed on unsupported multi-group configurations."""
+        """Verifies that standard dense block-major initialization fails closed on
+        unsupported multi-group configurations."""
         attn_spec = FullAttentionSpec(
             block_size=16,
             num_kv_heads=2,
@@ -1886,6 +1911,190 @@ def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
             SimpleNamespace(kv_cache_groups=clash),
             {**kv_caches, "m.layers.0.attn.swa_cache": csa_nope},
         )
+
+
+def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
+    """A CSA layer gets int32 NoPE and RoPE arrays (see `csa_cache_layout`).
+
+    NoPE keeps one 128-word row per token, RoPE packs four tokens' 32 words
+    per row, so the sparse gather can fetch a token's own 128 RoPE bytes. The
+    bytes are the uint8 pair's; overflow overlay hosts copy the NoPE host.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    def mla(compress_ratio, head_size=640):
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            alignment=None,
+        )
+
+    def swa():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        )
+
+    specs = {
+        "m.layers.0.attn": mla(4),
+        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),
+        "m.layers.1.attn": mla(128),
+        "m.layers.0.attn.compressor.state_cache": swa(),
+        "m.layers.1.attn.compressor.state_cache": swa(),
+        "m.layers.0.attn.swa_cache": swa(),
+        "m.layers.1.attn.swa_cache": swa(),
+    }
+    groups = [
+        SimpleNamespace(
+            layer_names=[
+                "m.layers.0.attn",
+                "m.layers.0.attn.indexer.k_cache",
+                "m.layers.1.attn",
+            ]
+        ),
+        SimpleNamespace(layer_names=["m.layers.0.attn.compressor.state_cache"]),
+        SimpleNamespace(layer_names=["m.layers.1.attn.compressor.state_cache"]),
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"]
+        ),
+    ]
+    for group in groups:
+        group.kv_cache_spec = specs[group.layer_names[0]]
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner.device = "cpu"
+    runner.max_num_reqs = 256
+    runner.max_num_tokens = 1024
+    runner.most_model_len = None
+    runner.input_batch.block_table = [
+        SimpleNamespace(max_num_blocks_per_req=pages)
+        for pages in (1024, 65536, 32768, 8192)
+    ]
+    kv_caches: dict = {}
+    num_blocks = 3
+
+    DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
+        SimpleNamespace(kv_cache_groups=groups),
+        specs.__getitem__,
+        kv_caches,
+        num_blocks,
+    )
+
+    # Only the compressed-KV group (1,024 pages) bounds the requests per
+    # forward; the compressor-state and SWA groups do not.
+    assert runner.num_reqs_max_model_len == 128
+    runner._attention_capacity.clear.assert_called_once()
+
+    # T = 256 / 4 = 64 compressed tokens per page.
+    nope, rope = kv_caches["m.layers.0.attn"]
+    assert nope.dtype == rope.dtype == torch.int32
+    assert tuple(nope.shape) == (num_blocks, 64, 128)
+    assert tuple(rope.shape) == (num_blocks, 16, 128)
+    assert nope.numel() * nope.element_size() == num_blocks * 64 * 512
+    assert rope.numel() * rope.element_size() == num_blocks * 64 * 128
+    # The CSA state rides its own layer's entry; the HCA state overlays the
+    # CSA NoPE array.
+    assert (
+        kv_caches["m.layers.0.attn.compressor.state_cache"]
+        is (kv_caches["m.layers.0.attn"])
+    )
+    assert kv_caches["m.layers.1.attn.compressor.state_cache"] is nope
+    # Two SWA layers of one group: the first overlays the CSA NoPE array, the
+    # second gets a standalone host of the same shape and dtype.
+    assert kv_caches["m.layers.0.attn.swa_cache"] is nope
+    overflow = kv_caches["m.layers.1.attn.swa_cache"]
+    assert overflow is not nope
+    assert overflow.dtype == torch.int32
+    assert tuple(overflow.shape) == tuple(nope.shape)
+
+
+def test_dsv4_request_caps_match_runner_refresh():
+    """DSv4's caps equal the runner's own refresh over its counted groups.
+
+    `_refresh_ds_v4_request_caps` repeats `_refresh_smem_request_caps` with
+    the SWA and compressor-state groups left out, so the two must agree when
+    the runner's refresh is given only the compressed-KV group.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    mla = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        alignment=None,
+    )
+
+    def swa(block_size):
+        return SlidingWindowMLASpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        )
+
+    groups = [
+        SimpleNamespace(layer_names=["m.layers.0.attn"], kv_cache_spec=mla),
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn.compressor.state_cache"],
+            kv_cache_spec=swa(16),
+        ),
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn.swa_cache"], kv_cache_spec=swa(128)
+        ),
+    ]
+    tables = [
+        SimpleNamespace(max_num_blocks_per_req=pages, blocks_per_kv_block=1)
+        for pages in (1024, 65536, 8192)
+    ]
+
+    def make_runner(kv_cache_groups, block_tables):
+        runner = SimpleNamespace(
+            max_model_len=1048576,
+            most_model_len=65536,
+            max_num_reqs=64,
+            max_num_tokens=1024,
+            block_size=1024,
+            max_num_blocks_per_req=1024,
+            shared_kv_cache_layers={},
+            input_batch=SimpleNamespace(block_table=block_tables),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=kv_cache_groups),
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+            ),
+            _attention_capacity={"stale": object()},
+            _decode_device_cache_key=("stale",),
+        )
+        return runner
+
+    dsv4_runner = make_runner(groups, tables)
+    DsV4KVCacheAllocator(dsv4_runner)._refresh_ds_v4_request_caps(
+        dsv4_runner.kv_cache_config,
+        [["m.layers.0.attn.swa_cache"]],
+        ["m.layers.0.attn.compressor.state_cache"],
+    )
+    reference = make_runner(groups[:1], tables[:1])
+    TPUModelRunner._refresh_smem_request_caps(reference)
+
+    for name in (
+        "num_reqs_max_model_len",
+        "num_reqs_most_model_len",
+        "num_blocks_per_most_len_req",
+        "_attention_capacity",
+        "_decode_device_cache_key",
+    ):
+        assert getattr(dsv4_runner, name) == getattr(reference, name), name
+    assert dsv4_runner.num_reqs_max_model_len == 64
 
 
 class TestUpdateAttentionPageSizePadded:

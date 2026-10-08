@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Distributed custom-op checks for unified PCP packed KV layouts."""
+"""SPMD custom-op checks for unified PCP4 x TP2 packed KV layouts."""
 
 import argparse
 import json
@@ -28,9 +28,11 @@ import pytest
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 WORLD_SIZE = 8
+PCP_SIZE = 4
+TP_SIZE = 2
 PAGE_SIZE = 128
 LOCAL_TOKENS = 128
-GLOBAL_TOKENS = WORLD_SIZE * LOCAL_TOKENS
+GLOBAL_TOKENS = PCP_SIZE * LOCAL_TOKENS
 HEAD_DIM = 128
 LAUNCH_TIMEOUT_SECONDS = 420
 
@@ -153,6 +155,12 @@ def _prepare_worker_env() -> dict[str, str]:
     env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    env.setdefault("TPU_SKIP_MDS_QUERY", "true")
+    # vllm_torchtpu.tpu_info does not yet honor TPU_SKIP_MDS_QUERY for every
+    # lookup, so provide the single-host metadata explicitly as well.
+    env.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x")
+    env.setdefault("TPU_NAME", "pcp4-tp2-spmd-ut")
+    env.setdefault("TPU_WORKER_ID", "0")
     return env
 
 
@@ -192,7 +200,9 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
     return tuple(int(tensor.cpu().item()) for tensor in gathered)
 
 
-def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
+def _build_mesh(
+    jax, np, global_device_ids: tuple[int, ...], pcp_axis_name: str, tp_axis_name: str
+):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
         device_id for device_id in global_device_ids if device_id not in devices_by_id
@@ -202,8 +212,10 @@ def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
             f"JAX does not expose worker TPU ids {missing}; "
             f"available={sorted(devices_by_id)}"
         )
-    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
+    devices = np.asarray(
+        [devices_by_id[device_id] for device_id in global_device_ids]
+    ).reshape(PCP_SIZE, TP_SIZE)
+    return jax.sharding.Mesh(devices, axis_names=(pcp_axis_name, tp_axis_name))
 
 
 def _torch_dtype(torch, name: str):
@@ -349,10 +361,11 @@ def _run_worker(result_dir: Path) -> None:
 
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
             PCP_AXIS_NAME,
+            TP_AXIS_NAME,
         )
 
         global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
-        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
+        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME, TP_AXIS_NAME)
         case_results = []
         comparison_outputs = []
         for case in CASES:
@@ -392,8 +405,8 @@ def _run_worker(result_dir: Path) -> None:
 
 
 @pytest.mark.nightly
-def test_pcp_attention_executes_unified_bf16_fp8_single_multi_head_matrix(tmp_path):
-    result_dir = tmp_path / "pcp_unified_head_matrix"
+def test_pcp4_tp2_attention_executes_unified_bf16_fp8_head_matrix(tmp_path):
+    result_dir = tmp_path / "pcp4_tp2_unified_head_matrix"
     result_dir.mkdir()
     completed = _run_worker_group(result_dir)
     combined_output = completed.stdout

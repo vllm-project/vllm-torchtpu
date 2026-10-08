@@ -132,6 +132,27 @@ class GDNConfig:
         return self.window_size
 
     @property
+    def state_in_pos(self) -> int:
+        """VMEM window position the initial (incoming) state is DMA'd into.
+
+        With a speculative window (`window_size > 1`) the state tile is
+        INPUT_OUTPUT and double buffered: the pipeline issues copy_in for tile
+        i+1 into the slot whose checkpoint copy_out for tile i-1 is still in
+        flight (wait_out(i-1) runs only at the end of step i). If the incoming
+        state shared position 0 with checkpoint 0, the copy_in could overwrite
+        it before the copy_out read it, writing another request's state into
+        checkpoint 0 in HBM. Use a dedicated extra position `window_size`
+        instead, which copy_out never reads. Without a window keep position 0
+        (unchanged layout).
+        """
+        return self.window_size if self.window_size > 1 else 0
+
+    @property
+    def state_window_alloc(self) -> int:
+        """Window positions allocated per sequence in the VMEM state tiles."""
+        return self.window_size + (1 if self.window_size > 1 else 0)
+
+    @property
     def seq_tile_size(self) -> int:
         if self.mode == GDNMode.PER_SEQ:
             return 1
@@ -167,12 +188,20 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
+        # Within-block forward substitution issues head_groups * B / 2 broadcasts
+        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+        #   B inversely with head_groups (head_groups * B <= 16).
+        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        if self.is_kda:
+            for b in (16, 8, 4):
+                if head_groups * b * b <= 256:
+                    return b
             return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # GDN: between-block updates scale as 1 / B.
+        return max(2, min(16, 16 // head_groups))
 
     @property
     def use_recurrent(self) -> bool:

@@ -60,23 +60,26 @@ def test_ragged_kv_cache_update_signature_and_wiring():
     mock_kv = MagicMock()
     mock_new_kv = MagicMock()
     mock_new_kv.shape = (10, 2, 128)
+    unwrapped_update = inspect.unwrap(ragged_kv_cache_update.kv_cache_update)
 
     # Verify when env var is False
-    with patch.dict(os.environ, {}, clear=True):
-        with patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update:
-            ragged_kv_cache_update.kv_cache_update.__wrapped__(
-                mock_new_kv, MagicMock(), mock_kv, MagicMock(), num_slices_per_block=4
-            )
-            mock_update.assert_called_once()
-            _, kwargs = mock_update.call_args
-            assert kwargs["pipelined_dma"] is False
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update,
+    ):
+        unwrapped_update(
+            mock_new_kv, MagicMock(), mock_kv, MagicMock(), num_slices_per_block=4
+        )
+        mock_update.assert_called_once()
+        _, kwargs = mock_update.call_args
+        assert kwargs["pipelined_dma"] is False
 
     # Verify when env var is True
     with (
         patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"}, clear=True),
         patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update,
     ):
-        ragged_kv_cache_update.kv_cache_update.__wrapped__(
+        unwrapped_update(
             mock_new_kv, MagicMock(), mock_kv, MagicMock(), num_slices_per_block=4
         )
         mock_update.assert_called_once()
@@ -88,7 +91,7 @@ def test_ragged_kv_cache_update_signature_and_wiring():
         patch.dict(os.environ, {"USE_RPA_PIPELINED_DMA_STAGING": "1"}, clear=True),
         patch.object(ragged_kv_cache_update, "_kv_cache_update") as mock_update,
     ):
-        ragged_kv_cache_update.kv_cache_update.__wrapped__(
+        unwrapped_update(
             mock_new_kv,
             MagicMock(),
             mock_kv,
@@ -99,6 +102,48 @@ def test_ragged_kv_cache_update_signature_and_wiring():
         mock_update.assert_called_once()
         _, kwargs = mock_update.call_args
         assert kwargs["pipelined_dma"] is False
+
+
+def test_kv_cache_update_builds_block_specs_and_traces():
+    """Verify _kv_cache_update builds pl.ANY BlockSpecs and traces cleanly."""
+    import functools
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+
+    new_kv = jnp.zeros((16, 2, 128), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((64, 2, 128), dtype=jnp.bfloat16)
+    slices = jnp.zeros((3, 4), dtype=jnp.int32)
+    num_slices = jnp.array([2], dtype=jnp.int32)
+
+    for pipelined_dma in (False, True):
+        with patch.object(
+            ragged_kv_cache_update.pl,
+            "pallas_call",
+            wraps=ragged_kv_cache_update.pl.pallas_call,
+        ) as spy_pallas_call:
+            out_shape = jax.eval_shape(
+                functools.partial(
+                    ragged_kv_cache_update.kv_cache_update,
+                    num_slices_per_block=4,
+                    pipelined_dma=pipelined_dma,
+                ),
+                new_kv,
+                slices,
+                kv_cache,
+                num_slices,
+            )
+            assert out_shape.shape == kv_cache.shape
+            assert out_shape.dtype == kv_cache.dtype
+            spy_pallas_call.assert_called_once()
+            _, call_kwargs = spy_pallas_call.call_args
+            grid_spec = call_kwargs["grid_spec"]
+            assert [spec.memory_space for spec in grid_spec.in_specs] == [
+                pl.ANY,
+                pl.ANY,
+            ]
+            assert [spec.memory_space for spec in grid_spec.out_specs] == [pl.ANY]
 
 
 def test_kernel_v3_prepare_inputs_outputs_wiring():

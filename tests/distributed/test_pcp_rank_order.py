@@ -20,8 +20,6 @@ import pytest
 
 from vllm_torchtpu.distributed import pcp_rank_order as order_mod
 
-pytestmark = pytest.mark.cpu_test
-
 
 def _config(**kwargs):
     parallel = SimpleNamespace(
@@ -245,9 +243,11 @@ def test_raises_when_new_group_cannot_preserve_order():
     original_new_group = torch.distributed.new_group
     torch.distributed.new_group = lambda ranks=None, backend=None: None
     try:
-        with pytest.raises(RuntimeError, match="no sort_ranks parameter"):
-            with order_mod.pcp_topology_order({"pcp": [[0, 1]]}):
-                pass
+        with (
+            pytest.raises(RuntimeError, match="no sort_ranks parameter"),
+            order_mod.pcp_topology_order({"pcp": [[0, 1]]}),
+        ):
+            pass
     finally:
         torch.distributed.new_group = original_new_group
 
@@ -326,6 +326,86 @@ def test_context_manager_replaces_both_axes():
     assert seen["pcp"] == orders["pcp"]
     assert seen["tp"] == orders["tp"]
     assert seen["dp"] == [[0]]
+
+
+def test_preserve_dcp_order_sorts_unsorted_and_disables_sort_ranks():
+    """preserve_dcp_order=True sorts unsorted dcp ranks and passes sort_ranks=False
+    to new_group, while leaving already-sorted or non-dcp axes with default
+    sort_ranks=True.
+    """
+    import torch
+    from vllm.distributed import parallel_state
+
+    original_new_group = torch.distributed.new_group
+    original_init = parallel_state.init_model_parallel_group
+
+    calls = []
+    seen_ranks = {}
+
+    def _record_new_group(ranks=None, sort_ranks=True, **kwargs):
+        calls.append(sort_ranks)
+        return None
+
+    def _fake_init(group_ranks, local_rank, backend, *args, **kwargs):
+        axis = kwargs.get("group_name")
+        seen_ranks[axis] = [list(g) for g in group_ranks]
+        for ranks in group_ranks:
+            torch.distributed.new_group(ranks)
+
+    torch.distributed.new_group = _record_new_group
+    parallel_state.init_model_parallel_group = _fake_init
+    try:
+        with order_mod.pcp_topology_order(None, preserve_dcp_order=True):
+            patched = parallel_state.init_model_parallel_group
+
+            # 1. Unsorted DCP group: sorted, and sort_ranks=False passed to new_group
+            calls.clear()
+            patched([[0, 8, 1, 9]], 0, "gloo", group_name="dcp")
+            assert seen_ranks["dcp"] == [[0, 1, 8, 9]]
+            assert calls == [False]
+
+            # 2. Already-sorted DCP group: untouched, and default sort_ranks=True
+            calls.clear()
+            patched([[0, 1, 8, 9]], 0, "gloo", group_name="dcp")
+            assert seen_ranks["dcp"] == [[0, 1, 8, 9]]
+            assert calls == [True]
+
+            # 3. Non-DCP axis: untouched, and default sort_ranks=True
+            calls.clear()
+            patched([[0, 2], [1, 3]], 0, "gloo", group_name="tp")
+            assert seen_ranks["tp"] == [[0, 2], [1, 3]]
+            assert calls == [True, True]
+
+            calls.clear()
+            patched([[0]], 0, "gloo", group_name="dp")
+            assert seen_ranks["dp"] == [[0]]
+            assert calls == [True]
+    finally:
+        torch.distributed.new_group = original_new_group
+        parallel_state.init_model_parallel_group = original_init
+
+
+def test_preserve_dcp_order_false_leaves_unsorted_dcp_untouched():
+    """preserve_dcp_order=False leaves unsorted dcp group ranks untouched."""
+    from vllm.distributed import parallel_state
+
+    seen = {}
+    before = parallel_state.init_model_parallel_group
+
+    def _record(group_ranks, local_rank, backend, **kwargs):
+        seen[kwargs.get("group_name")] = [list(g) for g in group_ranks]
+        return None
+
+    parallel_state.init_model_parallel_group = _record
+    try:
+        with order_mod.pcp_topology_order(None, preserve_dcp_order=False):
+            parallel_state.init_model_parallel_group(
+                [[0, 8, 1, 9]], 0, "gloo", group_name="dcp"
+            )
+    finally:
+        parallel_state.init_model_parallel_group = before
+
+    assert seen["dcp"] == [[0, 8, 1, 9]]
 
 
 # --- verify_pcp_topology_order ---------------------------------------------

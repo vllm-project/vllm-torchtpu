@@ -17,6 +17,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
 
 def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     """Applies interleaved Rotary Position Embedding (RoPE) to a vector."""
@@ -191,10 +193,7 @@ def pack_nope_tiled(
     scale_flat = scale_bytes.reshape(tile_n, -1)  # (tile_n, S * num_blocks)
 
     # Select NOPE parts
-    if nope_dim < q_flat.shape[1]:
-        q_nope = q_flat[:, :nope_dim]
-    else:
-        q_nope = q_flat
+    q_nope = q_flat[:, :nope_dim] if nope_dim < q_flat.shape[1] else q_flat
 
     nope_blocks = (nope_dim + block_size - 1) // block_size
     if nope_blocks < scale_flat.shape[1]:
@@ -212,30 +211,47 @@ def pack_nope_tiled(
     return nope_record_padded.reshape(tile_n, -1, last_dim_size)
 
 
-def pack_rope_tiled(rope_slot_ropped, rope_head_dim_actual, rope_width=128):
-    # rope_slot_ropped: (tile_n, 1, 128)
-    # TODO: make this a config value rather than inferred
-    start = 128 - rope_head_dim_actual
-    rope_val = rope_slot_ropped[:, :, start:]  # (tile_n, 1, rope_head_dim)
+def rope_words_tiled(rope_slot_ropped, rope_head_dim):
+    """RoPE channels as cache words: low half bf16 ``k``, high half ``k + 32``.
 
-    rope_bf16 = rope_val.astype(jnp.bfloat16)
-    rope_width_bf16 = rope_width // 2
+    rope_slot_ropped: (tile_n, 1, 128) f32 holding the channels in its last
+    ``rope_head_dim`` lanes. Returns (tile_n, 1, 128) int32 with word ``k`` at
+    lane ``128 - rope_head_dim + k``; the lanes around it are junk.
+    """
+    bits = pltpu.bitcast(rope_slot_ropped.astype(jnp.bfloat16), jnp.uint16)
+    bits = bits.astype(jnp.int32)
+    half = rope_head_dim // 2
+    # Lane c picks up channel c + half as its high half.
+    return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
 
-    if rope_head_dim_actual < rope_width_bf16:
-        rope_padded_bf16 = jnp.pad(
-            rope_bf16,
-            ((0, 0), (0, 0), (0, rope_width_bf16 - rope_head_dim_actual)),
-        )
-    else:
-        rope_padded_bf16 = rope_bf16
 
-    rope_u16 = pltpu.bitcast(rope_padded_bf16, jnp.uint16)
-    rope_i32 = rope_u16.astype(jnp.int32)
-    rope_hi = ((rope_i32 >> 8) & 0xFF).astype(jnp.uint8)
-    rope_lo = (rope_i32 & 0xFF).astype(jnp.uint8)
-    rope_uint8_2d = jnp.concatenate([rope_hi, rope_lo], axis=-1)
+def merge_rope_row(
+    row,  # (1, 128) int32, the RoPE row as read from HBM
+    kv_slots,  # (tile_n,) int, token index of every token in the tile
+    words,  # rope_words_tiled(...)
+    rope_lane,  # int, lane of RoPE word 0 in `words`
+    n,  # int, the token whose row this is
+):
+    """Writes every tile token whose RoPE lands in token n's row into it.
 
-    return rope_uint8_2d[:, None, :]
+    Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
+    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    """
+    per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
+    width = csa_cache_layout.ROPE_WORDS
+    lanes = row.shape[-1]
+    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
+    curr_slot = kv_slots[n]
+    curr_row = curr_slot // per_row
+
+    for i in range(kv_slots.shape[0]):
+        slot_i = kv_slots[i]
+        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
+        pos_i = slot_i % per_row
+        for j in range(per_row):
+            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
+            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
+    return row
 
 
 def merge_slot_updates(

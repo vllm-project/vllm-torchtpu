@@ -22,6 +22,7 @@ CPU.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils, scatter, scatter_utils
@@ -80,6 +81,7 @@ def _decode_rows(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
     return rows.reshape(spec.num_pages * spec.page_size, spec.token_bytes)
 
 
+@pytest.mark.tpu_test
 class SparseMLAScatterTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()
@@ -340,6 +342,80 @@ class SparseMLAScatterTest(parameterized.TestCase):
                 np.asarray(w),
                 err_msg=f"{name} cache differs from the jnp writer",
             )
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"d{dcp_size}_i{interleave_size}_{layout.value}",
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+            layout=layout,
+        )
+        for dcp_size, interleave_size in ((2, 4), (4, 64), (8, 16), (16, 4))
+        for layout in KVCacheLayout
+    )
+    def test_dcp_update_matches_the_jnp_writer(self, dcp_size, interleave_size, layout):
+        """`update_sparse_mla_kv_cache_dcp` on every rank equals its jnp twin.
+
+        Each rank writes only the rows it owns; the rest, and the padded tail,
+        become `SKIP_ROW` and must not reach any rank's shard.
+        """
+        inp = self._generate_inputs(8, 16, 512, 64)
+        specs = {
+            "nope_spec": SparseMLAKVCacheSpec.create(
+                KVCacheType.NOPE,
+                layout,
+                inp["num_pages"],
+                PAGE_SIZE,
+                LKV_DIM,
+                KV_PACKING,
+            ),
+            "rope_spec": SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                layout,
+                inp["num_pages"],
+                PAGE_SIZE,
+                ROPE_DIM,
+                KV_PACKING,
+            ),
+        }
+        num_pad = 24
+
+        def _pad(values):
+            # On the uint8 view: a float8 concatenate canonicalizes NaN bytes.
+            raw = jax.lax.bitcast_convert_type(values, jnp.uint8)
+            tail = jnp.full((num_pad, raw.shape[1]), 0xAB, jnp.uint8)
+            return jax.lax.bitcast_convert_type(
+                jnp.concatenate([raw, tail], axis=0), values.dtype
+            )
+
+        args = (
+            jnp.zeros(specs["nope_spec"].shape, specs["nope_spec"].jax_dtype),
+            jnp.zeros(specs["rope_spec"].shape, specs["rope_spec"].jax_dtype),
+            _pad(inp["kv_c_normed"]),
+            _pad(inp["k_pe"]),
+            inp["seq_lens"],
+            inp["block_tables"],
+            inp["query_start_loc"],
+        )
+        written = 0
+        for rank in range(dcp_size):
+            kwargs = dict(specs, dcp_size=dcp_size, interleave_size=interleave_size)
+            got = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                *args, jnp.int32(rank), **kwargs
+            )
+            want = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+                *args, jnp.int32(rank), **kwargs
+            )
+            for name, g, w in zip(("nope", "rope"), got, want):
+                np.testing.assert_array_equal(
+                    np.asarray(g),
+                    np.asarray(w),
+                    err_msg=f"rank {rank}: {name} cache differs from the jnp writer",
+                )
+            rows = _decode_rows(got[0], specs["nope_spec"])
+            written += int(rows.any(axis=1).sum())
+        # Ownership is a partition: every valid token on exactly one rank.
+        self.assertEqual(written, inp["num_tokens"])
 
 
 class ScatterContractTest(parameterized.TestCase):

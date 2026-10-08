@@ -14,6 +14,7 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
+    lower_dsv4_row_spans,
     lower_gdn_state_shard_spans,
     lower_glm_row_spans,
     lower_kda_state_shard_spans,
@@ -23,10 +24,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import RegionSpec
 
-from .raiden_test_utils import kimi_pool_manifest
+from .raiden_test_utils import KIMI_KV_ITEMSIZE, kimi_pool_manifest
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
-
-pytestmark = pytest.mark.cpu_test
 
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.
@@ -140,12 +139,18 @@ def _kda_physical_state(state, pool, shard_heads=None):
     return _apply_xla_tiled_layout(padded, (2, 1, 0), ((2, 128), (2, 1))).tobytes()
 
 
+@pytest.mark.parametrize("kv_dtype", ["bfloat16", "float8_e4m3fn"])
 @pytest.mark.parametrize("parallelism,dst_shards", [(32, 32), (32, 8)])
-def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards):
+def test_kda_reshard_matches_rank_blocked_kernel_layout(
+    parallelism, dst_shards, kv_dtype
+):
+    # The KDA regions are the same bytes under either KV dtype, so the bf16
+    # oracle below describes an fp8 pool too.
+    packing = 4 // KIMI_KV_ITEMSIZE[kv_dtype]
     local_heads = 96 // parallelism
-    source_manifest = kimi_pool_manifest(local_heads)
+    source_manifest = kimi_pool_manifest(local_heads, kv_dtype=kv_dtype)
     fan_in = parallelism // dst_shards
-    destination_manifest = kimi_pool_manifest(local_heads * fan_in)
+    destination_manifest = kimi_pool_manifest(local_heads * fan_in, kv_dtype=kv_dtype)
     fingerprints = []
     for manifest, fragments in ((source_manifest, 1), (destination_manifest, fan_in)):
         assert [pool.tag for pool in manifest.pools] == [
@@ -166,10 +171,14 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards)
         fingerprints.append(
             measured_kimi_k3_layout_fingerprint(
                 manifest,
-                page_tokens=manifest.storages[0].shape[1] * 2,
+                page_tokens=manifest.storages[0].shape[1] * packing,
                 state_fragment_heads=local_heads,
                 state_fragments=fragments,
-                layout_getter=lambda tensor: ([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
+                layout_getter=lambda tensor: (
+                    [3, 2, 1, 0],
+                    [[packing, 128], [packing, 1]],
+                    0,
+                ),
                 package_version=lambda package: "test",
             )
         )
@@ -222,6 +231,67 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards)
             )
             assert destination == _kda_physical_state(state, dest_pool, local_heads)
             np.testing.assert_array_equal(coverage[rank], 1)
+
+
+def _kimi_fingerprint(kv_dtype):
+    packing = 4 // KIMI_KV_ITEMSIZE[kv_dtype]
+    manifest = kimi_pool_manifest(3, kv_dtype=kv_dtype)
+    return measured_kimi_k3_layout_fingerprint(
+        manifest,
+        page_tokens=manifest.storages[0].shape[1] * packing,
+        state_fragment_heads=3,
+        state_fragments=1,
+        layout_getter=lambda tensor: (
+            [3, 2, 1, 0],
+            [[packing, 128], [packing, 1]],
+            0,
+        ),
+        package_version=lambda package: "test",
+    )
+
+
+def test_kimi_fingerprint_separates_bf16_and_fp8_pools():
+    """A prefill and a decode that disagree on the KV dtype must not pair."""
+    bf16_fingerprint, bf16_payload = _kimi_fingerprint("bfloat16")
+    fp8_fingerprint, fp8_payload = _kimi_fingerprint("float8_e4m3fn")
+
+    assert bf16_fingerprint != fp8_fingerprint
+    assert bf16_payload["layouts"]["fa"]["element_size_in_bits"] == 16
+    assert fp8_payload["layouts"]["fa"]["element_size_in_bits"] == 8
+    # Rows are the same bytes; only what a row holds differs.
+    assert (
+        bf16_payload["layouts"]["fa"]["row_bytes"]
+        == fp8_payload["layouts"]["fa"]["row_bytes"]
+        == 2560
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_dtype", "tail_tokens", "tail_rows"),
+    [("bfloat16", 5, 3), ("float8_e4m3fn", 5, 2), ("float8_e4m3fn", 4, 1)],
+)
+def test_kimi_fa_row_spans_trim_the_tail_to_the_dtype_row(
+    kv_dtype, tail_tokens, tail_rows
+):
+    manifest = kimi_pool_manifest(3, kv_dtype=kv_dtype)
+    fa = manifest.pools[-1]
+    rows, packing = manifest.storages[0].shape[1:3]
+    page_tokens = rows * packing
+
+    registration = lower_glm_row_spans(
+        tag="fa",
+        num_tokens=page_tokens + tail_tokens,
+        transfer_rank=0,
+        parallelism=1,
+        page_tokens=page_tokens,
+        live_bytes_per_block=fa.live_bytes_per_block,
+        row_bytes=fa.regions[0].unit_bytes,
+        block_ids=[7, 9],
+    )
+
+    full_page, tail = registration.spans
+    assert full_page.size_bytes == fa.live_bytes_per_block == 207360
+    assert tail.size_bytes == tail_rows * 2560
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():
@@ -605,6 +675,96 @@ def test_glm_row_spans_union_partitions_request_bytes():
         total += registration.declared_bytes
     assert sorted(owners) == list(range(num_pages))
     assert total == (num_pages - 1) * _GLM_FA_LIVE + 2 * _GLM_FA_ROW_BYTES
+
+
+# DeepSeek-V4-Flash at block_size=1024 (T=256 compressed tokens per page),
+# uint8 with packing 4. CSA NoPE puts four logical tokens on one 512-byte
+# row; RoPE and the indexer put sixteen on theirs; HCA keeps raw bf16 latents
+# and spends two rows on every one of its 256 page tokens.
+_DSV4_CSA_NOPE = dict(page_tokens=1024, live_bytes_per_block=256 * 512, row_bytes=512)
+_DSV4_CSA_ROPE = dict(page_tokens=1024, live_bytes_per_block=64 * 512, row_bytes=512)
+_DSV4_IDX = dict(page_tokens=1024, live_bytes_per_block=64 * 1024, row_bytes=1024)
+_DSV4_HCA = dict(page_tokens=256, live_bytes_per_block=512 * 512, row_bytes=512)
+
+
+def _dsv4_row_spans(role, **overrides):
+    kwargs = dict(
+        tag="dsv4.csa.nope.g0",
+        num_tokens=1024,
+        transfer_rank=0,
+        parallelism=1,
+        block_ids=[10],
+        **role,
+    )
+    kwargs.update(overrides)
+    return lower_dsv4_row_spans(**kwargs)
+
+
+def test_dsv4_row_spans_cover_whole_pages_at_dp_parallelism_one():
+    for role in (_DSV4_CSA_NOPE, _DSV4_CSA_ROPE, _DSV4_IDX):
+        registration = _dsv4_row_spans(role, num_tokens=3072, block_ids=[7, 8, 9])
+        live = role["live_bytes_per_block"]
+        assert registration.dst_space_version == 1
+        assert registration.block_ids == (7, 8, 9)
+        assert registration.declared_bytes == 3 * live
+        assert registration.spans == tuple(
+            PoolByteSpan(
+                src_block_ordinal=page,
+                src_offset_bytes=0,
+                dst_block_index=0,
+                dst_offset_bytes=page * live,
+                size_bytes=live,
+            )
+            for page in range(3)
+        )
+
+
+def test_dsv4_row_spans_use_each_groups_own_block_table():
+    """The tags do not share pages: HCA's group is paged at 256 tokens where
+    CSA's is paged at 1024, so the same request is a different page count."""
+    csa = _dsv4_row_spans(
+        _DSV4_CSA_NOPE, tag="dsv4.csa.nope.g0", num_tokens=1024, block_ids=[3]
+    )
+    hca = _dsv4_row_spans(
+        _DSV4_HCA, tag="dsv4.hca.g2", num_tokens=1024, block_ids=[40, 41, 42, 43]
+    )
+
+    assert csa.block_ids == (3,)
+    assert hca.block_ids == (40, 41, 42, 43)
+    assert not set(csa.block_ids) & set(hca.block_ids)
+    assert hca.declared_bytes == 4 * _DSV4_HCA["live_bytes_per_block"]
+
+
+def test_dsv4_row_spans_trim_the_tail_to_whole_rows():
+    # Four logical tokens per row: 476 tail tokens need 119 rows.
+    csa = _dsv4_row_spans(_DSV4_CSA_NOPE, num_tokens=1500, block_ids=[1, 2])
+    assert csa.spans[-1].size_bytes == 119 * 512
+
+    # Two rows per token, the direction lower_glm_row_spans cannot express:
+    # 44 tail tokens need 88 rows.
+    hca = _dsv4_row_spans(
+        _DSV4_HCA, tag="dsv4.hca.g2", num_tokens=300, block_ids=[1, 2]
+    )
+    assert hca.spans[-1].size_bytes == 88 * 512
+    assert hca.declared_bytes == _DSV4_HCA["live_bytes_per_block"] + 88 * 512
+
+
+def test_dsv4_row_spans_validation_failures():
+    cases = (
+        (dict(block_ids=[10, 11]), "complete request page set"),
+        (dict(live_bytes_per_block=256 * 512 + 1), "whole rows"),
+        (dict(transfer_rank=1), "outside parallelism"),
+        (dict(num_tokens=0), "num_tokens must be positive"),
+        (dict(row_bytes=0), "row_bytes and live_bytes_per_block"),
+        (dict(tag=""), "pool tag must not be empty"),
+    )
+    for overrides, message in cases:
+        try:
+            _dsv4_row_spans(_DSV4_CSA_NOPE, **overrides)
+        except ValueError as exc:
+            assert message in str(exc), (overrides, exc)
+        else:
+            raise AssertionError(f"accepted invalid input: {overrides}")
 
 
 def test_glm_row_spans_validation_failures():

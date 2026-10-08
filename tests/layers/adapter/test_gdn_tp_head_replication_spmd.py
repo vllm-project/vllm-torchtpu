@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.gdn_attention import run_jax_gdn_attention_pooled_local
 
@@ -331,6 +332,7 @@ def test_loaded_tp_gdn_matches_tp1_spmd(
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
     monkeypatch.delenv("REQUANTIZE_BLOCK_SIZE", raising=False)
     monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn")
+    monkeypatch.setattr(GDNConfig, "triangular_block_size", property(lambda self: 16))
     checkpoint = _checkpoint(num_key_heads, num_value_heads, quantization)
     rng = np.random.default_rng(39)
     conv_dim = (2 * num_key_heads + num_value_heads) * HEAD_DIM
@@ -419,7 +421,7 @@ def test_loaded_tp_gdn_matches_tp1_spmd(
                     max_errors[name], float(np.max(np.abs(got - want)))
                 )
         print(
-            f"{quantization} K={num_key_heads} V={num_value_heads} TP={tp_size} {phase}: "
-            f"max_abs={max_errors}",
+            f"{quantization} K={num_key_heads} V={num_value_heads} "
+            f"TP={tp_size} {phase}: max_abs={max_errors}",
             flush=True,
         )

@@ -11,7 +11,7 @@ import copy
 import dataclasses
 import math
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -30,7 +30,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -51,6 +51,11 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolLayout,
+    unified_block_major_enabled,
+)
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -62,6 +67,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -73,7 +79,29 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    class _TpuKVCacheBackend(Protocol):
+        """Typing-only view of the KV cache methods on TPU attention backends."""
+
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str | torch.dtype = "auto",
+        ) -> tuple[int, ...]: ...
+
+        @staticmethod
+        def get_kv_cache_page_size_bytes(
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str | torch.dtype = "auto",
+        ) -> int: ...
+
 
 logger = init_logger(__name__)
 
@@ -261,6 +289,7 @@ class KVCacheManager:
                     # The layout can pad a page past what its shape and dtype
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
+                    assert backend_cls is not None
                     _warn_if_kv_cache_is_padded(
                         backend_cls,
                         block_size,
@@ -340,6 +369,38 @@ class KVCacheManager:
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
+
+        # Cross-model KV sharing (Gemma-4-style MTP) rides the same path as
+        # within-model sharing. The drafter is loaded before `get_kv_cache_spec`
+        # runs, so its `Attention` modules are already in the static forward
+        # context with `kv_sharing_target_layer_name` set and the loop above has
+        # registered them. Verify that rather than re-registering: a draft layer
+        # reaching this point unregistered would be allocated its own KV cache
+        # and would silently write there instead of into the target's.
+        drafter = getattr(self.runner, "drafter", None)
+        if (
+            self.runner._is_async_drafter
+            and getattr(drafter, "draft_model", None) is not None
+        ):
+            for draft_idx, layer in enumerate(drafter.draft_model.model.layers):
+                attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+                if attn is None or attn.kv_sharing_target_layer_name is None:
+                    continue
+                name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+                target = attn.kv_sharing_target_layer_name
+                if self.runner.shared_kv_cache_layers.get(name) != target:
+                    raise RuntimeError(
+                        f"Draft layer {name} declares KV sharing with {target} "
+                        "but was not registered as a shared layer. It would be "
+                        "given its own KV cache and write there instead of the "
+                        "target's."
+                    )
+                if name in kv_cache_spec:
+                    raise RuntimeError(
+                        f"Draft layer {name} shares KV with {target} but still "
+                        "has its own KVCacheSpec."
+                    )
+
         kv_cache_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.runner.kv_cache_dtype,
@@ -354,6 +415,7 @@ class KVCacheManager:
             and not ds_v4_layers
             and not self.runner._unified_kv_layout
         ):
+            assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
                 kv_cache_spec, backend_cls
             )
@@ -405,7 +467,9 @@ class KVCacheManager:
             page_bytes,
         )
         return {
-            name: dataclasses.replace(spec, page_size_padded=page_bytes)
+            name: dataclasses.replace(
+                cast(AttentionSpec, spec), page_size_padded=page_bytes
+            )
             for name, spec in kv_cache_specs.items()
         }
 
@@ -443,9 +507,13 @@ class KVCacheManager:
 
         # With fp8 KV cache the shared layer reads the target's cached K/V and
         # dequantizes with its OWN scales, so mismatched scales/dtype would
-        # silently corrupt attention.
-        attn_quant = attn_module.impl.kv_cache_quantized_dtype
-        target_quant = target_module.impl.kv_cache_quantized_dtype
+        # silently corrupt attention. TPU attention layers use the Pallas impl.
+        attn_quant = cast(
+            "PallasAttentionBackendImpl", attn_module.impl
+        ).kv_cache_quantized_dtype
+        target_quant = cast(
+            "PallasAttentionBackendImpl", target_module.impl
+        ).kv_cache_quantized_dtype
         # Trigger the check if EITHER side is fp8: the asymmetric case (only one
         # side quantized) is just as unsafe -- e.g. the shared layer reads the
         # target's packed fp8 bytes as bf16 -- and must error rather than
@@ -563,9 +631,13 @@ class KVCacheManager:
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
         for m in layers.values():
             if isinstance(m, Attention):
+                assert backend_cls is not None
                 attn_page_sizes.add(
                     backend_cls.get_kv_cache_page_size_bytes(
                         block_size,
@@ -631,7 +703,11 @@ class KVCacheManager:
             if isinstance(first_attn_module, Attention)
             else 1
         )
-        attention_backend = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        attention_backend = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
+        assert attention_backend is not None
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.runner.block_size,
             num_kv_heads,
@@ -687,10 +763,7 @@ class KVCacheManager:
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
-        if max_count < min_count * 1.5:
-            group_size = max_count
-        else:
-            group_size = min_count
+        group_size = max_count if max_count < min_count * 1.5 else min_count
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
         num_mamba_groups = (num_mamba + group_size - 1) // group_size
@@ -762,8 +835,10 @@ class KVCacheManager:
         budget = utils.compute_hbm_budget(
             [self.runner.device], self.runner.cache_config.gpu_memory_utilization
         )
-        return budget.available - utils.estimate_kv_connector_hbm_reserve(
-            self.runner.vllm_config
+        return utils.min_across_ep_dp(
+            self.runner.vllm_config.parallel_config,
+            budget.available
+            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
@@ -1063,18 +1138,32 @@ class KVCacheManager:
                 == self.runner.input_batch.block_table[group_id].get_cpu_tensor().dtype
             )
 
+        block_major = unified_block_major_enabled(self.runner.vllm_config)
+        if block_major:
+            self._check_block_major_pool_supported()
         materialized = materialize_kv_cache_tensors(
             kv_cache_config=kv_cache_config,
             attn_groups=self.runner.attn_groups,
             kernel_block_sizes=kernel_block_sizes,
             device=self.runner.device,
             cache_dtype=self.runner.kv_cache_dtype,
+            block_major=block_major,
         )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
+        self.runner.bm_pool_layout = materialized.bm_pool_layout
+        if materialized.bm_pool_layout is not None:
+            logger.info(
+                "Block-major unified pool: %d regions x %d kernel blocks per "
+                "scheduler block, pool %s %s",
+                materialized.bm_pool_layout.num_pools,
+                materialized.bm_pool_layout.split,
+                tuple(materialized.raw_tensors[0].shape),
+                materialized.raw_tensors[0].dtype,
+            )
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.raw_tensors
+                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
             )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
@@ -1109,6 +1198,8 @@ class KVCacheManager:
             self.runner.vllm_config.compilation_config.static_forward_context,
             self.runner.kv_caches,
         )
+        if materialized.bm_pool_layout is not None:
+            self._bind_block_major_pool_layers(materialized.bm_pool_layout)
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
@@ -1139,6 +1230,60 @@ class KVCacheManager:
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
 
+    def _check_block_major_pool_supported(self) -> None:
+        """Refuses execution features the block-major unified pool cannot index.
+
+        Runs before buffer allocation.
+        """
+        runner = self.runner
+        unsupported = None
+        if runner.speculative_config is not None:
+            # Pooled GDN speculative verification indexes `slot_read_offsets`
+            # directly by region-local state ID rather than remapped row IDs.
+            unsupported = "speculative decoding"
+        elif runner.parallel_config.decode_context_parallel_size > 1:
+            unsupported = "decode context parallelism"
+        elif runner.parallel_config.pipeline_parallel_size > 1:
+            unsupported = "pipeline parallelism"
+        elif runner.use_spmd:
+            unsupported = "SPMD"
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"VLLM_TPU_BLOCK_MAJOR_KV=1: {unsupported} is not supported "
+                "on the block-major unified pool"
+            )
+
+    def _bind_block_major_pool_layers(self, layout: BlockMajorPoolLayout) -> None:
+        """Binds each unified-pool layer to its region index within the merged pool.
+
+        Full-attention and GDN layers remap their block IDs before invoking the
+        underlying kernels; any other layer type lacks region-offset remapping
+        and is rejected to prevent cross-region aliasing.
+        """
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+            VllmGatedDeltaNetAttention,
+        )
+
+        pool_index = dict(layout.pool_index_by_layer)
+        for name, target in self.runner.shared_kv_cache_layers.items():
+            pool_index[name] = pool_index[target]
+        layers = get_layers_from_vllm_config(
+            self.runner.vllm_config, AttentionLayerBase
+        )
+        for name, index in pool_index.items():
+            layer = layers[name]
+            if isinstance(layer, VllmGatedDeltaNetAttention):
+                layer.set_block_major_pool(index, layout)
+            elif isinstance(layer.impl, PallasAttentionBackendImpl):
+                layer.impl.set_block_major_pool(index, layout)
+            else:
+                raise NotImplementedError(
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1: layer "
+                    f"{name} ({type(layer).__name__}) cannot address "
+                    "the block-major unified pool"
+                )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -1162,16 +1307,12 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
-            # Fail closed: unified pool allocation bypasses the block-major gate below,
-            # which would incorrectly register a block-major contract over unified-pool memory.
-            if envs.VLLM_TPU_BLOCK_MAJOR_KV:
-                raise NotImplementedError(
-                    "VLLM_TPU_BLOCK_MAJOR_KV=1: the unified KV block pool "
-                    "layout is not supported by the block-major KV bundle"
-                )
             self._initialize_unified_kv_cache(kv_cache_config)
             return
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
@@ -1182,14 +1323,16 @@ class KVCacheManager:
                 # (SWA 256 vs MLA 1024), so it is not asserted uniform here.
                 spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
-                # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
+                # We can safely ignore block size for Mamba layers since they only use a
+                # single cache state per sequence.
                 continue
             if (
                 not isinstance(spec, AttentionSpec)
                 and len(kv_cache_config.kv_cache_groups) > 1
             ):
                 raise NotImplementedError(
-                    "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
+                    "Only AttentionSpec and MambaSpec are supported in "
+                    "KV cache groups > 1."
                 )
 
         block_sizes = [
@@ -1262,22 +1405,23 @@ class KVCacheManager:
         # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
         _is_ds_v4 = any(
             is_cache_for_ds_v4(module)
-            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()
+            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
         )
 
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
         # Bundles all attention layer fragments into a single contiguous array in HBM:
         #   [num_blocks, num_layers, page_size, K2/p, p, head_dim]
         #
-        # Because num_blocks is the outermost dimension, all layer fragments for a logical
-        # block are contiguous in memory. This collapses save, load, and transfer operations
-        # from F independent DMAs into a single hardware DMA.
+        # Because num_blocks is the outermost dimension, all layer fragments for a
+        # logical block are contiguous in memory. This collapses save, load, and
+        # transfer operations from F independent DMAs into a single hardware DMA.
         #
-        # During forward execution, attention layers route through the bundled RPA kernel
-        # via VllmModelWrapperContext. Bound per-layer strided views share storage with
-        # the bundle, enabling deduplication during connector registration.
+        # During forward execution, attention layers route through the bundled RPA
+        # kernel via VllmModelWrapperContext. Bound per-layer strided views share
+        # storage with the bundle, enabling deduplication during connector registration.
         #
-        # Fail closed on unsupported model topologies to prevent cross-layout cache corruption.
+        # Fail closed on unsupported model topologies to prevent
+        # cross-layout cache corruption.
         self.runner._kv_cache_bundle = None
         self.runner._kv_cache_bundle_layer_index = {}
         bundle_view_by_name: dict[str, torch.Tensor] = {}
@@ -1296,7 +1440,8 @@ class KVCacheManager:
                 # Per-stage bundles require per-stage offload namespace isolation.
                 unsupported = "pipeline parallelism"
             elif self.runner.speculative_config is not None:
-                # Speculative decode propose paths execute outside the bundle wrapper context.
+                # Speculative decode propose paths execute outside the
+                # bundle wrapper context.
                 unsupported = "speculative decoding"
             elif self.runner.model_config.get_head_size() == 64:
                 # Bundled RPA kernel is not supported for head_size=64 architectures.
@@ -1386,9 +1531,10 @@ class KVCacheManager:
             region: tuple[int, int],
             geometry: list[tuple[tuple[int, ...], torch.dtype]],
         ) -> tuple[torch.Tensor, ...]:
+            native_caches = None
+            key = tuple(geometry)
             if share_attention_regions:
                 native_caches = attention_regions.setdefault(region, {})
-                key = tuple(geometry)
                 if key in native_caches:
                     return native_caches[key]
                 allocated_bytes = sum(
@@ -1409,7 +1555,7 @@ class KVCacheManager:
                 torch.zeros(shape, dtype=dtype).to(self.runner.device)
                 for shape, dtype in geometry
             )
-            if share_attention_regions:
+            if native_caches is not None:
                 native_caches[key] = caches
             return caches
 
@@ -1482,10 +1628,11 @@ class KVCacheManager:
                         )
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
-                    attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(
+                    attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
                         layer_name
                     )
                     if getattr(attn_module, "use_sparse", False):
+                        assert attn_module is not None
                         # Split (nope, rope) cache; each half's shape and dtype
                         # come from its own layout spec.
                         specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
@@ -1494,19 +1641,30 @@ class KVCacheManager:
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
                         )
+                        mla_dispatch.admit_layer(
+                            self.runner, attn_module, specs, kv_cache_spec.block_size
+                        )
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = allocate_attention_region(
                             region,
                             [(tuple(spec.shape), spec.torch_dtype) for spec in specs],
                         )
                         continue
-                    # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
-                    # Because MLA maps all attention heads onto a single joint compressed latent key-value
-                    # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
-                    # across tensor parallel ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
-                    # Each device partition consistently retains a complete, unsliced replication of the
-                    # compressed latent cache structure across multi-chip execution loops.
-                    kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    # SPMD Cache Invariance Details for
+                    # Multi-Head Latent Attention (MLA):
+                    # Because MLA maps all attention heads onto a single joint
+                    # compressed latent key-value representation (`num_kv_heads=1`), the
+                    # physical KV cache dimension never splits across tensor parallel
+                    # ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
+                    # Each device partition consistently retains a complete, unsliced
+                    # replication of the compressed latent cache structure across
+                    # multi-chip execution loops.
+                    mla_backend_cls = (
+                        VllmTPUDeepseekV32IndexerBackend
+                        if isinstance(attn_module, DeepseekV32IndexerCache)
+                        else PallasMLAttentionBackend
+                    )
+                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,
@@ -1530,9 +1688,11 @@ class KVCacheManager:
                     if region in shared_attention_caches:
                         kv_caches[layer_name] = shared_attention_caches[region]
                     elif use_block_major and layer_name in bundle_view_by_name:
-                        # Bind the strided per-layer view sharing storage with self._kv_cache_bundle.
+                        # Bind the strided per-layer view sharing storage
+                        # with self._kv_cache_bundle.
                         kv_caches[layer_name] = bundle_view_by_name[layer_name]
                     else:
+                        assert backend_cls is not None
                         kv_cache_shape = backend_cls.get_kv_cache_shape(
                             num_blocks,
                             kv_cache_spec.block_size,
@@ -1574,7 +1734,8 @@ class KVCacheManager:
             self.runner.kv_caches,
         )
 
-        # Pre-build and cache bundled RPA kernels across all attention layers before torch.compile tracing.
+        # Pre-build and cache bundled RPA kernels across all attention layers before
+        # torch.compile tracing.
         if self.runner._kv_cache_bundle is not None:
             from vllm_torchtpu.layers.adapter.attention import (
                 PallasAttentionBackendImpl,
@@ -1583,22 +1744,27 @@ class KVCacheManager:
             layers = get_layers_from_vllm_config(self.runner.vllm_config, Attention)
             # Only enter wrapper context when eligible attention layers are present.
             eligible = [
-                (name, attn_layer)
+                (name, attn_layer, impl)
                 for name, attn_layer in layers.items()
                 if name in self.runner._kv_cache_bundle_layer_index
-                and isinstance(attn_layer.impl, PallasAttentionBackendImpl)
+                and isinstance(impl := attn_layer.impl, PallasAttentionBackendImpl)
             ]
             if eligible:
                 with set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh,
                     kv_cache_bundle=self.runner._kv_cache_bundle,
                 ):
-                    for name, attn_layer in eligible:
-                        attn_layer.impl.setup_bundled(
+                    for name, attn_layer, impl in eligible:
+                        impl.setup_bundled(
                             self.runner._kv_cache_bundle_layer_index[name],
                             self.runner._kv_cache_bundle.device,
-                            attn_layer,
+                            cast(AttentionLayer, attn_layer),
                         )
+
+        # No-op unless DCP fine-grained prefix hits can emit CoW copies on
+        # these per-layer caches (same gate as the runtime path); compile
+        # before any forward runs.
+        self.runner._precompile_dense_kv_cache_block_copies()
 
         if self.runner.use_spmd:
             # Shard KV Cache
@@ -1608,8 +1774,9 @@ class KVCacheManager:
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
-            # Register KV caches with connector. TPURaidenOffloadingConnector deduplicates strided
-            # views by underlying storage, registering only the single canonical bundle.
+            # Register KV caches with connector. TPURaidenOffloadingConnector
+            # deduplicates strided views by underlying storage, registering only the
+            # single canonical bundle.
             kv_connector.register_kv_caches(kv_caches)
             # TPUConnector reads runner.kv_caches lazily and doesn't need
             # set_host_xfer_buffer_ops; only call it on connectors that

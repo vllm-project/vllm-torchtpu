@@ -49,6 +49,13 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
+    # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
+    # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
+    # in both get_global_shape and get_local_shape.
+    Patch(
+        "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
@@ -59,22 +66,30 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
     # MoE routing and collectives.
-    Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_sequence_parallel_moe_admission", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),
     # KV cache, scheduling, and offloading.
     Patch(
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
     ),
+    # After hybrid PCP: wraps the resolve it installed and rebinds its refs.
+    Patch(
+        "vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
+    ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -112,8 +127,9 @@ PATCHES = (
         _ACTIVE,
     ),
     # Model-specific patches.
-    # Append patches for new models here with stages=("platform_activation", "model_load")
-    # and model_config=True. See docs/tpu_patch_mechanism.md for details.
+    # Append patches for new models here with
+    # stages=("platform_activation", "model_load") and model_config=True.
+    # See docs/developers_guide/tpu_patch_mechanism.md for details.
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
         ("platform_activation", "model_load"),
@@ -123,6 +139,10 @@ PATCHES = (
         "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
         ("platform_activation", "model_load"),
         model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
+        ("platform_activation", "model_load"),
     ),
 )
 

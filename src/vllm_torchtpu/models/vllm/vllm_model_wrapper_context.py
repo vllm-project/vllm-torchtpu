@@ -39,9 +39,32 @@ _vllm_model_wrapper_context: VllmModelWrapperContext | None = None
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
     assert _vllm_model_wrapper_context is not None, (
         "VllmModelWrapperContext is not set. "
-        "Please use `set_vllm_model_wrapper_context` to set the VllmModelWrapperContext."
+        "Please use `set_vllm_model_wrapper_context` to set the "
+        "VllmModelWrapperContext."
     )
     return _vllm_model_wrapper_context
+
+
+def get_pallas_op_mesh() -> Mesh | None:
+    """The wrapper-context mesh to hand to ``pallas.jax_op(mesh=...)``.
+
+    torch_tpu (since 6c32c72bab, "enforces world-sized meshes for Pallas
+    distributed kernels") rejects a kernel mesh that does not span the whole
+    torch.distributed world, so passing the per-worker mesh fails every
+    multi-chip run at op build time::
+
+        ValueError: Pallas kernel mesh size (1) must match world size (16).
+
+    That mesh is one device (see TPURunner._create_mesh_for_parallelism),
+    which cannot describe cross-chip work anyway: without a mesh torch_tpu
+    ignores the partition specs and runs the kernel on this rank's device,
+    the same device the one-device mesh named. A multi-device mesh is passed
+    through unchanged.
+    """
+    mesh = get_vllm_model_wrapper_context().mesh
+    if mesh is None or mesh.size == 1:
+        return None
+    return mesh
 
 
 @contextmanager

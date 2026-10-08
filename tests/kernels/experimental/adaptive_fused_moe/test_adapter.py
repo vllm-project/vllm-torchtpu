@@ -11,8 +11,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter as bridge
 
-pytestmark = pytest.mark.cpu_test
-
 
 def layer(fp4=False):
     e, h, i = 4, 512, 256
@@ -186,7 +184,7 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(monkeypatc
         built.append((name, fn, op))
         return op
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     first = bridge._build_op(mesh, 2, True, "silu", None, "fp4", 64)
     second = bridge._build_op(mesh, 2, True, "silu", None, "fp8", None)
@@ -227,7 +225,7 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
         functions.append(fn)
         return Mock()
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     groups = ((1, 0),)
     original = bridge._build_op(mesh, 2, True, "silu", None)

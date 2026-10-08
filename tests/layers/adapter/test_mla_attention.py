@@ -17,9 +17,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import DCPGroupColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import attention as attention_adapter
+from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
 from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     PallasMLAttentionBackendImpl,
@@ -34,7 +37,8 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 def test_mla_attention_interface_mixed_q_split(monkeypatch):
-    """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to mla_ragged_paged_attention."""
+    """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to
+    mla_ragged_paged_attention."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -105,7 +109,8 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     assert kwargs["mixed_q_split"] == 1
     assert kwargs["sm_scale"] == 0.1
 
-    # 2. Overridden env vars (MIXED_Q_SPLIT=16, MIXED_NUM_QUERIES_PER_BLOCK=64, MIXED_NUM_KV_PAGES_PER_BLOCK=4): overrides mixed_tuned
+    # 2. Overridden env vars (MIXED_Q_SPLIT=16, MIXED_NUM_QUERIES_PER_BLOCK=64,
+    #    MIXED_NUM_KV_PAGES_PER_BLOCK=4): overrides mixed_tuned
     mock_mla_kernel.reset_mock()
     monkeypatch.setattr(envs, "MIXED_Q_SPLIT", 16)
     monkeypatch.setattr(envs, "MIXED_NUM_QUERIES_PER_BLOCK", 64)
@@ -325,6 +330,8 @@ def test_mla_wrapper_rope_preserves_activation_dtype():
     wrapper.kv_a_layernorm = lambda value: value
     wrapper.rotary_emb = lambda _positions, q_pe, k_pe: (q_pe.float(), k_pe.float())
     wrapper.is_sparse = False
+    wrapper.dcp_q_replicate = False
+    wrapper.dcp_group_size = 1
     wrapper.g_proj = None
     wrapper.gate_is_fused = False
     wrapper.mla_attn = MagicMock(return_value=torch.ones((3, 4), dtype=torch.bfloat16))
@@ -607,6 +614,62 @@ def _gate_wrapper(modules, q_lora_rank, **kwargs):
         )
 
 
+def test_mla_wrapper_forwards_the_shared_topk_buffer():
+    """A layer that reuses an earlier layer's indices has no indexer, so the
+    shared buffer is what states its top-k width to masked-dense admission."""
+    modules = _gate_modules("none", 2)
+    modules.topk_indices_buffer = torch.full((4, 2048), -1, dtype=torch.int32)
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmTPUMLAAttention"
+    ) as attention:
+        VllmMultiHeadLatentAttentionWrapper(
+            hidden_size=4,
+            num_heads=1,
+            scale=1.0,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=1,
+            v_head_dim=2,
+            q_lora_rank=2,
+            kv_lora_rank=2,
+            mla_modules=modules,
+        )
+    kwargs = attention.call_args.kwargs
+    assert kwargs["topk_indices_buffer"] is modules.topk_indices_buffer
+
+
+@pytest.mark.parametrize("allowed", [None, False, True])
+def test_sparse_mla_op_reads_admission_when_traced(allowed):
+    """The op is built before the KV cache is allocated, so it reads the
+    layer's admission when traced; an unadmitted layer passes False."""
+    impl, layer, _, _ = _make_impl_and_layer()
+    layer.layer_name = "model.layers.0.self_attn.attn"
+    layer.scale = 0.125
+    layer.kv_cache_quantized_dtype = None
+    captured = {}
+
+    def jax_op(name, fn, **kwargs):
+        captured["core"] = fn
+        return MagicMock()
+
+    with (
+        patch.object(attention_adapter.pallas, "jax_op", side_effect=jax_op),
+        patch.object(
+            attention_adapter,
+            "get_vllm_model_wrapper_context",
+            return_value=SimpleNamespace(mesh="mesh"),
+        ),
+        patch(
+            "vllm_torchtpu.layers.core.attention_interface.sparse_mla_attention"
+        ) as core,
+    ):
+        impl._build_sparse_mla_op(layer)
+        layer.mla_kv_spec = ("nope_spec", "rope_spec")
+        if allowed is not None:
+            layer.allow_masked_dense = allowed
+        captured["core"](*range(11))
+    assert core.call_args.kwargs["allow_masked_dense"] is bool(allowed)
+
+
 @pytest.mark.parametrize(
     "gate_mode,q_lora_rank",
     [("none", None), ("none", 2), ("separate", None), ("separate", 2), ("fused", 2)],
@@ -706,6 +769,257 @@ def test_tpu_platform_keeps_the_selected_backend_without_mla(selected, expected)
     assert cls_name != AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
 
 
+class _FakeQProj:
+    """A `DCPGroupColumnParallelLinear` stand-in carrying upstream's own
+    `_local_view`, so the slicing under test is the real one."""
+
+    qrep_active = True
+    _local_view = DCPGroupColumnParallelLinear._local_view
+
+    def __init__(self, group_size: int, rank_in_group: int, out=None):
+        self.group_size = group_size
+        self.rank_in_group = rank_in_group
+        self._out = out
+
+    def __call__(self, _hidden):
+        return self._out, None
+
+
+class _FakeHeadGatherGroup:
+    """Serves `all_gather(dim=1)` from a known per-rank stack."""
+
+    def __init__(self, per_rank, rank):
+        self.world_size = len(per_rank)
+        self.rank_in_group = rank
+        self._per_rank = per_rank
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 1
+        torch.testing.assert_close(tensor, self._per_rank[self.rank_in_group])
+        return torch.cat(self._per_rank, dim=1)
+
+
+def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
+    """qrep replaces the head all-gather with a local slice, so the two must
+    agree on where in the group's head axis a rank's own block sits. If they
+    disagree the heads are silently permuted and nothing raises."""
+    group_size, heads, dim = 4, 3, 5
+    torch.manual_seed(0)
+    per_rank = [torch.randn(2, heads, dim) for _ in range(group_size)]
+    grouped = torch.cat(per_rank, dim=1)
+
+    for rank in range(group_size):
+        group = _FakeHeadGatherGroup(per_rank, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        torch.testing.assert_close(cp_mla.all_gather_heads(per_rank[rank]), grouped)
+        nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+            per_rank[rank][..., :3], per_rank[rank][..., 3:], 3
+        )
+        torch.testing.assert_close(nope_dcp, grouped[..., :3])
+        torch.testing.assert_close(pe_dcp, grouped[..., 3:])
+        torch.testing.assert_close(
+            _FakeQProj(group_size, rank)._local_view(grouped), per_rank[rank]
+        )
+
+
+def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
+    """With query replication the projection returns the group's heads. Viewing
+    them as `num_heads` would fold the extra heads into the token axis, which is
+    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+    group_size, local_heads, num_tokens = 4, 2, 3
+    wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
+        VllmMultiHeadLatentAttentionWrapper
+    )
+    torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
+    wrapper.q_lora_rank = None
+    wrapper.kv_lora_rank = 4
+    wrapper.qk_nope_head_dim = 3
+    wrapper.qk_rope_head_dim = 2
+    wrapper.qk_head_dim = 5
+    wrapper.num_heads = local_heads
+    wrapper.v_head_dim = 2
+    wrapper.dcp_q_replicate = True
+    wrapper.dcp_group_size = group_size
+    wrapper.is_sparse = True
+    wrapper.indexer = None
+    wrapper.skip_topk = True
+    wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
+    group_width = local_heads * group_size * wrapper.qk_head_dim
+    wrapper.kv_a_proj_with_mqa = lambda hidden: (
+        torch.ones((hidden.shape[0], 6), dtype=hidden.dtype),
+        None,
+    )
+    q_values = torch.arange(num_tokens * group_width, dtype=torch.bfloat16).view(
+        num_tokens, group_width
+    )
+    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=2, out=q_values)
+    wrapper.kv_a_layernorm = lambda value: value
+    wrapper.rotary_emb = None
+    wrapper.g_proj = None
+    wrapper.gate_is_fused = False
+    wrapper.mla_attn = MagicMock(
+        return_value=torch.ones((num_tokens, 4), dtype=torch.bfloat16)
+    )
+    wrapper.o_proj = lambda value: (value, None)
+
+    VllmMultiHeadLatentAttentionWrapper.forward(
+        wrapper,
+        positions=torch.arange(num_tokens),
+        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+    )
+
+    (q_nope, q_pe) = wrapper.mla_attn.call_args.args[0]
+    rep_nope, rep_pe = wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"]
+    # The token axis survives; only the head axis carries the group.
+    assert q_nope.shape == (num_tokens, local_heads, wrapper.qk_nope_head_dim)
+    assert rep_nope.shape == (
+        num_tokens,
+        local_heads * group_size,
+        wrapper.qk_nope_head_dim,
+    )
+    assert rep_pe.shape == (
+        num_tokens,
+        local_heads * group_size,
+        wrapper.qk_rope_head_dim,
+    )
+    # And the local view is this rank's block of the replicated tensor.
+    start = 2 * local_heads
+    torch.testing.assert_close(q_nope, rep_nope[:, start : start + local_heads])
+    torch.testing.assert_close(q_pe, rep_pe[:, start : start + local_heads])
+
+
+def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
+    """On the sparse DCP path a replicated q is consumed directly, against the
+    group-wide `W_UK_T`, and the per-step head all-gather is not run."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(1)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+
+    def _explode(*_args):
+        raise AssertionError("qrep must not all-gather the query heads")
+
+    monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
+    monkeypatch.setattr(attention_adapter, "all_gather_q_nope_pe_heads", _explode)
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **_kw: out[:, :local_heads, :],
+    )
+
+    q_nope_rep = torch.randn(num_tokens, group_heads, 128)
+    q_pe_rep = torch.randn(num_tokens, group_heads, 64)
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(q_nope_rep, q_pe_rep),
+    )
+
+    layer.sparse_mla_dcp_op.assert_called_once()
+    _cache, ql_nope, q_pe, *_ = layer.sparse_mla_dcp_op.call_args.args
+    expected_ql = torch.bmm(
+        q_nope_rep.transpose(0, 1), layer.W_UK_T_dcp_qrep
+    ).transpose(0, 1)
+    torch.testing.assert_close(ql_nope, expected_ql)
+    torch.testing.assert_close(q_pe, q_pe_rep)
+
+
+def test_mla_forward_without_qrep_still_gathers(monkeypatch):
+    """The gather is only skipped when a replicated q actually arrives; the
+    unreplicated DCP path is untouched."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+
+    partial = torch.randn(num_tokens, local_heads * dcp_size, 512)
+    lse = torch.zeros(num_tokens, local_heads * dcp_size)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+
+    gathered = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **_kw: out[:, :local_heads, :],
+    )
+
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+
+    assert len(gathered) == 2
+    assert all(t.shape[1] == local_heads for t in gathered)
+
+    # Also verify the default fused Q gather path (`all_gather_q_nope_pe_heads`)
+    fused_calls = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        cp_mla.all_gather_heads,
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_q_nope_pe_heads",
+        lambda nope, pe, rank: (
+            fused_calls.append((nope, pe, rank)),
+            (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
+        )[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(fused_calls) == 1
+    assert fused_calls[0][0].shape[1] == local_heads
+    assert fused_calls[0][1].shape[1] == local_heads
+    assert fused_calls[0][2] == layer.kv_lora_rank
+
+    # Negative control: disabling TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER falls back
+    # to two separate all_gather_heads calls.
+    unfused_calls = []
+    monkeypatch.setenv("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", "0")
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(unfused_calls) == 2
+    assert len(fused_calls) == 1
+
+
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
@@ -728,3 +1042,474 @@ def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention.impl.forward.assert_called_once()
     assert attention.impl.forward.call_args.kwargs["attn_metadata"] == "meta"
     assert attention.impl.forward.call_args.kwargs["kv_cache"] == "cache"
+
+
+def test_indexer_kv_cache_mode_env_validation(monkeypatch):
+    """VLLM_TPU_INDEXER_KV_CACHE_MODE defaults to 'sal', normalizes case, and
+    rejects unknown modes."""
+    import importlib
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    assert "VLLM_TPU_INDEXER_KV_CACHE_MODE" in TpuPlatform.additional_env_vars
+    assert "TPU_USE_RAIDEN_KV_CACHE_MANAGER" in TpuPlatform.additional_env_vars
+    assert "TPU_RAIDEN_GLM_ADMISSION" in TpuPlatform.additional_env_vars
+    assert "TPU_KV_RESHARD_TRANSPORT" in TpuPlatform.additional_env_vars
+    assert (
+        envs.DEFAULT_INDEXER_KV_CACHE_MODE
+        == st_mod.DEFAULT_INDEXER_KV_CACHE_MODE
+        == "sal"
+    )
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    assert envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == "sal"
+    assert st_mod.indexer_kv_layout(256) == st_mod.KVLayout.SEQ_ALONG_LANE
+
+    for raw, expected in [("HAS", "has"), ("SAL", "sal"), ("Xla", "xla")]:
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raw)
+        assert (
+            envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]() == expected
+        )
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "invalid_mode")
+    with pytest.raises(ValueError, match="VLLM_TPU_INDEXER_KV_CACHE_MODE"):
+        envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]()
+
+
+def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):
+    """Single-source layout + strict fallback rule: HAS may fall back to 'xla',
+    SAL never falls back to 'xla', and block_size < 128 downgrades SAL layout to HAS."""
+    import importlib
+    import logging
+
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+    cache_has = jnp.zeros((4, 256, 4, 256), dtype=jnp.uint8)
+    cache_has_64 = jnp.zeros((4, 16, 4, 256), dtype=jnp.uint8)
+    cache_sal = jnp.zeros((4, 33, 4, 1024), dtype=jnp.uint8)
+    k_packed = jnp.zeros((8, 129), dtype=jnp.uint8)
+
+    # 'xla' never warns regardless of backend and logs info once.
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="xla"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="xla"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    info_msgs = [
+        r.message for r in caplog.records if "indexer kv cache: mode=" in r.message
+    ]
+    assert info_msgs == [
+        "indexer kv cache: mode=xla writer=xla layout=HAS cache_shape=(4, 256, 4, 256)"
+    ]
+
+    # On CPU, 'has' falls back to 'xla' and warns once per (mode, reason).
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("xla", KVLayout.HEAD_ALONG_SUBLANE)
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "falling back to 'xla'" in warnings[0]
+
+    # On CPU, 'sal' with a SAL-shaped cache MUST raise, never fall back to XLA.
+    with pytest.raises(ValueError, match="cannot fall back to 'xla'"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_sal, k_packed, mode="sal")
+
+    # On TPU, valid HAS and SAL shapes resolve to ('pallas', layout).
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has, k_packed, mode="has"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_sal, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.SEQ_ALONG_LANE)
+    prefix = "indexer kv cache: mode="
+    info_msgs = [r.message for r in caplog.records if prefix in r.message]
+    assert info_msgs == [
+        f"{prefix}has writer=pallas layout=HAS cache_shape=(4, 256, 4, 256)",
+        f"{prefix}sal writer=pallas layout=SAL cache_shape=(4, 33, 4, 1024)",
+    ]
+
+    # Mismatched cache shape (HAS cache with block_size=1024 under mode='sal', or
+    # SAL cache under mode='has'/'xla') raises ValueError.
+    with pytest.raises(ValueError, match="does not match expected"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+    with pytest.raises(ValueError, match="does not match expected"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_sal, k_packed, mode="has")
+
+    # SAL with unsupported token count raises ValueError rather than falling back.
+    with pytest.raises(ValueError, match="cannot fall back to 'xla'"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(
+            cache_sal, jnp.zeros((65536, 129), dtype=jnp.uint8), mode="sal"
+        )
+
+    # block_size=64 + mode='sal' downgrades layout via indexer_kv_layout to HAS
+    # (warning once) and uses the Pallas 'has' writer on TPU.
+    caplog.clear()
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has_64, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(
+        cache_has_64, k_packed, mode="sal"
+    ) == ("pallas", KVLayout.HEAD_ALONG_SUBLANE)
+    layout_warnings = [
+        r.message
+        for r in caplog.records
+        if "requires block_size to be a positive multiple of 128" in r.message
+    ]
+    assert len(layout_warnings) == 1
+
+
+def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
+    """_build_streamidx_op produces bit-identical cache updates and top-k args
+    across xla, has, and sal."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        kv_cache_append,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    # Capture the inner JAX function passed to pallas.jax_op and run the writer
+    # in interpret mode when executing on CPU so the full HAS/SAL paths run.
+    captured = {}
+
+    def _fake_jax_op(name, fn, donate_argnums=()):
+        captured["name"] = name
+        captured["fn"] = fn
+        captured["donate_argnums"] = donate_argnums
+        op = MagicMock(side_effect=fn)
+        op.register_fake = MagicMock()
+        return op
+
+    monkeypatch.setattr(mla_attention_op.pallas, "jax_op", _fake_jax_op)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    orig_append = kv_cache_append.coalesced_kv_append
+    monkeypatch.setattr(
+        mla_attention_op,
+        "coalesced_kv_append",
+        lambda *a, **kw: orig_append(*a, **kw, interpret=True),
+    )
+
+    recorded_topk_calls = []
+
+    def _fake_streamindex_topk(
+        q,
+        weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        *,
+        k,
+        kv_layout,
+        **kwargs,
+    ):
+        recorded_topk_calls.append((kv_layout, np.asarray(cache_kv)))
+        return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+
+    monkeypatch.setattr(mla_attention_op, "streamindex_topk", _fake_streamindex_topk)
+
+    rng = np.random.default_rng(42)
+    num_pages, page_size, head_dim, lkv_dim = 4, 128, 128, 256
+    num_tokens, num_heads, topk = 6, 32, 16
+    init_has = jnp.asarray(
+        rng.integers(
+            0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
+        )
+    )
+    init_sal = st_lib.convert_cache_to_seq_along_lane(
+        init_has, actual_head_dim=head_dim
+    )
+    q_bytes = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, num_heads, head_dim), dtype=np.uint8)
+    )
+    weights = jnp.ones((num_tokens, num_heads), dtype=jnp.bfloat16)
+    k_packed = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, head_dim + 1), dtype=np.uint8)
+    )
+    seq_lens = jnp.array([5, 67], dtype=jnp.int32)
+    page_indices = jnp.array([2, 0, 1, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 6], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    # Drop a value a previous test's monkeypatch.setattr undo may have left in the
+    # module dict, so `envs.__getattr__` resolves the variable afresh. A bare
+    # `delattr(raising=False)` is not enough: `hasattr` is True through
+    # `__getattr__`, so it raises on a module dict without the name.
+    if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in vars(envs):
+        monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE")
+    results = {}
+    for mode, init_cache in [
+        ("xla", init_has),
+        ("has", init_has),
+        ("sal", init_sal),
+    ]:
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+        indexer = mla_attention_op.VllmTPUSparseAttnIndexer.__new__(
+            mla_attention_op.VllmTPUSparseAttnIndexer
+        )
+        indexer.topk_tokens = topk
+        indexer.k_cache = SimpleNamespace(prefix="model.layers.0.indexer")
+        indexer._build_streamidx_op()
+        assert captured["donate_argnums"] == (2,)
+        new_cache, topk_out = captured["fn"](
+            q_bytes,
+            weights,
+            jnp.copy(init_cache),
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+        )
+        results[mode] = (new_cache, np.asarray(topk_out))
+
+    assert recorded_topk_calls[0][0] == KVLayout.HEAD_ALONG_SUBLANE
+    assert recorded_topk_calls[1][0] == KVLayout.HEAD_ALONG_SUBLANE
+    assert recorded_topk_calls[2][0] == KVLayout.SEQ_ALONG_LANE
+
+    # HAS Pallas cache update matches XLA cache update bit-for-bit.
+    np.testing.assert_array_equal(
+        np.asarray(results["has"][0]), np.asarray(results["xla"][0])
+    )
+    # SAL Pallas cache update matches converted XLA cache update bit-for-bit.
+    expected_sal = st_lib.convert_cache_to_seq_along_lane(
+        results["xla"][0], actual_head_dim=head_dim
+    )
+    np.testing.assert_array_equal(
+        np.asarray(results["sal"][0]), np.asarray(expected_sal)
+    )
+    np.testing.assert_array_equal(results["has"][1], results["xla"][1])
+    np.testing.assert_array_equal(results["sal"][1], results["xla"][1])
+
+
+def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
+    """_cp_scatter_indexer_k updates the DCP shard identically across xla, has,
+    and sal without re-resolving mode inside shard_map."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        DCP_AXIS_NAME,
+        KVLayout,
+        kv_cache_append,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    orig_append_dcp = kv_cache_append.coalesced_kv_append_dcp
+    monkeypatch.setattr(
+        mla_attention_op,
+        "coalesced_kv_append_dcp",
+        lambda *a, **kw: orig_append_dcp(*a, **kw, interpret=True),
+    )
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), (DCP_AXIS_NAME,))
+    rng = np.random.default_rng(99)
+    num_pages, page_size, head_dim, lkv_dim = 4, 128, 128, 256
+    num_tokens = 8
+    init_has = jnp.asarray(
+        rng.integers(
+            0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
+        )
+    )
+    init_sal = st_lib.convert_cache_to_seq_along_lane(
+        init_has, actual_head_dim=head_dim
+    )
+    k_packed = jnp.asarray(
+        rng.integers(0, 256, size=(num_tokens, head_dim + 1), dtype=np.uint8)
+    )
+    seq_lens = jnp.array([6, 70], dtype=jnp.int32)
+    page_indices = jnp.array([1, 3, 0, 2], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 3, 8], dtype=jnp.int32)
+
+    common_kw = dict(
+        mesh=mesh,
+        cp_size=1,
+        interleave_size=1,
+        axis_name=DCP_AXIS_NAME,
+    )
+    out_xla = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_has),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        writer="xla",
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        **common_kw,
+    )
+    out_has = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_has),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        writer="pallas",
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        **common_kw,
+    )
+    out_sal = mla_attention_op._cp_scatter_indexer_k(
+        jnp.copy(init_sal),
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        writer="pallas",
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+        **common_kw,
+    )
+
+    np.testing.assert_array_equal(np.asarray(out_has), np.asarray(out_xla))
+    np.testing.assert_array_equal(
+        np.asarray(out_sal),
+        np.asarray(
+            st_lib.convert_cache_to_seq_along_lane(out_xla, actual_head_dim=head_dim)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="only supports HEAD_ALONG_SUBLANE"):
+        mla_attention_op._cp_scatter_indexer_k(
+            jnp.copy(init_sal),
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            writer="xla",
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            **common_kw,
+        )
+
+
+def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):
+    """Raiden GLM admission downgrades default 'sal' to HAS with a one-time
+    warning, rejects explicit 'sal' with ValueError, and leaves 'has'/'xla' and
+    DSv4 admission unaffected."""
+    import importlib
+    import logging
+
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_FALLBACK_LOGGED", set())
+    monkeypatch.setattr(mla_attention_op, "_INDEXER_KV_CACHE_INFO_LOGGED", set())
+    monkeypatch.setattr(st_mod, "_INDEXER_KV_LAYOUT_FALLBACK_LOGGED", set())
+
+    # Pin the flags as module attributes rather than through os.environ: the
+    # helpers read `envs.<NAME>`, so this stays correct after enable_envs_cache()
+    # and regardless of attributes other tests' monkeypatch undo left behind.
+    # The mode is pinned both ways, since explicitness is read from os.environ.
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", False)
+
+    # 1. No Raiden flags -> default 'sal' selects SEQ_ALONG_LANE.
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    # 2. Only one of the two flags or DSv4 admission alone -> still SEQ_ALONG_LANE.
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_DSV4_ADMISSION", True)
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", True)
+    assert not envs.use_raiden_glm_admission()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+
+    # 3. Default 'sal' + Raiden GLM admission -> HEAD_ALONG_SUBLANE + one warning.
+    monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", True)
+    assert envs.use_raiden_glm_admission()
+    assert not envs.is_indexer_kv_cache_mode_explicit()
+    caplog.clear()
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "incompatible with Raiden GLM admission" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "VLLM_TPU_INDEXER_KV_CACHE_MODE=has" in warnings[0]
+
+    # 4. Explicit 'has' and 'xla' + Raiden GLM admission -> HAS, no warning.
+    for explicit_mode in ("has", "xla"):
+        caplog.clear()
+        monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
+        assert envs.is_indexer_kv_cache_mode_explicit()
+        assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+        assert not [
+            r.message
+            for r in caplog.records
+            if "incompatible with Raiden GLM admission" in r.message
+        ]
+
+    # 5. Explicit 'sal' (env or mode arg) + Raiden GLM admission -> ValueError.
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    assert envs.is_indexer_kv_cache_mode_explicit()
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        st_mod.indexer_kv_layout(256)
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        st_mod.indexer_kv_layout(256, mode="sal")
+
+    # 6. _resolve_indexer_kv_cache_mode under the downgrade returns
+    #    ('pallas', HEAD_ALONG_SUBLANE) on TPU and ('xla', HEAD_ALONG_SUBLANE) on CPU.
+    cache_has = jnp.zeros((4, 64, 4, 256), dtype=jnp.uint8)
+    k_packed = jnp.zeros((8, 129), dtype=jnp.uint8)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed) == (
+        "pallas",
+        KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    assert mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed) == (
+        "xla",
+        KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    with pytest.raises(ValueError, match="Raiden GLM admission"):
+        mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")

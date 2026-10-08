@@ -23,10 +23,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     _omni_enum = OmniPlatformEnum.OOT
 
+    # Diffusion worker world size recorded by set_device (see dist_backend).
+    _worker_world_size: int = 1
+
     @property
     def dist_backend(self) -> str:
-        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
-        return TpuPlatform.get_worker_distributed_backend(world_size=world_size)
+        return TpuPlatform.get_worker_distributed_backend(
+            world_size=self._worker_world_size
+        )
 
     def __init__(self) -> None:
         super().__init__()
@@ -65,12 +69,50 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
-    def set_device(cls, device: torch.device) -> None:
+    def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1:
+            cls._worker_world_size = world_size
+            chips = os.environ.get("TPU_VISIBLE_CHIPS")
+            if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
+                logger.warning(
+                    "Diffusion stage is pinned to TPU_VISIBLE_CHIPS=%s, but its "
+                    "%d ranks bind chips 0-%d by local rank. Multi-rank diffusion "
+                    "stages on other chips (e.g. in multi-stage pipelines) are "
+                    "not supported on TPU yet.",
+                    chips,
+                    world_size,
+                    world_size - 1,
+                )
+            cls._set_shared_slicebuilder_addresses(world_size)
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _set_shared_slicebuilder_addresses(world_size: int) -> None:
+        """Give every diffusion worker the same PjRt slicebuilder addresses.
+
+        Root cause: vLLM-Omni spawns diffusion workers with no platform hook
+        in the parent, so each worker reaches ``_prepare_singlehost_tpu_env``
+        without TORCH_TPU_SLICEBUILDER_ADDRESSES and picks its own random
+        ports. torch_tpu needs one identical list on every rank, otherwise
+        the slice bootstrap never completes. The workers already share
+        MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
+        list is derived from it.
+
+        An inherited list is replaced even when its size matches: in
+        multi-stage pipelines it is an LLM stage's list (built in the
+        orchestrator process), and sharing it hangs that stage's workers.
+        """
+        # TODO: Remove once vLLM-Omni calls a platform hook in the parent before
+        # spawning diffusion workers, so every rank inherits one address list, or
+        # torch_tpu allows more than one addressable device per process.
+        base_port = int(os.environ["MASTER_PORT"])
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+            f"localhost:{base_port + 1 + i}" for i in range(world_size)
+        )
 
     @classmethod
     def get_torch_device(cls, _local_rank: int | None = None) -> torch.device:
@@ -85,8 +127,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return None
 
     @classmethod
-    def synchronize(cls) -> None:
-        torch.accelerator.synchronize()
+    def synchronize(cls, device: torch.device | int | None = None) -> None:
+        torch.accelerator.synchronize(device)
 
     @classmethod
     def empty_cache(cls) -> None:
@@ -98,7 +140,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         if hbm is not None:
             return hbm
         raise ValueError(
-            f"Could not determine HBM memory for attached TPU device: {hardware.get_tpu_device_name()}"
+            "Could not determine HBM memory for attached TPU device: "
+            f"{hardware.get_tpu_device_name()}"
         )
 
     @classmethod

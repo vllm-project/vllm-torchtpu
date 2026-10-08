@@ -3,7 +3,7 @@
 import bisect
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -120,8 +120,23 @@ class SequenceLayoutPlan:
             value=-1,
         )
 
-        packed_to_request = self._packed_to_request_major_token_indices
-        request_to_packed = self._request_major_to_packed_token_indices
+        packed_to_request = cast(
+            np.ndarray, self._packed_to_request_major_token_indices
+        )
+        request_to_packed = cast(
+            np.ndarray, self._request_major_to_packed_token_indices
+        )
+        num_tokens = request_to_packed.size
+        assert num_tokens <= self.global_padded_num_tokens, (
+            "Request-major mapping exceeds the PCP global token capacity: "
+            f"{num_tokens=} {self.global_padded_num_tokens=}"
+        )
+        # Bucket before the device copy so MTP gather compilation does not
+        # specialize on every real token count within the same layout bucket.
+        padded_request_to_packed = np.full(
+            self.global_padded_num_tokens, -1, dtype=request_to_packed.dtype
+        )
+        padded_request_to_packed[:num_tokens] = request_to_packed
         local_start = int(self.token_slice.start or 0)
         local_end = int(self.token_slice.stop)
 
@@ -129,7 +144,7 @@ class SequenceLayoutPlan:
             request_major_token_tensor,
             request_major_gather_indices,
             packed_to_request[local_start:local_end],
-            request_to_packed,
+            padded_request_to_packed,
             local_start,
             local_end,
         )
@@ -366,10 +381,7 @@ def is_pcp_streaming_sequence_layout(
     kind: str | SequenceLayoutKind,
     protocol: str,
 ) -> bool:
-    if isinstance(kind, SequenceLayoutKind):
-        kind_value = kind.value
-    else:
-        kind_value = str(kind)
+    kind_value = kind.value if isinstance(kind, SequenceLayoutKind) else str(kind)
     return (
         kind_value == SequenceLayoutKind.PARTIAL.value
         and protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL

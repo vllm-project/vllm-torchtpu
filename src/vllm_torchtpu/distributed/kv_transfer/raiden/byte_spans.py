@@ -148,10 +148,7 @@ def lower_fa_spans(
 
 
 def _region_value(region: object, name: str) -> int | str:
-    if isinstance(region, dict):
-        value = region[name]
-    else:
-        value = getattr(region, name)
+    value = region[name] if isinstance(region, dict) else getattr(region, name)
     return str(value) if name == "name" else int(value)
 
 
@@ -210,15 +207,12 @@ def lower_gdn_state_shard_spans(
         name = str(_region_value(region, "name"))
         if name in normalized:
             raise ValueError(f"duplicate GDN state region {name!r} ({tag})")
-        values = tuple(
-            int(_region_value(region, field))
-            for field in (
-                "offset_bytes",
-                "stride_bytes",
-                "unit_bytes",
-                "num_units",
-                "units_per_stride",
-            )
+        values = (
+            int(_region_value(region, "offset_bytes")),
+            int(_region_value(region, "stride_bytes")),
+            int(_region_value(region, "unit_bytes")),
+            int(_region_value(region, "num_units")),
+            int(_region_value(region, "units_per_stride")),
         )
         if min(values) < 0 or values[2] <= 0 or values[3] <= 0 or values[4] <= 0:
             raise ValueError(f"invalid GDN state region {name!r} ({tag})")
@@ -469,6 +463,167 @@ def lower_glm_row_spans(
     # Full pages, then a tail rounded up to whole rows.
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
     tail_bytes = ((tail_tokens + tokens_per_row - 1) // tokens_per_row) * row_bytes
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=page,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=page * live_bytes_per_block,
+            size_bytes=(tail_bytes if page == num_pages - 1 else live_bytes_per_block),
+        )
+        for page in range(num_pages)
+        if page % parallelism == transfer_rank
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=sum(span.size_bytes for span in spans),
+        dst_space_version=1,
+    )
+
+
+def glm_dcp_chunk_bytes(
+    *,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    interleave_tokens: int,
+) -> int:
+    """Bytes of one ``interleave_tokens`` chunk of a packed-row GLM page.
+
+    A chunk must be whole packed rows and must not straddle a page, the same
+    constraints the DCP cache writers put on the interleave.
+    """
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    if row_bytes <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("row_bytes and live_bytes_per_block must be positive")
+    if live_bytes_per_block % row_bytes:
+        raise ValueError(
+            "page live bytes must be whole rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
+    rows_per_page = live_bytes_per_block // row_bytes
+    if page_tokens % rows_per_page:
+        raise ValueError(
+            "page tokens must spread evenly over the page's rows: "
+            f"page_tokens={page_tokens}, rows_per_page={rows_per_page}"
+        )
+    tokens_per_row = page_tokens // rows_per_page
+    if interleave_tokens <= 0 or page_tokens % interleave_tokens:
+        raise ValueError(
+            "the DCP interleave must divide the page: "
+            f"interleave_tokens={interleave_tokens}, page_tokens={page_tokens}"
+        )
+    if interleave_tokens % tokens_per_row:
+        raise ValueError(
+            "the DCP interleave must be whole packed rows: "
+            f"interleave_tokens={interleave_tokens}, "
+            f"tokens_per_row={tokens_per_row}"
+        )
+    return interleave_tokens // tokens_per_row * row_bytes
+
+
+def lower_glm_dcp_row_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    block_ids: Sequence[int],
+    dst_dcp_size: int,
+    interleave_tokens: int,
+) -> PoolSpanRegistration:
+    """Lower a GLM cache holding every token to a DCP-sharded destination."""
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if dst_dcp_size <= 0:
+        raise ValueError("dst_dcp_size must be positive")
+    chunk_bytes = glm_dcp_chunk_bytes(
+        page_tokens=page_tokens,
+        live_bytes_per_block=live_bytes_per_block,
+        row_bytes=row_bytes,
+        interleave_tokens=interleave_tokens,
+    )
+    num_pages = (num_tokens + page_tokens - 1) // page_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
+    chunks_per_page = page_tokens // interleave_tokens
+    last_chunk = (num_tokens - 1) // interleave_tokens
+    chunks_per_rank = last_chunk // dst_dcp_size + 1
+    spans = []
+    for chunk in range(chunks_per_rank * dst_dcp_size):
+        src_page, src_chunk = divmod(min(chunk, last_chunk), chunks_per_page)
+        spans.append(
+            PoolByteSpan(
+                src_block_ordinal=src_page,
+                src_offset_bytes=src_chunk * chunk_bytes,
+                dst_block_index=0,
+                dst_offset_bytes=chunk // dst_dcp_size * chunk_bytes,
+                size_bytes=chunk_bytes,
+                dst_unit_ordinal=chunk % dst_dcp_size if dst_dcp_size > 1 else None,
+            )
+        )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * chunk_bytes,
+        dst_space_version=1,
+    )
+
+
+def lower_dsv4_row_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    transfer_rank: int,
+    parallelism: int,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    row_bytes: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans."""
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    if parallelism <= 0:
+        raise ValueError("parallelism must be positive")
+    if not 0 <= transfer_rank < parallelism:
+        raise ValueError(
+            f"transfer_rank {transfer_rank} is outside parallelism {parallelism}"
+        )
+    if row_bytes <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("row_bytes and live_bytes_per_block must be positive")
+    if live_bytes_per_block % row_bytes:
+        raise ValueError(
+            "page live bytes must be whole rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
+    rows_per_page = live_bytes_per_block // row_bytes
+
+    num_pages = (num_tokens + page_tokens - 1) // page_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
+    tail_tokens = num_tokens - (num_pages - 1) * page_tokens
+    tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+    tail_bytes = tail_rows * row_bytes
     spans = tuple(
         PoolByteSpan(
             src_block_ordinal=page,

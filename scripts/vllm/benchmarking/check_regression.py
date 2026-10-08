@@ -4,7 +4,7 @@
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
-"""
+"""  # noqa: E501
 
 from __future__ import annotations
 
@@ -171,7 +171,8 @@ def check_perf(
     print("|---|---|---:|---:|---:|---|")
     for key, metric, actual, base, ratio, status in rows:
         print(
-            f"| `{key}` | {metric} | {actual:.4g} | {base:.4g} | {ratio:.4f} | {status} |"
+            f"| `{key}` | {metric} | {actual:.4g} | "
+            f"{base:.4g} | {ratio:.4f} | {status} |"
         )
     print()
     return failed

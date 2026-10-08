@@ -514,17 +514,19 @@ def test_real_wrapper_writes_ring_captured_kv_before_history(release_jax_backend
     )
 
 
-def test_real_pallas_preserves_state_when_first_ring_page_is_fully_masked(
-    release_jax_backend,
+@pytest.mark.parametrize("request_length", [95, 96, 97, 127])
+def test_real_pallas_multi_request_causal_positions(
+    release_jax_backend, request_length
 ):
     devices = _require_tpu_devices()
-    q_lens = [96, 96]
+    q_lens = [request_length, request_length]
     token_owner_starts = [0, q_lens[0]]
     request_absolute_starts = [0, 0]
     # Request 1 starts one ownership chunk out of phase with its absolute KV
     # coordinates.  On rank 1 its first local Q chunk is abs[0:32], while the
     # first ring source only contains KV abs[32:64] and is fully causal-masked.
-    assert token_owner_starts[1] % (PCP_SIZE * INTERLEAVE_SIZE) == (INTERLEAVE_SIZE)
+    # 95/97 additionally exercise packed rows that cross a partial
+    # interleave; the 96 case retains the fully masked first-page regression.
 
     rng = np.random.default_rng(321)
     q_requests = [

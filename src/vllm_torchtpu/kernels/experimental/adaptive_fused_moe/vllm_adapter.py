@@ -21,13 +21,14 @@ experimental path always builds sharded routing and never returns a GMM fallback
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 from vllm.config import get_current_vllm_config
 
 import vllm_torchtpu.envs as envs
@@ -38,7 +39,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
     ep_token_replica_groups,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental import adaptive_fused_moe as adaptive_kernel
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
@@ -50,6 +50,8 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 PreparedWeights = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -91,6 +93,7 @@ def prebuild_adaptive_fused_moe(
     contraction block size are inferred from their dtype and scale shapes.
     No W4A8 opt-in or routing-plan environment variable is read here.
     """
+    layer = cast("TpuRoutedExperts", layer)
     parallel = layer.moe_config.moe_parallel_config
     if not parallel.use_ep:
         raise ValueError("adaptive fused MoE requires expert-parallel weights")
@@ -200,6 +203,7 @@ def prebuild_adaptive_nvfp4(
     configured_block: int | None = None,
 ) -> tuple[torch.library.CustomOpDef, int]:
     """Validate checkpoint geometry before committing runtime requantization."""
+    layer = cast("TpuRoutedExperts", layer)
     block = U32_SUBLANE_TILE * PACK4 if configured_block is None else configured_block
     hidden = layer.w13_weight.shape[-1] * 2
     inter = layer.w2_weight.shape[-1] * 2
@@ -384,12 +388,11 @@ def _unsupported_routing_reason(layer: RoutedExperts) -> str | None:
         return f"scoring_func {scoring_fn!r}; the kernel scores with softmax"
     if layer.e_score_correction_bias is not None:
         return "e_score_correction_bias is not applied inside the kernel"
-    if (
-        layer.use_grouped_topk
-        and layer.num_expert_group > 1
-        and layer.topk_group < layer.num_expert_group
-    ):
-        return "grouped top-k routing is not implemented in the kernel"
+    if layer.use_grouped_topk:
+        # vLLM's router requires both group sizes when grouped top-k is on.
+        assert layer.num_expert_group is not None and layer.topk_group is not None
+        if layer.num_expert_group > 1 and layer.topk_group < layer.num_expert_group:
+            return "grouped top-k routing is not implemented in the kernel"
     if getattr(layer, "hash_indices_table", None) is not None:
         return "hash routing is not implemented in the kernel"
     scale = float(layer.routed_scaling_factor)
@@ -479,11 +482,14 @@ def _build_op(
         )
 
     spec = PartitionSpec(EP_AXIS_NAME)
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
-    op = sharded_jax_op(
+    # Stock jax_op. It used to size its outputs from the export's avals, where
+    # a shard_map result is recorded as replicated, so this rank's 2048 rows
+    # came back claiming the mesh-wide 16384; `sharded_jax_op`, which derives
+    # JaxCallable.__call__ from the installed source and replaces the line that
+    # builds the output placeholders, was the way around it. Torchtpu takes
+    # output_partition_specs itself now -- the same information, and it cannot
+    # come loose the way a text match on someone else's source can.
+    op = jax_op(
         name,
         moe,
         mesh=mesh,
@@ -493,10 +499,9 @@ def _build_op(
         output_partition_specs=spec,
     )
 
-    # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
-    # which resolves the output aval by running a real `jax.export` every time
-    # Dynamo traces the op. This kernel returns the rows it was given, so the
-    # answer is known without exporting for it.
+    # Deliberately replaces the fake jax_op installs, which resolves the output
+    # aval by running a real `jax.export` every time Dynamo traces the op. This kernel
+    # returns the rows it was given, so the answer is known without exporting for it.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 

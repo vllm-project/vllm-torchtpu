@@ -90,8 +90,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 num_lanes = pltpu.get_tpu_info().num_lanes
                 dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
-                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
+                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
                 pltpu.make_async_copy(
                     kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
                     vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
@@ -107,8 +109,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 src_new_off = pl.multiple_of(src_new_off, 128)
                 dst_vmem_off = pl.multiple_of(dst_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
-                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
+                #     total_new_tokens)
+                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                #     packing, page_size)
                 pltpu.make_async_copy(
                     new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
                     vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
@@ -232,8 +236,10 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         block_idx = jnp.maximum(grid_indices[0], 0)
 
         vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
-        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
+        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+        #     packing, page_size)
+        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
+        #     packing, page_size)
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         dma_list_cache = []
@@ -431,7 +437,8 @@ class BatchingORef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingLSERef(pltpu.BufferedRef):
-    """Handles writing LSE values to HBM, overlapped with compute via double buffering."""
+    """Handles writing LSE values to HBM, overlapped with compute via
+    double buffering."""
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 

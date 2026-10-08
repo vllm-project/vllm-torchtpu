@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import torch
@@ -32,13 +32,10 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.distributed.pcp_rank_order import (
-    pcp_topology_order,
-    resolve_pcp_topology_order,
-    verify_pcp_topology_order,
-)
+from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -405,7 +402,10 @@ class TPUWorker(WorkerBase):
 
         from vllm.platforms import current_platform
 
-        dist_backend = current_platform.get_worker_distributed_backend(dist_world_size)
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        tpu_platform = cast(TpuPlatform, current_platform)
+        dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
@@ -415,14 +415,26 @@ class TPUWorker(WorkerBase):
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
-        # Ring order is the PCP group's rank order, and the group is built
-        # below. topology_aware_mesh needs open chips and a live process
-        # group, so this is the first point it can be asked -- and the last
-        # point the answer can still be applied.
-        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
+        # The PCP group keeps its natural rank order. Reordering it used to be
+        # how the ring was chosen, on the understanding that the ring followed
+        # the group's own rank order. google-pytorch/torch_tpu#3522 binds
+        # partition index p to PyTorch rank p, so the ring follows the global
+        # rank order and a permuted group no longer reaches it. What a permuted
+        # group would still do is make rank_in_group differ from the rank the
+        # kernels index by, while the host splits tokens by rank_in_group --
+        # the mismatch this path exists to avoid. The ring stays good because
+        # the rank -> chip binding is already a Hamiltonian cycle: libtpu opens
+        # devices in ascending PCI order, and consecutive ranks land on
+        # ICI-adjacent chips.
         with (
             set_current_vllm_config(self.vllm_config),
-            pcp_topology_order(group_ranks_by_name),
+            pcp_topology_order(
+                None,
+                preserve_dcp_order=(
+                    pcp_size > 1
+                    and self.parallel_config.decode_context_parallel_size > 1
+                ),
+            ),
         ):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
@@ -430,29 +442,33 @@ class TPUWorker(WorkerBase):
                 prefill_context_model_parallel_size=pcp_size,
                 decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
-        # The patch above substitutes rank lists on the way in; this reads the
-        # built groups back, so a patch that silently stopped applying fails
-        # here rather than costing a few percent unnoticed.
-        verify_pcp_topology_order(group_ranks_by_name)
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        # WorkerBase declares `nn.Module | None`; this worker always holds a
+        # TPUModelRunner from here on.
+        # pyrefly: ignore[bad-override-mutable-attribute]
+        self.model_runner: TPUModelRunner = TPUModelRunner(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
             profiler_world_size=self.profile_world_size,
         )
         logger.info(
-            f"Init worker | "
-            f"rank={self.rank} | "
-            f"is_first_rank={is_first_rank} | "
-            f"is_last_rank={is_last_rank} | "
-            f"node_id={dist_utils.get_node_id()} | "
-            f"is_driver_worker={self.is_driver_worker} | "
+            "Init worker | "
+            "rank=%s | "
+            "is_first_rank=%s | "
+            "is_last_rank=%s | "
+            "node_id=%s | "
+            "is_driver_worker=%s | ",
+            self.rank,
+            is_first_rank,
+            is_last_rank,
+            dist_utils.get_node_id(),
+            self.is_driver_worker,
         )
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
@@ -490,7 +506,9 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        available = budget.available - kv_connector_hbm_reserve
+        available = utils.min_across_ep_dp(
+            self.parallel_config, budget.available - kv_connector_hbm_reserve
+        )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -498,12 +516,17 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
-            f"Memory statistics | "
-            f"{total_hbm_limit_gb=}GiB | "
-            f"{total_hbm_limit_cap_gb=}GiB | "
-            f"{total_hbm_used_gb=}GiB | "
-            f"{kv_connector_hbm_reserve_gb=}GiB | "
-            f"{total_hbm_avail_gb=}GiB"
+            "Memory statistics | "
+            "total_hbm_limit_gb=%rGiB | "
+            "total_hbm_limit_cap_gb=%rGiB | "
+            "total_hbm_used_gb=%rGiB | "
+            "kv_connector_hbm_reserve_gb=%rGiB | "
+            "total_hbm_avail_gb=%rGiB",
+            total_hbm_limit_gb,
+            total_hbm_limit_cap_gb,
+            total_hbm_used_gb,
+            kv_connector_hbm_reserve_gb,
+            total_hbm_avail_gb,
         )
 
         if available <= 0:
@@ -514,7 +537,50 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
+
+        cap = self._pooling_kv_cache_cap_bytes()
+        if cap is not None and cap < available:
+            logger.info(
+                "Pooling KV cache cap: %.2f GiB of %.2f GiB available; "
+                "%.2f GiB reclaimed (consider raising --max-num-batched-tokens; "
+                "set VLLM_TPU_POOLING_KV_CACHE_TOKENS=0 to disable).",
+                cap / utils.GBYTES,
+                available / utils.GBYTES,
+                (available - cap) / utils.GBYTES,
+            )
+            available = cap
         return available
+
+    def _pooling_kv_cache_cap_bytes(self) -> int | None:
+        """Deterministic KV budget for pure pooling models, or None.
+
+        Pooling requests are prefill-only, so KV only has to hold the in-flight
+        steps plus the earlier chunks of requests still in chunked prefill.
+        The cap is derived from the config alone, so num_gpu_blocks (and thus
+        the backbone compile hash) is identical across restarts and ranks.
+        """
+        runner = getattr(self, "model_runner", None)
+        setting = envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS
+        if (
+            runner is None
+            or not getattr(runner, "is_pooling_model", False)
+            or setting == 0
+            or self.cache_config.num_gpu_blocks_override is not None
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.vllm_config.kv_transfer_config is not None
+            or getattr(self.model_config, "is_hybrid", False)
+        ):
+            return None
+        sc = self.scheduler_config
+        return compute_pooling_kv_cache_cap_bytes(
+            runner.get_kv_cache_spec(),
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=sc.max_num_batched_tokens,
+            max_num_seqs=sc.max_num_seqs,
+            async_scheduling=bool(sc.async_scheduling),
+            long_prefill_token_threshold=sc.long_prefill_token_threshold,
+            override_tokens=setting if setting > 0 else None,
+        )
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
@@ -640,6 +706,7 @@ class TPUWorker(WorkerBase):
             # re-deriving it from the stop call's prefix.
             profile_dir = self.profile_run_dir
             if self.profile_capture_dir and self.profile_canonical_ts:
+                assert profile_dir is not None
                 profiler_trace.merge_rank_capture(
                     self.profile_capture_dir,
                     profile_dir,

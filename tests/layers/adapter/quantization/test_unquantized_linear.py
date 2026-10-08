@@ -29,6 +29,8 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 SHAPES = [(7, 64, 32), (128, 256, 512), (1, 128, 64)]
 
 

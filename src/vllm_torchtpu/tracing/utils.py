@@ -28,7 +28,7 @@ def extract_request_ids_for_tracing(
         for i, rid in enumerate(trimmed_req_ids):
             req_id_kwargs[f"request_id{i + 1}"] = rid
     except Exception as e:
-        logger.warning(f"Failed to extract request IDs for tracing: {e}")
+        logger.warning("Failed to extract request IDs for tracing: %s", e)
 
     return req_id_kwargs
 

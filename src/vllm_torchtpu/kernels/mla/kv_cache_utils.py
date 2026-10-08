@@ -83,7 +83,8 @@ def get_kv_cache_shape(
     kv_dtype: jnp.dtype | None = None,
     kv_packing: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Computes padded 4D shape `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
+    """Computes padded 4D shape
+    `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
     if kv_packing is None:
         assert kv_dtype is not None, "must pass kv_dtype if kv_packing is None"
         kv_packing = get_dtype_packing(kv_dtype)
@@ -263,6 +264,11 @@ def get_dst_rows(
     page, slot = get_page_and_slot(
         num_tokens, seq_lens, block_tables, query_start_loc, page_size
     )
+    return _dst_rows(page, slot, page_size)
+
+
+def _dst_rows(page: jax.Array, slot: jax.Array, page_size: int) -> jax.Array:
+    """(page, slot) -> flattened row, `SKIP_ROW` wherever `page` is `OOB_PAGE`."""
     return jnp.where(page < OOB_PAGE, page * page_size + slot, SKIP_ROW)
 
 
@@ -347,8 +353,10 @@ def update_sparse_mla_kv_cache(
       kv_cache_rope: Rope cache, shaped and typed by `rope_spec`.
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
-      block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
+      seq_lens: Per-sequence total KV length including the tokens being inserted
+        in this step (`[num_seqs]`).
+      block_tables: Flattened per-sequence-padded page table
+        (`[num_seqs * pages_per_seq]`).
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       nope_spec: Layout descriptor the nope cache was allocated from.
       rope_spec: Layout descriptor the rope cache was allocated from.
@@ -357,17 +365,46 @@ def update_sparse_mla_kv_cache(
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
     """
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
-    # Imported here, not at module scope: `scatter` imports this module back.
-    from vllm_torchtpu.kernels.mla import scatter
-
-    addressing = (
+    page, slot = get_page_and_slot(
         kv_c_normed.shape[0],
         seq_lens,
         block_tables,
         query_start_loc,
         nope_spec.page_size,
     )
-    dst_rows = get_dst_rows(*addressing)
+    return _scatter_caches(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        page,
+        slot,
+        nope_spec,
+        rope_spec,
+    )
+
+
+def _scatter_caches(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    page: jax.Array,
+    slot: jax.Array,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> tuple[jax.Array, jax.Array]:
+    """Write both caches at (`page`, `slot`), with Pallas wherever it can.
+
+    Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
+    writer; rope/TENSORCORE falls back to the XLA scatter. Shared by the
+    unsharded and DCP writers, which differ only in how they derive
+    (`page`, `slot`).
+    """
+    # Imported here, not at module scope: `scatter` imports this module back.
+    from vllm_torchtpu.kernels.mla import scatter
+
+    dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
@@ -376,7 +413,6 @@ def update_sparse_mla_kv_cache(
             kv_cache_rope, k_pe, rope_spec, dst_rows=dst_rows
         )
     else:
-        page, slot = get_page_and_slot(*addressing)
         kv_cache_rope = _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot)
     return kv_cache_nope, kv_cache_rope
 
@@ -450,7 +486,9 @@ def update_sparse_mla_kv_cache_dcp(
 
     Rows owned by another rank are dropped by aiming them at an out-of-bounds
     page -- the same trick the unsharded scatter uses for padding, and it is
-    why this needs no collective and no branch.
+    why this needs no collective and no branch. The writes then go through the
+    same SparseCore Pallas writer as the unsharded path, so the caches are
+    updated in place in the layout the readers use.
 
     Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
     along the DCP axis as traced data, so one compiled program serves every
@@ -470,8 +508,80 @@ def update_sparse_mla_kv_cache_dcp(
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
     """
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
-    # Asserted equal to the rope page size just above, so one (page, slot)
-    # addresses both caches.
+    page, slot = _get_dcp_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return _scatter_caches(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        page,
+        slot,
+        nope_spec,
+        rope_spec,
+    )
+
+
+def update_sparse_mla_kv_cache_dcp_jax(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Pure-XLA `update_sparse_mla_kv_cache_dcp`, for every layout.
+
+    The DCP twin of `update_sparse_mla_kv_cache_jax`: runs on CPU, and is the
+    golden the SparseCore DCP writer is checked against. Same arguments and
+    returns as it.
+    """
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    page, slot = _get_dcp_page_and_slot(
+        kv_c_normed.shape[0],
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return (
+        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
+    )
+
+
+def _get_dcp_page_and_slot(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own."""
+    # `_check_inputs` asserts it equal to the rope page size, so one
+    # (page, slot) addresses both caches.
     page_size = nope_spec.page_size
     if interleave_size % WORD_BYTES:
         raise ValueError(
@@ -488,9 +598,7 @@ def update_sparse_mla_kv_cache_dcp(
             "here."
         )
 
-    _, seq_id, pos, in_batch = _row_positions(
-        kv_c_normed.shape[0], seq_lens, query_start_loc
-    )
+    _, seq_id, pos, in_batch = _row_positions(num_tokens, seq_lens, query_start_loc)
 
     virtual_page_size = jnp.int32(page_size * dcp_size)
     cycle = jnp.int32(dcp_size * interleave_size)
@@ -511,8 +619,4 @@ def update_sparse_mla_kv_cache_dcp(
     page = jnp.where(
         valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
     )
-
-    return (
-        _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
-        _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
-    )
+    return page, slot

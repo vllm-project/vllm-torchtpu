@@ -21,23 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-try:
-    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (
-        KVLayout,
-        convert_cache_to_seq_along_lane,
-        streamindex_topk,
-    )
-except ImportError:
-    # `convert_cache_to_seq_along_lane` is not re-exported by the package's
-    # `__init__`, and the package attribute `streamindex_topk` is the jitted
-    # function rather than the submodule, so it is imported by name here.
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        KVLayout,
-        streamindex_topk,
-    )
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
-        convert_cache_to_seq_along_lane,
-    )
+# `convert_cache_to_seq_along_lane` is not re-exported by the package's
+# `__init__`, and the package attribute `streamindex_topk` is the jitted
+# function rather than the submodule, so it is imported by name here.
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    streamindex_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    convert_cache_to_seq_along_lane,
+)
 
 
 # =====================================================================
@@ -65,7 +58,10 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
 
 # =====================================================================
 
-pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+pytestmark = [
+    pytest.mark.tpu_test,
+    pytest.mark.filterwarnings("ignore::DeprecationWarning"),
+]
 
 
 def streamindex_topk_ref(
@@ -1238,7 +1234,7 @@ class TestChunkedPipelining:
     has to agree with the unchunked one exactly.
     """
 
-    # yapf: disable
+    # fmt: off
     @pytest.mark.parametrize(
         "B, T_list, S_list, page_size, H_I, D, k, comp_ratio, bq_sz, bkv_p,"
         " block_table_list, chunk_tokens, kv_layout",
@@ -1345,7 +1341,7 @@ class TestChunkedPipelining:
             ),
         ],
     )
-    # yapf: enable
+    # fmt: on
     def test_chunking_matches_unchunked(
         self,
         B,

@@ -33,6 +33,8 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
+from collections.abc import Sequence
+
 import jax.numpy as jnp
 import torch
 
@@ -180,7 +182,7 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
 def dequantize_tensor(
     tensor_q: torch.Tensor,
     scale: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Dequantize a quantized tensor with block scaling.
@@ -345,7 +347,7 @@ def dequantize_mxfp4_packed(
 
 def quantize_tensor_to_fp4(
     tensor: torch.Tensor,
-    axis: int = -1,
+    axis: int | Sequence[int] = -1,
     block_size: int = REQUANTIZED_BLOCK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize float tensor to FP4 with block scaling.
@@ -399,7 +401,8 @@ def quantize_tensor_to_fp4(
         if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
             if dim % block_size != 0:
                 raise ValueError(
-                    f"Dimension {i} of size {dim} is not divisible by block_size={block_size}"
+                    f"Dimension {i} of size {dim} is not divisible by "
+                    f"block_size={block_size}"
                 )
             num_blocks = dim // block_size
             blocked_shape.extend([num_blocks, block_size])

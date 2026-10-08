@@ -5,17 +5,21 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import vllm.envs as vllm_envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from jax.sharding import PartitionSpec
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.attention import AttentionConfig
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter as pcp_adapter
+from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout, flat_kernel_ids
+from vllm_torchtpu.distributed import pallas_shapes
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
     PallasBatchedRPAAttentionBackend,
     PallasBatchedRPAAttentionBackendImpl,
     _pallas_rpa_kernel_local,
+    get_tpu_min_page_size,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
@@ -79,7 +83,7 @@ def _tensors():
     return query, key, value, kv_cache
 
 
-def _metadata(*, pcp_streaming=False):
+def _metadata(*, pcp_streaming=False, block_tables=None):
     layout_kwargs = {}
     if pcp_streaming:
         layout_kwargs = {
@@ -88,7 +92,11 @@ def _metadata(*, pcp_streaming=False):
         }
     return AttentionMetadata(
         input_positions=torch.arange(3, dtype=torch.int32),
-        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        block_tables=(
+            torch.zeros(2, 4, dtype=torch.int32)
+            if block_tables is None
+            else block_tables
+        ),
         seq_lens=torch.tensor([3, 0], dtype=torch.int32),
         query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
@@ -108,6 +116,7 @@ def _capture_kernel(monkeypatch):
         skip_kv_update=False,
         use_pcp_streaming,
         cp_kv_cache_interleave_size,
+        block_major=False,
     ):
         captured["build"] = {
             "q_scale": q_scale,
@@ -116,6 +125,7 @@ def _capture_kernel(monkeypatch):
             "skip_kv_update": skip_kv_update,
             "use_pcp_streaming": use_pcp_streaming,
             "cp_kv_cache_interleave_size": cp_kv_cache_interleave_size,
+            "block_major": block_major,
         }
 
         def fake_kernel(*args):
@@ -132,6 +142,7 @@ def _capture_kernel(monkeypatch):
     return captured
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_partial_layout_to_streaming_kernel(
     monkeypatch, vllm_config_context
 ):
@@ -151,6 +162,7 @@ def test_forward_routes_partial_layout_to_streaming_kernel(
     assert torch.all(outputs == 7)
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_fp8_partial_layout_with_kv_scales(
     monkeypatch, vllm_config_context
 ):
@@ -174,6 +186,7 @@ def test_forward_routes_fp8_partial_layout_with_kv_scales(
     assert torch.all(outputs == 7)
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
     monkeypatch, vllm_config_context
 ):
@@ -191,6 +204,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
     assert captured["args"][8] is None
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("impl_kwargs", "expected_message"),
     [
@@ -205,21 +219,25 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
 
-    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
-        with pytest.raises(NotImplementedError, match=expected_message):
-            _impl(**impl_kwargs).forward(
-                _layer(), query, key, value, kv_cache, metadata
-            )
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match=expected_message),
+    ):
+        _impl(**impl_kwargs).forward(_layer(), query, key, value, kv_cache, metadata)
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
     vllm_config_context,
 ):
-    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
-        with pytest.raises(NotImplementedError, match="logits soft cap"):
-            _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match="logits soft cap"),
+    ):
+        _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
 
 
+@pytest.mark.tpu_test
 def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
@@ -234,6 +252,7 @@ def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch, vllm_config_c
     assert captured["build"]["cp_kv_cache_interleave_size"] == 0
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     monkeypatch, vllm_config_context
 ):
@@ -247,6 +266,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
         skip_kv_update=False,
         use_pcp_streaming=False,
         cp_kv_cache_interleave_size=0,
+        block_major=False,
     ):
         calls.append((use_pcp_streaming, cp_kv_cache_interleave_size))
         return MagicMock()
@@ -259,6 +279,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     assert calls == [(True, 4)]
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
     monkeypatch, vllm_config_context
 ):
@@ -275,6 +296,7 @@ def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
     assert not impl.runs_batched_rpa_schedule()
 
 
+@pytest.mark.tpu_test
 def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
     """The batched kernel streams its schedule from an HBM table and exposes
     no capacity, so no layer asks the runner to bound its schedule."""
@@ -282,6 +304,38 @@ def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
     assert not _impl().runs_batched_rpa_schedule()
 
 
+def test_streaming_rpa_partition_specs_cover_pcp_and_tp_axes():
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec("pcp", "tp"),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+    ) == pcp_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+    assert (
+        PartitionSpec("pcp", None, "tp"),
+        PartitionSpec("pcp", "tp"),
+    ) == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+
+
+def test_streaming_rpa_mesh_requests_full_pcp_tp_grid(monkeypatch):
+    captured = {}
+    mesh = object()
+
+    def fake_get_mesh(axis_name, *, tp_axis_name):
+        captured["axis_names"] = (axis_name, tp_axis_name)
+        return mesh
+
+    monkeypatch.setattr(pcp_adapter, "get_or_create_pcp_mesh", fake_get_mesh)
+
+    assert pcp_adapter.get_pcp_streaming_mesh() is mesh
+    assert captured["axis_names"] == ("pcp", "tp")
+
+
+@pytest.mark.tpu_test
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     monkeypatch, vllm_config_context
 ):
@@ -340,8 +394,10 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("block_major", [False, True])
 def test_build_streaming_kernel_registers_eight_tensor_custom_op(
-    monkeypatch, vllm_config_context
+    monkeypatch, vllm_config_context, block_major
 ):
     impl = _impl()
     fake_mesh = object()
@@ -368,6 +424,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     def fake_jax_op(_name, fn, **kwargs):
         captured["signature"] = inspect.signature(fn, follow_wrapped=False)
         captured["input_partition_specs"] = kwargs["input_partition_specs"]
+        captured["output_partition_specs"] = kwargs["output_partition_specs"]
         return FakeOp()
 
     monkeypatch.setattr(
@@ -386,12 +443,28 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
             None,
             use_pcp_streaming=True,
             cp_kv_cache_interleave_size=4,
+            block_major=block_major,
         )
 
     params = list(captured["signature"].parameters.values())
     assert len(params) == 8
     assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
     assert len(captured["input_partition_specs"]) == 8
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    local_cache = (8, 3, 16, 2, 1, 128) if block_major else (8, 16, 2, 1, 128)
+    global_cache = (32, 3, 16, 4, 1, 128) if block_major else (32, 16, 4, 1, 128)
+    assert (
+        pallas_shapes.get_global_shape(
+            local_cache, mesh, captured["input_partition_specs"][0]
+        )
+        == global_cache
+    )
+    assert (
+        pallas_shapes.get_local_shape(
+            global_cache, mesh, captured["output_partition_specs"][0]
+        )
+        == local_cache
+    )
 
     query, key, value, kv_cache = _tensors()
     metadata = _metadata(pcp_streaming=True)
@@ -422,6 +495,7 @@ def hnd_vllm_config_context(monkeypatch):
         yield config
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
     monkeypatch, hnd_vllm_config_context
 ):
@@ -465,6 +539,7 @@ def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
     assert captured["kv_layout"] == KVLayout.SEQ_ALONG_LANE
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
     hnd_vllm_config_context,
 ):
@@ -486,6 +561,7 @@ def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
     ]
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_requires_custom_backend_and_fp8(hnd_vllm_config_context):
     with pytest.raises(NotImplementedError, match="non-CUSTOM"):
         _impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
@@ -571,91 +647,122 @@ def test_adapter_make_streaming_kernel_rejects_unsupported_features(
         )
 
 
-def test_adapter_scoped_callable_uses_lowered_out_shardings(monkeypatch):
+@pytest.mark.tpu_test
+def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
+    """The callable must be stock, not a subclass that overrides __call__.
+
+    It used to be a local subclass so it could size shard_map outputs from
+    ``lowered._out_named_shardings``; stock derived them from
+    ``lowered.out_avals``, which jax.export records as replicated. Now
+    stock takes ``output_partition_specs`` directly, so the
+    subclass is unnecessary -- and while it existed it silently dropped every
+    argument stock's __call__ gained, ``mesh_device_ids`` included. Asserting
+    the exact type is what keeps a subclass from creeping back in.
+    """
     captured = {}
-    original_call = pcp_adapter.pallas_impl.JaxCallable.__call__
-
-    class FakeOutTree:
-        def unflatten(self, values):
-            return tuple(values)
-
-    class FakeLowered:
-        out_avals = ("aval0", "aval1")
-        _out_named_shardings = ("sharding0", "sharding1")
-        out_tree = FakeOutTree()
-        mlir_module_serialized = b"mlir"
-
-        def mlir_module(self):
-            return "module {}"
-
-    class FakePcpCallable(pcp_adapter._PcpStreamingJaxCallable):
-        def __init__(self):
-            self.trace_key = "trace"
-            self.static_argnums = ()
-            self.output_shapes = {}
-            self.kernel_key_to_mlir_fingerprint = {}
-            self.mesh = "mesh"
-            self.input_partition_specs = ("input_spec",)
-            self.name = "op"
-            self.exported = lambda *args, **kwargs: FakeLowered()
-            self.donate_argnums = ()
-            self.input_output_aliases = {}
-
-        def _validate_args(self, *args):
-            captured["validated_args"] = args
-
-    class FakePallasRuntime:
-        def lookup_custom_kernel(self, name, key):
-            captured["lookup"] = (name, key)
-            return False
-
-        def register_custom_kernel(self, name, key, *, serialized_mlir_module):
-            captured["registered"] = (name, key, serialized_mlir_module)
-
-        def call_custom_kernel(
-            self, name, key, *, inputs, output_shapes, donate_argnums
-        ):
-            captured["call"] = {
-                "name": name,
-                "key": key,
-                "inputs": inputs,
-                "output_shapes": output_shapes,
-                "donate_argnums": donate_argnums,
-            }
-            return ("result0", "result1")
 
     monkeypatch.setattr(
-        pcp_adapter.pallas_impl, "tpu_torch_pallas", FakePallasRuntime()
+        pcp_adapter.pallas_impl, "_verify_signature", lambda _signature: None
+    )
+    monkeypatch.setattr(
+        pcp_adapter.pallas_impl, "_infer_static_argnums", lambda _signature: ()
     )
     monkeypatch.setattr(
         pcp_adapter.pallas_impl,
         "_get_kernel_invocation_key",
-        lambda *_args, **_kwargs: "kernel_key",
+        lambda *_args, **_kwargs: "trace_key",
+    )
+
+    # Record the kwargs but hand back a genuinely jitted function:
+    # JaxCallable.__init__ runs jax.export.export on it, which rejects
+    # anything that is not the result of jit.
+    real_jit = pcp_adapter.jax.jit
+
+    def recording_jit(fn, **kwargs):
+        captured["jit_kwargs"] = kwargs
+        return real_jit(fn, **kwargs)
+
+    monkeypatch.setattr(pcp_adapter.jax, "jit", recording_jit)
+
+    mesh = object()
+    callable_ = pcp_adapter.build_pcp_streaming_callable(
+        "pcp::op",
+        lambda tensor: tensor,
+        donate_argnums=(0,),
+        mesh=mesh,
+        input_partition_specs=("input_spec",),
+        output_partition_specs=("out_spec",),
+    )
+
+    assert type(callable_) is pcp_adapter.pallas_impl.JaxCallable
+    assert callable_.name == "pcp::op"
+    assert callable_.mesh is mesh
+    assert callable_.input_partition_specs == ("input_spec",)
+    assert callable_.output_partition_specs == ("out_spec",)
+    assert callable_.donate_argnums == (0,)
+    # Stock does not constrain the jit's outputs, and neither should this: the
+    # shard_map body already declares out_specs, so pinning them again only
+    # adds an advisory result attribute to a module whose partitioner is a
+    # no-op. Matching stock is what makes the two paths interchangeable.
+    assert "out_shardings" not in captured["jit_kwargs"]
+
+
+@pytest.mark.tpu_test
+def test_build_pcp_streaming_callable_defaults_output_specs(monkeypatch):
+    monkeypatch.setattr(
+        pcp_adapter.pallas_impl, "_verify_signature", lambda _signature: None
+    )
+    monkeypatch.setattr(
+        pcp_adapter.pallas_impl, "_infer_static_argnums", lambda _signature: ()
     )
     monkeypatch.setattr(
         pcp_adapter.pallas_impl,
-        "jax_placeholders",
-        lambda *_args, **_kwargs: ("jax_arg",),
-    )
-    monkeypatch.setattr(
-        pcp_adapter,
-        "_torch_placeholder_with_sharding",
-        lambda aval, sharding, mesh: f"{aval}:{sharding}:{mesh}",
+        "_get_kernel_invocation_key",
+        lambda *_args, **_kwargs: "trace_key",
     )
 
-    result = FakePcpCallable()(torch.tensor(1.0))
+    callable_ = pcp_adapter.build_pcp_streaming_callable(
+        "pcp::op",
+        lambda tensor: tensor,
+        donate_argnums=None,
+        mesh=object(),
+        input_partition_specs=("input_spec",),
+    )
 
-    assert result == ("result0", "result1")
-    assert captured["call"]["output_shapes"] == [
-        "aval0:sharding0:mesh",
-        "aval1:sharding1:mesh",
-    ]
-    assert pcp_adapter.pallas_impl.JaxCallable.__call__ is original_call
+    assert (
+        callable_.output_partition_specs
+        == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
+
+
+def test_adapter_converts_dimensions_sharded_over_pcp_and_tp():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    spec = PartitionSpec(None, ("tp", "pcp"), None)
+
+    global_shape = pallas_shapes._convert_partitioned_shape(
+        (3, 8, 16), mesh, spec, to_global=True
+    )
+    local_shape = pallas_shapes._convert_partitioned_shape(
+        global_shape, mesh, spec, to_global=False
+    )
+
+    assert global_shape == (3, 64, 16)
+    assert local_shape == (3, 8, 16)
+
+
+def test_adapter_rejects_nondivisible_compound_axis_output_shape():
+    mesh = SimpleNamespace(shape={"pcp": 4, "tp": 2})
+    with pytest.raises(ValueError, match="not divisible by mesh factor 8"):
+        pallas_shapes._convert_partitioned_shape(
+            (3, 63, 16),
+            mesh,
+            PartitionSpec(None, ("tp", "pcp"), None),
+            to_global=False,
+        )
 
 
 def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     captured = {}
-    original_call = pcp_adapter.pallas_impl.JaxCallable.__call__
 
     class FakePcpCallable:
         def __init__(self, **kwargs):
@@ -669,7 +776,7 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
         captured["custom_op"] = (name, wrapped_fn, mutates_args)
         return FakeCustomOp()
 
-    monkeypatch.setattr(pcp_adapter, "_PcpStreamingJaxCallable", FakePcpCallable)
+    monkeypatch.setattr(pcp_adapter.pallas_impl, "JaxCallable", FakePcpCallable)
     monkeypatch.setattr(
         pcp_adapter.pallas_impl, "_verify_signature", lambda _signature: None
     )
@@ -680,9 +787,6 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
         pcp_adapter.pallas_impl,
         "_get_kernel_invocation_key",
         lambda *_args, **_kwargs: "trace_key",
-    )
-    monkeypatch.setattr(
-        pcp_adapter, "_named_shardings", lambda *_args, **_kwargs: ("out0", "out1")
     )
     monkeypatch.setattr(
         pcp_adapter.jax, "jit", lambda fn, **kwargs: ("jit_fn", fn, kwargs)
@@ -705,8 +809,11 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     assert captured["callable_kwargs"]["name"] == "pcp::op"
     assert captured["callable_kwargs"]["jit_fn"][0] == "jit_fn"
     assert captured["callable_kwargs"]["donate_argnums"] == (0,)
+    assert (
+        captured["callable_kwargs"]["output_partition_specs"]
+        == pcp_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
     assert captured["custom_op"][2] == ()
-    assert pcp_adapter.pallas_impl.JaxCallable.__call__ is original_call
 
 
 def test_adapter_invoke_streaming_op_trims_generic_tensor_args():
@@ -742,6 +849,7 @@ def test_adapter_invoke_streaming_op_rejects_kwargs_and_wrong_arg_count():
         pcp_adapter.invoke_pcp_streaming_op(lambda *_args: None, object(), (), {})
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "rebind_local, expects_kv_layout",
     [(False, True), (True, False)],
@@ -806,3 +914,177 @@ def test_kv_layout_kwarg_follows_the_bound_kernel_entry(
     assert ("kv_layout" in bound.keywords) is expects_kv_layout
     # The partial must be callable with what it was bound to.
     inspect.signature(bound.func).bind_partial(**bound.keywords)
+
+
+# --- block-major unified pool ---------------------------------------------------
+
+
+@pytest.fixture
+def cpu_vllm_config_context():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
+_BM_LAYOUT = BlockMajorPoolLayout(
+    num_blocks=8, num_pools=3, split=4, pool_index_by_layer={}
+)
+_BM_POOL_INDEX = 1
+
+
+def _reset_kernel_registry(monkeypatch):
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+
+
+@pytest.mark.parametrize("block_major", [True, False])
+def test_forward_remaps_block_tables_for_the_block_major_pool(
+    monkeypatch, cpu_vllm_config_context, block_major
+):
+    """Only a layer bound to a merged pool region hands the kernel remapped
+    block tables; a per-region pool passes the scheduler's tables through."""
+    captured = _capture_kernel(monkeypatch)
+    query, key, value, kv_cache = _tensors()
+    if block_major:
+        kv_cache = torch.zeros(8, 3 * 4, 4, 2, 1, 128)
+    block_tables = torch.arange(1, 9, dtype=torch.int32).reshape(2, 4)
+    metadata = _metadata(block_tables=block_tables)
+    impl = _impl()
+    if block_major:
+        impl._bm_kernel = True
+        impl.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+
+    with set_vllm_model_wrapper_context(
+        mesh=_mesh(), vllm_config=_vllm_config(pcp_size=1)
+    ):
+        impl.forward(_layer(), query, key, value, kv_cache, metadata)
+
+    assert captured["build"]["block_major"] is block_major
+    passed = captured["args"][5]
+    if block_major:
+        expected = flat_kernel_ids(block_tables, _BM_POOL_INDEX, 3, 4)
+        assert passed.tolist() == expected.tolist()
+        assert passed.tolist() != block_tables.tolist()
+    else:
+        assert passed is block_tables
+
+
+def test_build_rpa_kernel_rejects_an_entry_without_block_major(
+    monkeypatch, cpu_vllm_config_context
+):
+    impl = _impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    _reset_kernel_registry(monkeypatch)
+
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        pytest.raises(NotImplementedError, match="block-major"),
+    ):
+        impl._build_rpa_kernel(None, None, None, block_major=True)
+
+
+def test_build_rpa_kernel_keys_the_registry_on_block_major(
+    monkeypatch, cpu_vllm_config_context
+):
+    impl = _impl()
+    _reset_kernel_registry(monkeypatch)
+    registered = []
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+        def __call__(self, kv_cache, query, *_args, **_kwargs):
+            return kv_cache, query
+
+    def fake_jax_op(name, wrapped_fn, **_kwargs):
+        registered.append((name, wrapped_fn))
+        return FakeOp()
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()):
+        layer_major = impl._build_rpa_kernel(None, None, None)
+        block_major = impl._build_rpa_kernel(None, None, None, block_major=True)
+        again = impl._build_rpa_kernel(None, None, None, block_major=True)
+
+    assert layer_major is not block_major
+    assert again is block_major
+    assert len(PallasAttentionBackendImpl._kernel_registry) == 2
+    (lm_name, lm_fn), (bm_name, bm_fn) = registered
+    assert lm_name != bm_name
+    assert "block_major" not in lm_fn.keywords
+    assert bm_fn.keywords["block_major"] is True
+    assert bm_fn.func is impl._kernel_entry
+
+
+@pytest.mark.parametrize("pcp", [4, 16])
+@pytest.mark.parametrize("max_num_seqs", [32, 64, 128])
+def test_pcp_streaming_does_not_apply_smem_page_table_bound(pcp, max_num_seqs):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp,
+            decode_context_parallel_size=1,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == 1
+
+
+@pytest.mark.parametrize(
+    "dcp,max_num_seqs,expected",
+    [
+        (2, 32, 128),
+        (2, 64, 256),
+        (2, 128, 512),
+        (8, 32, 32),
+        (8, 64, 64),
+        (8, 128, 128),
+    ],
+)
+def test_dcp_keeps_rank_local_smem_page_table_bound(dcp, max_num_seqs, expected):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=dcp,
+        ),
+    )
+    # A configured 384-token page is too small for DCP2 at 128 sequences,
+    # but remains valid for DCP8 under the same 512-KiB SMEM budget.
+    assert get_tpu_min_page_size(config) == expected
+
+
+def test_dcp_page_table_bound_rounds_up_incomplete_local_page():
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048577),
+        scheduler_config=SimpleNamespace(max_num_seqs=128),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == 1024
+
+
+@pytest.mark.parametrize("max_num_seqs,expected", [(32, 256), (64, 512), (128, 1024)])
+def test_non_cp_keeps_page_table_lower_bound(max_num_seqs, expected):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1048576),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+    )
+    assert get_tpu_min_page_size(config) == expected

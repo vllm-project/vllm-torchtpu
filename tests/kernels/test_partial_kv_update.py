@@ -1,4 +1,4 @@
-"""TPU tests for the in-place partial slot update kernel (b/546309078).
+"""TPU tests for the in-place partial slot update kernel.
 
 The cases here are the ones that actually bit during development, not a
 generic sweep. Each names the failure it guards against, because several of
@@ -48,6 +48,7 @@ def _scatter(pool, indices, vals):
     return np.asarray(pallas_scatter_slots(pool, idx, vals))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "shape",
     [
@@ -66,6 +67,7 @@ def test_scatter_matches_reference(shape):
     np.testing.assert_array_equal(got, _reference(pool, indices, vals))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("shape", [(4096, LANES * 8), (4096, SUBLANES, LANES)])
 def test_unselected_slots_are_untouched(shape):
     """The whole point: everything outside the written slots must survive."""
@@ -81,6 +83,7 @@ def test_unselected_slots_are_untouched(shape):
     np.testing.assert_array_equal(got[mask], before[mask])
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("shape", [(4096, LANES * 8), (4096, SUBLANES, LANES)])
 def test_indices_colliding_in_one_sublane_block(shape):
     """Every index inside a single 8-row block.
@@ -101,6 +104,7 @@ def test_indices_colliding_in_one_sublane_block(shape):
     np.testing.assert_array_equal(got, _reference(pool, indices, vals))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("shape", [(4096, LANES * 8), (4096, SUBLANES, LANES)])
 def test_partial_collision_leaves_block_neighbours_alone(shape):
     """Some slots of a block written, the rest of that block untouched."""
@@ -116,6 +120,7 @@ def test_partial_collision_leaves_block_neighbours_alone(shape):
         np.testing.assert_array_equal(got[untouched], before[untouched])
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("shape", [(4096, LANES * 8), (4096, SUBLANES, LANES)])
 def test_duplicate_indices_resolve_last_write_wins(shape):
     """Matches numpy and PyTorch: the later update to a slot is the one kept.
@@ -134,6 +139,7 @@ def test_duplicate_indices_resolve_last_write_wins(shape):
     np.testing.assert_array_equal(got[3], np.asarray(vals)[2])
 
 
+@pytest.mark.tpu_test
 def test_single_update():
     """na == 1 -- the degenerate grid, and the decode-of-one case."""
     shape = (4096, SUBLANES, LANES)
@@ -146,6 +152,7 @@ def test_single_update():
     np.testing.assert_array_equal(got, _reference(pool, indices, vals))
 
 
+@pytest.mark.tpu_test
 def test_rank2_num_slots_must_tile_evenly():
     """A partial trailing block would write past the end of the aliased
     output, so this raises rather than corrupting."""

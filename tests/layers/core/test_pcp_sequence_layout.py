@@ -355,6 +355,64 @@ def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
     torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
 
 
+@pytest.mark.parametrize(
+    "num_tokens,expected_gathers",
+    [
+        (3, [[0, 1, -1], [-1, -1, -1]]),
+        (5, [[0, 2, -1], [-1, -1, -1]]),
+        (6, [[0, -1, -1], [-1, 2, -1]]),
+    ],
+)
+def test_partial_plan_buckets_mapping_before_device_copy(
+    monkeypatch, num_tokens, expected_gathers
+):
+    packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
+        [1, num_tokens - 1],
+        pcp_size=2,
+        interleave_size=1,
+        padded_num_tokens=6,
+        token_owner_start_offsets_per_req=[0, 1],
+    )
+    original_mapping = request_to_packed.copy()
+    request_tokens = torch.arange(num_tokens, dtype=torch.int32)
+    request_gathers = torch.tensor([0, num_tokens - 1, 0])
+    tensor = torch.tensor
+    host_arrays = []
+
+    def record_tensor(data, *args, **kwargs):
+        if isinstance(data, np.ndarray):
+            host_arrays.append(data.copy())
+        return tensor(data, *args, **kwargs)
+
+    # Observe the actual host-to-device boundary while running the real ops.
+    monkeypatch.setattr(sequence_layout.torch, "tensor", record_tensor)
+    for rank in range(2):
+        local_start = rank * 3
+        plan = SequenceLayoutPlan(
+            descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+            token_slice=slice(local_start, local_start + 3),
+            global_num_tokens=num_tokens,
+            global_padded_num_tokens=6,
+            local_num_tokens=int(
+                np.count_nonzero(packed_to_request[local_start : local_start + 3] >= 0)
+            ),
+            local_padded_num_tokens=3,
+            _packed_to_request_major_token_indices=packed_to_request,
+            _request_major_to_packed_token_indices=request_to_packed,
+        )
+        host_arrays.clear()
+        _, local_gathers = plan.localize_token_tensor_and_gather_indices(
+            request_tokens, request_gathers, num_valid_gathers=2
+        )
+        # Both copies use layout capacities, even when the real token count
+        # changes. Padding on the device would still expose a dynamic input.
+        assert [array.shape for array in host_arrays] == [(3,), (6,)]
+        np.testing.assert_array_equal(host_arrays[1][:num_tokens], original_mapping)
+        np.testing.assert_array_equal(host_arrays[1][num_tokens:], -1)
+        torch.testing.assert_close(local_gathers, tensor(expected_gathers[rank]))
+        np.testing.assert_array_equal(request_to_packed, original_mapping)
+
+
 def test_partial_plan_ignores_padded_request_aligned_gathers():
     packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
         [2, 3],

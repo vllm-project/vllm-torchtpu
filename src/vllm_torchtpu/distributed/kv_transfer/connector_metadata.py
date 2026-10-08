@@ -26,13 +26,17 @@ class SendMeta:
     # ordinal (the block holding the final recurrent state); None for FA-only
     # Stage-3 models and all legacy paths.
     mamba_state_block_ids: list[int] | None = None
+    # One block table per transferred kv-cache group, in Stage-3 transfer-plan
+    # order. Only DSv4 sets it, because its groups page at different sizes;
+    # single-group models leave it None and use local_block_ids.
+    group_block_ids: list[list[int]] | None = None
 
 
 @dataclass
 class LoadMeta:
     uuid: int
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    local_block_ids: list[int] | None
+    remote_block_ids: list[int] | None
     remote_host: str | list[str]
     remote_port: int | list[int]
     remote_side_channel_port: int | None = None

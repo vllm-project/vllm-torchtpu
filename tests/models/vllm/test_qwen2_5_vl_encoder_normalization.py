@@ -12,8 +12,6 @@ from vllm.model_executor.models.vision import FusedInputNorm
 
 from vllm_torchtpu.models.vllm.qwen2_5_vl_patch import maybe_patch_qwen2_5_vl
 
-pytestmark = pytest.mark.cpu_test
-
 
 class RecordingVisionEncoder:
     dtype = torch.float32

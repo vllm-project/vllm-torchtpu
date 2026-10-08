@@ -24,6 +24,13 @@ torch operation or add tensors to the model graph.
 Registering storages the kernels never touch (e.g. the raw unified pages while
 the typed caches are private) hard-fails before any raiden manager is
 constructed.
+
+Under the block-major unified pool (``vllm_torchtpu.block_major_pool``), a
+single raw tensor packs scheduler block ``b`` across all layer regions into
+row ``b``. Its manifest exposes the same logical pools backed by that single
+storage: region ``p`` starts at ``base_offset_bytes = p * region_bytes`` with
+``block_stride_bytes`` equal to the full multi-region row, while preserving
+the exact intra-page region descriptors of the layer-major layout.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
@@ -44,14 +51,26 @@ from vllm_torchtpu.gdn_pool_layout import (
 
 from .tags import (
     TAG_DSA_IDX,
+    TAG_DSV4_CSA_NOPE,
+    TAG_DSV4_CSA_ROPE,
+    TAG_DSV4_HCA,
+    TAG_DSV4_IDX,
+    TAG_DSV4_STATE_CSA,
+    TAG_DSV4_STATE_HCA,
+    TAG_DSV4_STATE_IDX,
+    TAG_DSV4_SWA,
     TAG_FA,
     TAG_GDN_CONV,
     TAG_GDN_SSM,
     TAG_MLA_NOPE,
     TAG_MLA_ROPE,
     class_tag,
+    dsv4_group_tag,
     layer_tag,
 )
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -209,8 +228,8 @@ def _dtype_tag(tensor: Any) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PooledStateView:
-    """Tensor-like metadata for one logical state inside a unified pool.
+class _PooledView:
+    """Tensor-like metadata for one logical cache inside a unified pool.
 
     The descriptor deliberately implements only the accessors used below.  In
     particular, constructing it never calls ``view``/``as_strided`` on an XLA
@@ -243,6 +262,41 @@ def _raw_index_for(tensor: Any, raw_tensors: Sequence[Any]) -> int | None:
         if tensor_ptr is not None and raw_ptr is not None and tensor_ptr == raw_ptr:
             return idx
     return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegionPlacement:
+    """Byte placement of a single layer region within the merged block-major pool.
+
+    All layers alias the single raw pool of ``num_blocks`` rows, with region
+    ``p`` starting at byte offset ``p * region_bytes`` within each row.
+    """
+
+    num_blocks: int
+    region_bytes: int
+    region_offset_bytes: int
+
+
+def _region_placement(
+    block_major: BlockMajorPoolLayout, raw: Any, layer_name: str
+) -> _RegionPlacement:
+    num_blocks = int(block_major.num_blocks)
+    num_pools = int(block_major.num_pools)
+    raw_nbytes = _nbytes(raw)
+    if num_blocks <= 0 or num_pools <= 0 or raw_nbytes % (num_blocks * num_pools) != 0:
+        raise ManifestError(
+            f"block-major pool bytes {raw_nbytes} are not {num_blocks} rows "
+            f"of {num_pools} regions"
+        )
+    pool_index = block_major.pool_index_by_layer.get(layer_name)
+    if pool_index is None:
+        raise ManifestError(f"layer {layer_name} has no region in the block-major pool")
+    region_bytes = raw_nbytes // (num_blocks * num_pools)
+    return _RegionPlacement(
+        num_blocks=num_blocks,
+        region_bytes=region_bytes,
+        region_offset_bytes=int(pool_index) * region_bytes,
+    )
 
 
 def layer_index_from_name(layer_name: str) -> int | None:
@@ -432,6 +486,7 @@ def _pooled_gdn_state_views(
     raw_tensors: Sequence[Any],
     layer_name: str,
     gdn_geometry: GdnHeadGeometry,
+    placement: _RegionPlacement | None = None,
 ) -> tuple[Any, Any]:
     """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
 
@@ -444,6 +499,10 @@ def _pooled_gdn_state_views(
     materialization path) must not leak into transfer spans.  The spec
     contributes the SSM dtype and manager page pitch, plus the identity check
     that this is a two-state GDN layer.
+
+    When ``placement`` is provided, offsets and strides are anchored to the
+    layer's region within the merged block-major row; when ``None``, the pool
+    is layer-major with one region per manager page.
     """
     raw_index = _raw_index_for(pool, raw_tensors)
     if raw_index is None:
@@ -510,16 +569,27 @@ def _pooled_gdn_state_views(
             f"GDN states for {layer_name} exceed one manager page: "
             f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}"
         )
-    num_blocks = raw_nbytes // manager_page_bytes
+    if placement is None:
+        num_blocks = raw_nbytes // manager_page_bytes
+        region_offset_bytes = 0
+    else:
+        if placement.region_bytes != manager_page_bytes:
+            raise ManifestError(
+                f"block-major region of {placement.region_bytes} bytes does "
+                f"not match the manager page of {manager_page_bytes} bytes "
+                f"for {layer_name}"
+            )
+        num_blocks = placement.num_blocks
+        region_offset_bytes = placement.region_offset_bytes
 
-    states: list[_PooledStateView] = []
+    states: list[_PooledView] = []
     # The PR #106 pooled ABI places SSM first and conv immediately after it,
     # while the public/canonical manifest order remains conv then SSM.
     for shape, dtype, itemsize, state_bytes, offset_bytes in (
         (conv_shape, conv_dtype, conv_itemsize, conv_bytes, ssm_bytes),
         (ssm_shape, ssm_dtype, ssm_itemsize, ssm_bytes, 0),
     ):
-        absolute_offset_bytes = pool_offset_bytes + offset_bytes
+        absolute_offset_bytes = pool_offset_bytes + region_offset_bytes + offset_bytes
         if manager_page_bytes % itemsize != 0 or absolute_offset_bytes % itemsize != 0:
             raise ManifestError(
                 f"pooled GDN state for {layer_name} is not aligned to "
@@ -527,7 +597,7 @@ def _pooled_gdn_state_views(
                 f"offset={absolute_offset_bytes}"
             )
         states.append(
-            _PooledStateView(
+            _PooledView(
                 pool=pool,
                 shape=(num_blocks, *shape),
                 dtype=dtype,
@@ -577,7 +647,7 @@ def _pooled_kda_regions(
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
-        raise ManifestError("KDA transfer requires f32 SSM and bf16 pool rows")
+        raise ManifestError("KDA transfer requires f32 SSM and word-aligned pool rows")
     return {
         TAG_GDN_SSM: (
             0,
@@ -592,6 +662,33 @@ def _pooled_kda_regions(
             ),
         ),
     }
+
+
+def _block_major_fa_view(
+    *, pool: Any, spec: Any, layer_name: str, placement: _RegionPlacement
+) -> _PooledView:
+    """Describes one FA region of the merged block-major pool as a paged cache."""
+    block_size = int(spec.block_size)
+    itemsize = _element_size(pool)
+    absolute_offset_bytes = _storage_offset_bytes(pool) + placement.region_offset_bytes
+    if block_size <= 0 or placement.region_bytes % block_size != 0:
+        raise ManifestError(
+            f"block-major region of {placement.region_bytes} bytes for "
+            f"{layer_name} is not {block_size} whole tokens"
+        )
+    if absolute_offset_bytes % itemsize != 0:
+        raise ManifestError(
+            f"block-major region of {layer_name} is not aligned to its "
+            f"dtype: offset={absolute_offset_bytes} itemsize={itemsize}"
+        )
+    return _PooledView(
+        pool=pool,
+        shape=(placement.num_blocks, block_size),
+        dtype=pool.dtype,
+        itemsize=itemsize,
+        storage_offset_elems=absolute_offset_bytes // itemsize,
+        nbytes=placement.num_blocks * placement.region_bytes,
+    )
 
 
 class _StorageTable:
@@ -676,6 +773,7 @@ def build_qwen35_pool_manifest(
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     per_layer_tags: bool = False,
     fa_layout: FaLayoutHook | None = None,
+    block_major: BlockMajorPoolLayout | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -695,11 +793,25 @@ def build_qwen35_pool_manifest(
     raiden keeps treating tags as opaque. Both peers must configure it
     identically (enforced by the manifest identity check at plan time).
 
+
+    ``block_major`` specifies the merged pool geometry when block-major
+    unified allocation is active; all layer caches must alias the single raw
+    pool, and each layer's manifest entry is anchored to its region offset
+    within the block row.
     """
+    if block_major is not None and len(raw_tensors) != 1:
+        raise ManifestError(
+            "the block-major pool manifest describes exactly one raw pool: "
+            f"got {len(raw_tensors)}"
+        )
+
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
     for layer_name in _ordered_layers(named_kv_caches):
         cache = named_kv_caches[layer_name]
+        placement = None
+        if block_major is not None:
+            placement = _region_placement(block_major, raw_tensors[0], layer_name)
         if isinstance(cache, (list, tuple)):
             if len(cache) == 1:
                 spec = _group_spec_for_layer(kv_cache_groups, layer_name)
@@ -709,8 +821,14 @@ def build_qwen35_pool_manifest(
                     raw_tensors=raw_tensors,
                     layer_name=layer_name,
                     gdn_geometry=gdn_geometry,
+                    placement=placement,
                 )
             elif len(cache) == 2:
+                if placement is not None:
+                    raise ManifestError(
+                        f"GDN layer {layer_name} must expose the block-major "
+                        "pool, not private (conv, ssm) states"
+                    )
                 states = cache
             else:
                 raise ManifestError(
@@ -721,6 +839,24 @@ def build_qwen35_pool_manifest(
             suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
+        elif placement is not None:
+            if _raw_index_for(cache, raw_tensors) != 0:
+                raise ManifestError(
+                    f"full-attention cache {layer_name} must alias the block-major pool"
+                )
+            spec = _group_spec_for_layer(kv_cache_groups, layer_name)
+            flat.append(
+                (
+                    TAG_FA,
+                    layer_name,
+                    _block_major_fa_view(
+                        pool=cache,
+                        spec=spec,
+                        layer_name=layer_name,
+                        placement=placement,
+                    ),
+                )
+            )
         else:
             flat.append((TAG_FA, layer_name, cache))
     if per_layer_tags:
@@ -822,6 +958,11 @@ def build_qwen35_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
+# KV dtypes the Kimi pool is admitted with. The KDA state regions keep their
+# own dtypes inside the pool (gdn_pool_layout), whichever of these it has.
+_KIMI_POOL_DTYPE_TAGS = frozenset({"bfloat16", "float8_e4m3fn"})
+
+
 def build_kimi_k3_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -847,13 +988,16 @@ def build_kimi_k3_pool_manifest(
         shape = tuple(int(dim) for dim in tensor.shape)
         spec = _group_spec_for_layer(kv_cache_groups, layer_name)
         page_bytes = int(spec.page_size_bytes)
-        if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
+        dtype_tag = _dtype_tag(tensor)
+        if len(shape) != 4 or dtype_tag not in _KIMI_POOL_DTYPE_TAGS:
             raise ManifestError(
-                f"Kimi cache {layer_name} must be bf16 "
-                f"[blocks, rows, packing, width], got {shape}"
+                f"Kimi cache {layer_name} must be bf16 or fp8 "
+                f"[blocks, rows, packing, width], got {dtype_tag} {shape}"
             )
         num_blocks, rows, packing, width = shape
-        if min(shape) <= 0 or packing != 2:
+        # The packing axis fills one 32-bit word, so a packed row is
+        # 4 * width bytes for either dtype and only its token count differs.
+        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1006,9 +1150,9 @@ def materialize_storages(manifest: PoolManifest) -> None:
     """
     for storage in manifest.storages:
         if hasattr(storage, "cpu"):
-            try:
+            try:  # noqa: SIM105 (non-torch test fakes)
                 storage[:1].cpu()
-            except Exception:  # pragma: no cover - non-torch fakes
+            except Exception:  # pragma: no cover - non-torch fakes  # noqa: S110
                 pass
 
 
@@ -1099,6 +1243,7 @@ def build_glm_mla_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     raw_tensors: Sequence[Any],
     block_size_tokens: int,
+    per_layer_tags: bool = False,
 ) -> PoolManifest:
     """Builds the Pool Manifest for GLM MLA models.
 
@@ -1107,6 +1252,10 @@ def build_glm_mla_pool_manifest(
     The packed [blocks, rows, packing, width] layout is declared as
     row-granular regions; a nope cache carries one row per token,
     every other class packs `packing` tokens per row.
+
+    ``per_layer_tags`` appends the layer index to every tag (``mla.nope.l3``)
+    so a pipeline stage, which holds only some layers, sends each layer's
+    cache to the same layer on the destination.
     """
     if block_size_tokens <= 0:
         raise ManifestError("block_size_tokens must be positive")
@@ -1127,6 +1276,16 @@ def build_glm_mla_pool_manifest(
         flat.append((TAG_DSA_IDX, layer_name, dtype_tag, cache))
     if not any(tag == TAG_MLA_NOPE for tag, _, _, _ in flat):
         raise ManifestError("GLM MLA admission found no latent (mla.nope) caches")
+    if per_layer_tags:
+        tagged = []
+        for tag, layer_name, dtype_tag, tensor in flat:
+            layer_index = layer_index_from_name(layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {layer_name}"
+                )
+            tagged.append((layer_tag(tag, layer_index), layer_name, dtype_tag, tensor))
+        flat = tagged
 
     binding, _ = _binding_for(
         [(layer_name, tensor) for _, layer_name, _, tensor in flat], raw_tensors
@@ -1155,7 +1314,7 @@ def build_glm_mla_pool_manifest(
                 f"num_blocks {num_blocks}"
             )
         live_stride = nbytes // num_blocks
-        if tag == TAG_MLA_NOPE:
+        if class_tag(tag) == TAG_MLA_NOPE:
             # One packed row per token in the nope layout.
             if rows != block_size_tokens:
                 raise ManifestError(
@@ -1190,7 +1349,345 @@ def build_glm_mla_pool_manifest(
                 base_offset_bytes=0,
                 block_stride_bytes=live_stride,
                 num_blocks=num_blocks,
-                regions=_glm_row_region(tag, row_bytes=row_bytes, num_rows=rows),
+                regions=_glm_row_region(
+                    class_tag(tag), row_bytes=row_bytes, num_rows=rows
+                ),
+                dtype_tag=dtype_tag,
+            )
+        )
+
+    manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
+    block_counts = {pool.num_blocks for pool in manifest.pools}
+    if len(block_counts) != 1:
+        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
+    manifest.geometry_by_tag()  # raises on per-tag geometry divergence
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.
+# ---------------------------------------------------------------------------
+
+# Layer-name conventions, mirroring TPUModelRunner's DSv4 constants. They are
+# duplicated rather than imported because this module must stay deviceless.
+DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
+DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+DSV4_CSA_COMPRESS_RATIO = 4
+
+_DSV4_STATE_TAG_BY_KV_TAG = {
+    TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
+    TAG_DSV4_IDX: TAG_DSV4_STATE_IDX,
+    TAG_DSV4_HCA: TAG_DSV4_STATE_HCA,
+}
+
+
+def dsv4_compressed_kv_layer_name(state_cache_name: str) -> str:
+    """`<...>.attn.compressor.state_cache` -> `<...>.attn`, and the indexer's
+    -> `<...>.indexer.k_cache`. Mirrors `DeepseekCompressor.k_cache_prefix`."""
+    if not state_cache_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+        raise ManifestError(
+            f"DSv4 compressor state cache {state_cache_name!r} does not end "
+            f"with {DSV4_STATE_CACHE_SUFFIX!r}, so its compressed-KV layer "
+            "cannot be derived"
+        )
+    base = state_cache_name[: -len(DSV4_STATE_CACHE_SUFFIX)]
+    return base + ".k_cache" if base.endswith(".indexer") else base
+
+
+def _dsv4_row_region(*, row_bytes: int, num_rows: int) -> tuple[RegionSpec, ...]:
+    """One dense region of whole packed rows covering the full page."""
+    return (
+        RegionSpec(
+            name="dsv4_rows",
+            offset_bytes=0,
+            stride_bytes=row_bytes,
+            unit_bytes=row_bytes,
+            num_units=num_rows,
+            units_per_stride=1,
+        ),
+    )
+
+
+def _dsv4_layer_spec(group_spec: Any, layer_name: str) -> Any:
+    """The per-layer spec behind a DSv4 cache group.
+
+    The group's spec is a `UniformTypeKVCacheSpecs` wrapper whose `block_size`
+    is the uncompressed page and which has no `tokens_per_state`, so reading
+    role geometry off it reports every layer as an uncompressed HCA page.
+    `TPUModelRunner._per_layer_spec` unwraps the same way before allocating.
+    """
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs is None:
+        return group_spec
+    try:
+        return specs[layer_name]
+    except KeyError:
+        raise ManifestError(
+            f"DSv4 layer {layer_name} is not in its own cache group's "
+            f"spec map (has {sorted(specs)})"
+        ) from None
+
+
+def _dsv4_spec_field(spec: Any, field: str, layer_name: str) -> int:
+    """One geometry field off a per-layer spec, or a hard failure.
+
+    Never default these. vLLM renames KV cache spec fields, and a default
+    turns a rename into a plausible wrong number instead of an error.
+    """
+    value = getattr(spec, field, None)
+    if value is None:
+        raise ManifestError(
+            f"DSv4 layer {layer_name} spec {type(spec).__name__} has no "
+            f"`{field}`; vLLM renamed it and pool_manifest needs updating"
+        )
+    return int(value)
+
+
+def _dsv4_num_states(spec: Any, layer_name: str) -> int:
+    """Compressed states per page (`T` in the runner's allocation table).
+
+    The same field `_initialize_ds_v4_kv_cache` sizes the arrays from.
+    """
+    return _dsv4_spec_field(spec, "num_states", layer_name)
+
+
+def _dsv4_kv_tag(layer_name: str, spec: Any) -> str:
+    """The compressed-KV role of an MLA layer (CSA reports its NoPE tag)."""
+    if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+        return TAG_DSV4_IDX
+    if (
+        _dsv4_spec_field(spec, "tokens_per_state", layer_name)
+        == DSV4_CSA_COMPRESS_RATIO
+    ):
+        return TAG_DSV4_CSA_NOPE
+    return TAG_DSV4_HCA
+
+
+class Dsv4LayerEntry(NamedTuple):
+    """One layer's claim on one array, which is what a pool is built from.
+
+    Layers and arrays are not one-to-one. A CSA layer binds a `(nope, rope)`
+    pair and yields two entries; an overlaid SWA or compressor-state layer owns
+    no memory of its own and yields one entry naming the array it sits on.
+    `group_index` says whose block table addresses those pages, so two entries
+    on one array with different indices are the aliasing case.
+    """
+
+    # Role tag without the `.g{index}` suffix, e.g. `dsv4.csa.nope`.
+    tag_base: str
+    layer_name: str
+    group_index: int
+    array: Any
+
+
+def _dsv4_classify(
+    kv_cache_groups: Sequence[Any],
+    named_kv_caches: Mapping[str, Any],
+) -> list[Dsv4LayerEntry]:
+    """Split DSv4's layers into one `Dsv4LayerEntry` per (layer, array).
+
+    Mirrors `TPUModelRunner._classify_ds_v4_layers` and the overlay plan it
+    feeds. Iteration is in cache-group order, then declared layer order, so
+    both transfer peers build the same pool list.
+    """
+    kv_tag_by_layer: dict[str, str] = {}
+    for group in kv_cache_groups:
+        for layer_name in group.layer_names:
+            if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+                continue
+            if "swa_cache" in layer_name:
+                continue
+            kv_tag_by_layer[layer_name] = _dsv4_kv_tag(
+                layer_name, _dsv4_layer_spec(group.kv_cache_spec, layer_name)
+            )
+
+    entries: list[Dsv4LayerEntry] = []
+    for group_index, group in enumerate(kv_cache_groups):
+        for layer_name in group.layer_names:
+            cache = named_kv_caches.get(layer_name)
+            if cache is None:
+                raise ManifestError(
+                    f"DSv4 layer {layer_name} has no allocated KV cache"
+                )
+            arrays = tuple(cache) if isinstance(cache, tuple) else (cache,)
+            if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+                kv_layer = dsv4_compressed_kv_layer_name(layer_name)
+                kv_tag = kv_tag_by_layer.get(kv_layer)
+                if kv_tag is None:
+                    raise ManifestError(
+                        f"DSv4 state cache {layer_name} names a compressed-KV "
+                        f"layer {kv_layer} that is not an MLA cache"
+                    )
+                # CSA states are overlaid on the `(nope, rope)` pair, but in
+                # overlap mode the compressor writes state rows through NoPE
+                # only. The RoPE array holds no state, so do not send one.
+                entries.append(
+                    Dsv4LayerEntry(
+                        _DSV4_STATE_TAG_BY_KV_TAG[kv_tag],
+                        layer_name,
+                        group_index,
+                        arrays[0],
+                    )
+                )
+            elif "swa_cache" in layer_name:
+                entries.append(
+                    Dsv4LayerEntry(TAG_DSV4_SWA, layer_name, group_index, arrays[0])
+                )
+            else:
+                kv_tag = kv_tag_by_layer[layer_name]
+                if kv_tag == TAG_DSV4_CSA_NOPE:
+                    if len(arrays) != 2:
+                        raise ManifestError(
+                            f"DSv4 CSA layer {layer_name} must bind a "
+                            f"(nope, rope) pair; got {len(arrays)} array(s)"
+                        )
+                    entries.append(
+                        Dsv4LayerEntry(
+                            TAG_DSV4_CSA_NOPE, layer_name, group_index, arrays[0]
+                        )
+                    )
+                    entries.append(
+                        Dsv4LayerEntry(
+                            TAG_DSV4_CSA_ROPE, layer_name, group_index, arrays[1]
+                        )
+                    )
+                else:
+                    if len(arrays) != 1:
+                        raise ManifestError(
+                            f"DSv4 layer {layer_name} ({kv_tag}) must bind a "
+                            f"single array; got {len(arrays)}"
+                        )
+                    entries.append(
+                        Dsv4LayerEntry(kv_tag, layer_name, group_index, arrays[0])
+                    )
+                _dsv4_check_role_rows(
+                    kv_tag,
+                    layer_name,
+                    _dsv4_layer_spec(group.kv_cache_spec, layer_name),
+                    arrays,
+                )
+    return entries
+
+
+def _dsv4_check_role_rows(
+    kv_tag: str, layer_name: str, spec: Any, arrays: Sequence[Any]
+) -> None:
+    """Row counts must match the runner's per-role allocation table."""
+    tokens = _dsv4_num_states(spec, layer_name)
+    if kv_tag == TAG_DSV4_CSA_NOPE:
+        expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
+    elif kv_tag == TAG_DSV4_IDX:
+        expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+    else:
+        expected = {"latents": tokens * 2}
+    for (role, rows), array in zip(expected.items(), arrays):
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if len(shape) in (3, 4) and shape[1] != rows:
+            raise ManifestError(
+                f"DSv4 {kv_tag} layer {layer_name} array {role} has "
+                f"{shape[1]} rows; the {tokens}-token page needs {rows}"
+            )
+
+
+def build_dsv4_pool_manifest(
+    *,
+    named_kv_caches: Mapping[str, Any],
+    kv_cache_groups: Sequence[Any],
+    raw_tensors: Sequence[Any],
+) -> PoolManifest:
+    """Builds the Pool Manifest for DeepSeek-V4, one pool per (layer, array).
+
+    DSv4's caches alias: an SWA cache sits on a CSA NoPE array, a compressor
+    state on its own compressed-KV array, both at byte offset 0. Only the
+    allocator never giving one block ID to two cache groups keeps them apart,
+    and Raiden cannot see that. So a tag names its group, and a byte-span
+    registration always addresses the pages of one block table.
+
+    DESIGN_DSV4_PD.md defines layer, array, cache group, pool and tag.
+    """
+    if not named_kv_caches:
+        raise ManifestError("named_kv_caches is empty")
+    if not kv_cache_groups:
+        raise ManifestError("DSv4 admission needs at least one KV cache group")
+
+    entries = _dsv4_classify(kv_cache_groups, named_kv_caches)
+
+    binding, _ = _binding_for(
+        [(entry.layer_name, entry.array) for entry in entries], raw_tensors
+    )
+    if binding != BINDING_PRIVATE_TYPED:
+        raise ManifestError(
+            "DSv4 admission requires private typed cache tensors; got "
+            f"binding {binding!r}"
+        )
+
+    storages = _StorageTable()
+    pools: list[PoolEntry] = []
+    # storage index -> (group index, layer name) of the pool that claimed it.
+    claimed_by_group: dict[tuple[int, int], str] = {}
+    for tag_base, layer_name, group_index, array in entries:
+        dtype_tag = _dtype_tag(array)
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if dtype_tag == "int32" and len(shape) == 3:
+            # CSA NoPE/RoPE and their overlays are int32 word rows (see
+            # `csa_cache_layout`): a packing-1 row of the same 512 bytes.
+            shape = (shape[0], shape[1], 1, shape[2])
+        elif dtype_tag != "uint8":
+            raise ManifestError(
+                f"DSv4 cache {layer_name} ({tag_base}) must be uint8; got {dtype_tag}"
+            )
+        if len(shape) != 4:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} ({tag_base}) must be "
+                f"[blocks, rows, packing, width]: got shape {shape}"
+            )
+        num_blocks, rows, packing, width = shape
+        itemsize = _element_size(array)
+        nbytes = _nbytes(array)
+        if num_blocks <= 0 or nbytes % num_blocks != 0:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} nbytes {nbytes} is not divisible by "
+                f"num_blocks {num_blocks}"
+            )
+        block_stride = nbytes // num_blocks
+        # The packing axis must fill one 32-bit word (see the layout
+        # fingerprint's tile assertion).
+        if packing * itemsize != 4:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} packing {packing} does not fill one "
+                f"32-bit word at itemsize {itemsize}"
+            )
+        if width % 128:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} width {width} is not lane-aligned"
+            )
+        row_bytes = packing * width * itemsize
+        if block_stride != rows * row_bytes:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} block stride {block_stride} does "
+                f"not match {rows} rows of {row_bytes} bytes"
+            )
+
+        storage_index = storages.index_for(array)
+        claim = (group_index, storage_index)
+        if claim in claimed_by_group:
+            raise ManifestError(
+                f"DSv4 layers {claimed_by_group[claim]} and {layer_name} "
+                f"share an array inside kv cache group {group_index}; layers of "
+                "one group share a block table, so they would overwrite each "
+                "other's pages"
+            )
+        claimed_by_group[claim] = layer_name
+
+        pools.append(
+            PoolEntry(
+                tag=dsv4_group_tag(tag_base, group_index),
+                layer_name=layer_name,
+                storage_index=storage_index,
+                base_offset_bytes=0,
+                block_stride_bytes=block_stride,
+                num_blocks=num_blocks,
+                regions=_dsv4_row_region(row_bytes=row_bytes, num_rows=rows),
                 dtype_tag=dtype_tag,
             )
         )

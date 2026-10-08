@@ -16,7 +16,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -59,7 +58,8 @@ def test_grouped_softmax_delegates_to_vllm_grouped_topk():
 
 
 def test_classic_topk_sqrtsoftplus_scoring():
-    """DSV4 classic top-k selection with sqrtsoftplus scoring and e_score_correction_bias."""
+    """DSV4 classic top-k selection with sqrtsoftplus scoring and
+    e_score_correction_bias."""
     hidden = torch.randn(2, 4)
     logits = torch.zeros(2, 4)
     bias = torch.tensor([0.0, 0.5, 0.0, 1.0])
@@ -97,7 +97,8 @@ def test_classic_topk_sqrtsoftplus_renormalize_and_scaling():
     )
     assert weights.shape == (2, 2)
     assert ids.shape == (2, 2)
-    # With renormalize=True and scaling=2.5, sum across topk weights per token must equal 2.5
+    # With renormalize=True and scaling=2.5, sum across topk weights per token must
+    # equal 2.5
     torch.testing.assert_close(
         weights.sum(dim=-1), torch.full((2,), 2.5, dtype=weights.dtype)
     )
@@ -186,7 +187,6 @@ def test_non_grouped_plain_path_matches_manual_topk():
     torch.testing.assert_close(weights, expected_w.to(weights.dtype))
 
 
-@pytest.mark.cpu_test
 def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
     """The runner owns the gate; DSv4 must forward tokens without a second GEMM."""
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config

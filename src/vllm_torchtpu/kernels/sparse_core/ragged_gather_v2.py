@@ -25,7 +25,8 @@ from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
-    """Calculates the max column size bounded by VMEM limits and hidden_size divisibility."""
+    """Calculates the max column size bounded by VMEM limits and
+    hidden_size divisibility."""
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None, "SparseCore info is missing."
@@ -109,23 +110,24 @@ def main_kernel_v2(
 
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
-    # SparseCore `.bitcast()` leverages hardware Row-Packing for 16-bit -> 32-bit conversion.
+    # SparseCore `.bitcast()` leverages hardware Row-Packing for
+    # 16-bit -> 32-bit conversion.
     # The logical row count halves, while physical column dimensions remain unchanged.
     in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
     out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
 
     num_phys_cols = col_size
 
-    # The outer pipeline runs on the Vector Core, hoisting the integer arithmetic required
-    # to decode the row-packed indices. This prevents scalar-core instruction starvation
-    # during the execution of the indirect `in_specs` block lambdas.
+    # The outer pipeline runs on the Vector Core, hoisting the integer arithmetic
+    # required to decode the row-packed indices. This prevents scalar-core instruction
+    # starvation during the execution of the indirect `in_specs` block lambdas.
 
-    # TODO(guoweij): The nested `emit_pipeline` design creates a pipeline bubble (DMA wait)
-    # when the inner pipeline empties and restarts with new indices. This is a known
-    # high-level API limitation, currently amortized by setting a large num_row_subchunks
-    # and shouldn't be an issue for most use cases. We should still monitor
-    # the bubble's impact on E2E performance and, if needed, manually reimplement
-    # this using primitive operations to eliminate the bubble entirely.
+    # TODO(guoweij): The nested `emit_pipeline` design creates a pipeline bubble
+    # (DMA wait) when the inner pipeline empties and restarts with new indices. This is
+    # a known high-level API limitation, currently amortized by setting a large
+    # num_row_subchunks and shouldn't be an issue for most use cases. We should still
+    # monitor the bubble's impact on E2E performance and, if needed, manually
+    # reimplement this using primitive operations to eliminate the bubble entirely.
 
     def col_loop(col_base, gather_ref, out_ref, idx_rem, unpack_col_chunk):
         col_slice = pl.ds(col_base, unpack_col_chunk)
@@ -134,7 +136,8 @@ def main_kernel_v2(
             out_dt = out_ref.bitcast(dtype)
             out_dt[:, col_slice] = gather_dt[:, col_slice]
         else:
-            # Manual bitwise extraction and packing for packing >= 2 (bfloat16, int8, int4)
+            # Manual bitwise extraction and packing for
+            # packing >= 2 (bfloat16, int8, int4)
             # bf16: 0xFFFF, int8: 0xFF, int4: 0xF
             mask = (1 << dtype_bits) - 1
             shift_multiplier = dtype_bits.bit_length() - 1

@@ -15,50 +15,12 @@ repos:
         args: [--allow-multiple-documents] # k8s manifests are multi-document
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
-- repo: https://github.com/PyCQA/isort
-  rev: 6.0.1
-  hooks:
-  - id: isort
-    # The paths isort still owns. Anything not listed is formatted by ruff. The
-    # same paths appear in pyproject.toml under [tool.ruff.format] `exclude` and
-    # [tool.ruff.lint.per-file-ignores]; all three move together, otherwise two
-    # tools format the same file.
-    files: &legacy_formatter_paths |
-      (?x)^(
-      # (?!) never matches, so every path below can carry a leading `|` and a
-      # migration deletes whole lines only.
-      (?!)
-
-
-
-
-
-
-
-
-
-
-
-
-      )
-    # protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting
-    # it would make every regeneration produce a spurious diff.
-    exclude: &legacy_formatter_skip ^src/vllm_torchtpu/tools/xplane_pb2\.py$
-- repo: https://github.com/google/yapf
-  rev: v0.43.0
-  hooks:
-  - id: yapf
-    args: [--in-place, --verbose]
-    files: *legacy_formatter_paths
-    exclude: *legacy_formatter_skip
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
   - id: ruff-check
     args: [--output-format, github, --fix]
   - id: ruff-format
-    # Scoped by `exclude` under [tool.ruff.format] in pyproject.toml, which
-    # holds for explicitly passed filenames because `force-exclude` is set.
 - repo: https://github.com/pre-commit/mirrors-clang-format
   rev: v20.1.3
   hooks:
@@ -89,6 +51,11 @@ repos:
   hooks:
   - id: detect-missing-init
     args: ['--create', "--track", "--python-folders", "src/vllm_torchtpu"]
+# Keeps the lines inside each keep-sorted block in sorted order.
+- repo: https://github.com/google/keep-sorted
+  rev: v0.10.0
+  hooks:
+  - id: keep-sorted
 - repo: local
   hooks:
   - id: signoff-commit
@@ -137,6 +104,15 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: no-internal-refs
+    name: No internal links, bug numbers or source paths
+    # The repo is public, so internal links, bug and change numbers, and
+    # internal source paths mean nothing to most readers. Put the reasoning in
+    # the comment or cite a public source. A link must start a word or follow
+    # http:// or https://, so paths such as /usr/local/go/bin pass.
+    entry: '(^|[\s(\[{"''`<,]|https?://)(go/[A-Za-z]|b/[0-9]{6,}|cl/[0-9]{6,})|\bgoogle3\b'
+    language: pygrep
+    types: [text]
   - id: pyrefly
     name: Pyrefly type check
     # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather
@@ -144,7 +120,7 @@ repos:
     # happens to touch. A full run is well under a second.
     entry: pyrefly check
     language: python
-    additional_dependencies: [pyrefly==1.2.0]
+    additional_dependencies: [pyrefly==1.3.0]
     pass_filenames: false
     always_run: true
   - id: suggestion

@@ -19,13 +19,14 @@ arrives after the engine core has built its executor and scheduler; until
 then chunks are cut by token count alone.
 """
 
-from typing import Any
+import math
+from typing import Any, cast
 
-from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -95,9 +96,12 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
-        spread over the pipeline's stages, rounded up to a granule, at most
-        a full step. None until the cost model is installed or when no
-        prefill work is pending."""
+        spread over up to as many steps as the pipeline has stages, rounded
+        up to a granule, at most a full step. Of those spreads the one that
+        gets the work through the pipeline soonest is taken: a step of half
+        the tokens that takes as long as the whole one only adds steps.
+        None until the cost model is installed or when no prefill work is
+        pending."""
         if self._cost is None:
             return None
         pending = 0
@@ -108,9 +112,20 @@ class TpuPipelineChunkScheduler(Scheduler):
         if pending == 0:
             return None
         granularity = self._cost.granularity
-        share = -(-pending // self._pp_size)
-        share = -(-share // granularity) * granularity
-        return min(self._cost.buckets[-1], max(granularity, share))
+        buckets = self._cost.buckets
+        limit, soonest = buckets[-1], math.inf
+        for spread in range(1, self._pp_size + 1):
+            share = -(-pending // spread)
+            share = -(-share // granularity) * granularity
+            share = min(buckets[-1], max(granularity, share))
+            bucket = next(b for b in buckets if b >= share)
+            # The last of the work leaves the pipeline a stage count minus
+            # one steps after its step enters.
+            steps = -(-pending // share) + self._pp_size - 1
+            done_ms = steps * self._cost.step_ms(bucket, 0.0, float(share) * share)
+            if done_ms < soonest:
+                limit, soonest = share, done_ms
+        return limit
 
     def _mamba_block_aligned_split(
         self,
@@ -184,7 +199,8 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
         [[tuple(s) for s in report["samples"]] for report in reports],
         envs.TPU_PP_CHUNK_SLACK,
         granularity,
-        min(schedules) if schedules else None,
+        # Each worker reports its kernel schedule as (pairs, bq, bkv).
+        cast(tuple[int, int, int], min(schedules)) if schedules else None,
     )
     scheduler.install_cost_model(model)
 

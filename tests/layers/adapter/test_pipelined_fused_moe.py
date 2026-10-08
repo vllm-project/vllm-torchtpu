@@ -28,10 +28,10 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import (  # noqa: E501
     VllmCompressedTensorsW4A16MoEMethod,
 )
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -63,7 +63,8 @@ def test_env_var_default_and_override():
 
 
 def test_enable_pipelined_collective_and_compute():
-    """Verify enable_pipelined_collective_and_compute reflects TPU_MOE_COLLECTION_CHUNK_SIZE > 0."""
+    """Verify enable_pipelined_collective_and_compute reflects
+    TPU_MOE_COLLECTION_CHUNK_SIZE > 0."""
     with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
         assert enable_pipelined_collective_and_compute() is False
 
@@ -89,7 +90,8 @@ def test_enable_pipelined_collective_allows_pcp():
     ],
 )
 def test_supports_internal_mk_property(method_cls):
-    """Verify supports_internal_mk is True when chunk_size > 0, False when 0 across all 6 quantization classes."""
+    """Verify supports_internal_mk is True when chunk_size > 0, False when 0 across
+    all 6 quantization classes."""
     prop = method_cls.supports_internal_mk
     assert isinstance(prop, property)
 
@@ -101,7 +103,8 @@ def test_supports_internal_mk_property(method_cls):
 
 
 def test_calculate_moe_chunks_math():
-    """Verify chunk calculation: N_chunk = ceil((DP * S) / C), S_chunk = S // N_chunk."""
+    """Verify chunk calculation: N_chunk = ceil((DP * S) / C),
+    S_chunk = S // N_chunk."""
     # S=8192, DP=4, C=16384 -> T_global=32768 -> N_chunk=2, S_chunk=4096
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len=8192, parallel_size=4, chunk_size=16384
@@ -130,14 +133,16 @@ def test_calculate_moe_chunks_math():
     assert num_chunks == 1
     assert chunk_size_local == 1024
 
-    # Non-multiple global: S=3072, DP=8, C=16384 -> T_global=24576 -> N_chunk=2, S_chunk=1536
+    # Non-multiple global:
+    # S=3072, DP=8, C=16384 -> T_global=24576 -> N_chunk=2, S_chunk=1536
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len=3072, parallel_size=8, chunk_size=16384
     )
     assert num_chunks == 2
     assert chunk_size_local == 1536
 
-    # Non-multiple global: S=8000, DP=4, C=16384 -> T_global=32000 -> N_chunk=2, S_chunk=4000
+    # Non-multiple global:
+    # S=8000, DP=4, C=16384 -> T_global=32000 -> N_chunk=2, S_chunk=4000
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len=8000, parallel_size=4, chunk_size=16384
     )
@@ -172,18 +177,19 @@ class _MockCollectiveGroup:
         self.call_log = []
 
     def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        self.call_log.append(("all_gather", tensor.shape))
+        self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
         # Replicate along dim=0 across world_size
         return torch.cat([tensor] * self.world_size, dim=dim)
 
     def reduce_scatter(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        self.call_log.append(("reduce_scatter", tensor.shape))
+        self.call_log.append(("reduce_scatter", tensor.shape, tensor.dtype))
         chunks = tensor.chunk(self.world_size, dim=dim)
         return chunks[self.rank_in_group]
 
 
 def test_pipelined_moe_execution_flow_and_numerical_parity():
-    """Verify pipelined execution interleaving collectives and compute with numerical parity."""
+    """Verify pipelined execution interleaving collectives and compute with
+    numerical parity."""
     dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     seq_len = 8192
     hidden_dim = 128
@@ -239,7 +245,8 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     # Numerical parity check: each token should be exactly hs * 2.0
     torch.testing.assert_close(out, hidden_states * 2.0)
 
-    # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids) and 2 reduce-scatters
+    # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids)
+    # and 2 reduce-scatters
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
     # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls
@@ -298,13 +305,202 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
     assert dp_group.call_log == []
 
 
+def test_fp8_all_gather_is_off_by_default():
+    """The flag is opt-in: nothing quantizes the gather unless it is set."""
+    with patch.dict(os.environ, {}, clear=True):
+        assert envs.TPU_MOE_FP8_ALL_GATHER is False
+
+
+def test_fp8_all_gather_alone_claims_the_collectives():
+    """The fp8 method has to own the gather to be the one quantizing it.
+
+    Chunk pipelining is off here, so this is the flag's own doing: without it
+    vLLM would issue the all-gather itself, in the activations' full width,
+    and the layer would never see the tokens before the wire.
+    """
+    prop = VllmFp8MoEMethodTPU.supports_internal_mk
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+        patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
+    ):
+        assert prop.fget(None) is True
+
+    # No other method reads the flag, so none of them changes hands over it.
+    for method_cls in (
+        VllmUnquantizedFusedMoEMethod,
+        VllmMxfp4MoEMethod,
+        VllmNvfp4MoEMethod,
+        VllmCompressedTensorsW4A16MoEMethod,
+        VllmCompressedTensorsW4ANMxfp4MoEMethod,
+    ):
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+            patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
+        ):
+            assert method_cls.supports_internal_mk.fget(None) is False
+
+
+def _run_with_fp8_all_gather(
+    hidden_states, *, group, chunk_size=0, fp8_all_gather=True
+):
+    """Drive pipelined_fused_moe_gmm with an identity kernel.
+
+    Standing in for the real kernel with the identity lets the assertions be
+    about what the pipeline handed it: the gather is the only thing the flag
+    touches, so a kernel that returns its input turns the whole call into a
+    round trip of the activations through the wire.
+    """
+    seq_len, hidden_dim = hidden_states.shape
+    topk = 2
+    calls = []
+
+    def mock_kernel_fn(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"]
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", chunk_size),
+        patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", fp8_all_gather),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=None,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=group,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+            side_effect=mock_kernel_fn,
+        ),
+    ):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=torch.ones(seq_len, topk, dtype=hidden_states.dtype) / topk,
+            topk_ids=torch.zeros(seq_len, topk, dtype=torch.int32),
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+    assert out.shape == (seq_len, hidden_dim)
+    return out, calls
+
+
+def test_fp8_all_gather_puts_eight_bit_rows_on_the_wire():
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 1536, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    # The rows cross as int8 -- the same eight bits as fp8, in a dtype every
+    # collective backend carries -- next to one f32 scale per row. The routing
+    # tensors gathered after them keep their own dtypes and are not the point.
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == (hidden_states.shape, torch.int8)
+    assert gathers[1] == ((64, 1), torch.float32)
+    assert not [
+        dtype
+        for shape, dtype in gathers
+        if shape == hidden_states.shape and dtype is not torch.int8
+    ]
+
+    # The narrow form stops at the wire: the kernel is handed the activations
+    # back in their own dtype and full width, exactly as it would be with the
+    # flag off, so nothing downstream has to know the gather was quantized.
+    kwargs = calls[0]
+    assert kwargs["hidden_states"].shape == (64 * 4, 1536)
+    assert kwargs["hidden_states"].dtype is torch.bfloat16
+
+    # e4m3 keeps four mantissa bits, so a round trip lands within 1/32.
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_takes_a_hidden_size_no_block_would_divide():
+    """Per-row scales make the hidden size the gather's business, not a
+    precondition: 576 is not a multiple of any width the gmm blocks in, and it
+    still crosses whole, unpadded, one scale per row."""
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8, 576, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == ((8, 576), torch.int8)
+    assert gathers[1] == ((8, 1), torch.float32)
+    assert calls[0]["hidden_states"].shape == (16, 576)
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
+    """Each chunk is quantized and restored against its own rows.
+
+    Two chunks are in flight at once here, and each carries a scale derived
+    from its own tokens. Restoring a chunk against the other one's scale would
+    leave the concatenated output nowhere near the input.
+    """
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 512, dtype=torch.bfloat16)
+    # 64 local tokens * 4 ranks / 128 = 2 chunks.
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group, chunk_size=128)
+
+    assert len(calls) == 2
+    for kwargs in calls:
+        assert kwargs["hidden_states"].shape == (32 * 4, 512)
+        assert kwargs["hidden_states"].dtype is torch.bfloat16
+
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_declines_on_a_single_rank():
+    """Nothing crosses the wire on one rank, so rounding would buy nothing."""
+    group = _MockCollectiveGroup(world_size=1, rank=0)
+    hidden_states = torch.randn(64, 512, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    assert not [
+        c for c in group.call_log if c[0] == "all_gather" and c[2] is torch.int8
+    ]
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
+    # Declining means no rounding at all, so this is exact, not approximate.
+    assert torch.equal(out, hidden_states)
+
+
+def test_fp8_all_gather_off_leaves_the_gather_in_full_width():
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 128, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(
+        hidden_states, group=group, fp8_all_gather=False
+    )
+
+    assert [c[2] for c in group.call_log if c[0] == "all_gather"][0] is torch.bfloat16
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
+    assert torch.equal(out, hidden_states)
+
+
 class TestMoEForwardPrecisionBranches:
-    """Tests protecting apply_monolithic call paths and signature parity across all MoE precision methods."""
+    """Tests protecting apply_monolithic call paths and signature parity across all MoE
+    precision methods."""
 
     def test_fused_moe_and_pipelined_signature_parity(self):
-        """Ensure fused_moe_gmm and pipelined_fused_moe_gmm maintain identical signatures.
+        """Ensure fused_moe_gmm and pipelined_fused_moe_gmm maintain
+        identical signatures.
 
-        Prevents changes to fused_moe_gmm parameter list that break pipelined_fused_moe_gmm.
+        Prevents changes to fused_moe_gmm parameter list that break
+        pipelined_fused_moe_gmm.
         """
         sig_fused = inspect.signature(fused_moe_gmm)
         sig_pipelined = inspect.signature(pipelined_fused_moe_gmm)
@@ -312,13 +508,15 @@ class TestMoEForwardPrecisionBranches:
         assert list(sig_fused.parameters.keys()) == list(
             sig_pipelined.parameters.keys()
         ), (
-            f"Signature parameter mismatch between fused_moe_gmm ({list(sig_fused.parameters.keys())}) "
+            "Signature parameter mismatch between "
+            f"fused_moe_gmm ({list(sig_fused.parameters.keys())}) "
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
         )
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify FP8 apply_monolithic passes identical valid kwargs to both branches."""
+        """Verify FP8 apply_monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16).to(
@@ -377,7 +575,8 @@ class TestMoEForwardPrecisionBranches:
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_unquantized_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify unquantized apply_monolithic passes identical valid kwargs to both branches."""
+        """Verify unquantized apply_monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
@@ -429,7 +628,8 @@ class TestMoEForwardPrecisionBranches:
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify MXFP4 forward monolithic passes identical valid kwargs to both branches."""
+        """Verify MXFP4 forward monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
@@ -484,7 +684,8 @@ class TestMoEForwardPrecisionBranches:
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_nvfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify NVFP4 apply_monolithic passes identical valid kwargs to both branches."""
+        """Verify NVFP4 apply_monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
@@ -536,7 +737,8 @@ class TestMoEForwardPrecisionBranches:
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_w4a16_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify compressed tensors W4A16 apply_monolithic passes identical valid kwargs to both branches."""
+        """Verify compressed tensors W4A16 apply_monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer.activation = "silu"
         layer.moe_config = _make_mock_moe_config()
@@ -588,7 +790,8 @@ class TestMoEForwardPrecisionBranches:
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_w4an_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
-        """Verify compressed tensors W4AN_MXFP4 apply_monolithic passes identical valid kwargs to both branches."""
+        """Verify compressed tensors W4AN_MXFP4 apply_monolithic passes identical valid
+        kwargs to both branches."""
         layer = MagicMock()
         layer._experts_start = torch.zeros((), dtype=torch.int32)
         layer.w13_weight = torch.randn(4, 64, 128, dtype=torch.bfloat16)
@@ -688,7 +891,8 @@ def test_pipelined_moe_single_chunk_dp_greater_than_one():
     assert out.shape == (seq_len, hidden_dim)
     torch.testing.assert_close(out, hidden_states * 3.0)
 
-    # In single-chunk mode (num_chunks=1): 3 all_gathers (hs, weights, ids) and 1 reduce_scatter
+    # In single-chunk mode (num_chunks=1): 3 all_gathers (hs, weights, ids)
+    # and 1 reduce_scatter
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
     assert len(ag_calls) == 3
@@ -826,7 +1030,8 @@ def test_pipelined_moe_with_none_routing_tensors():
 
 
 def test_pipelined_moe_four_stage_pipeline():
-    """Verify pipelining with 4 chunks exercises multi-iteration pipeline steady state."""
+    """Verify pipelining with 4 chunks exercises multi-iteration
+    pipeline steady state."""
     dp_group = _MockCollectiveGroup(world_size=4, rank=0)
     # S=16384, DP=4, C=16384 -> T_global=65536 -> N_chunk=4, S_chunk=4096
     seq_len = 16384

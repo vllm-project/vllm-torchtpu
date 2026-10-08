@@ -4,6 +4,8 @@ from unittest.mock import Mock, call
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
 from vllm_torchtpu.runner import mm_encoder_manager as mm
 
@@ -205,7 +207,10 @@ def test_replay_counts_items_and_passes_padded_values(manager):
     manager.model.encoder_eager_forward.assert_not_called()
 
 
-def test_replay_failure_uses_original_inputs_for_eager_fallback(manager):
+@pytest.mark.parametrize("allow_eager_fallback", [True, False])
+def test_replay_failure_uses_original_inputs_for_eager_fallback(
+    manager, allow_eager_fallback
+):
     mm_kwargs = {"images": object()}
     manager.model.prepare_encoder_cudagraph_replay_buffers.return_value = (
         SimpleNamespace(values={"pixels": torch.ones(2, 2)})
@@ -220,9 +225,138 @@ def test_replay_failure_uses_original_inputs_for_eager_fallback(manager):
         return output
 
     manager.model.encoder_eager_forward.side_effect = eager
+    if not allow_eager_fallback:
+        with pytest.raises(RuntimeError, match="execute"):
+            manager._run_budget_graph(mm_kwargs, 8, "local", allow_eager_fallback=False)
+        manager.model.encoder_eager_forward.assert_not_called()
+        return
     assert manager._run_budget_graph(mm_kwargs, 8, "local") is output
     assert manager.graph_hits == 0
     assert manager.graph_misses == 2
+
+
+@pytest.fixture
+def coordinated_manager(manager, monkeypatch):
+    manager.path_token_budgets = {"default": [4, 8]}
+    manager.budget_templates = {"default": manager.budget_templates["global"]}
+    manager.config.out_hidden_size = 2
+    monkeypatch.setattr(mm, "synchronize_tensors", Mock())
+    manager.model.get_encoder_cudagraph_item_specs.side_effect = lambda kwargs: [
+        EncoderItemSpec(input_size=4 * count, output_tokens=count)
+        for count in kwargs["tokens"]
+    ]
+    manager.model.select_encoder_cudagraph_items.side_effect = lambda kwargs, indices: {
+        "tokens": [kwargs["tokens"][i] for i in indices]
+    }
+    manager._run_budget_graph = Mock(return_value=torch.zeros(8, 2))
+    manager._compiled_budget_forward.return_value = torch.zeros(8, 2)
+
+    def postprocess(graphs, indices, tokens, outputs, **kwargs):
+        for index, count in zip(
+            indices, kwargs["batch_mm_kwargs"]["tokens"], strict=True
+        ):
+            outputs[index] = torch.full((count, 2), float(count))
+
+    manager.model.postprocess_encoder_output.side_effect = postprocess
+    return manager
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
+    coordinated_manager, monkeypatch, active
+):
+    manager = coordinated_manager
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=3, cpu_group=None),
+    )
+
+    def gather(plans, local, *, group):
+        assert local == (None, [4, 4] if active else [], 8 if active else 0)
+        plans[:] = [local, (None, [8, 8, 8], 24), (None, [], 0)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    counts = [3, 1, 4] if active else []
+    outputs = manager.execute_dp_coordinated({"tokens": counts} if active else None)
+    assert [o.shape[0] for o in outputs] == counts
+    for count, output in zip(counts, outputs, strict=True):
+        assert (output == count).all()
+    assert manager._run_budget_graph.call_args_list == (
+        [
+            call({"tokens": [1, 3]}, 8, allow_eager_fallback=False),
+            call({"tokens": [4]}, 8, allow_eager_fallback=False),
+        ]
+        if active
+        else []
+    )
+    assert manager._compiled_budget_forward.call_count == (1 if active else 3)
+    assert mm.synchronize_tensors.call_count == 3
+
+
+def test_coordinated_encoder_propagates_peer_input_errors(
+    coordinated_manager, monkeypatch
+):
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=None),
+    )
+
+    def gather(plans, local, *, group):
+        plans[:] = [local, ("image exceeds largest bucket", [], 0)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="image exceeds largest bucket"):
+        coordinated_manager.execute_dp_coordinated(None)
+    coordinated_manager._compiled_budget_forward.assert_not_called()
+
+
+@pytest.mark.parametrize("counts", [[3, 1, 4], [3], []])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
+    coordinated_manager, monkeypatch, counts, rank
+):
+    manager = coordinated_manager
+    manager.use_dp = True
+    tp = SimpleNamespace(world_size=2, rank_in_group=rank, all_gather=Mock())
+    ep = SimpleNamespace(world_size=4, cpu_group=object())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: ep)
+    assignments = (
+        [[2], [0, 1]] if len(counts) == 3 else [[0], []] if counts else [[], []]
+    )
+
+    def plans_gather(plans, local, *, group):
+        assert group is ep.cpu_group
+        local_tokens = sum(counts[i] for i in assignments[rank])
+        assert local == (None, [4] if local_tokens else [], local_tokens)
+        plans[:] = [local, (None, [8, 8], 12), (None, [], 0), (None, [], 0)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", plans_gather)
+    gathered = torch.zeros(24, 2)
+    for peer, assigned in enumerate(assignments):
+        offset = peer * 12
+        for index in assigned:
+            gathered[offset : offset + counts[index]] = counts[index]
+            offset += counts[index]
+
+    def tensors_gather(padded, *, dim):
+        assert dim == 0
+        torch.testing.assert_close(padded, gathered[rank * 12 : (rank + 1) * 12])
+        assert mm.synchronize_tensors.call_args == call(padded, wait=True)
+        return gathered
+
+    tp.all_gather.side_effect = tensors_gather
+    outputs = manager.execute_dp_coordinated({"tokens": counts} if counts else None)
+    assert [o.shape[0] for o in outputs] == counts
+    for count, output in zip(counts, outputs, strict=True):
+        assert (output == count).all()
+    assert manager._compiled_budget_forward.call_count == (
+        1 if assignments[rank] else 2
+    )
+    assert mm.synchronize_tensors.call_args == call(gathered, wait=True)
+    tp.all_gather.assert_called_once()
 
 
 @pytest.mark.parametrize(

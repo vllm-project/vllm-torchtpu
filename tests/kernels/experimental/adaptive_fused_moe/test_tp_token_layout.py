@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SPMD token-replica layout contract, including noncontiguous TP groups.
 
-Runs on an eight-device CPU mesh with XLA_FLAGS=--xla_force_host_platform_device_count=8;
-the fused FP8/FP4 TPU comparison is in test_tp_tokens.py.
+Runs on an eight-device CPU mesh with
+XLA_FLAGS=--xla_force_host_platform_device_count=8; the fused FP8/FP4 TPU comparison is
+in test_tp_tokens.py.
 """
 
 import jax
@@ -17,7 +18,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import
 )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("groups", [None, tuple((i,) for i in range(8))])
 @pytest.mark.parametrize("rows", [1, 7, 17, 257])
 def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, rows):
@@ -102,7 +102,6 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
     )
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "groups", [(), ((0, 1),), ((0, 0), (2, 3)), ((0,), (1, 2, 3)), ((0, 1), (2, 4))]
 )

@@ -6,13 +6,17 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.distributed.mesh_utils import (
-    CpGroupLayout,
-    get_cp_group_layout,
-    get_or_create_cp_mesh,
-)
+from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 PcpGroupLayout = CpGroupLayout
+
+# Each CP axis builds its own Pallas mesh and keys the cache on its own
+# factorization of the world, so each keeps its own dict rather than sharing
+# one that would hand a caller whichever axis ran first.
+_MESH_CACHE: dict[tuple, Any] = {}
 
 
 def get_pcp_group() -> Any | None:
@@ -58,36 +62,6 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     return group.all_reduce(tensor)
 
 
-def get_pcp_cache_rank() -> int:
-    """
-    Index of the PCP chunk whose KV this worker's device physically holds.
-    """
-    from torch_tpu._internal.distributed import tpu_distributed
-
-    group = get_pcp_group()
-    if group is None or int(group.world_size) == 1:
-        return 0
-    world_size = int(group.world_size)
-
-    device_id = int(tpu_distributed.global_device_id())
-    device_ids = [int(value) for value in tpu_distributed.all_global_device_ids()]
-    # A slice wider than the PCP world means the kernels' partition space is
-    # not the PCP group, so no index into it would mean what callers expect.
-    if len(device_ids) != world_size:
-        raise RuntimeError(
-            f"torch_tpu exposes {len(device_ids)} devices {device_ids} but the "
-            f"PCP group has world_size={world_size}; the kernels' partition "
-            f"space does not match the PCP group, so the chunk this worker "
-            f"holds is undefined."
-        )
-    if device_id not in device_ids:
-        raise RuntimeError(
-            f"This worker's TPU device id {device_id} is not in torch_tpu's "
-            f"device list {device_ids}."
-        )
-    return device_ids.index(device_id)
-
-
 def get_pcp_group_layout() -> PcpGroupLayout:
     """Return the current PCP group's rank order and TPU device-id order.
 
@@ -98,10 +72,88 @@ def get_pcp_group_layout() -> PcpGroupLayout:
     return get_cp_group_layout(get_pcp_group())
 
 
-def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
-    """Build a JAX mesh ordered by the current vLLM PCP group.
+def get_or_create_pcp_mesh(
+    axis_name: str = "pcp", *, tp_axis_name: str | None = None
+) -> Any:
+    """Build a rank-aligned PCP x TP mesh over the TorchTPU world.
 
-    This helper is intentionally op-local: it does not replace the runner's
-    normal single-device model mesh.
+    Partition ``pcp_rank * tp_size + tp_rank`` is the global PyTorch rank.
+    Validate the actual vLLM groups rather than silently accepting reordered
+    groups that disagree with that runtime assignment.
     """
-    return get_or_create_cp_mesh(axis_name=axis_name, group=get_pcp_group())
+    import torch.distributed as dist
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    layout = get_pcp_group_layout()
+    group = get_pcp_group()
+    axis_names = (axis_name,) if tp_axis_name is None else (axis_name, tp_axis_name)
+    if len(set(axis_names)) != len(axis_names):
+        raise ValueError("PCP and TP mesh axis names must be distinct.")
+    tp_size = 1
+    tp_rank = 0
+    tp_group = None
+    if tp_axis_name is not None and group is not None:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        tp_rank = int(tp_group.rank_in_group)
+    shape = (
+        (layout.world_size,) if tp_axis_name is None else (layout.world_size, tp_size)
+    )
+    cache_key = (
+        axis_names,
+        shape,
+        layout.ranks,
+        layout.device_ids,
+        () if tp_group is None else tuple(tp_group.ranks),
+    )
+    if cache_key in _MESH_CACHE:
+        return _MESH_CACHE[cache_key]
+    if group is None:
+        import jax
+        import numpy as np
+        from jax.sharding import Mesh
+
+        mesh = Mesh(
+            np.asarray(jax.local_devices()[:1]).reshape(shape), axis_names=axis_names
+        )
+    else:
+        world_size = int(dist.get_world_size())
+        if layout.world_size * tp_size != world_size:
+            raise NotImplementedError(
+                f"PCP world_size={layout.world_size} x TP={tp_size} does not "
+                f"cover the torch.distributed world={world_size}."
+            )
+        expected_pcp_ranks = tuple(range(tp_rank, world_size, tp_size))
+        if layout.ranks != expected_pcp_ranks:
+            raise RuntimeError(
+                "PCP group must follow ranks 0..N-1 reshaped as PCP x TP: "
+                f"expected={expected_pcp_ranks}, actual={layout.ranks}."
+            )
+        if tp_group is not None:
+            first = layout.rank_in_group * tp_size
+            expected_tp_ranks = tuple(range(first, first + tp_size))
+            if (
+                tuple(tp_group.ranks) != expected_tp_ranks
+                or int(dist.get_rank()) != first + tp_rank
+            ):
+                raise RuntimeError(
+                    "TP group coordinates disagree with the rank-aligned "
+                    f"PCP x TP mesh: expected={expected_tp_ranks}, "
+                    f"actual={tuple(tp_group.ranks)}."
+                )
+        mesh = (
+            get_pallas_mesh(axis_names=axis_names)
+            if tp_axis_name is None
+            else get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
+        )
+    logger.info(
+        "PCP device mesh | axes=%s shape=%s PCP ranks=%s device_ids=%s",
+        axis_names,
+        shape,
+        layout.ranks,
+        layout.device_ids,
+    )
+    _MESH_CACHE[cache_key] = mesh
+    return mesh

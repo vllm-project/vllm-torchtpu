@@ -227,7 +227,7 @@ class _HostStagedParams:
 
     def __init__(self):
         # name -> (parameter, its real device tensor).
-        self._staged: dict[str, tuple[torch.nn.Parameter, torch.Tensor]] = {}
+        self._staged: dict[str, tuple[torch.nn.Parameter, torch.nn.Parameter]] = {}
 
     def stage(self, name: str, param: torch.nn.Parameter) -> torch.nn.Parameter:
         """Return a host-backed stand-in for `param` for loaders to write."""
@@ -240,7 +240,10 @@ class _HostStagedParams:
             # ``param.data`` cannot simply be re-pointed at host storage:
             # this backend's tensors carry their own TensorImpl and set_data
             # rejects the dispatch-key change.
-            host = torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False)
+            host = typing.cast(
+                torch.nn.Parameter,
+                torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False),
+            )
             host.__dict__.update(param.__dict__)
             self._staged[name] = (param, host)
         return self._staged[name][1]
@@ -337,7 +340,7 @@ class DeepseekV4Model(nn.Module):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
-                dtype=vllm_config.model_config.dtype,
+                dtype=typing.cast(torch.dtype, vllm_config.model_config.dtype),
             )
         else:
             self._mtp_hidden_buffer = None
@@ -366,12 +369,34 @@ class DeepseekV4Model(nn.Module):
     def _dp_gather_hash_moe_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """All-gather input_ids over the DP group for hash-MoE routing.
 
-        Hash layers route on hash_indices_table[input_ids], and the MoE runner
-        routes over the DP-gathered global batch, so every rank needs every id.
-        Uses the same all_gather(dim=0) as hidden_states to keep rows aligned.
+        Hash layers route on hash_indices_table[input_ids], so the ids must
+        line up row-for-row with the hidden states the experts are handed.
+        That is the DP-gathered global batch whenever the MoE runner gathers
+        it, and this rank's own rows when the layer owns its dispatch -- the
+        fused EP kernel does, and then gathering here would hand a layer ids
+        for dp_size times the rows it computes. Uses the same
+        all_gather(dim=0) as hidden_states to keep rows aligned.
         """
         dp_group = get_dp_group()
         if dp_group.world_size == 1:
+            return input_ids
+        # One gather serves every hash layer, so they have to agree on which
+        # rows they want. They are built from one config and armed by one
+        # weight-load path, so disagreeing is a bug here rather than a case to
+        # handle -- and it would be a silent shape mismatch deep in a layer.
+        hash_layers = typing.cast(
+            Iterable[DeepseekV4DecoderLayer],
+            self.layers[
+                self.start_layer : min(self.end_layer, self.config.num_hash_layers)
+            ],
+        )
+        wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
+        assert len(wants) == 1, (
+            "DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
+            "DP-gathers the token rows, so no single gather of input_ids can "
+            "serve them all"
+        )
+        if not wants.pop():
             return input_ids
         return dp_group.all_gather(input_ids, dim=0)
 
@@ -396,7 +421,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -405,7 +430,9 @@ class DeepseekV4Model(nn.Module):
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
+            hidden_states = typing.cast(
+                torch.Tensor, intermediate_tensors["hidden_states"]
+            )
 
         # Hash routing is confined to the first `num_hash_layers`; only those
         # layers need ids gathered across DP.
@@ -665,7 +692,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

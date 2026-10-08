@@ -45,6 +45,7 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -57,7 +58,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      -r pyproject.toml \
+      --group vllm
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -99,10 +101,13 @@ FROM ci AS dev
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
+# --group vllm keeps vLLM (already installed in base) in this resolution, so
+# the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
-      --extra test \
+      --group vllm \
+      --group test \
       --extra benchmarking
 
 COPY . .
@@ -115,10 +120,10 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
       sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
     fi
 
-# Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
+# Scoped to the vllm-torchtpu-core dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps -e .
 
 # Install vLLM from source if requested.
@@ -140,7 +145,19 @@ ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
 
-# Variant 4: Production/Full Image (Production/Minimal Variant)
+# Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
+FROM dev AS omni
+
+# --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
+# replace it with a PyPI vllm.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+      -r pyproject.toml \
+      --group vllm \
+      --extra omni
+
+
+# Variant 5: Production/Full Image (Production/Minimal Variant)
 # This variant copies all source code and installs the package regularly
 # without extra dev/testing tools, starting directly from the runtime base.
 FROM base AS prod
@@ -157,7 +174,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 
 # Use --no-deps to preserve layer caching since dependencies were already resolved and installed in base.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps .
 
 RUN if [ -z "$VLLM_SOURCE" ] && [ -d /workspace/vllm-torchtpu/vllm ]; then \

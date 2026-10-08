@@ -18,7 +18,7 @@ import jax.numpy as jnp
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
-import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel
+import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
@@ -58,8 +58,9 @@ def derive_metadata(
       query_start_loc: [num_reqs + 1]. Cumulative sum of query lengths.
       kv_block_table: [num_reqs * max_kv_blocks]. Flattened row-major page table
         for the compressed KV cache.
-      cache: [num_pages, physical_page_size, 4, lanes] uint8. The compressed-KV
-        buffer; only its shape is read here.
+      cache: [num_pages, physical_page_size, 4, lanes] uint8, or CSA's
+        [num_pages, physical_page_size, 128] int32 NoPE array. The
+        compressed-KV buffer; only its shape is read here.
       compress_ratio: Compression ratio (e.g. 4 for CSA, 128 for HCA).
       state_block_size: Block size vLLM used to build ``block_table``. One page
         must be able to hold that many token states; it may hold more with the
@@ -231,8 +232,8 @@ def compressor_forward(
     block_table: jax.Array,  # [num_reqs * max_blocks] int
     query_start_loc: jax.Array,  # [num_reqs + 1] int
     kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
-    cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8
-    rope_cache: jax.Array,  # [num_pages, page_size // 4, 4, 128] uint8
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
+    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
     distribution: jax.Array,  # i32[3]
     state_block_size: int,
     head_dim: int,

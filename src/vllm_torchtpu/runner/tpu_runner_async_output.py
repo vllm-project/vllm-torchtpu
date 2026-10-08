@@ -2,10 +2,65 @@
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    LogprobsLists,
+    LogprobsTensors,
+    ModelRunnerOutput,
+)
 
 INVALID_TOKEN_ID = -1
+
+
+@dataclass
+class SpecLogprobsChunk:
+    """One chunk's logprobs in a spec-decode step, one row per logits row.
+
+    A verify chunk's logits hold, per request, one row per draft token and
+    then its bonus row, so request `i`'s verify slots are rows
+    `row_starts[i]`, `row_starts[i] + 1`, ... in slot order, and its accepted
+    tokens are a prefix of them. A chunk without drafts has one row per
+    request (`row_starts[i] == i`). Rows are computed for every slot, accepted
+    or not, and filtered on the host once the accepted counts are known.
+    """
+
+    # Device tensors until the async copy is issued, CPU tensors after.
+    tensors: LogprobsTensors
+    # [num_reqs] first logprobs row of each real request in the chunk.
+    row_starts: np.ndarray
+
+
+def spec_logprobs_lists(
+    chunks: list[SpecLogprobsChunk], gen_lens: list[int]
+) -> LogprobsLists:
+    """Keep each request's accepted rows, in request order.
+
+    `gen_lens[i]` is request `i`'s number of generated tokens this step,
+    counted across all chunks before any discard, as vLLM's rejection
+    sampler does.
+    """
+    ids, lps, ranks = [], [], []
+    offset = 0
+    for chunk in chunks:
+        n = len(chunk.row_starts)
+        take = [
+            np.arange(start, start + g, dtype=np.int64)
+            for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
+        ]
+        rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
+        ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
+        lps.append(chunk.tensors.logprobs.numpy()[rows])
+        ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
+        offset += n
+    assert offset == len(gen_lens), (offset, len(gen_lens))
+    return LogprobsLists(
+        logprob_token_ids=np.concatenate(ids),
+        logprobs=np.concatenate(lps),
+        sampled_token_ranks=np.concatenate(ranks),
+        cu_num_generated_tokens=np.concatenate(([0], np.cumsum(gen_lens))).tolist(),
+    )
 
 
 @dataclass
@@ -24,13 +79,28 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
+    # Spec-decode step with logprobs requested: per-chunk logprobs, copied
+    # with the tokens and filtered to the accepted rows in `get_output`.
+    spec_logprobs: list[SpecLogprobsChunk] | None = None
+    # Device sources of `spec_logprobs`, kept alive until the copy lands.
+    _spec_logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
     def from_device_chunks(
-        cls, chunks_tpu: list[torch.Tensor], chunk_real_lens: list[int]
+        cls,
+        chunks_tpu: list[torch.Tensor],
+        chunk_real_lens: list[int],
+        spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        spec_logprobs_tpu = None
+        if spec_logprobs:
+            spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
+            spec_logprobs = [
+                SpecLogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
+                for c in spec_logprobs
+            ]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
@@ -38,6 +108,8 @@ class AsyncTPUCopyState:
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
+            spec_logprobs=spec_logprobs or None,
+            _spec_logprobs_tpu=spec_logprobs_tpu,
         )
 
     def wait(self) -> None:
@@ -45,6 +117,7 @@ class AsyncTPUCopyState:
             return
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
+        self._spec_logprobs_tpu = None
         self.completed = True
 
     @property
@@ -75,9 +148,10 @@ class AsyncPreResults:
     # on-device so the next step can correct its optimistically-advanced
     # positions/seq_lens. None for non-spec.
     spec_decode_num_rejected_tokens: torch.Tensor | None = None
-    # Spec decode only: per-request draft count proposed this step, keyed by the
-    # request_seq_lens index. _modify_prev_results uses it to size the
-    # (1 + num_draft) optimistic-placeholder rollback. None for non-spec.
+    # Per-request draft count VERIFIED this step, keyed by request_seq_lens
+    # index. Sizes the (1 + num_draft) output placeholders and their rollback;
+    # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
+    # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
 
     def wait_for_copy(self) -> torch.Tensor | None:
@@ -124,6 +198,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             valid_sampled_token_ids = [
                 seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
+            if self.copy_state.spec_logprobs:
+                self._model_runner_output.logprobs = spec_logprobs_lists(
+                    self.copy_state.spec_logprobs, gen_lens
+                )
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
 
@@ -167,14 +245,15 @@ def subtract_num_rejected_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remove the previous async step's per-request rejected-token over-count.
 
-    In async spec decode the host advances ``num_computed_tokens`` optimistically, assuming *every* speculative
-    draft was accepted. The real acceptance is only known on-device, so this
-    subtracts the actual per-request rejection count here — on-device, before the
-    verify forward.
+    In async spec decode the host advances ``num_computed_tokens`` optimistically,
+    assuming *every* speculative draft was accepted. The real acceptance is only known
+    on-device, so this subtracts the actual per-request rejection count here —
+    on-device, before the verify forward.
 
     Args:
         seq_lens: ``[num_reqs]`` optimistic sequence lengths.
-        positions: ``[total_tokens]`` (or ``[3, total_tokens]`` mrope) optimistic positions.
+        positions: ``[total_tokens]`` (or ``[3, total_tokens]`` mrope)
+            optimistic positions.
         num_rejected: ``[num_placeholder_reqs]`` rejection count per source index.
         seq_lens_subtract_indices: ``[num_reqs]`` index into ``num_rejected`` for
             each seq_lens slot, ``-1`` to leave it unchanged.
@@ -208,7 +287,7 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices][target_logits_indices + 1]
+    return input_ids[logits_indices[target_logits_indices + 1]]
 
 
 def compute_num_rejected(

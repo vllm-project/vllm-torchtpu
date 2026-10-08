@@ -29,9 +29,9 @@ def get_tpu_metadata(key: str = "") -> str:
             return accelerator_type_request.text
         else:
             logger.error(
-                "Unable to poll TPU GCE Metadata. Got "
-                f"status code: {accelerator_type_request.status_code} and "
-                f"content: {accelerator_type_request.text}"
+                "Unable to poll TPU GCE Metadata. Got status code: %s and content: %s",
+                accelerator_type_request.status_code,
+                accelerator_type_request.text,
             )
     except requests.RequestException as e:
         logger.error("Unable to poll the TPU GCE Metadata: %s", e)

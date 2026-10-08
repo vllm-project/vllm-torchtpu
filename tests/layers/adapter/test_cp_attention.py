@@ -39,8 +39,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.fixture
 def cpu_vllm_config_context():
@@ -96,6 +94,7 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         world_size=2,
         rank_in_group=rank,
         all_gather=lambda tensor, dim: torch.cat([tensor, tensor], dim=dim),
+        reduce_scatter=lambda tensor, dim: (2 * tensor).chunk(2, dim)[rank],
     )
     monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
     monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
@@ -195,6 +194,8 @@ def test_dcp_hnd_rejects_backends_that_allocate_nhd(
     get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
     impl = _impl(cls, head_size)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
-    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
-        with pytest.raises(NotImplementedError, match="DCP with HND requires"):
-            impl.initialize_kernel(layer)
+    with (
+        set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()),
+        pytest.raises(NotImplementedError, match="DCP with HND requires"),
+    ):
+        impl.initialize_kernel(layer)

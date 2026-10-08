@@ -13,9 +13,12 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, glm_named_kv_caches
-
-pytestmark = pytest.mark.cpu_test
+from .raiden_test_utils import (
+    FakeTensor,
+    dsv4_materialization,
+    glm_named_kv_caches,
+    kimi_pool_manifest,
+)
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
@@ -739,6 +742,113 @@ def test_unified_pool_requires_a_complete_listed_raw_storage():
         )
 
 
+def _block_major_fixture():
+    """Build a 2-region x 4-block `(4, 2, 128, 1, 4, 256)` FP8 fixture.
+
+    Each page is 131,072 B. Region 0 hosts FA layer 1 and GDN layer 0; region 1
+    hosts FA layer 5 and GDN layer 4.
+    """
+    geometry = rpm.GdnHeadGeometry(
+        local_key_heads=4,
+        local_value_heads=8,
+        key_head_dim=64,
+        value_head_dim=32,
+        conv_kernel_size=3,
+    )
+    pool = FakeTensor((4, 2, 128, 1, 4, 256), 1, dtype="torch.float8_e4m3fn")
+    fa = ["model.layers.1.self_attn.attn", "model.layers.5.self_attn.attn"]
+    gdn = ["model.layers.0.linear_attn", "model.layers.4.linear_attn"]
+    named = {fa[0]: pool, fa[1]: pool, gdn[0]: [pool], gdn[1]: [pool]}
+    groups = (
+        _fa_group(fa, block_size=128, num_kv_heads=2, head_size=256),
+        _pooled_gdn_group(
+            gdn,
+            shapes=((2, 768), (8, 64, 32)),
+            dtypes=("torch.bfloat16", "torch.float32"),
+            page_size_bytes=131_072,
+        ),
+    )
+    layout = types.SimpleNamespace(
+        num_blocks=4,
+        num_pools=2,
+        split=1,
+        pool_index_by_layer={fa[0]: 0, gdn[0]: 0, fa[1]: 1, gdn[1]: 1},
+    )
+    return pool, named, groups, geometry, layout
+
+
+def test_block_major_pool_places_each_region_inside_the_row():
+    pool, named, groups, geometry, layout = _block_major_fixture()
+    ordinals = {name: 0 for name in named if "linear_attn" in name}
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(pool,),
+        gdn_geometry=geometry,
+        mamba_group_ordinal_by_layer=ordinals,
+        block_major=layout,
+    )
+
+    assert manifest.binding == rpm.BINDING_ALIASED_RAW
+    assert manifest.storages == [pool]
+    by_layer = {(pool_.tag, pool_.layer_name): pool_ for pool_ in manifest.pools}
+    assert len(by_layer) == 6
+    page = 131_072
+    ssm_bytes = 8 * 64 * 32 * 4
+    # Every pool spans the whole row per block and counts scheduler blocks.
+    assert all(entry.num_blocks == 4 for entry in manifest.pools)
+    assert all(entry.block_stride_bytes == 2 * page for entry in manifest.pools)
+    assert all(entry.storage_index == 0 for entry in manifest.pools)
+    for region, (fa, gdn) in enumerate(
+        (
+            ("model.layers.1.self_attn.attn", "model.layers.0.linear_attn"),
+            ("model.layers.5.self_attn.attn", "model.layers.4.linear_attn"),
+        )
+    ):
+        base = region * page
+        fa_pool = by_layer[(rpm.TAG_FA, fa)]
+        ssm_pool = by_layer[(f"{rpm.TAG_GDN_SSM}.g0", gdn)]
+        conv_pool = by_layer[(f"{rpm.TAG_GDN_CONV}.g0", gdn)]
+        assert fa_pool.base_offset_bytes == base
+        assert fa_pool.live_bytes_per_block == page
+        assert ssm_pool.base_offset_bytes == base
+        assert conv_pool.base_offset_bytes == base + ssm_bytes
+        assert (
+            conv_pool.base_offset_bytes
+            + max(r.extent_end_bytes for r in conv_pool.regions)
+        ) <= base + page
+    # The regions are the layer-major ones: only the placement moved.
+    (fa_region,) = by_layer[(rpm.TAG_FA, "model.layers.1.self_attn.attn")].regions
+    assert (
+        fa_region.num_units,
+        fa_region.units_per_stride,
+        fa_region.stride_bytes,
+    ) == (128, 2, 1024)
+    manifest.geometry_by_tag()
+    rpm.verify_storage_binding(manifest, named, raw_tensors=(pool,))
+
+
+def test_block_major_pool_manifest_rejects_a_foreign_layer_or_pool():
+    pool, named, groups, geometry, layout = _block_major_fixture()
+    with pytest.raises(rpm.ManifestError, match="exactly one raw pool"):
+        rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(pool, pool),
+            gdn_geometry=geometry,
+            block_major=layout,
+        )
+    del layout.pool_index_by_layer["model.layers.5.self_attn.attn"]
+    with pytest.raises(rpm.ManifestError, match="no region in the block-major"):
+        rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(pool,),
+            gdn_geometry=geometry,
+            block_major=layout,
+        )
+
+
 def test_mixed_binding_is_rejected():
     page = 4_268_032
     raw = FakeTensor((16 * page,), 1, dtype="torch.int8")
@@ -934,3 +1044,178 @@ def test_glm_manifest_rejects_bad_geometry(overrides, message):
         rpm.build_glm_mla_pool_manifest(
             named_kv_caches=named, raw_tensors=(), block_size_tokens=_GLM_BLOCK_SIZE
         )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.
+# ---------------------------------------------------------------------------
+
+
+def test_dsv4_manifest_tags_every_pool_with_its_cache_group():
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    assert manifest.tag_counts() == {
+        "dsv4.csa.nope.g0": 2,
+        "dsv4.csa.rope.g0": 2,
+        "dsv4.idx.g1": 2,
+        "dsv4.hca.g2": 1,
+        "dsv4.swa.g3": 2,
+        "dsv4.state.csa.g4": 2,
+        "dsv4.state.idx.g5": 2,
+        "dsv4.state.hca.g6": 1,
+    }
+    # Aliased pools resolve to the storage they were overlaid onto, so the
+    # manifest registers each array exactly once.
+    assert len(manifest.storages) == 2 + 2 + 2 + 1  # csa nope/rope, idx, hca
+
+
+def test_dsv4_aliased_pools_share_their_host_storage_and_geometry():
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    by_tag: dict[str, list] = {}
+    for pool in manifest.pools:
+        by_tag.setdefault(pool.tag, []).append(pool)
+
+    # SWA, the CSA state and the HCA state all sit on CSA NoPE array 0, at the
+    # same byte offset. Only the block IDs their cache groups hand out keep
+    # them apart, which is why each carries a different tag.
+    host = by_tag["dsv4.csa.nope.g0"][0]
+    for tag in ("dsv4.swa.g3", "dsv4.state.csa.g4", "dsv4.state.hca.g6"):
+        alias = by_tag[tag][0]
+        assert alias.storage_index == host.storage_index
+        assert alias.base_offset_bytes == host.base_offset_bytes
+        assert alias.block_stride_bytes == host.block_stride_bytes
+        assert alias.num_blocks == host.num_blocks
+
+
+def test_dsv4_csa_state_pool_covers_nope_only():
+    """The compressor runs CSA in overlap mode: no separate state view, and
+    the state rows go through NoPE, so RoPE holds no state to transfer."""
+    named, groups = dsv4_materialization()
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    state_pools = [p for p in manifest.pools if p.tag == "dsv4.state.csa.g4"]
+    rope_storages = {
+        p.storage_index for p in manifest.pools if p.tag == "dsv4.csa.rope.g0"
+    }
+    assert len(state_pools) == 2
+    assert not {p.storage_index for p in state_pools} & rope_storages
+
+
+@pytest.mark.parametrize(
+    "layer_name,replacement,match",
+    [
+        # Both SWA layers of group 3 land on one CSA NoPE array. They share a
+        # block table, so this is real corruption rather than benign aliasing.
+        (
+            "model.layers.1.self_attn.swa_cache",
+            "model.layers.0.self_attn.swa_cache",
+            "share an array inside",
+        ),
+        # HCA keeps raw bf16 latents: two rows per token, not one.
+        ("model.layers.2.self_attn.attn", (16, 256, 4, 128), "256 rows; the 256-token"),
+    ],
+)
+def test_dsv4_manifest_rejects_a_materialization_it_cannot_describe(
+    layer_name, replacement, match
+):
+    named, groups = dsv4_materialization()
+    named[layer_name] = (
+        named[replacement]
+        if isinstance(replacement, str)
+        else FakeTensor(replacement, 1, dtype="torch.uint8")
+    )
+
+    with pytest.raises(rpm.ManifestError, match=match):
+        rpm.build_dsv4_pool_manifest(
+            named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+        )
+
+
+def test_dsv4_state_cache_name_resolves_its_compressed_kv_layer():
+    assert (
+        rpm.dsv4_compressed_kv_layer_name(
+            "model.layers.3.self_attn.attn.compressor.state_cache"
+        )
+        == "model.layers.3.self_attn.attn"
+    )
+    assert (
+        rpm.dsv4_compressed_kv_layer_name(
+            "model.layers.3.self_attn.attn.indexer.compressor.state_cache"
+        )
+        == "model.layers.3.self_attn.attn.indexer.k_cache"
+    )
+    with pytest.raises(rpm.ManifestError, match="cannot be derived"):
+        rpm.dsv4_compressed_kv_layer_name("model.layers.3.self_attn.attn")
+
+
+def test_glm_manifest_per_layer_tags():
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(),
+        raw_tensors=(),
+        block_size_tokens=1024,
+        per_layer_tags=True,
+    )
+    assert sorted(pool.tag for pool in manifest.pools) == [
+        "dsa.idx.l0",
+        "mla.nope.l0",
+        "mla.nope.l1",
+        "mla.rope.l0",
+        "mla.rope.l1",
+    ]
+    assert {pool.regions[0].name for pool in manifest.pools_of_class("mla.nope")} == {
+        "mla_nope_rows"
+    }
+    assert set(manifest.geometry_by_tag()) == {"mla.nope", "mla.rope", "dsa.idx"}
+
+
+def test_kimi_fp8_pool_keeps_the_bf16_pool_byte_geometry():
+    """An fp8 K3 pool packs four tokens per row instead of two, in the same
+    2,560 bytes, and its KDA state regions do not move."""
+    bf16 = kimi_pool_manifest(3, kv_dtype="bfloat16")
+    fp8 = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
+
+    assert bf16.storages[0].shape[1:] == (81, 2, 640)
+    assert fp8.storages[0].shape[1:] == (81, 4, 640)
+    assert [pool.tag for pool in fp8.pools] == [pool.tag for pool in bf16.pools]
+    for bf16_pool, fp8_pool in zip(bf16.pools, fp8.pools):
+        assert fp8_pool.base_offset_bytes == bf16_pool.base_offset_bytes
+        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 207360
+        assert fp8_pool.regions == bf16_pool.regions
+        assert (bf16_pool.dtype_tag, fp8_pool.dtype_tag) == (
+            "bfloat16",
+            "float8_e4m3fn",
+        )
+    conv, ssm, fa = fp8.pools
+    # SSM is f32 and conv is bf16 whatever the pool dtype: 77 + 4 rows.
+    assert ssm.live_bytes_per_block == 3 * 128 * 128 * 4
+    assert conv.base_offset_bytes == 77 * 2560
+    assert conv.live_bytes_per_block == 4 * 2560
+    assert fa.regions[0].unit_bytes == 2560
+
+
+@pytest.mark.parametrize(
+    ("shape", "itemsize", "dtype", "match"),
+    [
+        ((4, 81, 4, 640), 1, "torch.float8_e5m2", "must be bf16 or fp8"),
+        ((4, 81, 4, 640), 1, "torch.uint8", "must be bf16 or fp8"),
+        # A packing axis that does not fill the 32-bit word.
+        ((4, 162, 2, 640), 1, "torch.float8_e4m3fn", "invalid packed-row geometry"),
+        ((4, 81, 4, 320), 2, "torch.bfloat16", "invalid packed-row geometry"),
+    ],
+    ids=["fp8-e5m2", "uint8", "fp8-packing-2", "bf16-packing-4"],
+)
+def test_kimi_manifest_rejects_a_pool_it_cannot_describe(shape, itemsize, dtype, match):
+    pool = FakeTensor(shape, itemsize, dtype=dtype)
+    with pytest.raises(rpm.ManifestError, match=match):
+        kimi_pool_manifest(3, pool=pool)

@@ -1,9 +1,10 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 
@@ -30,6 +31,7 @@ class FakeRoutedExperts(RoutedExperts):
         return expert_id
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_create_weights_and_process():
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
@@ -55,7 +57,8 @@ def test_mxfp4_create_weights_and_process():
         params_dtype=torch.bfloat16,
     )
 
-    # Validate that extra_weight_attrs["weight_loader"] correctly captured get_tpu_cpu_weight_loader_hook
+    # Validate that extra_weight_attrs["weight_loader"] correctly captured
+    # get_tpu_cpu_weight_loader_hook
     assert hasattr(layer, "w13_weight_packed")
     assert hasattr(layer, "w13_weight_scale")
     assert hasattr(layer, "w2_weight_packed")
@@ -68,10 +71,14 @@ def test_mxfp4_create_weights_and_process():
     assert weight_loader is not None
 
     # Load fake MXFP4 weights
-    # w1/w3 checkpoint shape: [intermediate_size_per_partition, hidden_size // 2] -> [64, 64]
-    # w1/w3 scale checkpoint shape: [intermediate_size_per_partition, hidden_size // 32] -> [64, 4]
-    # w2 checkpoint shape: [hidden_size, intermediate_size_per_partition // 2] -> [128, 32]
-    # w2 scale checkpoint shape: [hidden_size, intermediate_size_per_partition // 32] -> [128, 2]
+    # w1/w3 checkpoint shape: [intermediate_size_per_partition, hidden_size // 2]
+    #   -> [64, 64]
+    # w1/w3 scale checkpoint shape: [intermediate_size_per_partition, hidden_size // 32]
+    #   -> [64, 4]
+    # w2 checkpoint shape: [hidden_size, intermediate_size_per_partition // 2]
+    #   -> [128, 32]
+    # w2 scale checkpoint shape: [hidden_size, intermediate_size_per_partition // 32]
+    #   -> [128, 2]
     w13_packed_val = torch.ones(64, 64, dtype=torch.uint8)
     w13_scale_val = torch.ones(64, 4, dtype=torch.uint8)
     w2_packed_val = torch.ones(128, 32, dtype=torch.uint8)
@@ -123,9 +130,11 @@ def test_mxfp4_create_weights_and_process():
     assert hasattr(layer, "w2_weight_scale")
     assert not hasattr(layer, "w13_weight_packed")
 
-    # w13 native fp4 K-major: [E, K, N] -> N=128, K=128, last dim halved for float4_e2m1fn_x2 -> [4, 128, 64]
+    # w13 native fp4 K-major: [E, K, N] -> N=128, K=128, last dim halved for
+    # float4_e2m1fn_x2 -> [4, 128, 64]
     assert layer.w13_weight.shape == (4, 128, 64)
-    # w2 native fp4 K-major: [E, K, N] -> N=128, K=64, last dim halved for float4_e2m1fn_x2 -> [4, 64, 64]
+    # w2 native fp4 K-major: [E, K, N] -> N=128, K=64, last dim halved for
+    # float4_e2m1fn_x2 -> [4, 64, 64]
     assert layer.w2_weight.shape == (4, 64, 64)
 
     # w13_scale_4d: [E, num_blocks, 1, N] -> [4, 4, 1, 128]
@@ -197,6 +206,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
     assert mock_gmm.call_args.kwargs["skip_padded_tokens"] is True
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     """The decode-shaped MoE call must not mix otherwise identical rows."""
     moe_config = MagicMock(w13_num_shards=2)
@@ -329,6 +339,7 @@ def test_mxfp4_create_weights_does_not_zero_initialize():
         assert hasattr(layer, name)
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_processes_directly_materialized_dummy_weights():
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
@@ -486,6 +497,7 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w2_scale[:, :, 1:].any()
 
 
+@pytest.mark.tpu_test
 def test_mxfp4_requantize_block():
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed,
@@ -584,8 +596,9 @@ def test_mxfp4_requantize_block():
 
     actual_w13_f32 = unpack_uint8_to_fp4(layer.w13_weight.data.cpu().view(torch.uint8))
 
-    # XLA and PyTorch round quantization ties slightly differently (1% of values shift by 1 bin).
-    # Since the spacing in FP4 e2m1 is at most 1.0 around the low values, we permit a max diff of 1.0.
+    # XLA and PyTorch round quantization ties slightly differently (1% of values shift
+    # by 1 bin). Since the spacing in FP4 e2m1 is at most 1.0 around the low values, we
+    # permit a max diff of 1.0.
     max_diff = (actual_w13_f32 - w13_fp4_f32_expected_kmajor).abs().max()
     assert max_diff <= 1.0, f"Max diff on w13 ({max_diff}) exceeded 1.0"
 
@@ -598,7 +611,7 @@ def test_mxfp4_requantize_block():
 def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
         compressed_tensors_moe_w4an_mxfp4 as module,
     )
 

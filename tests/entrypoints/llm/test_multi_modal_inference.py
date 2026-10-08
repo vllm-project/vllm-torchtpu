@@ -36,6 +36,8 @@ from vllm.multimodal.image import convert_image_mode
 
 from vllm_torchtpu import tpu_info
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 # Known-good partial text outputs for the cherry-blossom image.
@@ -46,7 +48,8 @@ EXPECTED_TEXTS = (
     "clear and blue, providing a vibrant backdrop to the scene. The tower appears to "
     "be a significant landmark",
     "The image depicts a stunning view of the Tokyo Skytree, a tall broadcasting tower "
-    "located in the Odaiba district of Tokyo, Japan. The skytree is surrounded by cherry "
+    "located in the Odaiba district of Tokyo, Japan. "
+    "The skytree is surrounded by cherry "
     "blossom trees in full bloom, creating a picturesque and vibrant scene. The cherry "
     "blossoms are in various stages of bloom, with some branches densely covered",
 )

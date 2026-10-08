@@ -14,7 +14,8 @@
 # limitations under the License.
 
 # Priority constants for pipeline jobs.
-# Post-merge > Pre-merge > Integration pipeline > Benchmark > Other/Default > Nightly
+# On-call fix > Post-merge > Pre-merge > Integration pipeline > Benchmark > Other/Default > Nightly
+export PRIORITY_ONCALL_FIX=12
 export PRIORITY_POST_MERGE=11
 export PRIORITY_PRE_MERGE=6
 export PRIORITY_INTEGRATION=4

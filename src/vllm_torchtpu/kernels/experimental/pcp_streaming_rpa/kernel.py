@@ -42,6 +42,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     RuntimeScheduleField,
     TilePlanField,
     build_pcp_streaming_schedule_inputs_from_metadata_jax,
+    query_row_positions,
 )
 
 AXIS = "pcp"
@@ -423,6 +424,9 @@ def _consume_scheduled_kv_page_multi_head(
         q_global_start = sched_vmem_ref[
             consumer_rank, lane, RuntimeScheduleField.Q_GLOBAL_START
         ]
+        q_hbm_offset = sched_vmem_ref[
+            consumer_rank, lane, RuntimeScheduleField.Q_HBM_OFFSET
+        ]
         kv_global_start = sched_vmem_ref[
             consumer_rank, lane, RuntimeScheduleField.KV_GLOBAL_START
         ]
@@ -511,12 +515,12 @@ def _consume_scheduled_kv_page_multi_head(
             if causal:
                 scores = scores * sm_scale
                 q_interleave = interleave_size
-                q_chunk_idx = lax.div(q_row, q_interleave)
-                q_chunk_offset = lax.rem(q_row, q_interleave)
-                q_pos = (
-                    q_global_start
-                    + q_chunk_idx * pcp_size * q_interleave
-                    + q_chunk_offset
+                q_pos = query_row_positions(
+                    q_global_start,
+                    q_hbm_offset,
+                    q_row,
+                    pcp_size=pcp_size,
+                    interleave_size=q_interleave,
                 )
                 kv_chunk_idx = lax.div(kv_local_pos, q_interleave)
                 kv_chunk_offset = lax.rem(kv_local_pos, q_interleave)

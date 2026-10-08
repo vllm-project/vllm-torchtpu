@@ -233,8 +233,8 @@ def select_experts(
     1. DeepSeek-V4 hash routing (if `layer.hash_indices_table` is present).
     2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
        config actually requires grouped selection).
-    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
-       and optional `e_score_correction_bias`.
+    3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for
+       DeepSeek-V4) and optional `e_score_correction_bias`.
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.
@@ -247,6 +247,8 @@ def select_experts(
     )
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        # hash_indices_table is only set when layer is not None.
+        assert layer is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -268,6 +270,7 @@ def select_experts(
             grouped_topk,
         )
 
+        assert layer is not None
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,

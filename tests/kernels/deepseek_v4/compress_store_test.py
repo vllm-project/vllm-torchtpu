@@ -13,12 +13,16 @@
 # limitations under the License.
 """Correctness test for Kernel 2 (compress_norm_rope_store)."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compress_store_ref,
     config,
@@ -29,6 +33,8 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     project_and_save_state_ref as proj_and_save_state_ref,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 
 def generate_kv_slot_mapping(
@@ -50,6 +56,39 @@ def generate_kv_slot_mapping(
     return jnp.array(kv_slot_mapping_np, dtype=jnp.int32)
 
 
+# Block table size for a long-context server: one row per request and one
+# column per state block of the longest context. With CSA's 16-token state
+# blocks, that is 64 x 65,536 int32 entries (16 MiB), more than the 1 MiB of
+# SMEM on TPU v7x.
+LONG_CONTEXT_NUM_REQS = 64
+LONG_CONTEXT_MAX_MODEL_LEN = 1_048_576
+
+
+def make_block_table(rows, cols, pages_for_state, num_pages):
+    """Build a block table whose rows differ in the order of their state pages.
+
+    Row 0 maps state block i to page i. Every other row lists the populated
+    state pages in a different order, so a lookup in the wrong row reads the
+    wrong pages. The remaining pages map to themselves. Any columns beyond
+    num_pages are zero; with `rows` and `cols` set, the table has the size a
+    long-context server's would.
+    """
+    assert rows <= math.factorial(pages_for_state)
+    rng = np.random.default_rng(0)
+    orders = [tuple(range(pages_for_state))]
+    while len(orders) < rows:
+        order = tuple(int(p) for p in rng.permutation(pages_for_state))
+        if order not in orders:
+            orders.append(order)
+
+    table = np.zeros((rows, max(num_pages, cols or 0)), dtype=np.int32)
+    table[:, :pages_for_state] = np.array(orders, dtype=np.int32)
+    table[:, pages_for_state:num_pages] = np.arange(
+        pages_for_state, num_pages, dtype=np.int32
+    )
+    return table
+
+
 def normalize_fp8_zero_sign(arr):
     is_zero = (arr & 0x7F) == 0
     return jnp.where(is_zero, 0, arr)
@@ -64,6 +103,15 @@ def normalize_bf16_zero_sign(arr):
     new_odd = jnp.where(is_zero, odd & 0x7F, odd)
     normalized = jnp.stack([even, new_odd], axis=-1)
     return normalized.reshape(orig_shape)
+
+
+def normalize_bf16_words_zero_sign(words):
+    """`normalize_bf16_zero_sign` for int32 words holding two bf16 each."""
+    u = jax.lax.bitcast_convert_type(words, jnp.uint32)
+    lo, hi = u & 0xFFFF, u >> 16
+    lo = jnp.where((lo & 0x7FFF) == 0, 0, lo)
+    hi = jnp.where((hi & 0x7FFF) == 0, 0, hi)
+    return jax.lax.bitcast_convert_type(lo | (hi << 16), jnp.int32)
 
 
 class CompressStoreTest(jtu.JaxTestCase):
@@ -85,6 +133,8 @@ class CompressStoreTest(jtu.JaxTestCase):
         prefill_len=None,
         interpret=False,
         hidden_size=7168,
+        block_table_rows=1,
+        block_table_max_model_len=None,
     ):
         # Create config first
         if head_dim == 128:
@@ -118,10 +168,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             else state_page_capacity
         )
         cfgs = make_cfgs(state_block_size)
-        if mode is config.Mode.HCA:
-            separate_state = True
-        else:
-            separate_state = False
+        separate_state = mode is config.Mode.HCA
 
         state_width = cfgs.state_width
         state_dim = 2 * state_width
@@ -161,10 +208,10 @@ class CompressStoreTest(jtu.JaxTestCase):
         def state_slot(token_index):
             """Physical state row of a token, the way `derive_metadata` maps it.
 
-            The block table below is the identity, so the page number is just
-            the block index. Tokens are page-strided, not densely packed: a
-            page holds `state_page_capacity` states but is only paged at
-            `state_block_size` of them.
+            States are written through an identity page mapping, so the page
+            number is just the block index. Tokens are page-strided, not densely
+            packed: a page holds `state_page_capacity` states but is only paged
+            at `state_block_size` of them.
             """
             return (token_index // state_block_size) * cfgs.state_physical_page_size + (
                 token_index % state_block_size
@@ -199,6 +246,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         else:
             populated_cache = populated_state_cache
             populated_state_cache = None
+        if cfgs.dims.has_rope_cache:
+            # CSA's cache is allocated as int32 words (see csa_cache_layout).
+            populated_cache = csa_cache_layout.slabs_to_words(populated_cache)
 
         # 3. Setup Kernel 2 inputs
         if token_to_req_indices is None:
@@ -241,7 +291,11 @@ class CompressStoreTest(jtu.JaxTestCase):
         kv_slot_mapping = jnp.array(kv_slot_mapping_padded)
 
         if block_table is None:
-            block_table = jnp.array([[i for i in range(num_pages)]], dtype=jnp.int32)
+            cols = None
+            if block_table_max_model_len:
+                cols = block_table_max_model_len // state_block_size
+            table = make_block_table(block_table_rows, cols, pages_for_state, num_pages)
+            block_table = jnp.array(table)
         else:
             block_table = jnp.array(block_table)
         block_table_stride = block_table.shape[1]
@@ -254,8 +308,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         cos_sin_cache = jax.random.normal(k5, (cos_sin_cache_len, rope_head_dim))
 
         if cfgs.dims.has_rope_cache:
+            num_rope_pages, rope_rows, _, lanes = cfgs.rope_cache_shape(num_pages)
             init_rope_cache = jnp.zeros(
-                cfgs.rope_cache_shape(num_pages), dtype=jnp.uint8
+                (num_rope_pages, rope_rows, lanes), dtype=jnp.int32
             )
         else:
             init_rope_cache = jnp.zeros((num_pages, 1, 1, 128), dtype=jnp.uint8)
@@ -327,6 +382,11 @@ class CompressStoreTest(jtu.JaxTestCase):
             interpret=interpret,
         )
         pallas_cache_output, pallas_rope_output = pallas_out
+        if cfgs.dims.has_rope_cache:
+            self.assertEqual(pallas_cache_output.dtype, jnp.int32)
+            self.assertEqual(ref_cache_output.dtype, jnp.int32)
+            pallas_cache_output = csa_cache_layout.words_to_slabs(pallas_cache_output)
+            ref_cache_output = csa_cache_layout.words_to_slabs(ref_cache_output)
 
         if is_quantized:
             pallas_cache_normalized = normalize_fp8_zero_sign(pallas_cache_output)
@@ -336,8 +396,9 @@ class CompressStoreTest(jtu.JaxTestCase):
             ref_cache_normalized = normalize_bf16_zero_sign(ref_cache_output)
 
         if cfgs.dims.has_rope_cache:
-            pallas_rope_normalized = normalize_bf16_zero_sign(pallas_rope_output)
-            ref_rope_normalized = normalize_bf16_zero_sign(ref_rope_output)
+            self.assertEqual(pallas_rope_output.dtype, jnp.int32)
+            pallas_rope_normalized = normalize_bf16_words_zero_sign(pallas_rope_output)
+            ref_rope_normalized = normalize_bf16_words_zero_sign(ref_rope_output)
             self.assertArraysEqual(pallas_rope_normalized, ref_rope_normalized)
 
         self.assertArraysEqual(pallas_cache_normalized, ref_cache_normalized)
@@ -496,6 +557,56 @@ class CompressStoreTest(jtu.JaxTestCase):
                 overlap=True,
                 physical_page_size=32,
                 quant_block=128,
+            ),
+        ),
+        (
+            "csa_long_context_table",
+            dict(
+                num_tokens=128,
+                head_dim=512,
+                rope_head_dim=64,
+                compress_ratio=4,
+                overlap=True,
+                physical_page_size=256,
+                token_to_req_indices=(
+                    np.arange(128, dtype=np.int32) % LONG_CONTEXT_NUM_REQS
+                ),
+                block_table_rows=LONG_CONTEXT_NUM_REQS,
+                block_table_max_model_len=LONG_CONTEXT_MAX_MODEL_LEN,
+            ),
+        ),
+        (
+            "hca_long_context_table",
+            dict(
+                num_tokens=256,
+                head_dim=512,
+                rope_head_dim=64,
+                compress_ratio=128,
+                overlap=False,
+                physical_page_size=16,
+                state_physical_page_size=256,
+                token_to_req_indices=(
+                    np.arange(256, dtype=np.int32) % LONG_CONTEXT_NUM_REQS
+                ),
+                block_table_rows=LONG_CONTEXT_NUM_REQS,
+                block_table_max_model_len=LONG_CONTEXT_MAX_MODEL_LEN,
+            ),
+        ),
+        (
+            "csa_indexer_long_context_table",
+            dict(
+                num_tokens=128,
+                head_dim=128,
+                rope_head_dim=64,
+                compress_ratio=4,
+                overlap=True,
+                physical_page_size=32,
+                quant_block=128,
+                token_to_req_indices=(
+                    np.arange(128, dtype=np.int32) % LONG_CONTEXT_NUM_REQS
+                ),
+                block_table_rows=LONG_CONTEXT_NUM_REQS,
+                block_table_max_model_len=LONG_CONTEXT_MAX_MODEL_LEN,
             ),
         ),
         (

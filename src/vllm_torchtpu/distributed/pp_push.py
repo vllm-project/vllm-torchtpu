@@ -42,8 +42,9 @@ reply ring, so the widening is installed in the engine process and, through
 widest any pipeline in the process asked for.
 """
 
+import contextlib
 from concurrent.futures import Future
-from typing import Any
+from typing import Any, cast
 
 from vllm.logger import init_logger
 
@@ -142,10 +143,8 @@ class _PushFuture(Future):
         self._wave.before_waiting(self._executor, self._step, self._real_step)
         # The executor's future resolves only inside result(); a stored
         # exception raises there and is read back below.
-        try:
+        with contextlib.suppress(Exception):
             self._inner.result(timeout)
-        except Exception:
-            pass
         return self._inner.exception(timeout=0)
 
     def done(self):
@@ -254,13 +253,13 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         step = state.dispatched()
         # For pooling models and for steps without sampling the engine
         # waits on this future directly, so it pushes like the sampling one.
-        inner = orig_execute(self, scheduler_output, non_block=True)
+        inner = cast(Future, orig_execute(self, scheduler_output, non_block=True))
         future = _PushFuture(inner, self, state, step, state.real_steps)
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
         state = _state(self)
-        inner = orig_sample(self, grammar_output, non_block=True)
+        inner = cast(Future, orig_sample(self, grammar_output, non_block=True))
         # Sampling belongs to the last dispatched step, whatever pushes
         # went out since.
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)

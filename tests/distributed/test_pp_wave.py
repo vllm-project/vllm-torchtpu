@@ -287,7 +287,7 @@ def test_a_forward_that_drops_a_side_tensor_is_refused(monkeypatch):
         )
 
 
-def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_input_once():
+def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_input_once():  # noqa: E501
     """The next stage's first norm adds hidden states and residual in
     float32, normalizes the sum and keeps it rounded as the residual. The
     hand-off sends the sum rounded to the model dtype with a zero residual,

@@ -116,7 +116,8 @@ def main(args: dict):
         llm.start_profile()
     if use_chat_template:
         logger.info(
-            f"Using LLM chat API for inference with extra chat kwargs: {chat_template_kwargs}"
+            "Using LLM chat API for inference with extra chat kwargs: %s",
+            chat_template_kwargs,
         )
         conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
         outputs = llm.chat(

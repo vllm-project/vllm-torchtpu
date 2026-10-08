@@ -44,7 +44,8 @@ def quantized_matmul_kernel(
     Args:
       x: Input unquantized array.
       w_q: Weight quantized array. [n_output_features, n_input_features]
-      w_scale: Weight quantization scale. [n_input_features // block_size, 1, n_output_features]
+      w_scale: Weight quantization scale.
+        [n_input_features // block_size, 1, n_output_features]
       w_zp: Weight zero point for asymmetric quantization.
       block_size: Block size for subchannel quantization.
       x_q_dtype: Quantization type of the input. If None or if the value is the
@@ -169,9 +170,11 @@ def quantized_matmul_kernel(
     )
 
     steps_k = in_block_size // block_size
-    # n_lane_multiplier > 1 could improve perf by reducing loop overhead and increasing instruction-level parallelism,
-    # allowing the compiler to overlap output fusion and packing overhead with MXU computation
-    # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
+    # n_lane_multiplier > 1 could improve perf by reducing loop overhead and increasing
+    # instruction-level parallelism, allowing the compiler to overlap output fusion and
+    # packing overhead with MXU computation
+    # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when
+    # JAX version is newer
     compute_tile_n = MXU_SIZE * n_lane_multiplier
     if out_block_size % compute_tile_n != 0:
         raise ValueError(f"{out_block_size=} must be divisible by {compute_tile_n=}.")

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import torch
@@ -42,7 +42,7 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
 )
-from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
     VllmDeepseekV4SWACache,
     _attention_csa,
@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
 
@@ -129,7 +130,8 @@ def _name_float(value: float) -> str:
     return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
-def _live_cache(entry: object) -> torch.Tensor | None:
+# `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
+def _live_cache(entry: Any) -> torch.Tensor | None:
     """The array bound to a layer, or None while it has none.
 
     vLLM binds a numel==0 placeholder until `initialize_kv_cache` runs, so an
@@ -142,6 +144,11 @@ class VllmDeepseekV4MLAAttention(
     dsv4_attention.DeepseekV4Attention, AttentionLayerBase
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+
+    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
+    mla_attn: VllmDeepseekV4MLAAttention
+    # Set to True on DSpark draft layers; read with getattr(..., False).
+    non_causal_multi_token_decode: bool
 
     def __init__(
         self,
@@ -172,16 +179,20 @@ class VllmDeepseekV4MLAAttention(
             self.custom_prefix = prefix
             object.__setattr__(self, "mla_attn", self)
             for module in self.modules():
-                if module is not self and hasattr(module, "get_kv_cache_spec"):
-                    if module.__class__.__name__ == "DeepseekV4Attention":
-                        module.get_kv_cache_spec = self.get_kv_cache_spec
+                if (
+                    module is not self
+                    and hasattr(module, "get_kv_cache_spec")
+                    and module.__class__.__name__ == "DeepseekV4Attention"
+                ):
+                    module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
             torch.cuda.Event = orig_cuda_event
 
-        # Bind compressor key-cache reference to SWA or main layer depending on compression ratio.
+        # Bind compressor key-cache reference to SWA or main layer depending on
+        # compression ratio.
         if hasattr(self, "compressor") and self.compressor is not None:
             if self.compress_ratio <= 1:
                 object.__setattr__(self.compressor, "k_cache", self.swa_cache_layer)
@@ -242,7 +253,7 @@ class VllmDeepseekV4MLAAttention(
         block_size = vllm_config.cache_config.block_size
         comp_ratio = max(1, self.compress_ratio)
         hf_config = vllm_config.model_config.hf_config
-        if comp_ratio == 4:
+        if comp_ratio == 4:  # noqa: SIM108 (one comment per branch)
             # CSA (`sparse_mla`) reads the NoPE record from this array and the
             # RoPE channels from the companion `{prefix}_rope` array; the
             # packed width here budgets for both.
@@ -263,7 +274,8 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def attn_op(self):
-        """The Pallas attention op, built lazily on first forward with final runtime geometry."""
+        """The Pallas attention op, built lazily on first forward
+        with final runtime geometry."""
         op = self.__dict__.get("_attn_op_instance")
         if op is not None:
             return op
@@ -286,7 +298,7 @@ class VllmDeepseekV4MLAAttention(
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
@@ -324,13 +336,15 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
+            vllm_config.cache_config.block_size, self.window_size
         )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self.mla_attn, "scale", None)
             or getattr(self.mla_attn, "softmax_scale", None)
@@ -411,7 +425,8 @@ class VllmDeepseekV4MLAAttention(
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
 
-        # Donate sw_cache to permit in-place updates by the Pallas sliding-window kernel.
+        # Donate sw_cache to permit in-place updates by the Pallas
+        # sliding-window kernel.
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
@@ -460,7 +475,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions
@@ -485,7 +500,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions
@@ -557,7 +572,7 @@ class VllmDeepseekV4MLAAttention(
         """Bitcast 1-byte cache allocations to uint8 required by Pallas kernels."""
         if cache is None:
             return None
-        if cache.dtype != torch.uint8:
+        if cache.dtype not in (torch.uint8, torch.int32):
             return cache.view(torch.uint8)
         return cache
 
@@ -639,7 +654,8 @@ class VllmDeepseekV4MLAAttention(
         if not swa_only and main_attn_metadata is not None:
             main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
             if main_cache_kv is None:
-                # Clone tensor handle so XLA traces distinct operands for signature matching.
+                # Clone tensor handle so XLA traces distinct operands for
+                # signature matching.
                 main_cache_kv = sw_cache.clone()
             m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
             main_kv_lens = (
@@ -732,7 +748,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions
@@ -752,7 +768,7 @@ class VllmDeepseekV4MLAAttention(
                   self.n_local_groups * self.o_lora_rank).
         """
         del act_dtype
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
             self.n_local_groups * self.o_lora_rank,
@@ -775,7 +791,7 @@ class VllmDeepseekV4MLAAttention(
         The kernel is the only `wo_a` path, so an unmet condition is a
         configuration error.
         """
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         scale = getattr(self.wo_a, "weight_scale", None)
 
         # Both MXU operands are fp8: the kernel quantizes the activations

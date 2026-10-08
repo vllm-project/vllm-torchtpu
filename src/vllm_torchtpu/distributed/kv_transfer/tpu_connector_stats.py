@@ -43,6 +43,27 @@ METRIC_TYPE_GAUGE = "gauge"
 
 # Default fallback value for missing label dimensions
 DEFAULT_LABEL_VALUE = ""
+RUNNER_TIMING_BUCKETS_SECONDS = (
+    0.00001,
+    0.000025,
+    0.00005,
+    0.0001,
+    0.00025,
+    0.0005,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+)
 
 
 @dataclass
@@ -82,9 +103,17 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record the decode (load) queue length."""
         self.data["decode_queue_length"].append(decode_queue_length)
 
+    def record_runner_timings(
+        self,
+        cpu_samples: list[tuple[str, str, float]],
+        device_samples: list[tuple[str, str, float]],
+    ) -> None:
+        self.data["runner_cpu_issue_seconds"].extend(cpu_samples)
+        self.data["runner_device_elapsed_seconds"].extend(device_samples)
+
     def reset(self):
         # Must be serializable
-        self.data: dict[str, list[float | int]] = {
+        self.data: dict[str, list[float | int | tuple[str, str, float]]] = {
             "d2h_transfer_time": [],
             "h2d_transfer_time": [],
             "kv_pull_time": [],
@@ -92,6 +121,8 @@ class TpuKVConnectorStats(KVConnectorStats):
             "num_failed_transfers": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
+            "runner_cpu_issue_seconds": [],
+            "runner_device_elapsed_seconds": [],
         }
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
@@ -200,7 +231,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ]
         tpu_histogram_d2h_transfer_time = self._histogram_cls(
             name="vllm:tpu_d2h_transfer_time_ms",
-            documentation="Histogram of D2H transfer duration for TPU KV Cache transfers.",
+            documentation="Histogram of D2H transfer duration for "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -209,7 +241,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         )
         tpu_histogram_h2d_transfer_time = self._histogram_cls(
             name="vllm:tpu_h2d_transfer_time_ms",
-            documentation="Histogram of H2D transfer duration for TPU KV Cache transfers.",
+            documentation="Histogram of H2D transfer duration for "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -238,12 +271,31 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         ]
         tpu_histogram_kv_megabytes_transferred = self._histogram_cls(
             name="vllm:tpu_kv_megabytes_transferred",
-            documentation="Histogram of megabytes transferred per TPU KV Cache transfers.",
+            documentation="Histogram of megabytes transferred per "
+            "TPU KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
         self.tpu_histogram_kv_megabytes_transferred = create_metric_per_engine(
             tpu_histogram_kv_megabytes_transferred, self.per_engine_labelvalues
+        )
+        runner_labels = [*labelnames, "rank", "stage"]
+        self.runner_cpu_issue = self._histogram_cls(
+            name="vllm:tpu_runner_cpu_issue_seconds",
+            documentation=(
+                "Host time spent issuing a TPU runner stage, including Python work."
+            ),
+            buckets=RUNNER_TIMING_BUCKETS_SECONDS,
+            labelnames=runner_labels,
+        )
+        self.runner_device_elapsed = self._histogram_cls(
+            name="vllm:tpu_runner_device_elapsed_seconds",
+            documentation=(
+                "Approximate wall time between TPU stage Event completions, "
+                "observed by a background thread."
+            ),
+            buckets=RUNNER_TIMING_BUCKETS_SECONDS,
+            labelnames=runner_labels,
         )
         counter_tpu_num_failed_transfers = self._counter_cls(
             name="vllm:tpu_num_failed_transfers",
@@ -285,13 +337,13 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         # Dynamically load TPU Raiden C++ metric schema descriptors
         metric_defs = {}
         try:
-            # Without this call, get_metric_metadata won't return the correct metrics definitions
+            # Without this call, get_metric_metadata won't return the correct
+            # metrics definitions
             dist_utils.configure_raiden_telemetry()
             telemetry = dist_utils.get_raiden_telemetry_module()
             descriptors = []
-            if telemetry is not None:
-                if hasattr(telemetry, "get_metric_metadata"):
-                    descriptors = telemetry.get_metric_metadata()
+            if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
+                descriptors = telemetry.get_metric_metadata()
         except Exception as e:
             logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
 
@@ -341,6 +393,18 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         return metric_defs
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        engine_labels = self.per_engine_labelvalues[engine_idx]
+        for rank, stage, seconds in transfer_stats_data.get(
+            "runner_cpu_issue_seconds", []
+        ):
+            self.runner_cpu_issue.labels(*engine_labels, rank, stage).observe(seconds)
+        for rank, stage, seconds in transfer_stats_data.get(
+            "runner_device_elapsed_seconds", []
+        ):
+            self.runner_device_elapsed.labels(*engine_labels, rank, stage).observe(
+                seconds
+            )
+
         for prom_obj, list_item_key in zip(
             [
                 self.tpu_histogram_d2h_transfer_time,

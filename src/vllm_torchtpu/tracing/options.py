@@ -2,6 +2,8 @@ import os
 import re
 from typing import Any
 
+import vllm_torchtpu.envs as envs
+
 _STANDARD_KEYS = frozenset(
     {
         "host_tracer_level",
@@ -26,7 +28,7 @@ def _parse_option_value(key: str, val: str) -> Any:
         if not _ALLOWED_VALUE_CHARS.match(val):
             raise ValueError(
                 f"Invalid characters in option value '{val}' for key '{key}'"
-            )
+            ) from None
         return val
 
 
@@ -67,17 +69,20 @@ def parse_profile_options(
     return standard_opts, advanced_opts
 
 
-_DEFAULT_STANDARD_OPTS = {
-    "host_tracer_level": 2,
-    "device_tracer_level": 1,
-    "python_tracer_level": 1,
-}
+def get_default_standard_opts() -> dict[str, Any]:
+    return {
+        "host_tracer_level": envs.HOST_TRACER_LEVEL,
+        "device_tracer_level": envs.DEVICE_TRACER_LEVEL,
+        "python_tracer_level": envs.PYTHON_TRACER_LEVEL,
+    }
 
-_DEFAULT_ADVANCED_OPTS = {
-    "tpu_trace_mode": "TRACE_COMPUTE",
-    "tpu_num_sparse_cores_to_trace": 1,
-    "tpu_num_sparse_core_tiles_to_trace": 1,
-}
+
+def get_default_advanced_opts() -> dict[str, Any]:
+    return {
+        "tpu_trace_mode": envs.TPU_TRACE_MODE,
+        "tpu_num_sparse_cores_to_trace": envs.TPU_NUM_SPARSE_CORES_TO_TRACE,
+        "tpu_num_sparse_core_tiles_to_trace": envs.TPU_NUM_SPARSE_CORE_TILES_TO_TRACE,
+    }
 
 
 def resolve_profile_dir_and_opts(
@@ -102,8 +107,8 @@ def resolve_profile_dir_and_opts(
         dictionaries are pre-populated with baseline defaults and merged with
         any overrides specified in profile_prefix and profiler_kwargs.
     """
-    standard_opts = _DEFAULT_STANDARD_OPTS.copy()
-    advanced_opts = _DEFAULT_ADVANCED_OPTS.copy()
+    standard_opts = get_default_standard_opts()
+    advanced_opts = get_default_advanced_opts()
     profile_dir = base_dir
 
     effective_prefix = profile_prefix

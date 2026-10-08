@@ -181,10 +181,11 @@ def main_kernel(
                         if row_dst_pack == packing - 1:
                             # Store packed data into correct position.
                             row_dst = row_src // packing
-                            # Instead of creating a separate buffer for saving the result,
-                            # we reuse existing buffer to minimize vmem requirement.
-                            # We can safely overwrite the buffer because the new values are
-                            # the packed values of the existing values.
+                            # Instead of creating a separate buffer for saving the
+                            # result, we reuse existing buffer to minimize vmem
+                            # requirement. We can safely overwrite the buffer because
+                            # the new values are the packed values of the
+                            # existing values.
                             out_vmem_ref[row_dst, col_slice] = out
                             out = None
 

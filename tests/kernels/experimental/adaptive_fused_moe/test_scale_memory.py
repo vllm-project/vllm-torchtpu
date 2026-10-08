@@ -6,8 +6,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.mark.parametrize("experts", [8, 64, 256])
 @pytest.mark.parametrize("w1_nbuf,w2_nbuf,expected_mib", [(2, 1, 6), (3, 2, 9)])

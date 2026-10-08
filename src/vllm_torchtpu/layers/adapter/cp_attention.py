@@ -17,15 +17,6 @@ Process-group access lives in distributed/dcp.py.
 
 Each DCP rank stores a shard of the KV cache (interleaved by page_size).
 DCP ranks own *different* Q heads but share one GQA-replicated KV head.
-
-Forward splits into two kernel passes, merged with LSE-weighted combination:
-  1. CACHE_ONLY — query is AllGathered by heads so every rank's own heads
-     can attend against every partner's KV shard, then partial
-     outputs/LSEs are AllGathered and folded, then sliced back down to
-     this rank's own heads.
-  2. NEW_TOKENS_ONLY — new tokens aren't DCP-sharded (every rank has the
-     full local K/V for this step), so this rank's own heads attend
-     directly; no gather/combine needed.
 """
 
 from __future__ import annotations
@@ -37,6 +28,7 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
+from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
 )
@@ -50,7 +42,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 # ---------------------------------------------------------------------------
 
 
-def lse_weighted_combine(
+def merge_attn_results(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
     out_b: torch.Tensor,
@@ -80,36 +72,6 @@ def lse_weighted_combine(
     return out, lse_out
 
 
-def dcp_allgather_lse_combine(
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    dcp_group,
-    dcp_world_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """AllGather partial outputs and LSEs across DCP ranks, then fold them.
-
-    Args:
-        output: [T, H, D] — this rank's partial attention output.
-        lse:    [T, H]    — corresponding log-sum-exp values.
-        dcp_group: vLLM GroupCoordinator for the DCP process group.
-        dcp_world_size: number of DCP ranks.
-    Returns:
-        (combined_out [T, H, D], combined_lse [T, H]) after folding all ranks.
-    """
-    # [T, H, D] -> [dcp_world_size * T, H, D]
-    all_outputs = dcp_group.all_gather(output, dim=0)
-    # [T, H]   -> [dcp_world_size * T, H]
-    all_lses = dcp_group.all_gather(lse, dim=0)
-    out_chunks = all_outputs.chunk(dcp_world_size, dim=0)
-    lse_chunks = all_lses.chunk(dcp_world_size, dim=0)
-    out_combined, lse_combined = out_chunks[0], lse_chunks[0]
-    for i in range(1, dcp_world_size):
-        out_combined, lse_combined = lse_weighted_combine(
-            out_combined, lse_combined, out_chunks[i], lse_chunks[i]
-        )
-    return out_combined, lse_combined
-
-
 # ---------------------------------------------------------------------------
 # DCP kernel entry functions (for pallas.jax_op)
 # ---------------------------------------------------------------------------
@@ -134,10 +96,15 @@ def _pallas_rpa_kernel_dcp(
     cp_group_size: int,
     cp_rank_val: int,
     attention_scope: _batched_rpa_configs.AttentionScope,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
-    output, lse). cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
+    output, lse). decode_query_size widens the DECODE bucket so speculative
+    verify windows (K + 1 tokens) run there instead of in MIXED.
+    cp_group_size/cp_rank select schedule_cp.CPMetadataComputer
     inside ragged_paged_attention, needed by both scopes: CACHE_ONLY to
     compute this rank's local cache length, NEW_TOKENS_ONLY to land the
     write on the right physical page of this rank's DCP-interleaved
@@ -164,6 +131,7 @@ def _pallas_rpa_kernel_dcp(
         cp_group_size=cp_group_size,
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
+        decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
     )
@@ -227,7 +195,10 @@ def build_dcp_kernels(
     v_scale: float | None,
     cp_group_size: int,
     cp_rank: int,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    decode_query_size: int = 1,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -250,6 +221,7 @@ def build_dcp_kernels(
         cp_group_size,
         cp_rank,
         kv_layout,
+        decode_query_size,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -269,6 +241,7 @@ def build_dcp_kernels(
             cp_rank_val=cp_rank,
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -284,6 +257,7 @@ def build_dcp_kernels(
             cp_rank_val=cp_rank,
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
@@ -311,15 +285,18 @@ def forward_with_dcp(
     kv_cache_quantized_dtype,
     dcp_world_size: int,
     dcp_rank: int,
-    kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    decode_query_size: int = 1,
 ) -> torch.Tensor:
-    """Orchestrate the two-pass DCP attention forward.
+    """Two-pass DCP attention forward.
+    1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
+        shard, then partials are merged by `cp_lse_ag_out_rs` back to own heads.
+    2. NEW_TOKENS_ONLY: new tokens aren't DCP-sharded (every rank has the
+        full local K/V for this step), so this rank's own heads attend
+            directly; no gather/combine needed.
 
-    CACHE_ONLY pass: AllGather Q (by heads) -> attend against this rank's KV
-        shard -> AllGather + LSE-combine partial outputs -> select this
-        rank's own head slice back out.
-    NEW_TOKENS_ONLY pass: this rank's own heads only (not DCP-sharded).
-    Final: LSE-combine the context result with the new-token result.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -339,14 +316,9 @@ def forward_with_dcp(
         cp_group_size=dcp_world_size,
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
     )
 
-    own_num_heads = query.shape[1]
-
-    # This rank's own Q heads must be attended against every DCP partner's
-    # KV shard, not just this rank's own -- so gather every partner's Q
-    # heads onto every rank (cheap: one token) instead of moving the KV
-    # cache around (which DCP shards specifically to avoid).
     query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
 
     shared_args = (
@@ -363,20 +335,14 @@ def forward_with_dcp(
 
     ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
 
-    combined_output, combined_lse = dcp_allgather_lse_combine(
-        ctx_output, ctx_lse, dcp_group, dcp_world_size
+    ctx_output, ctx_lse = cp_lse_ag_out_rs(
+        ctx_output, ctx_lse, dcp_group, return_lse=True
     )
-
-    # all_gather above concatenates in rank order, so this rank's own
-    # heads sit at [rank * own_num_heads : (rank + 1) * own_num_heads).
-    head_start = dcp_rank * own_num_heads
-    head_end = head_start + own_num_heads
-    combined_output = combined_output[:, head_start:head_end, :]
-    combined_lse = combined_lse[:, head_start:head_end]
 
     new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
 
-    output, _ = lse_weighted_combine(combined_output, combined_lse, new_output, new_lse)
+    output, _ = merge_attn_results(ctx_output, ctx_lse, new_output, new_lse)
+    output = output.to(new_output.dtype)  # f32 ctx_lse promotes the merge
 
     if not torch.compiler.is_compiling():
         synchronize_tensors(kv_cache, wait=False)

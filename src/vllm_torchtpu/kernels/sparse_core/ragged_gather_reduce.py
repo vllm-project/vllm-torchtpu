@@ -287,7 +287,8 @@ def main_kernel(
 
                         dst_row_hbm = dst_indices[row_src]
                         if row_src == 0:
-                            # carry[0] is the last dst_row_hbm from the previous row_tile.
+                            # carry[0] is the last dst_row_hbm from the
+                            # previous row_tile.
                             prev_row_hbm = carry[0]
                             previous_accumulated_data = plsc.bitcast(
                                 prev_iter_last_row_vmem_ref[0, col_slice], jnp.float32
@@ -296,11 +297,11 @@ def main_kernel(
                             prev_row_hbm = dst_indices[row_src - 1]
                             assert previous_accumulated_data is not None
 
-                        # We guarantee source rows that contribute to the same destination
-                        # row are adjacent to each other in the order of being processed.
-                        # If the current src row contributes to the same destination row as
-                        # the previous src row, we accumulate the data with the previously
-                        # accumulated data.
+                        # We guarantee source rows that contribute to the same
+                        # destination row are adjacent to each other in the order of
+                        # being processed. If the current src row contributes to the
+                        # same destination row as the previous src row, we accumulate
+                        # the data with the previously accumulated data.
                         accumulated_data = jnp.where(
                             dst_row_hbm == prev_row_hbm,
                             previous_accumulated_data + data,
@@ -310,11 +311,11 @@ def main_kernel(
                         data_to_write = plsc.bitcast(accumulated_data, jnp.uint32)
                         out_vmem_ref[row_src, col_slice] = data_to_write
 
-                        # We write the last row (within a row tile)'s accumulated data to
-                        # the prev_iter_last_row_vmem_ref. If the first src row in the next
-                        # row_tile contributes to the same destination row as the last src
-                        # row in the current row_tile, the lastest accumulated data in
-                        # prev_iter_last_row_vmem_ref will get used.
+                        # We write the last row (within a row tile)'s accumulated data
+                        # to the prev_iter_last_row_vmem_ref. If the first src row in
+                        # the next row_tile contributes to the same destination row as
+                        # the last src row in the current row_tile, the lastest
+                        # accumulated data in prev_iter_last_row_vmem_ref will get used.
                         if row_src == num_simd_lanes - 1:
                             prev_iter_last_row_vmem_ref[0, col_slice] = data_to_write
 
@@ -327,7 +328,7 @@ def main_kernel(
                 # efficiency. We just repeat the write of lastest accumulated data
                 # multiple times.
                 # `src_row_idx_in_vmem` tracks the right idx in vmem for each hbm write.
-                src_row_idx_in_vmem = []
+                src_row_idx_in_vmem: list[int | jax.Array] = []
                 row_valid_vec = []
                 for row_vmem_idx in reversed(range(num_simd_lanes)):
                     row_idx = row_block_id * num_simd_lanes + row_vmem_idx
@@ -360,11 +361,11 @@ def main_kernel(
                 # (and to avoid using `pl.when`).
                 last_valid_src_row_vmem = -1
                 last_valid_dst_row_hbm = -1
-                for i, (src_row_idx_in_vmem, row_valid) in enumerate(
+                for i, (src_row_idx, row_valid) in enumerate(
                     zip(src_row_idx_in_vmem, row_valid_vec, strict=True)
                 ):
                     src_row_vmem = jnp.where(
-                        row_valid, src_row_idx_in_vmem, last_valid_src_row_vmem
+                        row_valid, src_row_idx, last_valid_src_row_vmem
                     )
                     dst_row_hbm = jnp.where(
                         row_valid, dst_indices[i], last_valid_dst_row_hbm

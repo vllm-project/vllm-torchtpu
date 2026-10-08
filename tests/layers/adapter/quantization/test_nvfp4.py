@@ -163,6 +163,7 @@ class TestNvfp4Helpers:
             _requant_moe_w4a8(w13_u8, w13_scale_f, w2_u8, w2_scale_f, block)
 
 
+@pytest.mark.tpu_test
 class TestNvfp4Config:
     """Tests for VllmNvfp4Config get_name and get_quant_method dispatch."""
 
@@ -329,7 +330,9 @@ class TestNvfp4LinearMethod:
 
 
 class TestNvfp4MoEMethod:
-    """Tests for VllmNvfp4MoEMethod weight creation, processing, and forward execution."""
+    """Tests for VllmNvfp4MoEMethod weight creation, processing, and
+    forward execution.
+    """
 
     def test_moe_properties(self):
         moe_cfg = MagicMock(has_bias=False, is_act_and_mul=True)

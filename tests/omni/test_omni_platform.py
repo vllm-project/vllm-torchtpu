@@ -1,20 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
+from .mock_omni import vllm_omni_mock  # isort: split
+
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+from vllm_torchtpu.omni.patches import (
+    apply_omni_model_specific_patches,
+    apply_omni_tpu_patches,
+)
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-from .mock_omni import vllm_omni_mock
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = pytest.mark.omni
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -51,6 +56,70 @@ def test_platform_attributes():
 
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
+
+
+def test_shared_slicebuilder_addresses(monkeypatch):
+    # Every worker derives the same list from the shared MASTER_PORT.
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+    # A correctly sized inherited list (e.g. another stage's) is replaced too.
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+
+
+def test_dist_backend_after_world_size_pop(monkeypatch):
+    # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
+    # size set_device recorded must keep multi-rank groups on tpu_dist.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    monkeypatch.delenv("WORLD_SIZE")
+    assert OmniTpuPlatform().dist_backend == "tpu_dist"
+
+
+@pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
+def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
+    # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
+    # (e.g. a diffusion stage in a multi-stage pipeline) is flagged.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    if chips is None:
+        monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    else:
+        monkeypatch.setenv("TPU_VISIBLE_CHIPS", chips)
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with (
+        patch("vllm_torchtpu.omni.platform.logger.warning") as mock_warning,
+        patch("torch.empty"),
+        patch("torch.device"),
+    ):
+        OmniTpuPlatform.set_device(None)
+    assert mock_warning.called == warns
 
 
 def test_memory_methods(monkeypatch):
@@ -191,3 +260,14 @@ def test_safe_pack_tensor_if_large():
     res = ipc._pack_tensor_if_large(t)
     assert t.cpu_called is True
     assert res["device"] == "cpu"
+
+
+def test_omni_tpu_patches_configuration(monkeypatch):
+    # Call the undecorated body so the run-once cache is left alone, and
+    # restore the process-global state it edits (env var, F.interpolate).
+    orig_interpolate = torch.nn.functional.interpolate
+    monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    with patch.dict(os.environ):
+        os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
+        apply_omni_tpu_patches.__wrapped__()
+        assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"

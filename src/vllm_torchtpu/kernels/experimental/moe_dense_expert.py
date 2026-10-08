@@ -67,14 +67,12 @@ def can_use_dense_expert(
         or w2.dtype != jnp.float8_e4m3fn
     ):
         return False
-    if (
-        s1.shape != (e, 1, 1, 2 * i)
-        or s2.shape != (e, 1, 1, h)
-        or s1.dtype != jnp.float32
-        or s2.dtype != jnp.float32
-    ):
-        return False
-    return True
+    return (
+        s1.shape == (e, 1, 1, 2 * i)
+        and s2.shape == (e, 1, 1, h)
+        and s1.dtype == jnp.float32
+        and s2.dtype == jnp.float32
+    )
 
 
 def _quantize(x, q_ref, scale_ref):
