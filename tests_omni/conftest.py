@@ -36,7 +36,6 @@ import contextlib
 import copy
 import gc
 import json
-import sys
 import threading
 from collections.abc import Generator
 from typing import Any
