@@ -1,4 +1,4 @@
-# Sweep: 3 runs (2 traced, 1 untraced) with minimal token lengths
+# Sweep: 3 runs (all traced) with minimal token lengths
 # Model: Gemma 4 31B-IT (TP=4, BF16)
 # Hardware: Cloud TPU v6e (4 chips)
 
@@ -17,7 +17,9 @@ env_vars:
   XPROF_COMPRESS_JFTRACE: 'true'
   xprof_compress_jftrace: 'true'
 
-# Only the first two coordinates (input_len=32 and input_len=64) are traced
+# NOTE: a non-empty trace_configs enables tracing for ALL sweep
+# coordinates; the entries below only select which
+# jax_advanced_configuration applies to a matching coordinate.
 trace_configs:
   - batch_size: 1
     input_len: 32
