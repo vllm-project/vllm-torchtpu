@@ -102,21 +102,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorWorker` has no attribute `named_kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `layer_view`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
     },
@@ -189,11 +174,6 @@
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
       "name": "unbound-name",
       "concise_description": "`descriptors` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
@@ -269,11 +249,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/vllm_adapter.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `int` has no attribute `astype`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
@@ -584,16 +559,6 @@
       "path": "src/vllm_torchtpu/runner/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `data`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `data`"
     },
     {
       "path": "src/vllm_torchtpu/runner/utils.py",

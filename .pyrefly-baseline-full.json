@@ -157,11 +157,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorWorker` has no attribute `named_kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "bad-override",
       "concise_description": "Class member `TPUConnector.start_load_kv` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
     },
@@ -233,26 +228,6 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `layer_view`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `device | None` is not assignable to parameter `device` with type `device` in function `vllm_torchtpu.distributed.kv_transfer.kv_scatter.prepare_scatter_args`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `device | None` is not assignable to parameter `device` with type `device` in function `vllm_torchtpu.distributed.kv_transfer.kv_scatter.smoke_test_multi_layer_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `get`"
     },
     {
@@ -354,11 +329,6 @@
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-assignment",
-      "concise_description": "`dict[str, Any] | None` is not assignable to variable `params` with type `dict[str, Any]`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
@@ -482,11 +452,6 @@
     },
     {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `ActorHandle[RayWorkerWrapper] | type[RayWorkerWrapper]` is not assignable to parameter `worker` with type `ActorHandle[Unknown] | None` in function `vllm.v1.executor.ray_executor.RayWorkerMetaData.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
       "name": "bad-assignment",
       "concise_description": "`None` is not assignable to attribute `model_weights` with type `str`"
     },
@@ -499,11 +464,6 @@
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
       "name": "invalid-inheritance",
       "concise_description": "Invalid base class: `RayWorkerWrapper | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `ActorHandle[RayWorkerProc] | type[RayWorkerProc]` is not assignable to parameter `actor` with type `ActorHandle[Unknown] | None` in function `vllm.v1.executor.ray_executor_v2.RayWorkerHandle.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
@@ -1019,11 +979,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/vllm_adapter.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `int` has no attribute `astype`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
@@ -1592,11 +1547,6 @@
     },
     {
       "path": "src/vllm_torchtpu/model_loader_patches.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 1 positional argument, got 3"
-    },
-    {
-      "path": "src/vllm_torchtpu/model_loader_patches.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts.weight_loader` called with arguments: (Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, return_success=bool | Unknown)"
     },
@@ -1832,36 +1782,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_page_size_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `type[AttentionBackend] | None` is not assignable to parameter `attention_backend` with type `type[PallasAttentionBackend]` in function `vllm_torchtpu.kv_cache_spec_normalizer.normalize_kv_cache_specs_for_tpu`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_page_size_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_page_size_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `dict[str, LayerKVCache]` is not assignable to parameter `kv_caches` with type `dict[str, Tensor]` in function `vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1.register_kv_caches`"
     },
@@ -1879,11 +1799,6 @@
       "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, Tensor]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
-      "name": "missing-attribute",
-      "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
     },
     {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
@@ -2004,21 +1919,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-override",
       "concise_description": "Class member `TPUModelRunner._build_attention_metadata` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `SimpleNamespace` is not assignable to parameter `common_attn_metadata` with type `CommonAttentionMetadata` in function `vllm.v1.attention.backend.AttentionMetadataBuilder.build`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `AttentionMetadataBuilder` has no attribute `kv_cache_group_id`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `SimpleNamespace` is not assignable to parameter `common_attn_metadata` with type `CommonAttentionMetadata` in function `vllm.v1.attention.backend.AttentionMetadataBuilder.build`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",

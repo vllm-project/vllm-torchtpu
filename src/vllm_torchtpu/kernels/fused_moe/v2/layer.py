@@ -151,7 +151,7 @@ def _combine_arrivals(
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
         terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
-    return sum(terms).astype(out_dtype).reshape(t_local, hidden)
+    return cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):

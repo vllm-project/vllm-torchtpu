@@ -57,6 +57,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -112,6 +113,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     attention_block_table_width,
     stage_block_table_uploads,
@@ -1593,7 +1595,9 @@ class TPUModelRunner(GPUModelRunner):
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for group_list in self.attn_groups:
             for group in group_list:
-                built = group.metadata_builders[0].build(
+                built = cast(
+                    AttentionMetadataBuilder, group.metadata_builders[0]
+                ).build(
                     common_prefix_len=0,
                     common_attn_metadata=common,
                 )
@@ -1635,14 +1639,16 @@ class TPUModelRunner(GPUModelRunner):
                 ctx,
                 num_reqs_padded,
                 gids={
-                    group.metadata_builders[0].kv_cache_group_id
+                    cast(
+                        AttentionMetadataBuilder, group.metadata_builders[0]
+                    ).kv_cache_group_id
                     for group, _ in selected_groups
                 },
             )
         common = SimpleNamespace(num_reqs=num_reqs_padded)
         metadata: dict[str, AttentionMetadata] = {}
         for group, selected in selected_groups:
-            built = group.metadata_builders[0].build(
+            built = cast(AttentionMetadataBuilder, group.metadata_builders[0]).build(
                 common_prefix_len=0,
                 common_attn_metadata=common,
             )
@@ -4185,7 +4191,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens_cpu=seq_lens_cpu,
             device=self.device,
         )
-        pooler_output = self.model.pooler(
+        pooler_output = cast(VllmModelForPooling, self.model).pooler(
             hidden_states=unpadded_hidden_states,
             pooling_metadata=pooling_metadata,
         )

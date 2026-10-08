@@ -30,7 +30,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4IndexerCache,
 )
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.attention.backend import AttentionBackend, AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -102,6 +102,9 @@ if TYPE_CHECKING:
             cache_dtype_str: str | torch.dtype = "auto",
         ) -> int: ...
 
+        @staticmethod
+        def get_name() -> str: ...
+
 
 logger = init_logger(__name__)
 
@@ -153,7 +156,7 @@ def check_kv_caches_cover_block_ids(
 
 
 def _warn_if_kv_cache_is_padded(
-    backend: type[AttentionBackend],
+    backend: type[_TpuKVCacheBackend],
     block_size: int,
     num_kv_heads: int,
     head_size: int,
@@ -291,7 +294,7 @@ class KVCacheManager:
                     # off this layer so it always matches the dimensions below.
                     assert backend_cls is not None
                     _warn_if_kv_cache_is_padded(
-                        backend_cls,
+                        cast("type[_TpuKVCacheBackend]", backend_cls),
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
@@ -300,7 +303,9 @@ class KVCacheManager:
                     page_size_padded = (
                         self.runner._hybrid_uniform_page_size_bytes
                         if self.runner._hybrid_uniform_page_size_bytes is not None
-                        else backend_cls.get_kv_cache_page_size_bytes(
+                        else cast(
+                            "type[_TpuKVCacheBackend]", backend_cls
+                        ).get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -417,14 +422,14 @@ class KVCacheManager:
         ):
             assert backend_cls is not None
             kv_cache_spec = self._pad_native_attention_regions(
-                kv_cache_spec, backend_cls
+                kv_cache_spec, cast("type[_TpuKVCacheBackend]", backend_cls)
             )
         return kv_cache_spec
 
     def _pad_native_attention_regions(
         self,
         kv_cache_specs: dict[str, KVCacheSpec],
-        backend_cls: type[AttentionBackend],
+        backend_cls: type[_TpuKVCacheBackend],
     ) -> dict[str, KVCacheSpec]:
         if can_share_attention_cache(list(kv_cache_specs.values()), backend_cls):
             return kv_cache_specs

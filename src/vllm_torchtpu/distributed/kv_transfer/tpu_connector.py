@@ -969,7 +969,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         canonical pool manifest.
         """
         if self.use_raiden and self.connector_worker is not None:
-            self.connector_worker.named_kv_caches = kv_caches
+            cast(
+                TPURaidenConnectorWorker, self.connector_worker
+            ).named_kv_caches = kv_caches
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         assert self.connector_worker is not None
@@ -1350,10 +1352,12 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         self, slot_idx: int, num_blocks: int, block_ids: list[int]
     ) -> tuple[list, list, int]:
         indices = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
+        assert self.runner is not None
         kv_caches = self.runner.kv_caches
         tpu_tensors: list = []
         cpu_tensors: list = []
         d2h_total_bytes = 0
+        assert self._coord_pool is not None
         for layer_idx, cache in enumerate(kv_caches):
             src_shard = torch.index_select(cache, 0, indices)
             dest_view = self._coord_pool.layer_view(
@@ -1412,6 +1416,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         dest_blocks_dev = torch.tensor(
             local_blocks, dtype=torch.int32, device=self.device
         )
+        assert self.device is not None
         prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev, self.device)
         return kv_scatter.multi_layer_scatter_into(
             device_shards, kv_caches, dest_blocks_dev, prebuilt_args=prebuilt
@@ -1435,6 +1440,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
             )
             return
         trailing = tuple(self.shape[1:]) if len(self.shape) > 1 else (128,)
+        assert self.device is not None
         ok = kv_scatter.smoke_test_multi_layer_scatter(
             device=self.device,
             num_layers=2,
