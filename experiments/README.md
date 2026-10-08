@@ -1,6 +1,6 @@
 # TPU Inference & Structured Sparsity Benchmarking Suite
 
-An automated, modular performance and accuracy evaluation framework for Large Language Models running on Google Cloud TPU v6e / v7 / v5e using vLLM, JAX, and Cloud DevKit (CDK).
+An automated, modular performance and accuracy evaluation framework for Large Language Models running on Google Cloud TPU v6e / v5e using vLLM and JAX.
 
 ---
 
@@ -10,7 +10,7 @@ The architecture adheres strictly to **SOLID design principles**, separating par
 
 ```
                                   ┌────────────────────────────────┐
-                                  │   run_sweep.py (orchestrator)  │
+                                  │   run_sweep_orchestrator.py    │
                                   │   (Cartesian Grid Sequencer)   │
                                   └───────────────┬────────────────┘
                                                   │
@@ -21,16 +21,15 @@ The architecture adheres strictly to **SOLID design principles**, separating par
   │────────────────────────────────│                             │────────────────────────────────│
   │ • SparseGptResolver            │                             │ • TpuEvalRunner (lm_eval)      │
   │ • NaiveMagnitudeResolver       │                             │ • TpuProfileRunner (throughput)│
-  │ • WeightScalerResolver         │                             │ • CdkJobRunner (Cloud TPU v7)  │
-  │ • PallasSpmmResolver           │                             └────────────────┬───────────────┘
+  │ • WeightScalerResolver         │                             └────────────────┬───────────────┘
   └───────────────┬────────────────┘                                              │
                   │ (resolves checkpoint path)                                    │ (executes benchmark)
                   ▼                                                               ▼
   ┌────────────────────────────────┐                             ┌────────────────────────────────┐
-  │   Model Splicer & Pruners      │                             │     vLLM on Cloud TPU v6e/v7   │
+  │   Model Splicer & Pruners      │                             │     vLLM on Cloud TPU v6e      │
   │────────────────────────────────│                             │────────────────────────────────│
   │ • Cross-Shard ModelSplicer     │                             │ • 4-way Tensor Parallelism     │
-  │ • TPU SparseGPT Hessian Kernel │                             │ • Native Pallas FlashAttention │
+  │ • SparseGPT Hessian Pruner     │                             │ • Native Pallas FlashAttention │
   │ • Naive N:M Magnitude Pruner   │                             │ • bfloat16 / FP8 KV Cache      │
   │ • Checkpoint Integrity Shards  │                             └────────────────┬───────────────┘
   └────────────────────────────────┘                                              │
@@ -81,36 +80,34 @@ experiments/
 ├── resolvers/                                                   # Dynamic checkpoint resolvers and layer transformers
 │   ├── __init__.py                                              # Package initialization
 │   ├── base_resolver.py                                         # Abstract base class for all checkpoint resolvers
-│   ├── base_sparsity_resolver.py                                # Unified base class with automatic cache reaping
+│   ├── base_sparsity_resolver.py                                # Unified base class with owner-marked cache reaping
 │   ├── dataset_providers.py                                     # Calibration dataset providers (C4, WikiText, custom)
 │   ├── model_splicer.py                                         # Cross-shard layer splicer with disk shard integrity check
 │   ├── naive_magnitude_resolver.py                              # Data-free magnitude pruning resolver
-│   ├── pallas_spmm_resolver.py                                  # Pallas-based structured sparse matrix multiply resolver
 │   ├── registry.py                                              # Central resolver factory
 │   ├── sparsegpt_resolver.py                                    # SparseGPT Hessian-based error-compensated resolver
-│   ├── spmm_kernel_loader.py                                    # Hardware SPMM kernel loader
 │   └── weight_scaler_resolver.py                                # Constant scalar multiplier (c * W) resolver
 ├── runners/                                                     # Benchmark and evaluation execution engines
 │   ├── __init__.py                                              # Package initialization
 │   ├── base_runner.py                                           # Abstract base runner interface
-│   ├── cdk_runner.py                                            # Cloud DevKit Kubernetes runner for Cloud TPU v7
 │   ├── eval_runner.py                                           # Quality & accuracy evaluation runner (MMLU-Pro via lm_eval)
 │   ├── profile_runner.py                                        # Throughput & latency profiling runner
 │   └── registry.py                                              # Central runner factory
-├── sparsity/                                                    # Structured sparsity algorithms and TPU kernels
+├── sparsity/                                                    # Structured sparsity algorithms
 │   ├── LICENSE                                                  # Sparsity library license
+│   ├── README.md                                                # Sparsity package documentation
 │   ├── __init__.py                                              # Package initialization
 │   ├── datautils.py                                             # Calibration sequence tokenization utilities
 │   ├── gemma4.py                                                # Gemma 4 layer capture and Hessian orchestrator
-│   ├── layer_sensitivity_profiler.py                            # Empirical per-layer output loss delta profiler
 │   ├── llama.py                                                 # LLaMA architecture layer hooks
 │   ├── modelutils.py                                            # PyTorch module traversal & model structure helpers
 │   ├── naive_magnitude_pruner.py                                # Vectorized N:M magnitude pruner (dim=-1)
 │   ├── quant.py                                                 # Quantization helper routines
-│   └── sparsegpt.py                                             # PyTorch reference SparseGPT implementation
+│   └── sparsegpt.py                                             # PyTorch reference SparseGPT (+ LRC) implementation
 ├── tests/                                                       # Comprehensive unit, integration & TPU test suite
 │   ├── __init__.py                                              # Test package initialization
 │   ├── fixtures.py                                              # Synthetic multi-shard fixtures & dynamic path discovery
+│   ├── run_coverage.py                                          # Coverage report generator with sysmon engine
 │   ├── test_core.py                                             # Domain models, JSON/CSV recorders, engine builder
 │   ├── test_gemma4_sparsity.py                                  # Gemma 4 calibration hooks & loader
 │   ├── test_integration.py                                      # End-to-end simulated sweep pipeline
@@ -121,14 +118,16 @@ experiments/
 │   ├── test_runners.py                                          # TpuProfileRunner, TpuEvalRunner lifecycle
 │   ├── test_sparsity_algorithms.py                              # 2:4 / 1:4 magnitude math, SparseGPT Hessian, quant
 │   └── test_tpu_hardware.py                                     # Physical TPU v6e chip detection & on-chip pruning
-├── run_sweep.py                                                 # Primary sweep orchestrator entry point
-├── run_sweep_orchestrator.py                                    # Master sweep orchestrator CLI
+├── .coveragerc                                                  # Coverage scoping configuration
+├── pytest.ini                                                   # Pytest discovery configuration
+├── rescore.py                                                   # Re-score stored lm_eval samples with new filters
+├── run_sweep_orchestrator.py                                    # Sweep orchestrator CLI (entry point)
 └── README.md                                                    # This documentation file
 ```
 
 ---
 
-## 3. How to Sparsify Models Directly (Without `run_sweep`)
+## 3. How to Sparsify Models Directly (Without `run_sweep_orchestrator`)
 
 You can create 2:4 or 1:4 structured sparse checkpoints standalone without running a parameter sweep.
 
@@ -190,25 +189,12 @@ Launch under GNU `screen` to survive SSH disconnects:
 cd /mnt/pd/vllm-torchtpu/experiments
 source /mnt/pd/torchtpu_env/bin/activate
 
-screen -d -m -S my_sweep bash -c 'exec python -u run_sweep.py \
-  --config configs/gemma4/eval_phase9_2of4_barbell44_intermediate_31b_mmlu_pro.yaml \
+screen -d -m -S my_sweep bash -c 'exec python -u run_sweep_orchestrator.py \
+  --config configs/gemma4/eval_lrc_stage_l1_screen_12b.yaml \
   -m "My experiment description" >> sweep.log 2>&1'
 ```
 
-### B. Remote Execution on Cloud TPU v7 via Cloud DevKit (CDK)
-
-Submit multi-chip sweeps to Kubernetes TPU v7 clusters (`tpu7x`):
-
-```bash
-python -u run_sweep.py \
-  --config configs/gemma4_31b_8k_1k_trace.yaml \
-  --cdk \
-  --cdk-chips 4 \
-  --cdk-poll-interval 60 \
-  -m "CDK TPU v7 hardware profile sweep"
-```
-
-### C. Monitoring, Results & GCS Sync
+### B. Monitoring, Results & GCS Sync
 
 Results stream canonically into `sweep.json`:
 
@@ -216,17 +202,40 @@ Results stream canonically into `sweep.json`:
 cat results/<sweep_id>/sweep.json
 ```
 
-On completion, `JsonResultRecorder` automatically synchronizes results to Google Cloud Storage:
-`gs://cloud-tpu-inference-eval-staging/incoming/shenrunz/<sweep_id>/`
+On completion, `JsonResultRecorder` automatically synchronizes results to Google Cloud Storage under
+`gs://cloud-tpu-inference-eval-staging/incoming/<user>/<sweep_id>/`, where `<user>` is resolved from
+`USER_LDAP` / git email / `$USER` (see `core/env.py`). Pass `--no-upload-gcs` to disable the upload.
 
-### D. Resuming an Interrupted Sweep
+### C. Resuming an Interrupted Sweep
 
 If a sweep was stopped, preempted, or ran out of disk space, use `--resume` with the existing experiment ID. The orchestrator verifies that `--config` matches `metadata.yaml`, reads already-completed coordinates from `sweep.json`, and skips them:
 
 ```bash
-python -u run_sweep.py \
-  --config configs/gemma4/eval_phase9_2of4_barbell44_intermediate_31b_mmlu_pro.yaml \
+python -u run_sweep_orchestrator.py \
+  --config configs/gemma4/eval_lrc_stage_l1_screen_12b.yaml \
   --experiment-id 20260924_214452 \
   --resume \
-  -m "Resume Phase 9 arm C"
+  -m "Resume after preemption"
 ```
+
+---
+
+## 5. Running Unit, Integration & TPU Hardware Tests
+
+### A. Run All Unit & Integration Tests via Pytest
+
+```bash
+cd /mnt/pd/vllm-torchtpu/experiments
+source /mnt/pd/torchtpu_env/bin/activate
+VLLM_MOCK_TPU=1 pytest tests/ -q
+```
+
+Hardware tests (`hardware_smoke` marker) are deselected by default in `pytest.ini`; run them explicitly on a TPU host with `pytest tests/ -m hardware_smoke`.
+
+### B. Run Code Coverage Analysis
+
+```bash
+COVERAGE_CORE=sysmon python3 tests/run_coverage.py
+```
+
+*An interactive HTML report is compiled into `experiments/htmlcov/index.html`.*
