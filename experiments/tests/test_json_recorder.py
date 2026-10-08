@@ -291,3 +291,55 @@ def test_json_result_recorder_upload_enabled_without_env(
                                   sweep_id="20260828_140001",
                                   upload_gcs=True)
     assert recorder.upload_gcs is True
+
+
+def _make_profile_session(traces_dir, ts):
+    session = traces_dir / "plugins" / "profile" / ts
+    session.mkdir(parents=True)
+    (session / "host.xplane.pb").write_bytes(b"x")
+    return f"plugins/profile/{ts}/host.xplane.pb"
+
+
+def test_assign_trace_paths_maps_sessions_to_traced_trials_only(
+        tmp_path, monkeypatch):
+    """2 traced + 1 untraced trial, 2 profile sessions => 1:1 mapping."""
+    recorder = JsonResultRecorder(json_file=str(tmp_path / "sweep.json"),
+                                  sweep_id="sweep_a",
+                                  user="alice",
+                                  upload_gcs=False)
+    recorder.record({"input_len": 32, "trace": True}, {"m": 1})
+    recorder.record({"input_len": 64, "trace": False}, {"m": 2})
+    recorder.record({"input_len": 128, "trace": True}, {"m": 3})
+
+    traces_dir = tmp_path / "traces"
+    rel_a = _make_profile_session(traces_dir, "2026_01_01_00_00_00")
+    rel_b = _make_profile_session(traces_dir, "2026_01_01_00_05_00")
+    base = recorder.gcs_sweep_dir + "/traces/"
+    recorder._assign_trace_paths([base + rel_a, base + rel_b], str(traces_dir))
+
+    exps = recorder.data["experiments"]
+    assert exps[0]["artifacts"]["trace_paths"] == [base + rel_a]
+    assert exps[1]["artifacts"]["trace_paths"] == []
+    assert exps[2]["artifacts"]["trace_paths"] == [base + rel_b]
+
+
+def test_assign_trace_paths_untraced_trial_never_gets_uris(
+        tmp_path, monkeypatch):
+    """Session/trial count mismatch still never touches untraced trials."""
+    recorder = JsonResultRecorder(json_file=str(tmp_path / "sweep.json"),
+                                  sweep_id="sweep_b",
+                                  user="alice",
+                                  upload_gcs=False)
+    recorder.record({"input_len": 32, "trace": True}, {"m": 1})
+    recorder.record({"input_len": 64}, {"m": 2})
+
+    traces_dir = tmp_path / "traces"
+    rel_a = _make_profile_session(traces_dir, "2026_01_01_00_00_00")
+    rel_b = _make_profile_session(traces_dir, "2026_01_01_00_05_00")
+    base = recorder.gcs_sweep_dir + "/traces/"
+    uris = [base + rel_a, base + rel_b]
+    recorder._assign_trace_paths(uris, str(traces_dir))
+
+    exps = recorder.data["experiments"]
+    assert exps[0]["artifacts"]["trace_paths"] == uris
+    assert exps[1]["artifacts"]["trace_paths"] == []
