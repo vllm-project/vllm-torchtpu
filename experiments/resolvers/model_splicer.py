@@ -173,15 +173,24 @@ class ModelSplicer:
             output_dir: str,
             replacement_state_dict: Dict[str, torch.Tensor],
             target_layer_indices: Optional[Set[int]] = None) -> str:
-        """
-        Serializes a checkpoint by streaming safetensors shards from base_model_dir,
-        substituting tensors present in replacement_state_dict (filtered to target_layer_indices if provided),
-        and keeping all other weights (including non-layer multimodal tensors like model.vision_embedder.*)
-        bit-identical to base_model_dir.
+        """Write a new checkpoint to output_dir by copying base_model_dir
+        and replacing pruned layer weights from replacement_state_dict.
 
-        Raises ValueError if no tensor was substituted: the output would be
-        a dense copy mislabelled as sparse (e.g. state_dict key names that
-        do not match the shard key names).
+        Each safetensors shard in base_model_dir is read tensor by tensor:
+        - If a tensor's key is in replacement_state_dict (and its layer
+          index is in target_layer_indices, when specified), the new tensor
+          from replacement_state_dict is written.
+        - Otherwise, the original tensor from base_model_dir is copied
+          unchanged (preserving unpruned layers, embeddings, and vision weights).
+
+        Non-weight files (config.json, tokenizer files, shard index) are
+        copied directly from base_model_dir.
+
+        Raises:
+            ValueError: If no tensors in the shards matched
+                replacement_state_dict (for example, due to mismatched
+                key prefixes), which would otherwise silently write an
+                unpruned copy of the base model.
         """
         os.makedirs(output_dir, exist_ok=True)
 

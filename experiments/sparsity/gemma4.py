@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 from transformers import Gemma4ForConditionalGeneration
 
-from .lrc import lrc_prune
 from .modelutils import find_layers
 from .sparsegpt import SparseGPT
 
@@ -44,7 +43,7 @@ def get_gemma4(model_path: str) -> Gemma4ForConditionalGeneration:
 
 
 @torch.no_grad()
-def gemma4_sequential(model, dataloader, dev, args):
+def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
     """
     Performs layer-by-layer sequential SparseGPT pruning on Gemma 4.
     Passes calibration activations through each layer, captures empirical Hessians,
@@ -198,15 +197,10 @@ def gemma4_sequential(model, dataloader, dev, args):
             for h in handles:
                 h.remove()
 
-            # Step 2: Algorithm 1 (fasterprune) / LRC Alternating Minimization
-            # Solves min ||W*X - W_sparse*X||^2 using the accumulated Hessian gpts[name].H.
-            # If use_lrc is set, applies Low-Rank Compression (Frantar & Alistarh):
-            #   argmin_{S, U, V} || (W - S - U @ V) X ||^2_2
-            # Otherwise runs canonical SparseGPT with 2nd-order OBS weight compensation.
-            is_lrc = getattr(args, "use_lrc", False) or getattr(
-                args, "lrc", False)
-            lrc_rank = getattr(args, "lrc_rank", getattr(args, "lrc_k", 128))
-            lrc_iters = getattr(args, "lrc_iters", getattr(args, "lrc_T", 3))
+            # Step 2: Prune each Linear layer in place using the accumulated
+            # empirical Hessian gpts[name].H (defaults to SparseGPT OBS solver
+            # fasterprune; callers such as LRC can pass a custom prune_fn).
+            matrix_pruner = prune_fn or getattr(args, "prune_fn", None)
 
             for name in subset:
                 if name in gpts:
@@ -215,19 +209,8 @@ def gemma4_sequential(model, dataloader, dev, args):
                     print(f"    ├─ [{name:<24}] shape {str(w_shape):<16} ...",
                           end="",
                           flush=True)
-                    if is_lrc:
-                        lrc_prune(
-                            gpts[name],
-                            sparsity=args.sparsity
-                            if hasattr(args, "sparsity") and args.sparsity > 0
-                            else 0.5,
-                            prunen=args.prunen,
-                            prunem=args.prunem,
-                            percdamp=args.percdamp,
-                            blocksize=args.blocksize,
-                            T=lrc_iters,
-                            k=lrc_rank,
-                        )
+                    if matrix_pruner is not None:
+                        matrix_pruner(gpts[name])
                     else:
                         gpts[name].fasterprune(
                             args.sparsity,

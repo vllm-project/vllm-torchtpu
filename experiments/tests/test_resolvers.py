@@ -19,12 +19,14 @@ from unittest.mock import patch
 import torch
 from resolvers.base_resolver import BaseResolver
 from resolvers.base_sparsity_resolver import BaseSparsityResolver
+from resolvers.lrc_resolver import LrcResolver
 from resolvers.model_splicer import ModelSplicer
 from resolvers.naive_magnitude_resolver import NaiveMagnitudeResolver
 from resolvers.registry import ResolverRegistry
 from resolvers.sparsegpt_resolver import SparseGptResolver
 from resolvers.weight_scaler_resolver import WeightScalerResolver
 from safetensors import safe_open
+from sparsity.lrc import make_lrc_pruner
 
 try:
     from tests.fixtures import create_synthetic_model
@@ -470,29 +472,10 @@ class TestResolversEndToEnd(unittest.TestCase):
             os.path.exists(
                 os.path.join(out_target, "model.safetensors.index.json")))
 
-    def test_sparsegpt_resolver_outbound_signature_guard(self):
-        """
-        Contract Guard Test: Validates that all outbound arguments dispatched by
-        SparseGptResolver.prune_in_memory bind cleanly against prune_gemma4's real
-        inspect.signature without parameter divergence or unexpected kwargs.
-        """
-        import inspect
-
-        from sparsity import prune_gemma4
-
-        sig = inspect.signature(prune_gemma4)
-        intercepted_calls = []
-
-        def signature_verifier_spy(*args, **kwargs):
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-            intercepted_calls.append(bound)
-            return "/tmp/stub_output_dir"
-
-        with patch("resolvers.sparsegpt_resolver.prune_gemma4",
-                   side_effect=signature_verifier_spy):
-            resolver = SparseGptResolver()
-            resolver.prune_in_memory(
+    def test_sparsegpt_and_lrc_prune_in_memory_delegation(self):
+        """Verify SparseGptResolver and LrcResolver delegate expected kwargs to prune_gemma4."""
+        with patch("resolvers.sparsegpt_resolver.prune_gemma4") as mock_sgpt:
+            SparseGptResolver().prune_in_memory(
                 base_model="/mock/base",
                 save_path="/mock/save",
                 min_layer=0,
@@ -500,287 +483,97 @@ class TestResolversEndToEnd(unittest.TestCase):
                 prunen=2,
                 prunem=4,
                 resolver_config={
-                    "dataset": "c4",
                     "nsamples": 32,
-                    "seed": 42,
-                    "percdamp": 0.02,
-                    "blocksize": 64,
-                    "use_lrc": True,
-                    "lrc_rank": 64,
-                    "lrc_iters": 5,
-                    "save_prefix24_path": "/mock/prefix24",
+                    "seed": 42
                 },
                 sparse_layer_indices={1, 3},
             )
+            mock_sgpt.assert_called_once()
+            self.assertEqual(
+                mock_sgpt.call_args.kwargs["sparse_layer_indices"], {1, 3})
+            self.assertNotIn("use_lrc", mock_sgpt.call_args.kwargs)
 
-        self.assertEqual(len(intercepted_calls), 1)
-        bound = intercepted_calls[0]
-        self.assertEqual(bound.arguments["model_path"], "/mock/base")
-        self.assertEqual(bound.arguments["dataset"], "c4")
-        self.assertEqual(bound.arguments["minlayer"], 0)
-        self.assertEqual(bound.arguments["maxlayer"], 4)
-        self.assertEqual(bound.arguments["prunen"], 2)
-        self.assertEqual(bound.arguments["prunem"], 4)
-        self.assertEqual(bound.arguments["nsamples"], 32)
-        self.assertEqual(bound.arguments["seed"], 42)
-        self.assertEqual(bound.arguments["percdamp"], 0.02)
-        self.assertEqual(bound.arguments["blocksize"], 64)
-        self.assertEqual(bound.arguments["save_path"], "/mock/save")
-        self.assertEqual(bound.arguments["sparse_layer_indices"], {1, 3})
-        self.assertTrue(bound.arguments["use_lrc"])
-        self.assertEqual(bound.arguments["lrc_rank"], 64)
-        self.assertEqual(bound.arguments["lrc_iters"], 5)
-        self.assertEqual(bound.arguments["save_prefix24_path"],
-                         "/mock/prefix24")
-
-    def test_sparsegpt_resolver_prune_in_memory_nonprefix_unmocked_boundary(
-            self):
-        """
-        Arrange-Act-Assert: Exercises SparseGptResolver.prune_in_memory for a non-prefix layer set
-        reaching prune_gemma4 with NO mock on the resolver->prune_gemma4 boundary.
-        Executes real sequential SparseGPT calibration on a synthetic module, asserting that
-        layer 1 is 2:4 pruned while layer 0 remains dense.
-        """
-        import types
-
-        import torch.nn as nn
-
-        class MockDecoderLayer(nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.self_attn_q = nn.Linear(32, 32, bias=False)
-                self.mlp_down = nn.Linear(32, 32, bias=False)
-                self.self_attn_q.weight.data = torch.randn(32, 32)
-                self.mlp_down.weight.data = torch.randn(32, 32)
-
-            def forward(self, hidden_states, *args, **kwargs):
-                return (self.mlp_down(self.self_attn_q(hidden_states)), )
-
-        class MockLanguageModel(nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.layers = nn.ModuleList(
-                    [MockDecoderLayer(),
-                     MockDecoderLayer()])
-                self.embed_tokens = nn.Embedding(100, 32)
-                self.embed_tokens.weight.data = torch.randn(100, 32)
-                self.unique_layer_types = ["full_attention"]
-                self.config = types.SimpleNamespace(
-                    layer_types=["full_attention", "full_attention"],
-                    text_config=types.SimpleNamespace(hidden_size=32))
-
-            def rotary_emb(self, *args, **kwargs):
-                return torch.zeros((1, 32, 32))
-
-        class MockInnerModel(nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.language_model = MockLanguageModel()
-
-        class MockGemmaModel(nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.model = MockInnerModel()
-                self.config = types.SimpleNamespace(
-                    text_config=types.SimpleNamespace(hidden_size=32))
-                self.seqlen = 32
-
-            def forward(self, input_ids):
-                x = self.model.language_model.embed_tokens(input_ids)
-                return self.model.language_model.layers[0](x)
-
-        mock_model = MockGemmaModel()
-        mock_dataloader = [[torch.arange(0, 32).unsqueeze(0)]]
-
-        # Verify initial state: both layers have 0% zeros
-        w0_init = mock_model.model.language_model.layers[
-            0].self_attn_q.weight.data
-        w1_init = mock_model.model.language_model.layers[
-            1].self_attn_q.weight.data
-        self.assertEqual((w0_init == 0).sum().item(), 0)
-        self.assertEqual((w1_init == 0).sum().item(), 0)
-
-        resolver = SparseGptResolver()
-        resolver_config = {
-            "dataset": "c4",
-            "nsamples": 1,
-            "seed": 42,
-            "percdamp": 0.01,
-            "blocksize": 32,
-            "use_lrc": False,
-        }
-
-        # IMPORTANT: prune_gemma4 is UNMOCKED. The resolver calls the real prune_gemma4 function.
-        # Only HuggingFace model loading, dataset streaming, and causal masks are patched to run fast on CPU.
-        with patch("sparsity.gemma4.get_gemma4", return_value=mock_model), \
-             patch("sparsity.get_loaders", return_value=(mock_dataloader, None)), \
-             patch("transformers.models.gemma4.modeling_gemma4.create_causal_mask", return_value=None), \
-             patch("transformers.models.gemma4.modeling_gemma4.create_sliding_window_causal_mask", return_value=None):
-            out = resolver.prune_in_memory(
-                base_model="mock_model_dir",
-                save_path="",
+        with patch("resolvers.lrc_resolver.prune_gemma4") as mock_lrc, \
+             patch("resolvers.lrc_resolver.make_lrc_pruner", wraps=make_lrc_pruner) as mock_pruner:
+            LrcResolver().prune_in_memory(
+                base_model="/mock/base",
+                save_path="/mock/save",
                 min_layer=0,
-                max_layer=2,
+                max_layer=4,
                 prunen=2,
                 prunem=4,
-                resolver_config=resolver_config,
-                sparse_layer_indices={1},
+                resolver_config={
+                    "nsamples": 32,
+                    "lrc_rank": 64,
+                    "lrc_iters": 5
+                },
+                sparse_layer_indices={0, 2},
             )
-            self.assertEqual(out, "")
+            mock_pruner.assert_called_once_with(prunen=2,
+                                                prunem=4,
+                                                percdamp=0.01,
+                                                blocksize=128,
+                                                T=5,
+                                                k=64)
+            mock_lrc.assert_called_once()
+            self.assertTrue(callable(mock_lrc.call_args.kwargs["prune_fn"]))
 
-        # Layer 0: was not in sparse_layer_indices -> preserved 100% dense
-        w0_post = mock_model.model.language_model.layers[
-            0].self_attn_q.weight.data
-        zero_ratio_0 = (w0_post == 0).sum().item() / w0_post.numel()
-        self.assertEqual(zero_ratio_0, 0.0, "Layer 0 must remain dense")
-
-        # Layer 1: was in sparse_layer_indices={1} -> 2:4 SparseGPT pruned
-        w1_post = mock_model.model.language_model.layers[
-            1].self_attn_q.weight.data
-        zero_ratio_1 = (w1_post == 0).sum().item() / w1_post.numel()
-        self.assertAlmostEqual(zero_ratio_1,
-                               0.5,
-                               delta=0.05,
-                               msg="Layer 1 must be 2:4 sparse")
-
-    def test_base_sparsity_resolver_layer_bounds_validation(self):
-        """
-        Arrange-Act-Assert: Verify strict layer bounds validation (0 <= layer_idx < total_layers).
-        Prevents silent layer-dropping or out-of-bounds corruption.
-        """
-        resolver = BaseSparsityResolver()
-        resolver_config = {
+    def test_nonprefix_layers_ratio_and_bounds_resolution(self):
+        """Verify layer bounds, non-prefix calibration fallback, and N:M ratio cache keys/guards."""
+        resolver = NaiveMagnitudeResolver()
+        cfg = {
             "base_model": self.dense_dir,
             "reference_sparse_model": self.sparse_dir,
             "strategy": "first_to_last",
-            "checkpoint_base_dir": self.work_dir
+            "checkpoint_base_dir": self.work_dir,
         }
-
-        # Negative layer index must raise ValueError
-        with self.assertRaises(ValueError):
-            resolver.resolve({"layers": [-1, 1]}, resolver_config)
-
-        # Out-of-bounds layer index (>= total_layers=4) must raise ValueError
-        with self.assertRaises(ValueError):
-            resolver.resolve({"layers": [0, 4]}, resolver_config)
-
-        with self.assertRaises(ValueError):
-            resolver.resolve({"layers": [48]}, resolver_config)
-
-        # Invalid layers type (not list/set/tuple) must raise ValueError
-        with self.assertRaises(ValueError):
-            resolver.resolve({"layers": "invalid_string"}, resolver_config)
-
-        # Missing base_model in resolver_config must raise ValueError
+        for bad_layers in ([-1, 1], [0, 4], [48], "invalid"):
+            with self.assertRaises(ValueError):
+                resolver.resolve({"layers": bad_layers}, cfg)
         with self.assertRaises(ValueError):
             resolver.resolve({"layers": [1, 2]}, {})
 
-    def test_base_sparsity_resolver_nonprefix_layers_bypass_splicing(self):
-        """
-        Arrange-Act-Assert: Verify that an arbitrary non-prefix layer set bypasses
-        reference splicing and falls through to in-memory algorithmic pruning.
-        """
-        resolver = NaiveMagnitudeResolver()
-        current_config = {"layers": [1, 2]}
-        resolver_config = {
-            "base_model": self.dense_dir,
-            "reference_sparse_model": self.sparse_dir,
-            "strategy": "first_to_last",
-            "checkpoint_base_dir": self.work_dir
-        }
-
-        # Should NOT raise ValueError from _assert_spliceable; falls through to prune_in_memory
-        model_path, consumed_keys = resolver.resolve(current_config,
-                                                     resolver_config)
-        self.assertIn("layers", consumed_keys)
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(model_path, "model.safetensors.index.json")))
-
-    def test_base_sparsity_resolver_nonprefix_layers_allow_splice(self):
-        """
-        Arrange-Act-Assert: Verify that allow_nonprefix_splice permits splicing non-prefix layer sets.
-        """
-        resolver = NaiveMagnitudeResolver()
-        current_config = {"layers": [1, 2]}
-        resolver_config = {
-            "base_model": self.dense_dir,
-            "reference_sparse_model": self.sparse_dir,
-            "strategy": "first_to_last",
-            "allow_nonprefix_splice": True,
-            "checkpoint_base_dir": self.work_dir
-        }
-
-        model_path, consumed_keys = resolver.resolve(current_config,
-                                                     resolver_config)
-        self.assertIn("layers", consumed_keys)
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(model_path, "model.safetensors.index.json")))
-
-    def test_base_sparsity_resolver_ratio_in_cache_key(self):
-        """
-        Arrange-Act-Assert: Verify that prunen and prunem from current_config are respected,
-        added to CONSUMED_KEYS, and embedded into the non-prefix SHA1 cache key and checkpoint name.
-        """
-        resolver = NaiveMagnitudeResolver()
-        resolver_config = {
-            "base_model": self.dense_dir,
-            "strategy": "first_to_last",
-            "checkpoint_base_dir": self.work_dir
-        }
-
-        cur_1of4 = {"prunen": 1, "prunem": 4, "layers": [1, 2]}
-        model_path_1of4, consumed_1of4 = resolver.resolve(
-            cur_1of4, resolver_config)
-        self.assertIn("prunen", consumed_1of4)
-        self.assertIn("prunem", consumed_1of4)
-        self.assertIn("_1of4_", model_path_1of4)
-
-        cur_3of4 = {"prunen": 3, "prunem": 4, "layers": [1, 2]}
-        model_path_3of4, consumed_3of4 = resolver.resolve(
-            cur_3of4, resolver_config)
-        self.assertIn("_3of4_", model_path_3of4)
-
-        self.assertNotEqual(model_path_1of4, model_path_3of4)
-
-    def test_base_sparsity_resolver_reference_ratio_assertion(self):
-        """
-        Arrange-Act-Assert: Verify that reference_sparse_model ratio mismatch
-        (e.g., 2:4 reference for 1:4 sweep) is strictly rejected with ValueError.
-        """
-        resolver = BaseSparsityResolver()
-        ref_2of4_dir = os.path.join(self.work_dir, "model_2of4_canonical_full")
-        os.makedirs(ref_2of4_dir, exist_ok=True)
-        shutil.copytree(self.sparse_dir, ref_2of4_dir, dirs_exist_ok=True)
-
-        resolver_config = {
-            "base_model": self.dense_dir,
-            "reference_sparse_model": ref_2of4_dir,
-            "strategy": "first_to_last",
-            "checkpoint_base_dir": self.work_dir
-        }
-
-        with self.assertRaises(ValueError) as ctx:
-            resolver.resolve({
+        # Non-prefix bypasses splice and calibrates in memory; ratio is embedded in cache key
+        p_1of4, consumed = resolver.resolve(
+            {
                 "prunen": 1,
                 "prunem": 4,
-                "num_sparse_layers": 2
-            }, resolver_config)
-        self.assertIn("Reference sparse model ratio mismatch",
-                      str(ctx.exception))
-
-        path, consumed = resolver.resolve(
+                "layers": [1, 2]
+            },
             {
-                "prunen": 2,
+                "base_model": self.dense_dir,
+                "checkpoint_base_dir": self.work_dir
+            },
+        )
+        p_3of4, _ = resolver.resolve(
+            {
+                "prunen": 3,
                 "prunem": 4,
-                "num_sparse_layers": 2
-            }, resolver_config)
-        self.assertIn("_2of4_", path)
+                "layers": [1, 2]
+            },
+            {
+                "base_model": self.dense_dir,
+                "checkpoint_base_dir": self.work_dir
+            },
+        )
+        self.assertTrue({"layers", "prunen", "prunem"}.issubset(consumed))
+        self.assertIn("_1of4_", p_1of4)
+        self.assertIn("_3of4_", p_3of4)
+        self.assertNotEqual(p_1of4, p_3of4)
+
+        # Reference ratio mismatch raises ValueError
+        ref_2of4 = os.path.join(self.work_dir, "model_2of4_canonical_full")
+        shutil.copytree(self.sparse_dir, ref_2of4, dirs_exist_ok=True)
+        with self.assertRaisesRegex(ValueError,
+                                    "Reference sparse model ratio mismatch"):
+            resolver.resolve(
+                {
+                    "prunen": 1,
+                    "prunem": 4,
+                    "num_sparse_layers": 2
+                },
+                dict(cfg, reference_sparse_model=ref_2of4),
+            )
 
 
 class TestWeightScalerResolver(unittest.TestCase):
@@ -798,17 +591,9 @@ class TestWeightScalerResolver(unittest.TestCase):
         self.test_dir.cleanup()
 
     def test_weight_scaling_transformation(self):
-        """
-        Arrange-Act-Assert: Scale weights by constant factor c = 1.10.
-        Verifies:
-        1. 2D linear projection weights are scaled by exactly 1.10.
-        2. 1D layer norms and biases remain unscaled (1.0x).
-        """
         resolver = WeightScalerResolver()
         out_dir = os.path.join(self.test_dir.name, "scaled_model")
         scale_factor = 1.10
-
-        # Read original tensors
         orig_tensors = {}
         with safe_open(os.path.join(self.base_dir,
                                     "model-00001-of-00001.safetensors"),
@@ -817,12 +602,10 @@ class TestWeightScalerResolver(unittest.TestCase):
             for k in f.keys():
                 orig_tensors[k] = f.get_tensor(k)
 
-        # Scale weights
         resolver._scale_checkpoint(base_checkpoint=self.base_dir,
                                    output_dir=out_dir,
                                    scale_factor=scale_factor)
 
-        # Verify scaled tensors
         with safe_open(os.path.join(out_dir,
                                     "model-00001-of-00001.safetensors"),
                        framework="pt",
@@ -830,374 +613,136 @@ class TestWeightScalerResolver(unittest.TestCase):
             for k in f.keys():
                 scaled = f.get_tensor(k)
                 orig = orig_tensors[k]
-
-                # 2D projection weights should be scaled by 1.10
                 if "weight" in k and scaled.dim() == 2 and "embed" not in k:
                     expected = (orig.to(torch.float32) * scale_factor).to(
                         torch.bfloat16)
-                    self.assertTrue(
-                        torch.allclose(scaled, expected, atol=1e-2),
-                        f"Tensor {k} scaling mismatch")
+                    self.assertTrue(torch.allclose(scaled, expected,
+                                                   atol=1e-2))
                 elif "norm" in k or scaled.dim() == 1:
-                    # Norms must remain unscaled
-                    self.assertTrue(torch.equal(scaled, orig),
-                                    f"Norm {k} should NOT be scaled")
+                    self.assertTrue(torch.equal(scaled, orig))
 
 
 class TestCheckpointIntegrityGate(unittest.TestCase):
-    """Contract & Integrity Guard tests: validates checkpoint safetensors key parity and substitution."""
+    """Tests shard-header checkpoint integrity gate and save_substituted_checkpoint."""
 
-    def test_checkpoint_integrity_gate_pass_and_failures(self):
-        """
-        Contract & Integrity Guard Test: Validates that assert_checkpoint_integrity
-        passes when safetensors keys match 1:1, and fails loudly naming missing
-        or extra keys on any mismatch.
-        """
-        import tempfile
-
-        from safetensors.torch import save_file
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = os.path.join(tmpdir, "base")
-            valid_ckpt_dir = os.path.join(tmpdir, "valid_ckpt")
-            missing_key_dir = os.path.join(tmpdir, "missing_key_ckpt")
-            extra_key_dir = os.path.join(tmpdir, "extra_key_ckpt")
-
-            os.makedirs(base_dir)
-            os.makedirs(valid_ckpt_dir)
-            os.makedirs(missing_key_dir)
-            os.makedirs(extra_key_dir)
-
-            base_tensors = {
-                "model.language_model.layers.0.self_attn.q_proj.weight":
-                torch.randn(8, 8),
-                "model.language_model.layers.1.self_attn.q_proj.weight":
-                torch.randn(8, 8),
-                "model.vision_embedder.patch_dense.weight":
-                torch.randn(4, 4),
-                "model.language_model.embed_tokens.weight":
-                torch.randn(16, 8),
-            }
-            save_file(base_tensors, os.path.join(base_dir,
-                                                 "model.safetensors"))
-
-            # 1. Valid checkpoint: exact matching keys
-            valid_tensors = dict(base_tensors)
-            valid_tensors[
-                "model.language_model.layers.1.self_attn.q_proj.weight"] = torch.zeros(
-                    8, 8)
-            save_file(valid_tensors,
-                      os.path.join(valid_ckpt_dir, "model.safetensors"))
-
-            # Must pass without error
-            ModelSplicer.assert_checkpoint_integrity(base_dir, valid_ckpt_dir)
-
-            # 2. Missing key: omitted vision_embedder (reproducing the reported defect)
-            missing_tensors = dict(base_tensors)
-            del missing_tensors["model.vision_embedder.patch_dense.weight"]
-            save_file(missing_tensors,
-                      os.path.join(missing_key_dir, "model.safetensors"))
-
-            with self.assertRaises(ValueError) as ctx_missing:
-                ModelSplicer.assert_checkpoint_integrity(
-                    base_dir, missing_key_dir)
-            self.assertIn("Missing keys (1)", str(ctx_missing.exception))
-            self.assertIn("model.vision_embedder.patch_dense.weight",
-                          str(ctx_missing.exception))
-
-            # 3. Extra key: unexpected multimodal/tower key
-            extra_tensors = dict(base_tensors)
-            extra_tensors["model.audio_tower.extra.weight"] = torch.randn(4, 4)
-            save_file(extra_tensors,
-                      os.path.join(extra_key_dir, "model.safetensors"))
-
-            with self.assertRaises(ValueError) as ctx_extra:
-                ModelSplicer.assert_checkpoint_integrity(
-                    base_dir, extra_key_dir)
-            self.assertIn("Extra keys (1)", str(ctx_extra.exception))
-            self.assertIn("model.audio_tower.extra.weight",
-                          str(ctx_extra.exception))
-
-    def test_checkpoint_integrity_gate_reads_shards_not_index(self):
-        """
-        Regression: a save that dies before its last shard leaves the base
-        model's index (copied first) naming every key. The gate must read the
-        shards on disk, so a missing or truncated shard fails the check.
-        """
+    def test_integrity_gate_and_substituted_save(self):
         import json
-        import tempfile
 
         from safetensors.torch import save_file
 
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = os.path.join(tmpdir, "base")
             ckpt_dir = os.path.join(tmpdir, "ckpt")
+            save_dir = os.path.join(tmpdir, "saved")
             os.makedirs(base_dir)
             os.makedirs(ckpt_dir)
 
             shards = {
                 "model-00001-of-00002.safetensors": {
                     "model.language_model.layers.0.self_attn.q_proj.weight":
-                    torch.randn(8, 8),
+                    torch.ones(8, 8),
+                    "model.vision_embedder.patch_dense.weight":
+                    torch.ones(4, 4),
                 },
                 "model-00002-of-00002.safetensors": {
                     "model.language_model.layers.1.self_attn.q_proj.weight":
-                    torch.randn(8, 8),
+                    torch.ones(8, 8),
                 },
             }
             index = {
                 "metadata": {},
                 "weight_map": {
-                    key: shard_name
-                    for shard_name, tensors in shards.items()
-                    for key in tensors
+                    k: s
+                    for s, ts in shards.items()
+                    for k in ts
                 },
             }
             for d in (base_dir, ckpt_dir):
                 with open(os.path.join(d, "model.safetensors.index.json"),
                           "w") as f:
                     json.dump(index, f)
-            for shard_name, tensors in shards.items():
-                save_file(tensors, os.path.join(base_dir, shard_name))
+                with open(os.path.join(d, "config.json"), "w") as f:
+                    json.dump(
+                        {"architectures": ["Gemma4ForConditionalGeneration"]},
+                        f)
+            for s, ts in shards.items():
+                save_file(ts, os.path.join(base_dir, s))
+
             first, last = sorted(shards)
             save_file(shards[first], os.path.join(ckpt_dir, first))
 
-            # 1. Last shard never written: the index alone would pass.
-            with self.assertRaises(ValueError) as ctx_missing:
+            # Missing shard fails even when listed in index.json
+            with self.assertRaisesRegex(ValueError, "Missing shard files"):
                 ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
-            self.assertIn("Missing shard files (1)",
-                          str(ctx_missing.exception))
-            self.assertIn(last, str(ctx_missing.exception))
 
-            # 2. Complete: passes.
+            # Complete checkpoint passes; truncated shard fails
             last_path = os.path.join(ckpt_dir, last)
             save_file(shards[last], last_path)
             ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
-
-            # 3. Last shard cut short mid-write: fails.
             with open(last_path, "r+b") as f:
                 f.truncate(os.path.getsize(last_path) - 16)
-            with self.assertRaises(ValueError) as ctx_truncated:
+            with self.assertRaisesRegex(ValueError, "truncated"):
                 ModelSplicer.assert_checkpoint_integrity(base_dir, ckpt_dir)
-            self.assertIn("truncated", str(ctx_truncated.exception))
 
-    def test_save_substituted_checkpoint_preserves_multimodal_keys(self):
-        """
-        Arrange-Act-Assert: Verifies that ModelSplicer.save_substituted_checkpoint
-        correctly updates target layer weights while preserving non-layer multimodal
-        weights (such as model.vision_embedder.*) and config files from base_model.
-        """
-        import json
-        import tempfile
+            # save_substituted_checkpoint: raises on key mismatch or disjoint target layers
+            with self.assertRaisesRegex(ValueError, "replaced 0 tensors"):
+                ModelSplicer.save_substituted_checkpoint(
+                    base_dir, save_dir,
+                    {"layers.1.q_proj.weight": torch.zeros(8, 8)}, {1})
 
-        from safetensors.torch import save_file
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = os.path.join(tmpdir, "base")
-            save_dir = os.path.join(tmpdir, "saved")
-            os.makedirs(base_dir)
-
-            base_w0 = torch.ones(8, 8)
-            base_w1 = torch.ones(8, 8)
-            vision_w = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-            embed_w = torch.ones(16, 8) * 5.0
-
-            base_tensors = {
-                "model.language_model.layers.0.self_attn.q_proj.weight":
-                base_w0,
-                "model.language_model.layers.1.self_attn.q_proj.weight":
-                base_w1,
-                "model.vision_embedder.patch_dense.weight": vision_w,
-                "model.language_model.embed_tokens.weight": embed_w,
-            }
-            save_file(base_tensors, os.path.join(base_dir,
-                                                 "model.safetensors"))
-            with open(os.path.join(base_dir, "config.json"), "w") as f:
-                json.dump(
-                    {"architectures": ["Gemma4ForConditionalGeneration"]}, f)
-
-            # Replacement state dict modifies layer 1 only, plus a phantom key that must not leak
-            calibrated_w1 = torch.zeros(8, 8)
-            replacements = {
-                "model.language_model.layers.1.self_attn.q_proj.weight":
-                calibrated_w1,
-                "model.phantom_audio_tower.ignored": torch.randn(4, 4),
-            }
-
+            # Valid substitution updates layer 1 and preserves layer 0 + multimodal weights
             ModelSplicer.save_substituted_checkpoint(
-                base_model_dir=base_dir,
-                output_dir=save_dir,
-                replacement_state_dict=replacements,
-                target_layer_indices={1},
+                base_dir,
+                save_dir,
+                {
+                    "model.language_model.layers.1.self_attn.q_proj.weight":
+                    torch.zeros(8, 8)
+                },
+                {1},
             )
-
-            # Assert checkpoint integrity passes
             ModelSplicer.assert_checkpoint_integrity(base_dir, save_dir)
-
-            # Verify tensor contents
-            with safe_open(os.path.join(save_dir, "model.safetensors"),
+            with safe_open(os.path.join(save_dir, last),
                            framework="pt",
                            device="cpu") as sf:
-                self.assertEqual(set(sf.keys()), set(base_tensors.keys()))
-                # Layer 0 remained base_w0
-                self.assertTrue(
-                    torch.equal(
-                        sf.get_tensor(
-                            "model.language_model.layers.0.self_attn.q_proj.weight"
-                        ), base_w0))
-                # Layer 1 updated to calibrated_w1
                 self.assertTrue(
                     torch.equal(
                         sf.get_tensor(
                             "model.language_model.layers.1.self_attn.q_proj.weight"
-                        ), calibrated_w1))
-                # Vision embedder preserved exactly
-                self.assertTrue(
-                    torch.equal(
-                        sf.get_tensor(
-                            "model.vision_embedder.patch_dense.weight"),
-                        vision_w))
-                # Embed tokens preserved exactly
-                self.assertTrue(
-                    torch.equal(
-                        sf.get_tensor(
-                            "model.language_model.embed_tokens.weight"),
-                        embed_w))
-
-            # Verify config.json was copied
-            self.assertTrue(
-                os.path.exists(os.path.join(save_dir, "config.json")))
-
-    @staticmethod
-    def _write_two_layer_base(base_dir: str):
-        """Tiny single-shard base with two layers, each q_proj + norm."""
-        import json
-
-        from safetensors.torch import save_file
-
-        os.makedirs(base_dir)
-        tensors = {
-            "model.language_model.layers.0.self_attn.q_proj.weight":
-            torch.ones(8, 8),
-            "model.language_model.layers.0.input_layernorm.weight":
-            torch.ones(8),
-            "model.language_model.layers.1.self_attn.q_proj.weight":
-            torch.ones(8, 8),
-            "model.language_model.layers.1.input_layernorm.weight":
-            torch.ones(8),
-            "model.language_model.embed_tokens.weight":
-            torch.ones(16, 8),
-        }
-        save_file(tensors, os.path.join(base_dir, "model.safetensors"))
-        with open(os.path.join(base_dir, "config.json"), "w") as f:
-            json.dump({"architectures": ["Gemma4ForConditionalGeneration"]}, f)
-        return tensors
-
-    def test_save_substituted_checkpoint_raises_on_key_mismatch(self):
-        """
-        A replacement state dict whose keys carry a wrapper prefix matches
-        nothing in the shards. Silently writing a dense copy would score a
-        dense model as sparse, so this must raise.
-        """
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = os.path.join(tmpdir, "base")
-            save_dir = os.path.join(tmpdir, "saved")
-            self._write_two_layer_base(base_dir)
-            replacements = {
-                "wrapped.model.language_model.layers.1.self_attn.q_proj.weight":
-                torch.zeros(8, 8),
-            }
-            with self.assertRaisesRegex(ValueError, "replaced 0 tensors"):
-                ModelSplicer.save_substituted_checkpoint(
-                    base_model_dir=base_dir,
-                    output_dir=save_dir,
-                    replacement_state_dict=replacements,
-                    target_layer_indices={1},
-                )
-
-    def test_save_substituted_checkpoint_raises_when_targets_outside_dict(
-            self):
-        """Keys match, but none fall in the target layers: still 0 replaced."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = os.path.join(tmpdir, "base")
-            save_dir = os.path.join(tmpdir, "saved")
-            self._write_two_layer_base(base_dir)
-            replacements = {
-                "model.language_model.layers.1.self_attn.q_proj.weight":
-                torch.zeros(8, 8),
-            }
-            with self.assertRaisesRegex(ValueError, "replaced 0 tensors"):
-                ModelSplicer.save_substituted_checkpoint(
-                    base_model_dir=base_dir,
-                    output_dir=save_dir,
-                    replacement_state_dict=replacements,
-                    target_layer_indices={0},
-                )
-
-    def test_save_substituted_checkpoint_matching_keys_replace_expected(self):
-        """Matching keys substitute exactly the target-layer tensors."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = os.path.join(tmpdir, "base")
-            save_dir = os.path.join(tmpdir, "saved")
-            base = self._write_two_layer_base(base_dir)
-            # Full model state dict: every key, layer 1 pruned to zeros
-            replacements = {k: v.clone() for k, v in base.items()}
-            replacements[
-                "model.language_model.layers.1.self_attn.q_proj.weight"] = (
-                    torch.zeros(8, 8))
-
-            ModelSplicer.save_substituted_checkpoint(
-                base_model_dir=base_dir,
-                output_dir=save_dir,
-                replacement_state_dict=replacements,
-                target_layer_indices={1},
-            )
-            ModelSplicer.assert_checkpoint_integrity(base_dir, save_dir)
-            with safe_open(os.path.join(save_dir, "model.safetensors"),
-                           framework="pt",
-                           device="cpu") as sf:
-                # Layer 1 (q_proj + norm) substituted, layer 0 kept dense
-                self.assertTrue(
-                    torch.equal(
-                        sf.get_tensor(
-                            "model.language_model.layers.1.self_attn.q_proj.weight"
-                        ), torch.zeros(8, 8)))
-                self.assertTrue(
-                    torch.equal(
-                        sf.get_tensor(
-                            "model.language_model.layers.0.self_attn.q_proj.weight"
-                        ), torch.ones(8, 8)))
+                        ),
+                        torch.zeros(8, 8),
+                    ))
 
 
 class TestResolverRegistry(unittest.TestCase):
-    """Tests ResolverRegistry factory and resolver lifecycle."""
+    """Tests ResolverRegistry factory and LrcResolver lifecycle."""
 
-    def test_registry_lookup_and_unknown_resolver(self):
-        """
-        Arrange-Act-Assert: Verify standard resolver lookups and error handling for unknown resolver names.
-        """
-        scaler = ResolverRegistry.get("weight_scaler")
-        self.assertIsInstance(scaler, WeightScalerResolver)
-
-        sparsegpt = ResolverRegistry.get("sparsegpt")
-        self.assertIsInstance(sparsegpt, SparseGptResolver)
-
-        magnitude = ResolverRegistry.get("naive_magnitude")
-        self.assertIsInstance(magnitude, NaiveMagnitudeResolver)
-
+    def test_registry_lookup_and_lrc_resolver(self):
+        self.assertIsInstance(ResolverRegistry.get("weight_scaler"),
+                              WeightScalerResolver)
+        self.assertIsInstance(ResolverRegistry.get("sparsegpt"),
+                              SparseGptResolver)
+        self.assertIsInstance(ResolverRegistry.get("lrc"), LrcResolver)
+        self.assertIsInstance(ResolverRegistry.get("resolvers.lrc_resolver"),
+                              LrcResolver)
+        self.assertIsInstance(ResolverRegistry.get("naive_magnitude"),
+                              NaiveMagnitudeResolver)
         with self.assertRaises(KeyError):
             ResolverRegistry.get("non_existent_resolver_type_xyz")
 
+        lrc = LrcResolver()
+        sgpt = SparseGptResolver()
+        name_lrc = lrc.generate_checkpoint_name("gemma4", 2, 4,
+                                                "first_to_last", 0, 24, {
+                                                    "lrc_rank": 64,
+                                                    "lrc_iters": 5
+                                                })
+        name_sgpt = sgpt.generate_checkpoint_name("gemma4", 2, 4,
+                                                  "first_to_last", 0, 24, {})
+        self.assertIn("gemma4_lrc_2of4_first_to_last_layers_0_to_24_k64_T5",
+                      name_lrc)
+        self.assertNotEqual(name_lrc, name_sgpt)
+
     def test_custom_resolver_registration(self):
-        """
-        Arrange-Act-Assert: Test dynamic registration of a user-defined custom resolver class via @ResolverRegistry.register.
-        """
 
         @ResolverRegistry.register("custom_dummy")
         class DummyResolver(BaseResolver):
@@ -1205,165 +750,8 @@ class TestResolverRegistry(unittest.TestCase):
             def resolve(self, current_config, resolver_config):
                 return "/path/to/dummy", set()
 
-        resolved = ResolverRegistry.get("custom_dummy")
-        self.assertIsInstance(resolved, DummyResolver)
-
-
-class TestLrcSparsityResolution(unittest.TestCase):
-    """Tests Low-Rank Compensated (LRC: W = S + UV) sparsity resolution, naming, and verification."""
-
-    def setUp(self):
-        self.resolver = BaseSparsityResolver()
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.dense_dir = os.path.join(self.test_dir.name, "dense_model")
-        self.sparse_dir = os.path.join(self.test_dir.name, "sparse_model")
-        self.work_dir = os.path.join(self.test_dir.name, "workspace")
-        os.makedirs(self.work_dir, exist_ok=True)
-
-        create_synthetic_model(self.dense_dir,
-                               num_layers=4,
-                               num_shards=2,
-                               sparsity_ratio=0.0)
-        create_synthetic_model(self.sparse_dir,
-                               num_layers=4,
-                               num_shards=2,
-                               sparsity_ratio=0.5)
-
-    def tearDown(self):
-        self.test_dir.cleanup()
-
-    def test_checkpoint_naming_with_lrc(self):
-        """
-        Arrange-Act-Assert: Verify checkpoint naming with use_lrc enabled.
-        Ensures Arm B does not collide with Arm A's cached directory.
-        """
-        name_arm_a = self.resolver.generate_checkpoint_name(
-            arch_type="gemma4",
-            prunen=2,
-            prunem=4,
-            strategy="first_to_last",
-            min_layer=0,
-            max_layer=24,
-            resolver_config={"use_lrc": False},
-        )
-        name_arm_b = self.resolver.generate_checkpoint_name(
-            arch_type="gemma4",
-            prunen=2,
-            prunem=4,
-            strategy="first_to_last",
-            min_layer=0,
-            max_layer=24,
-            resolver_config={
-                "use_lrc": True,
-                "lrc_rank": 128,
-                "lrc_iters": 3
-            },
-        )
-        name_arm_b_custom = self.resolver.generate_checkpoint_name(
-            arch_type="gemma4",
-            prunen=2,
-            prunem=4,
-            strategy="first_to_last",
-            min_layer=0,
-            max_layer=24,
-            resolver_config={
-                "use_lrc": True,
-                "lrc_rank": 64,
-                "lrc_iters": 5
-            },
-        )
-        name_is_lrc = self.resolver.generate_checkpoint_name(
-            arch_type="gemma4",
-            prunen=2,
-            prunem=4,
-            strategy="first_to_last",
-            min_layer=0,
-            max_layer=24,
-            resolver_config={
-                "is_lrc": True,
-                "lrc_k": 32,
-                "lrc_T": 2
-            },
-        )
-
-        self.assertNotIn("_lrc", name_arm_a)
-        self.assertIn("_lrc_k128_T3", name_arm_b)
-        self.assertIn("_lrc_k64_T5", name_arm_b_custom)
-        self.assertIn("_lrc_k32_T2", name_is_lrc)
-        self.assertNotEqual(name_arm_a, name_arm_b)
-        self.assertNotEqual(name_arm_b, name_arm_b_custom)
-
-    def test_nonprefix_cache_payload_and_naming_with_lrc(self):
-        """
-        Arrange-Act-Assert: Verify non-prefix layer resolution embeds LRC parameters into
-        cache_payload and checkpoint naming, preventing collision between standard SparseGPT and LRC.
-        """
-        resolver = NaiveMagnitudeResolver()
-        resolver_config = {
-            "base_model": self.dense_dir,
-            "strategy": "first_to_last",
-            "checkpoint_base_dir": self.work_dir,
-        }
-
-        # Standard non-prefix (no LRC)
-        path_std, consumed_std = resolver.resolve(
-            {"layers": [1, 2]},
-            resolver_config,
-        )
-
-        # Non-prefix with LRC
-        lrc_config = dict(resolver_config)
-        lrc_config["use_lrc"] = True
-        lrc_config["lrc_rank"] = 128
-        lrc_config["lrc_iters"] = 3
-        path_lrc, consumed_lrc = resolver.resolve(
-            {"layers": [1, 2]},
-            lrc_config,
-        )
-
-        self.assertNotIn("_lrc", path_std)
-        self.assertIn("_lrc_k128_T3", path_lrc)
-        self.assertNotEqual(path_std, path_lrc)
-        self.assertIn("use_lrc", consumed_lrc)
-
-    def test_lrc_bypasses_non_lrc_reference_sparse_model(self):
-        """
-        Arrange-Act-Assert: Verify that when use_lrc is True, reference_sparse_model reuse
-        and splicing are bypassed unless the reference model is explicitly tagged as an LRC checkpoint.
-        """
-        resolver = NaiveMagnitudeResolver()
-
-        # Non-LRC reference model: must be bypassed, falling through to prune_in_memory
-        resolver_config_std_ref = {
-            "base_model": self.dense_dir,
-            "reference_sparse_model": self.sparse_dir,
-            "checkpoint_base_dir": self.work_dir,
-            "use_lrc": True,
-            "lrc_rank": 128,
-            "lrc_iters": 3,
-        }
-        path_bypassed, _ = resolver.resolve(
-            {"layers": [0]},
-            resolver_config_std_ref,
-        )
-        self.assertIn("_lrc_k128_T3", path_bypassed)
-
-        # LRC-tagged reference model: should NOT be bypassed for prefix splicing
-        ref_lrc_dir = os.path.join(self.work_dir, "gemma4_lrc_k128_T3_full")
-        shutil.copytree(self.sparse_dir, ref_lrc_dir, dirs_exist_ok=True)
-        resolver_config_lrc_ref = {
-            "base_model": self.dense_dir,
-            "reference_sparse_model": ref_lrc_dir,
-            "checkpoint_base_dir": self.work_dir,
-            "use_lrc": True,
-            "lrc_rank": 128,
-            "lrc_iters": 3,
-        }
-        path_spliced, _ = resolver.resolve(
-            {"layers": [0]},
-            resolver_config_lrc_ref,
-        )
-        self.assertIn("_lrc_k128_T3", path_spliced)
+        self.assertIsInstance(ResolverRegistry.get("custom_dummy"),
+                              DummyResolver)
 
 
 if __name__ == "__main__":

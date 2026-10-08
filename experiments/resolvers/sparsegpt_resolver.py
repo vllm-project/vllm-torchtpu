@@ -5,11 +5,7 @@ from sparsity import prune_gemma4
 
 
 class SparseGptResolver(BaseSparsityResolver):
-    """
-    Dedicated resolver for SparseGPT Hessian-based N:M structured sparsity.
-    Inherits caching and cross-shard zero-recompute splicing from BaseSparsityResolver,
-
-    """
+    """Dedicated resolver for SparseGPT Hessian-based N:M structured sparsity."""
     METHOD_NAME: str = "sparsegpt"
 
     def prune_in_memory(
@@ -35,14 +31,7 @@ class SparseGptResolver(BaseSparsityResolver):
             blocksize=resolver_config.get("blocksize", 128),
             save_path=save_path,
             sparse_layer_indices=sparse_layer_indices,
-            use_lrc=resolver_config.get("use_lrc", False)
-            or resolver_config.get("is_lrc", False)
-            or resolver_config.get("lrc", False),
-            lrc_rank=resolver_config.get("lrc_rank",
-                                         resolver_config.get("lrc_k", 128)),
-            lrc_iters=resolver_config.get("lrc_iters",
-                                          resolver_config.get("lrc_T", 3)),
-            save_prefix24_path=resolver_config.get("save_prefix24_path", None))
+        )
         return save_path
 
 

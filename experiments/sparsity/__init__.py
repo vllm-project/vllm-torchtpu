@@ -8,13 +8,13 @@ and TPU-accelerated SparseGPT kernel integrations for LLMs (Gemma 4, LLaMA).
 import os
 import shutil
 import time
-from typing import Optional, Set
+from typing import Any, Callable, Optional, Set
 
 import torch
 from transformers import AutoTokenizer
 
 from .datautils import get_loaders
-from .lrc import LrcResult, lrc_prune
+from .lrc import LrcResult, lrc_prune, make_lrc_pruner
 from .modelutils import find_layers
 from .quant import Quantizer
 from .sparsegpt import SparseGPT
@@ -33,10 +33,7 @@ def prune_gemma4(model_path: str,
                  save_path: str = "",
                  dev: str = "cpu",
                  sparse_layer_indices: Optional[Set[int]] = None,
-                 use_lrc: bool = False,
-                 lrc_rank: int = 128,
-                 lrc_iters: int = 3,
-                 save_prefix24_path: Optional[str] = None) -> str:
+                 prune_fn: Optional[Callable[[SparseGPT], Any]] = None) -> str:
     """
     Main entry point for SparseGPT pruning on Gemma 4 architectures.
     Captures layer activations sequentially, calculates second-order Hessian matrices,
@@ -56,10 +53,8 @@ def prune_gemma4(model_path: str,
         save_path: Output directory to serialize sparsified weights and configs.
         dev: Device string ('cpu' or 'cuda'/'tpu').
         sparse_layer_indices: Optional explicit set of layer indices to prune.
-        use_lrc: Whether to apply Low-Rank Compression alternating minimization.
-        lrc_rank: Low-rank rank k for LRC approximation.
-        lrc_iters: Alternating minimization iterations T for LRC.
-        save_prefix24_path: Optional path to save prefix-24 intermediate checkpoint.
+        prune_fn: Optional per-layer matrix solver callback prune_fn(gpt)
+            (defaults to SparseGPT.fasterprune).
     """
     from .gemma4 import gemma4_sequential, get_gemma4
 
@@ -87,10 +82,7 @@ def prune_gemma4(model_path: str,
     args.prunen = prunen
     args.prunem = prunem
     args.sparse_layer_indices = sparse_layer_indices
-    args.use_lrc = use_lrc
-    args.lrc_rank = lrc_rank
-    args.lrc_iters = lrc_iters
-    args.save_prefix24_path = save_prefix24_path
+    args.prune_fn = prune_fn
     args.model_path = model_path
     args.wbits = 16
     args.percdamp = percdamp
@@ -103,7 +95,7 @@ def prune_gemma4(model_path: str,
 
     # 3. Execute sequential layer-by-layer Hessian collection and pruning
     tick = time.time()
-    gemma4_sequential(model, dataloader, device, args)
+    gemma4_sequential(model, dataloader, device, args, prune_fn=prune_fn)
     tock = time.time()
     print(f">>> [SPARSITY ENGINE] Pruning finished in {tock - tick:.2f}s")
 
@@ -113,20 +105,27 @@ def prune_gemma4(model_path: str,
         print(
             f">>> [SPARSITY ENGINE] Saving pruned checkpoint to {save_path}..."
         )
-        has_safetensors = os.path.exists(model_path) and (os.path.exists(
-            os.path.join(model_path, "model.safetensors.index.json")) or any(
-                f.endswith(".safetensors") for f in os.listdir(model_path)))
+        base_dir = model_path
+        if not os.path.exists(base_dir):
+            try:
+                from core.model_utils import resolve_model_path
+                base_dir = resolve_model_path(model_path)
+            except Exception:
+                base_dir = model_path
+        has_safetensors = os.path.exists(base_dir) and (os.path.exists(
+            os.path.join(base_dir, "model.safetensors.index.json")) or any(
+                f.endswith(".safetensors") for f in os.listdir(base_dir)))
         if has_safetensors:
             from resolvers.model_splicer import ModelSplicer
             sparse_indices = sparse_layer_indices if sparse_layer_indices is not None else set(
                 range(minlayer, maxlayer))
             ModelSplicer.save_substituted_checkpoint(
-                base_model_dir=model_path,
+                base_model_dir=base_dir,
                 output_dir=save_path,
                 replacement_state_dict=model.state_dict(),
                 target_layer_indices=sparse_indices,
             )
-            ModelSplicer.assert_checkpoint_integrity(model_path, save_path)
+            ModelSplicer.assert_checkpoint_integrity(base_dir, save_path)
         else:
             model.save_pretrained(save_path)
             # Ensure multimodal processor and tokenizer configs are saved alongside sparse weights.
@@ -159,6 +158,7 @@ __all__ = [
     "SparseGPT",
     "LrcResult",
     "lrc_prune",
+    "make_lrc_pruner",
     "find_layers",
     "Quantizer",
     "get_loaders",

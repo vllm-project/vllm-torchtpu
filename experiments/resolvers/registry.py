@@ -1,6 +1,7 @@
 from typing import Dict, Type
 
 from core.interfaces import IModelResolver
+from resolvers.lrc_resolver import LrcResolver
 from resolvers.naive_magnitude_resolver import NaiveMagnitudeResolver
 from resolvers.sparsegpt_resolver import SparseGptResolver
 from resolvers.weight_scaler_resolver import WeightScalerResolver
@@ -13,6 +14,10 @@ class ResolverRegistry:
         "sparsegpt": SparseGptResolver,
         "resolvers.sparsegpt_resolver": SparseGptResolver,
         "resolvers.gemma_sparsity_resolver": SparseGptResolver,
+
+        # Low-Rank Compensated (LRC) SparseGPT sparsity
+        "lrc": LrcResolver,
+        "resolvers.lrc_resolver": LrcResolver,
 
         # Naive Magnitude structured sparsity (data-free)
         "magnitude": NaiveMagnitudeResolver,
