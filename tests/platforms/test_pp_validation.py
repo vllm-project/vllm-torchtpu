@@ -107,9 +107,14 @@ def test_accepts_context_parallel_stages():
     validate_pipeline_parallel_config(_config(pp=4, pcp=2))
 
 
-def test_rejects_kv_transfer_with_context_parallel_stages():
+def test_rejects_other_kv_transfer_with_context_parallel_stages():
+    other = SimpleNamespace(kv_connector="TPUConnectorHMA")
     with pytest.raises(NotImplementedError, match="context-parallel stages"):
-        validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+        validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=other))
+
+
+def test_raiden_accepts_context_parallel_stages():
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):

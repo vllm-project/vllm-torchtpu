@@ -59,9 +59,12 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif (
         parallel_config.prefill_context_parallel_size > 1
         and vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
     ):
-        # The KV connectors pair a stage with its peer through one pool per
+        # These connectors pair a stage with its peer through one pool per
         # device; a context-parallel stage spreads a request over several.
+        # The raiden connector lowers each PCP worker's chunks of the
+        # stage's layers.
         unsupported = "KV transfer connectors with context-parallel stages"
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async

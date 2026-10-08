@@ -5036,7 +5036,8 @@ class TPUModelRunner(GPUModelRunner):
             ", ".join(f"{t}+{p}: {ms:.1f} ms" for t, p, ms in samples),
         )
         return {
-            "granularity": int(self._pp_chunk_granularity),
+            # The scheduler sizes steps in tokens, like the samples above.
+            "granularity": int(self._pp_chunk_granularity) * pcp,
             "samples": samples,
             "schedule": schedule,
         }
