@@ -39,13 +39,13 @@ tests_lane_passed() {
   if [[ "${CI_FLEET:-bare}" == "kube" ]]; then
     file=".buildkite/pipeline_tests_kube.yml"
   fi
-  for key in $(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$'); do
+  while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)
     echo "tests lane ${key}: ${outcome:-no outcome}"
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done
+  done < <(grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${file}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
   [[ "${passed}" == true ]]
 }
 
