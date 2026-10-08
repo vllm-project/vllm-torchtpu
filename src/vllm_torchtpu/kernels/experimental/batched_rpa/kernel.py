@@ -621,6 +621,7 @@ def rpa_body(
 
     k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
+
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
     l_val = l_scratch_ref[...]
@@ -948,7 +949,6 @@ def rpa_kernel(
                 )
                 kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
                     -1, num_lanes
-                )
                 # Explicitly zero out scratches and Q/KV buffers.
                 for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
                     ref[...] = jnp.zeros_like(ref)
