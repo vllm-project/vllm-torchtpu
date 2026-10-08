@@ -326,6 +326,43 @@ class TestSweepOrchestrator(unittest.TestCase):
                                         resume=True)
         self.assertIn("metadata file not found", str(ctx.exception))
 
+    def test_runner_exception_marks_sweep_failed(self):
+        """Verifies a raising runner yields FAILED status + error_message in sweep.json and re-raises."""
+        config_data = {
+            "mode": "profile",
+            "sweep_matrix": {
+                "model": ["model_A"],
+                "batch_size": [1]
+            }
+        }
+        self._write_yaml(config_data)
+
+        mock_runner = MagicMock()
+        mock_runner.execute.side_effect = RuntimeError("TPU OOM")
+
+        with patch("runners.registry.RunnerRegistry.get",
+                   return_value=mock_runner):
+            orchestrator = run_sweep.SweepOrchestrator(
+                config_path=self.config_path,
+                result_dir=self.results_dir,
+                experiment_id="failing_exp")
+            with self.assertRaises(RuntimeError):
+                orchestrator.run()
+
+        with open(orchestrator.json_file, "r") as f:
+            data = json.load(f)
+        self.assertEqual(data["status"], "FAILED")
+        self.assertIn("TPU OOM", data["error_message"])
+        self.assertIsNotNone(data["completed_at"])
+        self.assertEqual(len(data["experiments"]), 1)
+        trial = data["experiments"][0]
+        self.assertEqual(trial["status"], "FAILED")
+        self.assertIn("TPU OOM", trial["error_message"])
+        self.assertEqual(trial["parameters"], {
+            "model": "model_A",
+            "batch_size": 1
+        })
+
     def test_fresh_run_with_custom_experiment_id(self):
         """Verifies that passing an experiment_id without resume=True starts a fresh run with that ID."""
         config_data = {
