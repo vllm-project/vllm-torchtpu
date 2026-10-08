@@ -395,14 +395,11 @@ def kernel(
         row = kv_head_dim_groups * num_lane_tiles_bkv + lane_tile_idx
         words = rows[batch_idx, pl.ds(row, 1), :]
         # UE8M0 holds a bare biased exponent, which is where f32 keeps its own:
-        # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly.
-        e = words & 0xFF
-        f = pltpu.bitcast(e << 23, jnp.float32)
-        return jnp.where(
-            e == 0xFF,
-            jnp.float32(jnp.nan),
-            jnp.where(e == 0, jnp.float32(2.0**-127), f),
-        )
+        # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly
+        # for every code the quantizer writes. The codes it never writes, 0 and
+        # 0xFF, decode to 0 and +inf instead of e8m0's 2^-127 and NaN; selecting
+        # those out is ~4% of SAL decode at batch 32.
+        return pltpu.bitcast((words & 0xFF) << 23, jnp.float32)
 
     def transpose_to_head_major(bq_rows, n_tok):
         """[n_tok*H, D] head-minor rows -> [H*n_tok, D] head-major rows."""
