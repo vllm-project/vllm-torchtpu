@@ -123,7 +123,7 @@ def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
     vals = _sparse_fixture(num_rows, width, keep_rate)
 
     want = np.asarray(_xla_pack_reference(jnp.asarray(vals)))
-    got = np.asarray(dcp_sc_compact.pack_nonnegative(jnp.asarray(vals)))
+    got = np.asarray(dcp_sc_compact.pack_owned_winners(jnp.asarray(vals)))
 
     np.testing.assert_array_equal(got, want)
 
@@ -192,6 +192,18 @@ def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
     return local_idxs, slots, want
 
 
+def _resolve_owned_winners(local_idxs, slots, k, dcp_rank):
+    """Stage 3 of `streamindex_topk_dcp`, which inlines it: keep and pack ours.
+
+    The candidate all-gather is rank-major, so flat column `c` came from rank
+    `c // k` at that rank's own slot `c % k`.
+    """
+    safe = jnp.maximum(slots, 0)
+    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
+    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    return dcp_sc_compact.pack_owned_winners(jnp.where(ours, mine, -1))
+
+
 @pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
 def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
     """The ranks' packed outputs reassemble the global top-k, each entry once."""
@@ -202,7 +214,7 @@ def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
     lists = np.stack(
         [
             np.asarray(
-                dcp_sc_compact.resolve_owned_winners(
+                _resolve_owned_winners(
                     jnp.asarray(local_idxs[r]), jnp.asarray(slots), k, jnp.int32(r)
                 )
             )
