@@ -986,6 +986,50 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             soft_cap=soft_cap,
         )
 
+        dist=[(1, 1, 1), (0, 0, 1)],
+    )
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        rng = np.random.default_rng(1234)
+        dtype = jnp.bfloat16
+        num_q_heads, num_kv_heads = 8, 1
+        head_dim = 128
+        page_size = 128
+        num_pages = 32
+        max_num_seq = 8
+        pages_per_seq = 8
+        q_len, kv_len = 4, 260
+
+        kv_packing = utils.get_dtype_packing(dtype)
+        num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
+        kv_cache = jnp.array(
+            rng.random(
+                dtype=np.float32,
+            ),
+            dtype=dtype,
+        )
+        kv_lens = jnp.zeros((max_num_seq,), dtype=jnp.int32).at[0].set(kv_len)
+        page_indices = jnp.arange(max_num_seq * pages_per_seq, dtype=jnp.int32)
+        cu_q_lens = jnp.zeros((max_num_seq + 1,), dtype=jnp.int32).at[1:].set(q_len)
+        distribution = jnp.array(dist, dtype=jnp.int32)
+
+        expected, expected_kvc = ref_ragged_paged_attention(
+            q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution
+        )
+        actual, actual_kvc = wrapper.ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
+        self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
+
     @parameterized.product(tuned_tiles=[False, True])
     def test_ragged_paged_attention_tuned_tiles(self, tuned_tiles):
         """The wrapper's own tiles, with and without the tuned rules, at a

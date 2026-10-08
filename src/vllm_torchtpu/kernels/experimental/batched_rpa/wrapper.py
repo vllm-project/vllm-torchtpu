@@ -920,6 +920,7 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
         lse_hbm_in: jax.Array | None,
+        dist: jax.Array = distribution,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
@@ -941,7 +942,7 @@ def ragged_paged_attention(
             kv_lens=kv_lens,
             page_indices=page_indices,
             cu_q_lens=cu_q_lens,
-            distribution=distribution,
+            distribution=dist,
         )
         need = configs.worst_case_schedule_chunks(cfgs)
         if need > configs.MAX_SCHEDULE_CHUNKS:
@@ -971,7 +972,7 @@ def ragged_paged_attention(
             q_offsets,
             kv_cache_lens,
             kv_new_lens,
-            distribution,
+            dist,
             page_indices,
             cfgs=cfgs,
             computer_cls=computer_cls,
@@ -997,12 +998,24 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
-    )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    effective_decode_blocks = decode_block_sizes or default_decode
+    if (
+        <= min(decode_query_size, effective_decode_blocks.bq_sz)
+        and cp_group_size is None
+    ):
+        decode_dist = jnp.repeat(distribution[2:3], 3)
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init, decode_dist
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
+        )
+    else:
+        )
+
+        else:
+                )
+
+            )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     if return_raw_output:
