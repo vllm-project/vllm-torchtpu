@@ -190,7 +190,7 @@ cd /mnt/pd/vllm-torchtpu/experiments
 source /mnt/pd/torchtpu_env/bin/activate
 
 screen -d -m -S my_sweep bash -c 'exec python -u run_sweep_orchestrator.py \
-  --config configs/gemma4/eval_lrc_stage_l1_screen_12b.yaml \
+  --config configs/gemma4/eval_front_to_back_12b_mmlu_pro.yaml \
   -m "My experiment description" >> sweep.log 2>&1'
 ```
 
@@ -212,7 +212,7 @@ If a sweep was stopped, preempted, or ran out of disk space, use `--resume` with
 
 ```bash
 python -u run_sweep_orchestrator.py \
-  --config configs/gemma4/eval_lrc_stage_l1_screen_12b.yaml \
+  --config configs/gemma4/eval_front_to_back_12b_mmlu_pro.yaml \
   --experiment-id 20260924_214452 \
   --resume \
   -m "Resume after preemption"
