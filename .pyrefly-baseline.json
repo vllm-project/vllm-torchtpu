@@ -381,11 +381,6 @@
       "concise_description": "Argument `tuple[int, ...]` is not assignable to parameter `limits` with type `tuple[int, int]` in function `_masked_dense_prefill_cost_tier`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/mla/masked_dense/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<` is not supported between `Literal[0]` and `None`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
@@ -407,11 +402,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
     },
@@ -424,16 +414,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, *tuple[Unknown, ...]] | None` is not assignable to parameter `input_partition_specs` with type `Sequence[Unknown]` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter.pcp_streaming_jax_op`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -494,16 +474,6 @@
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",

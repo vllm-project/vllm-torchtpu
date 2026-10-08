@@ -1382,11 +1382,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
     },
@@ -1409,16 +1404,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, ((...) -> tuple[Array, Array]) | partial[tuple[Array, Array]], donate_argnums=tuple[Literal[0]] | None, mesh=Any | None, input_partition_specs=tuple[P, P, P, P, P, P, P, P] | tuple[P, *tuple[P, ...]] | None)"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -1542,38 +1527,8 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
       "name": "bad-override",
       "concise_description": "Class member `GdnInterleavedColumnParallelLinear.weight_loader` overrides parent class `MergedColumnParallelLinear` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Module`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Literal[0] | Tensor | Unknown` is not assignable to parameter `*shape` with type `SymInt | int` in function `torch._C.TensorBase.reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C.TensorBase.narrow` called with arguments: (Literal[1], Literal[0] | Tensor | Unknown, Tensor | Unknown)"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a16.py",
@@ -1761,16 +1716,6 @@
       "concise_description": "`None` is not assignable to attribute `kv_cache` with type `tuple[Tensor, ...]`"
     },
     {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/dspark.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `shard_id`"
@@ -1809,11 +1754,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `FusedMoEMethodBase` has no attribute `apply_with_routing`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
@@ -2224,11 +2164,6 @@
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Tensor | ndarray` is not assignable to parameter `t` with type `Tensor` in function `_maybe_pad_dim0`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `astype`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

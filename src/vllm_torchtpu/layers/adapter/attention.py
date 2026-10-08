@@ -924,7 +924,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         block_major: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         max_model_len = (
             vllm_config.model_config.max_model_len
             if use_pcp_streaming and vllm_config is not None
@@ -1329,7 +1329,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # cache aliasing for how the shared cache tensor is set up.
         skip_kv_update = self.kv_sharing_target_layer_name is not None
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
         pcp_configured = (
             parallel_config is not None
@@ -1510,7 +1510,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
 
         if self.dcp_world_size > 1:
