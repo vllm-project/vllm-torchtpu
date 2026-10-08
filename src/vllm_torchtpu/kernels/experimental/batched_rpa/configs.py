@@ -539,8 +539,8 @@ class RpaConfigs:
 
     @property
     def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        """HBM schedule size in chunks of max_steps_ub steps: the serving
+        return max(self.serve.max_schedule_size_multiplier, need)
 
     def validate_inputs(
         self,
