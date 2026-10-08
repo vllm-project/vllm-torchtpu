@@ -211,8 +211,8 @@ class JsonResultRecorder(IResultRecorder):
                  status: str = "COMPLETED",
                  error_message: Optional[str] = None) -> None:
         """
-        Marks sweep completion (or failure), stamps completed_at, uploads
-        traces (partitioned per trial), and uploads sweep.json to GCS.
+        Marks sweep completion (or failure), stamps completed_at, and uploads
+        traces and sweep.json to GCS.
         """
         with self._lock:
             self.data["status"] = status
@@ -268,34 +268,44 @@ class JsonResultRecorder(IResultRecorder):
             for fp in trace_files
         ]
 
-        # Match timestamped profile sessions 1-to-1 with traced trials
-        profile_dirs = sorted(
-            glob.glob(os.path.join(traces_dir, "plugins", "profile", "*")))
+        self._assign_trace_paths(trace_uris, traces_dir)
+        return trace_uris
+
+    def _assign_trace_paths(self, trace_uris: List[str],
+                            traces_dir: str) -> None:
+        """Attaches trace URIs only to trials recorded with trace=True.
+
+        Timestamped profile sessions under plugins/profile/ are matched 1:1,
+        in chronological order, with traced trials in record order. Trials
+        that were not traced always get an empty trace_paths list.
+        """
+        experiments = self.data.get("experiments", [])
+        for exp in experiments:
+            exp.setdefault("artifacts", {}).setdefault("trace_paths", [])
+
         traced_exps = [
-            e for e in self.data.get("experiments", [])
+            e for e in experiments
             if e.get("parameters", {}).get("trace") is True
         ]
+        if not traced_exps:
+            return
 
-        if traced_exps and profile_dirs:
-            for exp, pdir in zip(traced_exps, profile_dirs):
-                ts = os.path.basename(pdir)
-                exp.setdefault("artifacts", {})["trace_paths"] = [
-                    u for u in trace_uris if f"/plugins/profile/{ts}/" in u
-                    and u.endswith(".xplane.pb")
-                ]
-            for exp in self.data.get("experiments", []):
-                if not exp.get("parameters", {}).get("trace"):
-                    exp.setdefault("artifacts",
-                                   {}).setdefault("trace_paths", [])
-        else:
-            for exp in self.data.get("experiments", []):
-                traces = exp.setdefault("artifacts",
-                                        {}).setdefault("trace_paths", [])
-                for u in trace_uris:
-                    if u not in traces:
-                        traces.append(u)
+        profile_dirs = sorted(
+            glob.glob(os.path.join(traces_dir, "plugins", "profile", "*")))
+        if len(profile_dirs) != len(traced_exps):
+            print(f">>> [GCS UPLOAD WARNING] {len(profile_dirs)} profile "
+                  f"session(s) for {len(traced_exps)} traced trial(s); "
+                  "attaching all trace URIs to every traced trial")
+            for exp in traced_exps:
+                exp["artifacts"]["trace_paths"] = list(trace_uris)
+            return
 
-        return trace_uris
+        for exp, pdir in zip(traced_exps, profile_dirs):
+            ts = os.path.basename(pdir)
+            exp["artifacts"]["trace_paths"] = [
+                u for u in trace_uris
+                if f"/plugins/profile/{ts}/" in u and u.endswith(".xplane.pb")
+            ]
 
     def _upload_to_gcs_unlocked(self) -> None:
         """Uploads sweep.json to GCS staging bucket."""
