@@ -1208,3 +1208,61 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+def test_v3_rejected_contract_does_not_clobber_rank_buffer(monkeypatch):
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_bridge
+
+    mesh = SimpleNamespace(shape={v3_bridge.EP_AXIS_NAME: _STUB_EP})
+    monkeypatch.setattr(v3_bridge, "_OP", None)
+    monkeypatch.setattr(v3_bridge, "_OP_CONTRACT", None)
+    monkeypatch.setattr(v3_bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(v3_bridge, "_EXPERT_ORDER", None)
+    monkeypatch.setattr(v3_bridge, "build_ep_mesh", lambda: mesh)
+    monkeypatch.setattr(v3_bridge, "_max_node_tokens", lambda ep: 4096)
+    monkeypatch.setattr(v3_bridge, "_expert_block_permutation", lambda ep, dev: None)
+    monkeypatch.setattr(
+        v3_bridge,
+        "_build_op",
+        lambda *args, **kwargs: setattr(v3_bridge, "_OP", "v3_op"),
+    )
+
+    layer1 = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=1):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer1, topk=2, renormalize=True, activation="silu"
+        )
+    assert getattr(layer1, "_tpu_fused_ep_eligible", False) is True
+    saved_rank_buf = v3_bridge._RANK_BUFFER
+    assert saved_rank_buf is not None and saved_rank_buf.item() == 1
+
+    # A second layer with a different contract must be rejected before mutating
+    # _RANK_BUFFER or _EXPERT_ORDER.
+    layer2 = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=0):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer2, topk=4, renormalize=True, activation="silu"
+        )
+    assert getattr(layer2, "_tpu_fused_ep_eligible", False) is False
+    assert v3_bridge._RANK_BUFFER is saved_rank_buf
+    assert v3_bridge._RANK_BUFFER.item() == 1
+
+
+def test_v3_rejects_out_of_bounds_ep_mesh_index(monkeypatch):
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_bridge
+
+    mesh = SimpleNamespace(shape={v3_bridge.EP_AXIS_NAME: _STUB_EP})
+    monkeypatch.setattr(v3_bridge, "_OP", None)
+    monkeypatch.setattr(v3_bridge, "_OP_CONTRACT", None)
+    monkeypatch.setattr(v3_bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(v3_bridge, "build_ep_mesh", lambda: mesh)
+    monkeypatch.setattr(v3_bridge, "_max_node_tokens", lambda ep: 4096)
+
+    layer = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=_STUB_EP):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer, topk=2, renormalize=True, activation="silu"
+        )
+    assert getattr(layer, "_tpu_fused_ep_eligible", False) is False
+    assert v3_bridge._OP is None
+    assert v3_bridge._RANK_BUFFER is None
