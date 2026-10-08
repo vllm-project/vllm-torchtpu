@@ -298,8 +298,9 @@ def calibrate_layers_tpu(lm,
     del dev
     cfg = lm.config
     _check_supported(cfg)
-    if getattr(spec, "use_lrc", False):
-        raise NotImplementedError("LRC is only implemented for the CPU calibrator (sparsity/lrc.py)")
+    if getattr(spec, "prune_fn", None) is not None:
+        raise NotImplementedError(
+            "Custom prune_fn is only supported by the CPU calibrator")
     prunen, prunem = int(spec.prunen), int(spec.prunem)
     blocksize, percdamp = int(spec.blocksize), float(spec.percdamp)
     sparsity = float(getattr(spec, "sparsity", 0.0) or 0.0)

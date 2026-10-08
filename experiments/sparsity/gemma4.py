@@ -129,11 +129,21 @@ def gemma4_sequential(model, dataloader, dev, args, prune_fn=None):
 
     lm, inps, position_embeddings = capture_layer0_inputs(
         model, dataloader, dev, args.nsamples)
-    calibrate_layers_cpu(lm, inps, position_embeddings, args, dev, prune_fn=prune_fn)
+    calibrate_layers_cpu(lm,
+                         inps,
+                         position_embeddings,
+                         args,
+                         dev,
+                         prune_fn=prune_fn)
 
 
 @torch.no_grad()
-def calibrate_layers_cpu(lm, inps, position_embeddings, args, dev, prune_fn=None):
+def calibrate_layers_cpu(lm,
+                         inps,
+                         position_embeddings,
+                         args,
+                         dev,
+                         prune_fn=None):
     """SparseGPT layer loop in PyTorch (the reference implementation).
 
     For each layer in order: accumulate the input Hessian of every linear with
