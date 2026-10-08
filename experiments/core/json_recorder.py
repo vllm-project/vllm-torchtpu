@@ -96,35 +96,64 @@ class JsonResultRecorder(IResultRecorder):
         Thread-safely appends an individual completed experiment trial to the sweep.
         """
         with self._lock:
-            trial_idx = len(self.data["experiments"])
-            trial_id = f"{self.sweep_id}_trial_{trial_idx:03d}"
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            trial_record: Dict[str, Any] = {
-                "experiment_id": trial_id,
-                "trial_index": trial_idx,
-                "status": "COMPLETED",
-                "timestamp": now_str,
-                "parameters": dict(metadata),
-                "metrics": dict(metrics),
-            }
-            if reproduction_cmd:
-                trial_record["reproduction_command"] = reproduction_cmd
-
+            trial_record = self._new_trial(metadata, metrics, reproduction_cmd)
             self.data["experiments"].append(trial_record)
             self._flush_unlocked()
-            print(
-                f">>> [JSON RECORDER] Appended trial {trial_id} to {os.path.basename(self.json_file)}"
-            )
+            print(f">>> [JSON RECORDER] Appended trial "
+                  f"{trial_record['experiment_id']} to "
+                  f"{os.path.basename(self.json_file)}")
 
-    def finalize(self, status: str = "COMPLETED") -> None:
+    def _new_trial(
+        self,
+        metadata: Dict[str, Any],
+        metrics: Dict[str, Any],
+        reproduction_cmd: str,
+    ) -> Dict[str, Any]:
+        """Builds a COMPLETED trial record; caller must hold the lock."""
+        trial_idx = len(self.data["experiments"])
+        trial_record: Dict[str, Any] = {
+            "experiment_id": f"{self.sweep_id}_trial_{trial_idx:03d}",
+            "trial_index": trial_idx,
+            "status": "COMPLETED",
+            "timestamp":
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "parameters": dict(metadata),
+            "metrics": dict(metrics),
+        }
+        if reproduction_cmd:
+            trial_record["reproduction_command"] = reproduction_cmd
+        return trial_record
+
+    def record_failure(
+        self,
+        metadata: Dict[str, Any],
+        error_message: str,
+        reproduction_cmd: str = "",
+    ) -> None:
         """
-        Marks sweep completion and stamps completed_at timestamp.
+        Appends a FAILED experiment trial carrying the runner error message.
+        """
+        with self._lock:
+            trial_record = self._new_trial(metadata, {}, reproduction_cmd)
+            trial_record["status"] = "FAILED"
+            trial_record["error_message"] = error_message
+            self.data["experiments"].append(trial_record)
+            self._flush_unlocked()
+            print(f">>> [JSON RECORDER] Recorded FAILED trial "
+                  f"{trial_record['experiment_id']}: {error_message}")
+
+    def finalize(self,
+                 status: str = "COMPLETED",
+                 error_message: Optional[str] = None) -> None:
+        """
+        Marks sweep completion (or failure) and stamps completed_at.
         """
         with self._lock:
             self.data["status"] = status
             self.data["completed_at"] = datetime.now(
                 timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if error_message is not None:
+                self.data["error_message"] = error_message
             self._flush_unlocked()
 
     def _flush_unlocked(self) -> None:
@@ -160,6 +189,8 @@ class CompositeResultRecorder(IResultRecorder):
         for recorder in self.recorders:
             recorder.record(metadata, metrics, reproduction_cmd)
 
-    def finalize(self, status: str = "COMPLETED") -> None:
+    def finalize(self,
+                 status: str = "COMPLETED",
+                 error_message: Optional[str] = None) -> None:
         for recorder in self.recorders:
-            recorder.finalize(status)
+            recorder.finalize(status, error_message)

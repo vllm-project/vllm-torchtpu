@@ -6,7 +6,7 @@ Defines core interfaces for execution runners, dynamic model resolvers, and metr
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from core.models import BenchmarkResult, ExecutionContext
 
@@ -43,7 +43,9 @@ class IResultRecorder(ABC):
         """Records a completed benchmark coordinate with its metrics and reproduction command."""
         pass
 
-    def finalize(self, status: str = "COMPLETED") -> None:
+    def finalize(self,
+                 status: str = "COMPLETED",
+                 error_message: Optional[str] = None) -> None:
         """Marks the end of a sweep (e.g. COMPLETED or FAILED).
 
         Optional hook; recorders without a notion of sweep-level state

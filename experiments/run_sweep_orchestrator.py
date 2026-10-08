@@ -297,12 +297,23 @@ class SweepOrchestrator:
 
             # 3. Execute benchmark via polymorphic runner (profile, eval, or both)
             runner_names = ["profile", "eval"] if mode == "both" else [mode]
+            cmd_repro = (f"python3 run_sweep_orchestrator.py --config "
+                         f"{self.config_path}")
             for r_name in runner_names:
                 runner = RunnerRegistry.get(r_name)
-                result: BenchmarkResult = runner.execute(context)
+                try:
+                    result: BenchmarkResult = runner.execute(context)
+                except Exception as e:
+                    # Persist the failure so sweep.json never stays RUNNING
+                    # after a crash, then propagate to the caller.
+                    error_message = f"{type(e).__name__}: {e}"
+                    self.json_recorder.record_failure(combined_metadata,
+                                                      error_message, cmd_repro)
+                    self.recorder.finalize(status="FAILED",
+                                           error_message=error_message)
+                    raise
 
                 # 4. Persist trial metrics to CSV and JSON
-                cmd_repro = f"python3 run_sweep_orchestrator.py --config {self.config_path}"
                 self.recorder.record(
                     metadata=combined_metadata,
                     metrics=result.metrics,
