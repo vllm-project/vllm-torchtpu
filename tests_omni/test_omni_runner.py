@@ -37,9 +37,9 @@ def _patch_omni_env():
     mp = pytest.MonkeyPatch()
     for mod in ("vllm_omni", "vllm_omni.entrypoints", "vllm_omni.entrypoints.omni"):
         mp.setitem(sys.modules, mod, types.ModuleType(mod))
-    sys.modules["vllm_omni.entrypoints.omni"].Omni = _FakeOmni  # type: ignore[attr-defined]
-    mp.setattr(omni_conftest, "cleanup_dist_env_and_memory", lambda: None)
-    mp.setattr(omni_conftest, "wait_for_tpu_release", lambda: None)
+    sys_omni = sys.modules["vllm_omni.entrypoints.omni"]
+    mp.setattr(sys_omni, "Omni", _FakeOmni, raising=False)
+    mp.setattr(omni_conftest, "cleanup_test_environment", lambda: None)
     _EVENTS.clear()
     yield
     mp.undo()
