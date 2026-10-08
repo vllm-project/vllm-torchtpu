@@ -45,10 +45,7 @@ import psutil
 import pytest
 from vllm.distributed import cleanup_dist_env_and_memory
 
-try:
-    from tests.tpu_release import wait_for_tpu_release
-except ImportError:
-    from tpu_release import wait_for_tpu_release
+from tests.tpu_release import wait_for_tpu_release
 
 omni_fixture_lock = threading.Lock()
 
