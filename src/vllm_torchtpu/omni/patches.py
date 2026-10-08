@@ -259,9 +259,6 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     The first request after startup therefore differs numerically from later
     same-seed requests (tests_omni/models/wan/test_wan_pr.py::
     test_wan_deterministic_seed_parity_tpu).
-
-    Applied from ``apply_omni_model_specific_patches``, i.e. in the process that
-    builds the model and runs the warmup forward.
     """
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
