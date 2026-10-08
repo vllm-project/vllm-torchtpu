@@ -92,3 +92,19 @@ def test_omni_runner_lifecycle_and_error_recovery(
     with pytest.raises(RuntimeError, match="init failed"):
         OmniRunner("broken-model")
     assert len(cleaned) == 2
+
+
+def test_omni_runner_seed_configuration() -> None:
+    # Default to no seed
+    r_default = OmniRunner("model-no-seed")
+    assert "seed" not in r_default.omni.kwargs
+
+    # Configured seed directly on OmniRunner
+    r_seeded = OmniRunner("model-seeded", seed=42)
+    assert r_seeded.omni.kwargs["seed"] == 42
+
+    # Configured via extra kwargs without TypeError
+    manager = _OmniRunnerManager(omni_fixture_lock)
+    r_extra = manager.get_or_create(("model-extra-seed", None, {"seed": 100}))
+    assert r_extra.omni.kwargs["seed"] == 100
+    manager.close()

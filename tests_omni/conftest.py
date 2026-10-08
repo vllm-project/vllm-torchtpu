@@ -83,15 +83,13 @@ class OmniRunner:
     (https://github.com/vllm-project/vllm/blob/main/tests/conftest.py).
     """
 
-    def __init__(self, model_name: str, seed: int = 42, **kwargs: Any) -> None:
+    def __init__(self, model_name: str, **kwargs: Any) -> None:
         cleanup_test_environment()
         self.model_name = model_name
-        self.seed = seed
         self.omni: Omni | None = None
         kwargs.setdefault("stage_init_timeout", 600)
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
-        kwargs.setdefault("seed", seed)
 
         try:
             from vllm_omni.entrypoints.omni import Omni
@@ -167,7 +165,7 @@ class _OmniRunnerManager:
                 return self._active_runner
             self.close()
             self._active_runner = OmniRunner(
-                model, seed=42, deploy_config=stage_cfg, **extra
+                model, deploy_config=stage_cfg, **extra
             )
             self._active_key = key
             return self._active_runner
@@ -205,7 +203,7 @@ def omni_runner_function(
     model, stage_cfg, extra = _parse_omni_runner_param(request.param)
     with (
         omni_fixture_lock,
-        OmniRunner(model, seed=42, deploy_config=stage_cfg, **extra) as runner,
+        OmniRunner(model, deploy_config=stage_cfg, **extra) as runner,
     ):
         yield runner
 
