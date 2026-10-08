@@ -20,6 +20,9 @@ import pytest
 import torch
 import torch._dynamo
 
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
@@ -502,6 +505,84 @@ def test_propose_unit(device):
     proposer._prepare_dflash_inputs.assert_called_once()
     proposer._update_draft_kv_cache_from_target.assert_called_once()
     proposer._dflash_forward_and_sample.assert_called_once()
+
+
+def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
+    """Run `run()` with the padding mask left in a target step's state and
+    return the mask the draft forward saw."""
+    state = TokenPaddingState.create(32, torch.device("cpu"))
+    # A target step with 3 real rows of 16: stale for any draft forward.
+    state.update(3, 16)
+    seen = []
+
+    def _forward(input_ids, positions, block_size):
+        seen.append(state.get_local_padding_mask(num_rows).tolist())
+        num_reqs = input_ids.shape[0] // block_size
+        return torch.zeros((num_reqs, block_size - 1), dtype=torch.int64), None
+
+    proposer._dflash_forward_and_sample = _forward
+    token_padding.set_padding_state(state)
+    try:
+        run()
+    finally:
+        token_padding.set_padding_state(None)
+    assert len(seen) == 1
+    return seen[0]
+
+
+def test_propose_marks_padding_for_draft_rows():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(num_reqs=2),
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer.draft_chunks = [SimpleNamespace(num_reqs=2, start_index=0)]
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    # 2 requests x block 4 = 8 real draft rows, padded to a 16-row bucket.
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+    )
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer.propose(
+            [], [], None, None, return_device=True, device_seed=torch.zeros(2)
+        ),
+        num_rows=16,
+    )
+
+    assert mask == [False] * 8 + [True] * 8
+
+
+def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", lambda *a, **k: None)
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer._dummy_draft_forward(
+            num_tokens=8, use_max_model_len=True, sync=False
+        ),
+        num_rows=8,
+    )
+
+    assert mask == [True] * 8
 
 
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
