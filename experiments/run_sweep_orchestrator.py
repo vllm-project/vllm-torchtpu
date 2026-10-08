@@ -317,8 +317,12 @@ class SweepOrchestrator:
                     raise
 
                 # 4. Persist trial metrics to CSV and JSON
+                # Persist whether this coordinate was traced so the JSON
+                # recorder can attach trace artifacts to the right trial.
                 self.recorder.record(
-                    metadata=combined_metadata,
+                    metadata={
+                        **combined_metadata, "trace": trace
+                    },
                     metrics=result.metrics,
                     reproduction_cmd=cmd_repro,
                 )
