@@ -66,6 +66,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
+        _is_dspark_pd_producer=False,
         _execute_dp_mm_encoder=lambda: order.append("encoder"),
         _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
         speculative_config=SimpleNamespace(use_eagle=lambda: True),

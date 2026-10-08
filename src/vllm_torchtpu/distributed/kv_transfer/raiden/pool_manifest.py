@@ -1008,8 +1008,12 @@ def build_kimi_k3_pool_manifest(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
         declared_block_size = getattr(spec, "block_size", None)
+        # Attention blocks count stored tokens. A Mamba block describes a
+        # logical sequence interval, not the row capacity of its state page.
+        # Validate state capacity through page bytes and _pooled_kda_regions.
         if (
-            declared_block_size is not None
+            not is_state
+            and declared_block_size is not None
             and int(declared_block_size) != rows * packing
         ):
             raise ManifestError(

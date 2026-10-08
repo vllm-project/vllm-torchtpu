@@ -970,6 +970,24 @@ class TPUModelRunner(GPUModelRunner):
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
+        speculative_config = self.speculative_config
+        # The producer populates draft context KV without generating proposals.
+        self._is_dspark_pd_producer = bool(
+            transfer_config is not None
+            and transfer_config.kv_connector == "TPURaidenConnector"
+            and transfer_config.is_kv_producer
+            and speculative_config is not None
+            and speculative_config.method == "dspark"
+        )
+        if self._is_dspark_pd_producer:
+            if not self._unified_kv_layout:
+                raise ValueError("DSpark PD requires the unified block pool.")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "DSpark PD producer currently requires sync scheduling."
+                )
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("DSpark PD producer currently requires PP=1.")
         # Maximum query length to be considered a decode.
         self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
@@ -3542,10 +3560,16 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
-        # Phase 2: all DRAFT dummy forwards (num_chunks * K), on the
-        # workers that host a drafter.
+        # Phase 2: pair the context updates or draft forwards on drafter workers.
         if num_chunks > 0 and self._is_async_drafter:
-            self._async_drafter.run_dp_dummy_draft(num_chunks)
+            if self._is_dspark_pd_producer:
+                assert isinstance(self.drafter, DFlashProposer)
+                # Busy producers only project context KV; pairing a draft
+                # forward here would emit collectives with no busy-rank peer.
+                self.drafter.run_dp_dummy_context(num_chunks)
+                synchronize_tensors()
+            else:
+                self._async_drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
@@ -4741,7 +4765,11 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
-        if self._is_async_drafter and combined_selected_tokens:
+        if (
+            self._is_async_drafter
+            and combined_selected_tokens
+            and not self._is_dspark_pd_producer
+        ):
             if is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
@@ -4780,6 +4808,13 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if self._is_dspark_pd_producer:
+            assert isinstance(self.drafter, DFlashProposer)
+            self.drafter.prepare_prefill_handoff()
+            # Context projections are deferred TPU graphs. A hardware-only
+            # barrier does not materialize their writes before Raiden reads.
+            synchronize_tensors()
 
         if copy_state is not None and self._fence_spec_kv_under_token_copy:
             # A Raiden producer registers a request's KV blocks ahead of its
