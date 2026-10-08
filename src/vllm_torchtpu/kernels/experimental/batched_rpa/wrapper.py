@@ -598,6 +598,7 @@ def calculate_block_sizes(
         "return_lse",
         "mask_invalid_v",
         "return_raw_output",
+        "native_fp8",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
