@@ -102,14 +102,14 @@ class OmniRunner:
             raise
 
     def get_default_sampling_params_list(self) -> list[Any]:
+        assert self.omni is not None, "Omni was not initialized"
         return copy.deepcopy(list(self.omni.default_sampling_params_list))
 
     def generate(
         self, prompts: Any, sampling_params_list: Any = None, *args: Any, **kwargs: Any
-    ) -> list[Any]:
-        if sampling_params_list is None and hasattr(
-            self.omni, "default_sampling_params_list"
-        ):
+    ) -> Generator[Any, None, None]:
+        assert self.omni is not None, "Omni cannot generate before initializing"
+        if sampling_params_list is None:
             sampling_params_list = self.get_default_sampling_params_list()
         return self.omni.generate(prompts, sampling_params_list, *args, **kwargs)
 
