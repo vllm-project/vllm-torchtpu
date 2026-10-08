@@ -14,6 +14,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .datautils import get_loaders
+from .lrc import LrcResult, lrc_prune
 from .modelutils import find_layers
 from .quant import Quantizer
 from .sparsegpt import SparseGPT
@@ -156,6 +157,8 @@ def prune_gemma4(model_path: str,
 
 __all__ = [
     "SparseGPT",
+    "LrcResult",
+    "lrc_prune",
     "find_layers",
     "Quantizer",
     "get_loaders",

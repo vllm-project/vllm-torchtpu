@@ -100,10 +100,11 @@ experiments/
 │   ├── datautils.py                                             # Calibration sequence tokenization utilities
 │   ├── gemma4.py                                                # Gemma 4 layer capture and Hessian orchestrator
 │   ├── llama.py                                                 # LLaMA architecture layer hooks
+│   ├── lrc.py                                                   # Low-Rank Compensated (LRC) alternating minimization
 │   ├── modelutils.py                                            # PyTorch module traversal & model structure helpers
 │   ├── naive_magnitude_pruner.py                                # Vectorized N:M magnitude pruner (dim=-1)
 │   ├── quant.py                                                 # Quantization helper routines
-│   └── sparsegpt.py                                             # PyTorch reference SparseGPT (+ LRC) implementation
+│   └── sparsegpt.py                                             # PyTorch reference SparseGPT implementation
 ├── tests/                                                       # Comprehensive unit, integration & TPU test suite
 │   ├── __init__.py                                              # Test package initialization
 │   ├── fixtures.py                                              # Synthetic multi-shard fixtures & dynamic path discovery
@@ -175,6 +176,27 @@ splicer.splice_checkpoint(
     sparse_layer_indices={0, 1, 2, 3, 4, 5, 6, 7, 8, 9},  # Splice first 10 prefix layers
     output_dir="/mnt/pd/sparse_checkpoints/gemma4_spliced_10_layers"
 )
+```
+
+### D. Low-Rank Compensated (LRC) 2:4 Pruning
+LRC (`sparsity/lrc.py`) decomposes each pruned linear layer as `W ≈ S + U @ V`, where `S` is 2:4 structured-sparse and `U @ V` is a rank-`k` residual adapter solved via `T` iterations of alternating minimization in whitened activation space (`||(W - S - U @ V) @ L||_F^2`, where `H = L @ L^T`).
+
+To enable LRC in a sweep YAML config, set `use_lrc: true`, `lrc_rank`, and `lrc_iters` inside `model.sparsity_config` (and omit `reference_sparse_model` unless it was also calibrated with matching LRC parameters):
+
+```yaml
+model:
+  path: google/gemma-4-26B-A4B-it
+  sparsity_config:
+    method: sparsegpt
+    sparsity_ratio: 0.5
+    prunen: 2
+    prunem: 4
+    strategy: custom_layers
+    sparse_layers: [0, 1, 2, 3, 4, 5, 6, 7]
+    nsamples: 64
+    use_lrc: true
+    lrc_rank: 128
+    lrc_iters: 3
 ```
 
 ---

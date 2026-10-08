@@ -135,7 +135,7 @@ class TestGemma4Sparsity(unittest.TestCase):
     def test_gemma4_sequential_lrc_execution(self):
         """
         Arrange-Act-Assert: Exercises gemma4_sequential with use_lrc=True to verify
-        the active gpts[name].lrc_prune alternating minimization path end-to-end.
+        the active lrc.lrc_prune alternating minimization path end-to-end.
         """
 
         class MockDecoderLayer(nn.Module):

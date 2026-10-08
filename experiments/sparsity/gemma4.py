@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from transformers import Gemma4ForConditionalGeneration
 
+from .lrc import lrc_prune
 from .modelutils import find_layers
 from .sparsegpt import SparseGPT
 
@@ -215,7 +216,8 @@ def gemma4_sequential(model, dataloader, dev, args):
                           end="",
                           flush=True)
                     if is_lrc:
-                        gpts[name].lrc_prune(
+                        lrc_prune(
+                            gpts[name],
                             sparsity=args.sparsity
                             if hasattr(args, "sparsity") and args.sparsity > 0
                             else 0.5,

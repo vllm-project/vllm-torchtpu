@@ -15,6 +15,7 @@ import unittest
 import torch
 import torch.nn as nn
 from safetensors import safe_open
+from sparsity.lrc import lrc_prune
 from sparsity.modelutils import find_layers
 from sparsity.naive_magnitude_pruner import (prune_model_magnitude,
                                              prune_tensor_magnitude_nm)
@@ -231,7 +232,8 @@ class TestSparseGPT(unittest.TestCase):
             out = linear(inp)
             sparsegpt.add_batch(inp, out)
 
-        U, V = sparsegpt.lrc_prune(
+        res = lrc_prune(
+            sparsegpt,
             sparsity=0,
             prunen=2,
             prunem=4,
@@ -241,21 +243,15 @@ class TestSparseGPT(unittest.TestCase):
             k=4,
         )
 
-        self.assertEqual(U.shape, (32, 4))
-        self.assertEqual(V.shape, (4, 16))
-        self.assertIsNotNone(sparsegpt.error_sparsegpt)
-        self.assertIsNotNone(sparsegpt.error_lrc)
-        self.assertLessEqual(sparsegpt.error_lrc,
-                             sparsegpt.error_sparsegpt + 1e-5)
+        self.assertEqual(res.U.shape, (32, 4))
+        self.assertEqual(res.V.shape, (4, 16))
+        self.assertEqual(res.S.shape, (32, 16))
+        self.assertLessEqual(res.error_lrc, res.error_sparsegpt + 1e-5)
         self.assertFalse(torch.isnan(linear.weight.data).any())
         self.assertFalse(torch.isinf(linear.weight.data).any())
 
         sparsegpt.free()
         self.assertIsNone(sparsegpt.H)
-        self.assertIsNone(sparsegpt.L)
-        self.assertIsNone(sparsegpt.U)
-        self.assertIsNone(sparsegpt.V)
-        self.assertIsNone(sparsegpt.S)
 
     def test_sparsegpt_lrc_prune_wide_matrix(self):
         """
@@ -276,7 +272,8 @@ class TestSparseGPT(unittest.TestCase):
             out = linear(inp)
             sparsegpt.add_batch(inp, out)
 
-        U, V = sparsegpt.lrc_prune(
+        res = lrc_prune(
+            sparsegpt,
             sparsity=0,
             prunen=2,
             prunem=4,
@@ -286,21 +283,15 @@ class TestSparseGPT(unittest.TestCase):
             k=4,
         )
 
-        self.assertEqual(U.shape, (16, 4))
-        self.assertEqual(V.shape, (4, 32))
-        self.assertIsNotNone(sparsegpt.error_sparsegpt)
-        self.assertIsNotNone(sparsegpt.error_lrc)
-        self.assertLessEqual(sparsegpt.error_lrc,
-                             sparsegpt.error_sparsegpt + 1e-5)
+        self.assertEqual(res.U.shape, (16, 4))
+        self.assertEqual(res.V.shape, (4, 32))
+        self.assertEqual(res.S.shape, (16, 32))
+        self.assertLessEqual(res.error_lrc, res.error_sparsegpt + 1e-5)
         self.assertFalse(torch.isnan(linear.weight.data).any())
         self.assertFalse(torch.isinf(linear.weight.data).any())
 
         sparsegpt.free()
         self.assertIsNone(sparsegpt.H)
-        self.assertIsNone(sparsegpt.L)
-        self.assertIsNone(sparsegpt.U)
-        self.assertIsNone(sparsegpt.V)
-        self.assertIsNone(sparsegpt.S)
 
     def test_sparsegpt_lrc_prune_zero_rank(self):
         """
@@ -317,7 +308,8 @@ class TestSparseGPT(unittest.TestCase):
             inp = torch.randn(16, 16)
             sparsegpt.add_batch(inp, linear(inp))
 
-        U, V = sparsegpt.lrc_prune(
+        res = lrc_prune(
+            sparsegpt,
             sparsity=0,
             prunen=2,
             prunem=4,
@@ -326,11 +318,9 @@ class TestSparseGPT(unittest.TestCase):
             T=2,
             k=0,
         )
-        self.assertEqual(U.shape, (16, 0))
-        self.assertEqual(V.shape, (0, 16))
-        self.assertAlmostEqual(sparsegpt.error_lrc,
-                               sparsegpt.error_sparsegpt,
-                               places=5)
+        self.assertEqual(res.U.shape, (16, 0))
+        self.assertEqual(res.V.shape, (0, 16))
+        self.assertAlmostEqual(res.error_lrc, res.error_sparsegpt, places=5)
         sparsegpt.free()
 
 
