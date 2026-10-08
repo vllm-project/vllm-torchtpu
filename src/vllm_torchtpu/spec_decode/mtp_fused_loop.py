@@ -138,6 +138,32 @@ class _MtpFusedLoop(nn.Module):
         return tuple(tokens)
 
 
+class _MtpMkFusedLoop(_MtpFusedLoop):
+    """The loop with the MTP layer on the megakernel, traced inside
+    `mtp_megakernel_context`. vLLM keys a compiled program by its forward's
+    code (Dynamo's cache, the AOT artifact path), so this one gets its own
+    rather than sharing the XLA loop's."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        seq_lens: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
+        return _MtpFusedLoop.forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            seq_lens,
+            intermediate_tensors,
+            inputs_embeds,
+        )
+
+
 def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
@@ -147,13 +173,16 @@ def build_mtp_fused_loop(
     dynamic_arg_dims: dict,
     greedy_head_owner: Any = None,
     propose_step0: bool = False,
+    megakernel: bool = False,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
     token dimension the same way. vLLM's compile wrapper skips a None
-    argument's dims, so `input_ids=None` under `propose_step0` is fine."""
+    argument's dims, so `input_ids=None` under `propose_step0` is fine.
+    `megakernel` compiles `_MtpMkFusedLoop`."""
+    base = _MtpMkFusedLoop if megakernel else _MtpFusedLoop
     cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
-        type("MtpFusedLoop", (_MtpFusedLoop,), {})
+        type("MtpFusedLoop", (base,), {})
     )
     return cls(
         vllm_config=vllm_config,

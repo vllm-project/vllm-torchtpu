@@ -91,17 +91,48 @@ class MtpLoopStepModel(nn.Module):
         )
 
 
+class _MtpMkStepModel(MtpLoopStepModel):
+    """Draft step 0 with the MTP layer on the megakernel, traced inside
+    `mtp_megakernel_context`. vLLM keys a compiled program by its forward's
+    code (Dynamo's cache, the AOT artifact path), so this one gets its own
+    rather than sharing another `MtpLoopStepModel`'s."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # By keyword, as the step-0 program and the fused loop pass it:
+        # Qwen3.5's MTP forward takes spec_step_idx only through **kwargs.
+        return type(self.mtp).forward(
+            self.mtp,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
+        )
+
+
 def build_mtp_loop_step_model(
     *,
     vllm_config: VllmConfig,
     prefix: str,
     mtp: nn.Module,
     dynamic_arg_dims: dict,
+    megakernel: bool = False,
 ) -> nn.Module:
     """Compile a separate loop-step program with the draft's own dynamic dims
-    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0)."""
+    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0).
+    `megakernel` compiles `_MtpMkStepModel`."""
+    base = _MtpMkStepModel if megakernel else MtpLoopStepModel
     cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
-        type("MtpLoopStepModel", (MtpLoopStepModel,), {})
+        type("MtpLoopStepModel", (base,), {})
     )
     return cls(
         vllm_config=vllm_config,

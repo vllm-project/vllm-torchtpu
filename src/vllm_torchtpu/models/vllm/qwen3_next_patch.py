@@ -138,6 +138,9 @@ _sigmoid_gate_o_proj_op: Callable | None = None
 _fp8_gate_and_se_op: Callable | None = None
 _V6_PATCHES_INSTALLED = False
 _step0_gather_indices: torch.Tensor | None = None
+# The draft megakernel running the MTP layer while a draft program compiled
+# for it executes (see `mtp_megakernel_context`).
+_mtp_megakernel: Any = None
 
 
 @contextlib.contextmanager
@@ -150,6 +153,23 @@ def step0_post_attn_gather_context(indices: torch.Tensor | None):
         yield
     finally:
         _step0_gather_indices = prev
+
+
+@contextlib.contextmanager
+def mtp_megakernel_context(mk: Any):
+    """Run the MTP layer and final norm through `mk.forward_layer`.
+
+    A draft program is traced once, so a program first called inside this
+    context must be called inside it every time, and a program traced outside
+    it must never be.
+    """
+    global _mtp_megakernel
+    prev = _mtp_megakernel
+    _mtp_megakernel = mk
+    try:
+        yield
+    finally:
+        _mtp_megakernel = prev
 
 
 def _step0_effective_gather_indices(
@@ -1653,6 +1673,11 @@ def patched_mtp_forward(
 
     current_step_idx = spec_step_idx % self.num_mtp_layers
     mtp_layer = self.layers[current_step_idx]
+    if _mtp_megakernel is not None and residual is None:
+        # One megakernel step runs the layer and `self.norm`.
+        return _mtp_megakernel.forward_layer(
+            mtp_layer, hidden_states, _step0_gather_indices
+        )
     full_num_tokens = positions.shape[-1]
     sp = mtp_layer.use_attn_reduce_scatter_for_moe and _rows_are_sequence_parallel(
         full_num_tokens
