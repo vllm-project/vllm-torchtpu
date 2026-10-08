@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://google.corp/marc/schemas/sweep.schema.json",
-  "title": "MarcExperimentSweep",
-  "description": "Canonical JSON schema for MARC experiment sweeps, trials, and metadata.",
+  "$id": "https://github.com/vllm-project/vllm-torchtpu/schemas/sweep.schema.json",
+  "title": "ExperimentSweep",
+  "description": "Canonical JSON schema for experiment sweeps, trials, and metadata.",
   "type": "object",
   "required": [
     "schema_version",

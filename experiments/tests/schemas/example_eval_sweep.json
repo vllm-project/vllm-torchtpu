@@ -8,7 +8,7 @@
   "hardware": {
     "accelerator_type": "TPU v6e",
     "chip_count": 4,
-    "node_hostname": "shenrunz-v6e-4-southamerica-west1-a-tpu"
+    "node_hostname": "tpu-vm-0"
   },
   "git_info": {
     "commit_hash": "176256b43d2ef74558ef9c7e39be3dd57d3eb84a",
@@ -113,10 +113,10 @@
         }
       },
       "artifacts": {
-        "log_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260826_173544/results.csv",
-        "eval_report_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260826_173544/eval_summary.json"
+        "log_path": "/workspace/vllm-torchtpu/experiments/results/20260826_173544/results.csv",
+        "eval_report_path": "/workspace/vllm-torchtpu/experiments/results/20260826_173544/eval_summary.json"
       },
-      "reproduction_command": "python3 run_sweep_orchestrator.py --config /mnt/pd/vllm-torchtpu/experiments/configs/0_baseline_mmlu_pro_fast.yaml",
+      "reproduction_command": "python3 run_sweep_orchestrator.py --config /workspace/vllm-torchtpu/experiments/configs/0_baseline_mmlu_pro_fast.yaml",
       "error_message": null
     }
   ]

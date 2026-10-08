@@ -8,7 +8,7 @@
   "hardware": {
     "accelerator_type": "TPU v6e",
     "chip_count": 4,
-    "node_hostname": "shenrunz-v6e-4-southamerica-west1-a-tpu"
+    "node_hostname": "tpu-vm-0"
   },
   "metadata": {
     "description": "Gemma 4 31B 8k input 1k output batch 1 with periodic hardware counter sampling",
@@ -73,9 +73,9 @@
         "total_tokens": 9216
       },
       "artifacts": {
-        "log_path": "/mnt/pd/vllm-torchtpu/experiments/results/20260827_235950/results.csv",
+        "log_path": "/workspace/vllm-torchtpu/experiments/results/20260827_235950/results.csv",
         "trace_paths": [
-          "/mnt/pd/vllm-torchtpu/experiments/results/20260827_235950/traces/plugins/profile/2026_08_27_23_59_50/local_tpu_worker.xplane.pb"
+          "/workspace/vllm-torchtpu/experiments/results/20260827_235950/traces/plugins/profile/2026_08_27_23_59_50/local_tpu_worker.xplane.pb"
         ]
       },
       "reproduction_command": "python3 run_sweep_orchestrator.py --config configs/gemma4_31b_8k_1k_trace.yaml",

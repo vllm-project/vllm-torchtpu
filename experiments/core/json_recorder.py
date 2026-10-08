@@ -2,7 +2,7 @@
 json_recorder.py
 ----------------
 Robust, thread-safe, schema-adhering JSON recorder implementing IResultRecorder.
-Persists hierarchical Sweep -> Experiments data matching the MARC JSON Schema.
+Persists hierarchical Sweep -> Experiments data matching the sweep JSON schema.
 """
 
 import json
