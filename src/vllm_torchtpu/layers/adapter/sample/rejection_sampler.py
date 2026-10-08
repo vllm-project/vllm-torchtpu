@@ -25,10 +25,7 @@ if TYPE_CHECKING:
 
 # Placeholder token ID for rejected tokens
 PLACEHOLDER_TOKEN_ID = -1
-# Added to the per-token temperature before dividing the target logits. Greedy
-# rows carry temperature == 0.0, so dividing by this tiny value sharpens their
-# logits into a one-hot at argmax -> deterministic accept/recover for free
-# (mirrors JAX tpu-inference's `logits /= (temperatures + 1e-9)`).
+# Keep temperature scaling defined for greedy rows in mixed batches.
 TEMPERATURE_EPS = 1e-9
 
 
@@ -450,10 +447,11 @@ def _random_rejection_sample_with_segment(
     draft_token_ids = draft_token_ids.to(torch.int64)
     valid_draft_token_ids = draft_token_ids >= 0
     safe_draft_token_ids = draft_token_ids.clamp(min=0)
+    is_greedy = temperatures.squeeze(-1) == 0
+    target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
 
-    # Shape the target distribution with temperature + top-k/top-p, then
-    # softmax. Greedy rows carry temperature == 0.0, so dividing by
-    # (temperatures + TEMPERATURE_EPS) collapses them to a one-hot at argmax.
+    # Temperature scaling cannot resolve greedy ties; greedy decisions below
+    # use the original logits' first argmax, as in the all-greedy path.
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
@@ -471,7 +469,11 @@ def _random_rejection_sample_with_segment(
         conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
         accepted = accept_u < conditional_rates
     else:
-        accepted = target_token_probs >= accept_u
+        accepted = torch.where(
+            is_greedy,
+            draft_token_ids == target_logits_argmax,
+            target_token_probs >= accept_u,
+        )
     accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
@@ -499,15 +501,15 @@ def _random_rejection_sample_with_segment(
         recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
         dim=-1,
     ).to(torch.int32)
-    # A synthetic rejection can reject a greedy draft that matches the target
-    # argmax. In that case p and q are the same one-hot distribution, leaving
-    # no residual mass. Match upstream's greedy path by recovering the target
-    # argmax instead of letting argmax(all-zero) fall through to token 0.
+    # Synthetic rejection can leave no residual mass for a one-hot target.
     has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
     recovered_token_ids = torch.where(
         has_recovery_mass,
         recovered_token_ids,
         torch.argmax(target_probs, dim=-1).to(torch.int32),
+    )
+    recovered_token_ids = torch.where(
+        is_greedy, target_logits_argmax, recovered_token_ids
     )
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)

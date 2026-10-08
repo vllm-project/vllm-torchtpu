@@ -733,13 +733,106 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
     assert torch.equal(output, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "logits,draft_token,accept_u,expected_greedy",
+    [
+        pytest.param([5.0, 5.0, 0.0], 0, 0.99, [0, 2], id="accept-first-tie"),
+        pytest.param([5.0, 5.0, 0.0], 1, 0.1, [0, -1], id="reject-second-tie"),
+        pytest.param([5.0, 5.0, 0.0], 2, 0.1, [0, -1], id="recover-first-tie"),
+        pytest.param([5.0, 0.0, 0.0], 1, 0.0, [0, -1], id="reject-zero-draw"),
+        pytest.param([5.0, 0.0, 0.0], 0, 0.99, [0, 2], id="accept-sole-maximum"),
+    ],
+)
+@pytest.mark.parametrize(
+    "random_accept_u,expected_random",
+    [(0.1, [1, 2]), (0.75, [0, -1])],
+)
+def test_rejection_sampler_mixed_batch_preserves_greedy_decisions(
+    device,
+    dtype,
+    logits,
+    draft_token,
+    accept_u,
+    expected_greedy,
+    random_accept_u,
+    expected_random,
+):
+    sampler = RejectionSampler()
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor(
+            [draft_token, 1], dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor([1, 1], dtype=torch.int32, device=device),
+        target_logits=torch.tensor(
+            [logits, [5.0, 5.0, 0.0]], dtype=dtype, device=device
+        ),
+        bonus_token_ids=torch.tensor([2, 2], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.tensor([accept_u, random_accept_u], device=device),
+        # Favor the second tied token during random recovery. Greedy recovery
+        # must still return the first argmax, independently of this noise.
+        recover_u=torch.tensor([[0.1, 0.99, 0.5], [0.5, 0.5, 0.5]], device=device),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor(
+        [expected_greedy, expected_random], dtype=torch.int32, device=device
+    )
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize(
+    "acceptance_rate,draft_token,expected",
+    [
+        pytest.param(1.0, 1, [[1, 2], [1, 2]], id="accept-non-argmax"),
+        pytest.param(0.0, 0, [[0, -1], [0, -1]], id="reject-first-tie"),
+        pytest.param(0.0, 1, [[0, -1], [0, -1]], id="reject-second-tie"),
+    ],
+)
+def test_rejection_sampler_synthetic_mixed_ties_follow_acceptance_schedule(
+    device,
+    acceptance_rate,
+    draft_token,
+    expected,
+):
+    sampler = _synthetic_sampler([acceptance_rate], device)
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor(
+            [draft_token, 1], dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor([1, 1], dtype=torch.int32, device=device),
+        target_logits=torch.tensor([[5.0, 5.0, 0.0], [5.0, 5.0, 0.0]], device=device),
+        bonus_token_ids=torch.tensor([2, 2], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.full((2,), 0.1, device=device),
+        recover_u=torch.tensor([[0.1, 0.99, 0.5], [0.5, 0.5, 0.5]], device=device),
+        do_sampling=True,
+    )
+
+    assert torch.equal(output, torch.tensor(expected, dtype=torch.int32, device=device))
+
+
 def test_rejection_sampler_random_greedy_row_accepts_argmax(device):
     # A temperature-0 (greedy) request routed through the random path must
     # accept the draft token deterministically iff it equals the target argmax,
     # even when the raw softmax over the target logits is far from one-hot.
     # `accept_u` is pinned high (0.99) so a soft-softmax accept probability
-    # (~0.52 here) would spuriously reject -- the temperature->one-hot collapse
-    # is what makes this pass.
+    # (~0.52 here) would spuriously reject.
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([0, 3], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
