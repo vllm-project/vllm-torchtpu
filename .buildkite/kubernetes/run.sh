@@ -60,6 +60,19 @@ IN_POD='
   [ -n "${ARTIFACTS_DIR:-}" ] && mkdir -p "$ARTIFACTS_DIR"
   "$@"
   rc=$?
+  # A TPU runtime that fails says why only in its own logs - a port it could
+  # not bind, a slice member it lost - and those go with the pod. Kept when the
+  # command fails, unless run_eval_configs.sh already kept the logs of each
+  # failed config under ARTIFACTS_DIR. tar exits 1 if a process still exiting
+  # grows a file mid-read, but the archive is still written.
+  logs="${TPU_LOG_DIR:-/tmp/tpu_logs}"
+  if [ "$rc" -ne 0 ] && [ -n "$(ls -A "$logs" 2>/dev/null)" ] &&
+     ! find "${ARTIFACTS_DIR:-/nonexistent}" -name tpu_logs.tar.gz 2>/dev/null | grep -q .; then
+    if tar -czf /tmp/tpu_logs.tar.gz -C "$logs" . 2>/dev/null || [ -s /tmp/tpu_logs.tar.gz ]; then
+      (cd /tmp && buildkite-agent artifact upload tpu_logs.tar.gz) ||
+        echo "WARNING: could not upload the libtpu logs" >&2
+    fi
+  fi
   if [ -n "${ARTIFACTS_DIR:-}" ] && [ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ]; then
     # A rig that points a `latest_*` symlink at a run directory leaves it
     # dangling once that directory is gone, and the upload globs it, opens it
