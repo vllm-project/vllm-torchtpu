@@ -39,6 +39,7 @@ BASE = "_tpu_prefix_change_log_base"
 EPOCH = "_tpu_prefix_cache_epoch"
 UNWRITTEN = "_tpu_unwritten_block_ids"
 _MARK = "_tpu_prefix_change_log_patch"
+_EPOCH_MARK = "_tpu_prefix_cache_epoch_patch"
 
 
 def _log_block_keys(d, log, epoch, block, extra_key=None) -> None:
@@ -66,6 +67,74 @@ def log_unwritten_clear(pool) -> None:
     blocks = pool.blocks
     for block_id in unwritten:
         _log_block_keys(d, log, epoch, blocks[block_id])
+
+
+def install_epoch() -> None:
+    """Count prefix-cache mutations in ``pool._tpu_prefix_cache_epoch``.
+
+    The epoch moves on every event that can change a prefix-cache lookup: a
+    hash inserted, hashes evicted, a prefix-cache reset, and the unwritten set
+    cleared at the start of a step. Idempotent.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(BlockPool._remove_cached_block_hashes, _EPOCH_MARK, False):
+        return
+
+    original_insert_block_hash = BlockPool._insert_block_hash
+    original_remove_cached_block_hashes = BlockPool._remove_cached_block_hashes
+    original_reset_prefix_cache = BlockPool.reset_prefix_cache
+    original_schedule = Scheduler.schedule
+
+    @functools.wraps(original_insert_block_hash)
+    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+        original_insert_block_hash(self, block_hash_with_group_id, block, num_tokens)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+
+    @functools.wraps(original_remove_cached_block_hashes)
+    def _remove_cached_block_hashes(self, *args, **kwargs):
+        evicted_hashes = original_remove_cached_block_hashes(
+            self, *args, **kwargs
+        )
+        if evicted_hashes:
+            d = self.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
+        return evicted_hashes
+
+    @functools.wraps(original_reset_prefix_cache)
+    def reset_prefix_cache(self):
+        res = original_reset_prefix_cache(self)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return res
+
+    @functools.wraps(original_schedule)
+    def schedule(self, *args, **kwargs):
+        pool = self.kv_cache_manager.block_pool
+        unwritten = pool.__dict__.get(UNWRITTEN)
+        if unwritten:
+            d = pool.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
+        return original_schedule(self, *args, **kwargs)
+
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        schedule,
+    ):
+        setattr(wrapper, _EPOCH_MARK, True)
+        wrapper._tpu_same_step_prefix_hit_patch = True
+    BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
+    BlockPool.reset_prefix_cache = reset_prefix_cache
+    Scheduler.schedule = schedule
 
 
 def install() -> bool:
