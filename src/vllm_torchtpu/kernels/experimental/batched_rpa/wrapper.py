@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wrapper for RPA kernel to match expected interface."""
+"""Public dispatch wrapper and metadata builder for Batched Ragged Paged Attention.
+
+Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
+and invokes the Pallas Batched RPA kernel.
+"""
 
 from typing import cast
 
@@ -231,8 +235,13 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+    """Calculate optimal block size for decode and prefill.
+
+    ``decode_batch_size`` is the most sequences one decode step works on
+    concurrently; 8 is the experimentally chosen default.
+    """
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -272,7 +281,12 @@ def calculate_block_sizes(
     else:
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
 
-    def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+    def calculate_vmem_usage(
+        batch_size: int,
+        bq_sz: int,
+        bkv_sz: int,
+        is_decode: bool = False,
+    ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
 
         # Step 1: Calculate buffer sizes.
@@ -346,6 +360,8 @@ def calculate_block_sizes(
 
         # Account for batch size.
         total_bytes *= batch_size
+        if is_decode:
+            # compute tiles are live for one batch item at a time.
 
         # Online-softmax scratch (m, l, and the output accumulator)
         lm_array_size = (
@@ -372,6 +388,8 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+            flops_ratio = round(
+                tpu_info.fp8_ops_per_second / tpu_info.bf16_ops_per_second
     def find_best_block_sizes(
         max_batch_size: int, fixed_bq_sz: int | None = None
     ) -> configs.BlockSizes:
@@ -379,7 +397,10 @@ def calculate_block_sizes(
 
         # Even if we loose some potential performance, we want to avoid OOM at all
         # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+        # batch_size, allowing a 0.85 VMEM cap so bkv_sz reaches 4096 (32 pages).
+        decode_vmem_frac = 0.85 if kv_bytes == 1 else 0.75
+        capped_vmem_limit_bytes = vmem_limit_bytes * (
+        )
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
         bkv_default = mxu_column_size
@@ -402,7 +423,6 @@ def calculate_block_sizes(
         # fits within VMEM limit.
         while (
             batch_size > 1
-            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
             > capped_vmem_limit_bytes
         ):
             batch_size -= 1
@@ -416,7 +436,7 @@ def calculate_block_sizes(
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
-            calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
+            < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
             and bkv_sz <= 4096  # TEMP PATCH
         ):
@@ -438,12 +458,18 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
+            # Clamp prefill/mixed bq_sz to the aligned total_q_tokens bucket so
+            # small decode buckets do not allocate 1024-token Q/O VMEM buffers.
+            max_useful_bq_sz = max(
+                mxu_column_size,
+                utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size),
+            )
+            bq_sz = min(bq_sz, max_useful_bq_sz)
+
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Threshold value based on hardware generation and precision.
         tpu_info = pltpu.get_tpu_info()
-
-        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:
             case 8 if _is_sfs(tpu_info):
@@ -454,7 +480,6 @@ def calculate_block_sizes(
                 threshold = 1500
 
         if is_8bit:
-            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
             threshold *= flops_ratio
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
@@ -476,8 +501,6 @@ def calculate_block_sizes(
             batch_size=batch_size,
         )
 
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
@@ -508,6 +531,7 @@ def calculate_block_sizes(
         "update_kv_cache",
         "kv_layout",
         "decode_query_size",
+        "decode_batch_size",
         "cp_group_size",
         "attention_scope",
         "return_lse",
@@ -551,6 +575,7 @@ def ragged_paged_attention(
     update_kv_cache: bool | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
+    decode_batch_size: int = 8,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
@@ -606,6 +631,7 @@ def ragged_paged_attention(
             is the same as skip_kv_update=True). None (default) uses skip_kv_update.
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
+        decode_batch_size: Most sequences a decode step works on concurrently.
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
             sharded across devices in this group. Defaults to None.
         cp_rank: Rank of the current device within the CP group, which determine
@@ -777,6 +803,7 @@ def ragged_paged_attention(
         serve_cfgs,
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
