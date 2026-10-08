@@ -7624,13 +7624,13 @@ class TPUModelRunner(GPUModelRunner):
         token_ids = sampled_tokens.to(torch.int64)
         token_logits = logits.gather(-1, token_ids)
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-        log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
-        token_logprobs = (token_logits - log_normalizers).to(torch.float32)
+        log_probs = logits.log_softmax(dim=-1, dtype=torch.float32)
+        token_logprobs = log_probs.gather(-1, token_ids)
 
         max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
-            topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
-            topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
+            topk_indices = torch.topk(logits, max_logprobs, dim=-1).indices
+            topk_logprobs = log_probs.gather(-1, topk_indices)
             logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
             logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
         else:
