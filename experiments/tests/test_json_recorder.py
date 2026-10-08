@@ -73,6 +73,49 @@ def test_json_recorder_initialization_and_schema(tmp_path, loaded_schema):
     jsonschema.validate(instance=data, schema=loaded_schema)
 
 
+@pytest.mark.parametrize("sweep_id", [
+    "20260828_120000",
+    "20260828_120000_resume",
+    "test_resume_json_exp",
+    "custom-Named.Exp_01",
+])
+def test_json_recorder_accepts_custom_sweep_ids(tmp_path, loaded_schema,
+                                                sweep_id):
+    """Custom --experiment-id values must validate against the schema."""
+    json_file = str(tmp_path / "sweep.json")
+    JsonResultRecorder(
+        json_file=json_file,
+        sweep_id=sweep_id,
+        metadata={
+            "description": "custom id",
+            "mode": "eval"
+        },
+    )
+    with open(json_file, "r") as f:
+        data = json.load(f)
+    assert data["sweep_id"] == sweep_id
+    jsonschema.validate(instance=data, schema=loaded_schema)
+
+
+@pytest.mark.parametrize("sweep_id", ["", " spaced id", "slash/id", "-lead"])
+def test_sweep_id_schema_rejects_unsafe_ids(loaded_schema, sweep_id):
+    """Path-unsafe identifiers are still rejected by the schema pattern."""
+    data = {
+        "schema_version": "1.0.0",
+        "sweep_id": sweep_id,
+        "created_at": "2026-08-28T12:00:00Z",
+        "status": "RUNNING",
+        "user_ldap": "user",
+        "metadata": {
+            "description": "",
+            "mode": "eval"
+        },
+        "experiments": [],
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=data, schema=loaded_schema)
+
+
 def test_json_recorder_records_trials_with_non_primitives(
         tmp_path, loaded_schema):
     """Tests recording trials with sets/tuples and non-primitive types."""
