@@ -262,6 +262,30 @@ def apply_top_k_top_p(
     return torch.where(should_apply_topp, topp_masked, masked_logits)
 
 
+def extract_topk_candidates(
+    logits: torch.Tensor,
+    num_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the `num_blocks` blocks of CANDIDATE_BLOCK logits with largest maxima.
+
+    Returns ``(cand_logits, cand_token_ids)`` of shape
+    ``[rows, num_blocks * CANDIDATE_BLOCK]``, where ``cand_token_ids`` holds
+    int32 full-vocab indices in ``[0, vocab_size)``.
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = blocks.amax(dim=-1)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    cand_logits = torch.gather(
+        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    intra = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=torch.int32)
+    cand_token_ids = (
+        block_ids.to(torch.int32).unsqueeze(-1) * CANDIDATE_BLOCK + intra
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    return cand_logits, cand_token_ids
+
+
 def apply_top_k_top_p_candidates(
     logits: torch.Tensor,
     top_k: torch.Tensor,
