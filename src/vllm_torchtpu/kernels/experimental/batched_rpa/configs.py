@@ -181,6 +181,8 @@ class ServingConfigs:
                 self,
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            jnp.dtype(jnp.float8_e4m3fn),
+            jnp.dtype(jnp.float8_e5m2),
             )
 
     @property
