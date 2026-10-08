@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Pallas FlashAttention inner-loop primitives for Batched Ragged Paged Attention.
+
+Implements tiled QK^T matmul, online softmax rescaling, and PV accumulation
+with optional native FP8 KV cache dequantization in VMEM.
+"""
+
 import math
 from typing import cast
 
@@ -21,6 +27,43 @@ from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+
+
+
+
+# Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
+_SPLIT_LO = 16.0
+
+
+def _quantize_rows(
+    x: jax.Array, dtype: jnp.dtype, split: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Quantizes x to fp8 `dtype` with one dynamic scale per row (last axis).
+
+    Returns the quantized array and the f32 row scales (keepdims), such that
+    x ~= x_q * scale. Rows of zeros get scale 1 (and stay zeros).
+
+    With `split`, also quantizes the rounding residual and stacks it under the
+    high part along axis -2: x ~= (hi + lo / _SPLIT_LO) * scale, which keeps
+    about 7 mantissa bits (bf16-like) at the cost of doubling the matmul's LHS
+    rows, which are nearly free in decode (16 of the MXU's rows are used).
+    """
+    x = x.astype(jnp.float32)
+    fp8_max = float(jnp.finfo(dtype).max)
+    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+    scale = amax * (1.0 / fp8_max)
+    scale = jnp.where(scale > 0, scale, 1.0)
+    x_s = jnp.clip(x * (1.0 / scale), -fp8_max, fp8_max)
+    x_q = x_s.astype(dtype)
+    if split:
+        resid = (x_s - x_q.astype(jnp.float32)) * _SPLIT_LO
+        x_q = jnp.concatenate([x_q, resid.astype(dtype)], axis=-2)
+    return x_q, scale
+
+
+def _merge_split(y: jax.Array, rows: int) -> jax.Array:
+    """Combines a matmul over split (hi; lo) LHS rows: [..., 2*rows, N]."""
+    return y[..., :rows, :] + y[..., rows:, :] * (1.0 / _SPLIT_LO)
 
 
 def vpu_diet_enabled() -> bool:
@@ -88,10 +131,14 @@ def flash_attention_qk_softmax(
 
     diet = vpu_diet_enabled()
     folded_scale = q_folded_scale(cfgs) if diet else None
+    row_scale = None
+    folded_scale = q_folded_scale(cfgs) if (diet and not native_qk) else None
     if folded_scale is not None and folded_scale != 1.0:
         q = q * jnp.asarray(folded_scale, dtype=q.dtype)
 
-    if cfgs.serve.scale_q is not None:
+    if native_qk:
+        q, row_scale = _quantize_rows(q, k.dtype, split=split_qk)
+    elif cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
         if jnp.issubdtype(k.dtype, jnp.floating):
             dtype_info = jnp.finfo(k.dtype)
@@ -100,10 +147,11 @@ def flash_attention_qk_softmax(
             q = jnp.clip(q, min=minval, max=maxval)
         q = q.astype(k.dtype)
 
+    q_rows = 2 * tq if split_qk else tq
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         s = k.shape[-1]
         qk = lax.dot(
-            q.reshape(-1, tq, h_size),
+            q.reshape(-1, q_rows, h_size),
             k.reshape(-1, h_size, s),
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
@@ -111,14 +159,26 @@ def flash_attention_qk_softmax(
     else:
         s = k.shape[-2]
         qk = lax.dot(
-            q.reshape(-1, tq, h_size),
+            q.reshape(-1, q_rows, h_size),
             k.reshape(-1, s, h_size),
             dimension_numbers=(([2], [2]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
+    if split_qk:
+        qk = _merge_split(qk, tq)
     qk = qk.reshape(b, k_heads, tq, s)
 
     if folded_scale is None:
+        scale = float(cfgs.model.sm_scale)
+            scale *= float(k_scale)
+            k_scale = k_scale * scale
+            scale = 1.0
+        if row_scale is not None:
+            qk *= row_scale.reshape(b, k_heads, tq, 1) * scale
+        elif scale != 1.0:
+            qk *= scale
+        if k_scale is not None and not isinstance(k_scale, (int, float)):
+            qk *= k_scale
         qk *= cfgs.model.sm_scale
         if cfgs.serve.scale_q is not None:
             qk *= cfgs.serve.scale_q
@@ -201,10 +261,15 @@ def flash_attention_pv(
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc
 
+    p_row_scale = None
+    if native_pv:
+        p, p_row_scale = _quantize_rows(p, v.dtype, split=split_pv)
+    p_rows = 2 * tq if split_pv else tq
+
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         h_size = v.shape[-2]
         pv = lax.dot(
-            p.reshape(-1, tq, s),
+            p.reshape(-1, p_rows, s),
             v.reshape(-1, h_size, s),
             dimension_numbers=(([2], [2]), ([0], [0])),
             preferred_element_type=jnp.float32,
@@ -212,11 +277,15 @@ def flash_attention_pv(
     else:
         h_size = v.shape[-1]
         pv = lax.dot(
-            p.reshape(-1, tq, s),
+            p.reshape(-1, p_rows, s),
             v.reshape(-1, s, h_size),
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
+    if split_pv:
+        pv = _merge_split(pv, tq)
+    if p_row_scale is not None:
+        pv = pv * p_row_scale.reshape(-1, tq, 1)
     pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
 
     if not cfgs.serve.per_token_scale and cfgs.serve.scale_v is not None:
