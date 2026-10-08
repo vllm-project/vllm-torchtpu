@@ -1,6 +1,11 @@
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class TPUMultiConnector(MultiConnector):
@@ -14,6 +19,28 @@ class TPUMultiConnector(MultiConnector):
     the connector is instantiated, so children injected at init time would
     be invisible to them.
     """
+
+    def __init__(self, vllm_config, role, kv_cache_config):
+        super().__init__(vllm_config, role, kv_cache_config)
+        if role != KVConnectorRole.SCHEDULER:
+            return
+        # Upstream reports divergent local hybrid hits only if every child
+        # does. A child that cannot turns Stage-3 suffix loads off for the
+        # whole engine and decode pulls whole payloads, so say which one.
+        capable = {
+            type(c).__name__: bool(
+                getattr(c, "supports_divergent_local_hybrid_hits", False)
+            )
+            for c in self._connectors
+        }
+        if any(capable.values()) and not all(capable.values()):
+            logger.warning(
+                "Prefix-aware Stage-3 loads are off for this engine: %s cannot "
+                "complete divergent local hybrid hits, so decode pulls whole "
+                "payloads. Capability per child: %s",
+                [name for name, ok in capable.items() if not ok],
+                capable,
+            )
 
     def register_runner(self, runner) -> None:
         # torchtpu extension unknown to upstream MultiConnector: forward it to

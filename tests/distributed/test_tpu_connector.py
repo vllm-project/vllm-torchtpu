@@ -396,7 +396,10 @@ class TestTPUConnector:
             ("kv_consumer", "raiden", True, False, "direct", False),
             ("kv_consumer", "zmq", True, True, "direct", False),
             ("kv_consumer", "raiden", True, True, "multi", True),
-            ("kv_consumer", "raiden", True, True, "offloading", False),
+            ("kv_consumer", "raiden", True, True, "offloading", True),
+            ("kv_consumer", "raiden", False, True, "offloading", False),
+            ("kv_consumer", "raiden", True, False, "offloading", False),
+            ("kv_producer", "raiden", True, True, "offloading", False),
         ],
     )
     def test_upstream_prefix_lookup_uses_connector_capability(
@@ -456,6 +459,27 @@ class TestTPUConnector:
             else (("common",), 3072, 6144, False)
         )
         assert result == expected
+
+    @pytest.mark.parametrize(
+        ("prefix_aware", "suffix_supported", "expected"),
+        [(True, True, True), (False, True, False), (True, False, False)],
+    )
+    def test_offloading_connector_capability_follows_prefix_aware_flag(
+        self, prefix_aware, suffix_supported, expected, monkeypatch
+    ):
+        # Standalone offload must keep the common-boundary lookup unless the
+        # Stage-3 suffix loads it is composed with are on.
+        from vllm_torchtpu.distributed.kv_transfer import tpu_connector
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        monkeypatch.setenv("TPU_RAIDEN_PREFIX_AWARE_LOAD", "1" if prefix_aware else "0")
+        monkeypatch.setattr(
+            tpu_connector, "_prefix_aware_load_supported", lambda: suffix_supported
+        )
+        # Capability lookup needs no store or worker resources.
+        connector = object.__new__(TPURaidenOffloadingConnector)
+
+        assert connector.supports_divergent_local_hybrid_hits is expected
 
     @patch(f"{_MOD}.TPUConnectorWorker")
     @patch(f"{_MOD}.TPUConnectorScheduler")

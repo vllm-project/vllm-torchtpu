@@ -334,6 +334,25 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # preconditions to enable bundled tensor allocation in the TPU model runner.
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
 
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Complete a deeper full-attention local hit, behind the Stage-3 flag.
+
+        Upstream offload lookup treats a Mamba group as a one-chunk window, so
+        a hit from this store ends where it holds the recurrent state for its
+        last chunk: a load restores the state the local hit lacks, and a miss
+        lets the scheduler reconcile to the common boundary. Decode composes
+        this connector with TPURaidenConnector in TPUMultiConnector, which
+        needs every child to agree before Stage-3 suffix loads can run. Gated
+        on the prefix-aware flag so standalone offload keeps today's lookup.
+        """
+        # Deferred: tpu_connector is heavy and only this property needs it.
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            _prefix_aware_load_enabled,
+        )
+
+        return _prefix_aware_load_enabled()
+
     def __init__(
         self,
         vllm_config: VllmConfig,
