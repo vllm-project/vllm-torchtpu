@@ -177,9 +177,9 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
     if cfg.state_plan is None:
-        return slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
+        return slot_ref[idx, 0].astype(jnp.float32)
     return load_state_region(
-        slot_ref.at[idx, cfg.state_in_pos],
+        slot_ref.at[idx, 0],
         cfg.state_plan.conv,
         (cfg.prev_kernel_size, 1, cfg.dim_size),
     ).astype(jnp.float32)
@@ -190,9 +190,9 @@ def _load_recurrent_state(
 ) -> jax.Array:
     """One slot's recurrent state, converted to FP32 for compute."""
     if cfg.state_plan is None:
-        return slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
+        return slot_ref[idx, 0].astype(jnp.float32)
     return load_state_region(
-        slot_ref.at[idx, cfg.state_in_pos],
+        slot_ref.at[idx, 0],
         cfg.state_plan.recurrent,
         (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim),
     ).astype(jnp.float32)
