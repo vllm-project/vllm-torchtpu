@@ -57,6 +57,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck disable=SC2016
 IN_POD='
   set -o pipefail
+  # One pod is one host, and a VM running the same command has none of the
+  # slice-member environment GKE gives a TPU pod (single_host_engine.sh has the
+  # whole list and why). Several TPU runtimes in one pod - a data-parallel
+  # server starts one per engine - would otherwise all take TPU_PROCESS_PORT
+  # and the same process addresses, and fail to start or abort mid-run.
+  # Emptied rather than unset, for the reason single_host_engine.sh gives.
+  export MEGASCALE_COORDINATOR_ADDRESS= MEGASCALE_NUM_SLICES= MEGASCALE_PORT= MEGASCALE_SLICE_ID=
+  export TPU_PROCESS_ADDRESSES= TPU_PROCESS_PORT= TPU_WORKER_HOSTNAMES=
   [ -n "${ARTIFACTS_DIR:-}" ] && mkdir -p "$ARTIFACTS_DIR"
   "$@"
   rc=$?
