@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Hardware-tuned block size configurations for Batched Ragged Paged Attention (RPA).
+
+Defines query (`B_q`) and KV page (`B_kv`) tiling parameters across batch sizes,
+head dimensions, and KV cache data types on TPU.
+"""
+
 import dataclasses
 import enum
 import math
@@ -173,15 +179,30 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
-    mask_invalid_v: bool | None = None
+    # Run the DECODE kernel's matmuls natively in the fp8 KV dtype instead of
+    # dequantizing K / V: "qk" quantizes q per (token, head) row, "pv"
+    # quantizes the softmax weights per row, "qkpv" does both. A "2" after
+    # either ("qk2", "pv2", "qk2pv2") splits that operand into fp8 high and
+    # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
+    # LHS rows). Empty: off.
+    native_fp8: str = ""
 
-    def __post_init__(self):
-        if self.mask_invalid_v is None:
-            object.__setattr__(
-                self,
-                "mask_invalid_v",
-                self.kv_layout == KVLayout.SEQ_ALONG_LANE,
-            )
+    def native_fp8_split(self, which: str) -> bool:
+        """Whether the native fp8 `which` operand is split into hi/lo halves."""
+        return f"{which}2" in self.native_fp8
+
+    def native_fp8_enabled(self, which: str) -> bool:
+        """Whether the native fp8 `which` ("qk" or "pv") matmul is enabled."""
+        if which not in self.native_fp8:
+            return False
+        is_fp8_kv = jnp.dtype(self.dtype_kv) in (
+            jnp.dtype(jnp.float8_e4m3fn),
+            jnp.dtype(jnp.float8_e5m2),
+        )
+        # The static-q-scale path already runs QK in the KV dtype.
+        if which == "qk" and self.scale_q is not None:
+            return False
+        return is_fp8_kv
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -539,8 +560,17 @@ class RpaConfigs:
 
     @property
     def max_schedule_size_multiplier(self) -> int:
-        # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        """HBM schedule size in chunks of max_steps_ub steps: the serving
+        value, raised (up to 128) to this shape's worst case of (q-block,
+        KV-block) pairs. Past it the schedule kernel drops steps rather than
+        write out of bounds (see rpa_metadata_schedule_kernel)."""
+        q_blocks = self.serve.num_seqs  # DECODE: q_len <= bq per sequence
+        if self.mode != RpaCase.DECODE:
+            q_blocks += self.serve.total_q_tokens // self.bq_sz
+        kv_tokens = self.serve.pages_per_seq * self.serve.page_size
+        steps = pl.cdiv(q_blocks * pl.cdiv(kv_tokens, self.bkv_sz), self.batch_size)
+        need = min(pl.cdiv(steps, self.max_steps_ub), 128)
+        return max(self.serve.max_schedule_size_multiplier, need)
 
     def validate_inputs(
         self,

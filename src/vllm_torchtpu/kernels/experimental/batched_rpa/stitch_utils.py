@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Partial attention output stitching utilities for split-KV Batched RPA.
+
+Combines partial log-sum-exp (`m`, `l`) and unnormalized output accumulators
+across split KV page ranges.
+"""
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -30,6 +36,7 @@ def _stitch_decode_lane(
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
     """O(1) Decode Path: Target only the VREGs containing the stitch boundary.
 
@@ -100,11 +107,23 @@ def _stitch_prefill_lane(
     bkv_sz_cache: jax.Array,
     cache_end: jax.Array,
     new_tok_offset: jax.Array,
+    bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
-    """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
+    """O(N) Prefill Path: Roll the entire new tokens buffer into place.
+
+    Lanes past the last valid token (``bkv_sz_cache + bkv_sz_new``) are zeroed,
+    as in `_stitch_decode_lane`. Otherwise they would take whatever the roll
+    brings in from unfetched VMEM, which can be a raw page tail from an earlier
+    step: page bytes past a sequence's length are undefined (in the unified
+    hybrid pool they are recycled Mamba state, often an fp8 NaN pattern), and
+    score masking cannot neutralize them because 0 * NaN = NaN in the P @ V
+    matmul. The CACHE_ONLY pass hits this on every step, since it fetches no
+    new tokens and so every lane past the cache is rolled-in garbage.
+    """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
     )
@@ -118,10 +137,14 @@ def _stitch_prefill_lane(
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
+    valid_end = bkv_sz_cache + bkv_sz_new
+    if local_k_end is not None:
+        valid_end = jnp.minimum(valid_end, local_k_end.astype(jnp.int32))
+    cache_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
-        lane_idx >= bkv_sz_cache,
-        rolled_u32[..., : cfgs.bkv_sz],
+        lane_idx < cache_end,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
+        jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
 
     return merged_cache_u32
@@ -170,6 +193,7 @@ def stitch_new_kv_lane(
     bkv_sz_frm_new: jax.Array,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
     """Fetches and computes stitched KV tokens (separated to avoid RAW hazards).
 
@@ -200,6 +224,8 @@ def stitch_new_kv_lane(
             bkv_sz_cache,
             cache_end,
             new_tok_offset,
-            cfgs.kv_vmem_lanes,
+            bkv_sz_frm_new.astype(jnp.int32),
+            v_len,
             cfgs=cfgs,
+            local_k_end=local_k_end,
         )
