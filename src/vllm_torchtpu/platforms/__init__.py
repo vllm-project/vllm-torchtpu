@@ -42,8 +42,10 @@ def _log_tpu_info() -> None:
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    from vllm_torchtpu.runai_pull_patches import patch_runai_pull_once
 
     _log_tpu_info()
+    patch_runai_pull_once()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 

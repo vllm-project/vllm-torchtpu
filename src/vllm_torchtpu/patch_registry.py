@@ -56,6 +56,10 @@ PATCHES = (
         "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
         _ACTIVE,
     ),
+    # Also invoked early from register_tpu_platform() so API servers guard
+    # ModelConfig.__post_init__ before platform activation, while _ACTIVE
+    # ensures spawned workers apply it without importing vllm at import stage.
+    Patch("vllm_torchtpu.runai_pull_patches:patch_runai_pull_once", _ACTIVE),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),

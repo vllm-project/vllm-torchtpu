@@ -2175,15 +2175,43 @@ COMBINE_PARITIES = 4
 # more lead keeps descriptors in flight across it. Must divide the rotation:
 # 0 < COMBINE_LEAD < COMBINE_PARITIES.
 COMBINE_LEAD = 2
+# A core's SMEM. Both scalar-prefetch tables -- pos as int32 and coef as f32,
+# each topk per token -- are resident for the kernel's whole life and share it,
+# so the pair costs 8 * t_local * topk bytes and the compiler cannot place them
+# past this. Sized in bytes rather than tokens because topk is what varies.
+COMBINE_SMEM_BYTES = 1 << 20
+# Headroom for everything else the kernel keeps in SMEM: the grid's own
+# scalars, the DMA descriptors and the loop state. The tables may have the
+# rest.
+COMBINE_SMEM_SHARE = 0.75
 
 
-def combine_step_tokens(t_local):
+def combine_prefetch_bytes(t_local, topk):
+    """SMEM the two scalar-prefetch tables take, in bytes.
+
+    `pos` is cast to int32 and `coef` is f32, both [t_local, topk] flattened.
+    """
+    return 2 * t_local * topk * 4
+
+
+def combine_step_tokens(t_local, topk=None):
     """Tokens a combine step stages, or 0 where this path does not apply.
 
     The step loop is unrolled by parity so that every VMEM store has a static
     buffer index, which needs an even step count; the group width has to divide
     the step; and the fixed cost is only worth paying above COMBINE_MIN_TOKENS.
+
+    The scalar-prefetch tables grow with the token count and SMEM does not, so
+    a large enough step also has to fall back: the caller's XLA epilogue is
+    correct at every size, it is only slower. `topk` is optional so that a
+    caller that cannot know it keeps the old behaviour.
     """
+    if (
+        topk is not None
+        and combine_prefetch_bytes(t_local, topk)
+        > COMBINE_SMEM_BYTES * COMBINE_SMEM_SHARE
+    ):
+        return 0
     if t_local < COMBINE_MIN_TOKENS:
         return 0
     tb = COMBINE_TOKENS
@@ -2217,7 +2245,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     so the sublane shuffle sees one bf16 token per group instead of topk
     packed-f8 rows, and the live accumulator is one token wide.
     """
-    tb = combine_step_tokens(t_local)
+    tb = combine_step_tokens(t_local, topk)
     steps = t_local // tb
     gt = COMBINE_GROUP
     groups = tb // gt

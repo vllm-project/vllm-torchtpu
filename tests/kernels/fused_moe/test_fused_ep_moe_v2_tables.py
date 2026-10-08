@@ -250,3 +250,20 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}"
         )
+
+
+def test_combine_step_tokens_respects_smem_budget():
+    from vllm_torchtpu.kernels.fused_moe.v2 import kernel
+
+    budget = kernel.COMBINE_SMEM_BYTES * kernel.COMBINE_SMEM_SHARE
+    # 4096 tokens * top-10 * 8 bytes = 327,680 bytes <= 786,432 budget -> uses
+    # kernel combine step.
+    assert kernel.combine_prefetch_bytes(4096, 10) <= budget
+    assert kernel.combine_step_tokens(4096, 10) > 0
+
+    # 16384 tokens * top-10 * 8 bytes = 1,310,720 bytes > 786,432 budget ->
+    # falls back to XLA gather (0).
+    assert kernel.combine_prefetch_bytes(16384, 10) > budget
+    assert kernel.combine_step_tokens(16384, 10) == 0
+    # Without topk specified, retains legacy token-count behavior.
+    assert kernel.combine_step_tokens(16384) > 0

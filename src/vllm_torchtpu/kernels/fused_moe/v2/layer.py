@@ -114,7 +114,7 @@ def _combine_arrivals(
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
-    if combine_step_tokens(t_local):
+    if combine_step_tokens(t_local, topk):
         combine = build_combine_kernel(
             t_local=t_local,
             topk=topk,

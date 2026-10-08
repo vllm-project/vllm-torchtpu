@@ -65,6 +65,8 @@ ranks do not re-pull.
 """
 
 import os
+import threading
+from contextlib import contextmanager
 
 from vllm.model_executor.model_loader.weight_utils import atomic_writer, get_lock
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
@@ -75,6 +77,25 @@ logger = init_logger(__name__)
 
 PULLING_SENTINEL = ".vllm_torchtpu_pulling"
 COMPLETE_SENTINEL = ".vllm_torchtpu_aux_complete"
+
+_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def acquire_runai_lock(uri: str):
+    """Acquire per-URI file lock, allowing re-entrant acquisition in thread."""
+    held = getattr(_LOCK_STATE, "uris", None)
+    if held is None:
+        held = _LOCK_STATE.uris = set()
+    if uri in held:
+        yield
+        return
+    held.add(uri)
+    try:
+        with get_lock(uri):
+            yield
+    finally:
+        held.discard(uri)
 
 
 def _touch(path: str, content: str) -> None:
@@ -120,7 +141,7 @@ def ensure_runai_aux_files(model_config) -> None:
         # the same here.
         tokenizer = uri
 
-    with get_lock(uri):
+    with acquire_runai_lock(uri):
         if rewritten and _is_complete(model_config.model):
             _report_tokenizer_gap(model_config)
             return
