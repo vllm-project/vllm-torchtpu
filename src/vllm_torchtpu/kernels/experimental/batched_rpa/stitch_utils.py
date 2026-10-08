@@ -100,11 +100,22 @@ def _stitch_prefill_lane(
     bkv_sz_cache: jax.Array,
     cache_end: jax.Array,
     new_tok_offset: jax.Array,
+    bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
 ):
-    """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
+    """O(N) Prefill Path: Roll the entire new tokens buffer into place.
+
+    Lanes past the last valid token (``bkv_sz_cache + bkv_sz_new``) are zeroed,
+    as in `_stitch_decode_lane`. Otherwise they would take whatever the roll
+    brings in from unfetched VMEM, which can be a raw page tail from an earlier
+    step: page bytes past a sequence's length are undefined (in the unified
+    hybrid pool they are recycled Mamba state, often an fp8 NaN pattern), and
+    score masking cannot neutralize them because 0 * NaN = NaN in the P @ V
+    matmul. The CACHE_ONLY pass hits this on every step, since it fetches no
+    new tokens and so every lane past the cache is rolled-in garbage.
+    """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
     )
@@ -118,10 +129,10 @@ def _stitch_prefill_lane(
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
+    valid_end = bkv_sz_cache + bkv_sz_new
     merged_cache_u32 = jax.lax.select(
-        lane_idx >= bkv_sz_cache,
-        rolled_u32[..., : cfgs.bkv_sz],
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
+        jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
 
     return merged_cache_u32
@@ -200,6 +211,7 @@ def stitch_new_kv_lane(
             bkv_sz_cache,
             cache_end,
             new_tok_offset,
+            bkv_sz_frm_new.astype(jnp.int32),
             cfgs.kv_vmem_lanes,
             cfgs=cfgs,
         )
