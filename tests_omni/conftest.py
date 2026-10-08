@@ -93,13 +93,6 @@ class OmniRunner:
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
         try:
-            if (
-                "vllm_omni.entrypoints.omni" not in sys.modules
-                and getattr(sys.modules.get("vllm_omni"), "__file__", None) is None
-            ):
-                for k in list(sys.modules):
-                    if k == "vllm_omni" or k.startswith("vllm_omni."):
-                        del sys.modules[k]
             from vllm_omni.entrypoints.omni import Omni
 
             self.omni = Omni(model=model_name, **kwargs)
