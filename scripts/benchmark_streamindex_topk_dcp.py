@@ -75,7 +75,9 @@ def _init_distributed():
         jax.distributed.initialize(
             coordinator_address=os.environ["COORD"],
             num_processes=nproc,
-            process_id=int(os.environ.get("TPU_WORKER_ID", os.environ.get("JOBSET_JOB_INDEX", "0"))),
+            process_id=int(
+                os.environ.get("TPU_WORKER_ID", os.environ.get("JOBSET_JOB_INDEX", "0"))
+            ),
         )
 
 
@@ -164,12 +166,12 @@ def main():
     args = ap.parse_args()
 
     _init_distributed()
+    import vllm_torchtpu
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
         DCP_AXIS_NAME,
         KVLayout,
         streamindex_topk_dcp,
     )
-    import vllm_torchtpu
 
     dcp = args.dcp
     _log(f"vllm_torchtpu.__file__ = {vllm_torchtpu.__file__}")
@@ -211,7 +213,9 @@ def main():
             @jax.jit
             def direct(n, q, w, c, sl, pi, cu, dist):
                 del n
-                return streamindex_topk_dcp(q, w, c, sl, pi, cu, dist, a2a_merge=a2a, **kw)
+                return streamindex_topk_dcp(
+                    q, w, c, sl, pi, cu, dist, a2a_merge=a2a, **kw
+                )
 
             return direct
 
@@ -235,7 +239,10 @@ def main():
         return loop
 
     def local_np(x):
-        return [np.asarray(s.data) for s in sorted(x.addressable_shards, key=lambda s: s.index[0].start or 0)]
+        return [
+            np.asarray(s.data)
+            for s in sorted(x.addressable_shards, key=lambda s: s.index[0].start or 0)
+        ]
 
     def run(fn, n, inputs):
         t0 = time.perf_counter()
@@ -243,7 +250,8 @@ def main():
         return time.perf_counter() - t0, out
 
     _log(
-        "| dcp | T | local_kv | arm | slope_us | slope_spread | wall_us | wall_spread | bitexact |"
+        "| dcp | T | local_kv | arm | slope_us | slope_spread "
+        "| wall_us | wall_spread | bitexact |"
     )
     _log("|---|---|---|---|---|---|---|---|---|")
     n1 = _replicated(mesh, np.int32(1))
@@ -271,14 +279,22 @@ def main():
                 order = (False, True) if rep % 2 == 0 else (True, False)
                 for a in order:
                     w1 = [run(loops[a], n1, inputs)[0] for _ in range(args.iters)]
-                    wn = [run(loops[a], nN, inputs)[0] for _ in range(max(3, args.iters // 4))]
+                    wn = [
+                        run(loops[a], nN, inputs)[0]
+                        for _ in range(max(3, args.iters // 4))
+                    ]
                     t1, tn = float(np.median(w1)), float(np.median(wn))
                     wall[a].append(t1 * 1e6)
                     slope[a].append((tn - t1) / (args.loop - 1) * 1e6)
             res = {}
             for a in (False, True):
                 s, w = np.array(slope[a]), np.array(wall[a])
-                res[a] = (np.median(s), np.ptp(s) / np.median(s), np.median(w), np.ptp(w) / np.median(w))
+                res[a] = (
+                    np.median(s),
+                    np.ptp(s) / np.median(s),
+                    np.median(w),
+                    np.ptp(w) / np.median(w),
+                )
                 _log(
                     f"| {dcp} | {T} | {L} | {'a2a' if a else 'gather'} | "
                     f"{res[a][0]:.1f} | {100 * res[a][1]:.1f}% | {res[a][2]:.1f} | "
@@ -287,11 +303,15 @@ def main():
             summary.append((T, L, res, exact))
             if not exact:
                 _log(f"MISMATCH at dcp={dcp} T={T} L={L}")
-    _log("SUMMARY dcp T local_kv gather_slope a2a_slope delta% gather_wall a2a_wall delta% bitexact")
+    _log(
+        "SUMMARY dcp T local_kv gather_slope a2a_slope delta% "
+        "gather_wall a2a_wall delta% bitexact"
+    )
     for T, L, res, exact in summary:
         g, a = res[False], res[True]
         _log(
-            f"SUMMARY {dcp} {T} {L} {g[0]:.1f} {a[0]:.1f} {100 * (a[0] - g[0]) / g[0]:+.1f} "
+            f"SUMMARY {dcp} {T} {L} {g[0]:.1f} {a[0]:.1f} "
+            f"{100 * (a[0] - g[0]) / g[0]:+.1f} "
             f"{g[2]:.1f} {a[2]:.1f} {100 * (a[2] - g[2]) / g[2]:+.1f} {exact}"
         )
     if not all(e for *_, e in summary):
