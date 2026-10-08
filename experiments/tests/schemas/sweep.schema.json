@@ -43,6 +43,10 @@
       "type": "string",
       "description": "LDAP of the experiment author (e.g. 'shenrunz')."
     },
+    "error_message": {
+      "type": ["string", "null"],
+      "description": "Error that aborted the sweep (present when status is FAILED)."
+    },
     "hardware": {
       "type": "object",
       "properties": {
