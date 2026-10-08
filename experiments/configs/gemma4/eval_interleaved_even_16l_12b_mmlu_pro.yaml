@@ -20,7 +20,7 @@ model_resolver:
   config:
     base_model: google/gemma-4-12B-it
     reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     strategy: custom_order
     layer_order: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
     custom_order_layers: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]

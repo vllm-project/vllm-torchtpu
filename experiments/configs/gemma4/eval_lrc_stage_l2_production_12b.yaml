@@ -23,8 +23,8 @@ model_resolver:
   function: resolve_model
   config:
     base_model: google/gemma-4-12B-it
-    reference_sparse_model: /mnt/pd/sparse_checkpoints/gemma4_12b_lrc_k128_T3_256c4_full
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    reference_sparse_model: gemma4_12b_lrc_k128_T3_256c4_full
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     strategy: first_to_last
     prunen: 2
     prunem: 4

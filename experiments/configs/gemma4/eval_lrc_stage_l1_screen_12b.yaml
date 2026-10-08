@@ -25,7 +25,7 @@ model_resolver:
   config:
     base_model: google/gemma-4-12B-it
     reference_sparse_model: null
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     strategy: first_to_last
     prunen: 2
     prunem: 4

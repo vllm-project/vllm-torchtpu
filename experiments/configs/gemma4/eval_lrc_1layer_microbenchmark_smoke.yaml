@@ -23,9 +23,9 @@ model_resolver:
   module: resolvers.sparsegpt_resolver
   function: resolve_model
   config:
-    base_model: /mnt/pd/huggingface_cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+    base_model: google/gemma-4-12B-it
     reference_sparse_model: null
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     strategy: first_to_last
     prunen: 2
     prunem: 4

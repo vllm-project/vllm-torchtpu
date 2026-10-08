@@ -26,7 +26,7 @@ model_resolver:
   config:
     base_model: google/gemma-4-12B-it
     reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     strategy: custom_order
     # Expressed as a custom order rather than first_to_last so that both arms
     # travel the identical code path and the only variable is the layer list.

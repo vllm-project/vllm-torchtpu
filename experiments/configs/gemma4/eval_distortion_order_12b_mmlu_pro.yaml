@@ -16,7 +16,7 @@ mode: eval
 model_resolver:
   config:
     base_model: google/gemma-4-12B-it
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
+    # checkpoint_base_dir defaults to $CACHE_DIR/sparse_checkpoints (core/env.py)
     nsamples: 256
     prunem: 4
     prunen: 2
