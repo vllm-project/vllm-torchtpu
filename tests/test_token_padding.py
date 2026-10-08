@@ -32,6 +32,27 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
 
+def test_update_skips_the_copy_only_when_counts_repeat():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    copies = []
+    real_copy = state.local_padding_mask.copy_
+
+    def counting_copy(src):
+        copies.append(src.clone())
+        return real_copy(src)
+
+    state.local_padding_mask.copy_ = counting_copy
+    # decode steps, an MTP rejection that shrinks the valid count, padding
+    # bucket growth, then back to an earlier count pair
+    steps = [(3, 4), (3, 4), (2, 4), (2, 4), (2, 8), (3, 4)]
+    for valid, padded in steps:
+        state.update(valid, padded)
+        expected = torch.zeros(8, dtype=torch.bool)
+        expected[valid:padded] = True
+        assert torch.equal(state.local_padding_mask, expected)
+    assert len(copies) == 4
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)
