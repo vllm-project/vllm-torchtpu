@@ -4,6 +4,7 @@ Complies with the formal Experiment Sweep JSON schema v1.0.0 and optionally
 uploads artifacts (such as xplane traces) and sweep metadata to GCS.
 """
 
+import getpass
 import glob
 import json
 import os
@@ -38,6 +39,14 @@ def _env_flag(name: str) -> bool:
     return value not in ("", "0", "false")
 
 
+def _default_user() -> str:
+    """Best-effort owner name, resolved lazily; never raises."""
+    try:
+        return os.environ.get("USER") or getpass.getuser() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 class JsonResultRecorder(IResultRecorder):
     """Records experiment trials into a structured JSON file adhering to schema v1.0.0."""
 
@@ -60,8 +69,8 @@ class JsonResultRecorder(IResultRecorder):
         self._lock = threading.Lock()
         self.sweep_id = (sweep_id or os.path.basename(self.json_dir) or
                          datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
-        self.user = (user or os.environ.get("USER")
-                     or os.environ.get("LOGNAME") or "unknown")
+        self.user = (user or (metadata.get("user") if metadata else None)
+                     or _default_user())
 
         raw_meta = dict(metadata or {})
         raw_meta.setdefault("description", "")
