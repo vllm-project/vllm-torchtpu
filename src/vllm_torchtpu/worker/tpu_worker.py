@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -747,6 +748,11 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # The warmed worker holds a large static heap (model, compiled
+        # executables, KV bookkeeping); freezing it keeps a gen-2 collection
+        # from scanning those objects mid-step.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

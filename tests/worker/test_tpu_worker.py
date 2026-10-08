@@ -399,7 +399,15 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
-        result = TPUWorker.compile_or_warm_up_model(worker)
+        with (
+            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
+            ) as gc_debug,
+        ):
+            result = TPUWorker.compile_or_warm_up_model(worker)
+        freeze.assert_called_once_with()
+        gc_debug.assert_called_once_with()
         assert warmup_threads == [2]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
