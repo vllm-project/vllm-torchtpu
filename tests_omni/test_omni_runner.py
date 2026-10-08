@@ -66,6 +66,12 @@ def test_omni_runner_spins_up_once_per_model(
         "sp": [{"steps": 2}],
     }
     assert [m for act, m in _EVENTS if act == "init"].count(omni_runner.model_name) == 1
+    if omni_runner.model_name == "model-b":
+        assert _EVENTS[:3] == [
+            ("init", "model-a"),
+            ("close", "model-a"),
+            ("init", "model-b"),
+        ]
 
 
 def test_omni_runner_lifecycle_and_error_recovery(
