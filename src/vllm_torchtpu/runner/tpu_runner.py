@@ -8641,6 +8641,35 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
+        self._qx_maybe_disable_aot_guard_checks()
+
+    def _qx_maybe_disable_aot_guard_checks(self) -> None:
+        if os.environ.get("QX_AOT_SKIP_GUARD_CHECK", "1") != "1":
+            return
+        roots = [self.model]
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            for attr in ("draft_model", "_mtp_loop_model", "_mtp_fused_loop"):
+                m = getattr(drafter, attr, None)
+                if m is not None:
+                    roots.append(m)
+        seen: set[int] = set()
+        n = 0
+        for root in roots:
+            if root is None:
+                continue
+            mods = list(root.modules()) if hasattr(root, "modules") else [root]
+            for mod in mods:
+                aot = getattr(mod, "aot_compiled_fn", None)
+                if (
+                    aot is not None
+                    and id(aot) not in seen
+                    and hasattr(aot, "disable_guard_check")
+                ):
+                    seen.add(id(aot))
+                    aot.disable_guard_check = True
+                    n += 1
+        logger.info("QX_AOT_SKIP_GUARD_CHECK: disabled guard check on %d AOT fns", n)
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
