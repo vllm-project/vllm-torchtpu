@@ -137,6 +137,7 @@ def test_json_recorder_records_trials_with_non_primitives(
             "accelerator_type": "TPU v6e",
             "chip_count": 4
         },
+        upload_gcs=False,
     )
 
     # Record trial with set and tuple in parameters to verify fallback serialization
@@ -185,6 +186,7 @@ def test_json_recorder_resumption(tmp_path, loaded_schema):
             "description": "Original run",
             "mode": "profile"
         },
+        upload_gcs=False,
     )
     recorder.record({"batch_size": 1}, {"Throughput_tok_s": 40.0})
 
@@ -192,6 +194,7 @@ def test_json_recorder_resumption(tmp_path, loaded_schema):
     resume_recorder = JsonResultRecorder(
         json_file=json_file,
         sweep_id="20260828_120000",
+        upload_gcs=False,
     )
     assert len(resume_recorder.data["experiments"]) == 1
     assert resume_recorder.data["status"] == "RUNNING"
@@ -220,6 +223,7 @@ def test_composite_result_recorder(tmp_path, loaded_schema):
             "description": "Composite test",
             "mode": "profile"
         },
+        upload_gcs=False,
     )
     composite = CompositeResultRecorder([csv_rec, json_rec])
 
@@ -256,11 +260,9 @@ def test_json_result_recorder_upload_gcs_disabled(tmp_path, loaded_schema):
         },
         upload_gcs=False,
     )
-    with unittest.mock.patch.object(recorder, "_upload_to_gcs_unlocked") as mock_upload, \
-         unittest.mock.patch.object(recorder, "_upload_traces_unlocked") as mock_traces:
+    with unittest.mock.patch("core.json_recorder.subprocess.run") as mock_run:
         recorder.finalize("COMPLETED")
-        mock_upload.assert_not_called()
-        mock_traces.assert_not_called()
+        mock_run.assert_not_called()
 
     with open(json_file, "r") as f:
         data = json.load(f)
