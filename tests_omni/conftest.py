@@ -77,7 +77,12 @@ def _omni_runner_cache_key(param: Any) -> tuple[str, str | None, str]:
 
 
 class OmniRunner:
-    """Context-managed wrapper around :class:`vllm_omni.entrypoints.omni.Omni`."""
+    """Context-managed wrapper around :class:`vllm_omni.entrypoints.omni.Omni`. Adapted
+    from :class:`vllm_omni.tests.helpers.runtime.OmniRunner`
+    (https://github.com/vllm-project/vllm-omni/blob/main/tests/helpers/runtime.py)
+    and vLLM's :class:`tests.conftest.VllmRunner`
+    (https://github.com/vllm-project/vllm/blob/main/tests/conftest.py).
+    """
 
     def __init__(self, model_name: str, seed: int = 42, **kwargs: Any) -> None:
         cleanup_test_environment()
