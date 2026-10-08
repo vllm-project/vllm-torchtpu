@@ -3,9 +3,7 @@
 Centralized paths and Cloud TPU environment setup.
 """
 
-import getpass
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -21,30 +19,6 @@ VLLM_REPO_PATH = str(ROOT_DIR / "vllm")
 VLLM_TORCHTPU_SRC = str(ROOT_DIR / "vllm-torchtpu/src")
 
 
-def resolve_user_ldap() -> str:
-    """Resolves LDAP username from environment, git email, or OS Login."""
-    for ev in ["USER_LDAP", "MARC_USER_LDAP", "GOOGLE_LDAP"]:
-        if val := os.environ.get(ev, "").strip():
-            return val
-    try:
-        email = subprocess.check_output(["git", "config", "user.email"],
-                                        text=True,
-                                        timeout=2).strip()
-        if "@google.com" in email:
-            return email.split("@")[0]
-    except Exception:
-        pass
-    raw = os.environ.get("USER") or os.environ.get(
-        "LOGNAME") or getpass.getuser() or ""
-    return raw[:-len("_google_com")] if raw.endswith("_google_com") else (
-        raw if raw and raw.lower() != "root" else "unknown")
-
-
-USER_LDAP = resolve_user_ldap()
-if USER_LDAP and USER_LDAP != "unknown":
-    os.environ.setdefault("USER_LDAP", USER_LDAP)
-
-
 # 3. Setup function for TPU process
 def setup_tpu_env() -> None:
     """Configures TPU execution flags, cache directories, and module paths."""
@@ -53,9 +27,6 @@ def setup_tpu_env() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
     os.environ.setdefault("USE_BATCHED_RPA_KERNEL", "1")
-
-    if USER_LDAP and USER_LDAP != "unknown":
-        os.environ.setdefault("USER_LDAP", USER_LDAP)
 
     os.environ["HF_HOME"] = HF_HOME
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = TORCHINDUCTOR_CACHE_DIR
