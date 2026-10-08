@@ -2093,3 +2093,107 @@ def sparse_attention_chunk(
         kernel_batch_size=kernel_batch_size,
         lse=lse,
     )
+
+
+_RAGGED_K_RUNGS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
+
+
+def get_dcp_kv_slice_rungs(max_k: int = 2048) -> tuple[int, ...]:
+    """Returns the subset of KV slice rungs up to max_k."""
+    return tuple(r for r in _RAGGED_K_RUNGS if r <= max_k)
+
+
+def select_dcp_kv_slice_size(max_capacity: int, active_k: int) -> int:
+    """Selects the smallest KV slice rung >= active_k, clamped to max_capacity."""
+    if active_k <= 0:
+        return 0
+    for rung in _RAGGED_K_RUNGS:
+        if active_k <= rung and rung <= max_capacity:
+            return rung
+    return min(max_capacity, _RAGGED_K_RUNGS[-1])
+
+
+
+def dispatch_sparse_mla_6rung(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array | None,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    gather_and_attention_chunk_size: int = 64,
+    attention_kernel_batch_size: int = 16,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    cache_layout: str = TENSORCORE_CACHE_LAYOUT,
+    sparsecore_atoms_per_batch: int = 16,
+    sparsecore_gather_wait_mode: str = "overlap_rope",
+    sparsecore_gather_pipelined: bool = True,
+    q_pe: jax.Array | None = None,
+    lse_lane_dense: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Lossless 6-Rung Dynamic KV Slice Dispatch with 0-Bypass Fastpath.
+
+    Selects the active KV slice rung from `_RAGGED_K_RUNGS = (64, 128, 256, 512, 1024, 2048)`
+    via `jax.lax.switch` based on `max_k = jnp.max(jnp.sum(topk_indices >= 0, axis=-1))`.
+    Branch 0 (max_k == 0) returns zeros and -inf LSE immediately without kernel launch.
+    Branches 1..6 slice `topk_indices` to the exact rung width, maintaining 16-row
+    SparseCore ROPE DMA alignment and eliminating up to 32x VMEM and gather overhead.
+    """
+    actual_k = jnp.sum(topk_indices >= 0, axis=-1)
+    max_k = jnp.max(actual_k)
+
+    branch_idx = jnp.int32(0)
+    for idx, rung in enumerate(_RAGGED_K_RUNGS, start=1):
+        prev_rung = _RAGGED_K_RUNGS[idx - 2] if idx > 1 else 0
+        branch_idx = jnp.where(max_k > prev_rung, jnp.int32(idx), branch_idx)
+    branch_idx = jnp.clip(branch_idx, 0, len(_RAGGED_K_RUNGS))
+
+    num_tokens, actual_num_q_heads, actual_head_dim = q.shape
+
+    def _branch_0(_):
+        out = jnp.zeros((num_tokens, actual_num_q_heads, actual_head_dim), dtype=q.dtype)
+        if lse_lane_dense:
+            lse = jnp.full((num_tokens, actual_num_q_heads), -jnp.inf, dtype=jnp.float32)
+        else:
+            lse = jnp.full((num_tokens, actual_num_q_heads, 1), -jnp.inf, dtype=jnp.float32)
+        return out, lse
+
+    def _make_rung_branch(rung: int):
+        def _branch(_):
+            if topk_indices.shape[-1] >= rung:
+                sub_topk = topk_indices[:, :rung]
+            else:
+                sub_topk = jnp.pad(
+                    topk_indices,
+                    ((0, 0), (0, rung - topk_indices.shape[-1])),
+                    constant_values=-1,
+                )
+            return sparse_ragged_paged_attention(
+                q,
+                cache_kv_nope,
+                cache_kv_rope,
+                sub_topk,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+                attention_kernel_batch_size=attention_kernel_batch_size,
+                vmem_limit_bytes=vmem_limit_bytes,
+                return_lse=True,
+                cache_layout=cache_layout,
+                sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+                sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
+                sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+                q_pe=q_pe,
+                lse_lane_dense=lse_lane_dense,
+            )
+        return _branch
+
+    branches = [_branch_0] + [_make_rung_branch(r) for r in _RAGGED_K_RUNGS]
+    return jax.lax.switch(branch_idx, branches, None)

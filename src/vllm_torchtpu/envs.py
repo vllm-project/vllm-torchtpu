@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
     TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_MOE_SINGLE_SORT: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -106,9 +107,15 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_SC_TOPK_SINGLE_SLICE: bool = False
     TPU_SC_TOPK_PARTITION_OVERRIDE: str = ""
-    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
-    TPU_INDEXER_TOPK_NOCOPY: bool = False
-    TPU_INDEXER_TOPK_SHARED_READ: bool = False
+    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = True
+    TPU_INDEXER_TOPK_NOCOPY: bool = True
+    TPU_INDEXER_TOPK_SHARED_READ: bool = True
+    TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS: int = 1024
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    DEFAULT_INDEXER_KV_CACHE_MODE: str = "sal"
+    TPU_SPARSE_MLA_DCP_A2A_MERGE: bool = False
+    TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: int = 64
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -117,6 +124,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -165,6 +173,8 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
@@ -383,6 +393,33 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+# Default indexer KV cache mode. "sal" uses the SEQ_ALONG_LANE
+# (num_blocks, 33, 4, page_size) cache layout (132 B/token instead of the
+# 256 B/token HEAD_ALONG_SUBLANE layout) with the coalesced Pallas KV append
+# writer (`coalesced_kv_append_dcp`). Pages whose size is not a multiple of
+# 128 fall back to HEAD_ALONG_SUBLANE in `indexer_kv_layout`.
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+
+
+def _get_dcp_a2a_merge_max_tokens() -> int:
+    val_str = os.getenv("TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS")
+    if val_str is None or val_str.strip() == "":
+        val_str = os.getenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS")
+    if val_str is None or val_str.strip() == "":
+        return 64
+    try:
+        val = int(val_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid value '{val_str}' for TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: must be an integer."
+        ) from exc
+    if val < 0:
+        raise ValueError(
+            f"Invalid value '{val}' for TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: must be >= 0."
+        )
+    return val
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
@@ -491,6 +528,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
+    ),
+    # Lossless 6-rung dynamic KV slice dispatch and VMEM split-Q LSE join for DCP.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool(
+        "TPU_DCP_MLA_SPLIT_Q_LSE", default=True
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
@@ -806,6 +847,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Build the MoE permutation, its inverse, and the sorted token ids from
+    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", default=False),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -818,6 +862,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # PR #1510 / PR #5 integrations (coalesced indexer k-writer and topk no-copy/shared-read).
+    "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=True
+    ),
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=True),
+    "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
+        "TPU_INDEXER_TOPK_SHARED_READ", default=True
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -867,12 +919,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full-width row update and hands the fresh rows to attention, instead of
     # a -1 fill plus a partial-width write whose result attention re-reads.
     "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
-        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=True
     ),
     # As TPU_INDEXER_TOPK_SINGLE_WRITE (implies it), with the row update done
     # by a donating op so XLA updates the table in place instead of copying the
     # whole `[max_num_batched_tokens, width]` table in every indexed layer.
-    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=True),
     # With TPU_INDEXER_TOPK_SINGLE_WRITE / _NOCOPY: the indexed layer's own
     # attention reads its rows back from the updated shared table, the same
     # `table[:num_tokens]` expression the following skip_topk layers read,
@@ -882,8 +934,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the first skip_topk layer recomputes it whenever num_tokens is short of
     # the table height (decode). Same values either way.
     "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
-        "TPU_INDEXER_TOPK_SHARED_READ", default=False
+        "TPU_INDEXER_TOPK_SHARED_READ", default=True
     ),
+    # Smallest token bucket for which the DCP StreamIndex top-k merges by token
+    # instead of by key: an all_to_all hands each rank 1/dcp of the tokens to
+    # merge, and the winners are all-gathered back, instead of every rank
+    # gathering and merging every token's `dcp * k` candidates. Buckets are
+    # static, so this picks a path at trace time. 0 disables it.
+    "TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS": env_nonnegative_int(
+        "TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS", 1024
+    ),
+    # Indexer KV cache layout and writer mode for Deepseek-V4 / GLM-5.2 StreamIndex:
+    # - "has": HEAD_ALONG_SUBLANE layout with coalesced Pallas KV append
+    # - "sal": SEQ_ALONG_LANE layout with coalesced Pallas KV append
+    # - "xla": HEAD_ALONG_SUBLANE layout with XLA scatter
+    "VLLM_TPU_INDEXER_KV_CACHE_MODE": env_with_choices(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        DEFAULT_INDEXER_KV_CACHE_MODE,
+        ["sal", "has", "xla"],
+        case_sensitive=False,
+    ),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE": env_bool("TPU_SPARSE_MLA_DCP_A2A_MERGE", False),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS": _get_dcp_a2a_merge_max_tokens,
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": _get_dcp_a2a_merge_max_tokens,
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
@@ -1058,6 +1131,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Support IndexShare (GLM-5.2 / DeepSeek-V3.2) in _MtpFusedLoop by taking
+    # saved step-0 top-k rows and installing them in-graph before each unrolled step.
+    "VLLM_TPU_MTP_FUSED_INDEXSHARE": env_bool(
+        "VLLM_TPU_MTP_FUSED_INDEXSHARE", default=False
+    ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
@@ -1156,4 +1234,4 @@ def enable_envs_cache() -> None:
 
 
 def __dir__() -> list[str]:
-    return list(environment_variables.keys())
+    return ["DEFAULT_INDEXER_KV_CACHE_MODE"] + list(environment_variables.keys())

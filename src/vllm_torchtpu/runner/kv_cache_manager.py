@@ -63,10 +63,14 @@ from vllm_torchtpu.kv_cache_materializer import (
     materialize_kv_cache_tensors,
     materialize_shared_attention_cache,
 )
-from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
+from vllm_torchtpu.kv_cache_spec_normalizer import (
+    _is_deepseek_v32_indexer_spec,
+    normalize_kv_cache_specs_for_tpu,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -419,7 +423,9 @@ class KVCacheManager:
                 spec,
             )
             backend = (
-                PallasMLAttentionBackend
+                VllmTPUDeepseekV32IndexerBackend
+                if _is_deepseek_v32_indexer_spec(spec)
+                else PallasMLAttentionBackend
                 if isinstance(spec, MLAAttentionSpec)
                 else backend_cls
             )
@@ -1621,7 +1627,12 @@ class KVCacheManager:
                     # Each device partition consistently retains a complete, unsliced
                     # replication of the compressed latent cache structure across
                     # multi-chip execution loops.
-                    kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    mla_backend_cls = (
+                        VllmTPUDeepseekV32IndexerBackend
+                        if isinstance(attn_module, DeepseekV32IndexerCache)
+                        else PallasMLAttentionBackend
+                    )
+                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,

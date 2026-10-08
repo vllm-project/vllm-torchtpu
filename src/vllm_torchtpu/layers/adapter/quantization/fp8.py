@@ -278,8 +278,13 @@ def _format_linear_scale_for_runtime(
         weight_scale = (
             weight_scale.transpose(0, 1).contiguous().unsqueeze(1).unsqueeze(0)
         )
-    elif weight_scale.ndim == 2 and weight_scale.shape[-1] == 1:
-        weight_scale = weight_scale.squeeze(-1).contiguous()
+    elif weight_scale.ndim == 2:
+        if weight_scale.shape[-1] == 1:
+            weight_scale = weight_scale.squeeze(-1).contiguous()
+        elif weight_scale.shape[0] == 1:
+            weight_scale = weight_scale.squeeze(0).contiguous()
+    elif weight_scale.ndim > 2 and not blockwise_kernel:
+        weight_scale = weight_scale.squeeze().contiguous()
     return weight_scale
 
 

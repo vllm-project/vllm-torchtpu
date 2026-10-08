@@ -393,6 +393,29 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_KV_RESHARD_TRANSPORT",
+        "VLLM_TPU_FUSED_DRAFT_LOOP",
+        "TPU_SAMPLER_VOCAB_PARALLEL",
+        "VLLM_DCP_Q_REPLICATE",
+        "TPU_DCP_LSE_MERGE_A2A",
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS",
+        "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS",
+        "TPU_SPARSE_MLA_NOPE_LAYOUT",
+        "TPU_SPARSE_MLA_ROPE_LAYOUT",
+        "TPU_STREAMIDX_ADAPTIVE_QBLOCK",
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ",
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP",
+        "TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS",
+        "TPU_SC_TOPK_FUSED_PAYLOAD",
+        "TPU_SC_TOPK_SINGLE_SLICE",
+        "TPU_SC_TOPK_PARTITION_OVERRIDE",
+        "TPU_MOE_SINGLE_SORT",
+        "TPU_MOE_ONEHOT_REUSE",
+        "TPU_MOE_COMBINE_UNROLL",
+        "TPU_FUSED_RMSNORM_FP8_ROPE",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -512,6 +535,7 @@ class TpuPlatform(Platform):
         # default) are registered in the scheduler process, which resolves the
         # backend for KV offloading without instantiating model layers.
         import vllm_torchtpu.layers.adapter.attention  # noqa: F401
+        import vllm_torchtpu.layers.adapter.layernorm  # noqa: F401
 
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA

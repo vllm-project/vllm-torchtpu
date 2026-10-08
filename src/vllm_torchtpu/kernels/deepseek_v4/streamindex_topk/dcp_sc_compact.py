@@ -154,7 +154,14 @@ def resolve_owned_winners(
     is rank-local already, because `local_idxs` never crossed the gather --
     which is also why this is the only place ownership is decided.
     """
-    safe = jnp.maximum(slots, 0)
-    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
-    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    # Gen-9 optimization: slots in [dcp_rank * k, (dcp_rank + 1) * k) belong to
+    # dcp_rank, with local index slots - dcp_rank * k in [0, k). Subtracting
+    # dcp_rank * k directly eliminates jnp.maximum + 32-bit floor_divide + mod
+    # across all 79 layers while remaining bit-exact for all negative (< 0) and
+    # non-owned (>= 0) slots (since dcp_rank >= 0 and k > 0).
+    rank_offset = jnp.asarray(dcp_rank, dtype=slots.dtype) * k
+    local_slot = slots - rank_offset
+    ours = (local_slot >= 0) & (local_slot < k)
+    safe_slot = jnp.where(ours, local_slot, 0)
+    mine = jnp.take_along_axis(local_idxs, safe_slot, axis=1)
     return pack_nonnegative(jnp.where(ours, mine, -1))

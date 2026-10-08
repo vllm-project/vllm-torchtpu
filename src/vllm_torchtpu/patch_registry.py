@@ -119,6 +119,8 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # TpuRMSNorm: importing the module registers the RMSNorm OOT replacement.
+    Patch("vllm_torchtpu.layers.adapter.layernorm", _ACTIVE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
