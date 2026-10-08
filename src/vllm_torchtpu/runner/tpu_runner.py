@@ -5604,7 +5604,8 @@ class TPUModelRunner(GPUModelRunner):
         granularity = self._pp_chunk_granularity
         assert granularity is not None
         return {
-            "granularity": int(granularity),
+            # The scheduler sizes steps in tokens, like the samples above.
+            "granularity": int(granularity) * pcp,
             "samples": samples,
             "schedule": schedule,
         }
