@@ -168,6 +168,12 @@ def main():
 
     dcp = args.dcp
     _log(f"vllm_torchtpu.__file__ = {vllm_torchtpu.__file__}")
+    # An installed wheel without the a2a kwarg would fail later; one with it
+    # would silently time the wrong code. Refuse site-packages outright.
+    if "site-packages" in vllm_torchtpu.__file__ and not os.environ.get(
+        "ALLOW_INSTALLED_VLLM_TORCHTPU"
+    ):
+        raise SystemExit("vllm_torchtpu imported from site-packages; set PYTHONPATH")
     _log(
         f"jax {jax.__version__} | processes {jax.process_count()} | "
         f"devices {jax.device_count()} | dcp {dcp}"
