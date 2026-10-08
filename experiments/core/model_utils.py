@@ -23,9 +23,11 @@ def resolve_model_path(model: str, base_dir: str = "") -> str:
        the resolved local path unchanged without touching the Hub.
     3. If already present in the Hugging Face cache, returns the cached
        snapshot directory.
-    4. If an uncached Hugging Face repo ID, downloads the full snapshot
-       and returns the directory.
-    5. Falls back to returning the resolved local path if offline.
+    4. Otherwise downloads the full snapshot and returns the directory.
+
+    Raises:
+        FileNotFoundError: if `model` looks like a repo id but is neither
+            cached nor downloadable (gated, missing, offline, timeout).
     """
     if not model:
         return ""
@@ -38,16 +40,20 @@ def resolve_model_path(model: str, base_dir: str = "") -> str:
     if not looks_like_hf_repo_id(model):
         return os.path.abspath(cand)
 
-    try:
-        cfg = try_to_load_from_cache(model, "config.json")
-        if cfg and isinstance(cfg, str):
-            return os.path.dirname(cfg)
-        print(f">>> [MODEL LOADER] Model '{model}' not found in local cache. "
-              "Downloading snapshot from Hugging Face...")
-        downloaded = snapshot_download(repo_id=model)
-        if downloaded and os.path.exists(downloaded):
-            return os.path.abspath(downloaded)
-    except Exception:
-        pass
+    cfg = try_to_load_from_cache(model, "config.json")
+    if cfg and isinstance(cfg, str):
+        return os.path.dirname(cfg)
 
-    return os.path.abspath(cand)
+    print(f">>> [MODEL LOADER] Model '{model}' not found in local cache. "
+          "Downloading snapshot from Hugging Face...")
+    try:
+        downloaded = snapshot_download(repo_id=model)
+    except Exception as e:  # noqa: BLE001 - re-raised with context below
+        raise FileNotFoundError(
+            f"Model '{model}' is neither a local path nor a downloadable "
+            f"Hugging Face repo ({type(e).__name__}: {e})") from e
+    if not downloaded or not os.path.exists(downloaded):
+        raise FileNotFoundError(
+            f"snapshot_download for '{model}' returned no local directory "
+            f"(got {downloaded!r})")
+    return os.path.abspath(downloaded)
