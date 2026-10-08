@@ -29,9 +29,10 @@ determine_job_priority() {
   local workload_priority=""
   echo "--- Determining job priority" >&2
   if [[ "${NIGHTLY:-0}" == "1" ]]; then
-    # Nightly build (Lowest priority)
+    # Nightly build (Lowest priority). Unclassed on kube, level with the
+    # tpu-inference nightlies it shares the TPU queues with, which record no
+    # class either.
     priority="$PRIORITY_NIGHTLY"
-    workload_priority="low"
     echo "Build type: Nightly - Priority: $priority" >&2
   elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
     local labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
@@ -65,8 +66,7 @@ read -r JOB_PRIORITY WORKLOAD_PRIORITY <<< "$job_priorities"
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
 # The kube launcher submits every workload of the build at this Kueue priority
-# class (ci-infra launch.py). None leaves them unclassed, at 0: above the
-# nightlies, as a default build ranks on bare metal.
+# class (ci-infra launch.py). None leaves them unclassed, at 0.
 if [[ -n "$WORKLOAD_PRIORITY" ]]; then
   buildkite-agent meta-data set "WORKLOAD_PRIORITY" "$WORKLOAD_PRIORITY"
 fi
