@@ -125,9 +125,7 @@ def _combine_arrivals(
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
-    coef = jnp.where(
-        topk_weights != 0, row_scales * topk_weights.astype(jnp.float32), 0.0
-    )
+    coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
             t_local=t_local,
@@ -146,13 +144,7 @@ def _combine_arrivals(
             rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
-        terms.append(
-            jnp.where(
-                slot_coef[:, None, None] != 0,
-                slot_rows.astype(jnp.float32) * slot_coef[:, None, None],
-                0.0,
-            )
-        )
+        terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
 
@@ -719,6 +711,9 @@ def fused_ep_moe_v2(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they

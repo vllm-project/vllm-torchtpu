@@ -355,8 +355,8 @@ def test_padded_tokens_are_dropped_from_routing_tables(
             assert int(np.asarray(whole_visit[1]).item()) == 0
 
 
-def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
-    """Zero-weight padded tokens must not propagate NaN from uninitialized arrivals."""
+def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
+    """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
     # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
@@ -381,17 +381,17 @@ def test_combine_arrivals_ignores_nan_on_zero_weight_padded_tokens():
     pos[4:] = sentinel_ranks
     mirror_pos[4:] = sentinel_ranks
     topk_weights[4:] = 0.0
+    row_routes = jnp.asarray([[True]] * 4 + [[False]] * 4)
 
-    out = np.asarray(
-        _combine_arrivals(
-            jnp.asarray(arrivals),
-            jnp.asarray(arrival_scales),
-            jnp.asarray(pos),
-            jnp.asarray(mirror_pos),
-            jnp.asarray(topk_weights),
-            jnp.bfloat16,
-        )
+    combined = _combine_arrivals(
+        jnp.asarray(arrivals),
+        jnp.asarray(arrival_scales),
+        jnp.asarray(pos),
+        jnp.asarray(mirror_pos),
+        jnp.asarray(topk_weights),
+        jnp.bfloat16,
     )
+    out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out[:4].astype(np.float32), 1.0)
     np.testing.assert_array_equal(

@@ -500,18 +500,18 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
-def test_pallas_combine_kernel_ignores_nan_arrivals_on_zero_weight_padded_tokens(
+def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     wire_dtype,
 ):
-    """Pallas `_build_combine_kernel` must mask NaN arrival rows when `coef == 0`.
+    """Pallas `_build_combine_kernel` keeps NaN arrival rows on padded rows.
 
     In `fused_ep_moe_v2`, a freshly allocated `arrivals` buffer may contain
-    zeroes on TPU rather than `NaN`, which would let an unguarded Pallas
-    combine kernel pass end-to-end tests. This single-chip test calls
+    zeroes on TPU rather than `NaN`. This single-chip test calls
     `layer._combine_arrivals` directly at `t_local = COMBINE_MIN_TOKENS` (256),
     where `kernel.combine_step_tokens(t_local) > 0` dispatches to the Pallas
     DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
-    `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions.
+    `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions,
+    followed by the layer's `jnp.where(row_routes, combined, jnp.zeros_like(combined))`.
     """
     t_local = kernel.COMBINE_MIN_TOKENS
     assert kernel.combine_step_tokens(t_local) > 0
@@ -543,17 +543,17 @@ def test_pallas_combine_kernel_ignores_nan_arrivals_on_zero_weight_padded_tokens
         pos[active:] = sentinel_ranks
         mirror_pos[active:] = sentinel_ranks
         topk_weights[active:] = 0.0
+        row_routes = jnp.asarray([[True]] * active + [[False]] * padded)
 
-        out = np.asarray(
-            layer._combine_arrivals(
-                arrivals,
-                arrival_scales,
-                jnp.asarray(pos),
-                jnp.asarray(mirror_pos),
-                jnp.asarray(topk_weights),
-                jnp.bfloat16,
-            )
+        combined = layer._combine_arrivals(
+            arrivals,
+            arrival_scales,
+            jnp.asarray(pos),
+            jnp.asarray(mirror_pos),
+            jnp.asarray(topk_weights),
+            jnp.bfloat16,
         )
+        out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
 
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out[:active].astype(np.float32), 1.0)

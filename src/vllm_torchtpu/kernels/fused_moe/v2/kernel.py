@@ -2219,11 +2219,9 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
             for k in range(topk):
-                c = coef_sm[(base + i) * topk + k]
-                term = jnp.where(
-                    c != 0,
-                    rows_vm[parity, k * tb + i].astype(jnp.float32) * c,
-                    0.0,
+                term = (
+                    rows_vm[parity, k * tb + i].astype(jnp.float32)
+                    * coef_sm[(base + i) * topk + k]
                 )
                 acc = term if acc is None else acc + term
             tile_vm[i] = acc.astype(out_dtype)
