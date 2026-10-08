@@ -91,6 +91,7 @@ class OmniRunner:
         kwargs.setdefault("stage_init_timeout", 600)
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
+        kwargs.setdefault("seed", seed)
         try:
             from vllm_omni.entrypoints.omni import Omni
 
