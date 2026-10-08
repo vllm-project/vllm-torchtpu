@@ -336,6 +336,82 @@ def _check_pooled_matches_dense(
         )
 
 
+@pytest.mark.parametrize(
+    ("has_offsets", "checkpoint_shape", "message"),
+    [
+        pytest.param(
+            False,
+            (2, 6),
+            "requires read offsets and checkpoint indices",
+            id="missing-offsets",
+        ),
+        pytest.param(
+            True,
+            None,
+            "requires read offsets and checkpoint indices",
+            id="missing-checkpoints",
+        ),
+        pytest.param(
+            False,
+            None,
+            "requires read offsets and checkpoint indices",
+            id="missing-both",
+        ),
+        pytest.param(
+            True,
+            (1, 6),
+            "checkpoint indices must match the verify window",
+            id="wrong-request-count",
+        ),
+        pytest.param(
+            True,
+            (2, 5),
+            "checkpoint indices must match the verify window",
+            id="short-window",
+        ),
+        pytest.param(
+            True,
+            (2, 7),
+            "checkpoint indices must match the verify window",
+            id="long-window",
+        ),
+        pytest.param(
+            True,
+            (12,),
+            "checkpoint indices must match the verify window",
+            id="wrong-rank",
+        ),
+    ],
+)
+def test_pooled_kda_rejects_invalid_speculative_metadata(
+    has_offsets, checkpoint_shape, message
+):
+    """Reject invalid verify metadata before pool access or TPU kernel dispatch."""
+    inputs = _inputs(np.random.default_rng(0), [6, 6], [6, 6])
+    pool = jnp.zeros((13, BLOCK_SIZE, PACK, LANES), dtype=jnp.bfloat16)
+    offsets = jnp.zeros(13, dtype=jnp.int32) if has_offsets else None
+    checkpoints = (
+        jnp.ones(checkpoint_shape, dtype=jnp.int32)
+        if checkpoint_shape is not None
+        else None
+    )
+    distribution = jnp.asarray([2, 2, 2], dtype=jnp.int32)
+    with pytest.raises(ValueError, match=message):
+        _pooled_kda_core(
+            **inputs,
+            pool=pool,
+            state_indices=jnp.asarray([1, 7], dtype=jnp.int32),
+            distribution=distribution,
+            window_distribution=distribution,
+            slot_read_offsets=offsets,
+            ckpt_indices=checkpoints,
+            lower_bound=LOWER_BOUND,
+            eps=EPS,
+            pool_block_tokens=BLOCK_SIZE * PACK,
+            num_spec_tokens=5,
+        )
+
+
 def test_pooled_kda_rejects_oversized_state():
     inputs = _inputs(np.random.default_rng(0), [2], [2])
     layout = derive_pooled_gdn_state_layout(
