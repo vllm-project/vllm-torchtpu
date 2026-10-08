@@ -52,8 +52,8 @@ Output
 
 Example
 -------
-    cd /mnt/pd/xujie/vllm-torchtpu/experiments
-    python3 rescore.py gs://cloud-tpu-inference-eval-staging/incoming/xujiezhang/20260922_225312
+    cd <repo>/experiments
+    python3 rescore.py gs://cloud-tpu-inference-eval-staging/incoming/<user>/<sweep_id>
 
 By default it:
   • takes the filters from the task_overrides stored in the input sweep.json,
