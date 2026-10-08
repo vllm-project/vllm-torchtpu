@@ -389,12 +389,9 @@ def test_startup_warmup_device_sync(monkeypatch):
 
     calls = []
 
-    class MockAccelerator:
-        @staticmethod
-        def synchronize(device=None):
-            calls.append("sync")
-
-    monkeypatch.setattr(torch, "accelerator", MockAccelerator(), raising=False)
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda device=None: calls.append("sync")
+    )
     monkeypatch.setattr(
         DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
     )
