@@ -1577,7 +1577,6 @@ def sparse_attention_chunk(
         # (always window 0's live rows, so a chunk without overflow gathers
         # exactly `(batch_end - start) * topk_cap` rows).
         assert capped_windows is not None
-        assert indices is not None or window_indices is not None
         gather_atoms = sparsecore_atoms_per_batch
         if small_chunk and small_chunk_live_gather:
             gather_atoms = small_chunk_gather_atoms
@@ -1592,6 +1591,7 @@ def sparse_attention_chunk(
             0, live_tokens
         ) * topk_cap
         if window_indices is None:
+            assert indices is not None
             window_indices = (
                 indices.reshape(chunk_size, capped_windows, topk_cap)
                 .transpose(1, 0, 2)
