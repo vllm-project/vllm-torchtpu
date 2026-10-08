@@ -44,9 +44,10 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 
 # Largest step written by this kernel. Its scalar pass and rope merge unroll
-# over the tokens (the merge is quadratic), so prefill-sized steps stay on the
-# SparseCore writer.
-MAX_TOKENS = 64
+# over the tokens (the merge is quadratic), so larger steps stay on the
+# SparseCore writer. Measured on GLM-5.2 DCP16: faster than the SparseCore
+# writer at 32 tokens, slower at 64 on a rank that owns rows.
+MAX_TOKENS = 32
 
 # Test-only faults (positive controls for the kernel's own test).
 _FAULTS = (None, "skip_rope_read", "shift_lane_group")

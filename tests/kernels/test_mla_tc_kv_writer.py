@@ -95,8 +95,8 @@ _CELLS = {
     # Physical-page and virtual-page boundaries (local slot 255 -> 0 of the
     # next block-table entry), a sequence's first token, and the largest step
     # the TC writer takes.
-    "page_boundary_t64": (
-        [(VIRTUAL_PAGE - 8, 16), (2 * VIRTUAL_PAGE - 8, 16), (0, 16), (2000, 16)],
+    "page_boundary_tmax": (
+        [(VIRTUAL_PAGE - 4, 8), (2 * VIRTUAL_PAGE - 4, 8), (0, 8), (2000, 8)],
         tc_scatter.MAX_TOKENS,
     ),
     # Every token on rank 5 (whole rope rows), so the other ranks own none.
@@ -312,7 +312,7 @@ class TcKvWriterDispatchTest(parameterized.TestCase):
         return out, spy.call_count
 
     @parameterized.named_parameters(
-        ("decode_t16", "decode_t16"), ("page_boundary_t64", "page_boundary_t64")
+        ("decode_t16", "decode_t16"), ("page_boundary_tmax", "page_boundary_tmax")
     )
     def test_flag_on_takes_the_tc_writer(self, cell):
         seqs, num_tokens = _CELLS[cell]
@@ -333,7 +333,7 @@ class TcKvWriterDispatchTest(parameterized.TestCase):
     def test_above_max_tokens_falls_back_to_the_sparsecore_writer(self):
         """A prefill-sized step keeps today's path, flag or no flag."""
         num_tokens = 2 * tc_scatter.MAX_TOKENS
-        seqs = [(_rank_chunk(r, 3 * r) + 1, 16) for r in range(8)]
+        seqs = [(_rank_chunk(r, 3 * r) + 1, 8) for r in range(8)]
         inp = _inputs(seqs, num_tokens)
         on, calls = self._run(inp, flag=True)
         self.assertEqual(calls, 0)
