@@ -51,7 +51,7 @@ def test_json_recorder_initialization_and_schema(tmp_path, loaded_schema):
         json_file=json_file,
         sweep_id="20260828_120000",
         metadata=metadata,
-        user_ldap="test_user",
+        user="test_user",
         hardware={
             "accelerator_type": "TPU v6e",
             "chip_count": 4
@@ -64,7 +64,7 @@ def test_json_recorder_initialization_and_schema(tmp_path, loaded_schema):
 
     assert data["schema_version"] == "1.0.0"
     assert data["sweep_id"] == "20260828_120000"
-    assert data["user_ldap"] == "test_user"
+    assert data["user"] == "test_user"
     assert data["status"] == "RUNNING"
     assert data["metadata"]["description"] == "Test sweep for validation"
     assert data["experiments"] == []
@@ -105,7 +105,7 @@ def test_sweep_id_schema_rejects_unsafe_ids(loaded_schema, sweep_id):
         "sweep_id": sweep_id,
         "created_at": "2026-08-28T12:00:00Z",
         "status": "RUNNING",
-        "user_ldap": "user",
+        "user": "user",
         "metadata": {
             "description": "",
             "mode": "eval"

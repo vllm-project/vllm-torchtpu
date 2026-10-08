@@ -38,7 +38,7 @@ class JsonResultRecorder(IResultRecorder):
         json_file: str,
         sweep_id: str = "",
         metadata: Optional[Dict[str, Any]] = None,
-        user_ldap: str = "",
+        user: str = "",
         hardware: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -52,8 +52,8 @@ class JsonResultRecorder(IResultRecorder):
         self._lock = threading.Lock()
         self.sweep_id = (sweep_id or os.path.basename(self.json_dir) or
                          datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
-        self.user_ldap = (user_ldap or os.environ.get("USER")
-                          or os.environ.get("LOGNAME") or "unknown")
+        self.user = (user or os.environ.get("USER")
+                     or os.environ.get("LOGNAME") or "unknown")
 
         # Normalize top-level metadata dict ensuring required schema fields
         raw_meta = dict(metadata or {})
@@ -78,7 +78,7 @@ class JsonResultRecorder(IResultRecorder):
                     "created_at": now_str,
                     "completed_at": None,
                     "status": "RUNNING",
-                    "user_ldap": self.user_ldap,
+                    "user": self.user,
                     "metadata": raw_meta,
                     "experiments": [],
                 }

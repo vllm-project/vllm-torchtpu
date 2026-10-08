@@ -9,7 +9,7 @@
     "sweep_id",
     "created_at",
     "status",
-    "user_ldap",
+    "user",
     "metadata",
     "experiments"
   ],
@@ -39,9 +39,9 @@
       "enum": ["PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"],
       "description": "High-level execution status of the sweep."
     },
-    "user_ldap": {
+    "user": {
       "type": "string",
-      "description": "LDAP of the experiment author (e.g. 'shenrunz')."
+      "description": "Username of the experiment author."
     },
     "error_message": {
       "type": ["string", "null"],
