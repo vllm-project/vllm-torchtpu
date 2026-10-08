@@ -178,6 +178,10 @@ class ModelSplicer:
         substituting tensors present in replacement_state_dict (filtered to target_layer_indices if provided),
         and keeping all other weights (including non-layer multimodal tensors like model.vision_embedder.*)
         bit-identical to base_model_dir.
+
+        Raises ValueError if no tensor was substituted: the output would be
+        a dense copy mislabelled as sparse (e.g. state_dict key names that
+        do not match the shard key names).
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -229,6 +233,16 @@ class ModelSplicer:
             print(
                 f">>> [SPLICER] Wrote merged shard {shard_name} ({len(merged_shard)} tensors)"
             )
+
+        if replaced_count == 0:
+            targets = (sorted(target_layer_indices)
+                       if target_layer_indices is not None else "ALL")
+            raise ValueError(
+                f"save_substituted_checkpoint replaced 0 tensors in "
+                f"'{output_dir}': no key of replacement_state_dict matched a "
+                f"shard key of '{base_model_dir}' within target layers "
+                f"{targets}. The output would be a dense copy mislabelled "
+                "as sparse.")
 
         print(
             f">>> [SPLICER] Calibrated checkpoint saved: {replaced_count} substituted, {kept_dense_count} preserved from base."
