@@ -32,6 +32,12 @@ def _json_serializer(obj: Any) -> Any:
     return str(obj)
 
 
+def _env_flag(name: str) -> bool:
+    """Returns True if the env var is set to a truthy value (not 0/false)."""
+    value = os.environ.get(name, "").strip().lower()
+    return value not in ("", "0", "false")
+
+
 class JsonResultRecorder(IResultRecorder):
     """Records experiment trials into a structured JSON file adhering to schema v1.0.0."""
 
@@ -44,7 +50,8 @@ class JsonResultRecorder(IResultRecorder):
         hardware: Optional[Dict[str, Any]] = None,
         upload_gcs: bool = True,
     ):
-        self.upload_gcs = upload_gcs
+        self.upload_gcs = upload_gcs and not _env_flag(
+            "EXPERIMENTS_NO_UPLOAD_GCS")
         self.json_file = os.path.abspath(json_file)
         self.json_dir = os.path.dirname(self.json_file)
         if self.json_dir:
