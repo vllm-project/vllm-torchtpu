@@ -18,7 +18,6 @@ model_resolver:
   config:
     base_model: google/gemma-4-12B-it
     reference_sparse_model: gemma4_12b_2of4_canonical_256c4_full
-    checkpoint_base_dir: /mnt/pd/sparse_checkpoints
     strategy: first_to_last
     prunen: 2
     prunem: 4
