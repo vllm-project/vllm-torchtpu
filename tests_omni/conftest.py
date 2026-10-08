@@ -92,6 +92,8 @@ class OmniRunner:
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
         kwargs.setdefault("seed", seed)
+
+        self.omni: Omni | None = None
         try:
             from vllm_omni.entrypoints.omni import Omni
 
@@ -138,9 +140,10 @@ class OmniRunner:
         return self
 
     def close(self, *_: Any) -> None:
-        omni, self.omni = getattr(self, "omni", None), None
-        if omni is not None:
-            getattr(omni, "close", getattr(omni, "shutdown", lambda: None))()
+        if self.omni is not None:
+            self.omni.close()
+            self.omni = None
+
         self._cleanup_process()
         cleanup_test_environment()
 
