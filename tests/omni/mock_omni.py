@@ -97,6 +97,29 @@ class _MockLTXRuntime:
         return MagicMock(output=self.output)
 
 
+def _init_mock_qwen_rope(self):
+    self.pos_freqs = torch.polar(
+        torch.ones(8, 4), torch.arange(32, dtype=torch.float32).view(8, 4)
+    )
+
+
+def _forward_mock_qwen_rope(self, video_fhw, txt_seq_lens, device):
+    return (
+        torch.cat([self.pos_freqs[:2]], dim=0),
+        self.pos_freqs[2 : 2 + max(txt_seq_lens), ...],
+    )
+
+
+class _MockQwenEmbedRope:
+    __init__ = _init_mock_qwen_rope
+    forward = _forward_mock_qwen_rope
+
+
+class _MockQwenEmbedLayer3DRope:
+    __init__ = _init_mock_qwen_rope
+    forward = _forward_mock_qwen_rope
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -106,6 +129,11 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
     lambda *args, **kwargs: None
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
+qwen_transformer_mock = (
+    vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
+)
+qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
+qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -129,4 +157,10 @@ sys.modules["vllm_omni.diffusion.models"] = vllm_omni_mock.diffusion.models
 sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models.ltx2
 sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
     vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
+)
+sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
+    vllm_omni_mock.diffusion.models.qwen_image
+)
+sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
+    vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
 )
