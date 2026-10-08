@@ -34,14 +34,15 @@ x-eval-runtime: &eval_runtime "18000"
 x-perf-step-defaults: &perf_step
   depends_on:
     - "build_docker"
-  # Six steps of four chips is 24 of the cohort's 40 v7x chips: the eight the
-  # 2x2x1 queue owns plus sixteen borrowed from 2x2x4, which a Kimi-K3 run
-  # reclaims. The other sixteen stay free for the multi-host steps of other
-  # lanes. Above this, watch for OSError: [Errno 116] Stale file handle: every
-  # pod loading a model rewrites refs/<rev> in the shared HF cache bucket, and a
-  # pod holding a handle across another's rewrite gets that error.
+  # Org-wide, so every build's perf and integration steps share these slots.
+  # Chips are not what it guards: Kueue holds a step until its chips are free,
+  # and twelve steps of four chips is 48 of the cohort's 72. It caps how many
+  # pods load a model at once, because every one rewrites refs/<rev> in the
+  # shared HF cache bucket and a pod holding a handle across another's rewrite
+  # gets OSError: [Errno 116] Stale file handle. If that error appears, this is
+  # the number to lower.
   concurrency_group: "tpu/v7x"
-  concurrency: 6
+  concurrency: 12
   # Covers queueing as well as running, so it cannot be set from how long the
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
@@ -213,10 +214,9 @@ steps:
 
   # The three v7x-16 steps below are two-host slices, so they go through
   # run_multihost.sh and the JobSets in manifests/. They are not in the tpu/v7x
-  # concurrency group and depend on nothing but the image: the fleet has five
-  # 2x2x2 slices and places each JobSet in a slice of its own, and the group
-  # above is capped at 24 of the 40 v7x chips, so two of these run alongside it
-  # from the start and the third takes the first slice to come free.
+  # concurrency group and depend on nothing but the image: the fleet places each
+  # JobSet in a 2x2x2 slice of its own, and Kueue starts them as the cohort has
+  # chips to lend that profile.
   - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
     key: "perf_nightly_glm_5_2_fp8_dp16_ep"
     # Without build_docker this submits a sixteen-chip workload against a tag
