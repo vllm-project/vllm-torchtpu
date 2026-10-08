@@ -37,7 +37,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -372,9 +372,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if self._wkv_wgate_transposed:
             return
-        weight = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        w_t = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        # torch_tpu can keep `w_t` as a view chain on the old parameter and
+        # re-materialize it at the `pallas.jax_op` boundary every step
+        # (`tt_jit_as_strided`). A fresh buffer + copy_ breaks the chain; same
+        # pattern as `_fresh()` in mla_attention_op.py and the flip in fp8.py.
+        weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
+        if self.fused_wkv_wgate.weight.device.type == "tpu":
+            synchronize_tensors([self.fused_wkv_wgate.weight])
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
@@ -598,8 +605,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
-            self.ape.clone(),
-            self.norm.weight.clone(),
+            self.ape,
+            self.norm.weight,
             rotary_emb.cos_sin_cache,
             positions,
             state_block_tables,

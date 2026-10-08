@@ -125,3 +125,24 @@ def test_compressor_op_is_built_lazily_and_cached():
         assert compressor.compressor_op is sentinel
         assert compressor.compressor_op is sentinel
     build.assert_called_once()
+
+
+def test_transpose_wkv_wgate_allocates_fresh_buffer():
+    """Transposed weight must live in a fresh contiguous buffer, not a view."""
+    compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
+    torch.nn.Module.__init__(compressor)
+    orig = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    orig_ptr = orig.untyped_storage().data_ptr()
+    compressor.fused_wkv_wgate = SimpleNamespace(
+        weight=torch.nn.Parameter(orig, requires_grad=False)
+    )
+    compressor._wkv_wgate_transposed = False
+
+    compressor.transpose_wkv_wgate()
+
+    w = compressor.fused_wkv_wgate.weight
+    assert compressor._wkv_wgate_transposed is True
+    assert w.shape == (4, 3)
+    assert w.is_contiguous()
+    assert w.untyped_storage().data_ptr() != orig_ptr
+    assert torch.equal(w, orig.t())
