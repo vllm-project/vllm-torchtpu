@@ -101,6 +101,9 @@ def test_promotes_warmest_within_window():
         assert s.schedule(throttle_prefills=True) is expected
 
 
+    q = s._select_waiting_queue_for_scheduling()
+
+
 def test_ranks_by_uncached_tokens_not_hit_ratio():
     now = time.time()
     # 100k tokens, 90% cached -> 10k uncached tokens
@@ -208,3 +211,107 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+    now = time.time()
+    r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
+    r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 5)
+    s = _make_scheduler([r1, r2], {"r1": 128, "r2": 640})
+
+    class DummyBlockPool:
+        def __init__(self):
+            self.cached_block_hash_to_block = {}
+            self._tpu_prefix_cache_epoch = 1
+
+    pool = DummyBlockPool()
+    s.kv_cache_manager.block_pool = pool
+    s.kv_cache_manager.enable_kv_cache_events = False
+    s.kv_cache_manager.prefix_cache_lookup_enabled = lambda req: True
+    s.kv_cache_manager.create_kv_cache_blocks = lambda blocks: blocks
+    s.connector = None
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["r2", "r1"]
+    assert s.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 2
+
+    # _get_local_prefix_cache_hit on the promoted request reuses _paw_hit_cache
+    blocks, num_local, boundary, diverged = s._get_local_prefix_cache_hit(r2)
+    assert num_local == 640
+    assert diverged is False
+    assert s.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 2
+
+    # Repeated scheduling step with unchanged epoch does not re-invoke coordinator
+    s._select_waiting_queue_for_scheduling()
+    assert s.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 2
+
+    # Advancing _tpu_prefix_cache_epoch invalidates _paw_hit_cache
+    pool._tpu_prefix_cache_epoch += 1
+    s._select_waiting_queue_for_scheduling()
+    assert s.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 4
+
+
+def _running_request(request_id: str, prompt: int, computed: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        num_prompt_tokens=prompt,
+        num_computed_tokens=computed,
+    )
+
+
+def _make_step_scheduler(running, monkeypatch, budget=8192):
+    """A PrefixAwareScheduler whose vLLM schedule() records what it saw."""
+    seen = {}
+
+    def fake_schedule(self, *args, **kwargs):
+        seen["order"] = [r.request_id for r in self.running]
+        seen["budget"] = self.max_num_scheduled_tokens
+        seen["args"] = (args, kwargs)
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = list(running)
+    s.max_num_scheduled_tokens = budget
+    return s, seen
+
+
+def test_decoders_first_moves_decoders_ahead_of_partial_prefills(monkeypatch):
+    running = [
+        _running_request("p1", prompt=100_000, computed=7680),
+        _running_request("d1", prompt=500, computed=501),
+        _running_request("new", prompt=2000, computed=0),
+        _running_request("d2", prompt=800, computed=800),
+        _running_request("p2", prompt=50_000, computed=640),
+    ]
+    s, seen = _make_step_scheduler(running, monkeypatch)
+    running_list = s.running
+
+    assert s.schedule(True) == "out"
+
+    assert s.running is running_list
+    assert seen["args"] == ((True,), {})
+
+
+def test_decoders_first_is_noop_without_a_mix(monkeypatch):
+    for running in (
+        [_running_request("d1", 10, 10), _running_request("d2", 10, 12)],
+        [_running_request("p1", 10, 5), _running_request("p2", 10, 0)],
+        [],
+    ):
+        s, seen = _make_step_scheduler(running, monkeypatch)
+        s.schedule()
+        assert seen["order"] == [r.request_id for r in running]
+
+
+def test_no_step_token_cap_with_many_decoders(monkeypatch):
+    """The validated policy has no decode-protect cap: the step budget stays
+    max_num_batched_tokens however many requests decode."""
+    running = [_running_request(f"d{i}", 100, 100) for i in range(24)]
+    running.append(_running_request("p", 100_000, 0))
+    s, seen = _make_step_scheduler(running, monkeypatch, budget=8192)
+    s.schedule()
+    assert seen["budget"] == 8192
+    assert s.max_num_scheduled_tokens == 8192
+
+
