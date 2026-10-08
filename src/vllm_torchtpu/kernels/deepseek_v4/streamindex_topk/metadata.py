@@ -220,13 +220,17 @@ def compute_batched_seq_metadata(
         # axis, so they overlap in num_chunks + max_seq_tiles - 1 pairs. That is
         # the total seam count; charging one seam per tile per chunk, as
         # num_chunks * per_chunk_bq does, overcounts it by up to num_chunks.
-        total_bq_ub = min(
-            num_chunks * per_chunk_bq,
-            max(1, pl.cdiv(next_power_of_2(max_num_tokens), bq_span))
-            + num_chunks
-            + max_seq_tiles
-            - 1,
-        )
+        # Overlapping chunks share tokens and break the partition, so they keep
+        # the per-chunk bound alone.
+        total_bq_ub = num_chunks * per_chunk_bq
+        if all(b - a >= chunk_tokens for a, b in zip(chunk_starts, chunk_starts[1:])):
+            total_bq_ub = min(
+                total_bq_ub,
+                max(1, pl.cdiv(next_power_of_2(max_num_tokens), bq_span))
+                + num_chunks
+                + max_seq_tiles
+                - 1,
+            )
         req_max_steps = total_bq_ub * max_bkv
     else:
         req_max_steps = total_max_bq * max_bkv
