@@ -93,6 +93,23 @@ class StateSourcePlan:
     whole_block_dma: bool = False
 
 
+DEFAULT_VMEM_FRACTION = 0.80
+WINDOWED_VMEM_FRACTION = 0.90
+
+
+def get_decode_vmem_limit_bytes(window_size: int = 1) -> int:
+    """Returns the VMEM limit in bytes for decode with window_size checkpoints."""
+    fraction = WINDOWED_VMEM_FRACTION if window_size > 1 else DEFAULT_VMEM_FRACTION
+    tpu_info = pltpu.get_tpu_info()
+    return int(fraction * tpu_info.vmem_capacity_bytes)
+
+
+def get_mixed_vmem_limit_bytes() -> int:
+    """Returns the VMEM limit in bytes for prefill or mixed sequence tiles."""
+    tpu_info = pltpu.get_tpu_info()
+    return int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -236,7 +253,10 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
+        return (
+            f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+            f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
+        )
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)

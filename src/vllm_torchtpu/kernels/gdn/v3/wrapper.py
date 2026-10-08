@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import (
     compute_conv1d,
     compute_gdn,
@@ -27,8 +28,12 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     config,
     memory_ref,
     metadata,
+    tiling,
     vmem_ldst,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def inner_kernel(
@@ -449,8 +454,9 @@ def fused_conv1d_gdn(
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
+            Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences.
+            sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -534,35 +540,65 @@ def fused_conv1d_gdn(
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    window_size = num_spec_tokens + 1
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+
+    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+            batch_size=batch_size,
+            num_seqs=num_seqs,
+            padded_batch_size=padded_batch_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=(
+                jnp.float32 if recurrent_state is None else recurrent_state.dtype
+            ),
+            num_lanes=num_lanes,
+            decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            window_size=window_size,
+        )
+        logger.info_once(
+            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            num_seqs,
+            batch_size,
+            window_size,
+            decode_tile_size,
+            mixed_tile_size,
+        )
 
     if num_spec_tokens > 0:
-        # A verify window holds one state checkpoint per window position per
-        # sequence in VMEM, which multiplies the per-sequence footprint by
-        # the window size. Shrink the tile so the double-buffered windows
-        # fit in roughly half the scoped-VMEM budget (the rest goes to
-        # weights, activations scratch and compiler temporaries).
-        window = num_spec_tokens + 1
-        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        # State tiles hold `window` checkpoints plus one dedicated
-        # incoming-state position (`GDNConfig.state_in_pos`) when window > 1.
-        state_positions = window + (1 if window > 1 else 0)
-        recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
-        bytes_per_seq = (
-            # Recurrent checkpoints (fp32) — the dominant term.
-            recurrent_bytes_per_seq
-            # Conv checkpoints (fp32).
-            + state_positions * (kernel_size - 1) * dim * 4
-            # qkv (fp32), b/a (fp32), out (act_out).
-            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        )
-        vmem_budget = int(
-            config.GDNConfig.WINDOWED_VMEM_FRACTION
-            * pltpu.get_tpu_info().vmem_capacity_bytes
-        )
-        spec_tile_budget = (vmem_budget // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
-        )
+        if not envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
+            # A verify window holds one state checkpoint per window position
+            # per sequence in VMEM, which multiplies the per-sequence
+            # footprint by the window size. Shrink the tile so the
+            # double-buffered windows fit in roughly half the scoped-VMEM
+            # budget (the rest goes to weights, activations scratch and
+            # compiler temporaries). Dynamic tiling counts the windows in
+            # tiling.get_tile_sizes instead.
+            window = num_spec_tokens + 1
+            num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+            # State tiles hold `window` checkpoints plus one dedicated
+            # incoming-state position (`GDNConfig.state_in_pos`) when window > 1.
+            state_positions = window + (1 if window > 1 else 0)
+            recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
+            bytes_per_seq = (
+                # Recurrent checkpoints (fp32) — the dominant term.
+                recurrent_bytes_per_seq
+                # Conv checkpoints (fp32).
+                + state_positions * (kernel_size - 1) * dim * 4
+                # qkv (fp32), b/a (fp32), out (act_out).
+                + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+            )
+            spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
+            decode_tile_size = max(
+                1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+            )
 
         if is_kda:
             # Keep exactly one KDA sequence in each window tile.  The state
@@ -696,6 +732,8 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
@@ -714,7 +752,7 @@ def fused_conv1d_gdn(
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
-                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+                vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg.get_kernel_name(),
             metadata=cfg.get_metadata(),
