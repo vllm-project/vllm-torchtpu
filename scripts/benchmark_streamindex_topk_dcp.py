@@ -156,6 +156,11 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20, help="wall samples per rep")
     ap.add_argument("--loop", type=int, default=11, help="N for the slope")
+    ap.add_argument(
+        "--direct",
+        action="store_true",
+        help="time one bare jitted call per sample (no fori_loop); slope = nan",
+    )
     args = ap.parse_args()
 
     _init_distributed()
@@ -201,6 +206,15 @@ def main():
     )
 
     def make_loop(a2a, T):
+        if args.direct:
+
+            @jax.jit
+            def direct(n, q, w, c, sl, pi, cu, dist):
+                del n
+                return streamindex_topk_dcp(q, w, c, sl, pi, cu, dist, a2a_merge=a2a, **kw)
+
+            return direct
+
         @jax.jit
         def loop(n, q, w, c, sl, pi, cu, dist):
             def body(_, carry):
@@ -244,7 +258,9 @@ def main():
             # Correctness: both arms, bit-identical, at this exact shape.
             outs = {}
             for a in (False, True):
+                _log(f"COMPILE+RUN dcp={dcp} T={T} L={L} a2a={a} direct={args.direct}")
                 _, o = run(loops[a], n1, inputs)  # also compiles
+                _log(f"OK dcp={dcp} T={T} L={L} a2a={a}")
                 run(loops[a], nN, inputs)
                 outs[a] = local_np(o)
             exact = all(np.array_equal(x, y) for x, y in zip(outs[False], outs[True]))
