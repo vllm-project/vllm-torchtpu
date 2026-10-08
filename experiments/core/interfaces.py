@@ -43,6 +43,14 @@ class IResultRecorder(ABC):
         """Records a completed benchmark coordinate with its metrics and reproduction command."""
         pass
 
+    def finalize(self, status: str = "COMPLETED") -> None:
+        """Marks the end of a sweep (e.g. COMPLETED or FAILED).
+
+        Optional hook; recorders without a notion of sweep-level state
+        (such as flat CSV logs) keep the default no-op.
+        """
+        return None
+
 
 class ISparsityEngine(ABC):
     """Abstract interface for weight pruning and structured sparsity algorithms."""

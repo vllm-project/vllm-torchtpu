@@ -310,9 +310,7 @@ class SweepOrchestrator:
                 )
 
         # Finalize recorders (e.g. stamp completed_at in sweep.json)
-        if hasattr(self.recorder, "finalize") and callable(
-                getattr(self.recorder, "finalize")):
-            self.recorder.finalize(status="COMPLETED")
+        self.recorder.finalize(status="COMPLETED")
 
         print(f">>> [SWEEP COMPLETE] Results written to {self.csv_file}")
         if os.path.exists(self.json_file):

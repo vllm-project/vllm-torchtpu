@@ -162,6 +162,4 @@ class CompositeResultRecorder(IResultRecorder):
 
     def finalize(self, status: str = "COMPLETED") -> None:
         for recorder in self.recorders:
-            if hasattr(recorder, "finalize") and callable(
-                    getattr(recorder, "finalize")):
-                recorder.finalize(status)
+            recorder.finalize(status)
