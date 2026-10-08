@@ -13,6 +13,8 @@
 # limitations under the License.
 """The single-sort MoE permutation matches the three-sort reference."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -130,14 +132,19 @@ def test_single_sort_fallback_when_bits_exceed_int32(monkeypatch):
     monkeypatch.setattr(fused_moe_gmm, "_SINGLE_SORT", True)
     # Using local_num_experts with 30 bits forces bits >= 31
     large_num_experts = 1 << 29
-    res = fused_moe_gmm.prepare_routed_gmm_inputs(
+    # Traced, not run: the three-sort path counts rows per expert with a
+    # (rows, local_num_experts) int32 one-hot, which at 2**29 experts is 86 GB.
+    res = jax.eval_shape(
+        functools.partial(
+            fused_moe_gmm.prepare_routed_gmm_inputs,
+            local_num_experts=large_num_experts,
+            topk=TOPK,
+            use_ep=False,
+            use_sparse_core=False,
+        ),
         hidden_states,
         local_ids,
         weights,
-        local_num_experts=large_num_experts,
-        topk=TOPK,
-        use_ep=False,
-        use_sparse_core=False,
     )
     assert res[0].shape[0] == num_tokens * TOPK
 
