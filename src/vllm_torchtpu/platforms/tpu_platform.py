@@ -406,6 +406,8 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_DCP_INDEXER_A2A_MERGE",
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
@@ -733,6 +735,9 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 

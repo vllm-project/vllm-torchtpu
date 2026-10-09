@@ -78,17 +78,24 @@ head_listening() {
 # listening. This is how a worker leaves: nothing kills these pods, so one that
 # waited on its own processes would hold its chips until the JobSet deadline.
 #
-# Three consecutive misses, not one: a DNS blip on the headless service looks
-# identical to a closed port from here, and leaving is irreversible.
+# The multihost manifests end the Job when the head succeeds (successPolicy on
+# index 0), and Kubernetes terminates the workers then; this is the fallback,
+# for a head that fails or a manifest without that rule. Gone for 20s
+# straight, not one miss: a DNS blip on the headless service looks identical
+# to a closed port from here, and leaving is irreversible. Probing every 2s
+# keeps that window but notices the end within ~20s; three misses 15s apart
+# held the worker's chips ~70s after the head had exited.
 wait_for_head_to_go() {
-  local misses=0
-  while [ "$misses" -lt 3 ]; do
+  local gone_since=""
+  while true; do
     if head_listening "$1" "$2"; then
-      misses=0
-    else
-      misses=$((misses + 1))
+      gone_since=""
+    elif [ -z "$gone_since" ]; then
+      gone_since=$SECONDS
+    elif [ $((SECONDS - gone_since)) -ge 20 ]; then
+      return 0
     fi
-    sleep 15
+    sleep 2
   done
 }
 
@@ -120,6 +127,10 @@ mp_serve_args() {
   [ -n "$QUANTIZATION" ] && extra_args="$extra_args --quantization $QUANTIZATION"
   extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
   [ -n "$EXTRA_SERVE_ARGS" ] && extra_args="$extra_args $EXTRA_SERVE_ARGS"
+  # Empty leaves the flag off, so vLLM serves the checkpoint's own window - what
+  # a full-context benchmark wants, rather than a number copied into a config.
+  # Every config that sets it behaves exactly as before.
+  [ -n "${MAX_MODEL_LEN:-}" ] && extra_args="$extra_args --max-model-len=$MAX_MODEL_LEN"
   local prefix_caching_flag="--no-enable-prefix-caching"
   [ "$ENABLE_PREFIX_CACHING" = "true" ] && prefix_caching_flag="--enable-prefix-caching"
   local async_flag="--async-scheduling"
@@ -140,7 +151,6 @@ mp_serve_args() {
     --data-parallel-size-local="$DP_LOCAL"
     --data-parallel-address="$DP_ADDRESS"
     --data-parallel-rpc-port="$DP_RPC_PORT"
-    --max-model-len="$MAX_MODEL_LEN"
     --max-num-batched-tokens="$MAX_NUM_BATCHED_TOKENS"
     --max-num-seqs="$MAX_NUM_SEQS"
     "$async_flag"

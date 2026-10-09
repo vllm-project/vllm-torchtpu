@@ -34,7 +34,9 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG=kimi-k3-tp8-dp4-ep-1p1d
+# The pair's serve flags and Raiden environment. The AgentX lane serves the
+# same pair with a longer context and its own ladder, so it passes its own.
+CONFIG="${K3_PD_CONFIG:-kimi-k3-tp8-dp4-ep-1p1d}"
 PORT=8000
 PROXY_PORT=8100
 DP_RPC_PORT=29500
@@ -120,6 +122,15 @@ vllm serve "${SERVE_ARGS[@]}" --api-server-count=1 --host 0.0.0.0 --port "$PORT"
 serve_pid=$!
 
 if [[ "$role" == "decode" ]]; then
+  wait "$serve_pid"
+  exit $?
+fi
+
+# K3_PD_EXTERNAL_CLIENT=1: something outside this role drives the pair, so this
+# head only serves. Unset, this head IS the driver and its finishing ends the
+# run, so falling through here would tear its own engine down mid-benchmark.
+if [[ "${K3_PD_EXTERNAL_CLIENT:-0}" == "1" ]]; then
+  echo "--- K3_PD_EXTERNAL_CLIENT: serving until the external client finishes"
   wait "$serve_pid"
   exit $?
 fi

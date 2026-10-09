@@ -26,7 +26,7 @@ AgentX replay) and eval_conc_sweep.sh (the lm_eval ladder) can be unit tested
          concurrency so that N requests are really in flight.
   gsm8k-row      --output-dir DIR --conc N
       -> "| N | <strict-match> | <flexible-extract> |"
-  agentx-table   --results-dir DIR --base NAME --concs N...
+  agentx-table   --results-dir DIR --base NAME --concs N... --chips N
       -> markdown table over DIR/NAME_c<N>.json, the aggregate JSON that
          InferenceX's process_agentic_result.py writes per point. A point whose
          conc_<N>/HARD_TIMEOUT marker exists is labelled as such whether or not
@@ -53,10 +53,33 @@ _SCORE_KEYS = (
     "exact_match,strict-match",
 )
 
-# (column title, dotted path into the InferenceX aggregate JSON)
+# USD per accelerator-hour, by the hardware family the aggregate's own "hw"
+# field starts with ("tpu7x-32" -> "tpu7x"). The one fixed number in this file,
+# and the only place it is written: the rate is a property of the hardware, not
+# of a deployment, so a manifest or a serve config carrying it would be one copy
+# per lane to drift. An unknown family leaves the column blank rather than
+# normalizing by a guess.
+#
+# 1.2 is our own figure. For reference, the rates InferenceX costs its published
+# rows with ("owning at large hyperscaler volume", from the SemiAnalysis TCO
+# model) are 1.73 USD/GPU-hour for B200, 1.86 for GB200 NVL72, 2.26 for B300 and
+# 2.31 for GB300; the only TPU number they publish is Google's internal TCO at
+# 1.03 USD/chip-hour. Pick the tier the comparison is being made against: this is
+# the one line to change.
+#
+# That spread is also why the headline is tokens per dollar and not per-chip
+# throughput: one Ironwood chip and one B300 are not the same amount of silicon,
+# money or power, so only a cost-normalized number compares.
+ACCELERATOR_USD_PER_HOUR = {"tpu7x": 1.2}
+
+# "out tok/$" is computed, not read: InferenceX publishes no cost field, and its
+# own per_gpu divides by the parallelism it is told about, which counts ranks -
+# two to a v7x chip - and is empty unless that parallelism is declared in its
+# multinode form. So the column is output tokens over what the chips cost for the
+# hour they produced them: tok/s x 3600 / (chips x USD per chip-hour).
+TOTAL_TPUT = "request_metrics.throughput.output.tokens_per_second"
 AGENTX_COLUMNS = (
-    ("out tok/s per chip", "request_metrics.throughput.per_gpu.output_tput_tps"),
-    ("out tok/s total", "request_metrics.throughput.output.tokens_per_second"),
+    ("out tok/s total", TOTAL_TPUT),
     ("requests ok", "num_requests_successful"),
     ("TTFT p50 s", "request_metrics.latency.ttft.p50"),
     ("TTFT p90 s", "request_metrics.latency.ttft.p90"),
@@ -132,10 +155,21 @@ def gsm8k_row(output_dir: str, conc: int) -> str:
     )
 
 
-def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
+def accelerator_usd_per_hour(hw: Any) -> float | None:
+    """The rate for an aggregate's "hw" label, or None when it is not known."""
+    if not isinstance(hw, str):
+        return None
+    for family, rate in ACCELERATOR_USD_PER_HOUR.items():
+        if hw == family or hw.startswith(f"{family}-"):
+            return rate
+    return None
+
+
+def agentx_table(results_dir: str, base: str, concs: list[int], chips: int = 0) -> str:
+    titles = ["out tok/$"] + [t for t, _ in AGENTX_COLUMNS]
     lines = [
-        "| conc | " + " | ".join(t for t, _ in AGENTX_COLUMNS) + " |",
-        "|" + "---|" * (len(AGENTX_COLUMNS) + 1),
+        "| conc | " + " | ".join(titles) + " |",
+        "|" + "---|" * (len(titles) + 1),
     ]
     for c in concs:
         path = os.path.join(results_dir, f"{base}_c{c}.json")
@@ -157,7 +191,16 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
             # points' numbers are still the run's result.
             lines.append(f"| {label} | (unreadable: {type(e).__name__}) |")
             continue
-        cells = []
+        total = dotted_get(d, TOTAL_TPUT)
+        rate = accelerator_usd_per_hour(d.get("hw"))
+        per_dollar = (
+            total * 3600 / (chips * rate)
+            if total is not None and rate is not None and chips > 0
+            else None
+        )
+        # Whole tokens: the figure runs to five digits, where .4g would turn into
+        # scientific notation.
+        cells = ["-" if per_dollar is None else f"{per_dollar:.0f}"]
         for _, key in AGENTX_COLUMNS:
             v = dotted_get(d, key)
             cells.append("-" if v is None else f"{v:.4g}")
@@ -185,6 +228,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--results-dir", required=True)
     s.add_argument("--base", required=True)
     s.add_argument("--concs", type=int, nargs="*", default=[])
+    s.add_argument(
+        "--chips",
+        type=int,
+        default=0,
+        help="physical accelerators serving the benchmark; what they cost per "
+        "hour is the tokens-per-dollar divisor",
+    )
     a = p.parse_args(argv)
 
     if a.cmd == "lm-eval-score":
@@ -205,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "gsm8k-row":
         print(gsm8k_row(a.output_dir, a.conc))
     elif a.cmd == "agentx-table":
-        print(agentx_table(a.results_dir, a.base, a.concs))
+        print(agentx_table(a.results_dir, a.base, a.concs, a.chips))
     return 0
 
 

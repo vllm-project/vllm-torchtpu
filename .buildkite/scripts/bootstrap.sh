@@ -29,9 +29,10 @@ determine_job_priority() {
   local workload_priority=""
   echo "--- Determining job priority" >&2
   if [[ "${NIGHTLY:-0}" == "1" ]]; then
-    # Nightly build (Lowest priority)
+    # Nightly build (Lowest priority). Unclassed on kube, level with the
+    # tpu-inference nightlies it shares the TPU queues with, which record no
+    # class either.
     priority="$PRIORITY_NIGHTLY"
-    workload_priority="low"
     echo "Build type: Nightly - Priority: $priority" >&2
   elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
     local labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
@@ -65,8 +66,7 @@ read -r JOB_PRIORITY WORKLOAD_PRIORITY <<< "$job_priorities"
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
 # The kube launcher submits every workload of the build at this Kueue priority
-# class (ci-infra launch.py). None leaves them unclassed, at 0: above the
-# nightlies, as a default build ranks on bare metal.
+# class (ci-infra launch.py). None leaves them unclassed, at 0.
 if [[ -n "$WORKLOAD_PRIORITY" ]]; then
   buildkite-agent meta-data set "WORKLOAD_PRIORITY" "$WORKLOAD_PRIORITY"
 fi
@@ -155,9 +155,25 @@ fi
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
 # kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
-# scheduled kube pipeline names its own lane - and defaults to all of them.
+# scheduled pipeline names its own lane. Without it a build runs every lane but
+# perf, which has scheduled builds of its own; nightly builds still run perf,
+# and so does the integration pipeline, whose LKG promotion waits on two perf
+# steps. A PR whose change needs perf/eval coverage asks for it with the
+# run-perf-eval label; adding the label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
-lanes="${CI_LANES:-${ALL_LANES}}"
+default_lanes="verify integration tests"
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+  default_lanes="${ALL_LANES}"
+elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
+  default_lanes="${ALL_LANES}"
+  if [[ -z "${CI_LANES:-}" ]]; then
+    buildkite-agent annotate --style info --context perf-eval \
+      "Runs the perf/eval lane (\`run-perf-eval\` label)."
+  fi
+fi
+lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
     echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2

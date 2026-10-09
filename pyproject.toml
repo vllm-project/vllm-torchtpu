@@ -42,7 +42,7 @@ dependencies = [
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20261002213151",
+    "tpu-sync-torch==0.0.1.dev20261008082921",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
@@ -135,6 +135,7 @@ test = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "tpu_test: tests that require TPU hardware; CI runs them on a single-host TPU agent",
     "nightly: tests that only run in the nightly CI workflow",

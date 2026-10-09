@@ -479,6 +479,21 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
+        # consecutive ranks (a two-device pipeline stage) can sit on different
+        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
+        order = envs.VLLM_TPU_DEVICE_ORDER
+        if order:
+            device = [int(x) for x in order.split(",")][binding.local_rank]
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+            logger.info(
+                "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                binding.local_rank,
+                device,
+                order,
+            )
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -507,10 +522,12 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
 
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 

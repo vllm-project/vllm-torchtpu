@@ -446,6 +446,39 @@ def test_forward_passes_router_logits_without_a_full_expert_gather():
     assert seen[0][5] is logits
 
 
+def test_forward_masks_padded_router_logits_when_enabled(monkeypatch):
+    """Padded rows of router_logits become NaN when TPU_MOE_SKIP_PADDED_TOKENS=1."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.ones(4, 8, dtype=torch.float32)
+    state = token_padding.TokenPaddingState(
+        local_padding_mask=torch.tensor([False, True, False, True])
+    )
+    token_padding.set_padding_state(state)
+    try:
+        monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+        assert seen[-1][5] is logits
+
+        monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+        masked = seen[-1][5]
+        assert torch.equal(masked[0], logits[0])
+        assert torch.isnan(masked[1]).all()
+        assert torch.equal(masked[2], logits[2])
+        assert torch.isnan(masked[3]).all()
+    finally:
+        token_padding.set_padding_state(None)
+
+
 @pytest.mark.parametrize(
     "order,expected",
     [
