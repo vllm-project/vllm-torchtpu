@@ -29,8 +29,11 @@ The sequence-parallel forwards, installed under TPU_MOE_SEQUENCE_PARALLEL=1,
 are copies of the upstream vLLM forwards with these changes, so torch.compile
 serves every bucket:
 - torch._check(num_tokens % tp == 0) states that buckets divide by TP.
-- narrow(0, 0, num_tokens) replaces [:num_tokens] after each all-gather to
-  preserve exact symbolic output dimensions across TorchDynamo traces.
+- The all-gathers take no narrow(0, 0, num_tokens): the row slice is an exact
+  reshape (buckets divide by TP), so the gather already has num_tokens rows,
+  and a narrow would put the token count into tensor sizes as a SymInt that
+  the torch_tpu backend cannot lower ("SymIntArrayRef expected to contain only
+  concrete integers" at the next all-gather's allocation).
 - The pad before the reduce-scatter is eliminated, removing redundant padding
   computations across layers.
 - A step shorter than `sequence_parallel.min_rows()` (TPU_SP_MIN_ROWS) keeps
@@ -1032,13 +1035,12 @@ def patched_decoder_layer_forward(
     prequant = None
     if sp and sequence_parallel.fp8_gather():
         x_q, x_s = linear_common.quantize_rows(hidden_states)
-        x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
-        x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)
+        x_q = tensor_model_parallel_all_gather(x_q, 0)
+        x_s = tensor_model_parallel_all_gather(x_s, 0)
         prequant = (x_q, x_s)
         hidden_states = x_q
     elif sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
     attn_kwargs: dict[str, Any] = {} if prequant is None else {"prequant": prequant}
 
     if self.layer_type == "linear_attention":
@@ -1141,11 +1143,9 @@ def patched_model_forward(
             hidden_size = hidden_states.shape[-1]
             hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
             hidden_states, *aux_hidden_states = hidden_states.split(hidden_size, dim=-1)
         else:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
     if aux_hidden_states:
         return hidden_states, aux_hidden_states
     return hidden_states
@@ -1202,7 +1202,6 @@ def patched_mtp_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
     return hidden_states
 
 
