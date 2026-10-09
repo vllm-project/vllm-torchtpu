@@ -4099,7 +4099,8 @@ class TPURaidenConnectorWorker:
         # spans are lowered over the stage's PCP ranks alone (one contiguous
         # owner without PCP), and the layer subset is expressed through
         # per-layer pool tags instead.
-        if _engine_is_pipeline(self.vllm_config):
+        pipeline = _engine_is_pipeline(self.vllm_config)
+        if pipeline:
             lowering_parallelism = _pipeline_stage_pcp_size(self.vllm_config)
             lowering_rank = transfer_rank % lowering_parallelism
         else:
