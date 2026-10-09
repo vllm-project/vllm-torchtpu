@@ -143,9 +143,10 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
 ### C64 DSpark and Engram offload CI
 
 The `epic/dsv41` lane includes
-`deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload`: C64, 100,000 input
-tokens, 12,000 output tokens, TP8/EP8/DP1, FP8 KV, DSpark K=5, and Engram CPU
-offload. It uses 8192-token prefill chunks and `[64,384,8192]` compile buckets.
+`deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload`: C64, 98,000 input
+tokens, 5,000 output tokens, TP8/EP8/DP1, FP8 KV, DSpark K=5, and Engram CPU
+offload. The maximum model length is 103424. It uses 8192-token prefill chunks
+and `[64,384,8192]` compile buckets.
 SP and local Q are off; SparseCore MoE is on. These settings are separate from
 the C4/C8/C16 baseline. The job warms up, measures one round, and keeps all
 benchmark and server artifacts. It has no throughput regression threshold yet.

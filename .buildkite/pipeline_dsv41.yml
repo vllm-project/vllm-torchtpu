@@ -107,7 +107,7 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
-          # C64, 100k input / 12k output, DSpark K=5, Engram CPU offload.
+          # C64, 98k input / 5k output, DSpark K=5, Engram CPU offload.
           # Upload uses ADC, optionally impersonating the service account in
           # DSV41_SHEETS_SERVICE_ACCOUNT. It needs Editor access to the sheet.
           - >-

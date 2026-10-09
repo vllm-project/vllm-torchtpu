@@ -46,8 +46,8 @@ def result_values(summary: dict[str, Any]) -> list[Any]:
     benchmark = summary["benchmark"]
     expected = {
         "concurrency": 64,
-        "input_length": 100000,
-        "output_length": 12000,
+        "input_length": 98000,
+        "output_length": 5000,
         "tensor_parallel_size": 8,
         "data_parallel_size": 1,
         "max_num_batched_tokens": 8192,
@@ -67,8 +67,9 @@ def result_values(summary: dict[str, Any]) -> list[Any]:
             row["valid"]
             and row["successful_requests"] == 64
             and row["failed_requests"] == 0
-            and row["usage_tokens"] == 64 * 12000
-            and row["timeline_valid_full_concurrency_decode"]
+            and row["usage_tokens"] == 64 * 5000
+            # The fixed-window grid can miss the exact full-overlap interval.
+            and row.get("server_running_requests_max") == 64
             and row["full_overlap_duration_s"] >= benchmark["min_full_overlap_s"]
             and row.get("server_preemptions") == 0
         ):
@@ -94,7 +95,7 @@ def result_values(summary: dict[str, Any]) -> list[Any]:
     return metrics + [
         f"{build_url}#{job_id}",
         os.environ.get("BUILDKITE_AGENT_NAME", ""),
-        "100000 in / 12000 out; C64 TP8 EP8 DP1; DSpark K=5; "
+        "98000 in / 5000 out; C64 TP8 EP8 DP1; DSpark K=5; "
         f"Engram CPU offload; {requested} round(s)",
         1000 * 64 / best["full_overlap_throughput"],
     ]

@@ -11,6 +11,6 @@ bash "$SCRIPT_DIR/run_decode_benchmark.sh" \
     --results-dir "$RESULTS_DIR" --rounds 1
 
 python3 "$SCRIPT_DIR/upload_decode_sheet.py" \
-    --summary "$RESULTS_DIR/decode/isl100000_osl12000_c64/summary.json" \
+    --summary "$RESULTS_DIR/decode/isl98000_osl5000_c64/summary.json" \
     --spreadsheet-id 1A2nrPEJgRd6wYGSqW5IZwaHDYph6viYH40kuRaBMpzw \
     --sheet-id 1542472756
