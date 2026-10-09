@@ -72,6 +72,9 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -85,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
+    FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -1333,6 +1337,14 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
     return False
 
 
+def _fp8_pallas_sched_group(prefix: str) -> int | None:
+    """TPU_IDX_TOPK_SCHED_GROUPS: G2 for the q_b_proj of a DCP indexer layer (its
+    indexer op, built at model init, registered the layer), else None."""
+    if not envs.TPU_IDX_TOPK_SCHED_GROUPS or not prefix.endswith(".q_b_proj"):
+        return None
+    return streamidx_config.registered_layer_scheduling_group(prefix)
+
+
 def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
     """(Re)build the kernel's zero-padded K-major copy of a flipped `[n_in, n_out]`
     weight whose width is not a lane multiple (q_a + kv_a: 2624 -> 2688), moving raw
@@ -1659,8 +1671,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
             if padded_copy:
                 _set_fp8_pallas_copy(layer)
+            sched_group = _fp8_pallas_sched_group(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if sched_group is not None:
+                setattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, sched_group)
             get_fp8_linear_pallas_op(
-                padded_copy
+                padded_copy, sched_group
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1715,12 +1732,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            # Only a DCP indexer layer's q_b_proj under TPU_IDX_TOPK_SCHED_GROUPS
+            # carries a group; every other call is unchanged.
+            sched_group = getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None)
+            sched_kwargs = (
+                {} if sched_group is None else {"scheduling_group_id": sched_group}
+            )
             out = quantized_matmul_pallas(
                 x,
                 weight,
                 layer.weight_scale,
                 getattr(layer, FP8_PALLAS_WEIGHT, None),
                 getattr(layer, FP8_PALLAS_SCALE, None),
+                **sched_kwargs,
             )
         else:
             out = quantized_matmul(x, weight, layer.weight_scale)

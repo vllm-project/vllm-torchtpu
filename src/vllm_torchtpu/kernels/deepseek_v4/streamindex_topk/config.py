@@ -2,6 +2,7 @@
 
 import enum
 import itertools
+import re
 import threading
 
 
@@ -123,3 +124,56 @@ def reset_scheduling_group_ids() -> None:
     global _scheduling_group_ids
     with _scheduling_group_ids_lock:
         _scheduling_group_ids = itertools.count(1)
+
+
+# `TPU_IDX_TOPK_SCHED_GROUPS`: a fixed `_scheduling_group_id` per DCP indexer
+# layer, G2(L) = 2**16 + L, pairing the layer's cross-rank SparseCore top-k with
+# its q_b_proj, which lives in another jax op. The counter above cannot serve
+# here: separately traced jax ops cannot agree on a counter value, so the id is
+# a function of the layer index alone. Starting at 2**16 keeps clear of the
+# counter, which counts from 1 and resets per program. Distinct per layer, so no
+# two layers share a group.
+INDEXER_LAYER_GROUP_BASE = 1 << 16
+
+_LAYER_INDEX = re.compile(r"(?:^|[._])layers[._](\d+)(?=[._]|$)")
+_indexer_layers: set[int] = set()
+_indexer_layers_lock = threading.Lock()
+
+
+def indexer_layer_scheduling_group(layer_index: int) -> int:
+    """G2 of DCP indexer layer `layer_index`: its cross-rank top-k + q_b_proj."""
+    if layer_index < 0:
+        raise ValueError(f"layer_index ({layer_index}) must be non-negative.")
+    return INDEXER_LAYER_GROUP_BASE + layer_index
+
+
+def layer_index_of(name: str) -> int | None:
+    """The `N` of `layers.N` in a module prefix or `layers_N` in an op name."""
+    m = _LAYER_INDEX.search(name)
+    return int(m.group(1)) if m else None
+
+
+def register_indexer_layer(name: str) -> int:
+    """Records the layer `name` belongs to as a DCP indexer layer.
+
+    Called when the layer's indexer op is built (model init), so the record is
+    complete before q_b_proj, whose op is built after the weights load, looks
+    it up.
+
+    Returns:
+      The layer's G2.
+    """
+    layer_index = layer_index_of(name)
+    if layer_index is None:
+        raise ValueError(f"no layer index in {name!r}")
+    with _indexer_layers_lock:
+        _indexer_layers.add(layer_index)
+    return indexer_layer_scheduling_group(layer_index)
+
+
+def registered_layer_scheduling_group(name: str) -> int | None:
+    """G2 of the layer `name` belongs to; None unless it is registered."""
+    layer_index = layer_index_of(name)
+    if layer_index is None or layer_index not in _indexer_layers:
+        return None
+    return indexer_layer_scheduling_group(layer_index)

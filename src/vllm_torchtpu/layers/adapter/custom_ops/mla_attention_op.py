@@ -56,6 +56,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
+    register_indexer_layer,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -469,6 +472,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
         )
+        global_group = None
+        if envs.TPU_IDX_TOPK_SCHED_GROUPS:
+            global_group = register_indexer_layer(self.k_cache.prefix)
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -517,6 +523,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                global_scheduling_group_id=global_group,
             )
             return cache_kv, local_topk
 

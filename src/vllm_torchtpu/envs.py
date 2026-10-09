@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_IDX_TOPK_SCHED_GROUPS: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -729,6 +730,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Per DCP indexer layer, put the cross-rank SparseCore top-k and q_b_proj in
+    # one XLA scheduling group (fixed per-layer id), so the scheduler can run
+    # q_b_proj while the TensorCore waits on the top-k. Same values.
+    "TPU_IDX_TOPK_SCHED_GROUPS": env_bool("TPU_IDX_TOPK_SCHED_GROUPS"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission

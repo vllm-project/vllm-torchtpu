@@ -1654,6 +1654,7 @@ def streamindex_topk(
         "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "global_scheduling_group_id",
     ),
 )
 def streamindex_topk_dcp(
@@ -1678,6 +1679,7 @@ def streamindex_topk_dcp(
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    global_scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1733,6 +1735,10 @@ def streamindex_topk_dcp(
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
         two compose.
       dcp_axis_name: name of the DCP mesh axis.
+      global_scheduling_group_id: XLA scheduling group of the cross-rank
+        SparseCore merge (stage 2), which the layer's independent TensorCore
+        work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
+        no group. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1814,6 +1820,7 @@ def streamindex_topk_dcp(
             k,
             dcp_rank=dcp_rank,
             dcp_size=dcp_size,
+            scheduling_group_id=global_scheduling_group_id,
         )
 
     replicated = P()
