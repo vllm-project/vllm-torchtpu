@@ -158,11 +158,20 @@ fi
 # scheduled pipeline names its own lane. Without it a build runs every lane but
 # perf, which has scheduled builds of its own; nightly builds still run perf,
 # and so does the integration pipeline, whose LKG promotion waits on two perf
-# steps.
+# steps. A PR whose change needs perf/eval coverage asks for it with the
+# run-perf-eval label; adding the label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
 default_lanes="verify integration tests"
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   default_lanes="${ALL_LANES}"
+elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
+  default_lanes="${ALL_LANES}"
+  if [[ -z "${CI_LANES:-}" ]]; then
+    buildkite-agent annotate --style info --context perf-eval \
+      "Runs the perf/eval lane (\`run-perf-eval\` label)."
+  fi
 fi
 lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
