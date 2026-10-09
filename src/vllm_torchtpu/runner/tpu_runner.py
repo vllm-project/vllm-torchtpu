@@ -671,8 +671,8 @@ class TPUModelRunner(GPUModelRunner):
         # attention share the uniform `num_blocks` as before.
         self._mamba_num_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
-        # allocated when a request first appears and returned when it leaves
-        # the persistent batch. Keying on req_id (rather than persistent-batch
+        # allocated when a request first appears and retained until its KV
+        # ownership ends. Keying on req_id (rather than persistent-batch
         # position) makes the mapping immune to condense/swap reordering in
         # upstream vLLM's InputBatch, which we do not subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
@@ -1629,8 +1629,8 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         """Build the device `mamba_state_indices` for the current chunk.
 
-        Reconciles the req_id->slot map against the live persistent batch:
-          * frees slots whose req_id is no longer present (request finished),
+        Reconciles the req_id->slot map against the live requests:
+          * frees slots whose request has finished,
           * allocates a fresh unique slot for any new req_id.
         Returns an int32 device tensor of length `target_num_reqs`: positions
         `[0, num_reqs)` hold the slot for `req_ids[start_index + i]`; the
@@ -1650,8 +1650,9 @@ class TPUModelRunner(GPUModelRunner):
         condense/swap reordering automatically because the map is keyed on the
         stable req_id, not the moving persistent-batch position.
         """
-        live_req_ids = set(self.input_batch.req_id_to_index.keys())
-        # Free slots for requests that left the batch.
+        # A scheduling gap does not release the request's recurrent state.
+        # Preemption/resume invalidation is handled by _update_states.
+        live_req_ids = self.requests.keys()
         for req_id in list(self._mamba_slot_by_req_id.keys()):
             if req_id not in live_req_ids:
                 self._free_mamba_slots.append(self._mamba_slot_by_req_id.pop(req_id))
@@ -1666,9 +1667,8 @@ class TPUModelRunner(GPUModelRunner):
             assert req_id is not None
             slot = self._mamba_slot_by_req_id.get(req_id)
             if slot is None:
-                # New request: take a fresh unique slot. The pool is sized to
-                # max_num_reqs + 1, so it can never be exhausted while the
-                # batch holds at most max_num_reqs requests.
+                # The scheduler bounds running requests by max_num_reqs;
+                # preempted owners release their slots in _update_states.
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
@@ -1756,7 +1756,9 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not self._mamba_copy_plan:
             return
-        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        # The last written column can be ahead of the committed token count
+        # after draft rejection. Retain it while the request still owns KV.
+        live_req_ids = self.requests.keys()
         for req_id in list(self._mamba_state_pos.keys()):
             if req_id not in live_req_ids:
                 del self._mamba_state_pos[req_id]
@@ -2423,6 +2425,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
+            slot = self._mamba_slot_by_req_id.pop(req_id, None)
+            if slot is not None:
+                self._free_mamba_slots.append(slot)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID

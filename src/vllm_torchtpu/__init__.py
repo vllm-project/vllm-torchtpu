@@ -21,6 +21,44 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_compact_mamba_streaming_input() -> None:
+    """Reject input sessions whose retained state can exceed the compact pool."""
+    import inspect
+    from functools import wraps
+
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+
+    original = InputProcessor.process_inputs
+    marker = "_tpu_compact_mamba_input_patch"
+    if original.__dict__.get(marker, False):
+        return
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def process_inputs(self, *args, **kwargs):
+        config = self.vllm_config
+        transfer = config.kv_transfer_config
+        uses_slots = transfer is None or transfer.kv_connector == "DecodeBenchConnector"
+        if (
+            uses_slots
+            and config.model_config.is_hybrid
+            and not unified_kv_layout_enabled(config)
+            and signature.bind(self, *args, **kwargs).arguments.get("resumable", False)
+        ):
+            raise ValueError(
+                "resumable input is unsupported with the compact Mamba state pool: "
+                "waiting sessions retain state beyond the running-request limit. "
+                "Use the unified KV pool on a supported architecture, or submit "
+                "complete inputs. Streaming output remains supported."
+            )
+        return original(self, *args, **kwargs)
+
+    process_inputs.__dict__[marker] = True
+    InputProcessor.process_inputs = process_inputs
+
+
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
 

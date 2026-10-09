@@ -91,6 +91,7 @@ def _make_self(
     ]
     plan = [(gid + 1, [raws[gid]]) for gid in range(len(group_block_rows))]
     ns = SimpleNamespace(
+        requests={rid: object() for rid in req_ids},
         _mamba_copy_plan=plan,
         _mamba_state_pos=dict(state_pos or {}),
         _mamba_offset_seeded=set(req_ids),
@@ -302,13 +303,47 @@ def test_decode_boundary_crossing_copies():
 
 
 def test_stale_request_positions_are_forgotten():
-    # A req_id no longer in the batch is dropped from _mamba_state_pos.
+    # Finished requests no longer own KV state.
     fake, _ = _make_self(
         ["live"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]], state_pos={"live": 1, "gone": 3}
     )
     _collect(fake, _sched({"live": BLOCK_SIZE}))
     assert "gone" not in fake._mamba_state_pos
     assert "live" in fake._mamba_state_pos
+
+
+@pytest.mark.parametrize("scheduled", [1, 4])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_unscheduled_request_resumes_last_written_checkpoint(scheduled, offset):
+    """Rejection can leave the committed position before the written state column."""
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    offsets[6] = offset
+    fake, raws = _make_self(
+        ["a"],
+        [BLOCK_SIZE - 1],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 1},
+        ckpt_window=4,
+        read_offsets=offsets,
+    )
+    # Each offset corresponds to a legal four-token window ending in column 1
+    # and accepting offset + 1 inputs, leaving computed == BLOCK_SIZE - 1.
+    raw = raws[0]
+    raw[5].fill_(float("nan"))
+    raw[6:10] = torch.arange(4).unsqueeze(1).expand(4, STATE_DIM) + 100
+    batch_a = fake.input_batch
+    batch_b, _ = _make_self(["b"], [10], [[[15, 16, 17, 18]]])
+    fake.requests["b"] = object()
+    fake.input_batch = batch_b.input_batch
+    _collect(fake, _sched({"b": 1}))
+    fake.input_batch = batch_a
+    _collect(fake, _sched({"a": scheduled}))
+    for buffers, src, dst in fake._pending_mamba_state_copies:
+        buffers[0][dst.long()] = buffers[0][src.long()].clone()
+    column = (BLOCK_SIZE - 1 + scheduled - 1) // BLOCK_SIZE
+    base = 5 + column
+    actual = raw[base + int(offsets[base])]
+    torch.testing.assert_close(actual, torch.full_like(actual, 100 + offset))
 
 
 def test_start_index_window_skips_other_rows():

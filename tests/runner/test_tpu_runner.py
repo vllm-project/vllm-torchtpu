@@ -1165,6 +1165,7 @@ class TestCompactMambaSlotPool:
 
     def _set_batch(self, runner, req_ids):
         """Set the persistent batch to the given ordered req_ids."""
+        runner.requests = {rid: object() for rid in req_ids}
         runner.input_batch.req_ids = list(req_ids)
         runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
@@ -1243,6 +1244,22 @@ class TestCompactMambaSlotPool:
         self._set_batch(runner, ["e"])
         idx1 = runner._build_mamba_state_indices(0, 1, 4).cpu()
         assert 1 <= int(idx1[0]) <= 4
+
+    @pytest.mark.parametrize("stride", [1, 4])
+    def test_unscheduled_request_keeps_state_at_full_capacity(self, stride):
+        runner = self._make_runner(max_num_reqs=2, slot_stride=stride)
+        runner._init_mamba_slot_pool(1 + 2 * stride)
+        owners = {rid: object() for rid in ("a", "b")}
+        state = torch.zeros(1 + 2 * stride)
+        for step, (rid, value) in enumerate([("a", 11), ("b", 22), ("a", 11)]):
+            self._set_batch(runner, [rid])
+            runner.requests = owners
+            slot = int(runner._build_mamba_state_indices(0, 1, 2)[0])
+            if step == 2:
+                assert state[slot] == value
+            state[slot] = value
+        assert len(runner._mamba_slot_by_req_id) == 2
+        assert runner._free_mamba_slots == []
 
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
