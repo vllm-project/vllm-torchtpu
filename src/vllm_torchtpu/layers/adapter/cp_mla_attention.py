@@ -133,7 +133,8 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    return cp_lse_ag_out_rs(output, lse, group)
+    rs_dtype = output.dtype if envs.TPU_DCP_LSE_MERGE_RS_BF16 else None
+    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
