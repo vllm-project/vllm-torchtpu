@@ -96,6 +96,9 @@ FORWARD=(
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
+  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh:
+  # the eval-only job, the eval smoke, and skipping the post-replay eval.
+  K3_AGENTX_EVAL_ONLY AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

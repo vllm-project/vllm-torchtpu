@@ -3,7 +3,9 @@
 #   agentx_sweep.sh          boots a server, then calls agentx_client.sh (boot,
 #                            config.json, cleanup, log dump, GCS)
 #   agentx_client.sh         benchmarks a server it did not boot (server URL,
-#                            liveness, drain, engine counters, GCS)
+#                            liveness, drain, engine counters, GCS, checkout)
+#   agentx_eval_client.sh    InferenceX's quality evals against a server it did
+#                            not boot (server URL, liveness, GCS, checkout)
 #   kimi-k3/eval_conc_sweep.sh  boots a server, then runs lm_eval (all of it)
 # Source it after setting:
 #   IX_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
@@ -172,6 +174,70 @@ ix_dump_server_log_context() {
         | grep -n -E -B3 -A25 'Traceback|Error|Exception|NotImplemented|Killed|OOM|halt' | tail -150 | cut -c1-400
     log "===== server.log: last 40 non-blank lines ====="
     tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
+}
+
+# Pinned, not main, and shared by both clients so a perf row and its quality
+# evals come from one InferenceX. InferenceX refactors its benchmark harness
+# under us: in one week it moved its tree into inferencex-e2e/, added ten env
+# vars that build_replay_cmd validates, and then replaced benchmark_lib.sh -
+# which agentx_client.sh sources - with the infx.bench package (#3610). A
+# nightly that tracks main races those. This is the last ref the lane ran clean
+# on (build 65: both ladder points, ok=19 err=0, isl p50 337k). Bump it
+# deliberately, with a run to show the new ref works; --ix-ref overrides for a
+# one-off.
+# shellcheck disable=SC2034  # read by the scripts that source this
+IX_DEFAULT_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
+IX_URL=https://github.com/SemiAnalysisAI/InferenceX
+
+# ix_layout_root <dir>: the directory inside the checkout that holds
+# benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
+# InferenceX moved that tree down into inferencex-e2e/ (the root now also holds
+# collectivex/, operatorx/ and power_model/), and --ix-ref can still pin a
+# commit from before the move, so this is probed rather than hardcoded.
+ix_layout_root() {
+    local d
+    for d in "$1/inferencex-e2e" "$1"; do
+        [ -d "$d/utils/aiperf/src" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# ix_checkout <dir> <ref> : InferenceX at <ref> in <dir>, reused when already
+# there, then IX_ROOT (the tree) and IX_EVALS (its evals directory, empty when
+# it has none). Returns non-zero with a FATAL line when it cannot be had.
+# shellcheck disable=SC2034  # IX_ROOT and IX_EVALS are for the caller
+ix_checkout() {
+    local dir="$1" ref="$2" d
+    if ! ix_layout_root "$dir" >/dev/null; then
+        rm -rf "$dir"
+        if [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then
+            log "FATAL: --ix-ref '$ref' looks like an abbreviated commit, which cannot" \
+                "be fetched - git answers \"couldn't find remote ref\". Use the full 40" \
+                "characters."
+            return 2
+        fi
+        if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            # A commit cannot be cloned with --branch: fetch just that commit.
+            if ! { git init -q "$dir" \
+                    && git -C "$dir" fetch -q --depth 1 "$IX_URL" "$ref" \
+                    && git -C "$dir" checkout -q FETCH_HEAD \
+                    && git -C "$dir" submodule update -q --init --depth 1 --recursive; }; then
+                log "FATAL: cannot fetch InferenceX commit $ref from $IX_URL"; return 1
+            fi
+        else
+            git clone -q --depth 1 --branch "$ref" --recurse-submodules --shallow-submodules "$IX_URL" "$dir" \
+                || { log "FATAL: cannot clone InferenceX branch/tag $ref from $IX_URL"; return 1; }
+        fi
+    fi
+    IX_ROOT=$(ix_layout_root "$dir") || {
+        log "FATAL: $dir has no utils/aiperf/src under its root or inferencex-e2e/"; return 1
+    }
+    # The eval task files and their lm-eval patch moved from utils/evals to
+    # infx/evals in the same reorganisation.
+    IX_EVALS=""
+    for d in "$IX_ROOT/infx/evals" "$IX_ROOT/utils/evals"; do
+        [ -d "$d" ] && { IX_EVALS="$d"; break; }
+    done
 }
 
 # run_benchmarks.sh, cleanup_server.sh and configs/ are shared with every other

@@ -47,14 +47,7 @@ RESULTS_DIR="/perf_eval_results/agentx-client"
 CONC_LIST=""
 DURATION=1800
 FAST=1
-# Pinned, not main. InferenceX refactors its benchmark harness under us: in one
-# week it moved its tree into inferencex-e2e/, added ten env vars that
-# build_replay_cmd validates, and then replaced benchmark_lib.sh - which this
-# script sources - with the infx.bench package (#3610). A nightly that tracks
-# main races those. This is the last ref the lane ran clean on (build 65:
-# both ladder points, ok=19 err=0, isl p50 337k). Bump it deliberately, with a
-# run to show the new ref works; --ix-ref overrides for a one-off.
-IX_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
+IX_REF=""              # empty = IX_DEFAULT_REF, the pin in sweep_lib.sh
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"         # comma list allowed: one GSM8K run per value
 TOK_DIR_ARG=""         # a local tokenizer directory, when the caller pulled the weights
@@ -154,6 +147,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IX_SWEEP_TAG="agentx-client"
 # shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
 source "$SCRIPT_DIR/sweep_lib.sh"
+IX_REF="${IX_REF:-$IX_DEFAULT_REF}"
 
 # One validator for both lists, shared with eval_conc_sweep.sh, so a 0 or an
 # 007 cannot reach aiperf's --concurrency or lm_eval's num_concurrent.
@@ -234,52 +228,9 @@ fi
 mkdir -p "$SCRATCH" "$DATA_SCRATCH"
 export TMPDIR="$DATA_SCRATCH/tmp"; mkdir -p "$TMPDIR"
 export AIPERF_UV_CACHE_DIR="$DATA_SCRATCH/uv-cache"
-IX_DIR="$SCRATCH/InferenceX"
-IX_URL=https://github.com/SemiAnalysisAI/InferenceX
-# ix_layout_root <dir>: the directory inside the checkout that holds
-# benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
-# InferenceX moved that tree down into inferencex-e2e/ (the root now also holds
-# collectivex/, operatorx/ and power_model/), and --ix-ref can still pin a
-# commit from before the move, so this is probed rather than hardcoded.
-ix_layout_root() {
-    local d
-    for d in "$1/inferencex-e2e" "$1"; do
-        [ -d "$d/utils/aiperf/src" ] && { echo "$d"; return 0; }
-    done
-    return 1
-}
-
-if ! ix_layout_root "$IX_DIR" >/dev/null; then
-    rm -rf "$IX_DIR"
-    if [[ "$IX_REF" =~ ^[0-9a-f]{7,39}$ ]]; then
-        log "FATAL: --ix-ref '$IX_REF' looks like an abbreviated commit, which cannot" \
-            "be fetched - git answers \"couldn't find remote ref\". Use the full 40" \
-            "characters."
-        exit 2
-    fi
-    if [[ "$IX_REF" =~ ^[0-9a-f]{40}$ ]]; then
-        # A commit cannot be cloned with --branch: fetch just that commit.
-        if ! { git init -q "$IX_DIR" \
-                && git -C "$IX_DIR" fetch -q --depth 1 "$IX_URL" "$IX_REF" \
-                && git -C "$IX_DIR" checkout -q FETCH_HEAD \
-                && git -C "$IX_DIR" submodule update -q --init --depth 1 --recursive; }; then
-            log "FATAL: cannot fetch InferenceX commit $IX_REF from $IX_URL"; exit 1
-        fi
-    else
-        git clone -q --depth 1 --branch "$IX_REF" --recurse-submodules --shallow-submodules "$IX_URL" "$IX_DIR" \
-            || { log "FATAL: cannot clone InferenceX branch/tag $IX_REF from $IX_URL"; exit 1; }
-    fi
-fi
-IX_ROOT=$(ix_layout_root "$IX_DIR") || {
-    log "FATAL: $IX_DIR has no utils/aiperf/src under its root or inferencex-e2e/"; exit 1
-}
-# The eval task files and their lm-eval patch moved from utils/evals to
-# infx/evals in the same reorganisation.
-IX_EVALS=""
-for _d in "$IX_ROOT/infx/evals" "$IX_ROOT/utils/evals"; do
-    [ -d "$_d" ] && { IX_EVALS="$_d"; break; }
-done
-log "InferenceX $(git -C "$IX_DIR" rev-parse --short HEAD) (tree $IX_ROOT), aiperf $(git -C "$IX_ROOT/utils/aiperf" rev-parse --short HEAD)"
+# Sets IX_ROOT and IX_EVALS; exits with a FATAL line when the ref cannot be had.
+ix_checkout "$SCRATCH/InferenceX" "$IX_REF" || exit $?
+log "InferenceX $(git -C "$SCRATCH/InferenceX" rev-parse --short HEAD) (tree $IX_ROOT), aiperf $(git -C "$IX_ROOT/utils/aiperf" rev-parse --short HEAD)"
 
 TOK_DIR=""
 if [ -n "$TOK_DIR_ARG" ]; then

@@ -38,7 +38,7 @@ CONFIG_NAME="kimi-k3-tp32-ep-agentx"
 RESULTS_DIR="/perf_eval_results/agentx-sweep"
 DURATION=1800
 FAST=1
-IX_REF=""            # empty: agentx_client.sh owns the pin
+IX_REF=""            # empty: the pin in sweep_lib.sh
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"
 # Physical TPU chips serving this benchmark. No default: see the note at the
