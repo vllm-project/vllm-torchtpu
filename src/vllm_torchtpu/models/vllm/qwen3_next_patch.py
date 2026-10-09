@@ -26,16 +26,24 @@ FP8 fusions, installed for every Qwen3Next / Qwen3.5 model:
   (`maybe_setup_fused_gate_se`).
 
 The sequence-parallel forwards, installed under TPU_MOE_SEQUENCE_PARALLEL=1,
-are copies of the upstream vLLM forwards with these changes, so torch.compile
-serves every bucket:
-- torch._check(num_tokens % tp == 0) states that buckets divide by TP.
-- The all-gathers take no narrow(0, 0, num_tokens): the row slice is an exact
-  reshape (buckets divide by TP), so the gather already has num_tokens rows,
-  and a narrow would put the token count into tensor sizes as a SymInt that
-  the torch_tpu backend cannot lower ("SymIntArrayRef expected to contain only
-  concrete integers" at the next all-gather's allocation).
-- The pad before the reduce-scatter is eliminated, removing redundant padding
-  computations across layers.
+are copies of the upstream vLLM forwards restructured so torch.compile serves
+every bucket:
+- The model and the MTP drafter do not chunk their rows at entry. The first
+  decoder layer (residual None) runs attention on the step's replicated rows;
+  the reduce-scatter after attention leaves this rank's slice, and the
+  residual is sliced to match. Every later layer takes the slice, all-gathers
+  it into attention, reduce-scatters after attention and runs the MoE on the
+  slice. Only the final norm's output is gathered back to every row.
+- Every slice takes its size from a tensor (the reduce-scatter, or
+  reshape(tp, -1, H) of the residual), never from the step's token count, and
+  no all-gather is followed by a narrow. The token count is a SymInt graph
+  input; a row count derived from it ahead of an all-gather can stay symbolic
+  in the compiled graph, which torch_tpu fails to lower ("SymIntArrayRef
+  expected to contain only concrete integers" at the all-gather's
+  allocation). Main's model-entry chunk hit this at every SP bucket; this
+  structure (from bec1a1c91) compiles.
+- The pad before the reduce-scatter is eliminated: buckets divide by TP
+  (`sequence_parallel.check_buckets`).
 - A step shorter than `sequence_parallel.min_rows()` (TPU_SP_MIN_ROWS) keeps
   its rows replicated and all-reduces the attention output instead.
 - With TPU_SP_FP8_GATHER, the attention-side all-gather carries FP8 rows and
@@ -960,12 +968,6 @@ def install_qwen3_next_v6_patches() -> None:
     _V6_PATCHES_INSTALLED = True
 
 
-def _check_tokens_divide_by_tp(num_tokens: int) -> None:
-    tp_size = get_tensor_model_parallel_world_size()
-    if tp_size > 1:
-        torch._check(num_tokens % tp_size == 0)
-
-
 def _rows_are_sequence_parallel(num_tokens: int) -> bool:
     """Whether a sequence-parallel layer slices this step's rows over TP.
 
@@ -978,10 +980,12 @@ def _rows_are_sequence_parallel(num_tokens: int) -> bool:
 
 
 def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:
-    """This TP rank's row slice of `x`.
+    """This TP rank's row slice of the replicated `x`, the rows the
+    reduce-scatter leaves on this rank.
 
     Reads the rank from the layer's `_tpu_sp_rank` tensor when it has one, so
     the traced graph takes the rank as data instead of baking in a constant.
+    The slice's size comes from `x`'s shape, not from the token count.
     """
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size <= 1:
@@ -1018,6 +1022,9 @@ def patched_decoder_layer_forward(
     sp = self.use_attn_reduce_scatter_for_moe and _rows_are_sequence_parallel(
         full_num_tokens
     )
+    # The first layer (no residual yet) takes the step's rows replicated and
+    # slices them after attention; every later layer takes this rank's slice.
+    input_is_sliced = sp and residual is not None
 
     # Rank tensors enter every layer's graph, so all layers trace alike.
     sp_rank = getattr(self, "_tpu_sp_rank", None)
@@ -1033,13 +1040,13 @@ def patched_decoder_layer_forward(
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
     prequant = None
-    if sp and sequence_parallel.fp8_gather():
+    if input_is_sliced and sequence_parallel.fp8_gather():
         x_q, x_s = linear_common.quantize_rows(hidden_states)
         x_q = tensor_model_parallel_all_gather(x_q, 0)
         x_s = tensor_model_parallel_all_gather(x_s, 0)
         prequant = (x_q, x_s)
         hidden_states = x_q
-    elif sp:
+    elif input_is_sliced:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
     attn_kwargs: dict[str, Any] = {} if prequant is None else {"prequant": prequant}
 
@@ -1064,8 +1071,9 @@ def patched_decoder_layer_forward(
 
     if self.use_attn_reduce_scatter_for_moe:
         if sp:
-            _check_tokens_divide_by_tp(full_num_tokens)
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+            if not input_is_sliced:
+                residual = _sp_chunk(self, residual)
         else:
             # o_proj leaves its TP partials unreduced for the reduce-scatter;
             # a replicated step sums them here instead.
@@ -1114,11 +1122,14 @@ def patched_model_forward(
     assert isinstance(hidden_states, torch.Tensor)
     full_num_tokens = positions.shape[-1]
     sp = self.use_sequence_parallel and _rows_are_sequence_parallel(full_num_tokens)
-    if sp:
-        _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = _sp_chunk(self.layers[self.start_layer], hidden_states)
 
+    # The rows enter replicated; the first layer slices them after attention.
     aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+    if sp and residual is None and aux_hidden_states:
+        # Slice the embedding like the layer outputs for the final gather.
+        aux_hidden_states = [
+            _sp_chunk(self.layers[self.start_layer], aux_hidden_states[0])
+        ]
     for layer_idx, layer in enumerate(
         islice(self.layers, self.start_layer, self.end_layer),
         start=self.start_layer,
@@ -1184,10 +1195,7 @@ def patched_mtp_forward(
     sp = mtp_layer.use_attn_reduce_scatter_for_moe and _rows_are_sequence_parallel(
         full_num_tokens
     )
-    if sp:
-        _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = _sp_chunk(mtp_layer, hidden_states)
-
+    # The layer takes the rows replicated and returns this rank's slice.
     hidden_states, residual = mtp_layer(
         positions=positions,
         hidden_states=hidden_states,
