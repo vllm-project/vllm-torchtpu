@@ -399,6 +399,7 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
+        capture_axes=(),
         paths={
             "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
         },
