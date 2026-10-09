@@ -623,8 +623,40 @@ def _topk_body(
             )(scores_hbm, lengths_hbm, *extra_in, out_hbm)
     else:
 
+        def write_empty_row(row):
+            """What `_run_step` writes for a row with nothing to select."""
+
+            def fill(i):
+                rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
+                if return_scores:
+                    keybuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full(
+                        (LANES,), BITS_NEG_INF, jnp.int32
+                    )
+
+            plsc.parallel_loop(0, k // LANES, unroll=4)(fill)
+            out_off = pl.multiple_of(row * k, LANES)
+            pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(out_off, k)])
+            if return_scores:
+                pltpu.sync_copy(
+                    keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)]
+                )
+
         def pipeline_step_coop(scores_vmem, len_slice_vmem):
-            _run_step(scores_vmem, len_slice_vmem)
+            if p != num_subcores:
+                _run_step(scores_vmem, len_slice_vmem)
+                return
+            # One row per SparseCore per wave, so all 16 subcores agree when it
+            # is empty and can skip its histogram, barriers and emit together.
+            # Padded token rows are empty, and a large bucket holds thousands.
+            row = pl.program_id(0) * groups_per_chip + core
+            row_len = jnp.where(row < b, vec_at(len_slice_vmem, 0), 0)
+            pl.when(row_len > 0)(
+                functools.partial(_run_step, scores_vmem, len_slice_vmem)
+            )
+            if write_empty:
+                pl.when((row_len == 0) & (row < b) & (sub == 0))(
+                    functools.partial(write_empty_row, row)
+                )
 
         in_specs = (
             pl.BlockSpec(
